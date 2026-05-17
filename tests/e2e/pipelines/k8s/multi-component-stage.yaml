@@ -1,0 +1,40 @@
+---
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: "{{.RunPrefix}}-multi-component-stage"
+  namespace: datuplet
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: posts-extractor
+          image: datuplet/http-json-extractor:latest
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
+            table_name: "posts"
+          outputs:
+            tables:
+              - name: posts
+                bucket: "{{.RunPrefix}}-multi"
+                writeMode: FULL_LOAD
+        - name: users-extractor
+          image: datuplet/http-json-extractor:latest
+          config:
+            url: "https://jsonplaceholder.typicode.com/users"
+            table_name: "users"
+          outputs:
+            tables:
+              - name: users
+                bucket: "{{.RunPrefix}}-multi"
+                writeMode: FULL_LOAD
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: "{{.RunPrefix}}-multi-component-stage-run"
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: "{{.RunPrefix}}-multi-component-stage"
+  parameters: {}

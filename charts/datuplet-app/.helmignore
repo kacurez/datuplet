@@ -1,0 +1,7 @@
+# charts/datuplet-app/.helmignore
+.DS_Store
+.git/
+.gitignore
+.idea/
+*.tmproj
+.vscode/

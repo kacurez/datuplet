@@ -1,0 +1,119 @@
+# Build artifacts
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Compiled binaries in root (from component builds + stray `go build .`
+# invocations that drop a binary at repo root)
+/csv-extractor
+/sql-transform
+/stdout-writer
+/datuplet
+/pipeline-api
+
+# Compiled component binaries dropped next to their Dockerfile by local
+# `go build` runs (the Docker build itself doesn't write to the host).
+/components/sql-transform/sql-transform
+
+# Go
+*.test
+*.out
+go.work
+go.work.sum
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+
+# Node.js
+node_modules/
+.next/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Working files
+initprompt.txt
+plan.md
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Coverage
+coverage.out
+coverage.html
+
+# Pipeline output data (generated at runtime)
+examples/data/raw/
+examples/data/staging/
+tmp/
+
+# Ad-hoc proof / debug artifacts (one-shot proofs, captured pod logs, etc.)
+tests/proofs/
+
+# Local-mode pipeline-api state dir (default ./local-data; absolute paths
+# obviously not covered).
+/local-data/
+
+# E2E scratch warehouses created under tests/e2e/testdata/
+tests/e2e/testdata/e2e-*/
+
+# Dev-only docs (RFCs, plans, spikes, audit notes, samples). Kept locally
+# for project history; never pushed to the public repo.
+docs/tmp/
+
+# Helm chart dependency tarballs — Chart.lock is source of truth, run
+# `helm dependency update charts/datuplet` to repopulate after clone.
+charts/*/charts/
+
+# New split-chart locks (datuplet-operators + datuplet-infra + datuplet-app + datuplet-lakekeeper) — regenerated
+# via `helm dependency update`; not committed, unlike charts/datuplet/Chart.lock.
+charts/datuplet-operators/Chart.lock
+charts/datuplet-infra/Chart.lock
+charts/datuplet-app/Chart.lock
+charts/datuplet-lakekeeper/Chart.lock
+

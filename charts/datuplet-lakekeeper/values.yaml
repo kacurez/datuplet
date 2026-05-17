@@ -1,0 +1,196 @@
+# charts/datuplet-lakekeeper/values.yaml
+#
+# Phase 4 of the Datuplet 5-phase install.
+# Requires datuplet-infra (Phase 2) + datuplet-app (Phase 3) installed first.
+
+# Phase 2 (datuplet-infra) + Phase 3 (datuplet-app) coordinates that
+# lakekeeper needs. MUST match the originating chart's values.
+platform:
+  # Source: charts/datuplet-app/values.yaml :: fgaModel.version
+  # The lakekeeper-config Secret pins lakekeeper to this model version.
+  fgaModelVersion: "4.4"
+  # Source: charts/datuplet-app/values.yaml :: platform.openfgaStoreName
+  openfgaStoreName: datuplet
+
+# Source: charts/datuplet-app/values.yaml :: pipelineApi.publicUrl
+# Used by the lakekeeper-config Secret to set OIDC discovery URL.
+pipelineApi:
+  publicUrl: ""
+
+image:
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Lakekeeper Iceberg REST catalog.
+# Lakekeeper reuses datuplet-infra state: pg-lakekeeper / pg-lakekeeper-pw
+# Secrets (created by infra's keygen-job → CNPG) and openfga-api-key Secret.
+lakekeeper:
+  enabled: true
+  # fullnameOverride is a top-level lakekeeper subchart key (not catalog.fullnameOverride)
+  fullnameOverride: lakekeeper
+  # helmWait=true tells the subchart to render its db-migration Job as a
+  # regular main resource (no helm.sh/hook annotation). Default would make
+  # it a post-install hook, deadlocking helm install --wait: the lakekeeper
+  # Pod's check-db initContainer is a main resource waiting for the
+  # migration table, but the migration Job (post-install hook) only fires
+  # AFTER main resources are Ready. With helmWait=true the migration runs
+  # alongside other main resources, completes, then check-db unblocks.
+  helmWait: true
+  catalog:
+    # Pin lakekeeper to v0.12.1. The FGA DSL files in
+    # charts/datuplet-app/files/fga/components/ are forked from
+    # lakekeeper v0.12.1's model. The subchart's default tag may lag
+    # behind; pin so binary and forked model versions match.
+    image:
+      tag: v0.12.1
+    podLabels:
+      app.kubernetes.io/part-of: datuplet
+      app.kubernetes.io/name: lakekeeper
+    # extraEnvFrom — cross-chart Secrets (created by datuplet-infra, same ns):
+    #   pg-lakekeeper       → POSTGRES_HOST/PORT/DB/USER (created by infra's
+    #                          postgres/connection-secret-lakekeeper.yaml)
+    #   lakekeeper-config   → LAKEKEEPER__OPENFGA__* + LAKEKEEPER__OPENID_*
+    #                          (parent-rendered in this chart, see
+    #                          templates/config-secret.yaml)
+    extraEnvFrom:
+      - secretRef:
+          name: pg-lakekeeper
+      - secretRef:
+          name: lakekeeper-config
+    extraEnv:
+      - name: POSTGRES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: pg-lakekeeper-pw     # created by datuplet-infra keygen-job
+            key: password
+      - name: LAKEKEEPER__PG_DATABASE_URL_READ
+        value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)"
+      - name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+        value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)"
+      - name: LAKEKEEPER__OPENFGA__API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: openfga-api-key       # created by datuplet-infra keygen-job
+            key: keys
+    # Two initContainers, ordered:
+    #   1. wait-for-fga-store      — polls openfga until "datuplet" store +
+    #                                 model pin are written by datuplet-app's
+    #                                 authz-bootstrap. Without this lakekeeper
+    #                                 can start before FGA is ready and reject
+    #                                 every catalog API call.
+    #   2. wait-for-pipeline-api   — polls pipeline-api's /.well-known/openid-
+    #                                 configuration. Lakekeeper hard-exits if
+    #                                 OIDC discovery fails at startup; this
+    #                                 gates the main container on pipeline-api
+    #                                 actually serving JWKS.
+    extraInitContainers:
+      - name: wait-for-fga-store
+        image: bitnami/kubectl:latest
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            set -eu
+            FGA_HTTP="http://openfga.$POD_NAMESPACE.svc.cluster.local:8080"
+            # VERSION sourced from the parent-rendered lakekeeper-config Secret
+            # (LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION) via secretKeyRef
+            # on the env block below. Single source of truth =
+            # .Values.platform.fgaModelVersion — no hardcoded version drift.
+            VERSION="$FGA_MODEL_VERSION"
+            for i in $(seq 1 60); do
+              # openfga returns stores as {"stores":[{"id":"...","name":"datuplet",...}]}.
+              # Field order in the response varies — match either id-first or name-first.
+              STORES=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                "$FGA_HTTP/stores" 2>/dev/null || echo "")
+              STORE_ID=""
+              if echo "$STORES" | grep -q '"name":"datuplet"'; then
+                STORE_ID=$(echo "$STORES" \
+                  | sed -nE 's/.*"id":"([^"]+)"[^}]*"name":"datuplet".*/\1/p; s/.*"name":"datuplet"[^}]*"id":"([^"]+)".*/\1/p' \
+                  | head -n1)
+              fi
+              if [ -n "$STORE_ID" ]; then
+                PIN=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                  -X POST "$FGA_HTTP/stores/$STORE_ID/read" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"tuple_key\":{\"relation\":\"openfga_id\",\"object\":\"model_version:collaboration-$VERSION\"}}" 2>/dev/null)
+                if echo "$PIN" | grep -q 'auth_model_id:'; then
+                  echo "FGA store + pin ready for version $VERSION (store=$STORE_ID)"
+                  exit 0
+                fi
+              fi
+              echo "Waiting for FGA store + pin... ($i/60)"
+              sleep 5
+            done
+            echo "Timed out waiting for FGA store + pin" >&2
+            exit 1
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: OPENFGA_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: openfga-api-key
+                key: keys
+          # Single-source the FGA model version from the parent-rendered
+          # lakekeeper-config Secret; updates flow from
+          # .Values.platform.fgaModelVersion.
+          - name: FGA_MODEL_VERSION
+            valueFrom:
+              secretKeyRef:
+                name: lakekeeper-config
+                key: LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: { drop: ["ALL"] }
+          seccompProfile: { type: RuntimeDefault }
+      - name: wait-for-pipeline-api
+        image: bitnami/kubectl:latest
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            set -eu
+            # OIDC discovery URL must match LAKEKEEPER__OPENID_PROVIDER_URI in
+            # templates/config-secret.yaml. Pipeline-api serves both
+            # the discovery doc AND the JWKS — probe the discovery endpoint,
+            # which proves the JWKS is also reachable.
+            URL="http://pipeline-api.$POD_NAMESPACE.svc.cluster.local:8081/.well-known/openid-configuration"
+            for i in $(seq 1 120); do
+              if curl -fsS "$URL" >/dev/null 2>&1; then
+                echo "pipeline-api OIDC discovery reachable at $URL"
+                exit 0
+              fi
+              echo "Waiting for pipeline-api OIDC... ($i/120)"
+              sleep 2
+            done
+            echo "Timed out waiting for pipeline-api OIDC discovery" >&2
+            exit 1
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: { drop: ["ALL"] }
+          seccompProfile: { type: RuntimeDefault }
+  authz:
+    # Enforces FGA authz at the catalog REST layer (not allowall). The
+    # endpoint + store_name come from the parent-rendered Secret (mounted
+    # via catalog.extraEnvFrom). authz.openfga.* fields here are left
+    # empty — subchart values can't be parent-templated.
+    backend: openfga
+    openfga:
+      endpoint: ""
+      store: ""
+      apiKey: ""
+  postgresql:
+    # Disable the lakekeeper subchart's bundled postgres (bitnami StatefulSet).
+    # We point lakekeeper at the datuplet-infra CNPG cluster via extraEnvFrom +
+    # extraEnv. Leaving this enabled would spawn an unused StatefulSet.
+    enabled: false
+    auth:
+      existingSecret: ""   # not used; here for schema compatibility
+  internalOpenFGA: false

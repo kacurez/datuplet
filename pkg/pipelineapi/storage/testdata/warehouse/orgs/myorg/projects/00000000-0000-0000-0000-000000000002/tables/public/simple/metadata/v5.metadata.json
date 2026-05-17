@@ -1,0 +1,102 @@
+{
+  "last-sequence-number": 1,
+  "format-version": 2,
+  "table-uuid": "1698912c-434e-4a6b-bbe9-43e0bb04354a",
+  "location": "file:///Users/tomaskacur/mydevel/datuplet/pkg/pipelineapi/storage/testdata/warehouse/orgs/myorg/projects/00000000-0000-0000-0000-000000000002/tables/public/simple",
+  "last-updated-ms": 1777042298461,
+  "last-column-id": 2,
+  "schemas": [
+    {
+      "type": "struct",
+      "fields": [
+        {
+          "type": "long",
+          "id": 1,
+          "name": "id",
+          "required": true
+        },
+        {
+          "type": "string",
+          "id": 2,
+          "name": "name",
+          "required": true
+        }
+      ],
+      "schema-id": 0,
+      "identifier-field-ids": []
+    }
+  ],
+  "current-schema-id": 0,
+  "partition-specs": [
+    {
+      "spec-id": 0,
+      "fields": []
+    }
+  ],
+  "default-spec-id": 0,
+  "last-partition-id": 999,
+  "properties": {
+    "datuplet.testdata.version": "5",
+    "schema.name-mapping.default": "[{\"field-id\":1,\"names\":[\"id\"]},{\"field-id\":2,\"names\":[\"name\"]}]"
+  },
+  "snapshots": [
+    {
+      "snapshot-id": 1777042298460,
+      "sequence-number": 1,
+      "timestamp-ms": 1777042298460,
+      "manifest-list": "file:///Users/tomaskacur/mydevel/datuplet/pkg/pipelineapi/storage/testdata/warehouse/orgs/myorg/projects/00000000-0000-0000-0000-000000000002/tables/public/simple/metadata/snap-1777042298460-7e0179d8.avro",
+      "summary": {
+        "added-data-files": "1",
+        "added-files-size": "714",
+        "added-records": "3",
+        "operation": "append",
+        "total-data-files": "1",
+        "total-files-size": "714",
+        "total-records": "3"
+      },
+      "schema-id": 0
+    }
+  ],
+  "current-snapshot-id": 1777042298460,
+  "snapshot-log": [
+    {
+      "snapshot-id": 1777042298460,
+      "timestamp-ms": 1777042298460
+    }
+  ],
+  "metadata-log": [
+    {
+      "metadata-file": "file:///Users/tomaskacur/mydevel/datuplet/pkg/pipelineapi/storage/testdata/warehouse/orgs/myorg/projects/00000000-0000-0000-0000-000000000002/tables/public/simple/metadata/v1.metadata.json",
+      "timestamp-ms": 1777042298461
+    },
+    {
+      "metadata-file": "file:///Users/tomaskacur/mydevel/datuplet/pkg/pipelineapi/storage/testdata/warehouse/orgs/myorg/projects/00000000-0000-0000-0000-000000000002/tables/public/simple/metadata/v2.metadata.json",
+      "timestamp-ms": 1777042298460
+    },
+    {
+      "metadata-file": "file:///Users/tomaskacur/mydevel/datuplet/pkg/pipelineapi/storage/testdata/warehouse/orgs/myorg/projects/00000000-0000-0000-0000-000000000002/tables/public/simple/metadata/v3.metadata.json",
+      "timestamp-ms": 1777042298461
+    },
+    {
+      "metadata-file": "file:///Users/tomaskacur/mydevel/datuplet/pkg/pipelineapi/storage/testdata/warehouse/orgs/myorg/projects/00000000-0000-0000-0000-000000000002/tables/public/simple/metadata/v4.metadata.json",
+      "timestamp-ms": 1777042298461
+    },
+    {
+      "metadata-file": "file:///Users/tomaskacur/mydevel/datuplet/pkg/pipelineapi/storage/testdata/warehouse/orgs/myorg/projects/00000000-0000-0000-0000-000000000002/tables/public/simple/metadata/v5.metadata.json",
+      "timestamp-ms": 1777042298461
+    }
+  ],
+  "sort-orders": [
+    {
+      "order-id": 0,
+      "fields": []
+    }
+  ],
+  "default-sort-order-id": 0,
+  "refs": {
+    "main": {
+      "snapshot-id": 1777042298460,
+      "type": "branch"
+    }
+  }
+}

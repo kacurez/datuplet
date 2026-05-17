@@ -1,0 +1,28 @@
+---
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: "{{.RunPrefix}}-error-missing-table"
+  namespace: datuplet
+spec:
+  stages:
+    - name: read
+      components:
+        - name: stdout-writer
+          image: datuplet/stdout-writer:latest
+          inputs:
+            tables:
+              - bucket: "{{.RunPrefix}}-nonexist"
+                table: does-not-exist
+          config:
+            format: json
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: "{{.RunPrefix}}-error-missing-table-run"
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: "{{.RunPrefix}}-error-missing-table"
+  parameters: {}

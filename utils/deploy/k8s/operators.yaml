@@ -1,0 +1,53 @@
+---
+# Pipeline Operator Deployment
+#
+# RFC 007 Slice 8: this is the only operator now. The PipelineRun
+# controller schedules commit Jobs directly when a stage's component
+# Pods complete.
+#
+# RFC 017: operator no longer carries warehouse/project env. The
+# PipelineAPIURL drives the JWKS endpoint DG + commit Jobs use to
+# validate the run-token JWT (which carries warehouse + project_id).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-operator
+  namespace: datuplet-e2e
+  labels:
+    app: pipeline-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pipeline-operator
+  template:
+    metadata:
+      labels:
+        app: pipeline-operator
+    spec:
+      serviceAccountName: pipeline-operator
+      containers:
+        - name: operator
+          image: datuplet/pipeline-operator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # RFC 007 Slice 7+8: commit Jobs (scheduled directly by this
+            # operator) talk to lakekeeper for metadata commits.
+            - name: LAKEKEEPER_URL
+              value: "http://lakekeeper.datuplet-e2e.svc.cluster.local:8181/catalog"
+            # RFC 017: base URL of pipeline-api. Operator derives the JWKS URL
+            # and injects it into every spawned DG sidecar + commit Job.
+            - name: PIPELINE_API_URL
+              value: "http://pipeline-api.datuplet-e2e.svc.cluster.local:8081"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false

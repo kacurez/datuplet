@@ -1,0 +1,472 @@
+syntax = "proto3";
+package datuplet.gateway.v2;
+
+option go_package = "github.com/datuplet/datuplet/pkg/datagateway/proto/v2;gatewaypb";
+
+// DataGateway is the v2 gRPC service that components use to access the data lake.
+// This version supports bucket-based access, format conversion, transformations, and optimized Parquet output.
+//
+// Key concepts:
+// - Tables are identified as bucket.table (e.g., "raw.orders")
+// - Components declare bucket-level access (read or write)
+// - Tables can be created dynamically under authorized buckets
+// - SDK uses: WriteChunk(table, data) or WriteChunkToBucket(bucket, table, data)
+service DataGateway {
+  // Lifecycle
+  rpc GetConfig(GetConfigRequest) returns (ComponentConfig);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Writing (component -> storage)
+  // For defaultBucket mode: OpenWriter with table name only
+  // For explicit mode: OpenWriterToBucket with bucket + table
+  rpc OpenWriter(OpenWriterRequest) returns (OpenWriterResponse);
+  rpc WriteChunk(WriteChunkRequest) returns (WriteChunkResponse);
+  rpc CloseWriter(CloseWriterRequest) returns (CloseWriterResponse);
+
+  // Reading (storage -> component)
+  // Always explicit: OpenReader with bucket + table
+  rpc OpenReader(OpenReaderRequest) returns (OpenReaderResponse);
+  rpc ReadChunk(ReadChunkRequest) returns (stream DataChunk);
+  rpc CloseReader(CloseReaderRequest) returns (CloseReaderResponse);
+
+  // Commit
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  // Schema/Sampling (for discovery)
+  rpc GetSchema(GetSchemaRequest) returns (SchemaResponse);
+  rpc GetSample(GetSampleRequest) returns (SampleResponse);
+
+  // Logging
+  rpc Log(LogRequest) returns (LogResponse);
+}
+
+// ============================================================================
+// Data Formats
+// ============================================================================
+
+// DataFormat specifies the format of data being sent or received.
+enum DataFormat {
+  FORMAT_UNSPECIFIED = 0;  // Auto-detect on read, CSV on write
+  FORMAT_CSV = 1;          // CSV with header row
+  FORMAT_JSON = 2;         // JSON array: [{...}, {...}]
+  FORMAT_JSONL = 3;        // JSON Lines: {...}\n{...}\n
+  FORMAT_PARQUET = 4;      // Parquet format
+  FORMAT_ARROW_IPC = 5;    // Arrow IPC streaming format
+}
+
+// ============================================================================
+// Schema
+// ============================================================================
+
+// Schema defines the structure of the data.
+message Schema {
+  repeated ColumnDef columns = 1;
+}
+
+// ColumnDef defines a single column.
+message ColumnDef {
+  string name = 1;
+  string type = 2;      // int64, float64, string, bool, timestamp, date, binary
+  bool nullable = 3;
+  int32 field_id = 4;   // Iceberg field ID (required for Parquet compatibility)
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+message GetConfigRequest {}
+
+// ComponentConfig provides the component's configuration.
+// Updated for bucket-based access model.
+message ComponentConfig {
+  string execution_id = 1;
+  string component_name = 2;
+
+  // Bucket-based access control
+  repeated string input_buckets = 3;      // Buckets component can read from
+  repeated string output_buckets = 4;     // Buckets component can write to
+  repeated InputTableConfig input_tables = 5;   // Specific tables for read access
+  OutputConfig output_config = 6;         // Output configuration
+
+  bytes config = 7;                       // Component-specific JSON config
+  int64 chunk_size = 8;
+
+  // Storage bootstrap data for components with native S3 access (e.g., DuckDB)
+  StorageBootstrap storage_bootstrap = 15;
+
+  // Legacy fields (deprecated - use bucket-based access)
+  map<string, string> inputs = 10;        // name -> table_path (deprecated)
+  map<string, string> outputs = 11;       // name -> table_path (deprecated)
+}
+
+// InputTableConfig defines a specific table input.
+message InputTableConfig {
+  string bucket = 1;
+  string table = 2;
+  string logical_name = 3;  // SDK-facing identifier (defaults to table name when empty)
+}
+
+// OutputConfig defines the output configuration for the component.
+message OutputConfig {
+  // DefaultBucket mode (exclusive): all writes go to this bucket
+  string default_bucket = 1;
+  string default_write_mode = 2;          // APPEND or FULL_LOAD
+
+  // Explicit bucket outputs (for dynamic table creation)
+  repeated BucketOutputConfig buckets = 3;
+
+  // Explicit table outputs (for fixed table names)
+  repeated TableOutputConfig tables = 4;
+
+  // Processors apply transformations to all outputs
+  repeated ProcessorConfig processors = 5;
+}
+
+// BucketOutputConfig defines a bucket output with dynamic table creation.
+message BucketOutputConfig {
+  string name = 1;                        // Bucket name
+  string write_mode = 2;                  // APPEND or FULL_LOAD
+}
+
+// TableOutputConfig defines a fixed table output.
+message TableOutputConfig {
+  string name = 1;                        // Iceberg target table name
+  string bucket = 2;                      // Bucket name
+  string write_mode = 3;                  // APPEND or FULL_LOAD
+  string logical_name = 4;                // SDK-facing identifier (defaults to name when empty)
+}
+
+// ProcessorConfig defines a data processor operation.
+message ProcessorConfig {
+  string type = 1;                        // Processor type: "drop"
+  repeated string columns = 2;            // For drop: columns to remove
+}
+
+// ============================================================================
+// Writing
+// ============================================================================
+
+// OpenWriterRequest opens a writer for a table.
+// Two modes:
+// 1. DefaultBucket mode: specify only table (bucket from config)
+// 2. Explicit mode: specify bucket + table
+message OpenWriterRequest {
+  string table = 1;                       // Table name (required)
+  string bucket = 2;                      // Bucket name (optional - uses defaultBucket if not set)
+  DataFormat input_format = 3;            // Format of chunks component will send
+  Schema schema = 4;                      // Optional - inferred from first chunk if not provided
+  TransformSpec transforms = 5;           // Optional write-time transforms
+
+  // Legacy field (deprecated)
+  string output_name = 10;                // References config.outputs key (deprecated)
+}
+
+message OpenWriterResponse {
+  string writer_id = 1;
+  Schema inferred_schema = 2;             // Populated after first chunk if schema was inferred
+  string http_endpoint = 3;               // HTTP endpoint for data transfer
+  string bucket = 4;                      // Resolved bucket name
+  string table = 5;                       // Table name
+}
+
+message WriteChunkRequest {
+  string writer_id = 1;
+  bytes data = 2;
+}
+
+message WriteChunkResponse {
+  int64 rows_accepted = 1;
+  int64 buffer_size_bytes = 2;            // Current buffer size (for monitoring)
+  Schema inferred_schema = 3;             // Populated on first chunk if schema was inferred
+}
+
+message CloseWriterRequest {
+  string writer_id = 1;
+
+  // Optional: for components that write files directly to storage (e.g., DuckDB)
+  // If provided, these files are used instead of BufferManager's internal files
+  repeated ExternalDataFile external_files = 2;
+}
+
+message CloseWriterResponse {
+  int64 total_rows = 1;
+  int64 total_bytes = 2;
+  int32 files_written = 3;
+}
+
+// ExternalDataFile describes a data file written directly to storage by the component.
+// Used when components bypass DataGateway's buffering and write to S3 directly.
+message ExternalDataFile {
+  string path = 1;          // Relative path from basePath (e.g., "data.parquet")
+  int64 row_count = 2;      // Number of rows in this file
+  int64 size_bytes = 3;     // File size in bytes (0 if unknown)
+}
+
+// ============================================================================
+// Reading
+// ============================================================================
+
+// OpenReaderRequest opens a reader for a table.
+// Always requires bucket + table (no defaultBucket for reads).
+message OpenReaderRequest {
+  string bucket = 1;                      // Bucket name (required)
+  string table = 2;                       // Table name (required)
+  DataFormat output_format = 3;           // Format component wants to receive
+  int64 chunk_size_bytes = 4;             // Target chunk size (0 = default)
+  TransformSpec transforms = 5;           // Optional read-time transforms
+  IncrementalReadSpec incremental = 6;    // Optional incremental read
+
+  // Legacy field (deprecated)
+  string input_name = 10;                 // References config.inputs key (deprecated)
+}
+
+// IncrementalReadSpec specifies the base snapshot for incremental (delta) reads.
+message IncrementalReadSpec {
+  oneof base_selector {
+    int64 from_snapshot_id = 1;           // Read data added after this snapshot
+    int64 from_timestamp_ms = 2;          // Read data added after this point in time (epoch ms)
+  }
+}
+
+// DeltaInfo contains metadata about a delta read response.
+message DeltaInfo {
+  int64 base_snapshot_id = 1;             // Base snapshot ID
+  int64 target_snapshot_id = 2;           // Target snapshot ID
+  string kind = 3;                        // "APPEND_ONLY" or "REQUIRES_FULL_REFRESH"
+  int32 snapshots_in_range = 4;           // Number of snapshots in delta range
+}
+
+message OpenReaderResponse {
+  string reader_id = 1;
+  Schema schema = 2;
+  int64 total_rows_estimate = 3;
+  int64 total_size_estimate = 4;
+  string http_endpoint = 5;               // HTTP endpoint for data transfer
+  string bucket = 6;                      // Bucket name
+  string table = 7;                       // Table name
+  DeltaInfo delta_info = 8;               // Populated when incremental read
+}
+
+message ReadChunkRequest {
+  string reader_id = 1;
+}
+
+message DataChunk {
+  bytes data = 1;
+  DataFormat format = 2;
+  int64 rows_in_chunk = 3;
+  bool is_last = 4;
+  map<string, string> metadata = 5;
+}
+
+message CloseReaderRequest {
+  string reader_id = 1;
+}
+
+message CloseReaderResponse {}
+
+// ============================================================================
+// Transforms
+// ============================================================================
+
+// TransformSpec defines a sequence of transformations to apply.
+message TransformSpec {
+  repeated TransformOp operations = 1;
+}
+
+// TransformOp defines a single transformation operation.
+message TransformOp {
+  oneof op {
+    FilterOp filter = 1;
+    SelectOp select = 2;
+    DropOp drop = 3;
+    RenameOp rename = 4;
+    ComputeOp compute = 5;
+    CastOp cast = 6;
+    ReorderOp reorder = 7;
+  }
+}
+
+message FilterOp {
+  string condition = 1;                   // SQL-like expression: "price > 100 AND status = 'active'"
+}
+
+message SelectOp {
+  repeated string columns = 1;            // Columns to keep
+}
+
+message DropOp {
+  repeated string columns = 1;            // Columns to remove
+}
+
+message RenameOp {
+  map<string, string> mapping = 1;        // old_name -> new_name
+}
+
+message ComputeOp {
+  string column = 1;                      // New column name
+  string expression = 2;                  // SQL-like expression: "price * quantity"
+  bool replace = 3;                       // Replace existing column if true
+}
+
+message CastOp {
+  string column = 1;
+  string target_type = 2;                 // int64, float64, string, bool, timestamp, date
+}
+
+message ReorderOp {
+  repeated string columns = 1;            // Column order (first columns listed, rest appended)
+}
+
+// ============================================================================
+// Commit
+// ============================================================================
+
+message CommitRequest {
+  bool best_effort = 1;                   // Continue on individual bucket failures
+}
+
+message CommitResponse {
+  bool success = 1;
+  string error = 2;
+  repeated BucketCommitResult buckets = 3;
+}
+
+// BucketCommitResult contains the result of committing a bucket.
+message BucketCommitResult {
+  string bucket = 1;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_COMMITTED = 1;
+    STATUS_FAILED = 2;
+    STATUS_SKIPPED = 3;
+  }
+  Status status = 2;
+
+  // Tables committed within this bucket
+  repeated TableCommitResult tables = 3;
+  string error = 4;
+}
+
+// TableCommitResult contains the result of committing a table.
+message TableCommitResult {
+  string table = 1;
+  string bucket = 2;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_COMMITTED = 1;
+    STATUS_FAILED = 2;
+    STATUS_SKIPPED = 3;
+  }
+  Status status = 3;
+
+  int64 snapshot_id = 4;
+  int32 files_added = 5;
+  int64 rows_added = 6;
+  int64 bytes_added = 7;
+  string error = 8;
+}
+
+// ============================================================================
+// Schema/Sampling
+// ============================================================================
+
+message GetSchemaRequest {
+  string bucket = 1;                      // Bucket name
+  string table = 2;                       // Table name
+
+  // Legacy field (deprecated)
+  string input_name = 10;
+}
+
+message SchemaResponse {
+  Schema schema = 1;
+}
+
+message GetSampleRequest {
+  string bucket = 1;                      // Bucket name
+  string table = 2;                       // Table name
+  int32 limit = 3;
+  DataFormat format = 4;                  // Format for sample rows (default: JSON)
+
+  // Legacy field (deprecated)
+  string input_name = 10;
+}
+
+message SampleResponse {
+  Schema schema = 1;
+  repeated bytes rows = 2;                // Rows in requested format
+  int64 total_estimate = 3;
+}
+
+// ============================================================================
+// Logging
+// ============================================================================
+
+message LogRequest {
+  string level = 1;                       // "DEBUG", "INFO", "WARN", "ERROR"
+  string message = 2;
+  map<string, string> fields = 3;
+}
+
+message LogResponse {}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}
+
+// ============================================================================
+// Storage Bootstrap (for native S3 access components)
+// ============================================================================
+
+// StorageBootstrap provides resolved storage locations and credentials
+// for components that access S3 directly (e.g., DuckDB transformations).
+message StorageBootstrap {
+  // Resolved input tables with explicit file paths
+  repeated ResolvedInput inputs = 1;
+
+  // Resolved output locations with pre-allocated paths
+  repeated ResolvedOutput outputs = 2;
+
+  // Per-bucket S3 credentials (scoped for security)
+  map<string, S3Credentials> bucket_credentials = 3;  // key: bucket name
+}
+
+// ResolvedInput provides the physical location and file list for an input table.
+message ResolvedInput {
+  string bucket = 1;                      // Logical bucket name
+  string table = 2;                       // Logical table name
+  repeated string file_paths = 3;         // Explicit Parquet file paths (snapshot-consistent)
+  string format = 4;                      // Data format (typically "parquet")
+  string logical_name = 5;                // SQL identifier for this input (defaults to table name if not specified)
+}
+
+// ResolvedOutput provides the pre-allocated location for an output table.
+message ResolvedOutput {
+  string bucket = 1;                      // Logical bucket name
+  string table = 2;                       // Logical table name
+  string location = 3;                    // Full S3 path for writes (e.g., "s3://bucket/writes/ws-123/table/data/")
+}
+
+// S3Credentials provides scoped access credentials for a specific bucket.
+message S3Credentials {
+  string access_key_id = 1;               // S3 access key
+  string secret_access_key = 2;           // S3 secret key
+  string endpoint = 3;                    // S3 endpoint URL (e.g., "https://s3.amazonaws.com" or "http://minio:9000")
+  string region = 4;                      // S3 region (e.g., "us-east-1")
+  string bucket_name = 5;                 // Physical bucket name (for URL scoping)
+  bool use_ssl = 6;                       // Whether to use HTTPS (true) or HTTP (false)
+  bool use_path_style = 7;                // Whether to use path-style URLs (required for MinIO)
+  string session_token = 8;              // STS session token (empty for long-lived credentials)
+  string scope = 9;                      // S3 prefix the cred is authorized for (set by lakekeeper STS policy)
+  int64 expires_at_unix = 10;            // Unix epoch seconds when the cred expires (0 = no expiry)
+}
+
+

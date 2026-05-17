@@ -1,0 +1,13 @@
+{{/* charts/datuplet-operators/templates/NOTES.txt */}}
+Datuplet operators installed in namespace {{ .Release.Namespace }} as release {{ .Release.Name }}.
+
+The CNPG operator is now running and its mutating/validating webhook Service
+has endpoints. Proceed to the infrastructure layer:
+
+  helm install datuplet-infra charts/datuplet-infra \
+    -n {{ .Release.Namespace }} \
+    --wait --wait-for-jobs
+
+then Layer 2 (datuplet-app), then scripts/register.sh.
+
+See docs/install.md.

@@ -1,0 +1,82 @@
+# charts/datuplet-infra/templates/postgres/openfga-dsn-job.yaml
+{{- /*
+Render openfga DSN Secret from CNPG password + connection fields.
+
+openfga subchart only accepts datastore.uriSecret (single Secret with key `uri`
+containing the full DSN). Since the password is CNPG-managed, we can't render
+the DSN at chart-template time — we render it via this Job after the password
+Secret exists.
+
+Secret name is FIXED (`openfga-pg-uri`, no release prefix) — the openfga
+subchart's `datastore.uriSecret: openfga-pg-uri` value matches.
+Acceptable because there's only one Datuplet platform install per namespace.
+
+Idempotent: re-runs overwrite the DSN Secret (helps when password rotates).
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "datuplet-infra.prefix" . }}openfga-dsn-{{ .Release.Revision }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-infra.selectorLabels" (dict "ctx" . "name" "openfga-dsn") | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      serviceAccountName: {{ include "datuplet-infra.prefix" . }}keygen
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-cnpg
+          image: {{ .Values.bootstrap.externalImages.kubectl | quote }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              for i in $(seq 1 60); do
+                phase=$(kubectl get cluster.postgresql.cnpg.io \
+                  {{ include "datuplet-infra.prefix" . }}pg \
+                  -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                if [ "$phase" = "Cluster in healthy state" ]; then
+                  echo "CNPG cluster healthy."
+                  exit 0
+                fi
+                echo "Waiting for CNPG cluster... phase=$phase ($i/60)"
+                sleep 5
+              done
+              exit 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
+      containers:
+        - name: render
+          image: {{ .Values.bootstrap.externalImages.kubectl | quote }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              NS={{ .Release.Namespace | quote }}
+              PREFIX={{ include "datuplet-infra.prefix" . | quote }}
+              HOST="${PREFIX}pg-rw.${NS}.svc.cluster.local"
+              PASSWORD=$(kubectl get secret -n "$NS" "${PREFIX}pg-openfga-pw" \
+                -o jsonpath='{.data.password}' | base64 -d)
+              URI="postgres://openfga_user:${PASSWORD}@${HOST}:5432/openfga?sslmode=disable"
+              kubectl create secret generic "openfga-pg-uri" \
+                -n "$NS" --from-literal=uri="$URI" \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "openfga DSN Secret rendered."
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}

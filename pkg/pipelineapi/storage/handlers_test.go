@@ -1,0 +1,433 @@
+package storage
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/storage/testdata"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
+)
+
+// fixtureProjectID mirrors the UUID testdata.GenerateSimple bakes into
+// the warehouse path. Tests hit the same project so the resolver +
+// authz stubs can return a fixed user/grant tied to it.
+const fixtureProjectID = "00000000-0000-0000-0000-000000000002"
+
+// fixtureLakekeeperProjectID is a synthetic lakekeeper project UUID used
+// by the test Service's LakekeeperProjectIDFor resolver. The storage handler
+// resolves this from the Datuplet project ID and passes it to the FGA check.
+const fixtureLakekeeperProjectID = "aaaaaaaa-0000-0000-0000-000000000002"
+
+// stubUser mirrors the local-mode hard-coded user so the handlers'
+// authz check has a stable userID to pair with the fixture project.
+var stubUser = &store.User{
+	ID:    uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+	Email: "test@example.com",
+}
+
+// stubResolver always returns stubUser, mirroring auth.LocalResolver.
+type stubResolver struct{}
+
+func (stubResolver) UserFor(_ http.ResponseWriter, _ *http.Request) (*store.User, bool, error) {
+	return stubUser, true, nil
+}
+func (stubResolver) Mode() string        { return "test" }
+func (stubResolver) SupportsLogin() bool { return false }
+
+// unauthResolver returns (nil, false, nil) — triggers 401 via WithUser.
+type unauthResolver struct{}
+
+func (unauthResolver) UserFor(_ http.ResponseWriter, _ *http.Request) (*store.User, bool, error) {
+	return nil, false, nil
+}
+func (unauthResolver) Mode() string        { return "test" }
+func (unauthResolver) SupportsLogin() bool { return false }
+
+// allowedFake returns an *authztest.Fake seeded with a datuplet_member grant
+// for stubUser on fixtureLakekeeperProjectID. Use for "membership granted" tests.
+func allowedFake() *authztest.Fake {
+	f := authztest.New()
+	userStr := authz.UserObject(stubUser.ID.String()).String()
+	f.Allow(userStr, "datuplet_member", authz.ProjectObject(fixtureLakekeeperProjectID))
+	return f
+}
+
+// deniedFake returns an empty *authztest.Fake (no tuples) — every Check
+// returns (false, nil), simulating a non-member. Use for "forbidden" tests.
+func deniedFake() *authztest.Fake { return authztest.New() }
+
+// makeFixtureServiceWithLK returns a Service with a LakekeeperProjectIDFor
+// resolver that maps any Datuplet project UUID to fixtureLakekeeperProjectID.
+// Use when tests need the FGA resolveProject path to succeed.
+func makeFixtureServiceWithLK(t *testing.T) *Service {
+	t.Helper()
+	svc := makeFixtureService(t)
+	svc.LakekeeperProjectIDFor = func(_ context.Context, _ uuid.UUID) (string, error) {
+		return fixtureLakekeeperProjectID, nil
+	}
+	return svc
+}
+
+// newTestServer wires a fresh HTTPHandlers + httptest.Server on a real
+// ServeMux with route patterns matching the production wiring. Each
+// caller gets its own mux + server so t.Parallel() would be safe even
+// though we don't use it here.
+func newTestServer(t *testing.T, svc *Service, resolver auth.UserResolver, authzr *authztest.Fake) *httptest.Server {
+	t.Helper()
+	h := &HTTPHandlers{Svc: svc, Authorizer: authzr}
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
+		auth.WithUser(resolver, http.HandlerFunc(h.ListTables)))
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/info",
+		auth.WithUser(resolver, http.HandlerFunc(h.TableInfo)))
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/schema",
+		auth.WithUser(resolver, http.HandlerFunc(h.TableSchema)))
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/preview",
+		auth.WithUser(resolver, http.HandlerFunc(h.Preview)))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// makeFixtureService regenerates the simple/orphan/empty fixtures into
+// a tempdir and returns a Service rooted there. Tests that want to
+// exercise identifier errors or unknown projects just reuse this.
+func makeFixtureService(t *testing.T) *Service {
+	t.Helper()
+	warehouse := filepath.Join(t.TempDir(), "warehouse")
+	testdata.GenerateAll(t, warehouse)
+	return &Service{
+		WarehouseURI: "file://" + warehouse,
+		OrgName:      "myorg",
+		AllowLocal:   true,
+	}
+}
+
+func TestListTables_Success(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
+	if err != nil {
+		t.Fatalf("GET tables: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		Tables []tableListEntry `json:"tables"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Fixture has public/simple as the only resolvable table (orphan has
+	// bad metadata, empty has no metadata — both silently dropped).
+	if len(body.Tables) != 1 {
+		t.Fatalf("got %d tables, want 1 (%v)", len(body.Tables), body.Tables)
+	}
+	if got, want := body.Tables[0].Namespace, "public"; got != want {
+		t.Errorf("namespace = %q, want %q", got, want)
+	}
+	if got, want := body.Tables[0].Name, "simple"; got != want {
+		t.Errorf("name = %q, want %q", got, want)
+	}
+	if body.Tables[0].CurrentSnapshotID == 0 {
+		t.Errorf("expected non-zero snapshot id")
+	}
+}
+
+func TestListTables_UnknownProject(t *testing.T) {
+	// Matches Iceberg catalog semantics: listing tables under an
+	// unknown project returns an empty list, not 404. Also avoids
+	// exposing which project IDs exist to authenticated-but-non-member
+	// callers (though here the caller is a member per the authz stub).
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	unknown := "00000000-0000-0000-0000-000000000099"
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + unknown + "/tables")
+	if err != nil {
+		t.Fatalf("GET tables: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		Tables []tableListEntry `json:"tables"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Tables) != 0 {
+		t.Errorf("expected empty tables, got %v", body.Tables)
+	}
+}
+
+func TestListTables_NoMembership(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, deniedFake())
+
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
+	if err != nil {
+		t.Fatalf("GET tables: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestListTables_NoSession(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, unauthResolver{}, allowedFake())
+
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
+	if err != nil {
+		t.Fatalf("GET tables: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestListTables_InvalidProjectID(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/not-a-uuid/tables")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestTableSchema_Success(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/schema"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET schema: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body schemaResp
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Columns) != 2 {
+		t.Fatalf("columns = %d, want 2 (%v)", len(body.Columns), body.Columns)
+	}
+	if body.Columns[0].Name != "id" || body.Columns[0].Type != "long" {
+		t.Errorf("col[0] = %+v, want id/long", body.Columns[0])
+	}
+	if body.Columns[1].Name != "name" || body.Columns[1].Type != "string" {
+		t.Errorf("col[1] = %+v, want name/string", body.Columns[1])
+	}
+	// Both fixture columns are required, so nullable=false.
+	for _, c := range body.Columns {
+		if c.Nullable {
+			t.Errorf("col %q nullable=true, want false", c.Name)
+		}
+	}
+}
+
+func TestTableSchema_InvalidIdentifier(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	// Path segment ".." fails ValidIdentifier (first char must be alphanumeric).
+	// The mux strips dot-segments before dispatch, so we target a segment
+	// that's non-empty but starts with a dot/underscore — the canonical
+	// "invalid identifier" case.
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/_bad/simple/schema"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%v)", resp.StatusCode, resp.Header)
+	}
+}
+
+func TestTablePreview_Success(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET preview: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body PreviewResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Rows) != 3 {
+		t.Errorf("rows = %d, want 3 (%v)", len(body.Rows), body.Rows)
+	}
+	if body.Truncated {
+		t.Errorf("preview should not be truncated for 3-row fixture")
+	}
+}
+
+// TestTablePreview_TruncationFlag exercises the P1 regression path:
+// EncodeRecords sets Truncated=true only when the underlying scan yields
+// one more row past the cap. Lowering previewRowCap below the fixture's
+// row count means iceberg-go must still hand at least one extra row to
+// the post-loop peek; if Preview caps at the scan layer itself, this
+// test fails.
+func TestTablePreview_TruncationFlag(t *testing.T) {
+	orig := previewRowCap
+	previewRowCap = 2
+	t.Cleanup(func() { previewRowCap = orig })
+
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET preview: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body PreviewResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Rows) != 2 {
+		t.Errorf("rows = %d, want 2 (capped by previewRowCap)", len(body.Rows))
+	}
+	if !body.Truncated {
+		t.Errorf("truncated = false, want true (fixture has 3 rows > cap of 2)")
+	}
+}
+
+func TestTableInfo_Success(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/info"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET info: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body infoResp
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.MetadataLocation == "" {
+		t.Error("metadata_location is empty")
+	}
+	if body.CurrentSnapshotID == 0 {
+		t.Error("current_snapshot_id is zero")
+	}
+	if len(body.Snapshots) != 1 {
+		t.Errorf("snapshots = %d, want 1 (fixture commits only one real snapshot)", len(body.Snapshots))
+	}
+	if body.RowCount != 3 {
+		t.Errorf("row_count = %d, want 3", body.RowCount)
+	}
+	if len(body.DataFiles) != 1 {
+		t.Errorf("data_files = %d, want 1", len(body.DataFiles))
+	}
+}
+
+// TestLoadRequestedTable_RejectsSymlinkedMetadata exercises the
+// defense-in-depth re-check on the resolved metadata path. The
+// table-root symlink guard in loadRequestedTable already runs against
+// .../tables/public/simple, but ResolveCurrentMetadata then follows
+// metadata/ + picks vN.metadata.json — and if metadata/ itself is a
+// symlink to outside the warehouse, the resolved metadata URI escapes
+// and we'd happily read whatever's at the target.
+//
+// To reproduce: bootstrap a real warehouse, move the metadata/ dir of
+// the fixture table OUTSIDE the warehouse, then symlink it back into
+// place. The handler must return 400 — not 200 (which would mean the
+// guard missed the escape) and not 500 (which would mean iceberg-go
+// blew up trying to load through a now-broken state).
+func TestLoadRequestedTable_RejectsSymlinkedMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	warehouse := filepath.Join(tmp, "warehouse")
+	testdata.GenerateAll(t, warehouse)
+
+	// Locate the fixture metadata dir, move it outside the warehouse,
+	// then symlink the original path to the moved location. This means
+	// .../tables/public/simple itself is a regular dir (so the table-
+	// root guard passes) but .../tables/public/simple/metadata is now a
+	// symlink whose target lives in tmp/escaped-metadata, outside the
+	// warehouse root.
+	metaDir := filepath.Join(warehouse, "orgs", "myorg", "projects", fixtureProjectID, "tables", "public", "simple", "metadata")
+	escaped := filepath.Join(tmp, "escaped-metadata")
+	if err := os.Rename(metaDir, escaped); err != nil {
+		t.Fatalf("rename metadata: %v", err)
+	}
+	if err := os.Symlink(escaped, metaDir); err != nil {
+		t.Fatalf("symlink metadata: %v", err)
+	}
+
+	svc := &Service{
+		WarehouseURI: "file://" + warehouse,
+		OrgName:      "myorg",
+		AllowLocal:   true,
+		LakekeeperProjectIDFor: func(_ context.Context, _ uuid.UUID) (string, error) {
+			return fixtureLakekeeperProjectID, nil
+		},
+	}
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/info"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET info: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (symlinked metadata must be rejected, not silently followed)", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Either guard is acceptable: the containment check ("metadata path
+	// escapes warehouse") fires when EvalSymlinks resolves the metadata
+	// URI before we get to the symlink-rejection step, and the symlink
+	// guard ("metadata path traverses symlink") fires the other way
+	// around. Both prove the defense-in-depth check caught the escape;
+	// pinning to one specific message would couple the test to ordering.
+	got := body["error"]
+	if got != "metadata path escapes warehouse" && got != "metadata path traverses symlink" {
+		t.Errorf("error = %q, want one of [metadata path escapes warehouse, metadata path traverses symlink]", got)
+	}
+}

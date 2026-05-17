@@ -1,0 +1,83 @@
+{{- /*
+ServiceAccount + ClusterRole + ClusterRoleBinding for pipeline-operator.
+
+The operator reconciles PipelineRuns and schedules component Pods + per-bucket
+commit Jobs across all per-project Namespaces (datuplet-<uuid>), so
+namespace-scoped roles are insufficient — ClusterRole + ClusterRoleBinding
+are required (mirrors utils/deploy/k8s/rbac/pipeline-operator-rbac.yaml).
+
+ClusterRole + ClusterRoleBinding use <namespace>-pipeline-operator as name
+to avoid cross-namespace collisions across installs in different namespaces
+(same convention as pipeline-api RBAC in this chart).
+*/ -}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pipeline-operator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pipeline-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-pipeline-operator
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+rules:
+  # CRDs - full access. This operator schedules commit Jobs directly
+  # (covered by the batch/jobs rule below).
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelines", "pipelineruns"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelines/status", "pipelineruns/status"]
+    verbs: ["get", "update", "patch"]
+  # Pods - create and monitor component pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Jobs - for component execution
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # ConfigMaps - gateway configuration
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Secrets - read credentials
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # Services - discover lakekeeper / pipeline-api
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  # Events - controller-runtime's recorder both emits and watches Events
+  # (used for e.g. recorder bookkeeping and leader-election hints). A
+  # missing list/watch perm causes the shared informer to churn every
+  # ~30s with "events is forbidden" errors, amplifying reconcile races
+  # on Status updates.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-pipeline-operator
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-operator
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-pipeline-operator
+  apiGroup: rbac.authorization.k8s.io

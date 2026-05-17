@@ -1,0 +1,559 @@
+/* RFC 005 B-2 + B-3: design tokens + base layout + component styles.
+ *
+ * Replaces the previous Pico-based stylesheet. Tokens, reset, base
+ * type + layout, and utility classes ship in B-2; the component
+ * vocabulary (buttons, tables, pills, forms, code blocks, empty
+ * states, skeletons) lands in B-3 below. Wiring pages to these
+ * classes is B-7/B-8.
+ */
+
+/* ---------- Tokens ---------- */
+:root {
+  /* type */
+  --font-sans: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --text-xs: 11px; --text-sm: 12px; --text-md: 13px;
+  --text-lg: 15px; --text-xl: 18px; --text-xxl: 22px;
+
+  /* surfaces (dark-first, dark-only for v1) */
+  --bg-0: #0a0a0b;
+  --bg-1: #111214;
+  --bg-2: #1a1c1f;
+  --border: #26282d;
+
+  /* text */
+  --fg-0: #e7e9ea;
+  --fg-1: #9ea3a8;
+  --fg-2: #5c6066;
+
+  /* accent + status */
+  --accent:         #3ecf8e;
+
+  /* Status token pairs — *-bg is full saturation, used at 15% alpha
+     in the fill via color-mix; *-fg is a pre-computed lighter shade
+     chosen for >=4.5:1 contrast per the A1-level contrast-snapshot
+     test in Task B-3. */
+  --status-ok-bg:      #3ecf8e;  --status-ok-fg:      #86efac;
+  --status-fail-bg:    #ef4444;  --status-fail-fg:    #fca5a5;
+  --status-running-bg: #eab308;  --status-running-fg: #fde68a;
+  --status-pending-bg: #6b7280;  --status-pending-fg: #c5cbd3;
+
+  /* spacing + shape */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px;
+  --s-4: 16px; --s-5: 24px; --s-6: 32px;
+  --radius: 4px;
+  --radius-pill: 2px;
+}
+
+/* ---------- Reset ---------- */
+*, *::before, *::after { box-sizing: border-box; }
+html { color-scheme: dark; -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  line-height: 1.5;
+  color: var(--fg-0);
+  background: var(--bg-0);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+h1, h2, h3, h4, h5, h6 { margin: 0; font-weight: 600; line-height: 1.25; }
+p { margin: 0 0 var(--s-3); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+img, svg { display: block; max-width: 100%; }
+button, input, select, textarea { font: inherit; color: inherit; }
+ul, ol { margin: 0; padding: 0; list-style: none; }
+
+/* ---------- Layout ---------- */
+#shell {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: 100vh;
+}
+
+#sidebar {
+  background: var(--bg-1);
+  border-right: 1px solid var(--border);
+  padding: var(--s-4) 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0; /* allow children to shrink */
+  padding: var(--s-5);
+}
+
+#app {
+  flex: 1;
+}
+
+/* ---------- Utilities ---------- */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0);
+  white-space: nowrap; border: 0;
+}
+
+/* Overlay stub for future modals — make it cover everything when a
+   child is present. */
+#overlay-root:empty { display: none; }
+#overlay-root {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- Sidebar (B-6) ---------- */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  height: 40px;
+  padding: 0 var(--s-4);
+  font-weight: 600;
+  color: var(--fg-0);
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-brand svg { width: 20px; height: 20px; }
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--s-4);
+  padding: 0 var(--s-2);
+  gap: var(--s-1);
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--radius);
+  color: var(--fg-1);
+  text-decoration: none;
+}
+.nav-item:hover {
+  color: var(--fg-0);
+  background: var(--bg-2);
+  text-decoration: none;
+}
+.nav-item--active {
+  color: var(--fg-0);
+  background: var(--bg-2);
+  border-left: 2px solid var(--accent);
+  padding-left: calc(var(--s-3) - 2px);
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: var(--s-3);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+
+.sidebar-project { color: var(--fg-1); font-size: var(--text-sm); }
+.sidebar-project .input { max-width: 100%; }
+
+.sidebar-user {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--fg-2);
+  font-size: var(--text-sm);
+}
+.sidebar-user span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#logout {
+  display: inline-flex;
+  align-items: center;
+  color: var(--fg-2);
+  padding: 2px;
+  border-radius: var(--radius);
+}
+#logout:hover { color: var(--fg-0); background: var(--bg-2); text-decoration: none; }
+
+/* ---------- Responsive collapse (<=1024px) ---------- */
+@media (max-width: 1024px) {
+  #shell { grid-template-columns: 56px 1fr; }
+  #sidebar .nav-item span,
+  #sidebar .sidebar-brand span,
+  #sidebar .sidebar-user span,
+  #sidebar .sidebar-project { display: none; }
+}
+
+/* =====================================================================
+ * RFC 005 B-3: component styles
+ *
+ * Hand-written vocabulary for buttons, tables, pills, forms, code
+ * blocks, empty states, and loading skeletons. Page wiring lands in
+ * B-7/B-8; this section only defines the classes.
+ * ===================================================================== */
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 32px;
+  padding: 0 var(--s-4);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  font: inherit;
+  font-size: var(--text-md);
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  background: transparent;
+  color: var(--fg-0);
+  transition: background 80ms linear;
+}
+.btn--primary {
+  background: var(--accent);
+  color: var(--bg-0);
+  font-weight: 600;
+}
+.btn--primary:hover { filter: brightness(1.1); }
+.btn--secondary {
+  border-color: var(--border);
+  color: var(--fg-0);
+}
+.btn--secondary:hover { background: var(--bg-2); }
+.btn--ghost { color: var(--fg-1); }
+.btn--ghost:hover { color: var(--fg-0); background: var(--bg-2); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ---------- Tables ---------- */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-md);
+}
+.table th {
+  text-align: left;
+  padding: var(--s-2) var(--s-3);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-2);
+  border-bottom: 1px solid var(--border);
+}
+.table td {
+  padding: 0 var(--s-3);
+  height: 32px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-0);
+  vertical-align: middle;
+}
+.table tbody tr { transition: background 80ms linear; }
+.table tbody tr:hover { background: var(--bg-2); cursor: pointer; }
+.table .mono { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--fg-1); }
+/* Nested <a> inside table cells inherits cell color instead of the
+ * global accent/underline treatment — keeps row look clean while
+ * still giving us a real link for keyboard/right-click/screen readers. */
+.table td a:not(.btn) {
+  color: inherit;
+  text-decoration: none;
+}
+.table td a:not(.btn):hover {
+  text-decoration: underline;
+}
+
+/* ---------- Status pills ----------
+ * Background is the status-bg colour at 15% alpha over the surface,
+ * foreground is a pre-computed lighter shade of the same hue with
+ * >=4.5:1 contrast against --bg-0/1/2 (enforced by
+ * pkg/pipelineapi/http/ui_contrast_test.go). */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--s-2);
+  border-radius: var(--radius-pill);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.pill--ok {
+  background: color-mix(in srgb, var(--status-ok-bg) 15%, transparent);
+  color: var(--status-ok-fg);
+}
+.pill--fail {
+  background: color-mix(in srgb, var(--status-fail-bg) 15%, transparent);
+  color: var(--status-fail-fg);
+}
+.pill--running {
+  background: color-mix(in srgb, var(--status-running-bg) 15%, transparent);
+  color: var(--status-running-fg);
+}
+.pill--pending {
+  background: color-mix(in srgb, var(--status-pending-bg) 15%, transparent);
+  color: var(--status-pending-fg);
+}
+.pill--cancelled {
+  background: color-mix(in srgb, var(--status-pending-bg) 15%, transparent);
+  color: var(--status-pending-fg);
+}
+
+/* ---------- Form inputs ---------- */
+.input, .textarea, select.input {
+  width: 100%;
+  max-width: 480px;
+  background: var(--bg-1);
+  color: var(--fg-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--s-2) var(--s-3);
+  font: inherit;
+  font-size: var(--text-md);
+}
+.input--mono { font-family: var(--font-mono); font-size: var(--text-sm); }
+.textarea { min-height: 160px; resize: vertical; font-family: var(--font-mono); }
+.input:focus, .textarea:focus, select.input:focus {
+  outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent;
+}
+label.field {
+  display: flex; flex-direction: column; gap: var(--s-1);
+  margin-bottom: var(--s-3);
+  font-size: var(--text-sm);
+  color: var(--fg-1);
+}
+
+/* ---------- Code / YAML blocks ---------- */
+.code {
+  display: block;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--s-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--fg-0);
+  overflow-x: auto;
+  white-space: pre;
+}
+code.inline {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  padding: 1px 4px;
+  background: var(--bg-1);
+  border-radius: 3px;
+  color: var(--fg-0);
+}
+
+/* ---------- Empty states ---------- */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-3);
+  padding: var(--s-6);
+  text-align: center;
+  color: var(--fg-1);
+}
+.empty-state svg { color: var(--fg-2); }
+.empty-state p { margin: 0; font-size: var(--text-md); }
+
+/* ---------- Loading skeletons ---------- */
+@keyframes skeleton-pulse {
+  0% { opacity: 0.4; }
+  50% { opacity: 0.7; }
+  100% { opacity: 0.4; }
+}
+.skeleton td {
+  background: var(--bg-2);
+  animation: skeleton-pulse 1.2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton td { animation: none; opacity: 0.5; }
+}
+
+.spinner {
+  width: 12px; height: 12px;
+  border: 2px solid var(--fg-2);
+  border-top-color: var(--fg-0);
+  border-radius: 50%;
+  animation: spin 600ms linear infinite;
+  display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
+/* ---------- Page header strip ---------- */
+#page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-4);
+}
+#page-head:not(:empty) {
+  padding-bottom: var(--s-3);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--s-4);
+}
+#page-head h1 { font-size: var(--text-xl); font-weight: 600; }
+#page-head .actions { display: flex; gap: var(--s-2); }
+
+/* ---------- Login card (B-8) ---------- */
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s-4);
+}
+.login-card {
+  width: 360px;
+  max-width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--s-6);
+}
+.login-card .brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  justify-content: center;
+  font-size: var(--text-xl);
+  font-weight: 600;
+  margin-bottom: var(--s-5);
+}
+.login-card .brand svg { width: 24px; height: 24px; color: var(--accent); }
+.login-card .btn { width: 100%; justify-content: center; }
+
+/* ---------- Overlay modal (B-9) ----------
+ * #overlay-root itself is a full-viewport backdrop (styled in the Utilities
+ * section above). The panel floats centred inside it. */
+.overlay-panel {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--s-5);
+  max-width: 520px;
+  width: 90%;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.overlay-head { margin-bottom: var(--s-4); }
+.overlay-head h2 { font-size: var(--text-lg); font-weight: 600; }
+.shortcuts-table td {
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--border);
+}
+.shortcuts-table td:first-child { width: 120px; }
+.shortcuts-table kbd {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 2px 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg-0);
+}
+
+/* ---------- Storage table-detail (C-3) ---------- */
+
+/* Breadcrumb-style title links — quieter than the full --accent. */
+#page-head h1 a.muted {
+  color: var(--fg-2);
+  text-decoration: none;
+}
+#page-head h1 a.muted:hover { color: var(--fg-1); }
+
+/* Inline callout used for "preview truncated" notices. */
+.callout {
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-1);
+  margin-bottom: var(--s-4);
+  font-size: var(--text-sm);
+  color: var(--fg-1);
+}
+.callout--warn {
+  border-color: color-mix(in srgb, var(--status-running-bg) 50%, var(--border));
+  color: var(--status-running-fg);
+}
+
+/* Key/value table for the Info tab. Uses a 2-col grid for clean
+   alignment without making it look like a data table. */
+.kv {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: var(--s-2) var(--s-4);
+  margin: 0 0 var(--s-4);
+}
+.kv dt { color: var(--fg-2); font-size: var(--text-sm); }
+.kv dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  word-break: break-all;
+}
+
+/* ----- Snapshot history section (RFC 013 C.2) ----- */
+.snapshot-history {
+  margin-top: var(--s-5);
+}
+.snapshot-history__title {
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--fg-1);
+  margin: 0 0 var(--s-3);
+}
+.snapshot-history__table td { vertical-align: middle; }
+
+/* Run-mode badges */
+.badge {
+  display: inline-block;
+  padding: 2px var(--s-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge--cluster {
+  background: color-mix(in srgb, var(--status-ok-bg) 15%, var(--bg-2));
+  color: var(--status-ok-fg);
+  border: 1px solid color-mix(in srgb, var(--status-ok-bg) 30%, var(--border));
+}
+.badge--cli {
+  background: color-mix(in srgb, var(--status-running-bg) 15%, var(--bg-2));
+  color: var(--status-running-fg);
+  border: 1px solid color-mix(in srgb, var(--status-running-bg) 30%, var(--border));
+}
+.badge--unknown {
+  background: var(--bg-2);
+  color: var(--fg-2);
+  border: 1px solid var(--border);
+}

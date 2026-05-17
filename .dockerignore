@@ -1,0 +1,71 @@
+# Build artifacts and binaries (223MB)
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+/csv-extractor
+/sql-transform
+/stdout-writer
+/duckdb-transform
+/http-json-extractor
+/pandas-transform
+
+# Git repository (1.2GB - BIGGEST WIN)
+.git/
+.gitignore
+.gitattributes
+
+# Python environments (85MB)
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.egg
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Documentation (not needed in images)
+docs/
+*.md
+!README.md
+initprompt.txt
+plan.md
+ideas.md
+workspace-rfc.md
+
+# Test artifacts
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Development data
+examples/data/raw/
+examples/data/staging/
+logs/
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Unexpected directories
+github.com/

@@ -1,0 +1,240 @@
+---
+# OpenFGA — fine-grained authorization engine (RFC 006 Slice 2).
+#
+# Single-namespace topology — everything lives in `datuplet-e2e` (matches
+# Helm chart's single-namespace shape from RFC 012, with a distinct name
+# so a chart install in `datuplet` and `make deploy-local` can coexist).
+# Service publishes:
+#   - openfga.datuplet-e2e.svc.cluster.local:8080  (HTTP — used by authz bootstrap)
+#   - openfga.datuplet-e2e.svc.cluster.local:8081  (gRPC — used by lakekeeper authz backend)
+#
+# Boot order (enforced by deploy-local.sh):
+#   1. postgres up
+#   2. openfga-migrate Job (one-shot; creates openfga DB schema)
+#   3. openfga Deployment up
+#   4. authz bootstrap Job (uploads Datuplet FGA model + writes pin tuples)
+#   5. lakekeeper Deployment up (sees CONFIGURED_MODEL_VERSION=4.4, skips its own migration)
+# ServiceAccount for OpenFGA pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openfga
+  namespace: datuplet-e2e
+---
+# ConfigMap: non-secret OpenFGA configuration.
+# DB credentials come from the openfga-config Secret (below).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openfga-config
+  namespace: datuplet-e2e
+data:
+  OPENFGA_HTTP_ADDR: "0.0.0.0:8080"
+  OPENFGA_GRPC_ADDR: "0.0.0.0:8081"
+  OPENFGA_LOG_LEVEL: "info"
+  OPENFGA_PLAYGROUND_ENABLED: "false"
+---
+# Secret: Postgres DSN for OpenFGA's own database.
+# Uses a separate 'openfga' database on the shared datuplet postgres
+# instance. The init-db initContainer creates it idempotently.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openfga-config
+  namespace: datuplet-e2e
+type: Opaque
+stringData:
+  OPENFGA_DATASTORE_ENGINE: postgres
+  OPENFGA_DATASTORE_URI: postgres://datuplet:datuplet-local-dev@postgres.datuplet-e2e.svc.cluster.local:5432/openfga?sslmode=disable
+  # Postgres admin credentials — only used by init-db initContainer.
+  POSTGRES_HOST: postgres.datuplet-e2e.svc.cluster.local
+  POSTGRES_USER: datuplet
+  POSTGRES_PASSWORD: datuplet-local-dev
+  POSTGRES_ADMIN_DB: postgres
+---
+# One-shot Job: runs `openfga migrate` to apply the OpenFGA Postgres schema.
+# Idempotent — openfga migrate is safe to re-run against an already-migrated DB.
+# The init-db initContainer creates the `openfga` database if absent.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openfga-migrate
+  namespace: datuplet-e2e
+  labels:
+    app: openfga-migrate
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: openfga
+      restartPolicy: OnFailure
+      initContainers:
+        - name: init-db
+          image: postgres:16-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for postgres at $POSTGRES_HOST:5432 ..."
+              until pg_isready -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_ADMIN_DB" -p 5432; do
+                sleep 2
+              done
+              EXISTS=$(PGPASSWORD="$POSTGRES_PASSWORD" psql \
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_ADMIN_DB" \
+                -tAc "SELECT 1 FROM pg_database WHERE datname='openfga'")
+              if [ "$EXISTS" != "1" ]; then
+                echo "Creating openfga database..."
+                PGPASSWORD="$POSTGRES_PASSWORD" psql \
+                  -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_ADMIN_DB" \
+                  -c "CREATE DATABASE openfga"
+              else
+                echo "openfga database already exists"
+              fi
+          env:
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_HOST
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_ADMIN_DB
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_ADMIN_DB
+      containers:
+        - name: openfga-migrate
+          image: openfga/openfga:v1.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/openfga", "migrate"]
+          envFrom:
+            - secretRef:
+                name: openfga-config
+            - configMapRef:
+                name: openfga-config
+---
+# Deployment: OpenFGA server.
+# Single replica — Postgres handles state; multiple replicas are safe but
+# unnecessary for POC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openfga
+  namespace: datuplet-e2e
+  labels:
+    app: openfga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openfga
+  template:
+    metadata:
+      labels:
+        app: openfga
+    spec:
+      serviceAccountName: openfga
+      # wait-for-postgres: OpenFGA's `openfga run` panics after ~11 retry
+      # attempts (~50s) when postgres is unreachable, then enters
+      # CrashLoopBackOff with exponential backoff that easily exceeds the
+      # 120s `kubectl wait` window in deploy-local.sh — even after postgres
+      # comes up later in the deploy. Mirror the wait-loop the migrate Job
+      # already runs (above) so the server pod tolerates any apply order.
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for postgres at $POSTGRES_HOST:5432 ..."
+              until pg_isready -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_ADMIN_DB" -p 5432; do
+                sleep 2
+              done
+              echo "postgres reachable"
+          env:
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_HOST
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_ADMIN_DB
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-config
+                  key: POSTGRES_ADMIN_DB
+      containers:
+        - name: openfga
+          image: openfga/openfga:v1.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/openfga", "run"]
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8081
+              name: grpc
+          envFrom:
+            - secretRef:
+                name: openfga-config
+            - configMapRef:
+                name: openfga-config
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+---
+# ClusterIP Service.
+# HTTP :8080 is for pipeline-api's bootstrap subcommand.
+# gRPC :8081 is for lakekeeper's openfga authz backend.
+apiVersion: v1
+kind: Service
+metadata:
+  name: openfga
+  namespace: datuplet-e2e
+spec:
+  selector:
+    app: openfga
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 8081
+      targetPort: 8081

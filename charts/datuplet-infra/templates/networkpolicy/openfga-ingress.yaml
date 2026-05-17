@@ -1,0 +1,46 @@
+# charts/datuplet-infra/templates/networkpolicy/openfga-ingress.yaml
+{{- if .Values.openfga.enabled }}
+{{- /*
+openfga-ingress NetworkPolicy.
+
+Allows ports 8080 (HTTP) + 8081 (gRPC) only from named-component Pods.
+authz-bootstrap (Job, part-of=datuplet) talks to openfga at install time;
+lakekeeper, pipeline-api, reaper talk to it at runtime.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "datuplet-infra.prefix" . }}openfga-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-infra.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openfga
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        # Lakekeeper (subchart, part-of=lakekeeper)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: lakekeeper
+              app.kubernetes.io/name: lakekeeper
+        # Pipeline-api + reaper (Layer 2)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-api-reaper
+        # authz-bootstrap Job (Layer 1, runs at install time)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: authz-bootstrap
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8081 }
+{{- end }}

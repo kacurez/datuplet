@@ -1,0 +1,14 @@
+{{/* charts/datuplet-infra/templates/NOTES.txt */}}
+Datuplet platform installed in namespace {{ .Release.Namespace }} as release {{ .Release.Name }}.
+
+Datuplet infrastructure layer installed. To complete a working install, you must also install the datuplet-app chart:
+
+  helm install datuplet-app charts/datuplet-app \
+    -n {{ .Release.Namespace }} \
+    --wait --wait-for-jobs
+
+After Layer 2 is installed, run the one-time business setup:
+
+  ./scripts/register.sh --namespace {{ .Release.Namespace }}
+
+See docs/install.md for the full operator workflow.

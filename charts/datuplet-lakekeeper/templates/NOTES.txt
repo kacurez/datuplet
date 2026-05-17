@@ -1,0 +1,8 @@
+Datuplet Lakekeeper catalog installed in namespace {{ .Release.Namespace }} as release {{ .Release.Name }}.
+
+Phase 4 of the Datuplet 5-phase install. Phases 1-3 (datuplet-operators, datuplet-infra, datuplet-app) must already be installed.
+
+After this phase, run the one-time business-state setup:
+  ./scripts/register.sh --namespace {{ .Release.Namespace }}
+
+See docs/install.md.

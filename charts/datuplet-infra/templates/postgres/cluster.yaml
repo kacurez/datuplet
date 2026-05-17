@@ -1,0 +1,44 @@
+{{- /* Cluster CR — operator provided by Layer 0 (charts/datuplet-operators/). */}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "datuplet-infra.prefix" . }}pg
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  instances: {{ .Values.postgres.cluster.instances }}
+  storage:
+    size: {{ .Values.postgres.cluster.storageSize }}
+  inheritedMetadata:
+    labels:
+      app.kubernetes.io/part-of: datuplet
+      app.kubernetes.io/name: postgres
+  bootstrap:
+    initdb:
+      # CNPG requires a bootstrap database/owner. We don't actually use this
+      # one — the three real app databases (lakekeeper, openfga, pipeline_api)
+      # are created in postInitSQL via the keygen-rendered init.sql Secret.
+      database: app
+      owner: app
+      # Roles + databases + grants are created atomically at cluster bootstrap
+      # via this Secret-backed SQL. The Secret is rendered by the keygen Job
+      # pre-install hook so its contents exist before the Cluster CR applies.
+      # Split into 5 keys, each referenced separately so CNPG runs each in its
+      # own Exec call. Multi-statement Exec uses Postgres's simple query
+      # protocol (implicit transaction), and CREATE DATABASE cannot run inside
+      # any transaction. One statement per key sidesteps that.
+      postInitSQLRefs:
+        secretRefs:
+          - name: {{ include "datuplet-infra.prefix" . }}pg-init-sql
+            key: 01-roles.sql
+          - name: {{ include "datuplet-infra.prefix" . }}pg-init-sql
+            key: 02-db-lakekeeper.sql
+          - name: {{ include "datuplet-infra.prefix" . }}pg-init-sql
+            key: 03-db-openfga.sql
+          - name: {{ include "datuplet-infra.prefix" . }}pg-init-sql
+            key: 04-db-pipeline_api.sql
+          - name: {{ include "datuplet-infra.prefix" . }}pg-init-sql
+            key: 05-grants.sql

@@ -1,0 +1,115 @@
+{{- /*
+pipeline-api reaper CronJob.
+
+Runs `pipeline-api reap-once` on a schedule to sweep terminal/orphaned
+PipelineRuns and their FGA tuples. suspend: true by default. Schedule
+defaults to every 5 minutes (cron schedule: minute=every-5, rest=star).
+
+reap-once uses DB + K8s + FGA only — no storage access.
+
+Env carried by this CronJob:
+  DATABASE_URL (via CNPG Secret + password injection),
+  PIPELINE_API_IN_CLUSTER,
+  OPENFGA_URL, OPENFGA_API_KEY, OPENFGA_STORE_NAME, OPENFGA_MODEL_VERSION.
+
+SIGNING_KEY_FILE / SIGNING_KEY_ID / AUDIENCE / PIPELINE_API_PUBLIC_URL /
+PIPELINE_API_LAKEKEEPER_PUBLIC_URL / PIPELINE_API_UI_DIR are intentionally
+absent: reap-once does not mint tokens, serve HTTP, or proxy storage, so
+it never reads those config fields.
+
+OPENFGA_STORE_NAME + OPENFGA_MODEL_VERSION: the reaper binary runs
+buildReaperAuthorizer which auto-discovers store+model via OPENFGA_STORE_NAME
+and falls back gracefully (FGA delete step skipped) if discovery fails.
+No initContainer needed — the reaper is a periodic Job starting after
+initial install when the store + pin tuple already exist.
+
+No ServiceAccount or RBAC in this file — bootstrap/rbac.yaml provides
+the ClusterRole + ClusterRoleBinding that the reaper pod uses. The
+ServiceAccount name is pipeline-api (shared with the Deployment to keep
+RBAC footprint minimal; the Deployment already has SA + RBAC).
+*/ -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}pipeline-api-reaper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pipeline-api-reaper
+spec:
+  schedule: {{ ((.Values.pipelineApi).reaper).schedule | default "*/5 * * * *" | quote }}
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-api-reaper") | nindent 12 }}
+            app.kubernetes.io/component: pipeline-api-reaper
+        spec:
+          serviceAccountName: pipeline-api
+          restartPolicy: Never
+          # SA token auto-mounted — reap-once needs K8s API access for the
+          # same reasons pipeline-api serve does (Pod/Pipeline/PipelineRun CRUD).
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- range . }}
+            - name: {{ . }}
+            {{- end }}
+          {{- end }}
+          containers:
+            - name: reap
+              image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["pipeline-api", "reap-once"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              # envFrom carries POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER
+              # from the CNPG-managed connection Secret (Layer 1 output).
+              envFrom:
+                - secretRef:
+                    name: {{ include "datuplet-app.platformPgPipelineApiSecret" . }}
+              env:
+                # Postgres credentials injected first so DATABASE_URL can
+                # reference $(POSTGRES_PASSWORD) via K8s dependent-env substitution.
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "datuplet-app.platformPgPipelineApiPwSecret" . }}
+                      key: password
+                - name: DATABASE_URL
+                  value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable"
+                - name: PIPELINE_API_IN_CLUSTER
+                  value: "true"
+                # reap-once accesses DB + K8s + FGA only; no S3 or lakekeeper creds.
+                # Fine-grained authz via OpenFGA: buildReaperAuthorizer reads
+                # OPENFGA_STORE_NAME and auto-discovers store_id + model_id at each
+                # tick via the pin tuple.
+                - name: OPENFGA_URL
+                  value: {{ include "datuplet-app.openfgaHttpUrl" . | quote }}
+                - name: OPENFGA_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "datuplet-app.platformOpenfgaApiKeySecret" . }}
+                      key: keys
+                - name: OPENFGA_STORE_NAME
+                  value: {{ .Values.platform.openfgaStoreName | default "datuplet" | quote }}
+                - name: OPENFGA_MODEL_VERSION
+                  value: {{ .Values.fgaModel.version | quote }}
+              resources:
+                requests:
+                  memory: "64Mi"
+                  cpu: "20m"
+                limits:
+                  memory: "256Mi"
+                  cpu: "200m"

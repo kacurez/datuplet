@@ -1,0 +1,105 @@
+{{- /*
+wait-for-fga-pin: pre-install Job that waits for the FGA model pin tuple.
+
+Polls OpenFGA for the FGA model pin tuple written by datuplet-app's
+authz-bootstrap (Phase 3). Lakekeeper hard-exits at startup if the
+pinned model version is missing — this Job gives a fast, actionable
+error at helm install time instead of CrashLoopBackOff on the Pod.
+
+Defense in depth: the wait-for-fga-store initContainer in values.yaml
+stays; this Job gives faster operator feedback at install time while
+the initContainer provides runtime safety.
+
+The FGA model version is inlined from .Values.platform.fgaModelVersion
+(not fetched from the lakekeeper-config Secret) because the Secret is a
+main-chart resource that doesn't exist when pre-install hooks run.
+The value is non-secret (just a version number) so inlining is correct.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "datuplet-lakekeeper.prefix" . }}wait-for-fga-pin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-lakekeeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-lakekeeper.selectorLabels" (dict "ctx" . "name" "wait-for-fga-pin") | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      serviceAccountName: datuplet-lakekeeper-bootstrap
+      restartPolicy: OnFailure
+      containers:
+        - name: check
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              FGA_HTTP="http://openfga.$POD_NAMESPACE.svc.cluster.local:8080"
+              VERSION="$FGA_MODEL_VERSION"
+
+              for i in $(seq 1 60); do
+                # Poll for the datuplet store
+                STORES=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                  "$FGA_HTTP/stores" 2>/dev/null || echo "")
+                STORE_ID=""
+                if echo "$STORES" | grep -q '"name":"datuplet"'; then
+                  STORE_ID=$(echo "$STORES" \
+                    | sed -nE 's/.*"id":"([^"]+)"[^}]*"name":"datuplet".*/\1/p; s/.*"name":"datuplet"[^}]*"id":"([^"]+)".*/\1/p' \
+                    | head -n1)
+                fi
+                if [ -n "$STORE_ID" ]; then
+                  # Poll for the pin tuple (relation=openfga_id, object=model_version:collaboration-<VERSION>)
+                  PIN=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                    -X POST "$FGA_HTTP/stores/$STORE_ID/read" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"tuple_key\":{\"relation\":\"openfga_id\",\"object\":\"model_version:collaboration-$VERSION\"}}" 2>/dev/null || echo "")
+                  if echo "$PIN" | grep -q 'auth_model_id:'; then
+                    echo "FGA model pin ready for version $VERSION (store=$STORE_ID)"
+                    exit 0
+                  fi
+                fi
+                echo "Waiting for FGA model pin (version $VERSION)... ($i/60)"
+                sleep 5
+              done
+
+              echo "" >&2
+              echo "Timed out waiting for FGA model pin (version $VERSION)." >&2
+              echo "Did datuplet-app finish installing? authz-bootstrap writes the pin tuple" >&2
+              echo "on Phase 3 (datuplet-app) install. Run:" >&2
+              echo "  helm upgrade --install datuplet-app charts/datuplet-app -n $POD_NAMESPACE --wait --wait-for-jobs" >&2
+              echo "before installing datuplet-lakekeeper." >&2
+              exit 1
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OPENFGA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-api-key
+                  key: keys
+            # Inlined from .Values.platform.fgaModelVersion — non-secret version
+            # number. Cannot use a secretKeyRef on lakekeeper-config because that
+            # Secret is a main-chart resource that doesn't exist when pre-install
+            # hooks run.
+            - name: FGA_MODEL_VERSION
+              value: {{ .Values.platform.fgaModelVersion | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }

@@ -1,0 +1,13 @@
+fgaModel:
+  version: "4.4"
+
+platform:
+  releaseName: datuplet-infra
+
+image:
+  pipelineApi:
+    repository: datuplet/pipeline-api
+    tag: latest
+  pipelineOperator:
+    repository: datuplet/pipeline-operator
+    tag: latest

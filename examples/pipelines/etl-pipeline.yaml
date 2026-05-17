@@ -1,0 +1,76 @@
+# ETL Pipeline Example (CLI / docker mode)
+#
+# 1. Extract — data-generator → raw.products
+# 2. Transform — sql-transform reads raw.products, writes processed.enriched_products
+# 3. Load — stdout-writer reads processed.enriched_products
+#
+# Run with: ./bin/datuplet run examples/pipelines/etl-pipeline.yaml
+#
+# Storage env (defaults shown):
+#   DATUPLET_STORAGE_ENDPOINT=localhost:9000
+#   DATUPLET_STORAGE_BUCKET=datuplet
+#   DATUPLET_STORAGE_ACCESS_KEY=minioadmin
+#   DATUPLET_STORAGE_SECRET_KEY=minioadmin
+#
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: etl-pipeline
+
+spec:
+  gateway:
+    chunkSize: 33554432       # 32MB
+    bufferSize: 67108864      # 64MB
+    rowGroupSize: 67108864    # 64MB
+    targetFileSize: 134217728 # 128MB
+
+  stages:
+    - name: extract
+      components:
+        - name: data-generator
+          image: datuplet/data-generator:latest
+          config:
+            tables:
+              - name: products
+                random:
+                  schema:
+                    id: int
+                    name: string
+                    category: string
+                    price: double
+                    quantity: int
+                  limit:
+                    rowsCount: 10
+          outputs:
+            defaultBucket: raw
+            defaultWriteMode: FULL_LOAD
+
+    - name: transform
+      components:
+        - name: sql-transform
+          image: datuplet/sql-transform:latest
+          inputs:
+            tables:
+              - bucket: raw
+                table: products
+          outputs:
+            tables:
+              - name: enriched_products
+                bucket: processed
+                writeMode: FULL_LOAD
+          config:
+            sql: |
+              CREATE TABLE enriched_products AS
+              SELECT id, name, category, price
+              FROM products;
+
+    - name: load
+      components:
+        - name: stdout-writer
+          image: datuplet/stdout-writer:latest
+          inputs:
+            tables:
+              - bucket: processed
+                table: enriched_products
+          config:
+            format: json

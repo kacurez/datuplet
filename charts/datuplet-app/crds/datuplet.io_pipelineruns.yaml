@@ -1,0 +1,283 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: pipelineruns.datuplet.io
+  labels:
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/name: pipelinerun
+spec:
+  group: datuplet.io
+  names:
+    kind: PipelineRun
+    listKind: PipelineRunList
+    plural: pipelineruns
+    singular: pipelinerun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.pipelineRef.name
+      name: Pipeline
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.currentStage
+      name: Stage
+      type: string
+    - jsonPath: .status.runID
+      name: RunID
+      priority: 1
+      type: string
+    - jsonPath: .status.message
+      name: Message
+      priority: 1
+      type: string
+    - jsonPath: .status.startTime
+      name: Started
+      type: date
+    - jsonPath: .status.completionTime
+      name: Completed
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: PipelineRun is the Schema for the pipelineruns API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PipelineRunSpec defines the desired state of PipelineRun
+            properties:
+              parameters:
+                additionalProperties:
+                  type: string
+                description: Parameters allows overriding component config values
+                type: object
+              pipelineRef:
+                description: PipelineRef references the Pipeline to run
+                properties:
+                  name:
+                    description: Name is the name of the Pipeline resource
+                    type: string
+                required:
+                - name
+                type: object
+              runId:
+                description: RunID optionally specifies the execution identifier. If
+                  empty, the controller generates one. Must be a valid UUID.
+                type: string
+              runTokenRef:
+                description: |-
+                  RunTokenRef names a Kubernetes Secret in the same namespace whose
+                  `token` key holds the signed JWT used by the gateway sidecar to
+                  authenticate with lakekeeper. Optional.
+                properties:
+                  name:
+                    description: Name is the Secret's name in the same namespace as the PipelineRun.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - pipelineRef
+            type: object
+          status:
+            description: PipelineRunStatus defines the observed state of PipelineRun
+            properties:
+              completionTime:
+                description: CompletionTime is when the run completed
+                format: date-time
+                type: string
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the PipelineRun's state
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentStage:
+                description: CurrentStage is the name of the currently executing stage
+                type: string
+              message:
+                description: Message provides additional information about the current
+                  phase
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the last generation observed by
+                  the controller
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the current phase of the PipelineRun
+                type: string
+              stageStatuses:
+                description: StageStatuses tracks the status of each stage
+                items:
+                  description: StageStatus tracks the status of a pipeline stage
+                  properties:
+                    completionTime:
+                      description: CompletionTime is when the stage completed
+                      format: date-time
+                      type: string
+                    componentStatuses:
+                      description: ComponentStatuses tracks the status of each component
+                        in the stage
+                      items:
+                        description: ComponentStatus tracks the status of a component
+                          execution
+                        properties:
+                          completionTime:
+                            description: CompletionTime is when the component completed
+                            format: date-time
+                            type: string
+                          exitCode:
+                            description: ExitCode is the container's exit code
+                            format: int32
+                            type: integer
+                          message:
+                            description: Message provides additional information
+                            type: string
+                          name:
+                            description: Name is the component name
+                            type: string
+                          phase:
+                            description: Phase is the current phase of the component
+                            type: string
+                          podName:
+                            description: PodName is the name of the Pod running this
+                              component
+                            type: string
+                          startTime:
+                            description: StartTime is when the component started
+                            format: date-time
+                            type: string
+                        required:
+                        - name
+                        - phase
+                        type: object
+                      type: array
+                    message:
+                      description: Message provides additional information
+                      type: string
+                    name:
+                      description: Name is the stage name
+                      type: string
+                    phase:
+                      description: Phase is the current phase of the stage
+                      type: string
+                    startTime:
+                      description: StartTime is when the stage started
+                      format: date-time
+                      type: string
+                  required:
+                  - name
+                  - phase
+                  type: object
+                type: array
+              startTime:
+                description: StartTime is when the run started
+                format: date-time
+                type: string
+              tableCommits:
+                description: TableCommits tracks the TableCommit resources created
+                  for this run
+                items:
+                  description: TableCommitRef references a TableCommit resource
+                  properties:
+                    bucket:
+                      description: Bucket is the bucket being committed
+                      type: string
+                    name:
+                      description: Name is the name of the TableCommit resource
+                      type: string
+                    phase:
+                      description: Phase is the current phase of the TableCommit
+                      type: string
+                  required:
+                  - bucket
+                  - name
+                  - phase
+                  type: object
+                type: array
+              runID:
+                description: RunID is the unique execution identifier for this pipeline
+                  run
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

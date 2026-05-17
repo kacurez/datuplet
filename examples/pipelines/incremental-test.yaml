@@ -1,0 +1,15 @@
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: incremental-test
+spec:
+  stages:
+    - name: read-delta
+      components:
+        - name: stdout-writer
+          image: datuplet/stdout-writer:latest
+          inputs:
+            tables:
+              - bucket: raw
+                table: products
+                since: 1m # only data from last minute

@@ -1,0 +1,103 @@
+{{- /*
+pipeline-observer Deployment.
+
+Single-replica K8s informer/observer mirroring PipelineRun status into the
+pipeline-api `runs` table. Extracted from pipeline-api so pipeline-api can
+scale to N replicas (HTTP only); pipeline-observer is the single writer to
+the runs table — no leader election, accepted trade-off.
+
+Failure mode if observer is down: run-status DB rows drift from K8s truth;
+pipeline runs themselves continue executing (operator + DG independent).
+The pipelineapi_observer_lag_seconds metric surfaces this state.
+
+automountServiceAccountToken is intentionally NOT set to false at the Pod
+level — the observer requires the SA token to build an in-cluster
+kubeconfig via rest.InClusterConfig(). The ServiceAccount-level default
+(true) is what we want. Pod hardening lives in `securityContext`.
+*/ -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}pipeline-observer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pipeline-observer
+spec:
+  # Single-replica — single writer to the runs DB. No leader election.
+  # Recreate strategy (NOT RollingUpdate maxSurge=1): observer is the
+  # single writer to the runs DB. A rolling upgrade with maxSurge=1
+  # would briefly run old + new pods concurrently, reintroducing the
+  # dual-writer race we extracted observer from pipeline-api to avoid.
+  # Accept a few seconds of run-status DB lag during upgrades — covered
+  # by the pipelineapi_observer_lag_seconds metric.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-observer") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-observer") | nindent 8 }}
+    spec:
+      serviceAccountName: pipeline-observer
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: pipeline-observer
+          image: "{{ .Values.image.pipelineObserver.repository }}:{{ .Values.image.pipelineObserver.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { containerPort: 8081, name: metrics }
+          envFrom:
+            - secretRef:
+                name: {{ include "datuplet-app.platformPgPipelineApiSecret" . }}
+          env:
+            - name: PIPELINE_OBSERVER_ADDR
+              value: ":8081"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "datuplet-app.platformPgPipelineApiPwSecret" . }}
+                  key: password
+            - name: DATABASE_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable"
+            # In-cluster K8s API access. Uses the SA token mounted at
+            # /var/run/secrets/kubernetes.io/serviceaccount/.
+            - name: PIPELINE_API_IN_CLUSTER
+              value: "true"
+          resources:
+            {{- toYaml .Values.pipelineObserver.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            # Initial cache sync can take up to 2 min; give the readinessProbe
+            # a generous initialDelay so it doesn't flip the pod to Unready
+            # during startup.
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 24   # ~4 minutes total
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          securityContext:
+            # Match pipeline-api's posture (alpine base runs as root by default —
+            # see utils/docker/Dockerfile.pipeline-observer). Defense-in-depth
+            # via drop ALL caps + seccomp + read-only rootfs; runAsNonRoot
+            # would require a USER directive in the Dockerfile and is a
+            # follow-up hardening (see docs/known-gaps.md).
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+            readOnlyRootFilesystem: true

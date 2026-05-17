@@ -1,0 +1,23 @@
+{{- /*
+FGA model ConfigMap, pre-install/pre-upgrade hook (weight 15).
+Must exist before the authz-bootstrap Job (weight 20) which mounts it.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}fga-model
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "15"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  fga.mod: |
+{{ .Files.Get "files/fga/fga.mod" | indent 4 }}
+{{- range $path, $_ := .Files.Glob "files/fga/components/*.fga" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}

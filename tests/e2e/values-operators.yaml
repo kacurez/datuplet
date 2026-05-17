@@ -1,0 +1,7 @@
+# tests/e2e/values-operators.yaml
+cloudnative-pg:
+  config:
+    data:
+      # Scope operator watch to the e2e namespace so multiple installs don't
+      # fight over Clusters in different namespaces.
+      WATCH_NAMESPACE: datuplet-e2e

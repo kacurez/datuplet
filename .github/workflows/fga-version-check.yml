@@ -1,0 +1,43 @@
+name: FGA version check
+
+on:
+  pull_request:
+    paths:
+      - 'charts/datuplet-app/files/fga/**'
+      - 'charts/datuplet-app/values.yaml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify version bump if DSL changed
+        run: |
+          set -eu
+          FGA_DIR="charts/datuplet-app/files/fga"
+          VALUES="charts/datuplet-app/values.yaml"
+          BASE="origin/${{ github.base_ref }}"
+
+          dsl_changed=$(git diff --name-only "$BASE" HEAD -- "$FGA_DIR" | wc -l)
+          if [ "$dsl_changed" -eq 0 ]; then
+            echo "No FGA DSL changes — skipping check."
+            exit 0
+          fi
+
+          old_version=$(git show "$BASE:$VALUES" 2>/dev/null \
+            | yq '.fgaModel.version' - 2>/dev/null || echo "")
+          new_version=$(yq '.fgaModel.version' "$VALUES")
+
+          if [ -z "$old_version" ] || [ "$old_version" != "$new_version" ]; then
+            echo "✓ DSL changed AND fgaModel.version bumped: $old_version → $new_version"
+          else
+            cat <<EOF >&2
+          ✗ DSL files changed but fgaModel.version did not bump.
+
+          You modified one or more files in $FGA_DIR. Bump $VALUES :: fgaModel.version
+          to indicate the model is being updated. See docs/fga-model-upgrades.md.
+          EOF
+            exit 1
+          fi

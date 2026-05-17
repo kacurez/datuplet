@@ -1,0 +1,27 @@
+---
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: "{{.RunPrefix}}-append-mode"
+  namespace: datuplet
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: json-extractor
+          image: datuplet/http-json-extractor:latest
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
+          outputs:
+            defaultBucket: "{{.RunPrefix}}-raw"
+            defaultWriteMode: APPEND
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: "{{.RunPrefix}}-append-mode-run"
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: "{{.RunPrefix}}-append-mode"
+  parameters: {}

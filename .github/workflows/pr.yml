@@ -1,0 +1,73 @@
+name: PR validation
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+# Cancel in-flight runs for the same ref on new pushes; saves runner minutes.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: go vet + go test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+  helm:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        chart:
+          - datuplet-operators
+          - datuplet-infra
+          - datuplet-app
+          - datuplet-lakekeeper
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.4'
+
+      - name: helm dependency update
+        run: helm dependency update charts/${{ matrix.chart }}
+
+      - name: helm lint
+        run: helm lint charts/${{ matrix.chart }}
+
+      - name: helm template
+        run: |
+          helm template ${{ matrix.chart }} charts/${{ matrix.chart }} \
+            --namespace datuplet > /tmp/${{ matrix.chart }}.yaml
+          # Sanity: rendered output should be non-trivial.
+          test "$(wc -l < /tmp/${{ matrix.chart }}.yaml)" -gt 50

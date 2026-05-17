@@ -1,0 +1,471 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: pipelines.datuplet.io
+  labels:
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/name: pipeline
+spec:
+  group: datuplet.io
+  names:
+    kind: Pipeline
+    listKind: PipelineList
+    plural: pipelines
+    singular: pipeline
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: Pipeline is the Schema for the pipelines API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PipelineSpec defines the desired state of Pipeline
+            properties:
+              gateway:
+                description: Gateway configures the data gateway settings
+                properties:
+                  bufferSize:
+                    default: 67108864
+                    description: BufferSize is the memory buffer size before flushing
+                      to disk
+                    format: int64
+                    type: integer
+                  chunkSize:
+                    default: 33554432
+                    description: ChunkSize is the chunk size for component read/write
+                      operations
+                    format: int64
+                    type: integer
+                  rowGroupSize:
+                    default: 67108864
+                    description: RowGroupSize is the target size for Parquet row groups
+                    format: int64
+                    type: integer
+                  targetFileSize:
+                    default: 134217728
+                    description: TargetFileSize is the target Parquet file size before
+                      rotation
+                    format: int64
+                    type: integer
+                type: object
+              secretsRef:
+                description: |
+                  SecretsRef names a Kubernetes Secret in the same namespace whose keys
+                  are resolvable via $[name] references in component configs. Optional.
+                properties:
+                  name:
+                    description: Name is the Secret's name in the same namespace as the PipelineRun.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                required:
+                  - name
+                type: object
+              stages:
+                description: Stages defines the pipeline stages
+                items:
+                  description: StageSpec defines a pipeline stage
+                  properties:
+                    components:
+                      description: Components defines the components in this stage
+                      items:
+                        description: ComponentSpec defines a pipeline component
+                        properties:
+                          config:
+                            additionalProperties:
+                              type: string
+                            description: Config contains component-specific configuration
+                              (simple key-value pairs)
+                            type: object
+                          configJSON:
+                            description: ConfigJSON contains component-specific configuration
+                              as JSON (for complex/nested values)
+                            type: string
+                          image:
+                            description: Image is the container image to run
+                            type: string
+                          inputs:
+                            description: Inputs defines input configuration
+                            properties:
+                              buckets:
+                                description: Buckets grants read access to all tables
+                                  in these buckets.
+                                items:
+                                  type: string
+                                type: array
+                              tables:
+                                description: Tables grants read access to specific
+                                  tables.
+                                items:
+                                  description: InputTableSpec defines a specific table
+                                    input.
+                                  properties:
+                                    bucket:
+                                      description: Bucket is the bucket name (e.g.,
+                                        "raw")
+                                      minLength: 1
+                                      pattern: ^[a-z][a-z0-9_-]*$
+                                      type: string
+                                    table:
+                                      description: Table is the table name (e.g.,
+                                        "orders")
+                                      minLength: 1
+                                      pattern: ^[a-z][a-z0-9_-]*$
+                                      type: string
+                                    logicalName:
+                                      description: |-
+                                        LogicalName is an optional override for the SQL identifier used to
+                                        reference this input table in SQL transform components. Defaults
+                                        to Table when not specified.
+                                      pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
+                                      type: string
+                                    since:
+                                      description: Relative duration for incremental
+                                        reads (e.g., "30m", "12h", "3d", "1w"). Mutually
+                                        exclusive with sinceSnapshot.
+                                      type: string
+                                    sinceSnapshot:
+                                      description: Explicit Iceberg snapshot ID for
+                                        incremental reads. Mutually exclusive with since.
+                                      format: int64
+                                      type: integer
+                                    sinceDays:
+                                      description: |-
+                                        SinceDays is sugar over Since: when set, DG applies an incremental
+                                        read for rows where TimestampColumn >= NOW - SinceDays days.
+                                        Mutually exclusive with Since and SinceSnapshot.
+                                      minimum: 1
+                                      type: integer
+                                    timestampColumn:
+                                      description: |-
+                                        TimestampColumn is the iceberg column DG uses to apply SinceDays /
+                                        Since filters. Defaults to "created" when SinceDays/Since is set
+                                        and this field is empty.
+                                      pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
+                                      type: string
+                                  required:
+                                  - bucket
+                                  - table
+                                  type: object
+                                type: array
+                            type: object
+                          name:
+                            description: Name is the component name
+                            type: string
+                          outputs:
+                            description: Outputs defines output configuration
+                            properties:
+                              buckets:
+                                description: |-
+                                  Explicit mode: declare specific buckets and/or tables
+                                  Buckets enables writes to any table within these buckets
+                                items:
+                                  description: OutputBucketSpec defines a bucket output
+                                    with dynamic table creation.
+                                  properties:
+                                    name:
+                                      description: Name is the bucket name (e.g.,
+                                        "raw")
+                                      minLength: 1
+                                      pattern: ^[a-z][a-z0-9_-]*$
+                                      type: string
+                                    writeMode:
+                                      default: APPEND
+                                      description: WriteMode is the write mode for
+                                        tables in this bucket
+                                      enum:
+                                      - APPEND
+                                      - FULL_LOAD
+                                      type: string
+                                  required:
+                                  - name
+                                  type: object
+                                type: array
+                              defaultBucket:
+                                description: |-
+                                  DefaultBucket mode (exclusive - cannot be combined with Buckets/Tables)
+                                  Enables dynamic table creation: SDK calls WriteChunk(table, data)
+                                type: string
+                              defaultWriteMode:
+                                default: FULL_LOAD
+                                description: DefaultWriteMode is the write mode for
+                                  tables created under DefaultBucket
+                                enum:
+                                - APPEND
+                                - FULL_LOAD
+                                type: string
+                              processors:
+                                description: |-
+                                  Processors apply transformations to output data (e.g., drop columns)
+                                  Applied to all outputs from this component
+                                items:
+                                  description: ProcessorSpec defines a data processor
+                                    operation
+                                  properties:
+                                    columns:
+                                      description: Columns is the list of columns
+                                        for the operation
+                                      items:
+                                        type: string
+                                      type: array
+                                    type:
+                                      description: Type is the processor type (drop)
+                                      enum:
+                                      - drop
+                                      type: string
+                                  required:
+                                  - type
+                                  type: object
+                                type: array
+                              tables:
+                                description: Tables enables writes to specific pre-declared
+                                  tables
+                                items:
+                                  description: OutputTableSpec defines a fixed table
+                                    output.
+                                  properties:
+                                    bucket:
+                                      description: Bucket is the bucket name (e.g.,
+                                        "curated")
+                                      minLength: 1
+                                      pattern: ^[a-z][a-z0-9_-]*$
+                                      type: string
+                                    logicalName:
+                                      description: |-
+                                        LogicalName is an optional override for the SQL identifier used to
+                                        reference this output table in SQL transform components. Defaults
+                                        to Name when not specified.
+                                      pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
+                                      type: string
+                                    name:
+                                      description: Name is the table name (e.g., "products")
+                                      minLength: 1
+                                      pattern: ^[a-z][a-z0-9_-]*$
+                                      type: string
+                                    partitionFields:
+                                      description: PartitionFields defines the partition
+                                        specification for this table.
+                                      items:
+                                        description: PartitionFieldSpec defines a single
+                                          partition field.
+                                        properties:
+                                          sourceColumn:
+                                            description: SourceColumn is the column name
+                                              in source data to partition by.
+                                            minLength: 1
+                                            type: string
+                                          transform:
+                                            description: Transform is the partition transform
+                                              to apply.
+                                            enum:
+                                            - identity
+                                            - day
+                                            - month
+                                            - year
+                                            - hour
+                                            type: string
+                                        required:
+                                        - sourceColumn
+                                        - transform
+                                        type: object
+                                      type: array
+                                    writeMode:
+                                      default: APPEND
+                                      description: WriteMode is the write mode for
+                                        this table
+                                      enum:
+                                      - APPEND
+                                      - FULL_LOAD
+                                      type: string
+                                  required:
+                                  - bucket
+                                  - name
+                                  type: object
+                                type: array
+                            type: object
+                          resources:
+                            description: Resources defines resource requirements
+                            properties:
+                              claims:
+                                description: |-
+                                  Claims lists the names of resources, defined in spec.resourceClaims,
+                                  that are used by this container.
+
+                                  This is an alpha field and requires enabling the
+                                  DynamicResourceAllocation feature gate.
+
+                                  This field is immutable. It can only be set for containers.
+                                items:
+                                  description: ResourceClaim references one entry
+                                    in PodSpec.ResourceClaims.
+                                  properties:
+                                    name:
+                                      description: |-
+                                        Name must match the name of one entry in pod.spec.resourceClaims of
+                                        the Pod where this field is used. It makes that resource available
+                                        inside a container.
+                                      type: string
+                                    request:
+                                      description: |-
+                                        Request is the name chosen for a request in the referenced claim.
+                                        If empty, everything from the claim is made available, otherwise
+                                        only the result of this request.
+                                      type: string
+                                  required:
+                                  - name
+                                  type: object
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - name
+                                x-kubernetes-list-type: map
+                              limits:
+                                additionalProperties:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
+                                description: |-
+                                  Limits describes the maximum amount of compute resources allowed.
+                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                type: object
+                              requests:
+                                additionalProperties:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
+                                description: |-
+                                  Requests describes the minimum amount of compute resources required.
+                                  If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                  otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                type: object
+                            type: object
+                        required:
+                        - image
+                        - name
+                        type: object
+                      minItems: 1
+                      type: array
+                    name:
+                      description: Name is the stage name
+                      type: string
+                  required:
+                  - components
+                  - name
+                  type: object
+                minItems: 1
+                type: array
+            required:
+            - stages
+            type: object
+          status:
+            description: PipelineStatus defines the observed state of Pipeline
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the Pipeline's state
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              message:
+                description: Message provides additional information about the current
+                  phase
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the last generation observed by
+                  the controller
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the current phase of the Pipeline
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

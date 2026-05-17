@@ -1,0 +1,2 @@
+# e2e overrides for charts/datuplet-lakekeeper. Defaults from values.yaml
+# already point at the same-namespace in-cluster Services.

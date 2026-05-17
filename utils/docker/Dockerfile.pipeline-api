@@ -1,0 +1,35 @@
+# pipeline-api service image (RFC 002 Slice C)
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY cmd/ ./cmd/
+COPY pkg/ ./pkg/
+COPY api/ ./api/
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /pipeline-api ./cmd/pipeline-api
+
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /pipeline-api /usr/local/bin/pipeline-api
+# UI assets (Plan D) — served at /ui/* when PIPELINE_API_UI_DIR is set.
+COPY ui/product/ /app/ui/product/
+
+# Configuration via environment variables:
+# - PIPELINE_API_ADDR            HTTP listen address (default :8081)
+# - DATABASE_URL                 Postgres DSN (required)
+# - PIPELINE_API_COOKIE_SECURE   Require HTTPS for session cookie (default false)
+# - PIPELINE_API_UI_DIR          Path to ui/product/ static assets. Set
+#                                to /app/ui/product in the K8s manifest;
+#                                unset disables /ui/*.
+
+EXPOSE 8081
+
+ENTRYPOINT ["pipeline-api"]
+CMD ["serve"]

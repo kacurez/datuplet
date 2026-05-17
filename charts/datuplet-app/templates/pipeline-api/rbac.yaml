@@ -1,0 +1,71 @@
+{{- /*
+ServiceAccount + ClusterRole + ClusterRoleBinding for pipeline-api.
+
+pipeline-api provisions per-project Namespaces (datuplet-<uuid>) and
+mutates PipelineRuns + Secrets across them, so namespace-scoped roles are
+not sufficient — ClusterRole + ClusterRoleBinding required.
+
+Verb set covers the actual trigger + cancel call graph:
+- Observer no longer runs in this binary — `watch` verbs dropped.
+- Pods: cancel path uses `list` + `patch` only.
+- Pipelines: only `get`, `create`, `update` from CRD materialization.
+- Pipelineruns: `get`, `create`, `delete` for trigger/cancel.
+  PLUS `list` (and Secrets `list`+`delete`) retained for the reaper
+  CronJob which currently shares this ServiceAccount. The cleaner fix is
+  to give the reaper its own narrower SA (see docs/known-gaps.md).
+*/}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pipeline-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pipeline-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-pipeline-api
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+rules:
+  # Namespace provisioning — Get-before-Create pattern.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create"]
+  # Pipeline CRD materialization on trigger (Get + Create, Update on race).
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelines"]
+    verbs: ["get", "create", "update"]
+  # PipelineRun trigger (Create + Get for UID) + cancel (Get + Delete).
+  # `list` kept for the reaper CronJob (shares this SA — see header).
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelineruns"]
+    verbs: ["get", "list", "create", "delete"]
+  # Run-token Secret: Create + Update (ownerReference patch). `list` +
+  # `delete` kept for the reaper CronJob (shares this SA — see header).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "list", "delete"]
+  # Cancel path: list pods by label selector, patch the
+  # datuplet.io/cancel=true annotation.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-pipeline-api
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-api
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-pipeline-api
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,30 @@
+---
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: "{{.RunPrefix}}-explicit-tables"
+  namespace: datuplet
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: json-extractor
+          image: datuplet/http-json-extractor:latest
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
+            table_name: "posts"
+          outputs:
+            tables:
+              - name: posts
+                bucket: "{{.RunPrefix}}-staging"
+                writeMode: FULL_LOAD
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: "{{.RunPrefix}}-explicit-tables-run"
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: "{{.RunPrefix}}-explicit-tables"
+  parameters: {}

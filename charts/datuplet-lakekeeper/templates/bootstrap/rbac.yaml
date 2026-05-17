@@ -1,0 +1,58 @@
+{{- /*
+RBAC for the wait-for-fga-pin pre-install Job.
+
+Scoped to only the two Secrets the Job needs:
+  - openfga-api-key   (bearer token for the FGA REST poll)
+
+The FGA model version is inlined from .Values.platform.fgaModelVersion
+directly in the Job env (option b), so lakekeeper-config is NOT in
+resourceNames and the SA can't read other cluster Secrets.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: datuplet-lakekeeper-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-lakekeeper.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: datuplet-lakekeeper-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-lakekeeper.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["openfga-api-key"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: datuplet-lakekeeper-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-lakekeeper.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+subjects:
+  - kind: ServiceAccount
+    name: datuplet-lakekeeper-bootstrap
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: datuplet-lakekeeper-bootstrap

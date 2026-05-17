@@ -1,0 +1,35 @@
+---
+# ServiceAccount for the pipeline-api-reaper CronJob. Strictly narrower
+# than the pipeline-api ServiceAccount: list+delete on PipelineRun and
+# Secret, nothing else. No namespace create, no Pipeline CRUD, no
+# signing-key mount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pipeline-api-reaper
+  namespace: datuplet-e2e
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pipeline-api-reaper
+rules:
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelineruns"]
+    verbs: ["list", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pipeline-api-reaper
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-api-reaper
+    namespace: datuplet-e2e
+roleRef:
+  kind: ClusterRole
+  name: pipeline-api-reaper
+  apiGroup: rbac.authorization.k8s.io

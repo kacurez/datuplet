@@ -1,0 +1,59 @@
+---
+# Full ETL Pipeline Example for Kubernetes (RFC 010 v3 sql-transform)
+#
+# Stage 1: Extract — http-json-extractor → staging.data
+# Stage 2: Transform — sql-transform reads staging.data, writes curated.enriched_posts
+#
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: full-pipeline
+  namespace: datuplet
+spec:
+  gateway:
+    chunkSize: 33554432       # 32MB
+    bufferSize: 67108864      # 64MB
+    rowGroupSize: 67108864    # 64MB
+    targetFileSize: 134217728 # 128MB
+
+  stages:
+    - name: extract
+      components:
+        - name: json-extractor
+          image: datuplet/http-json-extractor:latest
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
+          outputs:
+            tables:
+              - name: data
+                bucket: staging
+                writeMode: APPEND
+
+    - name: transform
+      components:
+        - name: transformer
+          image: datuplet/sql-transform:latest
+          inputs:
+            tables:
+              - bucket: staging
+                table: data
+          outputs:
+            tables:
+              - name: enriched_posts
+                bucket: curated
+                writeMode: APPEND
+          config:
+            sql: |
+              CREATE TABLE enriched_posts AS
+              SELECT id, title, body
+              FROM data;
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: full-pipeline-run-1
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: full-pipeline
+  parameters: {}

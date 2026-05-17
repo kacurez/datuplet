@@ -1,0 +1,7 @@
+postgres:
+  cluster:
+    storageSize: 1Gi  # smaller for e2e
+
+minio:
+  persistence:
+    size: 1Gi

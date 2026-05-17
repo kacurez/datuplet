@@ -1,0 +1,92 @@
+# charts/datuplet-infra/values.yaml
+image:
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+  pipelineApi:
+    repository: datuplet/pipeline-api
+    tag: latest
+
+bootstrap:
+  externalImages:
+    # bitnami/kubectl:1.31 was retired when Bitnami restructured their
+    # registry — only the :latest tag and bitnamilegacy/kubectl:X.Y tags
+    # remain. Using :latest to match the existing charts/datuplet/ chart.
+    kubectl: "bitnami/kubectl:latest"
+    openfgaCli: "openfga/cli:v0.6.2"
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+
+pipelineApi:
+  signingKey:
+    secretName: ""        # rendered in _helpers.tpl
+    existingSecret: ""    # operator-supplied override
+
+# Note: The `cloudnative-pg` subchart lives in charts/datuplet-operators/ because its
+# admission webhooks must be ready before the Cluster CR is applied (operator Pod not
+# Ready → no webhook endpoints → admission rejected). Install datuplet-operators first.
+# The Cluster CR (templates/postgres/cluster.yaml) is created here and reconciled by
+# the operator running in datuplet-operators.
+
+# Subchart toggles
+openfga:
+  enabled: true
+  fullnameOverride: openfga
+  datastore:
+    engine: postgres
+    uriSecret: openfga-pg-uri
+    # Use initContainer (not job) — `migrationType: job` makes openfga's
+    # wait-for-migration init wait on a Job that's a post-install hook,
+    # which deadlocks helm install --wait (main resources blocked from
+    # Ready until post-install hook fires, but post-install hook fires
+    # only after main resources Ready). The existing charts/datuplet/
+    # chart documents this exact gotcha.
+    migrationType: initContainer
+  authn:
+    method: preshared
+    preshared:
+      # Hardcoded to the default release name (datuplet-infra). Operators
+      # using a different release name should override via --set
+      # openfga.authn.preshared.keysSecret=<release>-openfga-api-key. Subchart
+      # values can't reference parent Release.Name. The Secret is created by
+      # the keygen Job with key 'keys'.
+      keysSecret: openfga-api-key
+  # The playground UI only supports authn.method=none; with preshared it
+  # panics on startup with "the playground only supports authn method 'none'".
+  # Disable it — we use authn=preshared in production-shape installs.
+  playground:
+    enabled: false
+minio:
+  enabled: true
+  fullnameOverride: minio
+  podLabels:
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/name: minio
+  mode: standalone
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 5Gi
+  rootUser: datuplet
+  # `buckets` (not `defaultBuckets`) is the official charts.min.io/ chart's
+  # field — the minio-post-job creates each entry via mc at install time.
+  buckets:
+    - name: datuplet
+      policy: none
+      purge: false
+  # Match existing charts/datuplet/ resource request — minio's default
+  # request of 16Gi memory exceeds OrbStack's node capacity.
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 2,    memory: 2Gi }
+
+# Lakekeeper lives in charts/datuplet-lakekeeper (Phase 4) rather than here
+# because lakekeeper fetches OIDC discovery from pipeline-api at startup,
+# so it must start after pipeline-api (Phase 3). pg-lakekeeper /
+# pg-lakekeeper-pw Secrets are created in this chart's keygen-job and consumed
+# cross-phase (same pattern as pg-pipeline-api).
+
+postgres:
+  cluster:
+    instances: 1
+    storageSize: 5Gi

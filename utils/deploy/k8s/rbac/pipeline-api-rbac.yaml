@@ -1,0 +1,52 @@
+---
+# ServiceAccount for pipeline-api. The Pod mounts its token via the
+# default projected volume; pipeline-api reads it when
+# PIPELINE_API_IN_CLUSTER=true.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pipeline-api
+  namespace: datuplet-e2e
+---
+# Cluster-scoped permissions: pipeline-api provisions per-project
+# Namespaces (datuplet-<uuid>) and reconciles PipelineRuns across them,
+# so namespace-scoped roles are not enough.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pipeline-api
+rules:
+  # Namespace provisioning (RFC 002 §B step 14).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "create", "watch"]
+  # Pipeline CRD materialization on trigger + GC on pipeline delete.
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelines"]
+    verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+  # PipelineRun creation + status mirror + reaper delete.
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelineruns"]
+    verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelineruns/status"]
+    verbs: ["get"]
+  # Run-token Secret: create + ownerReference patch + reaper delete of
+  # orphans. Namespaced resource but we allow cluster-wide because the
+  # target namespace is per-project and created lazily.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pipeline-api
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-api
+    namespace: datuplet-e2e
+roleRef:
+  kind: ClusterRole
+  name: pipeline-api
+  apiGroup: rbac.authorization.k8s.io

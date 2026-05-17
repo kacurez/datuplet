@@ -1,0 +1,35 @@
+# pipeline-observer service image (RFC 015 Slice A)
+#
+# Standalone K8s informer/observer mirroring PipelineRun status into the
+# pipeline-api `runs` table. Single-replica (no leader election); 2-replica
+# pipeline-api owns HTTP-only paths. Shares pkg/pipelineapi/k8s/* with
+# pipeline-api — no code duplication.
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY cmd/ ./cmd/
+COPY pkg/ ./pkg/
+COPY api/ ./api/
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /pipeline-observer ./cmd/pipeline-observer
+
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /pipeline-observer /usr/local/bin/pipeline-observer
+
+# Configuration via environment variables:
+# - PIPELINE_OBSERVER_ADDR        HTTP listen address for /healthz + /metrics (default :8081)
+# - DATABASE_URL                  Postgres DSN (required)
+# - KUBECONFIG                    Path to kubeconfig (dev only; ignored when PIPELINE_API_IN_CLUSTER=true)
+# - PIPELINE_API_IN_CLUSTER       "true" to use rest.InClusterConfig() (set by chart Deployment)
+
+EXPOSE 8081
+
+ENTRYPOINT ["pipeline-observer"]

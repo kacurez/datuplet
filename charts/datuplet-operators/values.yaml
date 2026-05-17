@@ -1,0 +1,28 @@
+# charts/datuplet-operators/values.yaml
+#
+# Layer 0 wraps the upstream cloudnative-pg subchart. The operator
+# manages PG clusters declared in Layer 1 (datuplet-infra).
+
+cloudnative-pg:
+  enabled: true
+  fullnameOverride: cnpg   # drops release prefix on operator Deployment/Service (namespace disambiguates)
+  # CRDs are installed via charts/datuplet-operators/crds/ (Helm magic dir,
+  # applied before any templates). Disable the subchart's own CRD install.
+  crds:
+    create: false
+  # WATCH_NAMESPACE empty = cluster-wide watch. For tests/CI that want
+  # namespace-scoped watch, override via --set or values file.
+  config:
+    create: true
+    data:
+      WATCH_NAMESPACE: ""
+  monitoring:
+    podMonitorEnabled: false
+  # failurePolicy: Fail is the safe default now that Layer 1 installs only
+  # after Layer 0's helm install --wait completes (operator Pod Ready, webhook
+  # service has endpoints).
+  webhook:
+    mutating:
+      failurePolicy: Fail
+    validating:
+      failurePolicy: Fail

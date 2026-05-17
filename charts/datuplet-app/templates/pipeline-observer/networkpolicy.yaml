@@ -1,0 +1,47 @@
+{{- /*
+pipeline-observer egress NetworkPolicy.
+
+Limits lateral movement blast radius if the observer Pod is compromised.
+The observer has no legitimate reason to reach MinIO, OpenFGA, lakekeeper,
+or pipeline-api directly — it talks to the K8s API and to Postgres only.
+
+Ingress is unrestricted (allow Prometheus or other scrapers to hit /metrics
+on the Service); operators wanting tighter ingress should add their own
+NetworkPolicy via a downstream chart.
+*/ -}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}pipeline-observer-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: datuplet
+      app.kubernetes.io/name: pipeline-observer
+  policyTypes: ["Egress"]
+  egress:
+    # DNS — required for resolving the Postgres + K8s API Service DNS.
+    - ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Postgres (CNPG primary Service). Same selector as
+    # datuplet-infra/templates/networkpolicy/postgres-ingress.yaml uses
+    # on the receiving side.
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: pg
+      ports:
+        - { protocol: TCP, port: 5432 }
+    # K8s API server. We can't pod-select kube-apiserver (it's not a Pod
+    # in the cluster), so allow TCP/443 to anywhere — this is the
+    # standard K8s NetworkPolicy idiom for in-cluster API access.
+    # The API server is the only thing on TCP/443 in the cluster's
+    # service CIDR by default.
+    - ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 6443 }

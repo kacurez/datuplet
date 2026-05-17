@@ -1,0 +1,32 @@
+# Data Gateway sidecar image
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download modules with cache mount
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Copy source
+COPY cmd/ ./cmd/
+COPY pkg/ ./pkg/
+COPY api/ ./api/
+
+# Build datuplet binary with cache mounts
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /datuplet ./cmd/datuplet
+
+# Runtime image
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /datuplet /usr/local/bin/datuplet
+
+# The entrypoint just sets up the gateway command; mode is passed via CMD
+ENTRYPOINT ["datuplet", "gateway"]
+CMD ["--local"]

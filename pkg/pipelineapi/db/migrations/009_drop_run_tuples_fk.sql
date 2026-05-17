@@ -1,0 +1,37 @@
+-- 009_drop_run_tuples_fk.sql — drop the run_tuples → runs FK that
+-- contradicts the documented insert order.
+--
+-- Background: 007_run_tuples.sql created run_tuples with
+--   run_id uuid PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE
+--
+-- but the trigger flow in pkg/pipelineapi/runbackend/k8s.go::TriggerRun
+-- (and local.go) inserts the run_tuples row BEFORE the runs row, in
+-- separate transactions:
+--
+--   1. INSERT INTO run_tuples (run_id, ...)  ← FK fails here
+--   2. WriteTuples to OpenFGA
+--   3. INSERT INTO runs (id, ...)
+--   4. UPDATE run_tuples SET committed=true
+--
+-- Rationale for that order is crash-recovery — at step 1 we record
+-- intent so a crash between steps 2 and 3 leaves a breadcrumb the
+-- reaper can use to delete orphaned FGA tuples. Reversing the order
+-- (runs first, then run_tuples) would orphan FGA tuples on a crash
+-- between writes and breadcrumb.
+--
+-- Symptom in production: triggering any pipeline with outputs failed
+-- with `pq: insert or update on table "run_tuples" violates foreign
+-- key constraint "run_tuples_run_id_fkey" (SQLSTATE 23503)`.
+--
+-- Fix: drop the FK. Cleanup integrity is handled by:
+--   - The reaper sweeping committed=false rows older than 5min
+--     (pkg/pipelineapi/k8s/reap_run_tuples.go).
+--   - The completion flow (Succeeded/Failed/Cancelled) which deletes
+--     the run_tuples row + the FGA tuples it references.
+-- The ON DELETE CASCADE behaviour is replaced by the reaper's explicit
+-- DELETE FROM run_tuples WHERE run_id = $1 calls.
+--
+-- Idempotent: IF EXISTS handles fresh deploys (where 007 hasn't run on
+-- this DB yet — the constraint name from 007 is run_tuples_run_id_fkey).
+
+ALTER TABLE run_tuples DROP CONSTRAINT IF EXISTS run_tuples_run_id_fkey;

@@ -1,0 +1,52 @@
+# charts/datuplet-infra/templates/networkpolicy/postgres-ingress.yaml
+{{- /*
+postgres-ingress NetworkPolicy.
+
+Allows port 5432 only from named-component Pods. The selectors below
+match what each chart actually emits:
+  - lakekeeper (main + db-migration Job) emits part-of=lakekeeper
+  - openfga emits part-of=openfga
+  - our Jobs + pipeline-api emit part-of=datuplet
+Per-component name labels keep the allowlist explicit (no umbrella selector).
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "datuplet-infra.prefix" . }}postgres-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-infra.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: {{ include "datuplet-infra.prefix" . }}pg
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        # Lakekeeper main Deployment (subchart, part-of=lakekeeper)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: lakekeeper
+              app.kubernetes.io/name: lakekeeper
+        # OpenFGA main Deployment + initContainer migrate (subchart, part-of=openfga)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: openfga
+              app.kubernetes.io/name: openfga
+        # Pipeline-api Deployment + migrate Job + reaper (Layer 2, part-of=datuplet)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-api-reaper
+        # Pipeline-observer Deployment — same DB as
+        # pipeline-api; reads/writes the runs table via the informer.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-observer
+      ports:
+        - { protocol: TCP, port: 5432 }

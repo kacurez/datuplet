@@ -1,0 +1,86 @@
+# Pandas Transform Pipeline Example (CLI mode)
+#
+# This example demonstrates using the pandas-transform component
+# for data filtering, selection, and sorting.
+#
+# Run with: ./bin/datuplet run examples/pipelines/pandas-pipeline.yaml
+#
+# Environment variables for storage (optional, defaults shown):
+#   DATUPLET_STORAGE_ENDPOINT=localhost:9000
+#   DATUPLET_STORAGE_BUCKET=datuplet
+#   DATUPLET_STORAGE_ACCESS_KEY=minioadmin
+#   DATUPLET_STORAGE_SECRET_KEY=minioadmin
+#
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: pandas-pipeline
+
+spec:
+  gateway:
+    chunkSize: 33554432       # 32MB
+    bufferSize: 67108864      # 64MB
+    rowGroupSize: 67108864    # 64MB
+    targetFileSize: 134217728 # 128MB
+
+  stages:
+    # Stage 1: Extract data to 'raw' bucket
+    - name: extract
+      components:
+        - name: data-generator
+          image: datuplet/data-generator:latest
+          config:
+            tables:
+              - name: products
+                random:
+                  schema:
+                    id: int
+                    name: string
+                    category: string
+                    price: double
+                    quantity: int
+                  limit:
+                    rowsCount: 10
+          outputs:
+            defaultBucket: raw
+            defaultWriteMode: FULL_LOAD
+
+    # Stage 2: Transform with pandas operations
+    - name: transform
+      components:
+        - name: pandas-transform
+          image: datuplet/pandas-transform:latest
+          # Read from 'raw' bucket
+          inputs:
+            buckets:
+              - raw
+          # Write to fixed table in 'processed' bucket
+          outputs:
+            tables:
+              - name: expensive_products
+                bucket: processed
+                writeMode: FULL_LOAD
+          config:
+            operations:
+              - type: filter
+                column: price
+                op: ">"
+                value: 50
+              - type: select
+                columns: [id, name, price, category]
+              - type: sort
+                by: [price]
+                ascending: false
+
+    # Stage 3: Output results
+    - name: load
+      components:
+        - name: stdout-writer
+          image: datuplet/stdout-writer:latest
+          # Read specific table from 'processed' bucket
+          inputs:
+            tables:
+              - bucket: processed
+                table: expensive_products
+          config:
+            format: json

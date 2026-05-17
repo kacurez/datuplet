@@ -1,0 +1,191 @@
+{{- /*
+keygen Job. Generates all chart-managed Secrets, idempotent via "skip if
+Secret already exists" check. Each Secret gets helm.sh/resource-policy: keep
+so helm uninstall doesn't destroy them.
+
+Secrets generated:
+  - <release>-signing-key:        RS256 PEM keypair (via initContainer)
+  - <release>-pg-lakekeeper-pw:   32 hex bytes (Postgres password)
+  - <release>-pg-openfga-pw:      32 hex bytes
+  - <release>-pg-pipeline-api-pw: 32 hex bytes
+  - <release>-openfga-api-key:    32 hex bytes
+  - <release>-pg-init-sql:        01-init.sql rendered with the 3 pg passwords
+                                   for CNPG postInitSQLRefs
+
+Two containers:
+- initContainer `keygen` (pipeline-api image): generates RS256 PEM via
+  `pipeline-api admin keygen`, drops into /shared (emptyDir, memory-backed).
+- container `apply` (kubectl image): creates Secret resources from the PEM
+  files + generates Postgres passwords + openfga API key + pg-init-sql.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "datuplet-infra.prefix" . }}keygen
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-infra.selectorLabels" (dict "ctx" . "name" "keygen") | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      serviceAccountName: {{ include "datuplet-infra.prefix" . }}keygen
+      restartPolicy: OnFailure
+      initContainers:
+        - name: keygen
+          image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              pipeline-api admin keygen \
+                --private-out=/shared/sk.pem \
+                --public-out=/shared/pk.pem
+              chmod 0644 /shared/sk.pem /shared/pk.pem
+          volumeMounts:
+            - name: keymat
+              mountPath: /shared
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
+      containers:
+        - name: apply
+          image: {{ .Values.bootstrap.externalImages.kubectl | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              NS={{ .Release.Namespace | quote }}
+              PREFIX={{ include "datuplet-infra.prefix" . | quote }}
+
+              # Helper: create-and-annotate a Secret only if it doesn't exist.
+              create_secret() {
+                local name="$1"
+                local key="$2"
+                local value="$3"
+                if kubectl get secret -n "$NS" "$name" >/dev/null 2>&1; then
+                  echo "Secret $name already exists — skipping."
+                  return 0
+                fi
+                kubectl create secret generic "$name" -n "$NS" \
+                  --from-literal="$key"="$value"
+                kubectl annotate secret "$name" -n "$NS" \
+                  helm.sh/resource-policy=keep --overwrite
+                echo "Created Secret $name."
+              }
+
+              # Random 32 hex bytes via dd|od|tr (no SIGPIPE under pipefail).
+              gen_hex() {
+                dd if=/dev/urandom bs=32 count=1 status=none \
+                  | od -An -tx1 | tr -d ' \n'
+              }
+
+              # 1. RS256 signing key from initContainer's output.
+              if ! kubectl get secret -n "$NS" "${PREFIX}signing-key" >/dev/null 2>&1; then
+                kubectl create secret generic "${PREFIX}signing-key" -n "$NS" \
+                  --from-file=signing-key.pem=/shared/sk.pem \
+                  --from-file=signing-key.pub=/shared/pk.pem
+                kubectl annotate secret "${PREFIX}signing-key" -n "$NS" \
+                  helm.sh/resource-policy=keep --overwrite
+                echo "Created signing-key Secret."
+              else
+                echo "Secret ${PREFIX}signing-key already exists — skipping."
+              fi
+
+              # 2-5. Generate passwords into shell variables first so we can
+              # reuse them when composing the pg-init-sql Secret below.
+              LAKEKEEPER_PW=$(gen_hex)
+              OPENFGA_PW=$(gen_hex)
+              PIPELINE_API_PW=$(gen_hex)
+              OPENFGA_API_KEY=$(gen_hex)
+
+              create_secret "${PREFIX}pg-lakekeeper-pw"   "password" "$LAKEKEEPER_PW"
+              create_secret "${PREFIX}pg-openfga-pw"      "password" "$OPENFGA_PW"
+              create_secret "${PREFIX}pg-pipeline-api-pw" "password" "$PIPELINE_API_PW"
+
+              # 5. OpenFGA preshared API key.
+              create_secret "${PREFIX}openfga-api-key"    "keys" "$OPENFGA_API_KEY"
+
+              # 6. Compose CNPG postInitSQLRefs target — roles + databases +
+              # grants split into 5 separate keys. Each key is referenced
+              # individually in the Cluster CR's postInitSQLRefs.secretRefs[]
+              # so CNPG executes each as its own pgx Exec call. Multi-statement
+              # batches use Postgres's simple query protocol which wraps in an
+              # implicit transaction; CREATE DATABASE cannot run inside any
+              # transaction. One statement per key sidesteps that.
+              # Split into 5 keys, each referenced separately so CNPG executes each as its own pgx Exec call.
+              if ! kubectl get secret -n "$NS" "${PREFIX}pg-init-sql" >/dev/null 2>&1; then
+                # 01-roles.sql — DO block creating the 3 app roles. PL/pgSQL,
+                # standard transaction-safe so multi-statement-in-one-Exec is fine.
+                printf '%s\n' \
+                  'DO $body$' \
+                  'BEGIN' \
+                  "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lakekeeper_user') THEN" \
+                  "    CREATE ROLE lakekeeper_user LOGIN PASSWORD '$LAKEKEEPER_PW';" \
+                  '  END IF;' \
+                  "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'openfga_user') THEN" \
+                  "    CREATE ROLE openfga_user LOGIN PASSWORD '$OPENFGA_PW';" \
+                  '  END IF;' \
+                  "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pipeline_api_user') THEN" \
+                  "    CREATE ROLE pipeline_api_user LOGIN PASSWORD '$PIPELINE_API_PW';" \
+                  '  END IF;' \
+                  'END' \
+                  '$body$;' \
+                  > /tmp/01-roles.sql
+
+                # 02..04 — one CREATE DATABASE per file. Plain SQL, single
+                # statement → no implicit transaction wrap.
+                echo 'CREATE DATABASE lakekeeper OWNER lakekeeper_user;'      > /tmp/02-db-lakekeeper.sql
+                echo 'CREATE DATABASE openfga OWNER openfga_user;'             > /tmp/03-db-openfga.sql
+                echo 'CREATE DATABASE pipeline_api OWNER pipeline_api_user;'   > /tmp/04-db-pipeline_api.sql
+
+                # 05-grants.sql — multiple GRANT statements OK in one batch
+                # (GRANT works fine inside a transaction).
+                printf '%s\n' \
+                  'GRANT ALL PRIVILEGES ON DATABASE lakekeeper   TO lakekeeper_user;' \
+                  'GRANT ALL PRIVILEGES ON DATABASE openfga      TO openfga_user;' \
+                  'GRANT ALL PRIVILEGES ON DATABASE pipeline_api TO pipeline_api_user;' \
+                  > /tmp/05-grants.sql
+
+                kubectl create secret generic "${PREFIX}pg-init-sql" -n "$NS" \
+                  --from-file=01-roles.sql=/tmp/01-roles.sql \
+                  --from-file=02-db-lakekeeper.sql=/tmp/02-db-lakekeeper.sql \
+                  --from-file=03-db-openfga.sql=/tmp/03-db-openfga.sql \
+                  --from-file=04-db-pipeline_api.sql=/tmp/04-db-pipeline_api.sql \
+                  --from-file=05-grants.sql=/tmp/05-grants.sql
+                kubectl annotate secret "${PREFIX}pg-init-sql" -n "$NS" \
+                  helm.sh/resource-policy=keep --overwrite
+                echo "Created Secret ${PREFIX}pg-init-sql (5 keys)."
+              else
+                echo "Secret ${PREFIX}pg-init-sql already exists — skipping."
+              fi
+
+              echo "Keygen Job complete."
+          volumeMounts:
+            - name: keymat
+              mountPath: /shared
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
+      volumes:
+        - name: keymat
+          emptyDir:
+            medium: Memory

@@ -1,0 +1,33 @@
+---
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: "{{.RunPrefix}}-error-crash"
+  namespace: datuplet
+spec:
+  stages:
+    - name: transform
+      components:
+        - name: sql-transform
+          image: datuplet/sql-transform:latest
+          inputs:
+            tables:
+              - bucket: "{{.RunPrefix}}-nonexistent"
+                table: products
+          outputs:
+            tables:
+              - name: result
+                bucket: "{{.RunPrefix}}-crash"
+                writeMode: FULL_LOAD
+          config:
+            sql: "SELECT * FROM products"
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: "{{.RunPrefix}}-error-crash-run"
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: "{{.RunPrefix}}-error-crash"
+  parameters: {}

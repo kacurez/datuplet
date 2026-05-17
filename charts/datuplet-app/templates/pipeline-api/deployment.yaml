@@ -1,0 +1,168 @@
+{{- /*
+pipeline-api Deployment.
+
+pipeline-api Deployment.
+
+Multi-replica HTTP-only service. The K8s informer runs in pipeline-observer
+(1 replica, single-writer to runs DB). Replicas default to 2; can scale
+higher via `pipelineApi.replicas`. Migrations run via the chart's pre-install
+Job, not at pod boot. Session state lives in Postgres (`sessions` table).
+CSRF uses `SameSite=Lax` cookie attribute — no in-memory nonce.
+
+Strategy: RollingUpdate with maxUnavailable=0 — keeps at least N-1 replicas
+serving during rollout.
+
+pipeline-api holds NO long-lived S3 credentials. The /ui/storage browser-preview
+path reads parquet via lakekeeper-vended STS creds scoped per-request to each
+table's S3 prefix. Lakekeeper is the credential authority; pipeline-api is a
+vended-creds consumer.
+
+OPENFGA_STORE_NAME + OPENFGA_MODEL_VERSION: pipeline-api calls
+authz.ResolveStoreAndModel at startup and fails fast if the FGA store +
+version-pin are absent. The authz-bootstrap pre-install hook (weight 20)
+ensures the store + pin are written before pipeline-api starts -- no
+initContainer needed.
+*/ -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}pipeline-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pipeline-api
+spec:
+  replicas: {{ .Values.pipelineApi.replicas | default 2 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels:
+      {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-api") | nindent 8 }}
+    spec:
+      # ServiceAccount with ClusterRole for Namespace + Pipeline/PipelineRun
+      # CRD + Secret CRUD across project namespaces.
+      # SA token is auto-mounted at /var/run/secrets/kubernetes.io/serviceaccount/
+      # — pipeline-api reads it for in-cluster K8s API access when
+      # PIPELINE_API_IN_CLUSTER=true.
+      serviceAccountName: pipeline-api
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      # FGA model pin is written by the authz-bootstrap pre-install hook Job
+      # (weight 20) before pipeline-api starts. No initContainer needed;
+      # pipeline-api fails fast on missing pin via authz.ResolveStoreAndModel.
+      containers:
+        - name: pipeline-api
+          image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--addr", ":8081"]
+          ports:
+            - { containerPort: 8081, name: http }
+          # envFrom carries POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER
+          # from the CNPG-managed connection Secret (Layer 1 output).
+          envFrom:
+            - secretRef:
+                name: {{ include "datuplet-app.platformPgPipelineApiSecret" . }}
+          env:
+            - name: PIPELINE_API_ADDR
+              value: ":8081"
+            # POSTGRES_PASSWORD comes from the per-app password Secret (Layer 1).
+            # Injected separately so DATABASE_URL can reference $(POSTGRES_PASSWORD)
+            # via K8s dependent-env substitution before the shell ever starts.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "datuplet-app.platformPgPipelineApiPwSecret" . }}
+                  key: password
+            - name: DATABASE_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable"
+            - name: SIGNING_KEY_FILE
+              value: "/var/run/secrets/datuplet-signing-key/signing-key.pem"
+            - name: SIGNING_KEY_ID
+              value: {{ .Values.pipelineApi.signingKey.keyId | quote }}
+            # pipeline-api runs in-cluster with its own ServiceAccount for K8s API
+            # access (Namespace + Pipeline CRD + PipelineRun + Secret).
+            - name: PIPELINE_API_IN_CLUSTER
+              value: "true"
+            # Run tokens carry aud=datuplet-catalog.
+            # Lakekeeper verifies them via the OIDC discovery doc + JWKS below.
+            - name: AUDIENCE
+              value: "datuplet-catalog"
+            # OIDC discovery doc advertises this URL as `issuer` and points
+            # lakekeeper at the JWKS endpoint. Defaults to the in-cluster
+            # Service URL when pipelineApi.publicUrl is unset; operators MUST
+            # override to the externally reachable URL in production.
+            - name: PIPELINE_API_PUBLIC_URL
+              value: {{ include "datuplet-app.pipelineApiPublicUrl" . | quote }}
+            # Returned to CLI clients in POST /api/v1/auth/token so
+            # `datuplet run --remote` can reach lakekeeper directly. Distinct
+            # from PIPELINE_API_PUBLIC_URL (which is pipeline-api's own OIDC URL).
+            # Empty → field omitted from the auth response (intentional default).
+            - name: PIPELINE_API_LAKEKEEPER_PUBLIC_URL
+              value: {{ .Values.pipelineApi.lakekeeperPublicUrl | quote }}
+            # Serve the browser UI at /ui/* from the bundled static assets.
+            - name: PIPELINE_API_UI_DIR
+              value: "/app/ui/product"
+            # Proxy /api/v1/storage/* through lakekeeper's REST catalog.
+            # Pipeline-api holds NO long-lived S3 credentials — parquet reads
+            # use lakekeeper-vended STS creds scoped per-request to each
+            # table's S3 prefix. Required; absent and the storage handlers
+            # degrade to 503.
+            #
+            # Warehouse name is NOT an env var: pipeline-api resolves it
+            # per-request from lakekeeper based on the user's project.
+            - name: DATUPLET_LAKEKEEPER_URL
+              value: {{ include "datuplet-app.lakekeeperUrl" . | quote }}
+            # Fine-grained authz via OpenFGA.
+            - name: OPENFGA_URL
+              value: {{ include "datuplet-app.openfgaHttpUrl" . | quote }}
+            # The keygen Job writes this Secret. pipeline-api reads the API key
+            # to authenticate against OpenFGA.
+            - name: OPENFGA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "datuplet-app.platformOpenfgaApiKeySecret" . }}
+                  key: keys
+            # pipeline-api self-discovers store_id + model_id at startup via
+            # authz.ResolveStoreAndModel (pin-tuple lookup). The authz-bootstrap
+            # pre-install hook (weight 20) guarantees both the store and pin
+            # tuple exist before pipeline-api starts.
+            - name: OPENFGA_STORE_NAME
+              value: {{ .Values.platform.openfgaStoreName | default "datuplet" | quote }}
+            - name: OPENFGA_MODEL_VERSION
+              value: {{ .Values.fgaModel.version | quote }}
+          volumeMounts:
+            - name: signing-key
+              mountPath: /var/run/secrets/datuplet-signing-key
+              readOnly: true
+          resources:
+            {{- toYaml .Values.pipelineApi.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: signing-key
+          secret:
+            secretName: {{ include "datuplet-app.platformSigningKeySecret" . }}

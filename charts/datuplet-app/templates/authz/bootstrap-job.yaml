@@ -1,0 +1,335 @@
+{{- /*
+authz-bootstrap: pre-install/pre-upgrade helm hook Job (weight 20).
+
+Why a hook (not a main-resource Job): pipeline-api uses
+authz.ResolveStoreAndModel to fail-fast at boot when the FGA store + version-pin
+tuple are missing. With authz-bootstrap as a pre-install hook, the store + pin are
+guaranteed to exist before any main resource (including pipeline-api) starts.
+
+Hook weight ordering in datuplet-app:
+  weight  0  -- wait-for-platform (validates Layer 1 state)
+  weight  5  -- pipeline-api-migrate (DB schema)
+  weight 15  -- fga-model ConfigMap + authz-bootstrap RBAC (Job dependencies)
+  weight 20  -- authz-bootstrap Job (this file; needs FGA up, ConfigMap, RBAC)
+
+before-hook-creation delete policy: ensures each helm upgrade recreates the Job
+cleanly (sidesteps Kubernetes Job spec immutability on re-run).
+hook-succeeded delete policy: deletes the Job after success (keeps namespace tidy).
+
+Three-container pattern:
+
+  prep (initContainer, kubectl):
+    1. Wait for OpenFGA's HTTP endpoint to respond (Bearer-auth probe if key set).
+    2. Get-or-create a store named "datuplet". Idempotent on re-run.
+    3. Emit /shared/store_id + /shared/.fga.yaml (api-url + store-id + api-token)
+       for the model-write init container.
+
+  model-write (initContainer, openfga/cli -- distroless, no shell):
+    4. Invoke /fga directly with --config /shared/.fga.yaml.
+       `fga model write --file fga.mod` auto-detects
+       modular DSL (fga.mod lists components/*.fga), parses + POSTs JSON.
+       Image has no shell so stdout cannot be redirected -- apply reads
+       the latest model_id from REST.
+
+  apply (main container, kubectl):
+    5. Read /shared/store_id, query latest model_id from REST.
+    6. Write two model_version pin tuples for version {{ .Values.fgaModel.version }}:
+         model_version:collaboration-{{ .Values.fgaModel.version }} | exists     | auth_model_id:*
+         model_version:collaboration-{{ .Values.fgaModel.version }} | openfga_id | auth_model_id:<id>
+    7. Produce/update the <release>-fga-config Secret (store_id + model_id).
+
+All curl calls carry a Bearer auth header (OPENFGA_API_KEY from the
+<release>-openfga-api-key Secret) matching the preshared key configured
+in the openfga subchart.
+
+Idempotency: Logic inside the Job is idempotent; before-hook-creation ensures a
+fresh Job on each helm upgrade.
+
+SHA-256 DSL hash drift detection guards against accidental model divergence (see sentinel ConfigMap logic below).
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}authz-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: authz-bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "20"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "authz-bootstrap") | nindent 8 }}
+        app.kubernetes.io/component: authz-bootstrap
+    spec:
+      serviceAccountName: {{ include "datuplet-app.prefix" . }}authz-bootstrap
+      restartPolicy: OnFailure
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      initContainers:
+        - name: prep
+          image: {{ .Values.bootstrap.externalImages.kubectl | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FGA={{ include "datuplet-app.openfgaHttpUrl" . | quote }}
+              echo "Using OpenFGA at $FGA"
+
+              # Wait for OpenFGA. /healthz is the standard probe;
+              # /stores is the fallback for older builds.
+              # Bearer header is always sent -- openfga with authn.method=preshared
+              # returns 401 on /healthz without the key. The header must be
+              # passed as a single quoted argument, not split across $AUTH_HEADER
+              # word expansion (which would break shell quoting on the colon).
+              for i in $(seq 1 180); do
+                if curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" "$FGA/healthz" >/dev/null 2>&1 \
+                  || curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" "$FGA/stores" >/dev/null 2>&1; then
+                  echo "OpenFGA is up (after ${i} probe(s))"
+                  break
+                fi
+                echo "Waiting for OpenFGA ($i/180)..."
+                sleep 5
+              done
+
+              # Get-or-create store named "datuplet". Idempotent on rerun.
+              STORE_LIST=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" "$FGA/stores")
+              STORE_ID=$(echo "$STORE_LIST" \
+                | jq -r '.stores[]? | select(.name=="datuplet") | .id' \
+                | head -n1)
+              if [ -z "$STORE_ID" ]; then
+                echo "Creating store 'datuplet'..."
+                STORE_ID=$(curl -fsS -X POST "$FGA/stores" \
+                  -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                  -H "Content-Type: application/json" \
+                  -d '{"name":"datuplet"}' \
+                  | jq -r '.id')
+              fi
+              echo "STORE_ID=$STORE_ID"
+
+              # Hand off store_id + fga-CLI config to subsequent containers
+              # via a tmpfs shared volume.
+              printf "api-url: %s\nstore-id: %s\napi-token: %s\n" \
+                "$FGA" "$STORE_ID" "$OPENFGA_API_KEY" \
+                > /shared/.fga.yaml
+              printf "%s" "$STORE_ID" > /shared/store_id
+              echo "prep complete"
+          env:
+            - name: OPENFGA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "datuplet-app.prefix" . }}openfga-api-key
+                  key: keys
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
+
+        - name: model-write
+          image: {{ .Values.bootstrap.externalImages.openfgaCli | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # openfga/cli image is distroless -- no shell. Invoke /fga directly.
+          # --config /shared/.fga.yaml supplies api-url + store-id + api-token.
+          # --file fga.mod triggers modular auto-detection; the CLI parses fga.mod,
+          # reads each components/*.fga relative to the manifest, and POSTs JSON.
+          command: ["/fga"]
+          args:
+            - --config
+            - /shared/.fga.yaml
+            - model
+            - write
+            - --file
+            - /etc/datuplet/fga/fga.mod
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+            - name: fga-model
+              mountPath: /etc/datuplet/fga
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
+
+      containers:
+        - name: apply
+          image: {{ .Values.bootstrap.externalImages.kubectl | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              FGA={{ include "datuplet-app.openfgaHttpUrl" . | quote }}
+              NS={{ .Release.Namespace | quote }}
+              VERSION={{ .Values.fgaModel.version | quote }}
+              FGA_CONFIG_SECRET="{{ include "datuplet-app.prefix" . }}fga-config"
+              STORE_ID=$(cat /shared/store_id)
+              echo "STORE_ID=$STORE_ID VERSION=$VERSION"
+
+              # Distroless model-write container can't pipe stdout to a file,
+              # so we query the latest model_id from REST. There is exactly one
+              # new model per upload; page_size=1 + first entry gives the id.
+              MODEL_ID=$(curl -fsS \
+                -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                "$FGA/stores/$STORE_ID/authorization-models?page_size=1" \
+                | jq -r '.authorization_models[0].id')
+              if [ -z "$MODEL_ID" ] || [ "$MODEL_ID" = "null" ]; then
+                echo "ERROR: no authorization model found in store $STORE_ID" >&2
+                exit 1
+              fi
+              echo "MODEL_ID=$MODEL_ID"
+
+              # Pin-existence + DSL hash drift check.
+              # Sentinel ConfigMap stores the SHA-256 of DSL files at upload time,
+              # keyed by sanitized version. Re-runs compare current hash to stored:
+              #   pin absent -> upload + write sentinel
+              #   pin present, hash matches -> no-op (idempotent)
+              #   pin present, hash differs -> fail loudly
+              SENTINEL_NAME="{{ include "datuplet-app.prefix" . }}fga-version-sentinel"
+              # Sanitize dots OUT of the key (in addition to other non-alphanum
+              # chars). Dots break kubectl's jsonpath path-resolution
+              # (`.data.fga-version-4.4-hash` is parsed as nested `.data` ->
+              # `.fga-version-4` -> `.4-hash` and returns empty).
+              SENTINEL_KEY="fga-version-${FGA_VERSION//[^a-zA-Z0-9-]/-}-hash"
+              PIN=$(curl -fsS -X POST "$FGA/stores/$STORE_ID/read" \
+                -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "{\"tuple_key\":{\"relation\":\"openfga_id\",\"object\":\"model_version:collaboration-$VERSION\"}}" \
+                | jq -r '.tuples[0].key.user' 2>/dev/null || echo "")
+              STORED_HASH=$(kubectl get configmap -n "$NS" "$SENTINEL_NAME" \
+                -o "jsonpath={.data.$SENTINEL_KEY}" 2>/dev/null || echo "")
+
+              if [ -n "$PIN" ] && [ "$PIN" != "null" ]; then
+                if [ -z "$STORED_HASH" ]; then
+                  echo "Pin exists but sentinel ConfigMap missing -- writing sentinel for $FGA_VERSION."
+                elif [ "$STORED_HASH" = "$FGA_DSL_HASH" ]; then
+                  echo "Model version $FGA_VERSION already pinned with matching hash -- skipping upload."
+                  exit 0
+                else
+                  echo "ERROR: DSL hash mismatch for version $FGA_VERSION." >&2
+                  echo "  stored:  $STORED_HASH" >&2
+                  echo "  current: $FGA_DSL_HASH" >&2
+                  echo "Refusing to upload silently. Either revert DSL changes or bump fgaModel.version." >&2
+                  exit 1
+                fi
+              fi
+
+              # Write the two model_version pin tuples.
+              # The lakekeeper v{{ .Values.fgaModel.version }} model_version type defines two relations:
+              #   exists:     [auth_model_id:*]   -- wildcard only (a marker)
+              #   openfga_id: [auth_model_id]     -- a specific instance
+              echo "Writing model_version pin tuples for collaboration-$VERSION..."
+              curl -fsS -X POST "$FGA/stores/$STORE_ID/write" \
+                -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "{\"writes\":{\"tuple_keys\":[{\"user\":\"auth_model_id:*\",\"relation\":\"exists\",\"object\":\"model_version:collaboration-$VERSION\"}]}}" \
+                2>&1 | head -c 400 || true
+              echo
+
+              # Delete any stale openfga_id pins for this model_version
+              # before writing the fresh one. Empty list is a no-op.
+              EXISTING=$(curl -fsS -X POST "$FGA/stores/$STORE_ID/read" \
+                -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "{\"tuple_key\":{\"relation\":\"openfga_id\",\"object\":\"model_version:collaboration-$VERSION\"}}" \
+                | jq -c '.tuples // [] | map(.key)')
+              if [ -n "$EXISTING" ] && [ "$EXISTING" != "[]" ]; then
+                echo "Deleting stale openfga_id pin tuples: $EXISTING"
+                curl -fsS -X POST "$FGA/stores/$STORE_ID/write" \
+                  -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"deletes\":{\"tuple_keys\":$EXISTING}}" \
+                  2>&1 | head -c 400 || true
+                echo
+              fi
+
+              curl -fsS -X POST "$FGA/stores/$STORE_ID/write" \
+                -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "{\"writes\":{\"tuple_keys\":[
+                      {\"user\":\"auth_model_id:$MODEL_ID\",\"relation\":\"openfga_id\",\"object\":\"model_version:collaboration-$VERSION\"}
+                    ]}}" \
+                2>&1 | head -c 400
+              echo
+
+              # Apply chart-managed Secret with store_id + model_id.
+              # --dry-run=client | apply overwrites on upgrade so the cached
+              # model_id stays fresh. resource-policy=keep guards against
+              # `helm uninstall` removing it while pipeline-api is still
+              # referencing it.
+              echo "Writing $FGA_CONFIG_SECRET in $NS (store_id=$STORE_ID, model_id=$MODEL_ID)"
+              kubectl create secret generic "$FGA_CONFIG_SECRET" \
+                -n "$NS" \
+                --from-literal=store_id="$STORE_ID" \
+                --from-literal=model_id="$MODEL_ID" \
+                --dry-run=client -o yaml \
+                | kubectl apply -f -
+              kubectl annotate secret "$FGA_CONFIG_SECRET" -n "$NS" \
+                helm.sh/resource-policy=keep --overwrite
+              echo "Authz bootstrap complete (store=$STORE_ID model=$MODEL_ID)"
+
+              # Update the sentinel ConfigMap with the DSL hash for this version.
+              # --dry-run=client | apply is idempotent; resource-policy=keep
+              # prevents helm uninstall from removing drift-detection history.
+              kubectl create configmap -n "$NS" "$SENTINEL_NAME" \
+                --from-literal="$SENTINEL_KEY=$FGA_DSL_HASH" \
+                --dry-run=client -o yaml | kubectl apply -f -
+              kubectl annotate configmap -n "$NS" "$SENTINEL_NAME" \
+                helm.sh/resource-policy=keep --overwrite
+              echo "Sentinel updated for $FGA_VERSION (hash=$FGA_DSL_HASH)."
+          env:
+            # Computed at chart-render time: SHA-256 of all DSL files combined.
+            - name: FGA_DSL_HASH
+              value: "{{ printf "%s%s%s%s%s%s%s%s%s%s" (.Files.Get "files/fga/fga.mod") (.Files.Get "files/fga/components/lakekeeper_table.fga") (.Files.Get "files/fga/components/lakekeeper_view.fga") (.Files.Get "files/fga/components/model_version.fga") (.Files.Get "files/fga/components/namespace.fga") (.Files.Get "files/fga/components/project.fga") (.Files.Get "files/fga/components/role.fga") (.Files.Get "files/fga/components/server.fga") (.Files.Get "files/fga/components/user.fga") (.Files.Get "files/fga/components/warehouse.fga") | sha256sum }}"
+            - name: FGA_VERSION
+              value: {{ .Values.fgaModel.version | quote }}
+            - name: OPENFGA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "datuplet-app.prefix" . }}openfga-api-key
+                  key: keys
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
+
+      volumes:
+        - name: fga-model
+          configMap:
+            name: {{ include "datuplet-app.prefix" . }}fga-model
+            items:
+              - { key: fga.mod,                path: fga.mod }
+              - { key: model_version.fga,      path: components/model_version.fga }
+              - { key: user.fga,               path: components/user.fga }
+              - { key: role.fga,               path: components/role.fga }
+              - { key: server.fga,             path: components/server.fga }
+              - { key: project.fga,            path: components/project.fga }
+              - { key: warehouse.fga,          path: components/warehouse.fga }
+              - { key: namespace.fga,          path: components/namespace.fga }
+              - { key: lakekeeper_table.fga,   path: components/lakekeeper_table.fga }
+              - { key: lakekeeper_view.fga,    path: components/lakekeeper_view.fga }
+        - name: shared
+          emptyDir:
+            medium: Memory

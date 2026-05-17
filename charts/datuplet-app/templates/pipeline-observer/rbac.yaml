@@ -1,0 +1,51 @@
+{{- /*
+pipeline-observer ServiceAccount + ClusterRole + ClusterRoleBinding
+
+
+Observer watches PipelineRun CRDs cluster-wide because PipelineRuns live
+in per-project namespaces (`datuplet-<uuid>`) created lazily by
+pipeline-api's trigger path. Read-only verbs only — the observer mirrors
+state into Postgres but never mutates K8s.
+
+Observer needs only `watch`/`list`/`get` on `pipelineruns.datuplet.io`.
+Pod reads aren't currently used by observer.go — it watches PipelineRun
+only. If a future change needs pod status mirroring, add `["pods"]` to
+this ClusterRole at that time.
+*/ -}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pipeline-observer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pipeline-observer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-pipeline-observer
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+rules:
+  # PipelineRun watch/list/get for the controller-runtime informer
+  # (pkg/pipelineapi/k8s/observer.go).
+  - apiGroups: ["datuplet.io"]
+    resources: ["pipelineruns"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-pipeline-observer
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-observer
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-pipeline-observer
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datuplet-sandbox"
+version = "0.1.0"
+description = "Datuplet sandbox library for querying data lake tables via DuckDB"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]

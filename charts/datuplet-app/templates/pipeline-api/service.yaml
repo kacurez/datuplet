@@ -1,0 +1,28 @@
+{{- /*
+pipeline-api Service.
+
+NodePort is the default for OrbStack dev — exposes :30081 on the node so
+the browser UI at http://localhost:30081/ui/ works without a port-forward.
+Production deployments should change pipelineApi.service.type to ClusterIP
+and front with an Ingress + TLS.
+*/ -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}pipeline-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pipeline-api
+spec:
+  type: {{ .Values.pipelineApi.service.type }}
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+      {{- if eq .Values.pipelineApi.service.type "NodePort" }}
+      nodePort: {{ .Values.pipelineApi.service.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-api") | nindent 4 }}

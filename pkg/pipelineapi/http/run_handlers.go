@@ -1,0 +1,169 @@
+package http
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/google/uuid"
+
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
+)
+
+type runJSON struct {
+	ID           string `json:"id"`
+	ProjectID    string `json:"project_id,omitempty"`
+	PipelineID   string `json:"pipeline_id,omitempty"`
+	PipelineName string `json:"pipeline_name,omitempty"`
+	Phase        string `json:"phase"`
+	CurrentStage string `json:"current_stage,omitempty"`
+	Message      string `json:"message,omitempty"`
+	CreatedAt    string `json:"created_at"`
+}
+
+func runToJSON(v store.RunView) runJSON {
+	j := runJSON{
+		ID: v.ID.String(),
+		Phase: v.Phase, CurrentStage: v.CurrentStage, Message: v.Message,
+		CreatedAt:    v.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		PipelineName: v.PipelineName,
+	}
+	if v.PipelineID != uuid.Nil {
+		j.PipelineID = v.PipelineID.String()
+	}
+	if v.ProjectID != nil {
+		j.ProjectID = v.ProjectID.String()
+	}
+	return j
+}
+
+// handleTriggerRun is POST /api/v1/projects/:pid/pipelines/:name/runs.
+//
+// The handler is a thin adapter: it resolves auth, looks up the pipeline
+// YAML, parses it once, and hands everything off to s.backend.TriggerRun.
+// The backend owns ordering of DB insert, CRD apply, token mint, and
+// PipelineRun + Secret creation (cluster mode) or Docker execution
+// (local mode).
+func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
+	user, authed := auth.UserFromContext(r.Context())
+	if !authed {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	_, projectID, ok := s.mustHaveRelation(w, r, "data_admin")
+	if !ok {
+		return
+	}
+	pipelineName := r.PathValue("name")
+
+	pipe, err := s.pipelines.GetByName(r.Context(), projectID, pipelineName)
+	if errors.Is(err, errStoreNotFound) {
+		writeError(w, http.StatusNotFound, "pipeline not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "get pipeline")
+		return
+	}
+
+	// Re-parse the stored YAML so capability derivation always matches
+	// what ApplyPipelineCRD will materialize. A parse failure here would
+	// be surprising — the same YAML was validated on PUT /pipelines — so
+	// treat it as a client-side 400. No run row is inserted yet, so this
+	// doesn't leave a ghost row behind.
+	parsed, err := config.Parse([]byte(pipe.YAML))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "pipeline YAML invalid: "+err.Error())
+		return
+	}
+
+	resp, err := s.backend.TriggerRun(r.Context(), runbackend.TriggerRequest{
+		ProjectID:    projectID,
+		UserID:       user.ID,
+		PipelineName: pipelineName,
+		PipelineID:   pipe.ID, // zero in local mode
+		PipelineYAML: []byte(pipe.YAML),
+		Parsed:       parsed,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"id":     resp.RunID.String(),
+		"status": "Pending",
+		"k8s_ns": resp.Namespace,
+	})
+}
+
+func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
+	_, projectID, ok := s.mustHaveRelation(w, r, "describe")
+	if !ok {
+		return
+	}
+	runs, err := s.runs.ListForProject(r.Context(), projectID, 100)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list runs")
+		return
+	}
+	out := make([]runJSON, 0, len(runs))
+	for _, rn := range runs {
+		out = append(out, runToJSON(rn))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
+	_, projectID, ok := s.mustHaveRelation(w, r, "describe")
+	if !ok {
+		return
+	}
+	rid, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	run, err := s.runs.GetByID(r.Context(), projectID, rid)
+	if errors.Is(err, errStoreNotFound) {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "get run")
+		return
+	}
+	writeJSON(w, http.StatusOK, runToJSON(run))
+}
+
+// handleCancelRun is POST /api/v1/projects/:pid/runs/:id/cancel.
+//
+// The handler is a thin adapter around s.backend.CancelRun; the backend
+// owns the terminal-phase guard, CRD deletion, detached-context DB
+// update, and token revocation.
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
+	_, projectID, ok := s.mustHaveRelation(w, r, "data_admin")
+	if !ok {
+		return
+	}
+	rid, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	err = s.backend.CancelRun(r.Context(), runbackend.CancelRequest{
+		ProjectID: projectID,
+		RunID:     rid,
+	})
+	if errors.Is(err, store.ErrRunNotFound) {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}

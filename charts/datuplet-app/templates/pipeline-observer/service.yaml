@@ -1,0 +1,25 @@
+{{- /*
+pipeline-observer Service.
+
+ClusterIP Service exposing /healthz + /metrics on port 8081. Used by
+Prometheus scrapers and A7's e2e validation. The observer doesn't serve
+any HTTP API beyond metrics + health — no need for NodePort or LB.
+*/ -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}pipeline-observer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pipeline-observer
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-observer") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8081
+      targetPort: 8081
+      protocol: TCP

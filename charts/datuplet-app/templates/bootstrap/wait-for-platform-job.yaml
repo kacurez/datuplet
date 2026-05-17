@@ -1,0 +1,92 @@
+{{- /*
+wait-for-platform pre-install Job.
+
+Validates that datuplet-infra is fully installed and ready before datuplet-app
+proceeds. Fails fast with actionable error messages if anything is missing.
+Runs as a helm pre-install hook so it blocks before any main resource applies.
+
+Checks:
+  1. CNPG cluster pg is "Cluster in healthy state"
+  2. signing-key Secret exists
+  3. pg-pipeline-api Secret exists
+  4. openfga-api-key Secret exists
+
+Note: The FGA pin tuple check lives in the datuplet-lakekeeper chart.
+authz-bootstrap (which writes the pin) is a datuplet-app post-install Job,
+so checking for the pin here would deadlock. The pin gate lives in
+charts/datuplet-lakekeeper/templates/bootstrap/wait-for-fga-pin-job.yaml,
+which runs as a pre-install hook on the lakekeeper chart (Phase 4).
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}wait-for-platform
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "wait-for-platform") | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      serviceAccountName: {{ include "datuplet-app.prefix" . }}bootstrap
+      restartPolicy: OnFailure
+      containers:
+        - name: check
+          image: {{ .Values.bootstrap.externalImages.kubectl | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              NS={{ .Release.Namespace | quote }}
+              CLUSTER={{ include "datuplet-app.platformClusterName" . | quote }}
+              SIGNING_KEY={{ include "datuplet-app.platformSigningKeySecret" . | quote }}
+              PG_SECRET={{ include "datuplet-app.platformPgPipelineApiSecret" . | quote }}
+              PG_PW_SECRET={{ include "datuplet-app.platformPgPipelineApiPwSecret" . | quote }}
+              FGA_KEY_SECRET={{ include "datuplet-app.platformOpenfgaApiKeySecret" . | quote }}
+
+              fail() {
+                echo "ERROR: $1" >&2
+                echo "" >&2
+                echo "Did you install datuplet-infra first?" >&2
+                echo "  helm install datuplet-infra charts/datuplet-infra -n $NS --wait" >&2
+                exit 1
+              }
+
+              echo "1/4 Checking CNPG Cluster $CLUSTER..."
+              phase=$(kubectl get cluster.postgresql.cnpg.io "$CLUSTER" -n "$NS" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+              if [ "$phase" != "Cluster in healthy state" ]; then
+                fail "CNPG cluster '$CLUSTER' not healthy (phase: '$phase')"
+              fi
+
+              echo "2/4 Checking signing-key Secret $SIGNING_KEY..."
+              kubectl get secret -n "$NS" "$SIGNING_KEY" >/dev/null 2>&1 \
+                || fail "Secret '$SIGNING_KEY' not found"
+
+              echo "3/4 Checking pipeline-api Postgres Secret $PG_SECRET..."
+              kubectl get secret -n "$NS" "$PG_SECRET" >/dev/null 2>&1 \
+                || fail "Secret '$PG_SECRET' not found"
+              kubectl get secret -n "$NS" "$PG_PW_SECRET" >/dev/null 2>&1 \
+                || fail "Secret '$PG_PW_SECRET' not found"
+
+              echo "4/4 Checking OpenFGA API key Secret $FGA_KEY_SECRET..."
+              kubectl get secret -n "$NS" "$FGA_KEY_SECRET" >/dev/null 2>&1 \
+                || fail "Secret '$FGA_KEY_SECRET' not found"
+
+              echo "Preflight passed."
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}

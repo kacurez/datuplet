@@ -1,0 +1,10 @@
+{{/* charts/datuplet-app/templates/NOTES.txt */}}
+Datuplet app installed in namespace {{ .Release.Namespace }} as release {{ .Release.Name }}.
+
+Pipeline-api Service: NodePort {{ .Values.pipelineApi.service.nodePort }} (http://localhost:{{ .Values.pipelineApi.service.nodePort }}/ui/ on OrbStack).
+
+To complete first-time setup (admin user, project, warehouse registration):
+
+  ./scripts/register.sh --namespace {{ .Release.Namespace }}
+
+See docs/install.md.

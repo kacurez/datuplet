@@ -1,0 +1,166 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Tag pushes are explicit user actions; no cancel-in-progress.
+permissions:
+  contents: write    # chart-releaser commits to gh-pages + creates Releases
+  packages: write    # ghcr.io image push
+
+env:
+  REGISTRY: ghcr.io
+  # ${{ github.repository_owner }} resolves to "kacurez" on the public repo.
+
+jobs:
+  images:
+    name: build + push images to ghcr.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      minor:   ${{ steps.meta.outputs.minor }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pipeline-api
+            dockerfile: utils/docker/Dockerfile.pipeline-api
+          - name: pipeline-observer
+            dockerfile: utils/docker/Dockerfile.pipeline-observer
+          - name: pipeline-operator
+            dockerfile: utils/docker/Dockerfile.pipeline-operator
+          - name: gateway
+            dockerfile: utils/docker/Dockerfile.gateway
+          - name: iceberg-job
+            dockerfile: utils/docker/Dockerfile.iceberg-job
+          - name: data-generator
+            dockerfile: components/data-generator/Dockerfile
+          - name: sql-transform
+            dockerfile: components/sql-transform/Dockerfile
+          - name: stdout-writer
+            dockerfile: components/stdout-writer/Dockerfile
+          - name: http-json-extractor
+            dockerfile: components/http-json-extractor/Dockerfile
+          - name: finnhub-extractor
+            dockerfile: components/finnhub-extractor/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version tags
+        id: meta
+        run: |
+          set -eu
+          REF="${GITHUB_REF#refs/tags/}"          # v0.1.0
+          VERSION="${REF#v}"                        # 0.1.0
+          MINOR="${VERSION%.*}"                     # 0.1
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "minor=$MINOR"     >> "$GITHUB_OUTPUT"
+          echo "ref=$REF"         >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push (multi-arch)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.meta.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.meta.outputs.minor }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+
+  charts:
+    name: package + publish helm charts
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.4'
+
+      - name: Pin chart image tags + versions to release tag
+        env:
+          VERSION:  ${{ needs.images.outputs.version }}
+          REGISTRY: ${{ env.REGISTRY }}
+          OWNER:    ${{ github.repository_owner }}
+        run: |
+          set -eu
+          APP_VALUES=charts/datuplet-app/values.yaml
+          INFRA_VALUES=charts/datuplet-infra/values.yaml
+
+          # Repoint image.repository to ghcr.io/<owner>/<image>. The five
+          # image refs in datuplet-app and the one in datuplet-infra are
+          # the only "repository: datuplet/X" lines in these files, so
+          # bare-line sed is unambiguous.
+          for img in pipeline-api pipeline-operator pipeline-observer gateway iceberg-job; do
+            sed -i "s|repository: datuplet/${img}\$|repository: ${REGISTRY}/${OWNER}/${img}|" "$APP_VALUES"
+          done
+          sed -i "s|repository: datuplet/pipeline-api\$|repository: ${REGISTRY}/${OWNER}/pipeline-api|" "$INFRA_VALUES"
+
+          # Pin every `tag: latest` line in both values files to the
+          # release version. No other "tag: latest" lines appear in these
+          # files (grep verifies before substitution). Note: -P (PCRE)
+          # cannot be combined with -E (ERE) in GNU grep — drop -E.
+          for f in "$APP_VALUES" "$INFRA_VALUES"; do
+            if grep -qP "tag:[[:space:]]+(?!latest$)" "$f"; then
+              echo "ERROR: $f has a non-'latest' tag line; refusing blanket replace" >&2
+              grep -nE "tag:" "$f" >&2 || true
+              exit 1
+            fi
+            sed -i "s|tag: latest|tag: ${VERSION}|g" "$f"
+          done
+
+          echo "--- pinned datuplet-app values (image block) ---"
+          sed -n '1,28p' "$APP_VALUES"
+          echo "--- pinned datuplet-infra values (image block) ---"
+          sed -n '1,10p' "$INFRA_VALUES"
+
+          # Bump every chart's Chart.yaml version + appVersion to match
+          # the release tag.
+          for chart in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do
+            sed -i -E "s|^version: .*\$|version: ${VERSION}|" "charts/${chart}/Chart.yaml"
+            sed -i -E "s|^appVersion: .*\$|appVersion: \"${VERSION}\"|" "charts/${chart}/Chart.yaml"
+          done
+          echo "--- Chart.yaml versions ---"
+          for chart in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do
+            echo "[$chart]"
+            grep -E "^version:|^appVersion:" "charts/${chart}/Chart.yaml" || true
+          done
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          charts_dir: charts
+          skip_existing: true
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CR_SKIP_EXISTING: "true"

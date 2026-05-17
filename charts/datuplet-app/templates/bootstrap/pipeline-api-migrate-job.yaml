@@ -1,0 +1,56 @@
+{{- /*
+pipeline-api-migrate: pre-install hook Job for DB schema migrations.
+
+Runs `pipeline-api admin migrate` against the CNPG-managed pipeline_api DB.
+Idempotent via pg_advisory_lock(20260419). hook-delete-policy ensures the
+Job is recreated cleanly on each helm upgrade (sidesteps Job spec
+immutability) and deleted after success (keeps namespace tidy).
+
+No wait-for-cnpg needed: Layer 1's helm install --wait --wait-for-jobs has
+already completed before Layer 2 starts, so CNPG cluster is healthy.
+wait-for-platform pre-install hook (-5 weight) validates this; this hook
+runs at weight 5 after wait-for-platform passes.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}pipeline-api-migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "pipeline-api") | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["pipeline-api", "admin", "migrate"]
+          envFrom:
+            - secretRef:
+                name: {{ include "datuplet-app.platformPgPipelineApiSecret" . }}
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "datuplet-app.platformPgPipelineApiPwSecret" . }}
+                  key: password
+            - name: DATABASE_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml .Values.bootstrap.resources | nindent 12 }}
