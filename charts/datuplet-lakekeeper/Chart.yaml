@@ -4,7 +4,9 @@ description: Datuplet Lakekeeper Iceberg REST catalog (Phase 4 of the 5-phase in
 type: application
 version: 0.1.0
 appVersion: "1.0"
-home: https://github.com/keboola/datuplet
+home: https://github.com/kacurez/datuplet
+sources:
+  - https://github.com/kacurez/datuplet
 maintainers:
   - name: kacurez
     email: tomas.kacur@keboola.com
