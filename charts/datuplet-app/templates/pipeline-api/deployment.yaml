@@ -57,6 +57,10 @@ spec:
         - name: {{ . }}
         {{- end }}
       {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       # FGA model pin is written by the authz-bootstrap pre-install hook Job
       # (weight 20) before pipeline-api starts. No initContainer needed;
       # pipeline-api fails fast on missing pin via authz.ResolveStoreAndModel.

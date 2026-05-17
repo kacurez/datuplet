@@ -42,3 +42,12 @@ spec:
             key: 04-db-pipeline_api.sql
           - name: {{ include "datuplet-infra.prefix" . }}pg-init-sql
             key: 05-grants.sql
+  {{- with .Values.tolerations }}
+  # CNPG Cluster propagates these tolerations to the spawned Postgres pods.
+  # Same chart-global toleration list that pod-spec templates pick up via
+  # .Values.tolerations — keeps the pod-placement story consistent across
+  # the chart.
+  affinity:
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}

@@ -50,6 +50,10 @@ spec:
         - name: {{ . }}
         {{- end }}
       {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: pipeline-observer
           image: "{{ .Values.image.pipelineObserver.repository }}:{{ .Values.image.pipelineObserver.tag }}"

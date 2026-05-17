@@ -32,6 +32,10 @@ spec:
     spec:
       serviceAccountName: {{ include "datuplet-infra.prefix" . }}keygen
       restartPolicy: OnFailure
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         - name: wait-for-cnpg
           image: {{ .Values.bootstrap.externalImages.kubectl | quote }}

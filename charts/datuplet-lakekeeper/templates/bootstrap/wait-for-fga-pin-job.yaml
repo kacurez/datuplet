@@ -37,6 +37,10 @@ spec:
     spec:
       serviceAccountName: datuplet-lakekeeper-bootstrap
       restartPolicy: OnFailure
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: check
           image: bitnami/kubectl:latest

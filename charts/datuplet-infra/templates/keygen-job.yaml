@@ -40,6 +40,10 @@ spec:
     spec:
       serviceAccountName: {{ include "datuplet-infra.prefix" . }}keygen
       restartPolicy: OnFailure
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         - name: keygen
           image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"

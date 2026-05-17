@@ -32,6 +32,10 @@ spec:
         app.kubernetes.io/component: migrate
     spec:
       restartPolicy: OnFailure
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: migrate
           image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"

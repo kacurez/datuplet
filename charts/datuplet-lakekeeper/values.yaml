@@ -3,6 +3,14 @@
 # Phase 4 of the Datuplet 5-phase install.
 # Requires datuplet-infra (Phase 2) + datuplet-app (Phase 3) installed first.
 
+# Chart-global tolerations applied to the chart's own pod-spec templates
+# (wait-for-fga-pin Job). NOT applied to the lakekeeper subchart — set
+# lakekeeper.tolerations separately for that.
+#
+# Example (ARM node pool with kubernetes.io/arch=arm64:NoSchedule taint):
+#   --set-json 'tolerations=[{"key":"kubernetes.io/arch","operator":"Equal","value":"arm64","effect":"NoSchedule"}]'
+tolerations: []
+
 # Phase 2 (datuplet-infra) + Phase 3 (datuplet-app) coordinates that
 # lakekeeper needs. MUST match the originating chart's values.
 platform:

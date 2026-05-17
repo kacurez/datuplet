@@ -1,4 +1,15 @@
 # charts/datuplet-infra/values.yaml
+
+# Chart-global tolerations applied to the chart's own pod-spec templates
+# (keygen Job, openfga-dsn Job) AND to the CNPG Postgres Cluster CR's
+# spec.affinity.tolerations (which CNPG propagates to spawned postgres
+# pods). NOT applied to the OpenFGA subchart — set openfga.tolerations
+# separately for that.
+#
+# Example (ARM node pool with kubernetes.io/arch=arm64:NoSchedule taint):
+#   --set-json 'tolerations=[{"key":"kubernetes.io/arch","operator":"Equal","value":"arm64","effect":"NoSchedule"}]'
+tolerations: []
+
 image:
   pullPolicy: IfNotPresent
   pullSecrets: []

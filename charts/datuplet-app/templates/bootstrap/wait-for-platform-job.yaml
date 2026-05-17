@@ -39,6 +39,10 @@ spec:
     spec:
       serviceAccountName: {{ include "datuplet-app.prefix" . }}bootstrap
       restartPolicy: OnFailure
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: check
           image: {{ .Values.bootstrap.externalImages.kubectl | quote }}

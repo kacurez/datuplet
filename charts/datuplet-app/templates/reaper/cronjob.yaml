@@ -63,6 +63,10 @@ spec:
             - name: {{ . }}
             {{- end }}
           {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           containers:
             - name: reap
               image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"

@@ -1,4 +1,14 @@
 # charts/datuplet-app/values.yaml
+
+# Chart-global tolerations applied to EVERY pod-spec template in this
+# chart (pipeline-api, pipeline-observer, pipeline-operator, reaper
+# CronJob, authz-bootstrap Job, pipeline-api-migrate Job, wait-for-platform
+# Job). Pass-through to each pod's spec.tolerations.
+#
+# Example (ARM node pool with kubernetes.io/arch=arm64:NoSchedule taint):
+#   --set-json 'tolerations=[{"key":"kubernetes.io/arch","operator":"Equal","value":"arm64","effect":"NoSchedule"}]'
+tolerations: []
+
 image:
   pullPolicy: IfNotPresent
   pullSecrets: []

@@ -41,6 +41,10 @@ spec:
         - name: {{ . }}
         {{- end }}
       {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: operator
           image: "{{ .Values.image.pipelineOperator.repository }}:{{ .Values.image.pipelineOperator.tag }}"
