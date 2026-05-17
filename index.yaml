@@ -1,0 +1,91 @@
+apiVersion: v1
+entries:
+  datuplet-app:
+  - apiVersion: v2
+    appVersion: 0.1.3
+    created: "2026-05-17T16:41:02.264200398Z"
+    description: Datuplet control plane — pipeline-api, pipeline-operator, CRDs, pipeline-observer,
+      and reaper (Phase 3 of the 5-phase install). Requires datuplet-infra (Phase
+      2) installed first. Lakekeeper is Phase 4 (charts/datuplet-lakekeeper).
+    digest: 623556fed267decfe2259d87912801001d737dcbb0c1412378efeeb742a72880
+    home: https://github.com/keboola/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-app
+    type: application
+    urls:
+    - datuplet-app-0.1.3.tgz
+    version: 0.1.3
+  datuplet-infra:
+  - apiVersion: v2
+    appVersion: 0.1.3
+    created: "2026-05-17T16:41:02.413747821Z"
+    dependencies:
+    - condition: openfga.enabled
+      name: openfga
+      repository: https://openfga.github.io/helm-charts
+      version: 0.3.3
+    - condition: minio.enabled
+      name: minio
+      repository: https://charts.min.io/
+      version: ~5.4.0
+    description: Datuplet infrastructure layer — CNPG Postgres Cluster, OpenFGA, MinIO,
+      NetworkPolicies, and FGA model bootstrap. Requires datuplet-operators to be
+      installed first.
+    digest: eb4d1861b3251a0e821166f1bcb99c2d564996f44d5b94cad9fd6eb4cc044e84
+    home: https://github.com/keboola/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-infra
+    type: application
+    urls:
+    - datuplet-infra-0.1.3.tgz
+    version: 0.1.3
+  datuplet-lakekeeper:
+  - apiVersion: v2
+    appVersion: 0.1.3
+    created: "2026-05-17T16:41:02.559063662Z"
+    dependencies:
+    - alias: lakekeeper
+      condition: lakekeeper.enabled
+      name: lakekeeper
+      repository: https://lakekeeper.github.io/lakekeeper-charts
+      version: 0.10.0
+    description: Datuplet Lakekeeper Iceberg REST catalog (Phase 4 of the 5-phase
+      install). Requires datuplet-infra (Phase 2) + datuplet-app (Phase 3) installed
+      first.
+    digest: 7f0ee1cf1c6da765451f6f9037debfe95de2e0acda34c89e8dbb90729882fe35
+    home: https://github.com/keboola/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-lakekeeper
+    type: application
+    urls:
+    - datuplet-lakekeeper-0.1.3.tgz
+    version: 0.1.3
+  datuplet-operators:
+  - apiVersion: v2
+    appVersion: 0.1.3
+    created: "2026-05-17T16:41:02.752659809Z"
+    dependencies:
+    - condition: cloudnative-pg.enabled
+      name: cloudnative-pg
+      repository: https://cloudnative-pg.github.io/charts
+      version: 0.23.0
+    description: Datuplet operators — CNPG (CloudNativePG) operator. Install before
+      datuplet-infra so the operator's mutating webhook has endpoints when the Cluster
+      CR is applied.
+    digest: 9a7485137076ada4c1cb80483ed05d7924fefc5242894267d139ed007e30fa7a
+    home: https://github.com/keboola/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-operators
+    type: application
+    urls:
+    - datuplet-operators-0.1.3.tgz
+    version: 0.1.3
+generated: "2026-05-17T16:41:02.752671135Z"
