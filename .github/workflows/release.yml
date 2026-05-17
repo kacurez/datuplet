@@ -5,41 +5,112 @@ on:
     tags:
       - 'v*.*.*'
 
-# These are the maximum permissions any called workflow can request.
-# The reusable build + manifest workflows declare their own (narrower)
-# permissions blocks.
 permissions:
-  contents: write    # charts job: gh-pages bootstrap + chart-releaser commits + Release entries
-  packages: write    # build + manifest workflows: ghcr.io push
+  contents: write    # charts job: gh-pages bootstrap + chart-releaser commits
+  packages: write    # image jobs: ghcr.io push
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  # Reusable workflow call — appears as ONE collapsible "build images"
-  # entry in the run-detail UI, containing 20 sub-jobs (10 images × 2 archs).
-  build:
-    name: build images
-    uses: ./.github/workflows/_release-build.yml
+  # Per-image reusable workflow call. Each entry below appears as one
+  # collapsible row in the run-detail UI labeled with the image name.
+  # Inside each row: amd64 / arm64 / manifest sub-jobs.
+  pipeline-api:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: pipeline-api
+      dockerfile: utils/docker/Dockerfile.pipeline-api
     secrets: inherit
 
-  # Reusable workflow call — appears as ONE collapsible "manifest images"
-  # entry containing 10 sub-jobs (one tagged multi-arch manifest per image).
-  manifest:
-    name: manifest images
-    needs: build
-    uses: ./.github/workflows/_release-manifest.yml
+  pipeline-observer:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: pipeline-observer
+      dockerfile: utils/docker/Dockerfile.pipeline-observer
+    secrets: inherit
+
+  pipeline-operator:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: pipeline-operator
+      dockerfile: utils/docker/Dockerfile.pipeline-operator
+    secrets: inherit
+
+  gateway:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: gateway
+      dockerfile: utils/docker/Dockerfile.gateway
+    secrets: inherit
+
+  iceberg-job:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: iceberg-job
+      dockerfile: utils/docker/Dockerfile.iceberg-job
+    secrets: inherit
+
+  data-generator:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: data-generator
+      dockerfile: components/data-generator/Dockerfile
+    secrets: inherit
+
+  sql-transform:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: sql-transform
+      dockerfile: components/sql-transform/Dockerfile
+    secrets: inherit
+
+  stdout-writer:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: stdout-writer
+      dockerfile: components/stdout-writer/Dockerfile
+    secrets: inherit
+
+  http-json-extractor:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: http-json-extractor
+      dockerfile: components/http-json-extractor/Dockerfile
+    secrets: inherit
+
+  finnhub-extractor:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: finnhub-extractor
+      dockerfile: components/finnhub-extractor/Dockerfile
     secrets: inherit
 
   charts:
     name: package + publish helm charts
-    needs: manifest
+    needs:
+      - pipeline-api
+      - pipeline-observer
+      - pipeline-operator
+      - gateway
+      - iceberg-job
+      - data-generator
+      - sql-transform
+      - stdout-writer
+      - http-json-extractor
+      - finnhub-extractor
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # Use the RELEASE_TOKEN PAT so subsequent git pushes and
+          # chart-releaser's Release-creation API calls use the PAT's
+          # identity, not GITHUB_TOKEN. GITHUB_TOKEN's Contents:write is
+          # silently insufficient for repos.releases.create on
+          # personal-account public repos.
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Configure git author
         run: |
@@ -110,7 +181,7 @@ jobs:
 
       - name: Bootstrap gh-pages branch if it does not exist
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -eu
           if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
@@ -118,18 +189,13 @@ jobs:
             exit 0
           fi
           echo "gh-pages missing; creating orphan branch with .nojekyll."
-          # Stash any unstaged changes from the chart-pin step so the
-          # orphan-branch checkout doesn't carry them. Restore after.
           git stash -u --include-untracked --quiet || true
           git switch --orphan gh-pages
-          # Clean any inherited files; orphan branch starts empty.
           git rm -rf . >/dev/null 2>&1 || true
           touch .nojekyll
           git add .nojekyll
           git commit -m "Initialize gh-pages branch"
           git push --set-upstream origin gh-pages
-          # Switch back to the tagged commit so chart-releaser sees the
-          # pinned chart values. The stash carried the chart-pin edits.
           git switch --detach "${GITHUB_SHA}"
           git stash pop --quiet || true
 
@@ -138,6 +204,7 @@ jobs:
         with:
           charts_dir: charts
           skip_existing: true
+          token: ${{ secrets.RELEASE_TOKEN }}
         env:
-          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CR_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           CR_SKIP_EXISTING: "true"
