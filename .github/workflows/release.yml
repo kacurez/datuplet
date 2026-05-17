@@ -5,148 +5,31 @@ on:
     tags:
       - 'v*.*.*'
 
+# These are the maximum permissions any called workflow can request.
+# The reusable build + manifest workflows declare their own (narrower)
+# permissions blocks.
 permissions:
-  contents: write    # chart-releaser commits to gh-pages + creates Releases
-  packages: write    # ghcr.io image push
+  contents: write    # charts job: gh-pages bootstrap + chart-releaser commits + Release entries
+  packages: write    # build + manifest workflows: ghcr.io push
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
+  # Reusable workflow call — appears as ONE collapsible "build images"
+  # entry in the run-detail UI, containing 20 sub-jobs (10 images × 2 archs).
   build:
-    name: ${{ matrix.image.name }} / ${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
-    runs-on: ${{ matrix.platform == 'linux/amd64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
-        image:
-          - name: pipeline-api
-            dockerfile: utils/docker/Dockerfile.pipeline-api
-          - name: pipeline-observer
-            dockerfile: utils/docker/Dockerfile.pipeline-observer
-          - name: pipeline-operator
-            dockerfile: utils/docker/Dockerfile.pipeline-operator
-          - name: gateway
-            dockerfile: utils/docker/Dockerfile.gateway
-          - name: iceberg-job
-            dockerfile: utils/docker/Dockerfile.iceberg-job
-          - name: data-generator
-            dockerfile: components/data-generator/Dockerfile
-          - name: sql-transform
-            dockerfile: components/sql-transform/Dockerfile
-          - name: stdout-writer
-            dockerfile: components/stdout-writer/Dockerfile
-          - name: http-json-extractor
-            dockerfile: components/http-json-extractor/Dockerfile
-          - name: finnhub-extractor
-            dockerfile: components/finnhub-extractor/Dockerfile
-    steps:
-      - uses: actions/checkout@v6
+    name: build images
+    uses: ./.github/workflows/_release-build.yml
+    secrets: inherit
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to ghcr.io
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build + push by digest
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ${{ matrix.image.dockerfile }}
-          platforms: ${{ matrix.platform }}
-          # push-by-digest: push manifest list entries by content digest,
-          # without a tag. The `manifest` job below stitches per-platform
-          # digests into a single tagged multi-arch manifest list.
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.platform }}
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v7
-        with:
-          name: digest-${{ matrix.image.name }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
+  # Reusable workflow call — appears as ONE collapsible "manifest images"
+  # entry containing 10 sub-jobs (one tagged multi-arch manifest per image).
   manifest:
-    name: ${{ matrix.image }} manifest
+    name: manifest images
     needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        image:
-          - pipeline-api
-          - pipeline-observer
-          - pipeline-operator
-          - gateway
-          - iceberg-job
-          - data-generator
-          - sql-transform
-          - stdout-writer
-          - http-json-extractor
-          - finnhub-extractor
-    steps:
-      - name: Resolve version tags
-        id: meta
-        run: |
-          set -eu
-          REF="${GITHUB_REF#refs/tags/}"          # v0.1.0
-          VERSION="${REF#v}"                        # 0.1.0
-          MINOR="${VERSION%.*}"                     # 0.1
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "minor=$MINOR"     >> "$GITHUB_OUTPUT"
-
-      - name: Download per-arch digests for this image
-        uses: actions/download-artifact@v8
-        with:
-          pattern: digest-${{ matrix.image }}-*
-          merge-multiple: true
-          path: /tmp/digests
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to ghcr.io
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create multi-arch manifest
-        run: |
-          set -eu
-          IMG=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
-          cd /tmp/digests
-          docker buildx imagetools create \
-            -t "$IMG:${{ steps.meta.outputs.version }}" \
-            -t "$IMG:${{ steps.meta.outputs.minor }}" \
-            -t "$IMG:latest" \
-            $(printf "${IMG}@sha256:%s " *)
-
-      - name: Inspect manifest
-        run: |
-          docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+    uses: ./.github/workflows/_release-manifest.yml
+    secrets: inherit
 
   charts:
     name: package + publish helm charts
@@ -224,6 +107,31 @@ jobs:
             echo "[$chart]"
             grep -E "^version:|^appVersion:" "charts/${chart}/Chart.yaml" || true
           done
+
+      - name: Bootstrap gh-pages branch if it does not exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "gh-pages already exists; nothing to bootstrap."
+            exit 0
+          fi
+          echo "gh-pages missing; creating orphan branch with .nojekyll."
+          # Stash any unstaged changes from the chart-pin step so the
+          # orphan-branch checkout doesn't carry them. Restore after.
+          git stash -u --include-untracked --quiet || true
+          git switch --orphan gh-pages
+          # Clean any inherited files; orphan branch starts empty.
+          git rm -rf . >/dev/null 2>&1 || true
+          touch .nojekyll
+          git add .nojekyll
+          git commit -m "Initialize gh-pages branch"
+          git push --set-upstream origin gh-pages
+          # Switch back to the tagged commit so chart-releaser sees the
+          # pinned chart values. The stash carried the chart-pin edits.
+          git switch --detach "${GITHUB_SHA}"
+          git stash pop --quiet || true
 
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.7.0
