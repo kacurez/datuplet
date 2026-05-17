@@ -1,0 +1,50 @@
+name: release-services
+
+# Reusable: builds + manifests the five datuplet service images
+# (pipeline-api, pipeline-observer, pipeline-operator, gateway, iceberg-job).
+# Each is a call to _release-image.yml. Called once from release.yml as
+# the `datuplet-services` job; appears as a collapsible group in the
+# run-detail UI containing the five image rows.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  pipeline-api:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: pipeline-api
+      dockerfile: utils/docker/Dockerfile.pipeline-api
+    secrets: inherit
+
+  pipeline-observer:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: pipeline-observer
+      dockerfile: utils/docker/Dockerfile.pipeline-observer
+    secrets: inherit
+
+  pipeline-operator:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: pipeline-operator
+      dockerfile: utils/docker/Dockerfile.pipeline-operator
+    secrets: inherit
+
+  gateway:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: gateway
+      dockerfile: utils/docker/Dockerfile.gateway
+    secrets: inherit
+
+  iceberg-job:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: iceberg-job
+      dockerfile: utils/docker/Dockerfile.iceberg-job
+    secrets: inherit

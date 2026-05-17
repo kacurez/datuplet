@@ -7,98 +7,30 @@ on:
 
 permissions:
   contents: write    # charts job: gh-pages bootstrap + chart-releaser commits
-  packages: write    # image jobs: ghcr.io push
+  packages: write    # image jobs (via reusable workflows): ghcr.io push
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  # Per-image reusable workflow call. Each entry below appears as one
-  # collapsible row in the run-detail UI labeled with the image name.
-  # Inside each row: amd64 / arm64 / manifest sub-jobs.
-  pipeline-api:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: pipeline-api
-      dockerfile: utils/docker/Dockerfile.pipeline-api
+  # Service images: pipeline-api, pipeline-observer, pipeline-operator,
+  # gateway, iceberg-job. Appears as one top-level "datuplet-services"
+  # row in the run-detail UI; expanding shows the five image rows, each
+  # of which contains amd64/arm64/manifest sub-jobs.
+  datuplet-services:
+    uses: ./.github/workflows/_release-services.yml
     secrets: inherit
 
-  pipeline-observer:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: pipeline-observer
-      dockerfile: utils/docker/Dockerfile.pipeline-observer
-    secrets: inherit
-
-  pipeline-operator:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: pipeline-operator
-      dockerfile: utils/docker/Dockerfile.pipeline-operator
-    secrets: inherit
-
-  gateway:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: gateway
-      dockerfile: utils/docker/Dockerfile.gateway
-    secrets: inherit
-
-  iceberg-job:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: iceberg-job
-      dockerfile: utils/docker/Dockerfile.iceberg-job
-    secrets: inherit
-
-  data-generator:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: data-generator
-      dockerfile: components/data-generator/Dockerfile
-    secrets: inherit
-
-  sql-transform:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: sql-transform
-      dockerfile: components/sql-transform/Dockerfile
-    secrets: inherit
-
-  stdout-writer:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: stdout-writer
-      dockerfile: components/stdout-writer/Dockerfile
-    secrets: inherit
-
-  http-json-extractor:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: http-json-extractor
-      dockerfile: components/http-json-extractor/Dockerfile
-    secrets: inherit
-
-  finnhub-extractor:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: finnhub-extractor
-      dockerfile: components/finnhub-extractor/Dockerfile
+  # Component images: data-generator, sql-transform, stdout-writer,
+  # http-json-extractor, finnhub-extractor. Same UI shape as the
+  # services bucket.
+  components:
+    uses: ./.github/workflows/_release-components.yml
     secrets: inherit
 
   charts:
     name: package + publish helm charts
-    needs:
-      - pipeline-api
-      - pipeline-observer
-      - pipeline-operator
-      - gateway
-      - iceberg-job
-      - data-generator
-      - sql-transform
-      - stdout-writer
-      - http-json-extractor
-      - finnhub-extractor
+    needs: [datuplet-services, components]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
