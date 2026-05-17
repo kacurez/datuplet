@@ -105,12 +105,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          # Use the RELEASE_TOKEN PAT so subsequent git pushes and
-          # chart-releaser's Release-creation API calls use the PAT's
-          # identity, not GITHUB_TOKEN. GITHUB_TOKEN's Contents:write is
-          # silently insufficient for repos.releases.create on
-          # personal-account public repos.
-          token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Configure git author
         run: |
@@ -181,7 +175,7 @@ jobs:
 
       - name: Bootstrap gh-pages branch if it does not exist
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
@@ -200,11 +194,20 @@ jobs:
           git stash pop --quiet || true
 
       - name: Run chart-releaser
+        # packages_with_index=true uploads chart tarballs directly to the
+        # gh-pages branch alongside index.yaml; it BYPASSES the GitHub
+        # Releases API entirely. This is the no-PAT path: GITHUB_TOKEN's
+        # contents:write is sufficient for the git push, but the same
+        # token consistently returns 403 on POST /repos/.../releases for
+        # personal-account public repos (an undocumented limit). Helm
+        # consumers only read index.yaml, so `helm repo add` works
+        # identically — we just don't get per-chart entries on the
+        # GitHub Releases page.
         uses: helm/chart-releaser-action@v1.7.0
         with:
           charts_dir: charts
           skip_existing: true
-          token: ${{ secrets.RELEASE_TOKEN }}
+          packages_with_index: true
         env:
-          CR_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CR_SKIP_EXISTING: "true"
