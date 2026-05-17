@@ -5,27 +5,25 @@ on:
     tags:
       - 'v*.*.*'
 
-# Tag pushes are explicit user actions; no cancel-in-progress.
 permissions:
   contents: write    # chart-releaser commits to gh-pages + creates Releases
   packages: write    # ghcr.io image push
 
 env:
   REGISTRY: ghcr.io
-  # ${{ github.repository_owner }} resolves to "kacurez" on the public repo.
 
 jobs:
-  images:
-    name: build + push images to ghcr.io
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      minor:   ${{ steps.meta.outputs.minor }}
+  build:
+    name: ${{ matrix.image.name }} / ${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+    runs-on: ${{ matrix.platform == 'linux/amd64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
+          - linux/amd64
+          - linux/arm64
+        image:
           - name: pipeline-api
             dockerfile: utils/docker/Dockerfile.pipeline-api
           - name: pipeline-observer
@@ -47,8 +45,66 @@ jobs:
           - name: finnhub-extractor
             dockerfile: components/finnhub-extractor/Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          # push-by-digest: push manifest list entries by content digest,
+          # without a tag. The `manifest` job below stitches per-platform
+          # digests into a single tagged multi-arch manifest list.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image.name }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: ${{ matrix.image }} manifest
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - pipeline-api
+          - pipeline-observer
+          - pipeline-operator
+          - gateway
+          - iceberg-job
+          - data-generator
+          - sql-transform
+          - stdout-writer
+          - http-json-extractor
+          - finnhub-extractor
+    steps:
       - name: Resolve version tags
         id: meta
         run: |
@@ -58,42 +114,47 @@ jobs:
           MINOR="${VERSION%.*}"                     # 0.1
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "minor=$MINOR"     >> "$GITHUB_OUTPUT"
-          echo "ref=$REF"         >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Download per-arch digests for this image
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+          path: /tmp/digests
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build + push (multi-arch)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.meta.outputs.version }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.meta.outputs.minor }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:latest
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+      - name: Create multi-arch manifest
+        run: |
+          set -eu
+          IMG=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          cd /tmp/digests
+          docker buildx imagetools create \
+            -t "$IMG:${{ steps.meta.outputs.version }}" \
+            -t "$IMG:${{ steps.meta.outputs.minor }}" \
+            -t "$IMG:latest" \
+            $(printf "${IMG}@sha256:%s " *)
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
 
   charts:
     name: package + publish helm charts
-    needs: images
+    needs: manifest
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -103,13 +164,21 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: 'v3.14.4'
 
+      - name: Resolve version tag
+        id: meta
+        run: |
+          set -eu
+          REF="${GITHUB_REF#refs/tags/}"
+          VERSION="${REF#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Pin chart image tags + versions to release tag
         env:
-          VERSION:  ${{ needs.images.outputs.version }}
+          VERSION:  ${{ steps.meta.outputs.version }}
           REGISTRY: ${{ env.REGISTRY }}
           OWNER:    ${{ github.repository_owner }}
         run: |
@@ -157,7 +226,7 @@ jobs:
           done
 
       - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1.6.0
+        uses: helm/chart-releaser-action@v1.7.0
         with:
           charts_dir: charts
           skip_existing: true
