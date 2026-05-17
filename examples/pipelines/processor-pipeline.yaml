@@ -34,7 +34,7 @@ spec:
     - name: extract
       components:
         - name: data-generator
-          image: datuplet/data-generator:latest
+          image: ghcr.io/kacurez/data-generator:latest
           config:
             tables:
               - name: products
@@ -61,7 +61,7 @@ spec:
     - name: load
       components:
         - name: stdout-writer
-          image: datuplet/stdout-writer:latest
+          image: ghcr.io/kacurez/stdout-writer:latest
           # Read from 'raw' bucket
           inputs:
             buckets:

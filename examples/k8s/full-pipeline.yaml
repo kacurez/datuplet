@@ -20,7 +20,7 @@ spec:
     - name: extract
       components:
         - name: json-extractor
-          image: datuplet/http-json-extractor:latest
+          image: ghcr.io/kacurez/http-json-extractor:latest
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
           outputs:
@@ -32,7 +32,7 @@ spec:
     - name: transform
       components:
         - name: transformer
-          image: datuplet/sql-transform:latest
+          image: ghcr.io/kacurez/sql-transform:latest
           inputs:
             tables:
               - bucket: staging

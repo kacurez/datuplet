@@ -7,7 +7,7 @@ spec:
     - name: read-delta
       components:
         - name: stdout-writer
-          image: datuplet/stdout-writer:latest
+          image: ghcr.io/kacurez/stdout-writer:latest
           inputs:
             tables:
               - bucket: raw

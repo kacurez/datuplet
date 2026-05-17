@@ -30,7 +30,7 @@ spec:
     - name: extract
       components:
         - name: data-generator
-          image: datuplet/data-generator:latest
+          image: ghcr.io/kacurez/data-generator:latest
           config:
             tables:
               - name: products

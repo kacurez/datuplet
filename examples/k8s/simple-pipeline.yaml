@@ -29,7 +29,7 @@ spec:
     - name: extract
       components:
         - name: json-extractor
-          image: datuplet/http-json-extractor:latest
+          image: ghcr.io/kacurez/http-json-extractor:latest
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
           # Dynamic table creation: component can create any table under 'raw' bucket

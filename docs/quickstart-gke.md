@@ -135,46 +135,67 @@ times out, check: `kubectl get pods -n datuplet`.
 ## 5. Bootstrap the GCS warehouse
 
 GCS bootstrap requires the service-account key file inside the pipeline-api pod.
-Copy it in and run `lakekeeper-bootstrap` directly:
+The order matters: **create the Datuplet project first**, capture its
+`lakekeeper_project_id`, **then** run `lakekeeper-bootstrap` targeting that
+project. Otherwise the warehouse lands on lakekeeper's default project and
+the Datuplet project (which has its own freshly-allocated lakekeeper project
+ID) sees no warehouses at run time.
 
 ```bash
-# Copy the key into the pod
 POD=$(kubectl get pods -n datuplet -l app.kubernetes.io/name=pipeline-api \
   --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 
+LK_URL=http://lakekeeper.datuplet.svc.cluster.local:8181
+SIGNING_KEY=/var/run/secrets/datuplet-signing-key/signing-key.pem
+OFGA_URL=http://openfga.datuplet.svc.cluster.local:8080
+
+# 1. Admin user
+kubectl exec -n datuplet "${POD}" -- \
+  /usr/local/bin/pipeline-api admin create-user \
+    --email=admin@example.com --password=<strong-password>
+
+# 2. Project (allocates a fresh lakekeeper project ID)
+kubectl exec -n datuplet "${POD}" -- \
+  /usr/local/bin/pipeline-api admin create-project \
+    --name=default \
+    --creator-email=admin@example.com \
+    --lakekeeper-url=$LK_URL \
+    --signing-key-file=$SIGNING_KEY \
+    --openfga-url=$OFGA_URL
+
+# 3. Capture the project's lakekeeper_project_id from Postgres
+PG_PW=$(kubectl -n datuplet get secret pg-pipeline-api-pw -o jsonpath='{.data.password}' | base64 -d)
+LK_PROJECT_ID=$(kubectl -n datuplet exec pg-1 -c postgres -- \
+  env PGPASSWORD="$PG_PW" psql -h 127.0.0.1 -U pipeline_api_user -d pipeline_api -t -A \
+    -c "SELECT lakekeeper_project_id FROM projects WHERE name = 'default';")
+echo "Datuplet project lakekeeper_project_id: $LK_PROJECT_ID"
+
+# 4. Copy the GCS SA key into the pod
 kubectl cp datuplet-sa.json datuplet/"${POD}":/tmp/datuplet-sa.json
 
-# Run bootstrap inside the pod
+# 5. Bootstrap the warehouse on the project's lakekeeper_project_id
+#    (NOT lakekeeper's default project)
 kubectl exec -n datuplet "${POD}" -- \
   /usr/local/bin/pipeline-api admin lakekeeper-bootstrap \
     --type=gcs \
     --gcs-bucket="${GCS_BUCKET}" \
     --gcs-sa-key-file=/tmp/datuplet-sa.json \
-    --warehouse-name=datuplet
+    --warehouse-name=datuplet \
+    --lakekeeper-project-id="$LK_PROJECT_ID" \
+    --lakekeeper-url=$LK_URL \
+    --signing-key-file=$SIGNING_KEY
 
-# Create the admin user + project
-kubectl exec -n datuplet "${POD}" -- \
-  /usr/local/bin/pipeline-api admin create-user \
-    --email=admin@example.com --password=<strong-password>
-
-kubectl exec -n datuplet "${POD}" -- \
-  /usr/local/bin/pipeline-api admin create-project \
-    --name=default \
-    --creator-email=admin@example.com \
-    --lakekeeper-url=http://lakekeeper.datuplet.svc.cluster.local:8181 \
-    --signing-key-file=/var/run/secrets/datuplet-signing-key/signing-key.pem \
-    --openfga-url=http://openfga.datuplet.svc.cluster.local:8080
-
+# 6. Grant the admin role on the project
 kubectl exec -n datuplet "${POD}" -- \
   /usr/local/bin/pipeline-api admin grant \
     --user=admin@example.com \
     --project=default \
     --role=admin \
-    --lakekeeper-url=http://lakekeeper.datuplet.svc.cluster.local:8181 \
-    --signing-key-file=/var/run/secrets/datuplet-signing-key/signing-key.pem \
-    --openfga-url=http://openfga.datuplet.svc.cluster.local:8080
+    --lakekeeper-url=$LK_URL \
+    --signing-key-file=$SIGNING_KEY \
+    --openfga-url=$OFGA_URL
 
-# Remove the key from the pod
+# Cleanup: remove the SA key from the pod
 kubectl exec -n datuplet "${POD}" -- rm /tmp/datuplet-sa.json
 rm datuplet-sa.json
 ```
@@ -184,11 +205,13 @@ Notes for the GCS path:
 - `register.sh` automates the S3 / MinIO flow but does not yet drive
   `lakekeeper-bootstrap --type=gcs`. The manual `kubectl exec` steps above
   reproduce what the script does for S3.
+- The `--lakekeeper-project-id` flag (added in v0.1.7) tells bootstrap which
+  lakekeeper project to create the warehouse in. Without it, the warehouse
+  defaults to lakekeeper's `00000000-...0` project and pipeline-api can't find
+  it when the Datuplet project uses a different lakekeeper project ID.
 - For v0.1, **`pipeline-api admin attach-warehouse` is S3-only**. Multi-warehouse
-  GCS attachment is deferred. Single-warehouse setups (the v0.1 quickstart) work
-  because `lakekeeper-bootstrap --type=gcs` creates the warehouse on the
-  default lakekeeper project, and `create-project` maps the Datuplet project
-  to that same lakekeeper project — no separate attach step needed.
+  GCS attachment is deferred to a future release. Use the
+  `--lakekeeper-project-id` flag on bootstrap instead.
 
 ---
 

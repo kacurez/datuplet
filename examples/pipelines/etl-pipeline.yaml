@@ -28,7 +28,7 @@ spec:
     - name: extract
       components:
         - name: data-generator
-          image: datuplet/data-generator:latest
+          image: ghcr.io/kacurez/data-generator:latest
           config:
             tables:
               - name: products
@@ -48,7 +48,7 @@ spec:
     - name: transform
       components:
         - name: sql-transform
-          image: datuplet/sql-transform:latest
+          image: ghcr.io/kacurez/sql-transform:latest
           inputs:
             tables:
               - bucket: raw
@@ -67,7 +67,7 @@ spec:
     - name: load
       components:
         - name: stdout-writer
-          image: datuplet/stdout-writer:latest
+          image: ghcr.io/kacurez/stdout-writer:latest
           inputs:
             tables:
               - bucket: processed

@@ -18,11 +18,22 @@ import (
 
 // warehouseSpec describes the inputs to buildWarehouseBody. The Type
 // field selects which sibling spec (S3 or GCS) is consulted.
+//
+// LakekeeperProjectID is the project the warehouse will be created in.
+// Lakekeeper's default project is 00000000-0000-0000-0000-000000000000;
+// use a different ID to target a project provisioned by
+// `pipeline-api admin create-project`. Datuplet's projects table stores
+// the lakekeeper_project_id allocated for each Datuplet project — pass
+// that value here so the warehouse lives where the Datuplet project
+// expects to find it (pipeline-api looks warehouses up by the calling
+// project's lakekeeper_project_id; mismatched IDs surface as
+// "no warehouses registered for project ..." at run-trigger time).
 type warehouseSpec struct {
-	WarehouseName string
-	Type          string // "s3" | "gcs"
-	S3            *s3Spec
-	GCS           *gcsSpec
+	WarehouseName       string
+	LakekeeperProjectID string
+	Type                string // "s3" | "gcs"
+	S3                  *s3Spec
+	GCS                 *gcsSpec
 }
 
 // s3Spec captures the S3-flavoured warehouse parameters that the chart
@@ -63,7 +74,7 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 		}
 		return map[string]any{
 			"warehouse-name": spec.WarehouseName,
-			"project-id":     "00000000-0000-0000-0000-000000000000",
+			"project-id":     spec.LakekeeperProjectID,
 			"storage-profile": map[string]any{
 				"type":              "s3",
 				"bucket":            spec.S3.Bucket,
@@ -101,7 +112,7 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 		}
 		return map[string]any{
 			"warehouse-name": spec.WarehouseName,
-			"project-id":     "00000000-0000-0000-0000-000000000000",
+			"project-id":     spec.LakekeeperProjectID,
 			"storage-profile": profile,
 			"storage-credential": map[string]any{
 				"type":            "gcs",
@@ -134,6 +145,17 @@ func adminLakekeeperBootstrap(args []string) error {
 	lkURL := fs.String("lakekeeper-url", "http://lakekeeper.lakekeeper.svc.cluster.local:8181", "Lakekeeper base URL")
 	warehouseName := fs.String("warehouse-name", "datuplet", "Warehouse to create")
 	whType := fs.String("type", "s3", "Warehouse storage type (s3 | gcs)")
+	// Lakekeeper project the warehouse lands in. The default lakekeeper
+	// project ID is "00000000-0000-0000-0000-000000000000" — sufficient for
+	// single-project deployments where the Datuplet project's
+	// lakekeeper_project_id is left at that default. For deployments that
+	// run `pipeline-api admin create-project` (which allocates a fresh
+	// lakekeeper project), pass that project's ID here so the warehouse
+	// lives where the Datuplet project will look for it. Mismatched IDs
+	// surface at run-trigger time as
+	// "no warehouses registered for project ...".
+	lakekeeperProjectID := fs.String("lakekeeper-project-id", "00000000-0000-0000-0000-000000000000",
+		"Lakekeeper project the warehouse will be created in. Use 00000000-...0 for the default project, or pass a Datuplet project's lakekeeper_project_id from `SELECT lakekeeper_project_id FROM projects;` for multi-project deployments.")
 
 	// S3 flags.
 	bucket := fs.String("bucket", "datuplet", "S3 bucket holding the warehouse")
@@ -170,8 +192,9 @@ func adminLakekeeperBootstrap(args []string) error {
 
 	// Build the per-type spec, validating required inputs.
 	spec := warehouseSpec{
-		WarehouseName: *warehouseName,
-		Type:          *whType,
+		WarehouseName:       *warehouseName,
+		LakekeeperProjectID: *lakekeeperProjectID,
+		Type:                *whType,
 	}
 	switch *whType {
 	case "s3":
