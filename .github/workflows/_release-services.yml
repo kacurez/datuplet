@@ -3,8 +3,8 @@ name: release-services
 # Reusable: builds + manifests the five datuplet service images
 # (pipeline-api, pipeline-observer, pipeline-operator, gateway, iceberg-job).
 # Each is a call to _release-image.yml. Called once from release.yml as
-# the `datuplet-services` job; appears as a collapsible group in the
-# run-detail UI containing the five image rows.
+# the `services` job; appears as a collapsible group in the run-detail
+# UI containing 15 flat entries (5 images × 3 sub-jobs).
 
 on:
   workflow_call:

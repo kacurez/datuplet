@@ -32,7 +32,13 @@ env:
 
 jobs:
   amd64:
-    name: amd64
+    # Image identity has to live in the job name itself. Nested reusable
+    # workflows flatten in the parent's run-detail sidebar (per
+    # actions/runner architecture), so generic labels like "amd64"
+    # become indistinguishable when 5 images call this workflow under
+    # the same bucket. The colon syntax mirrors a Docker image tag and
+    # survives the sidebar's slash-truncation behavior.
+    name: ${{ inputs.name }}:amd64
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -74,7 +80,7 @@ jobs:
           retention-days: 1
 
   arm64:
-    name: arm64
+    name: ${{ inputs.name }}:arm64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     steps:
@@ -116,7 +122,7 @@ jobs:
           retention-days: 1
 
   manifest:
-    name: manifest
+    name: ${{ inputs.name }}:manifest
     needs: [amd64, arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 10

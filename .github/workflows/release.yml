@@ -14,10 +14,12 @@ env:
 
 jobs:
   # Service images: pipeline-api, pipeline-observer, pipeline-operator,
-  # gateway, iceberg-job. Appears as one top-level "datuplet-services"
-  # row in the run-detail UI; expanding shows the five image rows, each
-  # of which contains amd64/arm64/manifest sub-jobs.
-  datuplet-services:
+  # gateway, iceberg-job. Appears as one top-level "services" row in
+  # the run-detail UI; expanding shows 15 flat entries (5 images × 3
+  # sub-jobs) named "<image>:amd64", "<image>:arm64", "<image>:manifest".
+  # Per-image collapsible groups inside the bucket aren't possible —
+  # GitHub Actions flattens nested-reusable-workflow jobs at runtime.
+  services:
     uses: ./.github/workflows/_release-services.yml
     secrets: inherit
 
@@ -30,7 +32,7 @@ jobs:
 
   charts:
     name: package + publish helm charts
-    needs: [datuplet-services, components]
+    needs: [services, components]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
