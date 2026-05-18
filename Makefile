@@ -14,7 +14,7 @@ export DOCKER_BUILDKIT=1
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
 	prune-images \
-	lint lint-notokenlog tidy all help
+	lint lint-notokenlog chart-render-check tidy all help
 
 # =============================================================================
 # Help
@@ -278,7 +278,7 @@ tidy: ## Run go mod tidy
 	go mod tidy
 
 # Static analysis and dead code detection
-lint: lint-notokenlog ## Run go vet + deadcode + notokenlog (RFC 019 §4.10) analyzers
+lint: lint-notokenlog chart-render-check ## Run go vet + deadcode + notokenlog (RFC 019 §4.10) analyzers + chart golden-render diff
 	@echo "Running go vet..."
 	go vet ./...
 	@echo "Running deadcode analysis..."
@@ -290,6 +290,24 @@ lint: lint-notokenlog ## Run go vet + deadcode + notokenlog (RFC 019 §4.10) ana
 lint-notokenlog: ## Run the notokenlog analyzer against ./... (RFC 019 §4.10)
 	@echo "Running notokenlog analyzer..."
 	go run ./tools/lint/notokenlog/cmd/notokenlog ./...
+
+chart-render-check: ## Diff helm template output against golden renders in charts/datuplet-lakekeeper/_render/
+	@# Pin encryptionKeySecret to suppress the randAlphaNum-generated Secret
+	@# that would produce a different key on every run and cause false diffs.
+	@helm template charts/datuplet-lakekeeper \
+	  --set workloadIdentity.enabled=true \
+	  --set workloadIdentity.gcpServiceAccount=test@example.iam.gserviceaccount.com \
+	  --set platform.enableGcpSystemCredentials=true \
+	  --set lakekeeper.secretBackend.postgres.encryptionKeySecret=golden-render \
+	  > /tmp/datuplet-lakekeeper-wif-on.yaml && \
+	diff -u charts/datuplet-lakekeeper/_render/wif-on.golden.yaml /tmp/datuplet-lakekeeper-wif-on.yaml \
+	  || { echo "chart drift on wif-on"; exit 1; }
+	@helm template charts/datuplet-lakekeeper \
+	  --set lakekeeper.secretBackend.postgres.encryptionKeySecret=golden-render \
+	  > /tmp/datuplet-lakekeeper-wif-off.yaml && \
+	diff -u charts/datuplet-lakekeeper/_render/wif-off.golden.yaml /tmp/datuplet-lakekeeper-wif-off.yaml \
+	  || { echo "chart drift on wif-off"; exit 1; }
+	@echo "✓ all chart renders match golden"
 
 # All-in-one: tidy, build, test
 all: tidy build test ## Tidy + build + test (all-in-one)
