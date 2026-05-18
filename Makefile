@@ -7,7 +7,7 @@ export DOCKER_BUILDKIT=1
 	build-component-sql-transform \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
-	test e2e e2e-k8s e2e-all \
+	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
 	deploy-local deploy-local-helm undeploy-local k8s-smoke \
 	k8s-reload-crds k8s-rebuild-operators k8s-rebuild-services \
 	k8s-retry-simple k8s-retry-duckdb k8s-retry-full \
@@ -172,6 +172,9 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	kubectl delete namespace datuplet-e2e --wait=false || true
 
 e2e-all: e2e-k8s ## Run all e2e tiers (K8s is the only supported surface; alias for e2e-k8s)
+
+e2e-k8s-gcs: ## Run the GCS e2e scenario against fake-gcs-server (skips when no Ready nodes)
+	./tests/e2e/scenarios/gcs-pipeline-k8s/run.sh
 
 # =============================================================================
 # Deploy (OrbStack K8s)
