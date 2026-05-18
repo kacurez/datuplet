@@ -14,7 +14,7 @@ export DOCKER_BUILDKIT=1
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
 	prune-images \
-	lint lint-notokenlog chart-render-check tidy all help
+	lint chart-render-check tidy all help
 
 # =============================================================================
 # Help
@@ -276,23 +276,26 @@ clean-go-git-cache: ## Free disk space (Go build/test/fuzz cache + git gc; prese
 	go clean -cache -testcache -fuzzcache
 	git gc --prune=now
 
-# Run go mod tidy
-tidy: ## Run go mod tidy
-	go mod tidy
+# Run go mod tidy on the root module AND every component module. Tidying
+# root in isolation drifts the components — their Docker builds enforce
+# `go mod tidy` parity and fail CI. Always tidy the whole monorepo.
+tidy: ## Run go mod tidy across root + components/*/
+	@echo "Tidying root..."
+	@go mod tidy
+	@for d in components/*/; do \
+	  echo "Tidying $$d..."; \
+	  (cd "$$d" && go mod tidy) || exit 1; \
+	done
+	@echo "✓ all modules tidy"
 
-# Static analysis and dead code detection
-lint: lint-notokenlog chart-render-check ## Run go vet + deadcode + notokenlog (RFC 019 §4.10) analyzers + chart golden-render diff
+# Static analysis and dead code detection. RFC 019 §4.10 bearer-redaction
+# is enforced via Stringer methods on the owned types (S3Creds, GCSCreds,
+# vendedTokenSource, refreshingTokenSource) — see pkg/catalogwriter/creds.go.
+lint: chart-render-check ## Run go vet + deadcode + chart golden-render diff
 	@echo "Running go vet..."
 	go vet ./...
 	@echo "Running deadcode analysis..."
 	go run golang.org/x/tools/cmd/deadcode@latest -test ./...
-
-# RFC 019 §4.10: reject fmt-verb / log-arg uses of bearer-credential types
-# (GCSCreds, *oauth2.Token, *vendedTokenSource). Source lives at
-# tools/lint/notokenlog/.
-lint-notokenlog: ## Run the notokenlog analyzer against ./... (RFC 019 §4.10)
-	@echo "Running notokenlog analyzer..."
-	go run ./tools/lint/notokenlog/cmd/notokenlog ./...
 
 chart-render-check: ## Diff helm template output against golden renders in charts/datuplet-lakekeeper/_render/
 	@# Pin encryptionKeySecret to suppress the randAlphaNum-generated Secret

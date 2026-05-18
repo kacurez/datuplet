@@ -35,6 +35,10 @@ func newRefreshingTokenSource(initial *oauth2.Token, fn refreshFunc) *refreshing
 	return &refreshingTokenSource{cur: initial, refresh: fn}
 }
 
+// String returns a placeholder; the wrapped *oauth2.Token carries the
+// live bearer and must never be expanded into log output. RFC 019 §4.10.
+func (r *refreshingTokenSource) String() string { return "<refreshingTokenSource>" }
+
 // Token implements oauth2.TokenSource. If the cached token has more than
 // one minute remaining before Expiry, it's returned as-is. Otherwise
 // refresh is invoked; on error the error is returned and the stale

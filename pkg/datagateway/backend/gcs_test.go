@@ -3,6 +3,8 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +97,24 @@ func TestVendedTokenSourceSurfacesError(t *testing.T) {
 	}
 	if !errors.Is(err, want) {
 		t.Fatalf("error = %v, want wraps %v", err, want)
+	}
+}
+
+// TestVendedTokenSourceStringRedacts ensures default fmt verbs on
+// *vendedTokenSource never recurse into the underlying credsFetcher
+// (which holds the live bearer). RFC 019 §4.10.
+func TestVendedTokenSourceStringRedacts(t *testing.T) {
+	f := &fakeFetcher{c: catalogwriter.GCSCreds{
+		OAuthToken: "ya29.bearer-must-not-leak",
+		Issued:     time.Now(),
+		Expires:    time.Now().Add(15 * time.Minute),
+	}}
+	ts := &vendedTokenSource{vc: f}
+	for _, verb := range []string{"%v", "%+v", "%s"} {
+		got := fmt.Sprintf(verb, ts)
+		if strings.Contains(got, "ya29.bearer-must-not-leak") {
+			t.Fatalf("%s leaked bearer: %s", verb, got)
+		}
 	}
 }
 

@@ -638,9 +638,8 @@ func parseEpochMillis(s string) (time.Time, error) {
 
 // parseGCSCreds extracts a GCSCreds from a lakekeeper response's config
 // block. See RFC 019 §4.2 for the key family. The returned GCSCreds
-// carries an OAuth bearer in OAuthToken — callers MUST NOT log it (the
-// notokenlog CI analyzer lands in Slice B and rejects %v / %+v /
-// structured-log calls on this type; see RFC 019 §4.10).
+// carries an OAuth bearer in OAuthToken — GCSCreds.String() redacts it,
+// so default fmt verbs (%v / %+v / %s) are safe. RFC 019 §4.10.
 //
 // TTL fallback chain (first non-zero wins):
 //  1. gcs.oauth2.token-expires-at (epoch-ms — the canonical key)

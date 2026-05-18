@@ -96,6 +96,22 @@ func TestRefreshingTokenSourceDoesNotReturnStaleOnFailure(t *testing.T) {
 	}
 }
 
+// TestRefreshingTokenSourceStringRedacts ensures default fmt verbs on
+// *refreshingTokenSource never expand the wrapped *oauth2.Token (whose
+// AccessToken field holds the live bearer). RFC 019 §4.10.
+func TestRefreshingTokenSourceStringRedacts(t *testing.T) {
+	rts := newRefreshingTokenSource(&oauth2.Token{
+		AccessToken: "ya29.bearer-must-not-leak",
+		Expiry:      time.Now().Add(time.Hour),
+	}, nil)
+	for _, verb := range []string{"%v", "%+v", "%s"} {
+		got := fmt.Sprintf(verb, rts)
+		if strings.Contains(got, "ya29.bearer-must-not-leak") {
+			t.Fatalf("%s leaked bearer: %s", verb, got)
+		}
+	}
+}
+
 // TestPickRefreshEndpointActivationFailsClosed verifies that datupletGCSFactory
 // fails fast at construction time when gcs.oauth2.refresh-credentials-endpoint
 // is present in props AND gcs.oauth2.refresh-credentials-enabled=true (explicit

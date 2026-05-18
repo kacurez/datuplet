@@ -134,6 +134,11 @@ type vendedTokenSource struct {
 // Compile-time assertion that vendedTokenSource satisfies oauth2.TokenSource.
 var _ oauth2.TokenSource = (*vendedTokenSource)(nil)
 
+// String returns a placeholder; vendedTokenSource holds a credsFetcher
+// whose Get() yields the live bearer, so any %v / %+v formatter that hits
+// this method MUST NOT recurse into the underlying value. RFC 019 §4.10.
+func (t *vendedTokenSource) String() string { return "<vendedTokenSource>" }
+
 // Token fetches the current vended creds, asserts they're GCSCreds, and
 // returns an *oauth2.Token suitable for the storage client. The
 // type-assertion is the load-bearing safety check: even though
