@@ -11,17 +11,26 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net/url"
 	"os"
+	"strings"
+	"time"
 
 	iceio "github.com/apache/iceberg-go/io"
 	_ "github.com/apache/iceberg-go/io/gocloud" // registers the default gs:// factory
 
 	"cloud.google.com/go/storage"
+	"gocloud.dev/blob"
+	"gocloud.dev/blob/gcsblob"
+	"gocloud.dev/gcp"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
@@ -145,11 +154,246 @@ func loadStaticOAuthToken(ctx context.Context, keyFile string) (string, error) {
 	return t.AccessToken, nil
 }
 
+// ---- Probe 2: refreshing TokenSource lifecycle ----
+
+// countingTokenSource returns tokens with a 10s expiry and increments *calls
+// on every Token() invocation.
+type countingTokenSource struct {
+	inner oauth2.TokenSource // real credentials
+	calls *int
+}
+
+func (c *countingTokenSource) Token() (*oauth2.Token, error) {
+	*c.calls++
+	t, err := c.inner.Token()
+	if err != nil {
+		return nil, err
+	}
+	// Override the expiry to 10s so the reuseSource refreshes after each sleep.
+	t.Expiry = time.Now().Add(10 * time.Second)
+	return t, nil
+}
+
+// gcsFile satisfies iceio.File (fs.File + io.ReadSeekCloser + io.ReaderAt)
+// by eagerly reading the full object content into memory. This is fine for
+// the probe since we only write tiny test payloads.
+type gcsFile struct {
+	data []byte // full object content
+	off  int    // current read position
+	name string
+	size int64
+}
+
+func (f *gcsFile) Read(p []byte) (int, error) {
+	if f.off >= len(f.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[f.off:])
+	f.off += n
+	return n, nil
+}
+
+func (f *gcsFile) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(f.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *gcsFile) Seek(offset int64, whence int) (int64, error) {
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = int64(f.off) + offset
+	case io.SeekEnd:
+		abs = f.size + offset
+	default:
+		return 0, fmt.Errorf("gcsFile: invalid whence %d", whence)
+	}
+	if abs < 0 {
+		return 0, fmt.Errorf("gcsFile: negative seek position")
+	}
+	f.off = int(abs)
+	return abs, nil
+}
+
+func (f *gcsFile) Close() error { return nil }
+
+func (f *gcsFile) Stat() (fs.FileInfo, error) {
+	return &gcsFileInfo{name: f.name, size: f.size}, nil
+}
+
+type gcsFileInfo struct {
+	name string
+	size int64
+}
+
+func (fi *gcsFileInfo) Name() string      { return fi.name }
+func (fi *gcsFileInfo) Size() int64       { return fi.size }
+func (fi *gcsFileInfo) Mode() fs.FileMode { return 0444 }
+func (fi *gcsFileInfo) ModTime() time.Time { return time.Time{} }
+func (fi *gcsFileInfo) IsDir() bool       { return false }
+func (fi *gcsFileInfo) Sys() any          { return nil }
+
+// gcsIO implements iceio.IO backed by a gocloud *blob.Bucket.
+// It also exposes Write for the probe's putAndGet helper.
+type gcsIO struct {
+	ctx    context.Context
+	bucket *blob.Bucket
+	prefix string // bucket name — used to strip from full URIs
+}
+
+func (g *gcsIO) Open(name string) (iceio.File, error) {
+	key, err := gcsKeyFromURI(name, g.prefix)
+	if err != nil {
+		return nil, err
+	}
+	r, err := g.bucket.NewReader(g.ctx, key, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	return &gcsFile{data: data, name: name, size: int64(len(data))}, nil
+}
+
+func (g *gcsIO) Remove(name string) error {
+	key, err := gcsKeyFromURI(name, g.prefix)
+	if err != nil {
+		return err
+	}
+	return g.bucket.Delete(g.ctx, key)
+}
+
+// Write writes data to the given full URI.
+func (g *gcsIO) Write(ctx context.Context, uri string, data []byte) error {
+	key, err := gcsKeyFromURI(uri, g.prefix)
+	if err != nil {
+		return err
+	}
+	return g.bucket.WriteAll(ctx, key, data, nil)
+}
+
+// gcsKeyFromURI strips "gs://bucket/" from a full URI.
+func gcsKeyFromURI(uri, bucket string) (string, error) {
+	prefix := "gs://" + bucket + "/"
+	if !strings.HasPrefix(uri, prefix) {
+		// Maybe it's already a bare key
+		return uri, nil
+	}
+	key := strings.TrimPrefix(uri, prefix)
+	if key == "" {
+		return "", fmt.Errorf("gcsKeyFromURI: empty key in %q", uri)
+	}
+	return key, nil
+}
+
+// openGCSWithTokenSource builds a gcsIO backed by the given oauth2.TokenSource.
+func openGCSWithTokenSource(ctx context.Context, ts oauth2.TokenSource, bucket string) (*gcsIO, error) {
+	gcpClient, err := gcp.NewHTTPClient(gcp.DefaultTransport(), gcp.TokenSource(ts))
+	if err != nil {
+		return nil, fmt.Errorf("gcp.NewHTTPClient: %w", err)
+	}
+	b, err := gcsblob.OpenBucket(ctx, gcpClient, bucket, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gcsblob.OpenBucket: %w", err)
+	}
+	return &gcsIO{ctx: ctx, bucket: b, prefix: bucket}, nil
+}
+
+// putAndGet writes payload to uri via gcsIO.Write, then reads it back via
+// iceio.IO.Open and verifies the content matches.
+func putAndGet(ctx context.Context, iofs iceio.IO, uri, payload string) error {
+	g, ok := iofs.(*gcsIO)
+	if !ok {
+		return fmt.Errorf("putAndGet: expected *gcsIO, got %T", iofs)
+	}
+	if err := g.Write(ctx, uri, []byte(payload)); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	f, err := iofs.Open(uri)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+	got, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	if !bytes.Equal(got, []byte(payload)) {
+		return fmt.Errorf("content mismatch: got %q want %q", got, payload)
+	}
+	return nil
+}
+
 func probeRefreshingTokenSource(ctx context.Context, bucket, keyFile string) error {
-	// RFC §4.5.4 criterion 2: a TokenSource that re-fetches every 30s must be
-	// honored by iceberg-go's gocloud-backed storage client (i.e., the client
-	// must not cache the first token).
-	return fmt.Errorf("TODO: implement in Task A0.3")
+	// RFC §4.5.4 criterion 2: a TokenSource whose tokens expire every 10s must
+	// be re-called by iceberg-go's underlying HTTP transport on every refresh
+	// cycle. We write+read 3 times with 12s gaps so the token ages past its
+	// window between iterations. After the loop, Token() must have been called
+	// ≥3 times — otherwise the client is caching the first token.
+
+	keyBytes, err := os.ReadFile(keyFile)
+	if err != nil {
+		return fmt.Errorf("read key file: %w", err)
+	}
+	cfg, err := google.JWTConfigFromJSON(keyBytes, storage.ScopeReadWrite)
+	if err != nil {
+		return fmt.Errorf("JWTConfigFromJSON: %w", err)
+	}
+	innerSrc := cfg.TokenSource(ctx)
+
+	calls := 0
+	inner := &countingTokenSource{inner: innerSrc, calls: &calls}
+	// ReuseTokenSourceWithExpiry ensures Token() is only called when the
+	// cached token is within the expiry window (10s here — matches what
+	// countingTokenSource stamps on each returned token).
+	ts := oauth2.ReuseTokenSourceWithExpiry(nil, inner, 10*time.Second)
+
+	// Override gs:// with our factory so every iceio.LoadFS call instantiates
+	// a client bound to our counting TokenSource.
+	iceio.Unregister("gs")
+	iceio.Register("gs", func(c context.Context, parsed *url.URL, props map[string]string) (iceio.IO, error) {
+		return openGCSWithTokenSource(c, ts, parsed.Host)
+	})
+
+	uri := fmt.Sprintf("gs://%s/_spike_probe/file.txt", bucket)
+	iofs, err := iceio.LoadFS(ctx, nil, fmt.Sprintf("gs://%s", bucket))
+	if err != nil {
+		return fmt.Errorf("iceio.LoadFS: %w", err)
+	}
+
+	defer func() {
+		// Best-effort cleanup of the spike test object.
+		_ = iofs.Remove(uri)
+	}()
+
+	log.Printf("probe 2: starting 3-iteration write/read loop (12s sleep between iterations)…")
+	for i := 0; i < 3; i++ {
+		log.Printf("probe 2: iteration %d — Token() calls so far: %d", i, calls)
+		if err := putAndGet(ctx, iofs, uri, fmt.Sprintf("hello %d", i)); err != nil {
+			return fmt.Errorf("iter %d: %w", i, err)
+		}
+		if i < 2 {
+			log.Printf("probe 2: sleeping 12s so the 10s token window expires…")
+			time.Sleep(12 * time.Second)
+		}
+	}
+
+	log.Printf("probe 2: loop done — Token() was called %d time(s)", calls)
+	if calls < 3 {
+		return fmt.Errorf("TokenSource.Token() called only %d time(s); iceberg-go / gocloud is caching the token beyond the window", calls)
+	}
+	return nil
 }
 
 func probeFakeGCSServerBearer(ctx context.Context) error {
