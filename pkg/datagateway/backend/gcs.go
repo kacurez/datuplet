@@ -298,6 +298,80 @@ func (g *gcsBackend) OpenReader(ctx context.Context, tablePath string) (Reader, 
 	}, nil
 }
 
+// gcsObjectLister + gcsObjectDeleter are the minimal storage surfaces
+// RemoveAll depends on. Production code passes the real BucketHandle (via
+// a thin adapter); tests inject a fake. Splitting list-vs-delete is
+// deliberate so the test can record deletes independently of listing.
+type gcsObjectLister interface {
+	listObjects(ctx context.Context, prefix string) gcsObjectIter
+}
+
+type gcsObjectDeleter interface {
+	deleteObject(ctx context.Context, key string) error
+}
+
+// gcsObjectIter mirrors *storage.ObjectIterator's Next() contract:
+// returns (attrs, nil) on each result and (nil, iteratorDone) when done.
+type gcsObjectIter interface {
+	Next() (*storage.ObjectAttrs, error)
+}
+
+// gcsListDeleteAdapter wraps *storage.BucketHandle into the two narrow
+// interfaces. The only place we touch the real bucket from RemoveAll.
+type gcsListDeleteAdapter struct {
+	bkt *storage.BucketHandle
+}
+
+func (a *gcsListDeleteAdapter) listObjects(ctx context.Context, prefix string) gcsObjectIter {
+	return a.bkt.Objects(ctx, &storage.Query{Prefix: prefix})
+}
+
+func (a *gcsListDeleteAdapter) deleteObject(ctx context.Context, key string) error {
+	return a.bkt.Object(key).Delete(ctx)
+}
+
+// RemoveAll deletes every object whose key starts with prefix in the
+// backend's bucket. Idempotent: empty listing → no error. Context
+// cancellation is honoured between objects. Mirrors MinIOBackend.RemoveAll.
+func (g *gcsBackend) RemoveAll(ctx context.Context, prefix string) error {
+	adapter := &gcsListDeleteAdapter{bkt: g.bkt}
+	return removeAllGCSObjects(ctx, adapter, adapter, prefix)
+}
+
+// removeAllGCSObjects is the testable core of RemoveAll. The listing-side
+// interface and the delete-side interface are separate so tests can record
+// each delete call individually without coupling them to a paginated list.
+//
+// GCS has no native bulk-delete in cloud.google.com/go/storage (the JSON
+// API supports it but the SDK doesn't expose a batch surface), so we
+// issue one Delete per object. This is acceptable for the workspace-cleanup
+// use case — same blast radius as minio's per-batch RemoveObjects.
+func removeAllGCSObjects(ctx context.Context, lister gcsObjectLister, deleter gcsObjectDeleter, prefix string) error {
+	prefix = strings.TrimPrefix(prefix, "/")
+
+	it := lister.listObjects(ctx, prefix)
+	for {
+		attrs, err := it.Next()
+		if err == iteratorDone {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("RemoveAll %q: list: %w", prefix, err)
+		}
+
+		// Honour cancellation between objects so long listings can be cancelled.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("RemoveAll %q: %w", prefix, err)
+		}
+
+		if err := deleter.deleteObject(ctx, attrs.Name); err != nil {
+			return fmt.Errorf("RemoveAll %q: delete %q: %w", prefix, attrs.Name, err)
+		}
+	}
+
+	return nil
+}
+
 // OpenWriter opens a writer for tablePath. The writer buffers all writes
 // and uploads on Close (mirroring minioWriter).
 func (g *gcsBackend) OpenWriter(ctx context.Context, tablePath string, opts WriteOptions) (Writer, error) {
