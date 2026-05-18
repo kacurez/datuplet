@@ -141,6 +141,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
+					Tolerations:   r.RuntimeTolerations, // nil-safe: omitted from Pod when nil
 					// Native sidecar in initContainers with restartPolicy: Always
 					InitContainers: []corev1.Container{
 						{

@@ -350,6 +350,43 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL_TrimsTrailingSlash(t *testing.
 	}
 }
 
+// TestBuildComponentJobHasRuntimeTolerations verifies that RuntimeTolerations
+// set on the reconciler are propagated to the component Job's PodSpec.
+func TestBuildComponentJobHasRuntimeTolerations(t *testing.T) {
+	r := &PipelineRunReconciler{
+		RuntimeTolerations: []corev1.Toleration{{Key: "k", Operator: "Equal", Value: "v", Effect: "NoSchedule"}},
+	}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	if len(job.Spec.Template.Spec.Tolerations) != 1 {
+		t.Fatalf("Tolerations len = %d, want 1", len(job.Spec.Template.Spec.Tolerations))
+	}
+	if job.Spec.Template.Spec.Tolerations[0].Key != "k" {
+		t.Fatalf("Tolerations[0].Key = %q, want %q", job.Spec.Template.Spec.Tolerations[0].Key, "k")
+	}
+}
+
+// TestBuildComponentJobNilTolerationsOmitsField verifies that a reconciler
+// with no RuntimeTolerations leaves spec.tolerations nil (not an empty slice).
+func TestBuildComponentJobNilTolerationsOmitsField(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	if job.Spec.Template.Spec.Tolerations != nil {
+		t.Fatalf("Tolerations = %v, want nil", job.Spec.Template.Spec.Tolerations)
+	}
+}
+
 // TestGenerateGatewayConfig_PipelineAPIJWKSURL_OmittedWhenUnset: a
 // reconciler without PipelineAPIURL emits a config without the field
 // (dev paths without JWT validation).
