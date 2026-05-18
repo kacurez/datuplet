@@ -18,6 +18,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -399,7 +400,81 @@ func probeRefreshingTokenSource(ctx context.Context, bucket, keyFile string) err
 func probeFakeGCSServerBearer(ctx context.Context) error {
 	// RFC §4.5.4 criterion 3: does fake-gcs-server accept (or fake-validate)
 	// Authorization: Bearer <tok> headers?
-	return fmt.Errorf("TODO: implement in Task A0.4")
+	// We test two GET requests (with and without bearer) and then a bucket
+	// create + object PUT with a bearer, to ensure writes also work.
+	const endpoint = "http://localhost:4443"
+
+	// Part A: GET /storage/v1/b with-bearer and no-bearer both must return <500.
+	for _, label := range []string{"with-bearer", "no-bearer"} {
+		req, _ := http.NewRequestWithContext(ctx, "GET", endpoint+"/storage/v1/b", nil)
+		if label == "with-bearer" {
+			req.Header.Set("Authorization", "Bearer dummy")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			return fmt.Errorf("%s: status %d", label, resp.StatusCode)
+		}
+		log.Printf("probe 3: GET listing %s → %d", label, resp.StatusCode)
+	}
+
+	// Part B: create a bucket and PUT an object with a bearer header.
+	bucket := "spike-probe-bucket"
+	createReq, _ := http.NewRequestWithContext(ctx, "POST",
+		endpoint+"/storage/v1/b?project=spike",
+		strings.NewReader(`{"name":"`+bucket+`"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Authorization", "Bearer dummy")
+	cr, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		return fmt.Errorf("create-bucket: %w", err)
+	}
+	cr.Body.Close()
+	// 200 (created) and 409 (already exists) are both acceptable.
+	if cr.StatusCode >= 500 {
+		return fmt.Errorf("create-bucket: status %d", cr.StatusCode)
+	}
+	log.Printf("probe 3: create-bucket → %d", cr.StatusCode)
+
+	putReq, _ := http.NewRequestWithContext(ctx, "POST",
+		endpoint+"/upload/storage/v1/b/"+bucket+"/o?uploadType=media&name=probe.txt",
+		strings.NewReader("hello"))
+	putReq.Header.Set("Content-Type", "text/plain")
+	putReq.Header.Set("Authorization", "Bearer dummy")
+	pr, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("put: %w", err)
+	}
+	pr.Body.Close()
+	if pr.StatusCode >= 400 {
+		return fmt.Errorf("put: status %d", pr.StatusCode)
+	}
+	log.Printf("probe 3: PUT object → %d", pr.StatusCode)
+
+	// Part C: verify the object is retrievable.
+	getObjReq, _ := http.NewRequestWithContext(ctx, "GET",
+		endpoint+"/storage/v1/b/"+bucket+"/o/probe.txt?alt=media", nil)
+	getObjReq.Header.Set("Authorization", "Bearer dummy")
+	gr, err := http.DefaultClient.Do(getObjReq)
+	if err != nil {
+		return fmt.Errorf("get-object: %w", err)
+	}
+	defer gr.Body.Close()
+	if gr.StatusCode >= 400 {
+		return fmt.Errorf("get-object: status %d", gr.StatusCode)
+	}
+	body, err := io.ReadAll(gr.Body)
+	if err != nil {
+		return fmt.Errorf("get-object read: %w", err)
+	}
+	if string(body) != "hello" {
+		return fmt.Errorf("get-object content mismatch: got %q want %q", body, "hello")
+	}
+	log.Printf("probe 3: GET object → %d body=%q", gr.StatusCode, body)
+	return nil
 }
 
 func probeLakekeeperRefreshEndpoint(ctx context.Context, lkURL, warehouse string) error {
