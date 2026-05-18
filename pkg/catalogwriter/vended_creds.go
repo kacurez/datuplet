@@ -544,8 +544,23 @@ func (v *VendedCreds) discoverPrefix(ctx context.Context, base, jwt, warehouse s
 // into operator logs.
 var bearerPattern = regexp.MustCompile(`Bearer [A-Za-z0-9_\-.]+`)
 
+// ya29Pattern matches GCP OAuth2 access tokens (e.g. those returned
+// by metadata-server / STS exchanges). Real tokens are ~140 chars of
+// base64-url-safe content after the `ya29.` prefix; we accept any
+// non-empty trailing run so partial / truncated tokens still get
+// scrubbed.
+var ya29Pattern = regexp.MustCompile(`ya29\.[A-Za-z0-9_\-]+`)
+
+// gcsSigPattern matches any `X-Goog-<word>=<value>` query parameter,
+// covering signed-URL fields like `X-Goog-Signature`, `X-Goog-
+// Credential`, `X-Goog-Date`, etc. Redaction is intentionally broad:
+// if any one of these leaks alongside a signature, the URL can be
+// replayed, so we strip the entire X-Goog-* surface.
+var gcsSigPattern = regexp.MustCompile(`X-Goog-[A-Za-z0-9\-]+=[^&\s"}]+`)
+
 // scrubBody truncates b to a sane length and redacts anything that
-// looks like a bearer token. Used as the body interpolation in
+// looks like a bearer token, a GCP OAuth access token, or a GCS
+// signed-URL parameter value. Used as the body interpolation in
 // lakekeeper-error messages.
 func scrubBody(b []byte) string {
 	const max = 256
@@ -553,7 +568,17 @@ func scrubBody(b []byte) string {
 	if len(s) > max {
 		s = s[:max] + "..."
 	}
-	return bearerPattern.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = bearerPattern.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = ya29Pattern.ReplaceAllString(s, "<redacted-oauth2-token>")
+	s = gcsSigPattern.ReplaceAllStringFunc(s, func(m string) string {
+		// Keep the param name; redact the value.
+		eq := strings.IndexByte(m, '=')
+		if eq < 0 {
+			return "<redacted>"
+		}
+		return m[:eq+1] + "<redacted>"
+	})
+	return s
 }
 
 // parseEpochMillis converts a decimal epoch-ms string into a time.Time.

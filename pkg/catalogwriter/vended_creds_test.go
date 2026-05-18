@@ -586,3 +586,34 @@ func TestParseCredsHappyPathGCS(t *testing.T) {
 		t.Fatalf("Type() = %q, want gcs", got.Type())
 	}
 }
+
+// TestScrubBodyRedactsYa29 verifies that GCP OAuth2 access tokens
+// (`ya29.*`) are redacted from error-body interpolation.
+func TestScrubBodyRedactsYa29(t *testing.T) {
+	in := `{"error":"401","reason":"token ya29.AAA-BBB_CCC expired"}`
+	out := scrubBody([]byte(in))
+	if strings.Contains(out, "ya29.AAA") {
+		t.Fatalf("ya29.* leaked: %s", out)
+	}
+}
+
+// TestScrubBodyRedactsSignedURLParams verifies that GCS signed-URL
+// parameter values (X-Goog-Signature, etc.) are redacted from
+// error-body interpolation.
+func TestScrubBodyRedactsSignedURLParams(t *testing.T) {
+	in := `https://storage.googleapis.com/b/k?X-Goog-Signature=DEAD%2BBEEF&X-Goog-Date=20260518T120000Z`
+	out := scrubBody([]byte(in))
+	if strings.Contains(out, "DEAD") {
+		t.Fatalf("X-Goog-Signature leaked: %s", out)
+	}
+}
+
+// TestScrubBodyKeepsBenignContent verifies that scrubBody does not
+// mangle bodies that contain no secrets.
+func TestScrubBodyKeepsBenignContent(t *testing.T) {
+	in := `{"ok":true,"region":"us-east-1"}`
+	out := scrubBody([]byte(in))
+	if out != in {
+		t.Fatalf("scrubBody mangled benign content: %s", out)
+	}
+}
