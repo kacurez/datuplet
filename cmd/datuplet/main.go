@@ -7,6 +7,12 @@ import (
 	"os"
 
 	"github.com/datuplet/datuplet/pkg/icebergjob"
+
+	// Blank-import the centralised iceberg-go IO scheme registration
+	// package so this binary's `gs://` factory is the Datuplet override
+	// regardless of which transitive package registers first. See
+	// pkg/datupleticeio/doc.go and RFC 019 §4.5.
+	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 func main() {

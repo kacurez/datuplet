@@ -15,6 +15,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	// Blank-import the centralised iceberg-go IO scheme registration
+	// package so this binary's `gs://` factory is the Datuplet override.
+	// See pkg/datupleticeio/doc.go and RFC 019 §4.5.
+	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 var (

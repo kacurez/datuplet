@@ -26,6 +26,11 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
+
+	// Blank-import the centralised iceberg-go IO scheme registration
+	// package so this binary's `gs://` factory is the Datuplet override.
+	// See pkg/datupleticeio/doc.go and RFC 019 §4.5.
+	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 func main() {

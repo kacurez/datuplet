@@ -37,6 +37,12 @@ import (
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/pkg/datagateway/jwks"
 	runtokenpkg "github.com/datuplet/datuplet/pkg/datagateway/runtoken"
+
+	// Blank-import the centralised iceberg-go IO scheme registration
+	// package so the `gs://` factory is the Datuplet override whenever
+	// this commit path runs (iceberg-job pod). See pkg/datupleticeio/doc.go
+	// and RFC 019 §4.5.
+	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 // jsonUnmarshalStrict decodes body into out via stdlib json.Unmarshal.

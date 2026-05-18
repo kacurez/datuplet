@@ -6,12 +6,14 @@ import (
 	"strings"
 
 	iceio "github.com/apache/iceberg-go/io"
-	// Blank-import the gocloud subpackage to register the s3:// scheme
-	// factory with iceberg-go's IO registry. The file:// scheme is
-	// registered by iceberg-go/io's package init, so no import is needed
-	// for local paths. Keep this the ONLY place that imports iceberg-go's
-	// io packages so scheme gating stays centralised.
-	_ "github.com/apache/iceberg-go/io/gocloud"
+	// Blank-import the centralised iceberg-go IO scheme registration
+	// package. It transitively registers the s3:// scheme via the
+	// upstream gocloud subpackage and additionally overrides the gs://
+	// scheme with the Datuplet refreshing-TokenSource factory. The
+	// file:// scheme is registered by iceberg-go/io's package init, so
+	// no import is needed for local paths. See pkg/datupleticeio/doc.go
+	// and RFC 019 §4.5.
+	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 // LoadFS returns an iceberg-go-compatible filesystem for the given URI.
