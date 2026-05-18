@@ -216,6 +216,35 @@ func adminLakekeeperBootstrap(args []string) error {
 	keyFile := fs.String("signing-key-file", "", "Path to the RS256 PEM private key (default from SIGNING_KEY_FILE env)")
 	keyID := fs.String("key-id", "", "JWK kid (default from SIGNING_KEY_ID env, then 'key-1')")
 	audience := fs.String("audience", tokens.TableTokenAudience, "JWT aud claim (must match LAKEKEEPER__OPENID_AUDIENCE)")
+
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), `Usage: pipeline-api admin lakekeeper-bootstrap [flags]
+
+Bootstrap a Lakekeeper warehouse. Supports both S3 and GCS; for GCS,
+both static-key and Workload-Identity (WIF) credentials are supported:
+
+  # GCS + Workload Identity (recommended on GKE)
+  pipeline-api admin lakekeeper-bootstrap \
+    --type=gcs --gcs-bucket=$BUCKET \
+    --gcs-credential-type=system-identity \
+    --lakekeeper-project-id=$LK_PROJECT_ID \
+    --lakekeeper-url=$LK_URL \
+    --signing-key-file=$SIGNING_KEY
+
+  # GCS + static service-account key (works anywhere)
+  pipeline-api admin lakekeeper-bootstrap \
+    --type=gcs --gcs-bucket=$BUCKET \
+    --gcs-credential-type=service-account-key \
+    --gcs-sa-key-file=/tmp/datuplet-sa.json \
+    --lakekeeper-project-id=$LK_PROJECT_ID \
+    --lakekeeper-url=$LK_URL \
+    --signing-key-file=$SIGNING_KEY
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+
 	_ = fs.Parse(args)
 
 	if *keyFile == "" {
@@ -269,24 +298,39 @@ func adminLakekeeperBootstrap(args []string) error {
 		if *gcsBucket == "" {
 			return fmt.Errorf("--gcs-bucket is required when --type=gcs")
 		}
-		if *gcsSAKeyFile == "" {
-			*gcsSAKeyFile = os.Getenv("GCS_SA_KEY_FILE")
-		}
-		if *gcsSAKeyFile == "" {
-			return fmt.Errorf("--gcs-sa-key-file is required when --type=gcs (or set GCS_SA_KEY_FILE)")
-		}
-		// Read the SA-key JSON from disk. Don't echo the path's
-		// content into the error — rely on os.ReadFile's error.
-		saBytes, err := os.ReadFile(*gcsSAKeyFile)
-		if err != nil {
-			return fmt.Errorf("read GCS service account key file: %w", err)
-		}
-		spec.GCS = &gcsSpec{
-			Bucket:                *gcsBucket,
-			KeyPrefix:             *gcsKeyPrefix,
-			StsEnabled:            *s3StsEnabled, // shared --sts-enabled flag
-			ServiceAccountKeyJSON: string(saBytes),
-			CredentialType:        *gcsCredType,
+		switch *gcsCredType {
+		case "", "system-identity":
+			if *gcsSAKeyFile != "" || os.Getenv("GCS_SA_KEY_FILE") != "" {
+				return fmt.Errorf("--gcs-credential-type=system-identity cannot be combined with --gcs-sa-key-file/GCS_SA_KEY_FILE")
+			}
+			spec.GCS = &gcsSpec{
+				Bucket:         *gcsBucket,
+				KeyPrefix:      *gcsKeyPrefix,
+				StsEnabled:     *s3StsEnabled, // shared --sts-enabled flag
+				CredentialType: "system-identity",
+			}
+		case "service-account-key":
+			if *gcsSAKeyFile == "" {
+				*gcsSAKeyFile = os.Getenv("GCS_SA_KEY_FILE")
+			}
+			if *gcsSAKeyFile == "" {
+				return fmt.Errorf("--gcs-credential-type=service-account-key requires --gcs-sa-key-file (or GCS_SA_KEY_FILE)")
+			}
+			// Read the SA-key JSON from disk. Don't echo the path's
+			// content into the error — rely on os.ReadFile's error.
+			saBytes, err := os.ReadFile(*gcsSAKeyFile)
+			if err != nil {
+				return fmt.Errorf("read GCS service account key file: %w", err)
+			}
+			spec.GCS = &gcsSpec{
+				Bucket:                *gcsBucket,
+				KeyPrefix:             *gcsKeyPrefix,
+				StsEnabled:            *s3StsEnabled, // shared --sts-enabled flag
+				CredentialType:        "service-account-key",
+				ServiceAccountKeyJSON: string(saBytes),
+			}
+		default:
+			return fmt.Errorf("unknown --gcs-credential-type %q (want system-identity or service-account-key)", *gcsCredType)
 		}
 	default:
 		return fmt.Errorf("unknown --type %q (want s3 or gcs)", *whType)
