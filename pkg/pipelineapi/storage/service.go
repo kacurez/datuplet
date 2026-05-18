@@ -33,7 +33,8 @@ import (
 type Service struct {
 	WarehouseURI string            // e.g. "s3://datuplet" or "file:///abs/path"; empty in lakekeeper mode
 	OrgName      string            // warehouse org segment — "myorg" default; unused in lakekeeper mode
-	S3Props      map[string]string // iceberg-go property map; nil in lakekeeper mode and file:// mode
+	S3Props      map[string]string // iceberg-go property map for s3:// warehouses; nil in lakekeeper mode and file:// mode
+	GCSProps     map[string]string // iceberg-go property map for gs:// warehouses; nil in lakekeeper mode and s3:// mode
 	AllowLocal   bool              // true when WarehouseURI is file://
 
 	// LakekeeperURL is the catalog REST base URL the handlers proxy
