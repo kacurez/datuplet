@@ -62,6 +62,28 @@ type gcsSpec struct {
 	CredentialType        string // "service-account-key" | "system-identity"
 }
 
+// Validate checks that the gcsSpec's CredentialType and ServiceAccountKeyJSON
+// are self-consistent. Returns an error for mutual-exclusion violations or
+// unknown credential types.
+func (s *gcsSpec) Validate() error {
+	switch s.CredentialType {
+	case "", "system-identity":
+		if s.ServiceAccountKeyJSON != "" {
+			return fmt.Errorf("--gcs-credential-type=system-identity cannot be combined with --gcs-sa-key-file/GCS_SA_KEY_FILE")
+		}
+	case "service-account-key":
+		if s.ServiceAccountKeyJSON == "" {
+			return fmt.Errorf("--gcs-credential-type=service-account-key requires --gcs-sa-key-file (or GCS_SA_KEY_FILE)")
+		}
+	default:
+		return fmt.Errorf("unknown --gcs-credential-type %q (want system-identity or service-account-key)", s.CredentialType)
+	}
+	if s.Bucket == "" {
+		return fmt.Errorf("--gcs-bucket required")
+	}
+	return nil
+}
+
 // buildWarehouseBody assembles the request body for
 // `POST /management/v1/warehouse`. Returns an error for unknown types,
 // missing per-type sub-spec, or malformed GCS service-account JSON.

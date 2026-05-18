@@ -196,6 +196,48 @@ func TestServerAdminTupleWrite(t *testing.T) {
 	}
 }
 
+// TestGCSSpec* tests exercise gcsSpec.Validate() — mutual-exclusion and unknown
+// credential type cases.
+
+func TestGCSSpecValidateSystemIdentityDefault(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: ""}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("default (system-identity) happy path: %v", err)
+	}
+}
+
+func TestGCSSpecValidateSystemIdentityExplicit(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: "system-identity"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("system-identity happy path: %v", err)
+	}
+	s.ServiceAccountKeyJSON = "{...}"
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined with --gcs-sa-key-file") {
+		t.Fatalf("expected mutual-exclusion error, got %v", err)
+	}
+}
+
+func TestGCSSpecValidateServiceAccountKey(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: "service-account-key", ServiceAccountKeyJSON: ""}
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "--gcs-sa-key-file") {
+		t.Fatalf("expected SA-key-file required error, got %v", err)
+	}
+	s.ServiceAccountKeyJSON = "{...}"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("with key set: %v", err)
+	}
+}
+
+func TestGCSSpecValidateUnknownType(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: "passport"}
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "unknown --gcs-credential-type") {
+		t.Fatalf("expected unknown-type error, got %v", err)
+	}
+}
+
 // TestPostJSON_WarehouseError_RedactsBody verifies that when redactBodyOnError
 // is true, the response body (which lakekeeper may echo from the request, e.g.
 // an SA key JSON) is not included in the returned error string.
