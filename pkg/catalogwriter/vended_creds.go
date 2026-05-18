@@ -573,9 +573,41 @@ func parseEpochMillis(s string) (time.Time, error) {
 	return time.UnixMilli(ms), nil
 }
 
-// parseGCSCreds is implemented in slice A.4. Stubbed here so parseCreds
-// (slice A.3) compiles and the package builds; A.4 lands the real
-// implementation in the next commit.
+// parseGCSCreds extracts a GCSCreds from a lakekeeper response's config
+// block. See RFC 019 §4.2 for the key family. The returned GCSCreds
+// carries an OAuth bearer in OAuthToken — callers MUST NOT log it (the
+// notokenlog CI analyzer lands in Slice B and rejects %v / %+v /
+// structured-log calls on this type; see RFC 019 §4.10).
+//
+// TTL fallback chain (first non-zero wins):
+//  1. gcs.oauth2.token-expires-at (epoch-ms — the canonical key)
+//  2. creds.expiration-time-ms    (legacy lakekeeper schema)
+//  3. Issued + 15min              (matches lakekeeper's documented STS lifetime)
+//
+// Issued is left zero; VendedCreds.fetch re-stamps it using its clock
+// source. The 15-min fallback is applied here so parseGCSCreds-only
+// callers (and unit tests) get a sane non-zero ExpiresAt without having
+// to wire a clock.
 func parseGCSCreds(cfg map[string]any) (Creds, error) {
-	return nil, errors.New("parseGCSCreds: NOT YET IMPLEMENTED (slice A.4)")
+	tok := readString(cfg, "gcs.oauth2.token")
+	if tok == "" {
+		return nil, errors.New("missing gcs.oauth2.token")
+	}
+	c := GCSCreds{
+		OAuthToken:      tok,
+		GCPProjectID:    readString(cfg, "gcs.project-id"),
+		RefreshEndpoint: readString(cfg, "gcs.oauth2.refresh-credentials-endpoint"),
+	}
+	if t, ok := readMillis(cfg, "gcs.oauth2.token-expires-at"); ok {
+		c.Expires = t
+	} else if t, ok := readMillis(cfg, "creds.expiration-time-ms"); ok {
+		c.Expires = t
+	} else {
+		// No absolute expiry hint: 15-min default from now. VendedCreds.fetch
+		// re-stamps Issued; if the caller is parseGCSCreds-only (no
+		// VendedCreds wrapper), Expires is still set so ExpiresAt() is
+		// non-zero.
+		c.Expires = time.Now().Add(15 * time.Minute)
+	}
+	return c, nil
 }

@@ -494,3 +494,95 @@ func TestParseCredsUnsetExpectedRejects(t *testing.T) {
 		t.Fatalf("expected unset-expected rejection, got %v", err)
 	}
 }
+
+// TestParseGCSCredsHappyPath covers all four GCS fields plus the
+// absolute-epoch-ms expiry path.
+func TestParseGCSCredsHappyPath(t *testing.T) {
+	now := time.Now()
+	cfg := map[string]any{
+		"gcs.oauth2.token":                        "ya29.AAA",
+		"gcs.project-id":                          "kacurez-labs",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lk/refresh",
+		"gcs.oauth2.token-expires-at":             float64(now.Add(20 * time.Minute).UnixMilli()),
+	}
+	got, err := parseGCSCreds(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gc, ok := got.(GCSCreds)
+	if !ok {
+		t.Fatalf("expected GCSCreds, got %T", got)
+	}
+	if gc.OAuthToken != "ya29.AAA" {
+		t.Fatalf("OAuthToken = %q", gc.OAuthToken)
+	}
+	if gc.GCPProjectID != "kacurez-labs" {
+		t.Fatalf("GCPProjectID = %q", gc.GCPProjectID)
+	}
+	if gc.RefreshEndpoint != "https://lk/refresh" {
+		t.Fatalf("RefreshEndpoint = %q", gc.RefreshEndpoint)
+	}
+	if gc.ExpiresAt().Before(now.Add(15 * time.Minute)) {
+		t.Fatalf("Expires = %v, want >= now+15m", gc.ExpiresAt())
+	}
+}
+
+// TestParseGCSCredsMissingTokenRejects: the OAuth token is mandatory.
+func TestParseGCSCredsMissingTokenRejects(t *testing.T) {
+	cfg := map[string]any{"gcs.project-id": "x"}
+	_, err := parseGCSCreds(cfg)
+	if err == nil || !strings.Contains(err.Error(), "missing gcs.oauth2.token") {
+		t.Fatalf("expected missing-token error, got %v", err)
+	}
+}
+
+// TestParseGCSCredsFallbackExpiry: when no expiry hint is present,
+// parseGCSCreds must produce a non-zero ExpiresAt (15-min default per
+// RFC 019 §4.2).
+func TestParseGCSCredsFallbackExpiry(t *testing.T) {
+	cfg := map[string]any{"gcs.oauth2.token": "ya29.AAA"}
+	got, err := parseGCSCreds(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExpiresAt().IsZero() {
+		t.Fatal("ExpiresAt zero — expected 15min default")
+	}
+}
+
+// TestParseGCSCredsCredsExpirationMsFallback covers the secondary
+// expiry key path (`creds.expiration-time-ms`) used when lakekeeper
+// emits the older schema.
+func TestParseGCSCredsCredsExpirationMsFallback(t *testing.T) {
+	target := time.Now().Add(20 * time.Minute)
+	cfg := map[string]any{
+		"gcs.oauth2.token":         "ya29.AAA",
+		"creds.expiration-time-ms": float64(target.UnixMilli()),
+	}
+	got, err := parseGCSCreds(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should be within a few seconds of the target (we accept any
+	// non-zero value within the 15-min default window).
+	diff := got.ExpiresAt().Sub(target)
+	if diff < -time.Second || diff > time.Second {
+		t.Fatalf("Expires = %v, want ~%v (diff %v)", got.ExpiresAt(), target, diff)
+	}
+}
+
+// TestParseCredsHappyPathGCS exercises the parseCreds GCS-family
+// dispatch end to end.
+func TestParseCredsHappyPathGCS(t *testing.T) {
+	cfg := map[string]any{
+		"gcs.oauth2.token": "ya29.AAA",
+		"gcs.project-id":   "kacurez-labs",
+	}
+	got, err := parseCreds(cfg, CredsTypeGCS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type() != CredsTypeGCS {
+		t.Fatalf("Type() = %q, want gcs", got.Type())
+	}
+}
