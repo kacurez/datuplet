@@ -356,3 +356,28 @@ func TestBuildCommitJob_NoS3EnvOnPod(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildCommitJobHasRuntimeTolerations verifies that RuntimeTolerations
+// set on the reconciler are propagated to the commit Job's PodSpec.
+func TestBuildCommitJobHasRuntimeTolerations(t *testing.T) {
+	r := &PipelineRunReconciler{
+		RuntimeTolerations: []corev1.Toleration{{Key: "k", Operator: "Equal", Value: "v", Effect: "NoSchedule"}},
+	}
+	job := r.buildCommitJob(minimalCommitPR(), "raw", datupletv1.WriteModeAppend)
+	if len(job.Spec.Template.Spec.Tolerations) != 1 {
+		t.Fatalf("Tolerations len = %d, want 1", len(job.Spec.Template.Spec.Tolerations))
+	}
+	if job.Spec.Template.Spec.Tolerations[0].Key != "k" {
+		t.Fatalf("Tolerations[0].Key = %q, want %q", job.Spec.Template.Spec.Tolerations[0].Key, "k")
+	}
+}
+
+// TestBuildCommitJobNilTolerationsOmitsField verifies that a reconciler
+// with no RuntimeTolerations leaves spec.tolerations nil (not an empty slice).
+func TestBuildCommitJobNilTolerationsOmitsField(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	job := r.buildCommitJob(minimalCommitPR(), "raw", datupletv1.WriteModeAppend)
+	if job.Spec.Template.Spec.Tolerations != nil {
+		t.Fatalf("Tolerations = %v, want nil", job.Spec.Template.Spec.Tolerations)
+	}
+}
