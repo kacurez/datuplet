@@ -29,13 +29,21 @@ var Analyzer = &analysis.Analyzer{
 	Run:      run,
 }
 
-// seeds is the list of fully-qualified type names that carry bearer
-// credentials and must never be formatted as values. Each entry is
-// "<package-path>.<type-name>". Pointer receivers are handled by
-// typeMatchesSeed unwrapping *T → T before comparison.
+// seeds names the qualified types whose values must never be passed to a
+// formatter/logger as an unredacted value. Listed types are the ones
+// carrying live bearer-credential material (a single field, the OAuth
+// token / bearer, leaking which compromises a session).
 //
-// Extend this list as new credential-carrying types land. Keep it sorted
-// alphabetically by package path for review ergonomics.
+// S3Creds (in pkg/catalogwriter) is intentionally excluded: the S3 path
+// predates RFC 019 and its secrets are guarded by separate scrubBody
+// rules + the AWS SDK's own credential handling. Add S3Creds here if the
+// S3 backend ever gains a new structured-log call site that handles
+// S3Creds values directly.
+//
+// Each entry is "<package-path>.<type-name>". Pointer receivers are
+// handled by typeMatchesSeed unwrapping *T (recursively) before
+// comparison. Extend this list as new credential-carrying types land.
+// Keep it sorted alphabetically by package path for review ergonomics.
 var seeds = []string{
 	"github.com/datuplet/datuplet/pkg/catalogwriter.GCSCreds",
 	"github.com/datuplet/datuplet/pkg/datagateway/backend.vendedTokenSource",
@@ -126,8 +134,14 @@ func typeMatchesSeed(t types.Type) (string, bool) {
 	if t == nil {
 		return "", false
 	}
-	// Unwrap pointer: *catalogwriter.GCSCreds → catalogwriter.GCSCreds.
-	if ptr, ok := t.(*types.Pointer); ok {
+	// Unwrap pointer(s): **T → *T → T. A single level is typical but
+	// recursive unwrapping handles generated or table-driven code that
+	// wraps values in double pointers.
+	for {
+		ptr, ok := t.(*types.Pointer)
+		if !ok {
+			break
+		}
 		t = ptr.Elem()
 	}
 	named, ok := t.(*types.Named)

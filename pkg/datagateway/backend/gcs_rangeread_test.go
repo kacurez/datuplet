@@ -36,7 +36,7 @@ func (f *fakeGCSRangeGetter) GetRange(_ context.Context, _ string, offset, lengt
 	}
 	end := offset + length
 	if end > int64(len(f.data)) {
-		return nil, fmt.Errorf("range out of bounds: offset=%d length=%d (size %d)", offset, length, len(f.data))
+		end = int64(len(f.data)) // clamp, don't error — matches real GCS behaviour
 	}
 	f.calls = append(f.calls, gcsRangeCall{offset, length})
 	return append([]byte(nil), f.data[offset:end]...), nil

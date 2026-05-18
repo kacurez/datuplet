@@ -144,6 +144,10 @@ var _ oauth2.TokenSource = (*vendedTokenSource)(nil)
 // Redaction: the wrong-type error formats %T (type-only); never %v / %+v
 // — formatting the Creds value would leak the bearer. See RFC 019 §4.10.
 func (t *vendedTokenSource) Token() (*oauth2.Token, error) {
+	// oauth2.TokenSource.Token() carries no context; context.Background() is
+	// the only option here. VendedCreds enforces a 30s per-request timeout
+	// via defaultHTTPTimeout in catalogwriter so a hung lakekeeper can't
+	// deadlock the storage client.
 	c, err := t.vc.Get(context.Background())
 	if err != nil {
 		return nil, err

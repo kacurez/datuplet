@@ -647,6 +647,30 @@ func TestScrubBodyKeepsBenignContent(t *testing.T) {
 	}
 }
 
+// TestScrubBodyRedactsBareJWT verifies that a JWT appearing without a
+// `Bearer ` prefix (e.g. in a lakekeeper error-body JSON field) is
+// replaced by `<redacted-jwt>`.
+func TestScrubBodyRedactsBareJWT(t *testing.T) {
+	in := []byte(`{"error":"invalid token: eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature_here"}`)
+	out := scrubBody(in)
+	if strings.Contains(out, "eyJhbGci") {
+		t.Fatalf("bare JWT leaked: %s", out)
+	}
+	if !strings.Contains(out, "<redacted-jwt>") {
+		t.Fatalf("expected jwt redaction marker, got: %s", out)
+	}
+}
+
+// TestScrubBodyRedactsAWSSignedURLParams verifies that X-Amz-* query
+// parameters (Security-Token, Signature, etc.) are redacted.
+func TestScrubBodyRedactsAWSSignedURLParams(t *testing.T) {
+	in := []byte(`X-Amz-Security-Token=IQoJb3JpZ2luX2Vj&X-Amz-Signature=ABCDEF`)
+	out := scrubBody(in)
+	if strings.Contains(out, "IQoJb3J") || strings.Contains(out, "ABCDEF") {
+		t.Fatalf("X-Amz-* leaked: %s", out)
+	}
+}
+
 // resetMetrics resets both creds-refresh counter-vecs between subtests so
 // that each subtest starts from a clean slate. It calls Reset() on both vecs,
 // which zeroes all label-series that have been observed so far. This is safe

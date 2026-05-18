@@ -557,14 +557,28 @@ func (v *VendedCreds) discoverPrefix(ctx context.Context, base, jwt, warehouse s
 // keeper is unlikely to echo the request's bearer token but defensive
 // scrubbing here keeps a misconfigured backend from leaking secrets
 // into operator logs.
-var bearerPattern = regexp.MustCompile(`Bearer [A-Za-z0-9_\-.]+`)
+var bearerPattern = regexp.MustCompile(`Bearer [^\s"'}]+`)
 
 // ya29Pattern matches GCP OAuth2 access tokens (e.g. those returned
 // by metadata-server / STS exchanges). Real tokens are ~140 chars of
 // base64-url-safe content after the `ya29.` prefix; we accept any
 // non-empty trailing run so partial / truncated tokens still get
 // scrubbed.
-var ya29Pattern = regexp.MustCompile(`ya29\.[A-Za-z0-9_\-]+`)
+var ya29Pattern = regexp.MustCompile(`ya29\.[A-Za-z0-9_\-+/]+`)
+
+// jwtPattern matches bare JWTs that appear outside a `Bearer ` prefix —
+// for example, token values echoed back in lakekeeper error JSON. The
+// three-segment `eyJ…` structure is distinctive enough that false
+// positives are negligible. Applied after bearerPattern so a
+// Bearer-prefixed JWT becomes `Bearer [REDACTED]` and the standalone
+// pattern never has to match it.
+var jwtPattern = regexp.MustCompile(`eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+`)
+
+// awsSigPattern matches X-Amz-* signed-URL query parameters (e.g.
+// X-Amz-Security-Token, X-Amz-Signature) that appear when an S3
+// pre-signed URL is logged in an error body. The parameter name is
+// preserved; only the value is redacted.
+var awsSigPattern = regexp.MustCompile(`X-Amz-[A-Za-z0-9\-]+=[^&\s"'}]+`)
 
 // gcsSigPattern matches any `X-Goog-<word>=<value>` query parameter,
 // covering signed-URL fields like `X-Goog-Signature`, `X-Goog-
@@ -584,8 +598,17 @@ func scrubBody(b []byte) string {
 		s = s[:max] + "..."
 	}
 	s = bearerPattern.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = jwtPattern.ReplaceAllString(s, "<redacted-jwt>")
 	s = ya29Pattern.ReplaceAllString(s, "<redacted-oauth2-token>")
 	s = gcsSigPattern.ReplaceAllStringFunc(s, func(m string) string {
+		// Keep the param name; redact the value.
+		eq := strings.IndexByte(m, '=')
+		if eq < 0 {
+			return "<redacted>"
+		}
+		return m[:eq+1] + "<redacted>"
+	})
+	s = awsSigPattern.ReplaceAllStringFunc(s, func(m string) string {
 		// Keep the param name; redact the value.
 		eq := strings.IndexByte(m, '=')
 		if eq < 0 {
