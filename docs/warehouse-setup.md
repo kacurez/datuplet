@@ -137,9 +137,12 @@ state in Postgres tied to this name.
 
 ---
 
-## Part 2 — GCS bucket preparation
+## Part 2 — GCS
 
-### 1. Create the bucket
+Lakekeeper supports two credential modes for GCS warehouses, both fully
+supported and equally tested in v0.2.
+
+### 1. Create the bucket (both modes)
 
 ```bash
 gcloud storage buckets create gs://my-org-datuplet \
@@ -150,70 +153,116 @@ gcloud storage buckets create gs://my-org-datuplet \
 Uniform bucket-level access is required — ACL-based access is not supported by Datuplet's
 Lakekeeper integration.
 
-### 2. Create a service account
+---
+
+### Mode A — Workload Identity Federation (recommended on GKE)
+
+**Prerequisite:** GKE cluster created with Workload Identity enabled
+(`--workload-pool=<project>.svc.id.goog` at cluster create time). Existing
+clusters can be retrofitted via the GKE console or
+`gcloud container clusters update --workload-pool=...`.
+
+**GSA + WIF binding (3 gcloud commands):**
 
 ```bash
-gcloud iam service-accounts create datuplet-warehouse \
-  --description="Datuplet Iceberg warehouse access" \
-  --display-name="Datuplet Warehouse"
-```
+GSA="datuplet-lakekeeper-warehouse@${GCP_PROJECT}.iam.gserviceaccount.com"
 
-### 3. Grant roles
+# 1. Create the GSA (skip if exists).
+gcloud iam service-accounts create datuplet-lakekeeper-warehouse \
+  --project="${GCP_PROJECT}"
 
-Grant object-level access to the bucket:
-
-```bash
-gcloud storage buckets add-iam-policy-binding gs://my-org-datuplet \
-  --member=serviceAccount:datuplet-warehouse@<project>.iam.gserviceaccount.com \
+# 2. Grant the GSA write access to the bucket.
+gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+  --member="serviceAccount:${GSA}" \
   --role=roles/storage.objectAdmin
+
+# 3. Bind the K8s ServiceAccount (datuplet/lakekeeper) as workloadIdentityUser
+#    on the GSA.
+gcloud iam service-accounts add-iam-policy-binding "${GSA}" \
+  --role=roles/iam.workloadIdentityUser \
+  --member="serviceAccount:${GCP_PROJECT}.svc.id.goog[datuplet/lakekeeper]"
 ```
 
-If STS-vended credentials are enabled (recommended — `warehouse.gcs.stsEnabled: true`),
-Lakekeeper exchanges the service account key for short-lived OAuth tokens on behalf of each
-pipeline run.  Grant the SA the right to create tokens for itself:
+**Chart values** (`charts/datuplet-lakekeeper` install):
 
 ```bash
-gcloud iam service-accounts add-iam-policy-binding \
-  datuplet-warehouse@<project>.iam.gserviceaccount.com \
-  --member=serviceAccount:datuplet-warehouse@<project>.iam.gserviceaccount.com \
-  --role=roles/iam.serviceAccountTokenCreator
+helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
+  -n datuplet --wait --wait-for-jobs --timeout 10m \
+  --set workloadIdentity.enabled=true \
+  --set workloadIdentity.gcpServiceAccount="${GSA}" \
+  --set platform.enableGcpSystemCredentials=true
 ```
 
-### 4. Generate a key
+**Bootstrap invocation:**
 
 ```bash
-gcloud iam service-accounts keys create sa-key.json \
-  --iam-account=datuplet-warehouse@<project>.iam.gserviceaccount.com
+pipeline-api admin lakekeeper-bootstrap \
+  --type=gcs --gcs-bucket="${GCS_BUCKET}" \
+  --gcs-credential-type=system-identity \
+  --lakekeeper-project-id="${LK_PROJECT_ID}" \
+  --lakekeeper-url="${LK_URL}" \
+  --signing-key-file="${SIGNING_KEY}"
 ```
 
-### 5. Create the K8s Secret
+**Troubleshooting:**
+
+- Pod fails to authenticate to GCS → check the KSA annotation:
+  `kubectl get sa lakekeeper -n datuplet -o jsonpath='{.metadata.annotations}'`
+  should contain `iam.gke.io/gcp-service-account: <GSA email>`.
+- Vended-token errors → check Lakekeeper logs for "GCS access denied" with
+  the GSA. Most common cause: the WIF binding was set up against a different
+  KSA namespace/name than what the chart actually creates (`datuplet/lakekeeper`).
+
+---
+
+### Mode B — Static service-account key (works anywhere)
+
+**Create the SA + key:**
 
 ```bash
-kubectl -n datuplet create secret generic my-gcs-creds \
-  --from-file=serviceAccountKey.json=sa-key.json
-rm sa-key.json  # don't leave the key on disk
+gcloud iam service-accounts create datuplet-lakekeeper-warehouse \
+  --project="${GCP_PROJECT}"
+
+GSA="datuplet-lakekeeper-warehouse@${GCP_PROJECT}.iam.gserviceaccount.com"
+
+gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+  --member="serviceAccount:${GSA}" \
+  --role=roles/storage.objectAdmin
+
+gcloud iam service-accounts keys create /tmp/datuplet-sa.json \
+  --iam-account="${GSA}" \
+  --project="${GCP_PROJECT}"
 ```
 
-The chart expects the key file under the `serviceAccountKey.json` key in the Secret.
+**Chart values** — no WIF flags needed:
 
-### 6. Wire the values
-
-```yaml
-# values.prod.yaml
-minio:
-  enabled: false
-
-warehouse:
-  type: gcs
-  name: datuplet
-  gcs:
-    bucket: my-org-datuplet
-    keyPrefix: datuplet     # optional sub-path within the bucket; leave empty for bucket root
-    stsEnabled: true
-    existingSecret: my-gcs-creds
+```bash
+helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
+  -n datuplet --wait --wait-for-jobs --timeout 10m
 ```
 
-### 7. Manual smoke test (optional)
+**Bootstrap:**
+
+```bash
+pipeline-api admin lakekeeper-bootstrap \
+  --type=gcs --gcs-bucket="${GCS_BUCKET}" \
+  --gcs-credential-type=service-account-key \
+  --gcs-sa-key-file=/tmp/datuplet-sa.json \
+  --lakekeeper-project-id="${LK_PROJECT_ID}" \
+  --lakekeeper-url="${LK_URL}" \
+  --signing-key-file="${SIGNING_KEY}"
+```
+
+**Cleanup:** delete `/tmp/datuplet-sa.json` after bootstrap — Lakekeeper has
+the key persisted internally.
+
+**Rotation:** to rotate the key, generate a new one + re-bootstrap with the
+same `--gcs-credential-type=service-account-key`. Lakekeeper replaces the
+stored credential.
+
+---
+
+### Manual smoke test (optional, both modes)
 
 ```bash
 GCS_BUCKET=my-org-datuplet \
