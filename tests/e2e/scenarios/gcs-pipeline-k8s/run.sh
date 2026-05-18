@@ -18,38 +18,29 @@ echo "==> Deploying fake-gcs-server"
 kubectl apply -f "${SCENARIO_DIR}/fake-gcs-server.yaml" -n "${NS}"
 kubectl rollout status deploy/fake-gcs-server -n "${NS}" --timeout=2m
 
-echo "==> Bootstrapping a fake-gcs warehouse via pipeline-api"
-# Skip in scenarios that haven't been wired to fake-gcs yet — the
-# integration harness for the bootstrap subcommand against fake-gcs is
-# tracked separately in the gcs-pipeline-k8s readme.
-
-echo "==> Applying pipeline + triggering run"
-kubectl apply -f "${SCENARIO_DIR}/pipeline.yaml" -n "${NS}"
-kubectl create -f - <<EOF
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  generateName: gcs-smoke-
-  namespace: ${NS}
-spec:
-  pipelineRef:
-    name: gcs-smoke
-EOF
-
-echo "==> Waiting for Succeeded"
-for i in $(seq 1 60); do
-    PHASE=$(kubectl -n "${NS}" get pipelinerun -o jsonpath='{.items[-1].status.phase}' 2>/dev/null || true)
-    if [[ "$PHASE" == "Succeeded" ]]; then
-        echo "PASS: pipeline succeeded"
-        exit 0
-    fi
-    if [[ "$PHASE" == "Failed" ]]; then
-        kubectl -n "${NS}" describe pipelinerun
-        echo "FAIL: pipeline failed"
-        exit 1
-    fi
-    sleep 5
-done
-
-echo "FAIL: pipeline did not reach Succeeded within 5 min"
+echo "==> Bootstrap-against-fake-gcs check"
+# This scenario needs three things wired before it can pass CI:
+#
+#   1. STORAGE_EMULATOR_HOST=http://fake-gcs-server.${NS}:4443 on the
+#      Lakekeeper container so the Rust GCS crate routes API calls to the
+#      in-cluster fake-gcs instead of storage.googleapis.com. Add via
+#      charts/datuplet-lakekeeper/values.yaml + extraEnvFrom or a new
+#      `platform.storageEmulatorHost` value.
+#
+#   2. scripts/register.sh extended with a --warehouse-type=gcs branch
+#      that calls pipeline-api admin lakekeeper-bootstrap with
+#      --gcs-credential-type=service-account-key and a fake SA JSON.
+#
+#   3. A separate "gcs-smoke" project + attach-warehouse so this pipeline
+#      doesn't silently write to the S3 warehouse the default project
+#      already has attached. (Otherwise the scenario false-positive
+#      passes by writing to MinIO.)
+#
+# Until those three land, the scenario fails CI deliberately with this
+# clear message rather than a confusing pipeline-run timeout. Reviewers
+# fixing forward should land them in that order.
+echo "FAIL: GCS-via-Lakekeeper bootstrap is not yet wired for the in-cluster"
+echo "      fake-gcs-server harness. See the comment block above for the"
+echo "      three TODOs needed to make this scenario actually exercise the"
+echo "      gs:// path end-to-end."
 exit 1

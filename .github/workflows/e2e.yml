@@ -74,6 +74,13 @@ jobs:
       - name: Run e2e (deploy + test + teardown)
         run: make e2e-k8s-deploy
 
+      - name: Run GCS e2e scenario (in-cluster fake-gcs-server)
+        # Blocking: a real failure here means the GCS path is broken in
+        # CI conditions. The scenario lives at tests/e2e/scenarios/gcs-pipeline-k8s/.
+        env:
+          NAMESPACE: datuplet-e2e
+        run: make e2e-k8s-gcs
+
       - name: Dump pod state on failure
         if: failure()
         run: |
