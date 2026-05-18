@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
 
 // TestNewResolver_RequiresURL: a resolver without a lakekeeper URL is
@@ -45,34 +47,34 @@ func TestNewResolver_OK(t *testing.T) {
 	}
 }
 
-// TestBuildS3Backend_FileScheme: a file:// data prefix yields a
-// LocalBackend and nil VendedCreds. Used by tests + local-mode dev
-// where no S3 client is needed.
-func TestBuildS3Backend_FileScheme(t *testing.T) {
+// TestBuildBackend_FileScheme: a file:// data prefix yields a
+// LocalBackend and nil VendedCreds via the scheme dispatcher. Used by
+// tests + local-mode dev where no S3 client is needed.
+func TestBuildBackend_FileScheme(t *testing.T) {
 	r := &Resolver{URL: "http://example.invalid:8181/catalog", Warehouse: "datuplet"}
-	be, vc, err := r.buildS3Backend("file:///tmp/warehouse/raw/orders/data/", "raw", "orders")
+	be, vc, err := r.buildBackend("file:///tmp/warehouse/raw/orders/data/", "raw", "orders")
 	if err != nil {
-		t.Fatalf("buildS3Backend file://: %v", err)
+		t.Fatalf("buildBackend file://: %v", err)
 	}
 	if be == nil {
-		t.Fatal("buildS3Backend file://: nil backend")
+		t.Fatal("buildBackend file://: nil backend")
 	}
 	if vc != nil {
-		t.Error("buildS3Backend file://: VendedCreds should be nil for file:// (no STS)")
+		t.Error("buildBackend file://: VendedCreds should be nil for file:// (no STS)")
 	}
 }
 
-// TestBuildS3Backend_UnsupportedScheme: a path that's neither s3:// nor
-// file:// is rejected. Catches a misconfigured lakekeeper warehouse
-// returning e.g. an HTTP URL.
-func TestBuildS3Backend_UnsupportedScheme(t *testing.T) {
+// TestBuildBackend_UnsupportedScheme: a path that's neither s3://, gs://,
+// nor file:// is rejected by the dispatcher. Catches a misconfigured
+// lakekeeper warehouse returning e.g. an HTTP URL.
+func TestBuildBackend_UnsupportedScheme(t *testing.T) {
 	r := &Resolver{URL: "http://example.invalid:8181/catalog", Warehouse: "datuplet"}
-	_, _, err := r.buildS3Backend("http://example.invalid/data/", "raw", "orders")
+	_, _, err := r.buildBackend("http://example.invalid/data/", "raw", "orders")
 	if err == nil {
-		t.Fatal("buildS3Backend http://: expected error, got nil")
+		t.Fatal("buildBackend http://: expected error, got nil")
 	}
 	if !strings.Contains(err.Error(), "unsupported scheme") {
-		t.Errorf("buildS3Backend http://: unexpected error: %v", err)
+		t.Errorf("buildBackend http://: unexpected error: %v", err)
 	}
 }
 
@@ -152,6 +154,46 @@ func TestBuildS3Backend_S3WithToken(t *testing.T) {
 	}
 	if !strings.Contains(seenAuth, "jwt-run-token") {
 		t.Errorf("STS Authorization header = %q, want it to contain \"jwt-run-token\"", seenAuth)
+	}
+}
+
+// TestBuildBackendRejectsUnknownScheme: buildBackend must return an
+// "unsupported scheme" error for paths that are neither s3://, gs://, nor
+// file://. The error message must mention gs:// as a supported scheme so
+// operators know GCS is available.
+func TestBuildBackendRejectsUnknownScheme(t *testing.T) {
+	r := &Resolver{URL: "http://example.invalid:8181/catalog", Warehouse: "datuplet"}
+	_, _, err := r.buildBackend("azure://x/y", "ns", "tbl")
+	if err == nil || !strings.Contains(err.Error(), "unsupported scheme") {
+		t.Fatalf("expected unsupported-scheme error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "gs://") {
+		t.Fatalf("error message should mention gs:// as a supported scheme; got %v", err)
+	}
+}
+
+// TestBuildBackendDispatchesGCS: a gs:// data prefix is routed to
+// buildGCSBackend via buildBackend. The returned backend must be non-nil,
+// VendedCreds must be non-nil, and ExpectedCredsType must be CredsTypeGCS.
+func TestBuildBackendDispatchesGCS(t *testing.T) {
+	r := &Resolver{
+		URL:       "http://test.example/catalog",
+		Warehouse: "test-warehouse",
+		ProjectID: "proj",
+		Token:     "fake-token",
+	}
+	be, vc, err := r.buildBackend("gs://test-bucket/some/prefix", "ns", "tbl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if be == nil {
+		t.Fatal("nil backend")
+	}
+	if vc == nil {
+		t.Fatal("nil VendedCreds")
+	}
+	if vc.ExpectedCredsType != catalogwriter.CredsTypeGCS {
+		t.Fatalf("ExpectedCredsType = %q, want gcs", vc.ExpectedCredsType)
 	}
 }
 

@@ -202,7 +202,7 @@ func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sch
 	}
 	dataPrefix := strings.TrimRight(loc, "/") + "/data/"
 
-	be, vc, err := r.buildS3Backend(dataPrefix, ns, tbl)
+	be, vc, err := r.buildBackend(dataPrefix, ns, tbl)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +269,7 @@ func (r *Resolver) LoadTableForRead(ctx context.Context, ns, tbl string) (*Reade
 		return nil, fmt.Errorf("lakekeeper: table %s.%s has empty location", ns, tbl)
 	}
 	dataPrefix := strings.TrimRight(loc, "/") + "/data/"
-	be, _, err := r.buildS3Backend(dataPrefix, ns, tbl)
+	be, _, err := r.buildBackend(dataPrefix, ns, tbl)
 	if err != nil {
 		return nil, err
 	}
@@ -295,21 +295,28 @@ func (r *Resolver) newClient(ctx context.Context, token string) (*catalogwriter.
 	})
 }
 
+// buildBackend dispatches to the scheme-appropriate backend constructor.
+// Supported schemes: s3://, gs://, file://. Unknown schemes return an
+// "unsupported scheme" error that names all three supported variants so
+// operators can diagnose a misconfigured lakekeeper warehouse quickly.
+func (r *Resolver) buildBackend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
+	switch {
+	case strings.HasPrefix(dataPrefix, "file://"):
+		return backend.NewLocalBackend(backend.LocalConfig{}), nil, nil
+	case strings.HasPrefix(dataPrefix, "s3://"):
+		return r.buildS3Backend(dataPrefix, ns, tbl)
+	case strings.HasPrefix(dataPrefix, "gs://"):
+		return r.buildGCSBackend(dataPrefix, ns, tbl)
+	default:
+		return nil, nil, fmt.Errorf("lakekeeper: unsupported scheme in %q (need s3://, gs://, or file://)", dataPrefix)
+	}
+}
+
 // buildS3Backend constructs a backend.StorageBackend for `s3://...`
 // data prefixes by wiring `pkg/catalogwriter.VendedCreds` into a
 // minio-go credentials provider. Returns the backend, the vendedCreds
 // (so callers can observe LastError), and any setup error.
-//
-// For `file://` prefixes (tests / local-mode dev), a LocalBackend is
-// returned and VendedCreds is nil.
 func (r *Resolver) buildS3Backend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
-	if strings.HasPrefix(dataPrefix, "file://") {
-		return backend.NewLocalBackend(backend.LocalConfig{}), nil, nil
-	}
-	if !strings.HasPrefix(dataPrefix, "s3://") {
-		return nil, nil, fmt.Errorf("lakekeeper: unsupported scheme in %q (need s3:// or file://)", dataPrefix)
-	}
-
 	tok := r.Token
 	tp := func(context.Context) (string, error) { return tok, nil }
 	// VendedCreds discovers the per-warehouse REST URL prefix lazily on
@@ -345,6 +352,42 @@ func (r *Resolver) buildS3Backend(dataPrefix, ns, tbl string) (backend.StorageBa
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("lakekeeper: build vended-creds minio backend: %w", err)
+	}
+	return be, vc, nil
+}
+
+// buildGCSBackend mirrors buildS3Backend for `gs://...` data prefixes,
+// wiring lakekeeper-vended GCS credentials into a GCS storage backend.
+// Returns the backend, the VendedCreds (for observability), and any setup error.
+func (r *Resolver) buildGCSBackend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
+	tok := r.Token
+	tp := func(context.Context) (string, error) { return tok, nil }
+	vc := &catalogwriter.VendedCreds{
+		LakekeeperURL:     r.URL,
+		WarehouseName:     r.Warehouse,
+		ProjectID:         r.ProjectID,
+		Namespace:         ns,
+		Table:             tbl,
+		TokenProvider:     tp,
+		ExpectedCredsType: catalogwriter.CredsTypeGCS,
+	}
+
+	// Bucket name comes from the table prefix. lakekeeper writes the
+	// scheme as `gs://<bucket>/<warehouse-uuid>/...`; only the bucket
+	// name is needed by the backend.
+	rest := strings.TrimPrefix(dataPrefix, "gs://")
+	parts := strings.SplitN(rest, "/", 2)
+	bucket := parts[0]
+	if bucket == "" {
+		return nil, nil, fmt.Errorf("lakekeeper: cannot derive bucket from %q", dataPrefix)
+	}
+
+	be, err := backend.NewGCSBackendWithProvider(backend.GCSProviderConfig{
+		Bucket:      bucket,
+		VendedCreds: vc,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("lakekeeper: build vended-creds gcs backend: %w", err)
 	}
 	return be, vc, nil
 }
