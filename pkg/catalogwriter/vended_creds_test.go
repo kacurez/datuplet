@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeClock is a tick-driven time source for the renewal-cadence
@@ -642,5 +644,177 @@ func TestScrubBodyKeepsBenignContent(t *testing.T) {
 	out := scrubBody([]byte(in))
 	if out != in {
 		t.Fatalf("scrubBody mangled benign content: %s", out)
+	}
+}
+
+// resetMetrics resets both creds-refresh counter-vecs between subtests so
+// that each subtest starts from a clean slate. It calls Reset() on both vecs,
+// which zeroes all label-series that have been observed so far. This is safe
+// because the counters are package-level vars in the same package.
+func resetMetrics() {
+	credsRefreshTotal.Reset()
+	credsRefreshFailuresTotal.Reset()
+}
+
+// TestCredsRefreshMetrics_SuccessCounterS3 asserts that a successful S3 fetch
+// increments datuplet_creds_refresh_total{type="s3"} exactly once.
+func TestCredsRefreshMetrics_SuccessCounterS3(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{
+			"config": map[string]string{
+				"s3.access-key-id":       "AKIA",
+				"s3.secret-access-key":   "secret",
+				"s3.session-token":       "session",
+				"s3.region":              "local-01",
+				"s3.endpoint":            "http://minio:9000",
+				"s3.session-ttl-seconds": "900",
+			},
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	got := testutil.ToFloat64(credsRefreshTotal.WithLabelValues("s3"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_total{type=s3} = %v, want 1", got)
+	}
+	// Failure counter must not have been touched.
+	if n := testutil.CollectAndCount(credsRefreshFailuresTotal); n != 0 {
+		t.Errorf("datuplet_creds_refresh_failures_total unexpected series count = %d, want 0", n)
+	}
+}
+
+// TestCredsRefreshMetrics_SuccessCounterGCS asserts that a successful GCS fetch
+// increments datuplet_creds_refresh_total{type="gcs"} exactly once.
+func TestCredsRefreshMetrics_SuccessCounterGCS(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{
+			"config": map[string]string{
+				"gcs.oauth2.token": "ya29.AAA",
+				"gcs.project-id":  "test-project",
+			},
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeGCS,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	got := testutil.ToFloat64(credsRefreshTotal.WithLabelValues("gcs"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_total{type=gcs} = %v, want 1", got)
+	}
+}
+
+// TestCredsRefreshMetrics_HttpFailure asserts that an HTTP 500 from lakekeeper
+// increments datuplet_creds_refresh_failures_total{type="s3",reason="http"}.
+func TestCredsRefreshMetrics_HttpFailure(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"down"}`))
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err == nil {
+		t.Fatal("expected error from 500 response, got nil")
+	}
+
+	got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "http"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_failures_total{type=s3,reason=http} = %v, want 1", got)
+	}
+	// Success counter must not have been touched.
+	if n := testutil.CollectAndCount(credsRefreshTotal); n != 0 {
+		t.Errorf("datuplet_creds_refresh_total unexpected series count = %d, want 0", n)
+	}
+}
+
+// TestCredsRefreshMetrics_TokenProviderFailure asserts that a TokenProvider
+// error increments datuplet_creds_refresh_failures_total{type="s3",reason="token_provider"}.
+func TestCredsRefreshMetrics_TokenProviderFailure(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("HTTP server should not be called when TokenProvider fails")
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider: func(context.Context) (string, error) {
+			return "", errors.New("token not found")
+		},
+	}
+	if _, err := v.Get(context.Background()); err == nil {
+		t.Fatal("expected error from failing TokenProvider, got nil")
+	}
+
+	got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "token_provider"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_failures_total{type=s3,reason=token_provider} = %v, want 1", got)
+	}
+}
+
+// TestCredsRefreshMetrics_ParseFailure asserts that a malformed JSON response
+// increments datuplet_creds_refresh_failures_total{type="s3",reason="parse"}.
+func TestCredsRefreshMetrics_ParseFailure(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Return valid JSON but with no config block so parseCreds rejects it.
+		_, _ = w.Write([]byte(`{"metadata":{}}`))
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err == nil {
+		t.Fatal("expected error from no-config response, got nil")
+	}
+
+	got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "parse"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_failures_total{type=s3,reason=parse} = %v, want 1", got)
 	}
 }

@@ -264,6 +264,11 @@ func (v *VendedCreds) LastError() error {
 // also return per-table metadata in the same body — we ignore
 // everything outside `config` for the purposes of this cache.
 func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
+	// credType is used for metric labels on the error path. We know
+	// ExpectedCredsType at construction; use it throughout so failures
+	// before the parse step still carry a meaningful label.
+	credType := string(v.ExpectedCredsType)
+
 	if v.LakekeeperURL == "" {
 		return nil, errors.New("catalogwriter: LakekeeperURL is required")
 	}
@@ -275,6 +280,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	}
 	tok, err := v.TokenProvider(ctx)
 	if err != nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "token_provider").Inc()
 		return nil, fmt.Errorf("catalogwriter: token provider: %w", err)
 	}
 
@@ -289,6 +295,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	if v.Prefix == "" && v.WarehouseName != "" {
 		discovered, derr := v.discoverPrefix(ctx, base, tok, v.WarehouseName)
 		if derr != nil {
+			credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
 			return nil, fmt.Errorf("catalogwriter: discover warehouse prefix: %w", derr)
 		}
 		v.Prefix = discovered
@@ -302,6 +309,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 	if err != nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "other").Inc()
 		return nil, fmt.Errorf("catalogwriter: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -322,6 +330,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
 		return nil, fmt.Errorf("catalogwriter: lakekeeper GET: %w", err)
 	}
 	defer resp.Body.Close()
@@ -330,9 +339,11 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	// can't OOM the data gateway with a multi-GB body.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
 		return nil, fmt.Errorf("catalogwriter: read response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
 		return nil, fmt.Errorf("catalogwriter: lakekeeper GET: status %d body=%s", resp.StatusCode, scrubBody(body))
 	}
 
@@ -340,15 +351,18 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 		Config map[string]any `json:"config"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
 		return nil, fmt.Errorf("catalogwriter: unmarshal response: %w", err)
 	}
 	cfg := parsed.Config
 	if cfg == nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
 		return nil, errors.New("catalogwriter: lakekeeper response had no config block")
 	}
 
 	c, err := parseCreds(cfg, v.ExpectedCredsType)
 	if err != nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
 		return nil, fmt.Errorf("catalogwriter: %w", err)
 	}
 	// parseCreds returns a Creds with absolute Expires when the response
@@ -378,6 +392,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 		}
 		c = x
 	}
+	credsRefreshTotal.WithLabelValues(string(c.Type())).Inc()
 	return c, nil
 }
 
