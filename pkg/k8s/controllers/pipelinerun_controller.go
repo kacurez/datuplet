@@ -72,6 +72,11 @@ type PipelineRunReconciler struct {
 	// JWT and lakekeeper-vended STS credentials exclusively.
 
 	Clientset kubernetes.Interface
+
+	// RuntimeTolerations are injected onto every per-run Pod spec (component
+	// Jobs and TableCommit Jobs) spawned by this operator. Populated from
+	// DATUPLET_RUN_TOLERATIONS_JSON at startup. Nil means no injection.
+	RuntimeTolerations []corev1.Toleration
 }
 
 // +kubebuilder:rbac:groups=datuplet.io,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete
