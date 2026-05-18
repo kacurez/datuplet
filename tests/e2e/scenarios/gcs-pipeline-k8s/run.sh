@@ -15,7 +15,7 @@ if ! kubectl get namespace "${NS}" 2>/dev/null | grep -q "${NS}"; then
 fi
 
 echo "==> Deploying fake-gcs-server"
-kubectl apply -f "${SCENARIO_DIR}/fake-gcs-server.yaml"
+kubectl apply -f "${SCENARIO_DIR}/fake-gcs-server.yaml" -n "${NS}"
 kubectl rollout status deploy/fake-gcs-server -n "${NS}" --timeout=2m
 
 echo "==> Bootstrapping a fake-gcs warehouse via pipeline-api"
@@ -24,7 +24,7 @@ echo "==> Bootstrapping a fake-gcs warehouse via pipeline-api"
 # tracked separately in the gcs-pipeline-k8s readme.
 
 echo "==> Applying pipeline + triggering run"
-kubectl apply -f "${SCENARIO_DIR}/pipeline.yaml"
+kubectl apply -f "${SCENARIO_DIR}/pipeline.yaml" -n "${NS}"
 kubectl create -f - <<EOF
 apiVersion: datuplet.io/v1
 kind: PipelineRun

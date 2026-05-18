@@ -98,33 +98,59 @@ func TestRefreshingTokenSourceDoesNotReturnStaleOnFailure(t *testing.T) {
 
 // TestPickRefreshEndpointActivationFailsClosed verifies that datupletGCSFactory
 // fails fast at construction time when gcs.oauth2.refresh-credentials-endpoint
-// is present in props and not disabled. Without this, the unvalidated
-// endpointRefresh path would only surface as an error ~15 minutes later
-// when the initial token expires mid-transaction (P1-S1).
+// is present in props AND gcs.oauth2.refresh-credentials-enabled=true (explicit
+// opt-in). Without this, the unvalidated endpointRefresh path would only surface
+// as an error ~15 minutes later when the initial token expires mid-transaction
+// (P1-S1). The endpoint path requires explicit opt-in via enabled=true.
 func TestPickRefreshEndpointActivationFailsClosed(t *testing.T) {
 	parsed, _ := url.Parse("gs://test-bucket")
 	props := map[string]string{
-		"gcs.oauth2.token":                        "ya29.test",
-		"gcs.oauth2.refresh-credentials-endpoint": "https://lakekeeper.example/refresh",
+		"gcs.oauth2.token":                         "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint":  "https://lakekeeper.example/refresh",
+		"gcs.oauth2.refresh-credentials-enabled":   "true", // explicit opt-in
 	}
 	_, err := datupletGCSFactory(context.Background(), parsed, props)
 	if err == nil {
-		t.Fatal("expected fail-fast error when endpoint refresh would be selected")
+		t.Fatal("expected fail-fast error when endpoint refresh is explicitly opted in")
 	}
 	if !strings.Contains(err.Error(), "not yet validated end-to-end in v0.2") {
 		t.Fatalf("error did not match fail-fast message: %v", err)
 	}
 }
 
-// TestPickRefreshEndpointDisabledSucceeds verifies that setting
-// gcs.oauth2.refresh-credentials-enabled=false suppresses the endpoint path
-// and the factory succeeds (falling back to loadTableRefresh).
-func TestPickRefreshEndpointDisabledSucceeds(t *testing.T) {
+// TestPickRefreshEndpointPresentButNotOptedIn verifies that when Lakekeeper
+// emits gcs.oauth2.refresh-credentials-endpoint in the loadTable response
+// (the default deployment shape) but the caller has NOT set
+// gcs.oauth2.refresh-credentials-enabled=true, the factory falls through to
+// loadTableRefresh and construction succeeds. This is the critical regression
+// test for the P1 opt-in fix: the prior `enabled != "false"` guard would
+// fail-fast here, breaking every WIF TableCommit.
+func TestPickRefreshEndpointPresentButNotOptedIn(t *testing.T) {
 	parsed, _ := url.Parse("gs://test-bucket")
 	props := map[string]string{
-		"gcs.oauth2.token":                          "ya29.test",
-		"gcs.oauth2.refresh-credentials-endpoint":   "https://lakekeeper.example/refresh",
-		"gcs.oauth2.refresh-credentials-enabled":    "false",
+		"gcs.oauth2.token":                        "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lakekeeper.example/refresh",
+		// gcs.oauth2.refresh-credentials-enabled NOT set — default deployment shape
+	}
+	gcsio, err := datupletGCSFactory(context.Background(), parsed, props)
+	if err != nil {
+		t.Fatalf("expected success (loadTableRefresh fallback), got %v", err)
+	}
+	if gcsio == nil {
+		t.Fatal("expected non-nil IO")
+	}
+	_ = gcsio.(*gcsIO).Close()
+}
+
+// TestPickRefreshEndpointExplicitlyDisabledSucceeds verifies that setting
+// gcs.oauth2.refresh-credentials-enabled=false also suppresses the endpoint
+// path (belt-and-suspenders: any value other than "true" keeps the fallback).
+func TestPickRefreshEndpointExplicitlyDisabledSucceeds(t *testing.T) {
+	parsed, _ := url.Parse("gs://test-bucket")
+	props := map[string]string{
+		"gcs.oauth2.token":                         "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint":  "https://lakekeeper.example/refresh",
+		"gcs.oauth2.refresh-credentials-enabled":   "false",
 	}
 	gcsio, err := datupletGCSFactory(context.Background(), parsed, props)
 	if err != nil {

@@ -12,7 +12,6 @@ apiVersion: datuplet.io/v1
 kind: Pipeline
 metadata:
   name: gcs-smoke
-  namespace: datuplet
 spec:
   stages:
     - name: extract

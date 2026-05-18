@@ -48,6 +48,20 @@ operator doesn't re-template in-place. See RFC 019 §12.6 R1.
 
 ## GCS
 
+## GCS TableCommit transaction TTL ceiling
+
+`pkg/datupleticeio/`'s `loadTableRefresh` (the default refresh strategy)
+is currently an unimplemented stub — the factory's vended OAuth bearer
+expires after the lakekeeper-issued TTL (~15 min default; ~1 hour on
+some warehouses) and any in-flight TableCommit transaction that
+exceeds that window fails with `loadTableRefresh: caller did not
+inject a refresh closure`. RFC 019 §4.5.3 describes the planned wiring;
+v0.2 ships the latent code path with a hard-error stub. Typical
+TableCommit transactions complete in seconds to a few minutes, so the
+ceiling is rarely hit in practice. Sufficiently large commits
+(e.g., ReplaceDataFiles on a 100GB+ partition) may exceed the window —
+in which case the operator must retry with a smaller batch.
+
 **GCS audit attribution.** Lakekeeper vends GCS tokens scoped to the per-table
 prefix (via Credential Access Boundaries). However, GCP Cloud Audit Logs record
 the *GSA* (Lakekeeper's Google service account) as the actor, not the Datuplet

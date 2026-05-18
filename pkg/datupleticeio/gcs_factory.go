@@ -99,15 +99,22 @@ func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]s
 // indicating whether the endpoint path was selected. Callers must reject the
 // endpoint path until it is validated end-to-end (see datupletGCSFactory).
 //
-// The second return value (endpointSelected) is true only when
-// gcs.oauth2.refresh-credentials-endpoint is non-empty AND
-// gcs.oauth2.refresh-credentials-enabled is not "false". This lets the factory
-// fail fast at construction time rather than 15 minutes later when the token
-// expires and the unvalidated path is invoked.
+// Endpoint-based refresh is OPT-IN: gcs.oauth2.refresh-credentials-enabled
+// must be explicitly set to "true". Lakekeeper's standard loadTable response
+// includes the gcs.oauth2.refresh-credentials-endpoint key by default; the
+// prior `enabled != "false"` condition would have fail-fasted every WIF
+// TableCommit (the endpoint prop is always present). The opt-in guard ensures
+// the factory construction succeeds when Lakekeeper emits the endpoint without
+// the caller explicitly enabling it, which is the default deployment shape.
 func pickRefresh(props map[string]string) (refreshFunc, bool) {
 	ep := props["gcs.oauth2.refresh-credentials-endpoint"]
 	enabled := props["gcs.oauth2.refresh-credentials-enabled"]
-	if ep != "" && enabled != "false" {
+	// Endpoint-based refresh is OPT-IN: caller must set enabled=true.
+	// Lakekeeper's standard loadTable response includes the endpoint key
+	// by default; falling through to loadTableRefresh ensures factory
+	// construction succeeds when Lakekeeper emits the endpoint without
+	// explicit client opt-in (which is the default deployment shape).
+	if ep != "" && enabled == "true" {
 		return endpointRefresh(ep, props), true
 	}
 	return loadTableRefresh(props), false
@@ -117,7 +124,9 @@ func pickRefresh(props map[string]string) (refreshFunc, bool) {
 // Lakekeeper instance is reachable from the dev environment. Until then,
 // this returns a clear error so any accidental activation is obvious.
 //
-// Suppress by setting gcs.oauth2.refresh-credentials-enabled=false.
+// Only reachable when gcs.oauth2.refresh-credentials-enabled=true is
+// explicitly set (opt-in). Datuplet callers should not set this unless
+// the endpoint path has been validated end-to-end.
 func endpointRefresh(ep string, props map[string]string) refreshFunc {
 	_ = ep
 	_ = props

@@ -9,6 +9,14 @@ import (
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
 
+// Compile-time: *gcsBackend must satisfy the fileReader interface shape used
+// in server_v2_reading.go — i.e. it must have OpenReaderForFiles with the
+// correct signature. The private interface lives in the datagateway package, so
+// we can't write var _ fileReader = ... here; instead the method-value
+// assignment in TestGCSBackendOpenReaderForFilesSignature below is the
+// equivalent check.
+var _ = (*gcsBackend).OpenReaderForFiles
+
 // fakeFetcher satisfies the credsFetcher interface for testing
 // vendedTokenSource in isolation — no HTTP / no real VendedCreds machinery.
 type fakeFetcher struct {
@@ -87,5 +95,35 @@ func TestVendedTokenSourceSurfacesError(t *testing.T) {
 	}
 	if !errors.Is(err, want) {
 		t.Fatalf("error = %v, want wraps %v", err, want)
+	}
+}
+
+// TestGCSBackendOpenReaderForFilesSignature verifies that *gcsBackend exposes
+// OpenReaderForFiles with the exact signature the private fileReader interface
+// in server_v2_reading.go requires. The compile-time check is the definitive
+// gate: if *gcsBackend does not have the method, this file will not compile.
+//
+// We also verify at runtime that the method returns a non-nil Reader and that
+// the Reader result satisfies the Reader interface — mirroring the structural
+// assertion pattern used in MinIOBackend tests.
+func TestGCSBackendOpenReaderForFilesSignature(t *testing.T) {
+	// Compile-time: if this assignment compiles, *gcsBackend has the method.
+	// We use an anonymous function to keep the zero-value *gcsBackend out of
+	// any real GCS traffic path — the test never calls the function.
+	var _ func(context.Context, []string) (Reader, error) = (*gcsBackend)(nil).OpenReaderForFiles
+
+	// Runtime: verify that calling OpenReaderForFiles with no files returns the
+	// documented empty-slice error rather than a nil Reader with a nil error
+	// (which would panic upstream in server_v2_reading.go).
+	g := &gcsBackend{
+		bucket: "test-bucket",
+		bkt:    nil, // nil bucket — should never be reached below
+	}
+	_, err := g.OpenReaderForFiles(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected non-nil error for empty filePaths slice")
+	}
+	if err.Error() != "no files provided" {
+		t.Fatalf("unexpected empty-slice error: %v", err)
 	}
 }

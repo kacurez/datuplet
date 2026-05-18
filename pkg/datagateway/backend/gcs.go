@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"path"
 	"strings"
 
@@ -293,6 +294,43 @@ func (g *gcsBackend) OpenReader(ctx context.Context, tablePath string) (Reader, 
 		return nil, fmt.Errorf("gcs: no data files found in %s or %s", tablePath, icebergDataPath)
 	}
 
+	format := detectFormat(files[0].path)
+
+	return &gcsReader{
+		bkt:       g.bkt,
+		files:     files,
+		format:    format,
+		chunkSize: g.chunkSize,
+	}, nil
+}
+
+// OpenReaderForFiles creates a reader for a specific list of data files.
+// This is used when lakekeeper provides an explicit list of files from an
+// Iceberg snapshot. File paths should be absolute GCS paths
+// ("gs://bucket/path") or bucket-relative keys; toObjectKey normalises them.
+// Mirrors MinIOBackend.OpenReaderForFiles one-to-one.
+func (g *gcsBackend) OpenReaderForFiles(ctx context.Context, filePaths []string) (Reader, error) {
+	if len(filePaths) == 0 {
+		return nil, fmt.Errorf("no files provided")
+	}
+
+	// Convert file paths to fileInfo structs.
+	files := make([]fileInfo, 0, len(filePaths))
+	for _, fp := range filePaths {
+		objectKey := g.toObjectKey(fp)
+
+		// Get file size from GCS.
+		attrs, err := g.bkt.Object(objectKey).Attrs(ctx)
+		if err != nil {
+			log.Printf("WARNING: Could not stat file %s: %v", objectKey, err)
+			// Still add the file but with unknown size (mirrors MinIO behaviour).
+			files = append(files, fileInfo{path: objectKey, size: 0})
+		} else {
+			files = append(files, fileInfo{path: objectKey, size: attrs.Size})
+		}
+	}
+
+	// Detect format from first file.
 	format := detectFormat(files[0].path)
 
 	return &gcsReader{
