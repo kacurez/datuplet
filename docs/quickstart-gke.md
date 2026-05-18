@@ -1,7 +1,7 @@
 # Quickstart — GKE + GCS
 
 Deploy Datuplet on a real GKE cluster with a GCS bucket as the Iceberg warehouse.
-Plan for 30–45 minutes. This is the smoke-test path for v0.1; production use
+Plan for 30–45 minutes. This is the smoke-test path for v0.2; production use
 requires additional hardening (network policies, IAM tightening, CNPG backups).
 
 ---
@@ -59,40 +59,55 @@ Datuplet's Lakekeeper integration.
 
 ---
 
-## 3. Create a GCP service account and key
+## 3. Set up GCS access — choose your mode
 
-This service account gives Lakekeeper access to the bucket. Lakekeeper stores the
-key and exchanges it for short-lived OAuth tokens on behalf of each pipeline run —
-no running Pod holds a long-lived credential at runtime.
+Pick one. Both are fully supported in v0.2.
+
+### Mode A — Workload Identity Federation (recommended on GKE)
+
+Lakekeeper runs as a Kubernetes ServiceAccount bound to a GCP service
+account via `iam.workloadIdentityUser`. No static key file is generated.
+
+The GKE cluster created in step 1 already has `--workload-pool` enabled.
 
 ```bash
-# Create the service account
-gcloud iam service-accounts create datuplet-warehouse \
+GSA="datuplet-lakekeeper-warehouse@${GCP_PROJECT}.iam.gserviceaccount.com"
+
+gcloud iam service-accounts create datuplet-lakekeeper-warehouse \
   --project="${GCP_PROJECT}" \
-  --description="Datuplet Iceberg warehouse access" \
-  --display-name="Datuplet Warehouse"
+  --display-name="Datuplet Lakekeeper Warehouse Access"
 
-SA_EMAIL="datuplet-warehouse@${GCP_PROJECT}.iam.gserviceaccount.com"
-
-# Grant bucket access
 gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
-  --member="serviceAccount:${SA_EMAIL}" \
+  --member="serviceAccount:${GSA}" \
   --role=roles/storage.objectAdmin
 
-# Allow the SA to create tokens for itself (needed for STS-vended creds)
-gcloud iam service-accounts add-iam-policy-binding "${SA_EMAIL}" \
-  --project="${GCP_PROJECT}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role=roles/iam.serviceAccountTokenCreator
+gcloud iam service-accounts add-iam-policy-binding "${GSA}" \
+  --role=roles/iam.workloadIdentityUser \
+  --member="serviceAccount:${GCP_PROJECT}.svc.id.goog[datuplet/lakekeeper]"
+```
 
-# Generate a key file
+### Mode B — Static service-account key (works anywhere)
+
+Use this when you can't set up Workload Identity (non-GKE clusters,
+restricted-IAM environments, or you just want to deploy in one fewer step).
+
+```bash
+gcloud iam service-accounts create datuplet-lakekeeper-warehouse \
+  --project="${GCP_PROJECT}"
+
+GSA="datuplet-lakekeeper-warehouse@${GCP_PROJECT}.iam.gserviceaccount.com"
+
+gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+  --member="serviceAccount:${GSA}" \
+  --role=roles/storage.objectAdmin
+
 gcloud iam service-accounts keys create datuplet-sa.json \
-  --iam-account="${SA_EMAIL}" \
+  --iam-account="${GSA}" \
   --project="${GCP_PROJECT}"
 ```
 
-Keep `datuplet-sa.json` safe. It is passed once to Lakekeeper at bootstrap time,
-then deleted. Do not commit it to source control.
+Keep `datuplet-sa.json` safe — the next step hands it to Lakekeeper once at
+bootstrap, after which the file can be deleted.
 
 ---
 
@@ -122,9 +137,16 @@ helm upgrade --install datuplet-app charts/datuplet-app \
   --set warehouse.type=gcs \
   --set warehouse.gcs.bucket="${GCS_BUCKET}"
 
-# Phase 4 — Lakekeeper
+# Phase 4 — Lakekeeper (Mode A — Workload Identity)
 helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
+  -n datuplet --wait --wait-for-jobs --timeout 10m \
+  --set workloadIdentity.enabled=true \
+  --set workloadIdentity.gcpServiceAccount="${GSA}" \
+  --set platform.enableGcpSystemCredentials=true
+
+# Phase 4 — Lakekeeper (Mode B — static key; no extra flags needed)
+# helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
+#   -n datuplet --wait --wait-for-jobs --timeout 10m
 ```
 
 Phase 2 provisions a CNPG Postgres cluster (30–60 s on first install). If it
@@ -134,12 +156,10 @@ times out, check: `kubectl get pods -n datuplet`.
 
 ## 5. Bootstrap the GCS warehouse
 
-GCS bootstrap requires the service-account key file inside the pipeline-api pod.
 The order matters: **create the Datuplet project first**, capture its
 `lakekeeper_project_id`, **then** run `lakekeeper-bootstrap` targeting that
 project. Otherwise the warehouse lands on lakekeeper's default project and
-the Datuplet project (which has its own freshly-allocated lakekeeper project
-ID) sees no warehouses at run time.
+the Datuplet project sees no warehouses at run time.
 
 ```bash
 POD=$(kubectl get pods -n datuplet -l app.kubernetes.io/name=pipeline-api \
@@ -169,49 +189,70 @@ LK_PROJECT_ID=$(kubectl -n datuplet exec pg-1 -c postgres -- \
   env PGPASSWORD="$PG_PW" psql -h 127.0.0.1 -U pipeline_api_user -d pipeline_api -t -A \
     -c "SELECT lakekeeper_project_id FROM projects WHERE name = 'default';")
 echo "Datuplet project lakekeeper_project_id: $LK_PROJECT_ID"
+```
 
-# 4. Copy the GCS SA key into the pod
-kubectl cp datuplet-sa.json datuplet/"${POD}":/tmp/datuplet-sa.json
+### Step 4 onwards — Mode A (Workload Identity)
 
-# 5. Bootstrap the warehouse on the project's lakekeeper_project_id
-#    (NOT lakekeeper's default project)
+No key file to copy. Run bootstrap with `--gcs-credential-type=system-identity`:
+
+```bash
+# 4. Bootstrap — Mode A (system-identity, recommended)
 kubectl exec -n datuplet "${POD}" -- \
   /usr/local/bin/pipeline-api admin lakekeeper-bootstrap \
     --type=gcs \
     --gcs-bucket="${GCS_BUCKET}" \
+    --gcs-credential-type=system-identity \
+    --warehouse-name=datuplet \
+    --lakekeeper-project-id="${LK_PROJECT_ID}" \
+    --lakekeeper-url="${LK_URL}" \
+    --signing-key-file="${SIGNING_KEY}"
+```
+
+### Step 4 onwards — Mode B (static service-account key)
+
+```bash
+# 4. Copy the GCS SA key into the pod
+kubectl cp datuplet-sa.json datuplet/"${POD}":/tmp/datuplet-sa.json
+
+# 5. Bootstrap — Mode B (service-account-key)
+kubectl exec -n datuplet "${POD}" -- \
+  /usr/local/bin/pipeline-api admin lakekeeper-bootstrap \
+    --type=gcs \
+    --gcs-bucket="${GCS_BUCKET}" \
+    --gcs-credential-type=service-account-key \
     --gcs-sa-key-file=/tmp/datuplet-sa.json \
     --warehouse-name=datuplet \
-    --lakekeeper-project-id="$LK_PROJECT_ID" \
-    --lakekeeper-url=$LK_URL \
-    --signing-key-file=$SIGNING_KEY
+    --lakekeeper-project-id="${LK_PROJECT_ID}" \
+    --lakekeeper-url="${LK_URL}" \
+    --signing-key-file="${SIGNING_KEY}"
 
-# 6. Grant the admin role on the project
+# Cleanup: remove the SA key from the pod and local disk
+kubectl exec -n datuplet "${POD}" -- rm /tmp/datuplet-sa.json
+rm datuplet-sa.json
+```
+
+### Final step (both modes)
+
+```bash
+# Grant the admin role on the project
 kubectl exec -n datuplet "${POD}" -- \
   /usr/local/bin/pipeline-api admin grant \
     --user=admin@example.com \
     --project=default \
     --role=admin \
-    --lakekeeper-url=$LK_URL \
-    --signing-key-file=$SIGNING_KEY \
-    --openfga-url=$OFGA_URL
-
-# Cleanup: remove the SA key from the pod
-kubectl exec -n datuplet "${POD}" -- rm /tmp/datuplet-sa.json
-rm datuplet-sa.json
+    --lakekeeper-url="${LK_URL}" \
+    --signing-key-file="${SIGNING_KEY}" \
+    --openfga-url="${OFGA_URL}"
 ```
 
-Notes for the GCS path:
+Notes:
 
 - `register.sh` automates the S3 / MinIO flow but does not yet drive
   `lakekeeper-bootstrap --type=gcs`. The manual `kubectl exec` steps above
   reproduce what the script does for S3.
-- The `--lakekeeper-project-id` flag (added in v0.1.7) tells bootstrap which
-  lakekeeper project to create the warehouse in. Without it, the warehouse
-  defaults to lakekeeper's `00000000-...0` project and pipeline-api can't find
-  it when the Datuplet project uses a different lakekeeper project ID.
-- For v0.1, **`pipeline-api admin attach-warehouse` is S3-only**. Multi-warehouse
-  GCS attachment is deferred to a future release. Use the
-  `--lakekeeper-project-id` flag on bootstrap instead.
+- The `--lakekeeper-project-id` flag tells bootstrap which lakekeeper project
+  to create the warehouse in. Without it, the warehouse defaults to
+  lakekeeper's `00000000-...0` project and pipeline-api can't find it.
 
 ---
 
@@ -264,13 +305,13 @@ gcloud container clusters delete datuplet \
   --region="${GCP_REGION}" --project="${GCP_PROJECT}" --quiet
 
 gcloud storage rm --recursive "gs://${GCS_BUCKET}/"
-gcloud iam service-accounts delete "datuplet-warehouse@${GCP_PROJECT}.iam.gserviceaccount.com" \
+gcloud iam service-accounts delete "datuplet-lakekeeper-warehouse@${GCP_PROJECT}.iam.gserviceaccount.com" \
   --project="${GCP_PROJECT}" --quiet
 ```
 
 ---
 
-## Known limitations on GKE for v0.1
+## Known limitations on GKE
 
 - CNPG has no backup configuration. Enable WAL archival before any production use.
 - No NetworkPolicy restricting DG sidecar egress. Add policies for production.
