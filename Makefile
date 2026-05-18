@@ -14,7 +14,7 @@ export DOCKER_BUILDKIT=1
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
 	prune-images \
-	lint tidy all help
+	lint lint-notokenlog tidy all help
 
 # =============================================================================
 # Help
@@ -278,11 +278,18 @@ tidy: ## Run go mod tidy
 	go mod tidy
 
 # Static analysis and dead code detection
-lint: ## Run go vet + deadcode analysis
+lint: lint-notokenlog ## Run go vet + deadcode + notokenlog (RFC 019 §4.10) analyzers
 	@echo "Running go vet..."
 	go vet ./...
 	@echo "Running deadcode analysis..."
 	go run golang.org/x/tools/cmd/deadcode@latest -test ./...
+
+# RFC 019 §4.10: reject fmt-verb / log-arg uses of bearer-credential types
+# (GCSCreds, *oauth2.Token, *vendedTokenSource). Source lives at
+# tools/lint/notokenlog/.
+lint-notokenlog: ## Run the notokenlog analyzer against ./... (RFC 019 §4.10)
+	@echo "Running notokenlog analyzer..."
+	go run ./tools/lint/notokenlog/cmd/notokenlog ./...
 
 # All-in-one: tidy, build, test
 all: tidy build test ## Tidy + build + test (all-in-one)
