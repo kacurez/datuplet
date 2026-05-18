@@ -57,6 +57,26 @@ func TestVendedTokenSourceRejectsS3(t *testing.T) {
 	}
 }
 
+func TestGCSToObjectKey(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"gs://mybucket/path/to/file", "path/to/file"},
+		{"gs://otherbucket/path/to/file", "path/to/file"},
+		{"gs://mybucket/single", "single"},
+		{"gs://mybucket", ""}, // no path after bucket
+		{"plain/relative/path", "plain/relative/path"},
+		{"", ""},
+	}
+	g := &gcsBackend{bucket: "mybucket"}
+	for _, c := range cases {
+		got := g.toObjectKey(c.in)
+		if got != c.want {
+			t.Errorf("toObjectKey(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestVendedTokenSourceSurfacesError(t *testing.T) {
 	want := errors.New("network fail")
 	f := &fakeFetcher{err: want}

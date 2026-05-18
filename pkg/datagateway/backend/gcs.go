@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"cloud.google.com/go/storage"
 	"golang.org/x/oauth2"
@@ -120,4 +121,66 @@ func (t *vendedTokenSource) Token() (*oauth2.Token, error) {
 		Expiry:      gc.ExpiresAt(),
 		TokenType:   "Bearer",
 	}, nil
+}
+
+// toObjectKey converts a storage path that may be a full GCS URL
+// ("gs://bucket/path") into the bucket-relative object key ("path").
+// Mirrors MinIOBackend.toObjectKey with the gs:// scheme.
+//
+// Examples:
+//   - "gs://mybucket/path/to/file" → "path/to/file"
+//   - "gs://otherbucket/path/to/file" → "path/to/file" (extracts path regardless of bucket)
+//   - "path/to/file" → "path/to/file" (already relative)
+func (g *gcsBackend) toObjectKey(storagePath string) string {
+	const scheme = "gs://"
+	if len(storagePath) >= len(scheme) && storagePath[:len(scheme)] == scheme {
+		withoutScheme := storagePath[len(scheme):]
+		for i := 0; i < len(withoutScheme); i++ {
+			if withoutScheme[i] == '/' {
+				return withoutScheme[i+1:]
+			}
+		}
+		// Edge case: gs://bucket with no path
+		return ""
+	}
+	return storagePath
+}
+
+// PutObject uploads raw bytes to the given path. The path may be a full
+// "gs://bucket/key" URL or a bucket-relative key; toObjectKey normalises it.
+func (g *gcsBackend) PutObject(ctx context.Context, storagePath string, data []byte) error {
+	objectKey := g.toObjectKey(storagePath)
+	w := g.bkt.Object(objectKey).NewWriter(ctx)
+	if _, err := w.Write(data); err != nil {
+		_ = w.Close()
+		return fmt.Errorf("gcs: put %q: %w", objectKey, err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("gcs: put %q: close: %w", objectKey, err)
+	}
+	return nil
+}
+
+// Close releases the underlying storage client. Idempotent.
+func (g *gcsBackend) Close() error {
+	if g.client == nil {
+		return nil
+	}
+	return g.client.Close()
+}
+
+// GetObject downloads raw bytes from the given path. The path may be a full
+// "gs://bucket/key" URL or a bucket-relative key.
+func (g *gcsBackend) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
+	objectKey := g.toObjectKey(storagePath)
+	r, err := g.bkt.Object(objectKey).NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("gcs: get %q: %w", objectKey, err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("gcs: read %q: %w", objectKey, err)
+	}
+	return data, nil
 }
