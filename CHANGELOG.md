@@ -6,6 +6,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-18
+
+### Added
+
+- **Native GCS warehouse support.** DataGateway writes Parquet directly
+  to `gs://` warehouses; TableCommit performs iceberg-go transactions
+  against `gs://` table locations; storage browser renders `gs://`.
+- **GCS Workload Identity mode.** Bootstrap with
+  `--gcs-credential-type=system-identity` to register a Lakekeeper
+  warehouse without static service-account keys (chart values
+  `workloadIdentity.enabled=true` + `gcpServiceAccount` required).
+  Both system-identity and the existing service-account-key modes are
+  fully supported; system-identity is the default.
+- **Helm-driven per-run tolerations.** New chart value
+  `runtimeDefaults.tolerations` on `charts/datuplet-app` flows into
+  operator-spawned PipelineRun + TableCommit Pods. Empty default is a no-op.
+
+### Changed
+
+- `pkg/catalogwriter.Creds` is now a sealed interface (`S3Creds`,
+  `GCSCreds`) instead of a flat struct. Downstream consumers type-switch
+  at one boundary.
+- `pkg/catalogwriter.VendedCreds.Get(ctx)` returns the `Creds` interface;
+  callers must set `ExpectedCredsType` for scheme-aware fail-closed
+  parsing.
+
+### Internal
+
+- New `pkg/datupleticeio/` package centralizes iceberg-go IO scheme
+  registration; overrides the upstream `gs://` factory with one that
+  consumes `gcs.oauth2.token` from props + a refreshing TokenSource.
+- New `tools/lint/notokenlog/` CI analyzer rejects fmt-verb formatting
+  of bearer-credential types.
+- See `docs/tmp/rfc/019-gcs-backend.md` for the full design.
+
 ## [0.1.0] — TBD
 
 Initial public release. Datuplet is experimental — APIs, CRD shapes, and chart
