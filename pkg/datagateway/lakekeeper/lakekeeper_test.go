@@ -100,7 +100,7 @@ func TestBuildS3Backend_S3WithToken(t *testing.T) {
 	    "s3.session-token":     "session-vended",
 	    "s3.endpoint":          "http://minio.example:9000",
 	    "s3.region":            "local-01",
-	    "expires-at-ms":        "9999999999999"
+	    "s3.expires-at-ms":     "9999999999999"
 	  }
 	}`
 	const warehouseUUID = "019dceed-aaaa-bbbb-cccc-111122223333"

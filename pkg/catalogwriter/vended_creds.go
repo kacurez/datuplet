@@ -607,12 +607,13 @@ func parseEpochMillis(s string) (time.Time, error) {
 // TTL fallback chain (first non-zero wins):
 //  1. gcs.oauth2.token-expires-at (epoch-ms — the canonical key)
 //  2. creds.expiration-time-ms    (legacy lakekeeper schema)
-//  3. Issued + 15min              (matches lakekeeper's documented STS lifetime)
+//  3. (nothing — Expires left zero; VendedCreds.fetch applies the
+//     15-min default via v.now(), same pattern as parseS3Creds)
 //
 // Issued is left zero; VendedCreds.fetch re-stamps it using its clock
-// source. The 15-min fallback is applied here so parseGCSCreds-only
-// callers (and unit tests) get a sane non-zero ExpiresAt without having
-// to wire a clock.
+// source. Expires left zero in the fallback; VendedCreds.fetch applies
+// the 15-min default via v.now() — clock-source consistency with
+// parseS3Creds, avoids fake-clock skew in tests.
 func parseGCSCreds(cfg map[string]any) (Creds, error) {
 	tok := readString(cfg, "gcs.oauth2.token")
 	if tok == "" {
@@ -623,16 +624,12 @@ func parseGCSCreds(cfg map[string]any) (Creds, error) {
 		GCPProjectID:    readString(cfg, "gcs.project-id"),
 		RefreshEndpoint: readString(cfg, "gcs.oauth2.refresh-credentials-endpoint"),
 	}
-	if t, ok := readMillis(cfg, "gcs.oauth2.token-expires-at"); ok {
-		c.Expires = t
-	} else if t, ok := readMillis(cfg, "creds.expiration-time-ms"); ok {
-		c.Expires = t
-	} else {
-		// No absolute expiry hint: 15-min default from now. VendedCreds.fetch
-		// re-stamps Issued; if the caller is parseGCSCreds-only (no
-		// VendedCreds wrapper), Expires is still set so ExpiresAt() is
-		// non-zero.
-		c.Expires = time.Now().Add(15 * time.Minute)
+	if exp, ok := readMillis(cfg, "gcs.oauth2.token-expires-at"); ok {
+		c.Expires = exp
+	} else if exp, ok := readMillis(cfg, "creds.expiration-time-ms"); ok {
+		c.Expires = exp
 	}
+	// (Else: leave c.Expires zero. VendedCreds.fetch applies the 15-minute
+	//  default via v.now() — same pattern as parseS3Creds.)
 	return c, nil
 }

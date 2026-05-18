@@ -93,7 +93,7 @@ func TestVendedCreds_FifteenMinuteTTL(t *testing.T) {
 		t.Fatalf("expected S3Creds, got %T", got1)
 	}
 	if c1.AccessKeyID == "" {
-		t.Fatalf("creds missing keys: %+v", c1)
+		t.Fatalf("creds missing keys: access-key-id=%q region=%q", c1.AccessKeyID, c1.Region)
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("after first Get hits=%d want 1", got)
@@ -286,7 +286,7 @@ func TestVendedCreds_RenewalFailureSurfacesAfterExpiry(t *testing.T) {
 		t.Fatalf("expected S3Creds, got %T", got)
 	}
 	if c.AccessKeyID != "AKIA" {
-		t.Fatalf("expected stale cached creds, got %+v", c)
+		t.Fatalf("expected stale cached creds: access-key-id=%q (want %q)", c.AccessKeyID, "AKIA")
 	}
 	if v.LastError() == nil {
 		t.Fatalf("LastError should be set after a failed fetch")
@@ -457,6 +457,30 @@ func TestParseCredsRejectsWrongFamily(t *testing.T) {
 	}
 }
 
+// TestParseCredsRejectsMixedGCSExpected asserts the confused-deputy
+// fail-closed when ExpectedCredsType=GCS but the response has BOTH
+// s3.* and gcs.oauth2.* keys.
+func TestParseCredsRejectsMixedGCSExpected(t *testing.T) {
+	cfg := map[string]any{
+		"s3.access-key-id": "AKIA...",
+		"gcs.oauth2.token": "ya29...",
+	}
+	_, err := parseCreds(cfg, CredsTypeGCS)
+	if err == nil || !strings.Contains(err.Error(), "BOTH s3.* and gcs.oauth2.*") {
+		t.Fatalf("expected mixed-family rejection, got %v", err)
+	}
+}
+
+// TestParseCredsRejectsWrongFamilyGCSExpected asserts that an S3-only
+// response is rejected when ExpectedCredsType=GCS.
+func TestParseCredsRejectsWrongFamilyGCSExpected(t *testing.T) {
+	cfg := map[string]any{"s3.access-key-id": "AKIA", "s3.secret-access-key": "secret"}
+	_, err := parseCreds(cfg, CredsTypeGCS)
+	if err == nil || !strings.Contains(err.Error(), "expected gcs credentials but lakekeeper returned s3") {
+		t.Fatalf("expected wrong-family rejection, got %v", err)
+	}
+}
+
 // TestParseCredsRejectsEmpty: an empty config block must not silently
 // produce a zero-value Creds.
 func TestParseCredsRejectsEmpty(t *testing.T) {
@@ -537,16 +561,19 @@ func TestParseGCSCredsMissingTokenRejects(t *testing.T) {
 }
 
 // TestParseGCSCredsFallbackExpiry: when no expiry hint is present,
-// parseGCSCreds must produce a non-zero ExpiresAt (15-min default per
-// RFC 019 §4.2).
+// parseGCSCreds intentionally leaves Expires zero — VendedCreds.fetch
+// applies the 15-min default via v.now(), same pattern as parseS3Creds.
 func TestParseGCSCredsFallbackExpiry(t *testing.T) {
 	cfg := map[string]any{"gcs.oauth2.token": "ya29.AAA"}
 	got, err := parseGCSCreds(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ExpiresAt().IsZero() {
-		t.Fatal("ExpiresAt zero — expected 15min default")
+	// parseGCSCreds intentionally leaves Expires zero when no expiry key
+	// is present — VendedCreds.fetch applies the 15-min default via v.now().
+	// Mirror parseS3Creds's behavior.
+	if !got.ExpiresAt().IsZero() {
+		t.Fatalf("ExpiresAt = %v, want zero (fetch fills it in)", got.ExpiresAt())
 	}
 }
 
