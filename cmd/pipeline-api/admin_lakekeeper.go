@@ -51,11 +51,15 @@ type s3Spec struct {
 // gcsSpec captures the GCS-flavoured warehouse parameters. The
 // ServiceAccountKeyJSON field carries the contents of a Google IAM
 // service-account key (the bytes mounted at --gcs-sa-key-file).
+// CredentialType selects the authentication mode:
+//   - "" or "system-identity": Workload Identity Federation (no key file).
+//   - "service-account-key": static SA JSON key (requires ServiceAccountKeyJSON).
 type gcsSpec struct {
 	Bucket                string
 	KeyPrefix             string
 	StsEnabled            bool
 	ServiceAccountKeyJSON string
+	CredentialType        string // "service-account-key" | "system-identity"
 }
 
 // buildWarehouseBody assembles the request body for
@@ -170,6 +174,8 @@ func adminLakekeeperBootstrap(args []string) error {
 	gcsBucket := fs.String("gcs-bucket", "", "GCS bucket name (required when --type=gcs)")
 	gcsKeyPrefix := fs.String("gcs-key-prefix", "", "GCS key prefix")
 	gcsSAKeyFile := fs.String("gcs-sa-key-file", "", "Path to a Google service-account key JSON file (default from GCS_SA_KEY_FILE env)")
+	gcsCredType := fs.String("gcs-credential-type", "system-identity",
+		"GCS credential type: 'system-identity' (default; Workload Identity Federation, no key file) or 'service-account-key' (static SA JSON key; needs --gcs-sa-key-file)")
 
 	// Signing.
 	keyFile := fs.String("signing-key-file", "", "Path to the RS256 PEM private key (default from SIGNING_KEY_FILE env)")
@@ -245,6 +251,7 @@ func adminLakekeeperBootstrap(args []string) error {
 			KeyPrefix:             *gcsKeyPrefix,
 			StsEnabled:            *s3StsEnabled, // shared --sts-enabled flag
 			ServiceAccountKeyJSON: string(saBytes),
+			CredentialType:        *gcsCredType,
 		}
 	default:
 		return fmt.Errorf("unknown --type %q (want s3 or gcs)", *whType)
