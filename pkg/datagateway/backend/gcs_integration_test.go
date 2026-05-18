@@ -135,3 +135,63 @@ func TestGCSBackendPutGetObjectGSURL(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, payload)
 	}
 }
+
+func TestGCSBackendOpenWriterOpenReaderCSV(t *testing.T) {
+	bucket := startFakeGCS(t, "datuplet-writer-reader")
+	be, err := NewGCSBackend(GCSConfig{Bucket: bucket})
+	if err != nil {
+		t.Fatalf("NewGCSBackend: %v", err)
+	}
+	defer be.Close()
+
+	ctx := context.Background()
+	tablePath := "tables/people"
+
+	// OpenWriter -> WriteChunk(CSV with header + 2 rows) -> Close.
+	w, err := be.OpenWriter(ctx, tablePath, WriteOptions{
+		OutputName: "people",
+		Format:     "csv",
+	})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	csvBytes := []byte("name,age\nAlice,30\nBob,25\n")
+	if err := w.WriteChunk(csvBytes, 2); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("writer.Close: %v", err)
+	}
+
+	stats := w.Stats()
+	if stats.RowsWritten != 2 {
+		t.Errorf("RowsWritten = %d, want 2", stats.RowsWritten)
+	}
+	if len(stats.FilePaths) != 1 {
+		t.Errorf("FilePaths = %v, want 1 entry", stats.FilePaths)
+	}
+
+	// OpenReader -> ReadChunk -> verify content.
+	r, err := be.OpenReader(ctx, tablePath)
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	chunk, err := r.ReadChunk()
+	if err != nil {
+		t.Fatalf("ReadChunk: %v", err)
+	}
+	if chunk.Format != "csv" {
+		t.Errorf("chunk.Format = %q, want csv", chunk.Format)
+	}
+	if chunk.RowsInChunk != 2 {
+		t.Errorf("RowsInChunk = %d, want 2", chunk.RowsInChunk)
+	}
+	if !strings.Contains(string(chunk.Data), "Alice,30") || !strings.Contains(string(chunk.Data), "Bob,25") {
+		t.Errorf("chunk.Data = %q, missing expected rows", chunk.Data)
+	}
+	if !chunk.IsLast {
+		t.Errorf("expected IsLast=true for single-file table")
+	}
+}
