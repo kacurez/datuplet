@@ -124,6 +124,21 @@ Before opening a PR:
   passes locally.
 - Diffs minimal and focused on the stated task.
 
+## Branch + release discipline
+
+- **Never push directly to `main`.** All work lands via PR. The contributor (or
+  agent) opens a PR against `main` from a feature branch; the maintainer reviews,
+  approves, merges, and cuts the tag. Force-push to `main` is never authorized.
+- **Agents must never `git push origin main` (or any equivalent).** If asked
+  to push completed work, push the feature branch and open a draft PR via
+  `gh pr create --draft`. Mention the PR number in the response so the
+  maintainer can review and merge it.
+- **No tag creation by agents.** Release tags (`v0.x.y`) are cut by the
+  maintainer after the PR is merged. Don't run `git tag` even if the PR has
+  landed; the maintainer triggers the release workflow.
+- These rules apply during implementation runs as well as final merges —
+  partial-progress checkpoints should also land via PR, not direct push.
+
 ## Proto / gRPC
 
 Proto definitions live in `api/proto/`. Generated Go code is checked in
