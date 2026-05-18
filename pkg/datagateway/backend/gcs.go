@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"path"
@@ -762,3 +763,112 @@ func (w *gcsWriter) Close() error {
 
 	return nil
 }
+
+// GetSchema returns the schema of the first data file under tablePath.
+// CSV is the only supported format here; Iceberg-aware schema resolution
+// is the job of the pipeline-api storage catalog (lakekeeper) and is not
+// part of the storage backend. Mirrors MinIOBackend.GetSchema.
+func (g *gcsBackend) GetSchema(ctx context.Context, tablePath string) (*SchemaInfo, error) {
+	files, err := g.findDataFiles(ctx, tablePath)
+	if err != nil || len(files) == 0 {
+		return nil, fmt.Errorf("gcs: no data files found in %s", tablePath)
+	}
+
+	format := detectFormat(files[0].path)
+	switch format {
+	case "csv":
+		return g.getCSVSchema(ctx, files[0].path)
+	default:
+		return nil, fmt.Errorf("gcs: schema detection not supported for format: %s", format)
+	}
+}
+
+// GetSample returns a sample of rows from the first data file under tablePath.
+// Mirrors MinIOBackend.GetSample (CSV-only).
+func (g *gcsBackend) GetSample(ctx context.Context, tablePath string, limit int) (*SampleResult, error) {
+	files, err := g.findDataFiles(ctx, tablePath)
+	if err != nil || len(files) == 0 {
+		return nil, fmt.Errorf("gcs: no data files found in %s", tablePath)
+	}
+
+	format := detectFormat(files[0].path)
+	switch format {
+	case "csv":
+		return g.getCSVSample(ctx, files[0].path, limit)
+	default:
+		return nil, fmt.Errorf("gcs: sampling not supported for format: %s", format)
+	}
+}
+
+func (g *gcsBackend) getCSVSchema(ctx context.Context, objectKey string) (*SchemaInfo, error) {
+	obj, err := g.bkt.Object(objectKey).NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("gcs: open %q: %w", objectKey, err)
+	}
+	defer obj.Close()
+
+	reader := csv.NewReader(obj)
+	headers, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+
+	columns := make([]ColumnInfo, len(headers))
+	for i, h := range headers {
+		columns[i] = ColumnInfo{Name: h, Type: "string", Nullable: true}
+	}
+	return &SchemaInfo{Columns: columns}, nil
+}
+
+func (g *gcsBackend) getCSVSample(ctx context.Context, objectKey string, limit int) (*SampleResult, error) {
+	obj, err := g.bkt.Object(objectKey).NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("gcs: open %q: %w", objectKey, err)
+	}
+	defer obj.Close()
+
+	reader := csv.NewReader(obj)
+	headers, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+
+	columns := make([]ColumnInfo, len(headers))
+	for i, h := range headers {
+		columns[i] = ColumnInfo{Name: h, Type: "string", Nullable: true}
+	}
+
+	var rows [][]byte
+	for i := 0; i < limit; i++ {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		row := make(map[string]string)
+		for j, h := range headers {
+			if j < len(record) {
+				row[h] = record[j]
+			}
+		}
+		jsonRow, err := json.Marshal(row)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, jsonRow)
+	}
+
+	return &SampleResult{
+		Schema:        &SchemaInfo{Columns: columns},
+		Rows:          rows,
+		TotalEstimate: -1,
+	}, nil
+}
+
+// Compile-time assertion that *gcsBackend satisfies StorageBackend.
+// If a future change to the StorageBackend interface breaks gcsBackend,
+// this line fails the build before runtime — the same guard
+// MinIOBackend uses.
+var _ StorageBackend = (*gcsBackend)(nil)

@@ -182,6 +182,67 @@ func TestGCSBackendRollbackDeletesStagedFiles(t *testing.T) {
 	}
 }
 
+func TestGCSBackendGetSchemaCSV(t *testing.T) {
+	bucket := startFakeGCS(t, "datuplet-schema")
+	be, err := NewGCSBackend(GCSConfig{Bucket: bucket})
+	if err != nil {
+		t.Fatalf("NewGCSBackend: %v", err)
+	}
+	defer be.Close()
+
+	ctx := context.Background()
+	if err := be.PutObject(ctx, "t/data.csv", []byte("name,age,city\n")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	schema, err := be.GetSchema(ctx, "t")
+	if err != nil {
+		t.Fatalf("GetSchema: %v", err)
+	}
+	if len(schema.Columns) != 3 {
+		t.Fatalf("columns = %d, want 3", len(schema.Columns))
+	}
+	wantNames := []string{"name", "age", "city"}
+	for i, want := range wantNames {
+		if schema.Columns[i].Name != want {
+			t.Errorf("Columns[%d].Name = %q, want %q", i, schema.Columns[i].Name, want)
+		}
+		if schema.Columns[i].Type != "string" {
+			t.Errorf("Columns[%d].Type = %q, want string", i, schema.Columns[i].Type)
+		}
+	}
+}
+
+func TestGCSBackendGetSampleCSV(t *testing.T) {
+	bucket := startFakeGCS(t, "datuplet-sample")
+	be, err := NewGCSBackend(GCSConfig{Bucket: bucket})
+	if err != nil {
+		t.Fatalf("NewGCSBackend: %v", err)
+	}
+	defer be.Close()
+
+	ctx := context.Background()
+	csvBody := "name,age\nAlice,30\nBob,25\nCarol,40\n"
+	if err := be.PutObject(ctx, "t/data.csv", []byte(csvBody)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	sample, err := be.GetSample(ctx, "t", 2)
+	if err != nil {
+		t.Fatalf("GetSample: %v", err)
+	}
+	if len(sample.Rows) != 2 {
+		t.Fatalf("Rows = %d, want 2 (limit honoured)", len(sample.Rows))
+	}
+	// Verify each row is JSON with the expected keys.
+	for i, row := range sample.Rows {
+		s := string(row)
+		if !strings.Contains(s, `"name"`) || !strings.Contains(s, `"age"`) {
+			t.Errorf("Rows[%d] = %q, missing expected keys", i, s)
+		}
+	}
+}
+
 func TestGCSBackendOpenWriterOpenReaderCSV(t *testing.T) {
 	bucket := startFakeGCS(t, "datuplet-writer-reader")
 	be, err := NewGCSBackend(GCSConfig{Bucket: bucket})
