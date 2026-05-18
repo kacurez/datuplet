@@ -15,9 +15,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 
+	"github.com/moby/moby/api/types/container"
+	mobynet "github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -25,6 +28,15 @@ import (
 const (
 	fakeGCSImage = "fsouza/fake-gcs-server:1.49"
 	fakeGCSPort  = "4443/tcp"
+	// fakeGCSHostPort is the fixed host-side port the container is bound to.
+	// fake-gcs hardcodes its internal bind port (4443) into the selfLink /
+	// mediaLink URLs it emits in JSON responses, and the cloud.google.com/go
+	// storage SDK follows those URLs for download endpoints. With a random
+	// testcontainers-mapped port the emitted URLs would be unreachable from
+	// the test process; with a fixed host-port + `-public-host` matching it,
+	// the URLs are reachable. Tests run sequentially (no t.Parallel), so a
+	// fixed host port doesn't conflict.
+	fakeGCSHostPort = "14443"
 )
 
 // startFakeGCS starts a fake-gcs-server container, creates the requested
@@ -44,9 +56,19 @@ func startFakeGCS(t *testing.T, bucket string) string {
 			ExposedPorts: []string{fakeGCSPort},
 			// -scheme http: serve plain HTTP so the storage client can hit it
 			//   without TLS plumbing.
-			// -public-host: tell fake-gcs to emit URLs that point back at the
-			//   mapped host:port the storage client sees.
-			Cmd:        []string{"-scheme", "http", "-public-host", "127.0.0.1"},
+			// -public-host: tells fake-gcs to emit URLs (selfLink, mediaLink)
+			//   pointing at the FIXED host port we bind below. Required because
+			//   the SDK follows mediaLink for downloads — a hardcoded internal
+			//   port would be unreachable through testcontainers' default
+			//   random port mapping.
+			Cmd: []string{"-scheme", "http", "-public-host", "127.0.0.1:" + fakeGCSHostPort},
+			HostConfigModifier: func(hc *container.HostConfig) {
+				hc.PortBindings = mobynet.PortMap{
+					mobynet.MustParsePort(fakeGCSPort): []mobynet.PortBinding{
+						{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: fakeGCSHostPort},
+					},
+				}
+			},
 			WaitingFor: wait.ForHTTP("/storage/v1/b").WithPort(fakeGCSPort),
 		},
 		Started: true,
@@ -60,15 +82,14 @@ func startFakeGCS(t *testing.T, bucket string) string {
 		}
 	})
 
-	host, err := c.Host(ctx)
-	if err != nil {
+	// The container is bound to a fixed host port (fakeGCSHostPort) per
+	// the PortBindings above, so we don't need to consult c.MappedPort.
+	// We still verify the container started before constructing the
+	// endpoint, by checking c.Host returns without error.
+	if _, err := c.Host(ctx); err != nil {
 		t.Fatalf("get container host: %v", err)
 	}
-	port, err := c.MappedPort(ctx, fakeGCSPort)
-	if err != nil {
-		t.Fatalf("get mapped port: %v", err)
-	}
-	endpoint := fmt.Sprintf("%s:%s", host, port.Port())
+	endpoint := "127.0.0.1:" + fakeGCSHostPort
 
 	// Create the bucket via the JSON API.
 	createURL := fmt.Sprintf("http://%s/storage/v1/b?project=datuplet-test", endpoint)
@@ -84,9 +105,13 @@ func startFakeGCS(t *testing.T, bucket string) string {
 	}
 
 	// Point the storage client at the emulator. The SDK reads this env var
-	// on storage.NewClient and routes all calls through it. We set with
-	// t.Setenv so the original value is restored at test end.
-	t.Setenv("STORAGE_EMULATOR_HOST", endpoint)
+	// on storage.NewClient and routes all calls through it. The scheme
+	// prefix is REQUIRED — without it the SDK silently falls back to
+	// real storage.googleapis.com routing for some endpoints (e.g. range
+	// reads), which produces a confusing "object doesn't exist" right
+	// after a "successful" PutObject. We set with t.Setenv so the
+	// original value is restored at test end.
+	t.Setenv("STORAGE_EMULATOR_HOST", "http://"+endpoint)
 	return bucket
 }
 

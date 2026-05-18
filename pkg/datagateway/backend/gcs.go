@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path"
 	"strings"
 
@@ -63,6 +64,14 @@ func NewGCSBackend(cfg GCSConfig) (*gcsBackend, error) {
 	opts := []option.ClientOption{option.WithUserAgent("datuplet-datagateway")}
 	if len(cfg.ServiceAccountKey) > 0 {
 		opts = append(opts, option.WithCredentialsJSON(cfg.ServiceAccountKey))
+	} else if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
+		// Emulator mode (fake-gcs-server): the SDK detects the env var
+		// for endpoint routing, but if no credentials are provided and
+		// ADC fails (the common dev/CI case), some download endpoints
+		// silently route through real storage.googleapis.com — producing
+		// a confusing "object doesn't exist" right after a "successful"
+		// upload. Explicit anonymous mode aligns all endpoints.
+		opts = append(opts, option.WithoutAuthentication())
 	}
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
