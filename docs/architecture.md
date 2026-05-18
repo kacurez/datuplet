@@ -42,6 +42,58 @@ graph LR
 
 ---
 
+## Credential flow
+
+How short-lived storage credentials reach the Data Gateway sidecar. Two parallel
+paths depending on warehouse type.
+
+### S3 leg (AWS STS)
+
+```mermaid
+sequenceDiagram
+    participant DG as Data Gateway sidecar
+    participant LK as Lakekeeper
+    participant STS as AWS STS
+
+    DG->>LK: LoadOrCreate table (run-token JWT)
+    LK->>STS: AssumeRole (scoped to table prefix)
+    STS-->>LK: temporary credentials (≤15 min)
+    LK-->>DG: vended S3 credentials
+    DG->>S3: PutObject with vended credentials
+```
+
+### GCS leg (Credential Access Boundary — WIF or SA key)
+
+```mermaid
+sequenceDiagram
+    participant DG as Data Gateway sidecar
+    participant LK as Lakekeeper
+    participant GKE as GKE metadata server (WIF)
+    participant IAM as GCP IAM / STS
+    participant GCS as GCS bucket
+
+    Note over LK,GKE: Mode A only (Workload Identity)
+    LK->>GKE: obtain GSA access token via metadata server
+    GKE-->>LK: short-lived GSA token
+
+    Note over LK,IAM: Both modes: downscope via CAB
+    LK->>IAM: exchange GSA token for CAB-scoped token<br/>(restricted to table prefix)
+    IAM-->>LK: downscoped OAuth2 token (≤1 h)
+
+    LK-->>DG: vended GCS OAuth2 token (gcs.oauth2.token)
+    DG->>GCS: object writes with vended token
+```
+
+In Mode B (static SA key), Lakekeeper holds the key in its Postgres store and
+uses it directly to obtain the initial GSA token — the GKE metadata server step
+is skipped. The CAB downscope step is identical in both modes.
+
+The Data Gateway renews credentials at 50 % of their issued TTL (minimum 60 s
+interval). On cancellation, FGA tuple deletion prevents renewal; the credential
+expires within the STS / CAB TTL (≤15 min for STS, ≤1 h for GCS CAB tokens).
+
+---
+
 ## Components
 
 ### pipeline-api
@@ -195,17 +247,21 @@ For the full token lifecycle, see [docs/auth-flow.md](auth-flow.md).
 
 ## Storage abstraction
 
-Lakekeeper owns all long-lived warehouse credentials (S3 access key / GCS service
-account key). These are passed as flags to `pipeline-api admin lakekeeper-bootstrap`
-at install time and forwarded to Lakekeeper; pipeline-api keeps no record. No
-Datuplet Deployment (pipeline-api, observer, operator) mounts a warehouse
-credential at runtime.
+Lakekeeper owns all long-lived warehouse credentials. For S3 this is an IAM
+access key; for GCS it is either a service-account key (Mode B) or the ambient
+Workload Identity Federation token from the GKE metadata server (Mode A — no
+static key stored). Credentials are passed as flags to
+`pipeline-api admin lakekeeper-bootstrap` at install time and forwarded to
+Lakekeeper; pipeline-api keeps no record. No Datuplet Deployment (pipeline-api,
+observer, operator) mounts a warehouse credential at runtime.
 
-Every runtime S3 operation uses STS-vended credentials (AWS STS or Google
-impersonated tokens) scoped to the requesting run's token. The Data Gateway renews
-credentials at 50% of their issued TTL, with a 60 s minimum renewal interval. On
-cancellation, FGA tuple deletion prevents renewal; the credential expires within the
-STS TTL (≤15 min).
+Every runtime storage operation uses short-lived vended credentials scoped to
+the requesting run's token: AWS STS for S3, Google Credential Access Boundary
+(CAB) downscoped tokens for GCS. The Data Gateway renews credentials at 50% of
+their issued TTL, with a 60 s minimum renewal interval. On cancellation, FGA
+tuple deletion prevents renewal; the credential expires within the STS / CAB TTL
+(≤15 min for STS; ≤1 h for GCS CAB tokens). See the [Credential flow](#credential-flow)
+section above for the per-backend sequence diagrams.
 
 Storage paths are opaque strings throughout the system. Lakekeeper allocates
 UUID-keyed paths (`s3://<warehouse>/<storage-uuid>/<table-uuid>/`); the Data
