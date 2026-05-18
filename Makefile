@@ -276,17 +276,29 @@ clean-go-git-cache: ## Free disk space (Go build/test/fuzz cache + git gc; prese
 	go clean -cache -testcache -fuzzcache
 	git gc --prune=now
 
-# Run go mod tidy on the root module AND every component module. Tidying
-# root in isolation drifts the components — their Docker builds enforce
-# `go mod tidy` parity and fail CI. Always tidy the whole monorepo.
-tidy: ## Run go mod tidy across root + components/*/
+# Run go mod tidy across every Go module in the monorepo. Tidying root
+# in isolation drifts the others — their Docker builds + e2e go test
+# enforce `go mod tidy` parity and fail CI. Always tidy the whole tree.
+#
+# Discovers modules dynamically rather than hardcoding paths so a new
+# components/*/ or sdk/*/ module doesn't silently get missed.
+#
+# tests/integration/go.mod is excluded: its go.mod is missing a
+# `replace github.com/datuplet/datuplet/sdk/go => ../../sdk/go` directive
+# and won't tidy until that's fixed. It is NOT run in CI today (see
+# .github/workflows/e2e.yml — only tests/e2e is exercised). Tracked as
+# a pre-existing repo cleanup, not blocking this PR.
+tidy: ## Run go mod tidy across every go.mod in the monorepo
 	@echo "Tidying root..."
 	@go mod tidy
-	@for d in components/*/; do \
-	  echo "Tidying $$d..."; \
-	  (cd "$$d" && go mod tidy) || exit 1; \
+	@for mod in $$(find . -name go.mod -not -path ./go.mod \
+	    -not -path './.git/*' -not -path './node_modules/*' \
+	    -not -path './vendor/*' -not -path './tests/integration/go.mod'); do \
+	  dir=$$(dirname $$mod); \
+	  echo "Tidying $$dir..."; \
+	  (cd $$dir && go mod tidy) || exit 1; \
 	done
-	@echo "✓ all modules tidy"
+	@echo "✓ all modules tidy (tests/integration intentionally skipped)"
 
 # Static analysis and dead code detection. RFC 019 §4.10 bearer-redaction
 # is enforced via Stringer methods on the owned types (S3Creds, GCSCreds,
