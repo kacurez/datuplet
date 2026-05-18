@@ -5,7 +5,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadFS_Local_ReadFile(t *testing.T) {
@@ -128,4 +131,39 @@ func TestS3Props_NonEmptyEndpointKept(t *testing.T) {
 	if p["s3.endpoint"] != "http://minio:9000" {
 		t.Errorf("want http://minio:9000, got %q", p["s3.endpoint"])
 	}
+}
+
+func TestGCSPropsShape(t *testing.T) {
+	exp := time.Date(2026, 5, 18, 14, 0, 0, 0, time.UTC)
+	props := GCSProps("ya29.abc", exp)
+	if props["gcs.oauth2.token"] != "ya29.abc" {
+		t.Fatalf("token = %q", props["gcs.oauth2.token"])
+	}
+	if props["gcs.oauth2.token-expires-at"] != strconv.FormatInt(exp.UnixMilli(), 10) {
+		t.Fatalf("expires-at = %q, want %q",
+			props["gcs.oauth2.token-expires-at"],
+			strconv.FormatInt(exp.UnixMilli(), 10))
+	}
+}
+
+// TestLoadFSGS verifies that LoadFS dispatches gs:// to the datupleticeio
+// factory instead of rejecting the scheme. The factory itself may fail at
+// credential-resolution or bucket-open time when there is no real GCS
+// backend — the test asserts only that the error does NOT say "unsupported
+// URI scheme" (which would mean the dispatch itself was broken). The full
+// happy path is exercised in the gcs-pipeline-k8s e2e scenario.
+func TestLoadFSGS(t *testing.T) {
+	props := GCSProps("ya29.test", time.Now().Add(15*time.Minute))
+	_, err := LoadFS(context.Background(), "gs://test-bucket/some/prefix", props)
+	// The factory MUST have been invoked: either it succeeded (err == nil)
+	// or it failed with a factory-specific error. Either way, the scheme
+	// must not have been rejected by LoadFS's default branch.
+	if err != nil && strings.Contains(err.Error(), "unsupported URI scheme") {
+		t.Fatalf("gs:// scheme was rejected by LoadFS instead of dispatched to factory: %v", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "not yet supported") {
+		t.Fatalf("LoadFS still has the Slice D.4 placeholder rejection for gs://: %v", err)
+	}
+	// If err is nil, the factory constructed an IO successfully (fake-gcs-server
+	// or an ambient GCS credential was present). Either outcome is acceptable here.
 }

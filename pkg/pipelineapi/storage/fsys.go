@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	iceio "github.com/apache/iceberg-go/io"
 	// Blank-import the centralised iceberg-go IO scheme registration
@@ -17,16 +19,11 @@ import (
 )
 
 // LoadFS returns an iceberg-go-compatible filesystem for the given URI.
-// Supported schemes: file://, s3://.
+// Supported schemes: file://, s3://, gs://.
 //
-// NOTE: gs:// is NOT surfaced by the storage browser in this release even
-// though the Datuplet GCS IO factory IS registered via the blank-import of
-// pkg/datupleticeio at the top of this file. Storage-browser support for GCS
-// warehouses is a follow-on slice; until then LoadFS rejects gs:// with an
-// explicit, actionable error so the gap is loud rather than silent.
-//
-// s3Props (optional) supplies the S3 credential + endpoint properties
-// iceberg-go expects; can be nil for local paths.
+// props (optional) supplies the credential + endpoint properties
+// iceberg-go expects for the relevant backend; can be nil for local paths.
+// Use S3Props to build the s3:// property map and GCSProps for gs://.
 //
 // This is the single entry-point every other file in the package uses
 // to obtain a filesystem. Do not call iceberg-go's io package directly
@@ -47,15 +44,29 @@ func LoadFS(ctx context.Context, uri string, s3Props map[string]string) (iceio.I
 	case strings.HasPrefix(uri, "s3://"):
 		// props already carry S3 creds; gocloud subpackage registers the scheme.
 	case strings.HasPrefix(uri, "gs://"):
-		// The gs:// IO factory IS registered (via pkg/datupleticeio's blank-import
-		// at the top of this file). The storage-browser UI surface for GCS
-		// warehouses is a follow-on slice; reject here explicitly so the
-		// rejection is loud and the fix is obvious when that slice lands.
-		return nil, fmt.Errorf("storage browser: gs:// is not yet supported by the storage browser in this release")
+		// GCS IO factory registered by pkg/datupleticeio blank-import above.
+		// props must carry gcs.oauth2.token (from GCSProps); forwarded verbatim.
 	default:
 		return nil, fmt.Errorf("unsupported URI scheme: %q", uri)
 	}
 	return iceio.LoadFS(ctx, props, uri)
+}
+
+// GCSProps builds the props map that pkg/datupleticeio's gs:// factory
+// consumes. Mirrors S3Props's shape; expects a lakekeeper-vended OAuth
+// bearer token and its absolute expiry time.
+//
+// The returned map uses the two keys the datupletGCSFactory reads:
+//
+//	"gcs.oauth2.token"             — the bearer token itself
+//	"gcs.oauth2.token-expires-at"  — absolute expiry as Unix milliseconds
+//
+// The caller passes this map directly to LoadFS for a gs:// URI.
+func GCSProps(oauthToken string, expiresAt time.Time) map[string]string {
+	return map[string]string{
+		"gcs.oauth2.token":            oauthToken,
+		"gcs.oauth2.token-expires-at": strconv.FormatInt(expiresAt.UnixMilli(), 10),
+	}
 }
 
 // S3Props normalizes our DATUPLET_* / S3_* env vars into the property
