@@ -298,6 +298,50 @@ func (g *gcsBackend) OpenReader(ctx context.Context, tablePath string) (Reader, 
 	}, nil
 }
 
+// Commit assembles per-writer stats into a CommitResult.
+// Mirrors MinIOBackend.Commit: this is the buffered-write commit, not the
+// Iceberg snapshot commit. Iceberg-level commits go through pkg/tablecommit
+// after the buffered files are stamped in object storage. (When the
+// pkg/datupleticeio gs:// factory lands in Slice D, TableCommit gains an
+// end-to-end path against GCS without changes here.)
+func (g *gcsBackend) Commit(ctx context.Context, writers []Writer) (*CommitResult, error) {
+	results := make([]TableCommitResult, len(writers))
+	for i, w := range writers {
+		gw, ok := w.(*gcsWriter)
+		if !ok {
+			continue
+		}
+
+		stats := gw.Stats()
+		results[i] = TableCommitResult{
+			OutputName: gw.OutputName(),
+			TablePath:  gw.TablePath(),
+			Status:     CommitStatusCommitted,
+			SnapshotID: 0,
+			FilesAdded: stats.PartsWritten,
+			RowsAdded:  stats.RowsWritten,
+		}
+	}
+	return &CommitResult{Tables: results}, nil
+}
+
+// Rollback deletes all part files written by the given writers.
+// Errors from individual deletes are swallowed (same as MinIOBackend.Rollback)
+// so a single missing file does not abort the cleanup of the remaining
+// staged parts.
+func (g *gcsBackend) Rollback(ctx context.Context, writers []Writer) error {
+	for _, w := range writers {
+		gw, ok := w.(*gcsWriter)
+		if !ok {
+			continue
+		}
+		for _, filePath := range gw.filePaths {
+			_ = g.bkt.Object(filePath).Delete(ctx)
+		}
+	}
+	return nil
+}
+
 // gcsObjectLister + gcsObjectDeleter are the minimal storage surfaces
 // RemoveAll depends on. Production code passes the real BucketHandle (via
 // a thin adapter); tests inject a fake. Splitting list-vs-delete is

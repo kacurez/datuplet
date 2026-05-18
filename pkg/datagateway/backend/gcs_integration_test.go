@@ -136,6 +136,52 @@ func TestGCSBackendPutGetObjectGSURL(t *testing.T) {
 	}
 }
 
+// TestGCSBackendRollbackDeletesStagedFiles verifies that Rollback deletes
+// the part files a writer accumulated in filePaths. We populate the
+// bucket directly (via PutObject) to avoid coupling to OpenWriter's
+// internals, hand the writer's filePaths to a fresh writer, then call
+// Rollback and confirm the objects are gone.
+func TestGCSBackendRollbackDeletesStagedFiles(t *testing.T) {
+	bucket := startFakeGCS(t, "datuplet-rollback")
+	be, err := NewGCSBackend(GCSConfig{Bucket: bucket})
+	if err != nil {
+		t.Fatalf("NewGCSBackend: %v", err)
+	}
+	defer be.Close()
+	ctx := context.Background()
+
+	// Stage two parts directly.
+	paths := []string{"tables/x/part-00000.csv", "tables/x/part-00001.csv"}
+	for _, p := range paths {
+		if err := be.PutObject(ctx, p, []byte("hello")); err != nil {
+			t.Fatalf("seed PutObject(%q): %v", p, err)
+		}
+	}
+
+	// Confirm they exist.
+	for _, p := range paths {
+		if _, err := be.GetObject(ctx, p); err != nil {
+			t.Fatalf("pre-rollback get %q: %v", p, err)
+		}
+	}
+
+	// Rollback the equivalent gcsWriter. NewGCSBackend currently returns
+	// *gcsBackend (Slice B staged-landing concession); after Slice D the
+	// constructors flip to StorageBackend and this no longer needs the
+	// concrete type.
+	gw := &gcsWriter{filePaths: paths}
+	if err := be.Rollback(ctx, []Writer{gw}); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	// Confirm they're gone.
+	for _, p := range paths {
+		if _, err := be.GetObject(ctx, p); err == nil {
+			t.Errorf("post-rollback get %q: object still exists", p)
+		}
+	}
+}
+
 func TestGCSBackendOpenWriterOpenReaderCSV(t *testing.T) {
 	bucket := startFakeGCS(t, "datuplet-writer-reader")
 	be, err := NewGCSBackend(GCSConfig{Bucket: bucket})
