@@ -44,8 +44,15 @@ import (
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/pkg/datagateway/backend"
-	dgschema "github.com/datuplet/datuplet/pkg/datagateway/schema"
 	"github.com/datuplet/datuplet/pkg/datagateway/manifest"
+	dgschema "github.com/datuplet/datuplet/pkg/datagateway/schema"
+	// Blank-import the centralised iceberg-go IO scheme registration package
+	// so isolated tests of this package (e.g. go test ./pkg/datagateway/lakekeeper/...)
+	// use the Datuplet-overridden gs:// factory rather than the upstream
+	// gocloud default. Without this, pkg/datupleticeio's init() is absent
+	// from the binary when lakekeeper is tested in isolation, silently
+	// activating the wrong factory.
+	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 // Resolver translates (namespace, table) into a writable / readable

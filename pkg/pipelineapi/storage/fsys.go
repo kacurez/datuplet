@@ -17,9 +17,16 @@ import (
 )
 
 // LoadFS returns an iceberg-go-compatible filesystem for the given URI.
-// Supported schemes: file://, s3://. s3Props (optional) supplies the
-// S3 credential + endpoint properties iceberg-go expects; can be nil
-// for local paths.
+// Supported schemes: file://, s3://.
+//
+// NOTE: gs:// is NOT surfaced by the storage browser in this release even
+// though the Datuplet GCS IO factory IS registered via the blank-import of
+// pkg/datupleticeio at the top of this file. Storage-browser support for GCS
+// warehouses is a follow-on slice; until then LoadFS rejects gs:// with an
+// explicit, actionable error so the gap is loud rather than silent.
+//
+// s3Props (optional) supplies the S3 credential + endpoint properties
+// iceberg-go expects; can be nil for local paths.
 //
 // This is the single entry-point every other file in the package uses
 // to obtain a filesystem. Do not call iceberg-go's io package directly
@@ -39,6 +46,12 @@ func LoadFS(ctx context.Context, uri string, s3Props map[string]string) (iceio.I
 		// local: no props needed, LocalFS is registered by iceberg-go/io init.
 	case strings.HasPrefix(uri, "s3://"):
 		// props already carry S3 creds; gocloud subpackage registers the scheme.
+	case strings.HasPrefix(uri, "gs://"):
+		// The gs:// IO factory IS registered (via pkg/datupleticeio's blank-import
+		// at the top of this file). The storage-browser UI surface for GCS
+		// warehouses is a follow-on slice; reject here explicitly so the
+		// rejection is loud and the fix is obvious when that slice lands.
+		return nil, fmt.Errorf("storage browser: gs:// is not yet supported by the storage browser in this release")
 	default:
 		return nil, fmt.Errorf("unsupported URI scheme: %q", uri)
 	}

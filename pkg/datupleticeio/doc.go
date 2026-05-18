@@ -1,8 +1,9 @@
 // Package datupleticeio centralizes Datuplet's iceberg-go IO scheme
 // registrations. Every binary that calls into iceberg-go (cmd/datuplet,
-// cmd/pipeline-api, cmd/pipeline-operator) and every package that does
-// (pkg/icebergjob, pkg/datagateway/lakekeeper, pkg/pipelineapi/storage)
-// blank-imports this package so the registration order is deterministic.
+// cmd/pipeline-api, cmd/pipeline-operator) and every package that uses
+// iceberg-go's IO factory directly (pkg/icebergjob, pkg/datagateway/lakekeeper,
+// pkg/pipelineapi/storage) blank-imports this package so the registration
+// order is deterministic and isolated package tests use the override.
 //
 // Today this package overrides only the `gs://` scheme. The default
 // iceberg-go/io/gocloud factory reads gcs.keypath / gcs.jsonkey / ADC

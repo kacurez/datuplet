@@ -47,6 +47,7 @@ var Analyzer = &analysis.Analyzer{
 var seeds = []string{
 	"github.com/datuplet/datuplet/pkg/catalogwriter.GCSCreds",
 	"github.com/datuplet/datuplet/pkg/datagateway/backend.vendedTokenSource",
+	"github.com/datuplet/datuplet/pkg/datupleticeio.refreshingTokenSource",
 	"golang.org/x/oauth2.Token",
 }
 

@@ -65,7 +65,10 @@ func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]s
 		return nil, fmt.Errorf("datupletGCSFactory: cannot derive bucket from %q", parsed.String())
 	}
 
-	refresh := pickRefresh(props)
+	refresh, endpointSelected := pickRefresh(props)
+	if endpointSelected {
+		return nil, fmt.Errorf("datupletGCSFactory: gcs.oauth2.refresh-credentials-endpoint is present in props but endpointRefresh is not yet validated end-to-end in v0.2; set gcs.oauth2.refresh-credentials-enabled=false to suppress and use the loadTable-based fallback")
+	}
 	ts := newRefreshingTokenSource(&oauth2.Token{
 		AccessToken: tok,
 		Expiry:      expires,
@@ -91,24 +94,23 @@ func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]s
 	return &gcsIO{bucket: bkt, bucketName: bucket, ctx: ctx}, nil
 }
 
-// pickRefresh chooses between endpoint-based refresh (latent in v0.2 — not
-// end-to-end validated; Slice A0 probe 4 was deferred because Lakekeeper
-// wasn't reachable from the dev cluster) and the loadTable-based fallback
-// (the default path).
+// pickRefresh chooses between endpoint-based refresh and the loadTable-based
+// fallback (the default path). It returns the chosen refreshFunc and a boolean
+// indicating whether the endpoint path was selected. Callers must reject the
+// endpoint path until it is validated end-to-end (see datupletGCSFactory).
 //
-// TODO(rfc-019): the endpoint-based path is shipped as a latent code path —
-// it activates only if Lakekeeper emits gcs.oauth2.refresh-credentials-endpoint
-// AND the operator hasn't explicitly set gcs.oauth2.refresh-credentials-enabled
-// to "false". A follow-on slice will validate it end-to-end against a real
-// Lakekeeper instance and lift the explicit "not yet validated" error.
-func pickRefresh(props map[string]string) refreshFunc {
+// The second return value (endpointSelected) is true only when
+// gcs.oauth2.refresh-credentials-endpoint is non-empty AND
+// gcs.oauth2.refresh-credentials-enabled is not "false". This lets the factory
+// fail fast at construction time rather than 15 minutes later when the token
+// expires and the unvalidated path is invoked.
+func pickRefresh(props map[string]string) (refreshFunc, bool) {
 	ep := props["gcs.oauth2.refresh-credentials-endpoint"]
 	enabled := props["gcs.oauth2.refresh-credentials-enabled"]
 	if ep != "" && enabled != "false" {
-		// Latent path — code present but NOT end-to-end validated.
-		return endpointRefresh(ep, props)
+		return endpointRefresh(ep, props), true
 	}
-	return loadTableRefresh(props)
+	return loadTableRefresh(props), false
 }
 
 // endpointRefresh is the latent path. Validated in a follow-on once a
@@ -209,8 +211,28 @@ func (g *gcsIO) Remove(name string) error {
 	if err != nil {
 		return &fs.PathError{Op: "remove", Path: name, Err: err}
 	}
+	if !fs.ValidPath(key) {
+		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrInvalid}
+	}
 	return g.bucket.Delete(g.ctx, key)
 }
+
+// Close releases the underlying gocloud blob.Bucket. iceio.IO doesn't
+// declare Close, but Datuplet callers that hold a non-iceio reference
+// to *gcsIO should call this defensively. Today gcsblob.Bucket.Close
+// is a no-op, but it is the correct cleanup point — future gcsblob
+// versions may close the storage.Client there.
+//
+// TODO(rfc-019): wire defer io.Close() in pkg/icebergjob/commit.go and
+// pkg/datagateway/lakekeeper/lakekeeper.go once the iceio.IO interface
+// is annotated to accept a Closer, or the call sites obtain *gcsIO
+// directly via a type assertion.
+func (g *gcsIO) Close() error {
+	return g.bucket.Close()
+}
+
+// Verify gcsIO satisfies io.Closer at compile time.
+var _ io.Closer = (*gcsIO)(nil)
 
 // gcsFile satisfies iceio.File = fs.File + io.ReadSeekCloser + io.ReaderAt.
 //
@@ -254,8 +276,8 @@ func (f *gcsFile) Stat() (fs.FileInfo, error) { return f, nil }
 // time (the object's size, not the bytes-remaining).
 func (f *gcsFile) Size() int64 { return f.Reader.Size() }
 
-// ModTime is provided by *blob.Reader and is automatically promoted by
-// embedding — no override needed. Likewise Read/Seek/Close.
+// ModTime, Read, Seek, and Close are all provided by *blob.Reader and are
+// automatically promoted by embedding — no override needed.
 
 // Compile-time interface assertions.
 var (

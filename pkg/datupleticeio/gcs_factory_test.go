@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -92,6 +93,81 @@ func TestRefreshingTokenSourceDoesNotReturnStaleOnFailure(t *testing.T) {
 	_, err = rts.Token()
 	if err == nil {
 		t.Fatal("expected hard error on refresh failure")
+	}
+}
+
+// TestPickRefreshEndpointActivationFailsClosed verifies that datupletGCSFactory
+// fails fast at construction time when gcs.oauth2.refresh-credentials-endpoint
+// is present in props and not disabled. Without this, the unvalidated
+// endpointRefresh path would only surface as an error ~15 minutes later
+// when the initial token expires mid-transaction (P1-S1).
+func TestPickRefreshEndpointActivationFailsClosed(t *testing.T) {
+	parsed, _ := url.Parse("gs://test-bucket")
+	props := map[string]string{
+		"gcs.oauth2.token":                        "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lakekeeper.example/refresh",
+	}
+	_, err := datupletGCSFactory(context.Background(), parsed, props)
+	if err == nil {
+		t.Fatal("expected fail-fast error when endpoint refresh would be selected")
+	}
+	if !strings.Contains(err.Error(), "not yet validated end-to-end in v0.2") {
+		t.Fatalf("error did not match fail-fast message: %v", err)
+	}
+}
+
+// TestPickRefreshEndpointDisabledSucceeds verifies that setting
+// gcs.oauth2.refresh-credentials-enabled=false suppresses the endpoint path
+// and the factory succeeds (falling back to loadTableRefresh).
+func TestPickRefreshEndpointDisabledSucceeds(t *testing.T) {
+	parsed, _ := url.Parse("gs://test-bucket")
+	props := map[string]string{
+		"gcs.oauth2.token":                          "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint":   "https://lakekeeper.example/refresh",
+		"gcs.oauth2.refresh-credentials-enabled":    "false",
+	}
+	gcsio, err := datupletGCSFactory(context.Background(), parsed, props)
+	if err != nil {
+		t.Fatalf("expected success with endpoint disabled, got %v", err)
+	}
+	if gcsio == nil {
+		t.Fatal("expected non-nil IO")
+	}
+	_ = gcsio.(*gcsIO).Close()
+}
+
+// TestPickRefreshLoadTableDefault verifies that without the endpoint prop
+// the factory succeeds (loadTableRefresh is the default).
+func TestPickRefreshLoadTableDefault(t *testing.T) {
+	parsed, _ := url.Parse("gs://test-bucket")
+	props := map[string]string{
+		"gcs.oauth2.token": "ya29.test",
+	}
+	gcsio, err := datupletGCSFactory(context.Background(), parsed, props)
+	if err != nil {
+		t.Fatalf("expected success with loadTableRefresh default, got %v", err)
+	}
+	if gcsio == nil {
+		t.Fatal("expected non-nil IO")
+	}
+	_ = gcsio.(*gcsIO).Close()
+}
+
+// TestRefreshErrorDoesNotLeakBearer locks in the no-leak contract:
+// when a refresh fails, the error message must not contain the bearer token.
+// RFC 019 §4.5.3.
+func TestRefreshErrorDoesNotLeakBearer(t *testing.T) {
+	sentinel := "ya29.secret-bearer-value"
+	rts := newRefreshingTokenSource(nil, func(ctx context.Context) (*oauth2.Token, error) {
+		return nil, errors.New("transient failure")
+	})
+	rts.cur = &oauth2.Token{AccessToken: sentinel, Expiry: time.Now().Add(-1 * time.Second)}
+	_, err := rts.Token()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("bearer leaked into error: %v", err)
 	}
 }
 
