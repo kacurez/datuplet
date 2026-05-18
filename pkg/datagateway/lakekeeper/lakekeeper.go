@@ -319,12 +319,13 @@ func (r *Resolver) buildS3Backend(dataPrefix, ns, tbl string) (backend.StorageBa
 	// REST URL — lakekeeper assigns separate identifiers — so deriving
 	// prefix from the path string is unsafe.
 	vc := &catalogwriter.VendedCreds{
-		LakekeeperURL: r.URL,
-		WarehouseName: r.Warehouse,
-		ProjectID:     r.ProjectID,
-		Namespace:     ns,
-		Table:         tbl,
-		TokenProvider: tp,
+		LakekeeperURL:     r.URL,
+		WarehouseName:     r.Warehouse,
+		ProjectID:         r.ProjectID,
+		Namespace:         ns,
+		Table:             tbl,
+		TokenProvider:     tp,
+		ExpectedCredsType: catalogwriter.CredsTypeS3,
 	}
 
 	// Bucket name comes from the table prefix. iceberg-go writes the

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,9 +75,10 @@ func TestVendedCreds_FifteenMinuteTTL(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok-15m", nil },
 		Now:           clk.Now,
 	}
@@ -134,9 +136,10 @@ func TestVendedCreds_FiveMinuteTTL(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 		Now:           clk.Now,
 	}
@@ -179,9 +182,10 @@ func TestVendedCreds_FloorBlocksPathologicalTTL(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 		Now:           clk.Now,
 	}
@@ -252,9 +256,10 @@ func TestVendedCreds_RenewalFailureSurfacesAfterExpiry(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 		Now:           clk.Now,
 	}
@@ -306,9 +311,10 @@ func TestVendedCreds_TokenProviderError(t *testing.T) {
 	defer srv.Close()
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) {
 			return "", errors.New("read run token: not found")
 		},
@@ -325,9 +331,10 @@ func TestVendedCreds_ConcurrentGet(t *testing.T) {
 	t.Parallel()
 	srv, hits := stubLakekeeper(t, 600, "")
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 	}
 	ctx := context.Background()
@@ -384,9 +391,10 @@ func TestVendedCreds_ConcurrentGetWithHungFetch(t *testing.T) {
 	defer srv.Close()
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 	}
 
@@ -421,5 +429,68 @@ func TestVendedCreds_ConcurrentGetWithHungFetch(t *testing.T) {
 
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("expected exactly 1 backend hit (all queued behind fetchDone), got %d", got)
+	}
+}
+
+// TestParseCredsRejectsMixed asserts the confused-deputy fail-closed:
+// a response that carries BOTH s3.* and gcs.oauth2.* keys is ambiguous
+// and must be rejected regardless of ExpectedCredsType.
+func TestParseCredsRejectsMixed(t *testing.T) {
+	cfg := map[string]any{
+		"s3.access-key-id": "AKIA...",
+		"gcs.oauth2.token": "ya29...",
+	}
+	_, err := parseCreds(cfg, CredsTypeS3)
+	if err == nil || !strings.Contains(err.Error(), "BOTH s3.* and gcs.oauth2.*") {
+		t.Fatalf("expected mixed-family rejection, got %v", err)
+	}
+}
+
+// TestParseCredsRejectsWrongFamily asserts a warehouse/backend mismatch
+// (backend resolver said "S3" but lakekeeper returned gcs keys) fails
+// closed with a clear diagnostic.
+func TestParseCredsRejectsWrongFamily(t *testing.T) {
+	cfg := map[string]any{"gcs.oauth2.token": "ya29..."}
+	_, err := parseCreds(cfg, CredsTypeS3)
+	if err == nil || !strings.Contains(err.Error(), "expected s3 credentials but lakekeeper returned gcs") {
+		t.Fatalf("expected wrong-family rejection, got %v", err)
+	}
+}
+
+// TestParseCredsRejectsEmpty: an empty config block must not silently
+// produce a zero-value Creds.
+func TestParseCredsRejectsEmpty(t *testing.T) {
+	_, err := parseCreds(map[string]any{}, CredsTypeS3)
+	if err == nil {
+		t.Fatal("expected error on empty cfg")
+	}
+}
+
+// TestParseCredsHappyPathS3 covers the happy path for S3 family.
+func TestParseCredsHappyPathS3(t *testing.T) {
+	cfg := map[string]any{
+		"s3.access-key-id":     "AKIA",
+		"s3.secret-access-key": "secret",
+		"s3.region":            "us-east-1",
+		"s3.endpoint":          "https://s3.example.com",
+		"s3.session-token":     "session",
+	}
+	got, err := parseCreds(cfg, CredsTypeS3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type() != CredsTypeS3 {
+		t.Fatalf("Type() = %q, want s3", got.Type())
+	}
+}
+
+// TestParseCredsUnsetExpectedRejects: a VendedCreds that forgot to set
+// ExpectedCredsType (zero value) must be rejected — this is the
+// mandatory-field guard.
+func TestParseCredsUnsetExpectedRejects(t *testing.T) {
+	cfg := map[string]any{"s3.access-key-id": "AKIA"}
+	_, err := parseCreds(cfg, "")
+	if err == nil || !strings.Contains(err.Error(), "ExpectedCredsType") {
+		t.Fatalf("expected unset-expected rejection, got %v", err)
 	}
 }

@@ -337,7 +337,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	}
 
 	var parsed struct {
-		Config map[string]string `json:"config"`
+		Config map[string]any `json:"config"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("catalogwriter: unmarshal response: %w", err)
@@ -347,45 +347,141 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 		return nil, errors.New("catalogwriter: lakekeeper response had no config block")
 	}
 
-	// Slice A (A.1+A.2): parse S3 credentials inline. A.3 will replace
-	// this with parseCreds(cfg, v.ExpectedCredsType) for scheme-aware
-	// fail-closed dispatch across S3 + GCS.
-	c := S3Creds{
-		AccessKeyID:     cfg["s3.access-key-id"],
-		SecretAccessKey: cfg["s3.secret-access-key"],
-		SessionToken:    cfg["s3.session-token"],
-		Region:          cfg["s3.region"],
-		Endpoint:        cfg["s3.endpoint"],
-		Issued:          v.now(),
+	c, err := parseCreds(cfg, v.ExpectedCredsType)
+	if err != nil {
+		return nil, fmt.Errorf("catalogwriter: %w", err)
 	}
-	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
-		return nil, errors.New("catalogwriter: lakekeeper config block missing s3 access key fields")
-	}
-
-	// Compute Expires from `s3.expires-at-ms` (epoch ms) if present;
-	// fall back to a 15-min default TTL matching lakekeeper's documented
-	// STS lifetime. The wire shape is lakekeeper-implementation-defined,
-	// so accept either form to stay forward-compatible with future
-	// lakekeeper versions. Bogus / pathological values (parse error,
-	// non-positive, > 24h) silently fall back to the 15-min default
-	// rather than poison the cache.
-	if expMs := cfg["s3.expires-at-ms"]; expMs != "" {
-		if t, perr := parseEpochMillis(expMs); perr == nil {
-			c.Expires = t
-		}
-	}
-	if c.Expires.IsZero() {
-		if ttlSec := cfg["s3.session-ttl-seconds"]; ttlSec != "" {
-			if d, perr := time.ParseDuration(ttlSec + "s"); perr == nil && d > 0 && d < 24*time.Hour {
-				c.Expires = c.Issued.Add(d)
+	// parseCreds returns a Creds with absolute Expires when the response
+	// carried an epoch-ms claim; otherwise Expires is zero. VendedCreds
+	// re-stamps Issued and the TTL fallback here so the renewal logic
+	// uses a single clock source (v.now), which is what tests use to
+	// drive deterministic renewal cadences.
+	switch x := c.(type) {
+	case S3Creds:
+		x.Issued = v.now()
+		if x.Expires.IsZero() {
+			// Relative TTL preserved via raw value; convert here with v.now().
+			if ttlSec := readString(cfg, "s3.session-ttl-seconds"); ttlSec != "" {
+				if d, perr := time.ParseDuration(ttlSec + "s"); perr == nil && d > 0 && d < 24*time.Hour {
+					x.Expires = x.Issued.Add(d)
+				}
 			}
 		}
+		if x.Expires.IsZero() {
+			x.Expires = x.Issued.Add(15 * time.Minute)
+		}
+		c = x
+	case GCSCreds:
+		x.Issued = v.now()
+		if x.Expires.IsZero() {
+			x.Expires = x.Issued.Add(15 * time.Minute)
+		}
+		c = x
 	}
-	if c.Expires.IsZero() {
-		c.Expires = c.Issued.Add(15 * time.Minute)
-	}
-
 	return c, nil
+}
+
+// parseCreds extracts a Creds value from a lakekeeper loadTable response's
+// "config" block. expected tells the parser which credential family it
+// should see — any mismatch (wrong family, mixed families, or no
+// recognized keys) fails closed. See RFC 019 §4.2.
+func parseCreds(cfg map[string]any, expected CredsType) (Creds, error) {
+	hasS3 := cfg["s3.access-key-id"] != nil
+	hasGCS := cfg["gcs.oauth2.token"] != nil
+
+	if hasS3 && hasGCS {
+		return nil, fmt.Errorf("lakekeeper response has BOTH s3.* and gcs.oauth2.* credential keys " +
+			"— refusing ambiguous response (possible confused deputy / response tampering)")
+	}
+	switch expected {
+	case CredsTypeS3:
+		if hasGCS {
+			return nil, fmt.Errorf("expected s3 credentials but lakekeeper returned gcs.oauth2.* keys (warehouse/backend mismatch)")
+		}
+		if !hasS3 {
+			return nil, fmt.Errorf("lakekeeper response missing s3.access-key-id")
+		}
+		return parseS3Creds(cfg)
+	case CredsTypeGCS:
+		if hasS3 {
+			return nil, fmt.Errorf("expected gcs credentials but lakekeeper returned s3.* keys (warehouse/backend mismatch)")
+		}
+		if !hasGCS {
+			return nil, fmt.Errorf("lakekeeper response missing gcs.oauth2.token")
+		}
+		return parseGCSCreds(cfg)
+	default:
+		return nil, fmt.Errorf("VendedCreds.ExpectedCredsType is unset or unsupported (%q); callers must set it to CredsTypeS3 or CredsTypeGCS", expected)
+	}
+}
+
+// parseS3Creds extracts an S3Creds from a lakekeeper response's config
+// block. Caller must have already verified the s3.* family is the
+// expected one (parseCreds handles this dispatch).
+//
+// Only the absolute-epoch-ms expiry path is set here. The relative
+// `s3.session-ttl-seconds` form requires a clock source for `now`, so
+// it is applied in VendedCreds.fetch where v.now() is available; this
+// keeps parseS3Creds pure / clock-free and testable in isolation.
+func parseS3Creds(cfg map[string]any) (Creds, error) {
+	c := S3Creds{
+		AccessKeyID:     readString(cfg, "s3.access-key-id"),
+		SecretAccessKey: readString(cfg, "s3.secret-access-key"),
+		SessionToken:    readString(cfg, "s3.session-token"),
+		Region:          readString(cfg, "s3.region"),
+		Endpoint:        readString(cfg, "s3.endpoint"),
+	}
+	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
+		return nil, errors.New("lakekeeper config block missing s3 access key fields")
+	}
+	if t, ok := readMillis(cfg, "s3.expires-at-ms"); ok {
+		c.Expires = t
+	}
+	return c, nil
+}
+
+// readString pulls a string value from an unmarshalled JSON map. Missing
+// or wrong-type values yield "".
+func readString(cfg map[string]any, key string) string {
+	if v, ok := cfg[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// readMillis pulls an epoch-millisecond value from an unmarshalled JSON
+// map, accepting either a JSON number (float64 after unmarshal) or a
+// decimal string. Returns (time.Time, ok). ok=false on missing /
+// wrong-type / non-positive values — the caller is expected to fall
+// back to a default TTL.
+func readMillis(cfg map[string]any, key string) (time.Time, bool) {
+	raw, present := cfg[key]
+	if !present {
+		return time.Time{}, false
+	}
+	var ms int64
+	switch x := raw.(type) {
+	case float64:
+		if x <= 0 {
+			return time.Time{}, false
+		}
+		ms = int64(x)
+	case json.Number:
+		n, err := x.Int64()
+		if err != nil || n <= 0 {
+			return time.Time{}, false
+		}
+		ms = n
+	case string:
+		t, err := parseEpochMillis(x)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return t, true
+	default:
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
 
 // discoverPrefix queries lakekeeper's `/v1/config?warehouse=<name>` and
@@ -475,4 +571,11 @@ func parseEpochMillis(s string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("non-positive epoch ms: %d", ms)
 	}
 	return time.UnixMilli(ms), nil
+}
+
+// parseGCSCreds is implemented in slice A.4. Stubbed here so parseCreds
+// (slice A.3) compiles and the package builds; A.4 lands the real
+// implementation in the next commit.
+func parseGCSCreds(cfg map[string]any) (Creds, error) {
+	return nil, errors.New("parseGCSCreds: NOT YET IMPLEMENTED (slice A.4)")
 }
