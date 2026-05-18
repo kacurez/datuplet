@@ -122,11 +122,8 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 		if spec.GCS == nil {
 			return nil, fmt.Errorf("type=gcs requires non-nil GCS spec")
 		}
-		var keyObj map[string]any
-		if err := json.Unmarshal([]byte(spec.GCS.ServiceAccountKeyJSON), &keyObj); err != nil {
-			// Do NOT echo the JSON content (could leak the private key
-			// into logs); surface only a generic invalidity message.
-			return nil, fmt.Errorf("invalid GCS service account key JSON: %s", err)
+		if err := spec.GCS.Validate(); err != nil {
+			return nil, err
 		}
 		profile := map[string]any{
 			"type":        "gcs",
@@ -136,16 +133,32 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 		if spec.GCS.KeyPrefix != "" {
 			profile["key-prefix"] = spec.GCS.KeyPrefix
 		}
-		return map[string]any{
-			"warehouse-name": spec.WarehouseName,
-			"project-id":     spec.LakekeeperProjectID,
-			"storage-profile": profile,
-			"storage-credential": map[string]any{
+		var storageCred map[string]any
+		switch spec.GCS.CredentialType {
+		case "", "system-identity":
+			storageCred = map[string]any{
+				"type":            "gcs",
+				"credential-type": "gcp-system-identity",
+			}
+		case "service-account-key":
+			var keyObj map[string]any
+			if err := json.Unmarshal([]byte(spec.GCS.ServiceAccountKeyJSON), &keyObj); err != nil {
+				// Do NOT echo the JSON content (could leak the private key
+				// into logs); surface only a generic invalidity message.
+				return nil, fmt.Errorf("invalid GCS service account key JSON: %s", err)
+			}
+			storageCred = map[string]any{
 				"type":            "gcs",
 				"credential-type": "service-account-key",
 				"key":             keyObj,
-			},
-			"delete-profile": map[string]any{"type": "hard"},
+			}
+		}
+		return map[string]any{
+			"warehouse-name":     spec.WarehouseName,
+			"project-id":         spec.LakekeeperProjectID,
+			"storage-profile":    profile,
+			"storage-credential": storageCred,
+			"delete-profile":     map[string]any{"type": "hard"},
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown warehouse type %q (want s3 or gcs)", spec.Type)
