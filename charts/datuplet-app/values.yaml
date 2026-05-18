@@ -9,6 +9,15 @@
 #   --set-json 'tolerations=[{"key":"kubernetes.io/arch","operator":"Equal","value":"arm64","effect":"NoSchedule"}]'
 tolerations: []
 
+# Tolerations applied to per-run Pods spawned by the pipeline-operator
+# (PipelineRun component Pods + TableCommit Job Pods). Empty default
+# means no tolerations are injected (pass-through to spec.tolerations on each Pod).
+#
+# Example for an all-ARM GKE node pool:
+#   --set-json 'runtimeDefaults.tolerations=[{"key":"kubernetes.io/arch","operator":"Equal","value":"arm64","effect":"NoSchedule"}]'
+runtimeDefaults:
+  tolerations: []
+
 image:
   pullPolicy: IfNotPresent
   pullSecrets: []
