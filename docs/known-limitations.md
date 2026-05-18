@@ -38,6 +38,42 @@ keygen Job. No rotation flow exists in v0.1.
 templates ship with the charts. Recommended manual alert:
 `pipelineapi_observer_lag_seconds > 300` for 5 minutes (observer is behind).
 
+**runtimeDefaults.tolerations on a live cluster.** Operators changing
+`runtimeDefaults.tolerations` after the operator is already running must delete
+any Pending per-run Pods (PipelineRun components + TableCommit Jobs) so the
+operator rebuilds them with the new tolerations. K8s Pods are immutable; the
+operator doesn't re-template in-place. See RFC 019 §12.6 R1.
+
+---
+
+## GCS
+
+## GCS TableCommit transaction TTL ceiling
+
+`pkg/datupleticeio/`'s `loadTableRefresh` (the default refresh strategy)
+is currently an unimplemented stub — the factory's vended OAuth bearer
+expires after the lakekeeper-issued TTL (~15 min default; ~1 hour on
+some warehouses) and any in-flight TableCommit transaction that
+exceeds that window fails with `loadTableRefresh: caller did not
+inject a refresh closure`. RFC 019 §4.5.3 describes the planned wiring;
+v0.2 ships the latent code path with a hard-error stub. Typical
+TableCommit transactions complete in seconds to a few minutes, so the
+ceiling is rarely hit in practice. Sufficiently large commits
+(e.g., ReplaceDataFiles on a 100GB+ partition) may exceed the window —
+in which case the operator must retry with a smaller batch.
+
+**GCS audit attribution.** Lakekeeper vends GCS tokens scoped to the per-table
+prefix (via Credential Access Boundaries). However, GCP Cloud Audit Logs record
+the *GSA* (Lakekeeper's Google service account) as the actor, not the Datuplet
+run-id. Per-run attribution requires a two-log join (Lakekeeper audit log + GCP
+audit log, joined on timestamp + table prefix). RFC 019 §5.3 describes the
+procedure.
+
+Additionally, querying GCS audit logs requires `roles/logging.viewer` (or
+broader) on the GCP project. The lakekeeper GSA's IAM role does NOT include
+this — operators need a separate log-reader SA (or to grant the role explicitly
+to a human/automation account) to retrieve audit entries.
+
 ---
 
 ## Upgrade
@@ -68,6 +104,12 @@ for production installs.
 **Reaper ServiceAccount is shared with pipeline-api.** The reaper CronJob uses
 pipeline-api's ServiceAccount, which has broader verbs than the reaper needs. A
 dedicated narrower ServiceAccount is follow-up work.
+
+**Chart-values write access ≈ operator-level cluster access.** Anyone who can
+modify `runtimeDefaults.tolerations` (or any other chart value injected as an
+env var on the operator) can schedule pods onto nodes that the operator's regular
+RBAC wouldn't normally permit. Treat helm-chart-values write access with the
+same scrutiny as ClusterRoleBinding write access.
 
 ---
 

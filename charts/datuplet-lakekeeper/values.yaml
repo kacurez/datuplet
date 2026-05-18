@@ -19,6 +19,11 @@ platform:
   fgaModelVersion: "4.4"
   # Source: charts/datuplet-app/values.yaml :: platform.openfgaStoreName
   openfgaStoreName: datuplet
+  # Set LAKEKEEPER__ENABLE_GCP_SYSTEM_CREDENTIALS=true so Lakekeeper accepts
+  # the gcp-system-identity credential-type in warehouse registrations.
+  # Independent of workloadIdentity.enabled — operators may use system
+  # identity via a different mechanism (e.g. Anthos) and still need the env.
+  enableGcpSystemCredentials: false
 
 # Source: charts/datuplet-app/values.yaml :: pipelineApi.publicUrl
 # Used by the lakekeeper-config Secret to set OIDC discovery URL.
@@ -202,3 +207,19 @@ lakekeeper:
     auth:
       existingSecret: ""   # not used; here for schema compatibility
   internalOpenFGA: false
+  # Disable subchart SA creation — the parent chart owns the ServiceAccount
+  # so it can conditionally inject the WIF annotation. The parent always
+  # renders a `lakekeeper` SA (see templates/serviceaccount.yaml).
+  serviceAccount:
+    create: false
+    name: lakekeeper
+
+# Workload Identity (GKE). When enabled=true, annotates the lakekeeper
+# KSA with the GSA email so the GKE metadata server lets the pod
+# impersonate the GSA. Required for --gcs-credential-type=system-identity.
+# Set gcpServiceAccount to the full email of the GSA bound via
+# `gcloud iam service-accounts add-iam-policy-binding ... --role=roles/iam.workloadIdentityUser`.
+workloadIdentity:
+  enabled: false
+  gcpServiceAccount: ""  # e.g. datuplet-warehouse@kacurez-labs.iam.gserviceaccount.com
+

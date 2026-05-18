@@ -7,14 +7,14 @@ export DOCKER_BUILDKIT=1
 	build-component-sql-transform \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
-	test e2e e2e-k8s e2e-all \
+	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
 	deploy-local deploy-local-helm undeploy-local k8s-smoke \
 	k8s-reload-crds k8s-rebuild-operators k8s-rebuild-services \
 	k8s-retry-simple k8s-retry-duckdb k8s-retry-full \
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
 	prune-images \
-	lint tidy all help
+	lint chart-render-check tidy all help
 
 # =============================================================================
 # Help
@@ -173,6 +173,9 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 
 e2e-all: e2e-k8s ## Run all e2e tiers (K8s is the only supported surface; alias for e2e-k8s)
 
+e2e-k8s-gcs: ## Run the GCS e2e scenario against fake-gcs-server (skips when no Ready nodes)
+	./tests/e2e/scenarios/gcs-pipeline-k8s/run.sh
+
 # =============================================================================
 # Deploy (OrbStack K8s)
 # =============================================================================
@@ -273,16 +276,56 @@ clean-go-git-cache: ## Free disk space (Go build/test/fuzz cache + git gc; prese
 	go clean -cache -testcache -fuzzcache
 	git gc --prune=now
 
-# Run go mod tidy
-tidy: ## Run go mod tidy
-	go mod tidy
+# Run go mod tidy across every Go module in the monorepo. Tidying root
+# in isolation drifts the others — their Docker builds + e2e go test
+# enforce `go mod tidy` parity and fail CI. Always tidy the whole tree.
+#
+# Discovers modules dynamically rather than hardcoding paths so a new
+# components/*/ or sdk/*/ module doesn't silently get missed.
+#
+# tests/integration/go.mod is excluded: its go.mod is missing a
+# `replace github.com/datuplet/datuplet/sdk/go => ../../sdk/go` directive
+# and won't tidy until that's fixed. It is NOT run in CI today (see
+# .github/workflows/e2e.yml — only tests/e2e is exercised). Tracked as
+# a pre-existing repo cleanup, not blocking this PR.
+tidy: ## Run go mod tidy across every go.mod in the monorepo
+	@echo "Tidying root..."
+	@go mod tidy
+	@for mod in $$(find . -name go.mod -not -path ./go.mod \
+	    -not -path './.git/*' -not -path './node_modules/*' \
+	    -not -path './vendor/*' -not -path './tests/integration/go.mod'); do \
+	  dir=$$(dirname $$mod); \
+	  echo "Tidying $$dir..."; \
+	  (cd $$dir && go mod tidy) || exit 1; \
+	done
+	@echo "✓ all modules tidy (tests/integration intentionally skipped)"
 
-# Static analysis and dead code detection
-lint: ## Run go vet + deadcode analysis
+# Static analysis and dead code detection. RFC 019 §4.10 bearer-redaction
+# is enforced via Stringer methods on the owned types (S3Creds, GCSCreds,
+# vendedTokenSource, refreshingTokenSource) — see pkg/catalogwriter/creds.go.
+lint: chart-render-check ## Run go vet + deadcode + chart golden-render diff
 	@echo "Running go vet..."
 	go vet ./...
 	@echo "Running deadcode analysis..."
 	go run golang.org/x/tools/cmd/deadcode@latest -test ./...
+
+chart-render-check: ## Diff helm template output against golden renders in charts/datuplet-lakekeeper/_render/
+	@# Pin encryptionKeySecret to suppress the randAlphaNum-generated Secret
+	@# that would produce a different key on every run and cause false diffs.
+	@helm template charts/datuplet-lakekeeper \
+	  --set workloadIdentity.enabled=true \
+	  --set workloadIdentity.gcpServiceAccount=test@example.iam.gserviceaccount.com \
+	  --set platform.enableGcpSystemCredentials=true \
+	  --set lakekeeper.secretBackend.postgres.encryptionKeySecret=golden-render \
+	  > /tmp/datuplet-lakekeeper-wif-on.yaml && \
+	diff -u charts/datuplet-lakekeeper/_render/wif-on.golden.yaml /tmp/datuplet-lakekeeper-wif-on.yaml \
+	  || { echo "chart drift on wif-on"; exit 1; }
+	@helm template charts/datuplet-lakekeeper \
+	  --set lakekeeper.secretBackend.postgres.encryptionKeySecret=golden-render \
+	  > /tmp/datuplet-lakekeeper-wif-off.yaml && \
+	diff -u charts/datuplet-lakekeeper/_render/wif-off.golden.yaml /tmp/datuplet-lakekeeper-wif-off.yaml \
+	  || { echo "chart drift on wif-off"; exit 1; }
+	@echo "✓ all chart renders match golden"
 
 # All-in-one: tidy, build, test
 all: tidy build test ## Tidy + build + test (all-in-one)

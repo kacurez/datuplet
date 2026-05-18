@@ -164,6 +164,7 @@ func (r *PipelineRunReconciler) buildCommitJob(pr *datupletv1.PipelineRun, bucke
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
+					Tolerations:   r.RuntimeTolerations, // nil-safe: omitted from Pod when nil
 					Containers: []corev1.Container{
 						{
 							Name:            commitContainerName,

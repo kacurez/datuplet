@@ -545,10 +545,29 @@ func (h *HTTPHandlers) Preview(w http.ResponseWriter, r *http.Request) {
 }
 
 // loaderFn is the FSysF closure iceberg-go's table.NewFromLocation
-// expects. Closes over the Service's S3Props so S3 warehouses get
-// their credentials; file:// warehouses pass nil.
+// expects. This is the single dispatch boundary for storage-scheme
+// routing in the walker fallback path (RFC §4.9): the URI scheme
+// determines which props map to pass to LoadFS.
+//
+//   - file:// → nil props (LocalFS needs none)
+//   - s3://   → svc.S3Props (carries STS access-key/secret/session-token)
+//   - gs://   → svc.GCSProps (carries gcs.oauth2.token + expires-at)
+//
+// In the lakekeeper proxy path, tables are loaded via catalog.LoadTable
+// and their FS closure is set by the REST catalog response — loaderFn
+// is not called at all. loaderFn is only used by the walker fallback
+// (LakekeeperURL == ""), which handles file:// and s3:// warehouses.
 func loaderFn(svc *Service, fileURI string) table.FSysF {
 	return func(ctx context.Context) (iceio.IO, error) {
-		return LoadFS(ctx, fileURI, svc.S3Props)
+		var props map[string]string
+		switch {
+		case strings.HasPrefix(fileURI, "gs://"):
+			props = svc.GCSProps
+		default:
+			// file:// and s3://: S3Props is either nil (file) or carries
+			// STS creds (s3). LoadFS handles both correctly.
+			props = svc.S3Props
+		}
+		return LoadFS(ctx, fileURI, props)
 	}
 }

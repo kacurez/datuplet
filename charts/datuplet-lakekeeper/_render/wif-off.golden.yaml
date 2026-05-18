@@ -1,0 +1,704 @@
+---
+# Source: datuplet-lakekeeper/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lakekeeper
+  namespace: default
+  labels:
+    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/component: lakekeeper
+automountServiceAccountToken: false
+---
+# Source: datuplet-lakekeeper/charts/lakekeeper/templates/config/secret-config-envs.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lakekeeper-config-envs
+  namespace: default
+  labels:
+    helm.sh/chart: lakekeeper-0.10.0
+    app.kubernetes.io/name: lakekeeper
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: lakekeeper
+    app.kubernetes.io/component: config
+data:
+  # Database Configs
+  LAKEKEEPER__PG_HOST_R: "bG9jYWxob3N0"
+  LAKEKEEPER__PG_HOST_W: "bG9jYWxob3N0"
+  LAKEKEEPER__PG_PORT: "NTQzMg=="
+  LAKEKEEPER__PG_DATABASE: "Y2F0YWxvZw=="
+  LAKEKEEPER__PG_USER: "Y2F0YWxvZw=="
+  LAKEKEEPER__PG_PASSWORD: ""
+
+  # Lakekeeper License Configs
+
+  # OPENID Auth Configs
+
+  # UI Auth configs
+
+  # Kubernetes Auth Configs  
+
+  # Secret store configs
+  LAKEKEEPER__SECRET_BACKEND: "UG9zdGdyZXM="
+  # LAKEKEEPER__PG_ENCRYPTION_KEY is mounted as secret
+
+  # Authorization configs
+  LAKEKEEPER__AUTHZ_BACKEND: "b3BlbmZnYQ=="
+
+  # User Configs
+---
+# Source: datuplet-lakekeeper/templates/config-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lakekeeper-config
+  namespace: default
+  labels:
+    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/component: lakekeeper-config
+type: Opaque
+stringData:
+  # OpenFGA backend (datuplet-infra service, same namespace).
+  LAKEKEEPER__OPENFGA__ENDPOINT: "http://openfga.default.svc.cluster.local:8081"
+  LAKEKEEPER__OPENFGA__STORE_NAME: "datuplet"
+  # OIDC auth: lakekeeper validates Bearer JWTs against pipeline-api's JWKS
+  # (published at /.well-known/openid-configuration → jwks_uri). Without
+  # OPENID_PROVIDER_URI lakekeeper has no JWKS and treats every token as
+  # anonymous — which fails the bootstrap endpoint and any authz check.
+  # ADDITIONAL_ISSUERS accepts pipeline-api's iss claim ("datuplet-api" —
+  # a plain string, not a URL). AUDIENCE pins lakekeeper to only accept
+  # tokens minted for it.
+  LAKEKEEPER__OPENID_PROVIDER_URI: "http://pipeline-api.default.svc.cluster.local:8081"
+  LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS: "datuplet-api"
+  LAKEKEEPER__OPENID_AUDIENCE: "datuplet-catalog"
+  # Tells lakekeeper to use OUR pinned model (model_version:collaboration-X)
+  # written by datuplet-app's authz-bootstrap instead of its compiled-in default
+  # (4.3 for lakekeeper 0.12.0). Without this lakekeeper fails at startup
+  # with "Active authorization model with version 4.3 not found in OpenFGA."
+  # because we pin our merged Datuplet+lakekeeper DSL as version
+  # 4.4.
+  # Also tells lakekeeper to skip its own FGA migration.
+  LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION: "4.4"
+---
+# Source: datuplet-lakekeeper/charts/lakekeeper/templates/catalog/catalog-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: lakekeeper
+  namespace: default
+  labels:
+    helm.sh/chart: lakekeeper-0.10.0
+    app.kubernetes.io/name: lakekeeper
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: lakekeeper
+    app.kubernetes.io/component: catalog
+spec:
+  type: ClusterIP
+  sessionAffinity: None
+  ports:
+    - port: 8181
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: lakekeeper
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/component: catalog
+---
+# Source: datuplet-lakekeeper/charts/lakekeeper/templates/catalog/catalog-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lakekeeper
+  namespace: default
+  labels:
+    helm.sh/chart: lakekeeper-0.10.0
+    app.kubernetes.io/name: lakekeeper
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: lakekeeper
+    app.kubernetes.io/component: catalog
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lakekeeper
+      app.kubernetes.io/instance: release-name
+      app.kubernetes.io/component: catalog
+  template:
+    metadata:
+      annotations:
+        checksum/secret-config-envs: 6c834eb1422e72bc5a4f99af25e058231769b409aa4e25da287f1e01246364d1
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+      labels:
+        helm.sh/chart: lakekeeper-0.10.0
+        app.kubernetes.io/name: lakekeeper
+        app.kubernetes.io/instance: release-name
+        app.kubernetes.io/version: "0.12.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: lakekeeper
+        app.kubernetes.io/component: catalog
+        app.kubernetes.io/name: lakekeeper
+        app.kubernetes.io/part-of: datuplet
+    spec:
+      restartPolicy: Always
+      serviceAccountName: lakekeeper
+      initContainers:
+        - args:
+          - |
+            set -eu
+            FGA_HTTP="http://openfga.$POD_NAMESPACE.svc.cluster.local:8080"
+            # VERSION sourced from the parent-rendered lakekeeper-config Secret
+            # (LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION) via secretKeyRef
+            # on the env block below. Single source of truth =
+            # .Values.platform.fgaModelVersion — no hardcoded version drift.
+            VERSION="$FGA_MODEL_VERSION"
+            for i in $(seq 1 60); do
+              # openfga returns stores as {"stores":[{"id":"...","name":"datuplet",...}]}.
+              # Field order in the response varies — match either id-first or name-first.
+              STORES=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                "$FGA_HTTP/stores" 2>/dev/null || echo "")
+              STORE_ID=""
+              if echo "$STORES" | grep -q '"name":"datuplet"'; then
+                STORE_ID=$(echo "$STORES" \
+                  | sed -nE 's/.*"id":"([^"]+)"[^}]*"name":"datuplet".*/\1/p; s/.*"name":"datuplet"[^}]*"id":"([^"]+)".*/\1/p' \
+                  | head -n1)
+              fi
+              if [ -n "$STORE_ID" ]; then
+                PIN=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                  -X POST "$FGA_HTTP/stores/$STORE_ID/read" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"tuple_key\":{\"relation\":\"openfga_id\",\"object\":\"model_version:collaboration-$VERSION\"}}" 2>/dev/null)
+                if echo "$PIN" | grep -q 'auth_model_id:'; then
+                  echo "FGA store + pin ready for version $VERSION (store=$STORE_ID)"
+                  exit 0
+                fi
+              fi
+              echo "Waiting for FGA store + pin... ($i/60)"
+              sleep 5
+            done
+            echo "Timed out waiting for FGA store + pin" >&2
+            exit 1
+          command:
+          - sh
+          - -c
+          env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: OPENFGA_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: keys
+                name: openfga-api-key
+          - name: FGA_MODEL_VERSION
+            valueFrom:
+              secretKeyRef:
+                key: LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION
+                name: lakekeeper-config
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          name: wait-for-fga-store
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            seccompProfile:
+              type: RuntimeDefault
+        - args:
+          - |
+            set -eu
+            # OIDC discovery URL must match LAKEKEEPER__OPENID_PROVIDER_URI in
+            # templates/config-secret.yaml. Pipeline-api serves both
+            # the discovery doc AND the JWKS — probe the discovery endpoint,
+            # which proves the JWKS is also reachable.
+            URL="http://pipeline-api.$POD_NAMESPACE.svc.cluster.local:8081/.well-known/openid-configuration"
+            for i in $(seq 1 120); do
+              if curl -fsS "$URL" >/dev/null 2>&1; then
+                echo "pipeline-api OIDC discovery reachable at $URL"
+                exit 0
+              fi
+              echo "Waiting for pipeline-api OIDC... ($i/120)"
+              sleep 2
+            done
+            echo "Timed out waiting for pipeline-api OIDC discovery" >&2
+            exit 1
+          command:
+          - sh
+          - -c
+          env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          name: wait-for-pipeline-api
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            seccompProfile:
+              type: RuntimeDefault        
+        
+        - name: check-db  
+          image: quay.io/lakekeeper/catalog:v0.12.1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65534
+          resources:
+            {}
+          envFrom:    
+            - secretRef:
+                name: lakekeeper-config-envs
+            - secretRef:
+                name: pg-lakekeeper
+            - secretRef:
+                name: lakekeeper-config
+          env:    
+            - name: LAKEKEEPER__PG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: golden-render
+                  key: encryptionKey
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: pg-lakekeeper-pw
+            - name: LAKEKEEPER__PG_DATABASE_URL_READ
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__OPENFGA__API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: keys
+                  name: openfga-api-key
+            
+            - name: LAKEKEEPER__PLACEHOLDER
+              value: "placeholder"
+          args:
+            - wait-for-db
+            - -dm
+            - -r
+            - "100"
+            - -b
+            - "2"
+      containers:
+        - name: lakekeeper          
+          image: quay.io/lakekeeper/catalog:v0.12.1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65534
+          env:            
+            - name: LAKEKEEPER__PG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: golden-render
+                  key: encryptionKey
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: pg-lakekeeper-pw
+            - name: LAKEKEEPER__PG_DATABASE_URL_READ
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__OPENFGA__API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: keys
+                  name: openfga-api-key
+            
+            - name: LAKEKEEPER__PLACEHOLDER
+              value: "placeholder"
+          envFrom:            
+            - secretRef:
+                name: lakekeeper-config-envs
+            - secretRef:
+                name: pg-lakekeeper
+            - secretRef:
+                name: lakekeeper-config
+          ports:
+            - name: http
+              containerPort: 8181
+              protocol: TCP
+            - name: metrics
+              containerPort: 9000
+              protocol: TCP
+          args:
+            - serve
+          livenessProbe:
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            failureThreshold: 5
+            timeoutSeconds: 5
+            httpGet:
+              path: /health
+              port: 8181
+          readinessProbe:
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            failureThreshold: 5
+            timeoutSeconds: 5
+            httpGet:
+              path: /health
+              port: 8181
+          resources:
+            {}
+---
+# Source: datuplet-lakekeeper/charts/lakekeeper/templates/db-migration.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lakekeeper-db-migration-1
+  namespace: default
+  labels:
+    helm.sh/chart: lakekeeper-0.10.0
+    app.kubernetes.io/name: lakekeeper
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: lakekeeper
+    app.kubernetes.io/component: db-migration
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "0"
+    helm-hook-enabled: "false"
+spec:
+  template:
+    metadata:
+      name: "lakekeeper-migration"
+      annotations:
+        checksum/secret-config-envs: 6c834eb1422e72bc5a4f99af25e058231769b409aa4e25da287f1e01246364d1
+      labels:
+        helm.sh/chart: lakekeeper-0.10.0
+        app.kubernetes.io/name: lakekeeper
+        app.kubernetes.io/instance: release-name
+        app.kubernetes.io/version: "0.12.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: lakekeeper
+        app.kubernetes.io/component: db-migration
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: lakekeeper
+      initContainers:        
+        
+        - name: check-db  
+          image: quay.io/lakekeeper/catalog:v0.12.1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65534
+          resources:
+            {}
+          envFrom:    
+            - secretRef:
+                name: lakekeeper-config-envs
+            - secretRef:
+                name: pg-lakekeeper
+            - secretRef:
+                name: lakekeeper-config
+          env:    
+            - name: LAKEKEEPER__PG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: golden-render
+                  key: encryptionKey
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: pg-lakekeeper-pw
+            - name: LAKEKEEPER__PG_DATABASE_URL_READ
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__OPENFGA__API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: keys
+                  name: openfga-api-key
+            
+            - name: LAKEKEEPER__PLACEHOLDER
+              value: "placeholder"
+          args:
+            - wait-for-db
+            - -d
+            - -r
+            - "100"
+            - -b
+            - "2"
+      containers:
+        - name: migration          
+          image: quay.io/lakekeeper/catalog:v0.12.1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65534
+          env:            
+            - name: LAKEKEEPER__PG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: golden-render
+                  key: encryptionKey
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: pg-lakekeeper-pw
+            - name: LAKEKEEPER__PG_DATABASE_URL_READ
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+              value: postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
+            - name: LAKEKEEPER__OPENFGA__API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: keys
+                  name: openfga-api-key
+            
+            - name: LAKEKEEPER__PLACEHOLDER
+              value: "placeholder"
+          envFrom:            
+            - secretRef:
+                name: lakekeeper-config-envs
+            - secretRef:
+                name: pg-lakekeeper
+            - secretRef:
+                name: lakekeeper-config
+          args:
+            - migrate
+          resources:
+            {}
+---
+# Source: datuplet-lakekeeper/templates/bootstrap/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: datuplet-lakekeeper-bootstrap
+  namespace: default
+  labels:
+    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/part-of: datuplet
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+# Source: datuplet-lakekeeper/templates/bootstrap/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: datuplet-lakekeeper-bootstrap
+  namespace: default
+  labels:
+    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/part-of: datuplet
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["openfga-api-key"]
+    verbs: ["get"]
+---
+# Source: datuplet-lakekeeper/templates/bootstrap/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: datuplet-lakekeeper-bootstrap
+  namespace: default
+  labels:
+    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/part-of: datuplet
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+subjects:
+  - kind: ServiceAccount
+    name: datuplet-lakekeeper-bootstrap
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: datuplet-lakekeeper-bootstrap
+---
+# Source: datuplet-lakekeeper/charts/lakekeeper/templates/tests/bootstrap.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "lakekeeper-test-bootstrap"
+  namespace: default
+  labels:
+    helm.sh/chart: lakekeeper-0.10.0
+    app.kubernetes.io/name: lakekeeper
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: lakekeeper
+    component: catalog
+  annotations:
+    "helm.sh/hook": test
+spec:
+  serviceAccountName: lakekeeper
+  containers:
+    - name: base
+      image: curlimages/curl:latest
+      command: ['sh', "-c"]
+      args:
+        - |
+          set -e
+          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+          BOOTSTRAP_URL="http://lakekeeper:8181/management/v1/bootstrap"
+          if [ -n "$TOKEN" ]; then
+            echo "Found K8s Service Account token"
+          else
+            echo "No K8s Service Account token found"
+          fi
+          for i in {1..45}; do
+            RESPONSE=$(curl --location "$BOOTSTRAP_URL" \
+              --header 'Content-Type: application/json' \
+              --header "Authorization: Bearer $TOKEN" \
+              --data '{"accept-terms-of-use": true}' \
+              --write-out "HTTP_CODE:%{http_code}" --silent --output /dev/null)
+
+            if [[ "$RESPONSE" == *"HTTP_CODE:204"* ]]; then
+              echo "Bootstrapping successful"
+              exit 0
+            else
+              echo "Request failed with status code and response: $RESPONSE"
+            fi
+
+            sleep 2
+          done
+          echo "Failed to bootstrap within the given time"
+          exit 1
+  restartPolicy: Never
+---
+# Source: datuplet-lakekeeper/templates/bootstrap/wait-for-fga-pin-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wait-for-fga-pin
+  namespace: default
+  labels:
+    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wait-for-fga-pin
+        app.kubernetes.io/instance: release-name
+        app.kubernetes.io/part-of: datuplet
+        app.kubernetes.io/component: bootstrap
+    spec:
+      serviceAccountName: datuplet-lakekeeper-bootstrap
+      restartPolicy: OnFailure
+      containers:
+        - name: check
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              FGA_HTTP="http://openfga.$POD_NAMESPACE.svc.cluster.local:8080"
+              VERSION="$FGA_MODEL_VERSION"
+
+              for i in $(seq 1 60); do
+                # Poll for the datuplet store
+                STORES=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                  "$FGA_HTTP/stores" 2>/dev/null || echo "")
+                STORE_ID=""
+                if echo "$STORES" | grep -q '"name":"datuplet"'; then
+                  STORE_ID=$(echo "$STORES" \
+                    | sed -nE 's/.*"id":"([^"]+)"[^}]*"name":"datuplet".*/\1/p; s/.*"name":"datuplet"[^}]*"id":"([^"]+)".*/\1/p' \
+                    | head -n1)
+                fi
+                if [ -n "$STORE_ID" ]; then
+                  # Poll for the pin tuple (relation=openfga_id, object=model_version:collaboration-<VERSION>)
+                  PIN=$(curl -fsS -H "Authorization: Bearer $OPENFGA_API_KEY" \
+                    -X POST "$FGA_HTTP/stores/$STORE_ID/read" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"tuple_key\":{\"relation\":\"openfga_id\",\"object\":\"model_version:collaboration-$VERSION\"}}" 2>/dev/null || echo "")
+                  if echo "$PIN" | grep -q 'auth_model_id:'; then
+                    echo "FGA model pin ready for version $VERSION (store=$STORE_ID)"
+                    exit 0
+                  fi
+                fi
+                echo "Waiting for FGA model pin (version $VERSION)... ($i/60)"
+                sleep 5
+              done
+
+              echo "" >&2
+              echo "Timed out waiting for FGA model pin (version $VERSION)." >&2
+              echo "Did datuplet-app finish installing? authz-bootstrap writes the pin tuple" >&2
+              echo "on Phase 3 (datuplet-app) install. Run:" >&2
+              echo "  helm upgrade --install datuplet-app charts/datuplet-app -n $POD_NAMESPACE --wait --wait-for-jobs" >&2
+              echo "before installing datuplet-lakekeeper." >&2
+              exit 1
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OPENFGA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-api-key
+                  key: keys
+            # Inlined from .Values.platform.fgaModelVersion — non-secret version
+            # number. Cannot use a secretKeyRef on lakekeeper-config because that
+            # Secret is a main-chart resource that doesn't exist when pre-install
+            # hooks run.
+            - name: FGA_MODEL_VERSION
+              value: "4.4"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }

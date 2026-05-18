@@ -2,12 +2,16 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/k8s/controllers"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -15,6 +19,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	// Blank-import the centralised iceberg-go IO scheme registration
+	// package so this binary's `gs://` factory is the Datuplet override.
+	// See pkg/datupleticeio/doc.go and RFC 019 §4.5.
+	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 var (
@@ -25,6 +34,54 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(datupletv1.AddToScheme(scheme))
+}
+
+// loadRuntimeTolerations reads DATUPLET_RUN_TOLERATIONS_JSON from the
+// environment and returns the parsed slice. Returns nil (no error) when the
+// env var is unset or empty. Fails fast on invalid JSON or unknown fields so
+// operator startup surfaces misconfiguration immediately.
+func loadRuntimeTolerations() ([]corev1.Toleration, error) {
+	raw := os.Getenv("DATUPLET_RUN_TOLERATIONS_JSON")
+	if raw == "" {
+		return nil, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var ts []corev1.Toleration
+	if err := dec.Decode(&ts); err != nil {
+		return nil, fmt.Errorf("DATUPLET_RUN_TOLERATIONS_JSON: invalid JSON: %w", err)
+	}
+	for i, t := range ts {
+		if err := validateToleration(t); err != nil {
+			return nil, fmt.Errorf("DATUPLET_RUN_TOLERATIONS_JSON[%d]: %w", i, err)
+		}
+	}
+	return ts, nil
+}
+
+// validateToleration checks that a single Toleration has a supported
+// operator, effect, and the correct key/value/tolerationSeconds constraints.
+func validateToleration(t corev1.Toleration) error {
+	switch t.Operator {
+	case "", corev1.TolerationOpEqual, corev1.TolerationOpExists:
+	default:
+		return fmt.Errorf("invalid operator %q (want Equal or Exists)", t.Operator)
+	}
+	switch t.Effect {
+	case "", corev1.TaintEffectNoSchedule, corev1.TaintEffectPreferNoSchedule, corev1.TaintEffectNoExecute:
+	default:
+		return fmt.Errorf("invalid effect %q", t.Effect)
+	}
+	if t.Operator == corev1.TolerationOpExists && t.Value != "" {
+		return fmt.Errorf("operator=Exists requires empty value, got %q", t.Value)
+	}
+	if t.Operator == corev1.TolerationOpEqual && t.Key == "" {
+		return fmt.Errorf("operator=Equal requires non-empty key")
+	}
+	if t.TolerationSeconds != nil && t.Effect != corev1.TaintEffectNoExecute {
+		return fmt.Errorf("tolerationSeconds is only valid with effect=NoExecute")
+	}
+	return nil
 }
 
 func main() {
@@ -87,6 +144,12 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	runTolerations, err := loadRuntimeTolerations()
+	if err != nil {
+		setupLog.Error(err, "invalid DATUPLET_RUN_TOLERATIONS_JSON")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		HealthProbeBindAddress: probeAddr,
@@ -115,13 +178,14 @@ func main() {
 	// Set up PipelineRun controller — the sole reconciler for both
 	// component Jobs and commit Jobs.
 	if err = (&controllers.PipelineRunReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		GatewayImage:     gatewayImage,
-		TableCommitImage: icebergJobImage,
-		LakekeeperURL:    lakekeeperURL,
-		PipelineAPIURL:   pipelineAPIURL,
-		Clientset:        clientset,
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		GatewayImage:       gatewayImage,
+		TableCommitImage:   icebergJobImage,
+		LakekeeperURL:      lakekeeperURL,
+		PipelineAPIURL:     pipelineAPIURL,
+		Clientset:          clientset,
+		RuntimeTolerations: runTolerations,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PipelineRun")
 		os.Exit(1)

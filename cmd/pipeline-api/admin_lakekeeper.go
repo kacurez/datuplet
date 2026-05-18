@@ -51,11 +51,37 @@ type s3Spec struct {
 // gcsSpec captures the GCS-flavoured warehouse parameters. The
 // ServiceAccountKeyJSON field carries the contents of a Google IAM
 // service-account key (the bytes mounted at --gcs-sa-key-file).
+// CredentialType selects the authentication mode:
+//   - "" or "system-identity": Workload Identity Federation (no key file).
+//   - "service-account-key": static SA JSON key (requires ServiceAccountKeyJSON).
 type gcsSpec struct {
 	Bucket                string
 	KeyPrefix             string
 	StsEnabled            bool
 	ServiceAccountKeyJSON string
+	CredentialType        string // "service-account-key" | "system-identity"
+}
+
+// Validate checks that the gcsSpec's CredentialType and ServiceAccountKeyJSON
+// are self-consistent. Returns an error for mutual-exclusion violations or
+// unknown credential types.
+func (s *gcsSpec) Validate() error {
+	switch s.CredentialType {
+	case "", "system-identity":
+		if s.ServiceAccountKeyJSON != "" {
+			return fmt.Errorf("--gcs-credential-type=system-identity cannot be combined with --gcs-sa-key-file/GCS_SA_KEY_FILE")
+		}
+	case "service-account-key":
+		if s.ServiceAccountKeyJSON == "" {
+			return fmt.Errorf("--gcs-credential-type=service-account-key requires --gcs-sa-key-file (or GCS_SA_KEY_FILE)")
+		}
+	default:
+		return fmt.Errorf("unknown --gcs-credential-type %q (want system-identity or service-account-key)", s.CredentialType)
+	}
+	if s.Bucket == "" {
+		return fmt.Errorf("--gcs-bucket required")
+	}
+	return nil
 }
 
 // buildWarehouseBody assembles the request body for
@@ -96,11 +122,8 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 		if spec.GCS == nil {
 			return nil, fmt.Errorf("type=gcs requires non-nil GCS spec")
 		}
-		var keyObj map[string]any
-		if err := json.Unmarshal([]byte(spec.GCS.ServiceAccountKeyJSON), &keyObj); err != nil {
-			// Do NOT echo the JSON content (could leak the private key
-			// into logs); surface only a generic invalidity message.
-			return nil, fmt.Errorf("invalid GCS service account key JSON: %s", err)
+		if err := spec.GCS.Validate(); err != nil {
+			return nil, err
 		}
 		profile := map[string]any{
 			"type":        "gcs",
@@ -110,16 +133,32 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 		if spec.GCS.KeyPrefix != "" {
 			profile["key-prefix"] = spec.GCS.KeyPrefix
 		}
-		return map[string]any{
-			"warehouse-name": spec.WarehouseName,
-			"project-id":     spec.LakekeeperProjectID,
-			"storage-profile": profile,
-			"storage-credential": map[string]any{
+		var storageCred map[string]any
+		switch spec.GCS.CredentialType {
+		case "", "system-identity":
+			storageCred = map[string]any{
+				"type":            "gcs",
+				"credential-type": "gcp-system-identity",
+			}
+		case "service-account-key":
+			var keyObj map[string]any
+			if err := json.Unmarshal([]byte(spec.GCS.ServiceAccountKeyJSON), &keyObj); err != nil {
+				// Do NOT echo the JSON content (could leak the private key
+				// into logs); surface only a generic invalidity message.
+				return nil, fmt.Errorf("invalid GCS service account key JSON: %s", err)
+			}
+			storageCred = map[string]any{
 				"type":            "gcs",
 				"credential-type": "service-account-key",
 				"key":             keyObj,
-			},
-			"delete-profile": map[string]any{"type": "hard"},
+			}
+		}
+		return map[string]any{
+			"warehouse-name":     spec.WarehouseName,
+			"project-id":         spec.LakekeeperProjectID,
+			"storage-profile":    profile,
+			"storage-credential": storageCred,
+			"delete-profile":     map[string]any{"type": "hard"},
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown warehouse type %q (want s3 or gcs)", spec.Type)
@@ -170,11 +209,42 @@ func adminLakekeeperBootstrap(args []string) error {
 	gcsBucket := fs.String("gcs-bucket", "", "GCS bucket name (required when --type=gcs)")
 	gcsKeyPrefix := fs.String("gcs-key-prefix", "", "GCS key prefix")
 	gcsSAKeyFile := fs.String("gcs-sa-key-file", "", "Path to a Google service-account key JSON file (default from GCS_SA_KEY_FILE env)")
+	gcsCredType := fs.String("gcs-credential-type", "system-identity",
+		"GCS credential type: 'system-identity' (default; Workload Identity Federation, no key file) or 'service-account-key' (static SA JSON key; needs --gcs-sa-key-file)")
 
 	// Signing.
 	keyFile := fs.String("signing-key-file", "", "Path to the RS256 PEM private key (default from SIGNING_KEY_FILE env)")
 	keyID := fs.String("key-id", "", "JWK kid (default from SIGNING_KEY_ID env, then 'key-1')")
 	audience := fs.String("audience", tokens.TableTokenAudience, "JWT aud claim (must match LAKEKEEPER__OPENID_AUDIENCE)")
+
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), `Usage: pipeline-api admin lakekeeper-bootstrap [flags]
+
+Bootstrap a Lakekeeper warehouse. Supports both S3 and GCS; for GCS,
+both static-key and Workload-Identity (WIF) credentials are supported:
+
+  # GCS + Workload Identity (recommended on GKE)
+  pipeline-api admin lakekeeper-bootstrap \
+    --type=gcs --gcs-bucket=$BUCKET \
+    --gcs-credential-type=system-identity \
+    --lakekeeper-project-id=$LK_PROJECT_ID \
+    --lakekeeper-url=$LK_URL \
+    --signing-key-file=$SIGNING_KEY
+
+  # GCS + static service-account key (works anywhere)
+  pipeline-api admin lakekeeper-bootstrap \
+    --type=gcs --gcs-bucket=$BUCKET \
+    --gcs-credential-type=service-account-key \
+    --gcs-sa-key-file=/tmp/datuplet-sa.json \
+    --lakekeeper-project-id=$LK_PROJECT_ID \
+    --lakekeeper-url=$LK_URL \
+    --signing-key-file=$SIGNING_KEY
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+
 	_ = fs.Parse(args)
 
 	if *keyFile == "" {
@@ -228,23 +298,39 @@ func adminLakekeeperBootstrap(args []string) error {
 		if *gcsBucket == "" {
 			return fmt.Errorf("--gcs-bucket is required when --type=gcs")
 		}
-		if *gcsSAKeyFile == "" {
-			*gcsSAKeyFile = os.Getenv("GCS_SA_KEY_FILE")
-		}
-		if *gcsSAKeyFile == "" {
-			return fmt.Errorf("--gcs-sa-key-file is required when --type=gcs (or set GCS_SA_KEY_FILE)")
-		}
-		// Read the SA-key JSON from disk. Don't echo the path's
-		// content into the error — rely on os.ReadFile's error.
-		saBytes, err := os.ReadFile(*gcsSAKeyFile)
-		if err != nil {
-			return fmt.Errorf("read GCS service account key file: %w", err)
-		}
-		spec.GCS = &gcsSpec{
-			Bucket:                *gcsBucket,
-			KeyPrefix:             *gcsKeyPrefix,
-			StsEnabled:            *s3StsEnabled, // shared --sts-enabled flag
-			ServiceAccountKeyJSON: string(saBytes),
+		switch *gcsCredType {
+		case "", "system-identity":
+			if *gcsSAKeyFile != "" || os.Getenv("GCS_SA_KEY_FILE") != "" {
+				return fmt.Errorf("--gcs-credential-type=system-identity cannot be combined with --gcs-sa-key-file/GCS_SA_KEY_FILE")
+			}
+			spec.GCS = &gcsSpec{
+				Bucket:         *gcsBucket,
+				KeyPrefix:      *gcsKeyPrefix,
+				StsEnabled:     *s3StsEnabled, // shared --sts-enabled flag
+				CredentialType: "system-identity",
+			}
+		case "service-account-key":
+			if *gcsSAKeyFile == "" {
+				*gcsSAKeyFile = os.Getenv("GCS_SA_KEY_FILE")
+			}
+			if *gcsSAKeyFile == "" {
+				return fmt.Errorf("--gcs-credential-type=service-account-key requires --gcs-sa-key-file (or GCS_SA_KEY_FILE)")
+			}
+			// Read the SA-key JSON from disk. Don't echo the path's
+			// content into the error — rely on os.ReadFile's error.
+			saBytes, err := os.ReadFile(*gcsSAKeyFile)
+			if err != nil {
+				return fmt.Errorf("read GCS service account key file: %w", err)
+			}
+			spec.GCS = &gcsSpec{
+				Bucket:                *gcsBucket,
+				KeyPrefix:             *gcsKeyPrefix,
+				StsEnabled:            *s3StsEnabled, // shared --sts-enabled flag
+				CredentialType:        "service-account-key",
+				ServiceAccountKeyJSON: string(saBytes),
+			}
+		default:
+			return fmt.Errorf("unknown --gcs-credential-type %q (want system-identity or service-account-key)", *gcsCredType)
 		}
 	default:
 		return fmt.Errorf("unknown --type %q (want s3 or gcs)", *whType)

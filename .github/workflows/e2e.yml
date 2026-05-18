@@ -74,6 +74,16 @@ jobs:
       - name: Run e2e (deploy + test + teardown)
         run: make e2e-k8s-deploy
 
+      # GCS e2e (`make e2e-k8s-gcs`) is intentionally NOT wired here.
+      # Lakekeeper hardcodes storage.googleapis.com — no GCS endpoint
+      # override exists in its config (verified in crates/lakekeeper/
+      # src/service/storage/gcs/mod.rs). Until either (a) real GCP
+      # credentials are wired via GH Actions secrets, or (b) an upstream
+      # Lakekeeper PR adds an endpoint override, the fake-gcs-server
+      # harness can't exercise the gs:// path through Lakekeeper. The
+      # scenario at tests/e2e/scenarios/gcs-pipeline-k8s/ stays in the
+      # repo as a skeleton for whichever path lands first.
+
       - name: Dump pod state on failure
         if: failure()
         run: |

@@ -68,6 +68,10 @@ spec:
               value: "{{ .Values.image.gateway.repository }}:{{ .Values.image.gateway.tag }}"
             - name: ICEBERG_JOB_IMAGE
               value: "{{ .Values.image.icebergJob.repository }}:{{ .Values.image.icebergJob.tag }}"
+            {{- with .Values.runtimeDefaults.tolerations }}
+            - name: DATUPLET_RUN_TOLERATIONS_JSON
+              value: {{ . | toJson | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.pipelineOperator.resources | nindent 12 }}
           securityContext:

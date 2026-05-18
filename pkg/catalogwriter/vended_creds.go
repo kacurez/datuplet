@@ -44,35 +44,6 @@ const defaultHTTPTimeout = 30 * time.Second
 //     so the actual cadence falls back to "every 60s".
 const DefaultRenewalFraction = 0.5
 
-// Creds is the immutable subset of an STS vended-credentials response
-// the rest of Datuplet cares about. Lifted from lakekeeper's
-// `GET /v1/{prefix}/namespaces/{ns}/tables/{tbl}` response, `config`
-// block.
-//
-// IssuedAt + ExpiresAt are absolute wall-clock times rather than a
-// duration so the cache's renewal logic doesn't drift if the host
-// clock jumps; ExpiresAt is computed from the response's `expires-at`
-// header / claim if present, falling back to IssuedAt + 15min (the
-// default STS TTL lakekeeper documents).
-type Creds struct {
-	AccessKeyID     string
-	SecretAccessKey string
-	SessionToken    string
-	Region          string
-	Endpoint        string
-	IssuedAt        time.Time
-	ExpiresAt       time.Time
-}
-
-// TTL is the duration between IssuedAt and ExpiresAt. Used by the
-// renewal-trigger calculation; not exposed to data-plane consumers.
-func (c Creds) TTL() time.Duration {
-	if c.IssuedAt.IsZero() || c.ExpiresAt.IsZero() {
-		return 0
-	}
-	return c.ExpiresAt.Sub(c.IssuedAt)
-}
-
 // VendedCreds caches a Creds value and refreshes it on demand from
 // lakekeeper. Safe for concurrent callers. The renewal contract:
 // renew when 50% of the issued TTL has elapsed, with a 60-second hard
@@ -117,8 +88,17 @@ type VendedCreds struct {
 	Now             func() time.Time
 	HTTPClient      *http.Client
 
+	// ExpectedCredsType is consulted by parseCreds to fail-closed on
+	// scheme mismatch. Set at construction time by the backend resolver
+	// (which knows the scheme from the table location). MANDATORY — a
+	// zero value causes parseCreds to return an error. Slice A wires
+	// this on every existing S3 call site at the same time the field is
+	// added, so there is no in-between window where callers can forget
+	// it. See RFC 019 §4.1.
+	ExpectedCredsType CredsType
+
 	mu        sync.Mutex
-	cached    *Creds
+	cached    Creds // interface — was *Creds (flat struct) before Slice A
 	lastErr   error
 	fetching  bool
 	fetchDone chan struct{} // closed when the in-flight fetch finishes; nil when not fetching
@@ -144,23 +124,28 @@ func (v *VendedCreds) fraction() float64 {
 // shouldRenew encodes the renewal contract: renew when 50% of the
 // issued TTL has elapsed, but never within MinRenewalInterval of the
 // last fetch. Returns true when c is nil (first-fetch).
-func (v *VendedCreds) shouldRenew(c *Creds) bool {
+func (v *VendedCreds) shouldRenew(c Creds) bool {
 	if c == nil {
 		return true
 	}
 	now := v.now()
-	if !c.ExpiresAt.IsZero() && !now.Before(c.ExpiresAt) {
+	exp := c.ExpiresAt()
+	if !exp.IsZero() && !now.Before(exp) {
 		// Already expired — must renew.
 		return true
 	}
-	ttl := c.TTL()
-	if ttl <= 0 {
+	issued := c.IssuedAt()
+	if issued.IsZero() || exp.IsZero() {
 		// No TTL info: be conservative; renew (and let the floor below
 		// throttle if the caller hammers Get repeatedly).
 		return true
 	}
+	ttl := exp.Sub(issued)
+	if ttl <= 0 {
+		return true
+	}
 	target := time.Duration(float64(ttl) * v.fraction())
-	elapsed := now.Sub(c.IssuedAt)
+	elapsed := now.Sub(issued)
 	if elapsed < MinRenewalInterval {
 		// Within the hard floor; defer.
 		return false
@@ -190,7 +175,7 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 		cur := v.cached
 		due := v.shouldRenew(cur)
 		if !due && cur != nil {
-			out := *cur
+			out := cur
 			v.mu.Unlock()
 			return out, nil
 		}
@@ -198,8 +183,8 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 			// Another goroutine is fetching. If we have an unexpired
 			// cache, return it; otherwise wait on fetchDone — closed
 			// when the in-flight fetch finishes (success or failure).
-			if cur != nil && !v.now().After(cur.ExpiresAt) {
-				out := *cur
+			if cur != nil && !v.now().After(cur.ExpiresAt()) {
+				out := cur
 				v.mu.Unlock()
 				return out, nil
 			}
@@ -211,14 +196,14 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 				// after a tiny pause so we don't spin.
 				select {
 				case <-ctx.Done():
-					return Creds{}, ctx.Err()
+					return nil, ctx.Err()
 				case <-time.After(time.Millisecond):
 				}
 				continue
 			}
 			select {
 			case <-ctx.Done():
-				return Creds{}, ctx.Err()
+				return nil, ctx.Err()
 			case <-done:
 			}
 			// In-flight fetch finished; loop to either consume the new
@@ -240,17 +225,17 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 			// Keep stale-but-unexpired creds usable. If cache was empty
 			// or the cached value is past expiry, return the error so
 			// the data plane fails loudly on renewal failure.
-			if cur != nil && v.now().Before(cur.ExpiresAt) {
-				out := *cur
+			if cur != nil && v.now().Before(cur.ExpiresAt()) {
+				out := cur
 				v.mu.Unlock()
 				close(done)
 				return out, nil
 			}
 			v.mu.Unlock()
 			close(done)
-			return Creds{}, err
+			return nil, err
 		}
-		v.cached = &c
+		v.cached = c
 		v.lastErr = nil
 		out := c
 		v.mu.Unlock()
@@ -279,18 +264,24 @@ func (v *VendedCreds) LastError() error {
 // also return per-table metadata in the same body — we ignore
 // everything outside `config` for the purposes of this cache.
 func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
+	// credType is used for metric labels on the error path. We know
+	// ExpectedCredsType at construction; use it throughout so failures
+	// before the parse step still carry a meaningful label.
+	credType := string(v.ExpectedCredsType)
+
 	if v.LakekeeperURL == "" {
-		return Creds{}, errors.New("catalogwriter: LakekeeperURL is required")
+		return nil, errors.New("catalogwriter: LakekeeperURL is required")
 	}
 	if v.Namespace == "" || v.Table == "" {
-		return Creds{}, errors.New("catalogwriter: Namespace + Table are required")
+		return nil, errors.New("catalogwriter: Namespace + Table are required")
 	}
 	if v.TokenProvider == nil {
-		return Creds{}, errors.New("catalogwriter: TokenProvider is required")
+		return nil, errors.New("catalogwriter: TokenProvider is required")
 	}
 	tok, err := v.TokenProvider(ctx)
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: token provider: %w", err)
+		credsRefreshFailuresTotal.WithLabelValues(credType, "token_provider").Inc()
+		return nil, fmt.Errorf("catalogwriter: token provider: %w", err)
 	}
 
 	base := strings.TrimRight(v.LakekeeperURL, "/")
@@ -304,7 +295,8 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	if v.Prefix == "" && v.WarehouseName != "" {
 		discovered, derr := v.discoverPrefix(ctx, base, tok, v.WarehouseName)
 		if derr != nil {
-			return Creds{}, fmt.Errorf("catalogwriter: discover warehouse prefix: %w", derr)
+			credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
+			return nil, fmt.Errorf("catalogwriter: discover warehouse prefix: %w", derr)
 		}
 		v.Prefix = discovered
 	}
@@ -317,7 +309,8 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: build request: %w", err)
+		credsRefreshFailuresTotal.WithLabelValues(credType, "other").Inc()
+		return nil, fmt.Errorf("catalogwriter: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Accept", "application/json")
@@ -337,7 +330,8 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: lakekeeper GET: %w", err)
+		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
+		return nil, fmt.Errorf("catalogwriter: lakekeeper GET: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -345,59 +339,164 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	// can't OOM the data gateway with a multi-GB body.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: read response: %w", err)
+		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
+		return nil, fmt.Errorf("catalogwriter: read response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Creds{}, fmt.Errorf("catalogwriter: lakekeeper GET: status %d body=%s", resp.StatusCode, scrubBody(body))
+		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
+		return nil, fmt.Errorf("catalogwriter: lakekeeper GET: status %d body=%s", resp.StatusCode, scrubBody(body))
 	}
 
 	var parsed struct {
-		Config map[string]string `json:"config"`
+		Config map[string]any `json:"config"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: unmarshal response: %w", err)
+		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
+		return nil, fmt.Errorf("catalogwriter: unmarshal response: %w", err)
 	}
 	cfg := parsed.Config
 	if cfg == nil {
-		return Creds{}, errors.New("catalogwriter: lakekeeper response had no config block")
+		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
+		return nil, errors.New("catalogwriter: lakekeeper response had no config block")
 	}
 
-	c := Creds{
-		AccessKeyID:     cfg["s3.access-key-id"],
-		SecretAccessKey: cfg["s3.secret-access-key"],
-		SessionToken:    cfg["s3.session-token"],
-		Region:          cfg["s3.region"],
-		Endpoint:        cfg["s3.endpoint"],
-		IssuedAt:        v.now(),
+	c, err := parseCreds(cfg, v.ExpectedCredsType)
+	if err != nil {
+		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
+		return nil, fmt.Errorf("catalogwriter: %w", err)
 	}
-	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
-		return Creds{}, errors.New("catalogwriter: lakekeeper config block missing s3 access key fields")
-	}
-
-	// Compute ExpiresAt from `s3.expires-at-ms` (epoch ms) if present;
-	// fall back to a 15-min default TTL matching lakekeeper's documented
-	// STS lifetime. The wire shape is lakekeeper-implementation-defined,
-	// so accept either form to stay forward-compatible with future
-	// lakekeeper versions. Bogus / pathological values (parse error,
-	// non-positive, > 24h) silently fall back to the 15-min default
-	// rather than poison the cache.
-	if expMs := cfg["s3.expires-at-ms"]; expMs != "" {
-		if t, perr := parseEpochMillis(expMs); perr == nil {
-			c.ExpiresAt = t
-		}
-	}
-	if c.ExpiresAt.IsZero() {
-		if ttlSec := cfg["s3.session-ttl-seconds"]; ttlSec != "" {
-			if d, perr := time.ParseDuration(ttlSec + "s"); perr == nil && d > 0 && d < 24*time.Hour {
-				c.ExpiresAt = c.IssuedAt.Add(d)
+	// parseCreds returns a Creds with absolute Expires when the response
+	// carried an epoch-ms claim; otherwise Expires is zero. VendedCreds
+	// re-stamps Issued and the TTL fallback here so the renewal logic
+	// uses a single clock source (v.now), which is what tests use to
+	// drive deterministic renewal cadences.
+	switch x := c.(type) {
+	case S3Creds:
+		x.Issued = v.now()
+		if x.Expires.IsZero() {
+			// Relative TTL preserved via raw value; convert here with v.now().
+			if ttlSec := readString(cfg, "s3.session-ttl-seconds"); ttlSec != "" {
+				if d, perr := time.ParseDuration(ttlSec + "s"); perr == nil && d > 0 && d < 24*time.Hour {
+					x.Expires = x.Issued.Add(d)
+				}
 			}
 		}
+		if x.Expires.IsZero() {
+			x.Expires = x.Issued.Add(15 * time.Minute)
+		}
+		c = x
+	case GCSCreds:
+		x.Issued = v.now()
+		if x.Expires.IsZero() {
+			x.Expires = x.Issued.Add(15 * time.Minute)
+		}
+		c = x
 	}
-	if c.ExpiresAt.IsZero() {
-		c.ExpiresAt = c.IssuedAt.Add(15 * time.Minute)
-	}
-
+	credsRefreshTotal.WithLabelValues(string(c.Type())).Inc()
 	return c, nil
+}
+
+// parseCreds extracts a Creds value from a lakekeeper loadTable response's
+// "config" block. expected tells the parser which credential family it
+// should see — any mismatch (wrong family, mixed families, or no
+// recognized keys) fails closed. See RFC 019 §4.2.
+func parseCreds(cfg map[string]any, expected CredsType) (Creds, error) {
+	hasS3 := cfg["s3.access-key-id"] != nil
+	hasGCS := cfg["gcs.oauth2.token"] != nil
+
+	if hasS3 && hasGCS {
+		return nil, fmt.Errorf("lakekeeper response has BOTH s3.* and gcs.oauth2.* credential keys " +
+			"— refusing ambiguous response (possible confused deputy / response tampering)")
+	}
+	switch expected {
+	case CredsTypeS3:
+		if hasGCS {
+			return nil, fmt.Errorf("expected s3 credentials but lakekeeper returned gcs.oauth2.* keys (warehouse/backend mismatch)")
+		}
+		if !hasS3 {
+			return nil, fmt.Errorf("lakekeeper response missing s3.access-key-id")
+		}
+		return parseS3Creds(cfg)
+	case CredsTypeGCS:
+		if hasS3 {
+			return nil, fmt.Errorf("expected gcs credentials but lakekeeper returned s3.* keys (warehouse/backend mismatch)")
+		}
+		if !hasGCS {
+			return nil, fmt.Errorf("lakekeeper response missing gcs.oauth2.token")
+		}
+		return parseGCSCreds(cfg)
+	default:
+		return nil, fmt.Errorf("VendedCreds.ExpectedCredsType is unset or unsupported (%q); callers must set it to CredsTypeS3 or CredsTypeGCS", expected)
+	}
+}
+
+// parseS3Creds extracts an S3Creds from a lakekeeper response's config
+// block. Caller must have already verified the s3.* family is the
+// expected one (parseCreds handles this dispatch).
+//
+// Only the absolute-epoch-ms expiry path is set here. The relative
+// `s3.session-ttl-seconds` form requires a clock source for `now`, so
+// it is applied in VendedCreds.fetch where v.now() is available; this
+// keeps parseS3Creds pure / clock-free and testable in isolation.
+func parseS3Creds(cfg map[string]any) (Creds, error) {
+	c := S3Creds{
+		AccessKeyID:     readString(cfg, "s3.access-key-id"),
+		SecretAccessKey: readString(cfg, "s3.secret-access-key"),
+		SessionToken:    readString(cfg, "s3.session-token"),
+		Region:          readString(cfg, "s3.region"),
+		Endpoint:        readString(cfg, "s3.endpoint"),
+	}
+	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
+		return nil, errors.New("lakekeeper config block missing s3 access key fields")
+	}
+	if t, ok := readMillis(cfg, "s3.expires-at-ms"); ok {
+		c.Expires = t
+	}
+	return c, nil
+}
+
+// readString pulls a string value from an unmarshalled JSON map. Missing
+// or wrong-type values yield "".
+func readString(cfg map[string]any, key string) string {
+	if v, ok := cfg[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// readMillis pulls an epoch-millisecond value from an unmarshalled JSON
+// map, accepting either a JSON number (float64 after unmarshal) or a
+// decimal string. Returns (time.Time, ok). ok=false on missing /
+// wrong-type / non-positive values — the caller is expected to fall
+// back to a default TTL.
+func readMillis(cfg map[string]any, key string) (time.Time, bool) {
+	raw, present := cfg[key]
+	if !present {
+		return time.Time{}, false
+	}
+	var ms int64
+	switch x := raw.(type) {
+	case float64:
+		if x <= 0 {
+			return time.Time{}, false
+		}
+		ms = int64(x)
+	case json.Number:
+		n, err := x.Int64()
+		if err != nil || n <= 0 {
+			return time.Time{}, false
+		}
+		ms = n
+	case string:
+		t, err := parseEpochMillis(x)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return t, true
+	default:
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
 
 // discoverPrefix queries lakekeeper's `/v1/config?warehouse=<name>` and
@@ -458,10 +557,39 @@ func (v *VendedCreds) discoverPrefix(ctx context.Context, base, jwt, warehouse s
 // keeper is unlikely to echo the request's bearer token but defensive
 // scrubbing here keeps a misconfigured backend from leaking secrets
 // into operator logs.
-var bearerPattern = regexp.MustCompile(`Bearer [A-Za-z0-9_\-.]+`)
+var bearerPattern = regexp.MustCompile(`Bearer [^\s"'}]+`)
+
+// ya29Pattern matches GCP OAuth2 access tokens (e.g. those returned
+// by metadata-server / STS exchanges). Real tokens are ~140 chars of
+// base64-url-safe content after the `ya29.` prefix; we accept any
+// non-empty trailing run so partial / truncated tokens still get
+// scrubbed.
+var ya29Pattern = regexp.MustCompile(`ya29\.[A-Za-z0-9_\-+/]+`)
+
+// jwtPattern matches bare JWTs that appear outside a `Bearer ` prefix —
+// for example, token values echoed back in lakekeeper error JSON. The
+// three-segment `eyJ…` structure is distinctive enough that false
+// positives are negligible. Applied after bearerPattern so a
+// Bearer-prefixed JWT becomes `Bearer [REDACTED]` and the standalone
+// pattern never has to match it.
+var jwtPattern = regexp.MustCompile(`eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+`)
+
+// awsSigPattern matches X-Amz-* signed-URL query parameters (e.g.
+// X-Amz-Security-Token, X-Amz-Signature) that appear when an S3
+// pre-signed URL is logged in an error body. The parameter name is
+// preserved; only the value is redacted.
+var awsSigPattern = regexp.MustCompile(`X-Amz-[A-Za-z0-9\-]+=[^&\s"'}]+`)
+
+// gcsSigPattern matches any `X-Goog-<word>=<value>` query parameter,
+// covering signed-URL fields like `X-Goog-Signature`, `X-Goog-
+// Credential`, `X-Goog-Date`, etc. Redaction is intentionally broad:
+// if any one of these leaks alongside a signature, the URL can be
+// replayed, so we strip the entire X-Goog-* surface.
+var gcsSigPattern = regexp.MustCompile(`X-Goog-[A-Za-z0-9\-]+=[^&\s"}]+`)
 
 // scrubBody truncates b to a sane length and redacts anything that
-// looks like a bearer token. Used as the body interpolation in
+// looks like a bearer token, a GCP OAuth access token, or a GCS
+// signed-URL parameter value. Used as the body interpolation in
 // lakekeeper-error messages.
 func scrubBody(b []byte) string {
 	const max = 256
@@ -469,7 +597,26 @@ func scrubBody(b []byte) string {
 	if len(s) > max {
 		s = s[:max] + "..."
 	}
-	return bearerPattern.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = bearerPattern.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = jwtPattern.ReplaceAllString(s, "<redacted-jwt>")
+	s = ya29Pattern.ReplaceAllString(s, "<redacted-oauth2-token>")
+	s = gcsSigPattern.ReplaceAllStringFunc(s, func(m string) string {
+		// Keep the param name; redact the value.
+		eq := strings.IndexByte(m, '=')
+		if eq < 0 {
+			return "<redacted>"
+		}
+		return m[:eq+1] + "<redacted>"
+	})
+	s = awsSigPattern.ReplaceAllStringFunc(s, func(m string) string {
+		// Keep the param name; redact the value.
+		eq := strings.IndexByte(m, '=')
+		if eq < 0 {
+			return "<redacted>"
+		}
+		return m[:eq+1] + "<redacted>"
+	})
+	return s
 }
 
 // parseEpochMillis converts a decimal epoch-ms string into a time.Time.
@@ -487,4 +634,39 @@ func parseEpochMillis(s string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("non-positive epoch ms: %d", ms)
 	}
 	return time.UnixMilli(ms), nil
+}
+
+// parseGCSCreds extracts a GCSCreds from a lakekeeper response's config
+// block. See RFC 019 §4.2 for the key family. The returned GCSCreds
+// carries an OAuth bearer in OAuthToken — GCSCreds.String() redacts it,
+// so default fmt verbs (%v / %+v / %s) are safe. RFC 019 §4.10.
+//
+// TTL fallback chain (first non-zero wins):
+//  1. gcs.oauth2.token-expires-at (epoch-ms — the canonical key)
+//  2. creds.expiration-time-ms    (legacy lakekeeper schema)
+//  3. (nothing — Expires left zero; VendedCreds.fetch applies the
+//     15-min default via v.now(), same pattern as parseS3Creds)
+//
+// Issued is left zero; VendedCreds.fetch re-stamps it using its clock
+// source. Expires left zero in the fallback; VendedCreds.fetch applies
+// the 15-min default via v.now() — clock-source consistency with
+// parseS3Creds, avoids fake-clock skew in tests.
+func parseGCSCreds(cfg map[string]any) (Creds, error) {
+	tok := readString(cfg, "gcs.oauth2.token")
+	if tok == "" {
+		return nil, errors.New("missing gcs.oauth2.token")
+	}
+	c := GCSCreds{
+		OAuthToken:      tok,
+		GCPProjectID:    readString(cfg, "gcs.project-id"),
+		RefreshEndpoint: readString(cfg, "gcs.oauth2.refresh-credentials-endpoint"),
+	}
+	if exp, ok := readMillis(cfg, "gcs.oauth2.token-expires-at"); ok {
+		c.Expires = exp
+	} else if exp, ok := readMillis(cfg, "creds.expiration-time-ms"); ok {
+		c.Expires = exp
+	}
+	// (Else: leave c.Expires zero. VendedCreds.fetch applies the 15-minute
+	//  default via v.now() — same pattern as parseS3Creds.)
+	return c, nil
 }

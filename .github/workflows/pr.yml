@@ -39,6 +39,16 @@ jobs:
       - name: go test
         run: go test -count=1 ./...
 
+      - name: go test (integration — GCS backend + datupleticeio)
+        # Validates pkg/datagateway/backend/gcs.go + pkg/datupleticeio
+        # against fsouza/fake-gcs-server via testcontainers. Docker is
+        # available on ubuntu-latest runners by default; no extra setup.
+        # See RFC 019 §B.3-B.4 for what this covers.
+        run: |
+          go test -tags=integration -count=1 -timeout 10m \
+            ./pkg/datagateway/backend/... \
+            ./pkg/datupleticeio/...
+
   helm:
     name: helm lint + template
     runs-on: ubuntu-latest

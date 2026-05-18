@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeClock is a tick-driven time source for the renewal-cadence
@@ -74,20 +77,25 @@ func TestVendedCreds_FifteenMinuteTTL(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok-15m", nil },
 		Now:           clk.Now,
 	}
 
 	ctx := context.Background()
-	c1, err := v.Get(ctx)
+	got1, err := v.Get(ctx)
 	if err != nil {
 		t.Fatalf("first Get: %v", err)
 	}
+	c1, ok := got1.(S3Creds)
+	if !ok {
+		t.Fatalf("expected S3Creds, got %T", got1)
+	}
 	if c1.AccessKeyID == "" {
-		t.Fatalf("creds missing keys: %+v", c1)
+		t.Fatalf("creds missing keys: access-key-id=%q region=%q", c1.AccessKeyID, c1.Region)
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("after first Get hits=%d want 1", got)
@@ -104,9 +112,13 @@ func TestVendedCreds_FifteenMinuteTTL(t *testing.T) {
 
 	// Cross the 7m30s threshold → renew.
 	clk.Advance(2 * time.Second) // now 7m31s
-	c2, err := v.Get(ctx)
+	got2, err := v.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get at 7m31: %v", err)
+	}
+	c2, ok := got2.(S3Creds)
+	if !ok {
+		t.Fatalf("expected S3Creds, got %T", got2)
 	}
 	if got := hits.Load(); got != 2 {
 		t.Fatalf("at 7m31 hits=%d want 2", got)
@@ -126,9 +138,10 @@ func TestVendedCreds_FiveMinuteTTL(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 		Now:           clk.Now,
 	}
@@ -171,9 +184,10 @@ func TestVendedCreds_FloorBlocksPathologicalTTL(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 		Now:           clk.Now,
 	}
@@ -244,9 +258,10 @@ func TestVendedCreds_RenewalFailureSurfacesAfterExpiry(t *testing.T) {
 	clk.Set(time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 		Now:           clk.Now,
 	}
@@ -264,12 +279,16 @@ func TestVendedCreds_RenewalFailureSurfacesAfterExpiry(t *testing.T) {
 	// before the 2-min TTL expires. Renewal fails, but the cached
 	// value is still valid → callers see the cached creds.
 	clk.Advance(70 * time.Second)
-	c, err := v.Get(ctx)
+	got, err := v.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get at 70s after lakekeeper down (expected stale-but-OK): %v", err)
 	}
+	c, ok := got.(S3Creds)
+	if !ok {
+		t.Fatalf("expected S3Creds, got %T", got)
+	}
 	if c.AccessKeyID != "AKIA" {
-		t.Fatalf("expected stale cached creds, got %+v", c)
+		t.Fatalf("expected stale cached creds: access-key-id=%q (want %q)", c.AccessKeyID, "AKIA")
 	}
 	if v.LastError() == nil {
 		t.Fatalf("LastError should be set after a failed fetch")
@@ -294,9 +313,10 @@ func TestVendedCreds_TokenProviderError(t *testing.T) {
 	defer srv.Close()
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) {
 			return "", errors.New("read run token: not found")
 		},
@@ -313,9 +333,10 @@ func TestVendedCreds_ConcurrentGet(t *testing.T) {
 	t.Parallel()
 	srv, hits := stubLakekeeper(t, 600, "")
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 	}
 	ctx := context.Background()
@@ -372,9 +393,10 @@ func TestVendedCreds_ConcurrentGetWithHungFetch(t *testing.T) {
 	defer srv.Close()
 
 	v := &VendedCreds{
-		LakekeeperURL: srv.URL,
-		Namespace:     "public",
-		Table:         "events",
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
 		TokenProvider: func(context.Context) (string, error) { return "tok", nil },
 	}
 
@@ -409,5 +431,414 @@ func TestVendedCreds_ConcurrentGetWithHungFetch(t *testing.T) {
 
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("expected exactly 1 backend hit (all queued behind fetchDone), got %d", got)
+	}
+}
+
+// TestParseCredsRejectsMixed asserts the confused-deputy fail-closed:
+// a response that carries BOTH s3.* and gcs.oauth2.* keys is ambiguous
+// and must be rejected regardless of ExpectedCredsType.
+func TestParseCredsRejectsMixed(t *testing.T) {
+	cfg := map[string]any{
+		"s3.access-key-id": "AKIA...",
+		"gcs.oauth2.token": "ya29...",
+	}
+	_, err := parseCreds(cfg, CredsTypeS3)
+	if err == nil || !strings.Contains(err.Error(), "BOTH s3.* and gcs.oauth2.*") {
+		t.Fatalf("expected mixed-family rejection, got %v", err)
+	}
+}
+
+// TestParseCredsRejectsWrongFamily asserts a warehouse/backend mismatch
+// (backend resolver said "S3" but lakekeeper returned gcs keys) fails
+// closed with a clear diagnostic.
+func TestParseCredsRejectsWrongFamily(t *testing.T) {
+	cfg := map[string]any{"gcs.oauth2.token": "ya29..."}
+	_, err := parseCreds(cfg, CredsTypeS3)
+	if err == nil || !strings.Contains(err.Error(), "expected s3 credentials but lakekeeper returned gcs") {
+		t.Fatalf("expected wrong-family rejection, got %v", err)
+	}
+}
+
+// TestParseCredsRejectsMixedGCSExpected asserts the confused-deputy
+// fail-closed when ExpectedCredsType=GCS but the response has BOTH
+// s3.* and gcs.oauth2.* keys.
+func TestParseCredsRejectsMixedGCSExpected(t *testing.T) {
+	cfg := map[string]any{
+		"s3.access-key-id": "AKIA...",
+		"gcs.oauth2.token": "ya29...",
+	}
+	_, err := parseCreds(cfg, CredsTypeGCS)
+	if err == nil || !strings.Contains(err.Error(), "BOTH s3.* and gcs.oauth2.*") {
+		t.Fatalf("expected mixed-family rejection, got %v", err)
+	}
+}
+
+// TestParseCredsRejectsWrongFamilyGCSExpected asserts that an S3-only
+// response is rejected when ExpectedCredsType=GCS.
+func TestParseCredsRejectsWrongFamilyGCSExpected(t *testing.T) {
+	cfg := map[string]any{"s3.access-key-id": "AKIA", "s3.secret-access-key": "secret"}
+	_, err := parseCreds(cfg, CredsTypeGCS)
+	if err == nil || !strings.Contains(err.Error(), "expected gcs credentials but lakekeeper returned s3") {
+		t.Fatalf("expected wrong-family rejection, got %v", err)
+	}
+}
+
+// TestParseCredsRejectsEmpty: an empty config block must not silently
+// produce a zero-value Creds.
+func TestParseCredsRejectsEmpty(t *testing.T) {
+	_, err := parseCreds(map[string]any{}, CredsTypeS3)
+	if err == nil {
+		t.Fatal("expected error on empty cfg")
+	}
+}
+
+// TestParseCredsHappyPathS3 covers the happy path for S3 family.
+func TestParseCredsHappyPathS3(t *testing.T) {
+	cfg := map[string]any{
+		"s3.access-key-id":     "AKIA",
+		"s3.secret-access-key": "secret",
+		"s3.region":            "us-east-1",
+		"s3.endpoint":          "https://s3.example.com",
+		"s3.session-token":     "session",
+	}
+	got, err := parseCreds(cfg, CredsTypeS3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type() != CredsTypeS3 {
+		t.Fatalf("Type() = %q, want s3", got.Type())
+	}
+}
+
+// TestParseCredsUnsetExpectedRejects: a VendedCreds that forgot to set
+// ExpectedCredsType (zero value) must be rejected — this is the
+// mandatory-field guard.
+func TestParseCredsUnsetExpectedRejects(t *testing.T) {
+	cfg := map[string]any{"s3.access-key-id": "AKIA"}
+	_, err := parseCreds(cfg, "")
+	if err == nil || !strings.Contains(err.Error(), "ExpectedCredsType") {
+		t.Fatalf("expected unset-expected rejection, got %v", err)
+	}
+}
+
+// TestParseGCSCredsHappyPath covers all four GCS fields plus the
+// absolute-epoch-ms expiry path.
+func TestParseGCSCredsHappyPath(t *testing.T) {
+	now := time.Now()
+	cfg := map[string]any{
+		"gcs.oauth2.token":                        "ya29.AAA",
+		"gcs.project-id":                          "kacurez-labs",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lk/refresh",
+		"gcs.oauth2.token-expires-at":             float64(now.Add(20 * time.Minute).UnixMilli()),
+	}
+	got, err := parseGCSCreds(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gc, ok := got.(GCSCreds)
+	if !ok {
+		t.Fatalf("expected GCSCreds, got %T", got)
+	}
+	if gc.OAuthToken != "ya29.AAA" {
+		t.Fatalf("OAuthToken = %q", gc.OAuthToken)
+	}
+	if gc.GCPProjectID != "kacurez-labs" {
+		t.Fatalf("GCPProjectID = %q", gc.GCPProjectID)
+	}
+	if gc.RefreshEndpoint != "https://lk/refresh" {
+		t.Fatalf("RefreshEndpoint = %q", gc.RefreshEndpoint)
+	}
+	if gc.ExpiresAt().Before(now.Add(15 * time.Minute)) {
+		t.Fatalf("Expires = %v, want >= now+15m", gc.ExpiresAt())
+	}
+}
+
+// TestParseGCSCredsMissingTokenRejects: the OAuth token is mandatory.
+func TestParseGCSCredsMissingTokenRejects(t *testing.T) {
+	cfg := map[string]any{"gcs.project-id": "x"}
+	_, err := parseGCSCreds(cfg)
+	if err == nil || !strings.Contains(err.Error(), "missing gcs.oauth2.token") {
+		t.Fatalf("expected missing-token error, got %v", err)
+	}
+}
+
+// TestParseGCSCredsFallbackExpiry: when no expiry hint is present,
+// parseGCSCreds intentionally leaves Expires zero — VendedCreds.fetch
+// applies the 15-min default via v.now(), same pattern as parseS3Creds.
+func TestParseGCSCredsFallbackExpiry(t *testing.T) {
+	cfg := map[string]any{"gcs.oauth2.token": "ya29.AAA"}
+	got, err := parseGCSCreds(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// parseGCSCreds intentionally leaves Expires zero when no expiry key
+	// is present — VendedCreds.fetch applies the 15-min default via v.now().
+	// Mirror parseS3Creds's behavior.
+	if !got.ExpiresAt().IsZero() {
+		t.Fatalf("ExpiresAt = %v, want zero (fetch fills it in)", got.ExpiresAt())
+	}
+}
+
+// TestParseGCSCredsCredsExpirationMsFallback covers the secondary
+// expiry key path (`creds.expiration-time-ms`) used when lakekeeper
+// emits the older schema.
+func TestParseGCSCredsCredsExpirationMsFallback(t *testing.T) {
+	target := time.Now().Add(20 * time.Minute)
+	cfg := map[string]any{
+		"gcs.oauth2.token":         "ya29.AAA",
+		"creds.expiration-time-ms": float64(target.UnixMilli()),
+	}
+	got, err := parseGCSCreds(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should be within a few seconds of the target (we accept any
+	// non-zero value within the 15-min default window).
+	diff := got.ExpiresAt().Sub(target)
+	if diff < -time.Second || diff > time.Second {
+		t.Fatalf("Expires = %v, want ~%v (diff %v)", got.ExpiresAt(), target, diff)
+	}
+}
+
+// TestParseCredsHappyPathGCS exercises the parseCreds GCS-family
+// dispatch end to end.
+func TestParseCredsHappyPathGCS(t *testing.T) {
+	cfg := map[string]any{
+		"gcs.oauth2.token": "ya29.AAA",
+		"gcs.project-id":   "kacurez-labs",
+	}
+	got, err := parseCreds(cfg, CredsTypeGCS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type() != CredsTypeGCS {
+		t.Fatalf("Type() = %q, want gcs", got.Type())
+	}
+}
+
+// TestScrubBodyRedactsYa29 verifies that GCP OAuth2 access tokens
+// (`ya29.*`) are redacted from error-body interpolation.
+func TestScrubBodyRedactsYa29(t *testing.T) {
+	in := `{"error":"401","reason":"token ya29.AAA-BBB_CCC expired"}`
+	out := scrubBody([]byte(in))
+	if strings.Contains(out, "ya29.AAA") {
+		t.Fatalf("ya29.* leaked: %s", out)
+	}
+}
+
+// TestScrubBodyRedactsSignedURLParams verifies that GCS signed-URL
+// parameter values (X-Goog-Signature, etc.) are redacted from
+// error-body interpolation.
+func TestScrubBodyRedactsSignedURLParams(t *testing.T) {
+	in := `https://storage.googleapis.com/b/k?X-Goog-Signature=DEAD%2BBEEF&X-Goog-Date=20260518T120000Z`
+	out := scrubBody([]byte(in))
+	if strings.Contains(out, "DEAD") {
+		t.Fatalf("X-Goog-Signature leaked: %s", out)
+	}
+}
+
+// TestScrubBodyKeepsBenignContent verifies that scrubBody does not
+// mangle bodies that contain no secrets.
+func TestScrubBodyKeepsBenignContent(t *testing.T) {
+	in := `{"ok":true,"region":"us-east-1"}`
+	out := scrubBody([]byte(in))
+	if out != in {
+		t.Fatalf("scrubBody mangled benign content: %s", out)
+	}
+}
+
+// TestScrubBodyRedactsBareJWT verifies that a JWT appearing without a
+// `Bearer ` prefix (e.g. in a lakekeeper error-body JSON field) is
+// replaced by `<redacted-jwt>`.
+func TestScrubBodyRedactsBareJWT(t *testing.T) {
+	in := []byte(`{"error":"invalid token: eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature_here"}`)
+	out := scrubBody(in)
+	if strings.Contains(out, "eyJhbGci") {
+		t.Fatalf("bare JWT leaked: %s", out)
+	}
+	if !strings.Contains(out, "<redacted-jwt>") {
+		t.Fatalf("expected jwt redaction marker, got: %s", out)
+	}
+}
+
+// TestScrubBodyRedactsAWSSignedURLParams verifies that X-Amz-* query
+// parameters (Security-Token, Signature, etc.) are redacted.
+func TestScrubBodyRedactsAWSSignedURLParams(t *testing.T) {
+	in := []byte(`X-Amz-Security-Token=IQoJb3JpZ2luX2Vj&X-Amz-Signature=ABCDEF`)
+	out := scrubBody(in)
+	if strings.Contains(out, "IQoJb3J") || strings.Contains(out, "ABCDEF") {
+		t.Fatalf("X-Amz-* leaked: %s", out)
+	}
+}
+
+// resetMetrics resets both creds-refresh counter-vecs between subtests so
+// that each subtest starts from a clean slate. It calls Reset() on both vecs,
+// which zeroes all label-series that have been observed so far. This is safe
+// because the counters are package-level vars in the same package.
+func resetMetrics() {
+	credsRefreshTotal.Reset()
+	credsRefreshFailuresTotal.Reset()
+}
+
+// TestCredsRefreshMetrics_SuccessCounterS3 asserts that a successful S3 fetch
+// increments datuplet_creds_refresh_total{type="s3"} exactly once.
+func TestCredsRefreshMetrics_SuccessCounterS3(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{
+			"config": map[string]string{
+				"s3.access-key-id":       "AKIA",
+				"s3.secret-access-key":   "secret",
+				"s3.session-token":       "session",
+				"s3.region":              "local-01",
+				"s3.endpoint":            "http://minio:9000",
+				"s3.session-ttl-seconds": "900",
+			},
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	got := testutil.ToFloat64(credsRefreshTotal.WithLabelValues("s3"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_total{type=s3} = %v, want 1", got)
+	}
+	// Failure counter must not have been touched.
+	if n := testutil.CollectAndCount(credsRefreshFailuresTotal); n != 0 {
+		t.Errorf("datuplet_creds_refresh_failures_total unexpected series count = %d, want 0", n)
+	}
+}
+
+// TestCredsRefreshMetrics_SuccessCounterGCS asserts that a successful GCS fetch
+// increments datuplet_creds_refresh_total{type="gcs"} exactly once.
+func TestCredsRefreshMetrics_SuccessCounterGCS(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{
+			"config": map[string]string{
+				"gcs.oauth2.token": "ya29.AAA",
+				"gcs.project-id":  "test-project",
+			},
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeGCS,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	got := testutil.ToFloat64(credsRefreshTotal.WithLabelValues("gcs"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_total{type=gcs} = %v, want 1", got)
+	}
+}
+
+// TestCredsRefreshMetrics_HttpFailure asserts that an HTTP 500 from lakekeeper
+// increments datuplet_creds_refresh_failures_total{type="s3",reason="http"}.
+func TestCredsRefreshMetrics_HttpFailure(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"down"}`))
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err == nil {
+		t.Fatal("expected error from 500 response, got nil")
+	}
+
+	got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "http"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_failures_total{type=s3,reason=http} = %v, want 1", got)
+	}
+	// Success counter must not have been touched.
+	if n := testutil.CollectAndCount(credsRefreshTotal); n != 0 {
+		t.Errorf("datuplet_creds_refresh_total unexpected series count = %d, want 0", n)
+	}
+}
+
+// TestCredsRefreshMetrics_TokenProviderFailure asserts that a TokenProvider
+// error increments datuplet_creds_refresh_failures_total{type="s3",reason="token_provider"}.
+func TestCredsRefreshMetrics_TokenProviderFailure(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("HTTP server should not be called when TokenProvider fails")
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider: func(context.Context) (string, error) {
+			return "", errors.New("token not found")
+		},
+	}
+	if _, err := v.Get(context.Background()); err == nil {
+		t.Fatal("expected error from failing TokenProvider, got nil")
+	}
+
+	got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "token_provider"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_failures_total{type=s3,reason=token_provider} = %v, want 1", got)
+	}
+}
+
+// TestCredsRefreshMetrics_ParseFailure asserts that a malformed JSON response
+// increments datuplet_creds_refresh_failures_total{type="s3",reason="parse"}.
+func TestCredsRefreshMetrics_ParseFailure(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Return valid JSON but with no config block so parseCreds rejects it.
+		_, _ = w.Write([]byte(`{"metadata":{}}`))
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	if _, err := v.Get(context.Background()); err == nil {
+		t.Fatal("expected error from no-config response, got nil")
+	}
+
+	got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "parse"))
+	if got != 1 {
+		t.Errorf("datuplet_creds_refresh_failures_total{type=s3,reason=parse} = %v, want 1", got)
 	}
 }

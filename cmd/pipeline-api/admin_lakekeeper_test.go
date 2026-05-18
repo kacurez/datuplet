@@ -79,6 +79,7 @@ func TestBuildWarehouseBody_GCS(t *testing.T) {
 			Bucket:                "my-gcs-bucket",
 			KeyPrefix:             "datuplet",
 			StsEnabled:            true,
+			CredentialType:        "service-account-key",
 			ServiceAccountKeyJSON: saKeyJSON,
 		},
 	})
@@ -128,6 +129,7 @@ func TestBuildWarehouseBody_GCS_InvalidJSON(t *testing.T) {
 		Type:          "gcs",
 		GCS: &gcsSpec{
 			Bucket:                "b",
+			CredentialType:        "service-account-key",
 			ServiceAccountKeyJSON: "not-valid-json",
 		},
 	})
@@ -193,6 +195,95 @@ func TestServerAdminTupleWrite(t *testing.T) {
 	if !strings.Contains(writeBody, `"user":"user:oidc~admin"`) ||
 		!strings.Contains(writeBody, `"object":"server:abc-123-def-456-789a-bcdef0123456"`) {
 		t.Fatalf("expected tuple write, got: %s", writeBody)
+	}
+}
+
+// TestBuildWarehouseBodySystemIdentity and TestBuildWarehouseBodyServiceAccountKey
+// verify the system-identity and service-account-key branches of buildWarehouseBody.
+
+func TestBuildWarehouseBodySystemIdentity(t *testing.T) {
+	spec := warehouseSpec{
+		WarehouseName:       "test",
+		LakekeeperProjectID: "00000000-0000-0000-0000-000000000000",
+		Type:                "gcs",
+		GCS:                 &gcsSpec{Bucket: "b", CredentialType: "system-identity"},
+	}
+	body, err := buildWarehouseBody(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := body["storage-credential"].(map[string]any)
+	if cred["credential-type"] != "gcp-system-identity" {
+		t.Fatalf("credential-type = %q, want gcp-system-identity", cred["credential-type"])
+	}
+	if _, hasKey := cred["key"]; hasKey {
+		t.Fatal("system-identity body must NOT carry a key field")
+	}
+}
+
+func TestBuildWarehouseBodyServiceAccountKey(t *testing.T) {
+	spec := warehouseSpec{
+		WarehouseName:       "test",
+		LakekeeperProjectID: "00000000-0000-0000-0000-000000000000",
+		Type:                "gcs",
+		GCS: &gcsSpec{
+			Bucket:                "b",
+			CredentialType:        "service-account-key",
+			ServiceAccountKeyJSON: `{"type":"service_account","project_id":"x"}`,
+		},
+	}
+	body, err := buildWarehouseBody(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := body["storage-credential"].(map[string]any)
+	if cred["credential-type"] != "service-account-key" {
+		t.Fatalf("credential-type = %q", cred["credential-type"])
+	}
+	if _, hasKey := cred["key"]; !hasKey {
+		t.Fatal("SA-key body must carry a key field")
+	}
+}
+
+// TestGCSSpec* tests exercise gcsSpec.Validate() — mutual-exclusion and unknown
+// credential type cases.
+
+func TestGCSSpecValidateSystemIdentityDefault(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: ""}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("default (system-identity) happy path: %v", err)
+	}
+}
+
+func TestGCSSpecValidateSystemIdentityExplicit(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: "system-identity"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("system-identity happy path: %v", err)
+	}
+	s.ServiceAccountKeyJSON = "{...}"
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined with --gcs-sa-key-file") {
+		t.Fatalf("expected mutual-exclusion error, got %v", err)
+	}
+}
+
+func TestGCSSpecValidateServiceAccountKey(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: "service-account-key", ServiceAccountKeyJSON: ""}
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "--gcs-sa-key-file") {
+		t.Fatalf("expected SA-key-file required error, got %v", err)
+	}
+	s.ServiceAccountKeyJSON = "{...}"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("with key set: %v", err)
+	}
+}
+
+func TestGCSSpecValidateUnknownType(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: "passport"}
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "unknown --gcs-credential-type") {
+		t.Fatalf("expected unknown-type error, got %v", err)
 	}
 }
 
