@@ -96,9 +96,28 @@ type vendedTokenSource struct {
 // Compile-time assertion that vendedTokenSource satisfies oauth2.TokenSource.
 var _ oauth2.TokenSource = (*vendedTokenSource)(nil)
 
-// Token is implemented in Slice B.2. The stub keeps the package compilable
-// while B.1 lands the scaffold; B.2 replaces this body with the real
-// type-switched implementation + tests.
+// Token fetches the current vended creds, asserts they're GCSCreds, and
+// returns an *oauth2.Token suitable for the storage client. The
+// type-assertion is the load-bearing safety check: even though
+// NewGCSBackendWithProvider validates ExpectedCredsType up front, this
+// runtime check defends against a misconfigured/poisoned VendedCreds that
+// somehow returns the wrong family — fail closed, never hand a non-GCS
+// secret to the GCS client.
+//
+// Redaction: the wrong-type error formats %T (type-only); never %v / %+v
+// — formatting the Creds value would leak the bearer. See RFC 019 §4.10.
 func (t *vendedTokenSource) Token() (*oauth2.Token, error) {
-	return nil, fmt.Errorf("vendedTokenSource.Token: not implemented (Slice B.2)")
+	c, err := t.vc.Get(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	gc, ok := c.(catalogwriter.GCSCreds)
+	if !ok {
+		return nil, fmt.Errorf("vendedTokenSource: expected GCSCreds, got %T", c)
+	}
+	return &oauth2.Token{
+		AccessToken: gc.OAuthToken,
+		Expiry:      gc.ExpiresAt(),
+		TokenType:   "Bearer",
+	}, nil
 }
