@@ -116,9 +116,13 @@ func NewMinIOBackendWithProvider(cfg MinIOProviderConfig) (*MinIOBackend, error)
 	// modest deadline so a hung lakekeeper doesn't block boot forever
 	// — VendedCreds itself enforces its own 30s default per request,
 	// and our caller can override the HTTPClient if needed.
-	primed, err := cfg.VendedCreds.Get(context.Background())
+	primedAny, err := cfg.VendedCreds.Get(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("prime vended creds: %w", err)
+	}
+	primed, ok := primedAny.(catalogwriter.S3Creds)
+	if !ok {
+		return nil, fmt.Errorf("vended creds: expected S3Creds, got %T (MinIO backend requires s3-family credentials)", primedAny)
 	}
 	if primed.Endpoint == "" {
 		return nil, fmt.Errorf("vended creds had empty endpoint; lakekeeper config likely missing s3.endpoint")
@@ -182,9 +186,13 @@ func (p *vendedCredsProvider) Retrieve() (credentials.Value, error) {
 // carries its own per-call timeout — that's the bound on a hung
 // lakekeeper for now.
 func (p *vendedCredsProvider) RetrieveWithCredContext(_ *credentials.CredContext) (credentials.Value, error) {
-	c, err := p.vc.Get(context.Background())
+	got, err := p.vc.Get(context.Background())
 	if err != nil {
 		return credentials.Value{}, err
+	}
+	c, ok := got.(catalogwriter.S3Creds)
+	if !ok {
+		return credentials.Value{}, fmt.Errorf("vended creds: expected S3Creds, got %T", got)
 	}
 	return credentials.Value{
 		AccessKeyID:     c.AccessKeyID,

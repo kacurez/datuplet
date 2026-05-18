@@ -82,9 +82,13 @@ func TestVendedCreds_FifteenMinuteTTL(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	c1, err := v.Get(ctx)
+	got1, err := v.Get(ctx)
 	if err != nil {
 		t.Fatalf("first Get: %v", err)
+	}
+	c1, ok := got1.(S3Creds)
+	if !ok {
+		t.Fatalf("expected S3Creds, got %T", got1)
 	}
 	if c1.AccessKeyID == "" {
 		t.Fatalf("creds missing keys: %+v", c1)
@@ -104,9 +108,13 @@ func TestVendedCreds_FifteenMinuteTTL(t *testing.T) {
 
 	// Cross the 7m30s threshold → renew.
 	clk.Advance(2 * time.Second) // now 7m31s
-	c2, err := v.Get(ctx)
+	got2, err := v.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get at 7m31: %v", err)
+	}
+	c2, ok := got2.(S3Creds)
+	if !ok {
+		t.Fatalf("expected S3Creds, got %T", got2)
 	}
 	if got := hits.Load(); got != 2 {
 		t.Fatalf("at 7m31 hits=%d want 2", got)
@@ -264,9 +272,13 @@ func TestVendedCreds_RenewalFailureSurfacesAfterExpiry(t *testing.T) {
 	// before the 2-min TTL expires. Renewal fails, but the cached
 	// value is still valid → callers see the cached creds.
 	clk.Advance(70 * time.Second)
-	c, err := v.Get(ctx)
+	got, err := v.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get at 70s after lakekeeper down (expected stale-but-OK): %v", err)
+	}
+	c, ok := got.(S3Creds)
+	if !ok {
+		t.Fatalf("expected S3Creds, got %T", got)
 	}
 	if c.AccessKeyID != "AKIA" {
 		t.Fatalf("expected stale cached creds, got %+v", c)

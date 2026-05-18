@@ -44,35 +44,6 @@ const defaultHTTPTimeout = 30 * time.Second
 //     so the actual cadence falls back to "every 60s".
 const DefaultRenewalFraction = 0.5
 
-// Creds is the immutable subset of an STS vended-credentials response
-// the rest of Datuplet cares about. Lifted from lakekeeper's
-// `GET /v1/{prefix}/namespaces/{ns}/tables/{tbl}` response, `config`
-// block.
-//
-// IssuedAt + ExpiresAt are absolute wall-clock times rather than a
-// duration so the cache's renewal logic doesn't drift if the host
-// clock jumps; ExpiresAt is computed from the response's `expires-at`
-// header / claim if present, falling back to IssuedAt + 15min (the
-// default STS TTL lakekeeper documents).
-type Creds struct {
-	AccessKeyID     string
-	SecretAccessKey string
-	SessionToken    string
-	Region          string
-	Endpoint        string
-	IssuedAt        time.Time
-	ExpiresAt       time.Time
-}
-
-// TTL is the duration between IssuedAt and ExpiresAt. Used by the
-// renewal-trigger calculation; not exposed to data-plane consumers.
-func (c Creds) TTL() time.Duration {
-	if c.IssuedAt.IsZero() || c.ExpiresAt.IsZero() {
-		return 0
-	}
-	return c.ExpiresAt.Sub(c.IssuedAt)
-}
-
 // VendedCreds caches a Creds value and refreshes it on demand from
 // lakekeeper. Safe for concurrent callers. The renewal contract:
 // renew when 50% of the issued TTL has elapsed, with a 60-second hard
@@ -117,8 +88,17 @@ type VendedCreds struct {
 	Now             func() time.Time
 	HTTPClient      *http.Client
 
+	// ExpectedCredsType is consulted by parseCreds to fail-closed on
+	// scheme mismatch. Set at construction time by the backend resolver
+	// (which knows the scheme from the table location). MANDATORY — a
+	// zero value causes parseCreds to return an error. Slice A wires
+	// this on every existing S3 call site at the same time the field is
+	// added, so there is no in-between window where callers can forget
+	// it. See RFC 019 §4.1.
+	ExpectedCredsType CredsType
+
 	mu        sync.Mutex
-	cached    *Creds
+	cached    Creds // interface — was *Creds (flat struct) before Slice A
 	lastErr   error
 	fetching  bool
 	fetchDone chan struct{} // closed when the in-flight fetch finishes; nil when not fetching
@@ -144,23 +124,28 @@ func (v *VendedCreds) fraction() float64 {
 // shouldRenew encodes the renewal contract: renew when 50% of the
 // issued TTL has elapsed, but never within MinRenewalInterval of the
 // last fetch. Returns true when c is nil (first-fetch).
-func (v *VendedCreds) shouldRenew(c *Creds) bool {
+func (v *VendedCreds) shouldRenew(c Creds) bool {
 	if c == nil {
 		return true
 	}
 	now := v.now()
-	if !c.ExpiresAt.IsZero() && !now.Before(c.ExpiresAt) {
+	exp := c.ExpiresAt()
+	if !exp.IsZero() && !now.Before(exp) {
 		// Already expired — must renew.
 		return true
 	}
-	ttl := c.TTL()
-	if ttl <= 0 {
+	issued := c.IssuedAt()
+	if issued.IsZero() || exp.IsZero() {
 		// No TTL info: be conservative; renew (and let the floor below
 		// throttle if the caller hammers Get repeatedly).
 		return true
 	}
+	ttl := exp.Sub(issued)
+	if ttl <= 0 {
+		return true
+	}
 	target := time.Duration(float64(ttl) * v.fraction())
-	elapsed := now.Sub(c.IssuedAt)
+	elapsed := now.Sub(issued)
 	if elapsed < MinRenewalInterval {
 		// Within the hard floor; defer.
 		return false
@@ -190,7 +175,7 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 		cur := v.cached
 		due := v.shouldRenew(cur)
 		if !due && cur != nil {
-			out := *cur
+			out := cur
 			v.mu.Unlock()
 			return out, nil
 		}
@@ -198,8 +183,8 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 			// Another goroutine is fetching. If we have an unexpired
 			// cache, return it; otherwise wait on fetchDone — closed
 			// when the in-flight fetch finishes (success or failure).
-			if cur != nil && !v.now().After(cur.ExpiresAt) {
-				out := *cur
+			if cur != nil && !v.now().After(cur.ExpiresAt()) {
+				out := cur
 				v.mu.Unlock()
 				return out, nil
 			}
@@ -211,14 +196,14 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 				// after a tiny pause so we don't spin.
 				select {
 				case <-ctx.Done():
-					return Creds{}, ctx.Err()
+					return nil, ctx.Err()
 				case <-time.After(time.Millisecond):
 				}
 				continue
 			}
 			select {
 			case <-ctx.Done():
-				return Creds{}, ctx.Err()
+				return nil, ctx.Err()
 			case <-done:
 			}
 			// In-flight fetch finished; loop to either consume the new
@@ -240,17 +225,17 @@ func (v *VendedCreds) Get(ctx context.Context) (Creds, error) {
 			// Keep stale-but-unexpired creds usable. If cache was empty
 			// or the cached value is past expiry, return the error so
 			// the data plane fails loudly on renewal failure.
-			if cur != nil && v.now().Before(cur.ExpiresAt) {
-				out := *cur
+			if cur != nil && v.now().Before(cur.ExpiresAt()) {
+				out := cur
 				v.mu.Unlock()
 				close(done)
 				return out, nil
 			}
 			v.mu.Unlock()
 			close(done)
-			return Creds{}, err
+			return nil, err
 		}
-		v.cached = &c
+		v.cached = c
 		v.lastErr = nil
 		out := c
 		v.mu.Unlock()
@@ -280,17 +265,17 @@ func (v *VendedCreds) LastError() error {
 // everything outside `config` for the purposes of this cache.
 func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	if v.LakekeeperURL == "" {
-		return Creds{}, errors.New("catalogwriter: LakekeeperURL is required")
+		return nil, errors.New("catalogwriter: LakekeeperURL is required")
 	}
 	if v.Namespace == "" || v.Table == "" {
-		return Creds{}, errors.New("catalogwriter: Namespace + Table are required")
+		return nil, errors.New("catalogwriter: Namespace + Table are required")
 	}
 	if v.TokenProvider == nil {
-		return Creds{}, errors.New("catalogwriter: TokenProvider is required")
+		return nil, errors.New("catalogwriter: TokenProvider is required")
 	}
 	tok, err := v.TokenProvider(ctx)
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: token provider: %w", err)
+		return nil, fmt.Errorf("catalogwriter: token provider: %w", err)
 	}
 
 	base := strings.TrimRight(v.LakekeeperURL, "/")
@@ -304,7 +289,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	if v.Prefix == "" && v.WarehouseName != "" {
 		discovered, derr := v.discoverPrefix(ctx, base, tok, v.WarehouseName)
 		if derr != nil {
-			return Creds{}, fmt.Errorf("catalogwriter: discover warehouse prefix: %w", derr)
+			return nil, fmt.Errorf("catalogwriter: discover warehouse prefix: %w", derr)
 		}
 		v.Prefix = discovered
 	}
@@ -317,7 +302,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: build request: %w", err)
+		return nil, fmt.Errorf("catalogwriter: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Accept", "application/json")
@@ -337,7 +322,7 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: lakekeeper GET: %w", err)
+		return nil, fmt.Errorf("catalogwriter: lakekeeper GET: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -345,36 +330,39 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	// can't OOM the data gateway with a multi-GB body.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: read response: %w", err)
+		return nil, fmt.Errorf("catalogwriter: read response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Creds{}, fmt.Errorf("catalogwriter: lakekeeper GET: status %d body=%s", resp.StatusCode, scrubBody(body))
+		return nil, fmt.Errorf("catalogwriter: lakekeeper GET: status %d body=%s", resp.StatusCode, scrubBody(body))
 	}
 
 	var parsed struct {
 		Config map[string]string `json:"config"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return Creds{}, fmt.Errorf("catalogwriter: unmarshal response: %w", err)
+		return nil, fmt.Errorf("catalogwriter: unmarshal response: %w", err)
 	}
 	cfg := parsed.Config
 	if cfg == nil {
-		return Creds{}, errors.New("catalogwriter: lakekeeper response had no config block")
+		return nil, errors.New("catalogwriter: lakekeeper response had no config block")
 	}
 
-	c := Creds{
+	// Slice A (A.1+A.2): parse S3 credentials inline. A.3 will replace
+	// this with parseCreds(cfg, v.ExpectedCredsType) for scheme-aware
+	// fail-closed dispatch across S3 + GCS.
+	c := S3Creds{
 		AccessKeyID:     cfg["s3.access-key-id"],
 		SecretAccessKey: cfg["s3.secret-access-key"],
 		SessionToken:    cfg["s3.session-token"],
 		Region:          cfg["s3.region"],
 		Endpoint:        cfg["s3.endpoint"],
-		IssuedAt:        v.now(),
+		Issued:          v.now(),
 	}
 	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
-		return Creds{}, errors.New("catalogwriter: lakekeeper config block missing s3 access key fields")
+		return nil, errors.New("catalogwriter: lakekeeper config block missing s3 access key fields")
 	}
 
-	// Compute ExpiresAt from `s3.expires-at-ms` (epoch ms) if present;
+	// Compute Expires from `s3.expires-at-ms` (epoch ms) if present;
 	// fall back to a 15-min default TTL matching lakekeeper's documented
 	// STS lifetime. The wire shape is lakekeeper-implementation-defined,
 	// so accept either form to stay forward-compatible with future
@@ -383,18 +371,18 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	// rather than poison the cache.
 	if expMs := cfg["s3.expires-at-ms"]; expMs != "" {
 		if t, perr := parseEpochMillis(expMs); perr == nil {
-			c.ExpiresAt = t
+			c.Expires = t
 		}
 	}
-	if c.ExpiresAt.IsZero() {
+	if c.Expires.IsZero() {
 		if ttlSec := cfg["s3.session-ttl-seconds"]; ttlSec != "" {
 			if d, perr := time.ParseDuration(ttlSec + "s"); perr == nil && d > 0 && d < 24*time.Hour {
-				c.ExpiresAt = c.IssuedAt.Add(d)
+				c.Expires = c.Issued.Add(d)
 			}
 		}
 	}
-	if c.ExpiresAt.IsZero() {
-		c.ExpiresAt = c.IssuedAt.Add(15 * time.Minute)
+	if c.Expires.IsZero() {
+		c.Expires = c.Issued.Add(15 * time.Minute)
 	}
 
 	return c, nil
