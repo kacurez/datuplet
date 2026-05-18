@@ -34,6 +34,7 @@ import (
 	"gocloud.dev/gcp"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 )
 
 func main() {
@@ -530,9 +531,77 @@ func probeLakekeeperRefreshEndpoint(ctx context.Context, lkURL, warehouse string
 	return nil
 }
 
+// auditHeaderTransport wraps an http.RoundTripper and injects a single
+// x-goog-custom-audit-* header on every request. This is the Option A
+// (preferred) pattern from the RFC spike plan — the same transport wrapper
+// Slice B would use in production.
+type auditHeaderTransport struct {
+	inner  http.RoundTripper
+	header string
+	value  string
+}
+
+func (t *auditHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Clone the request so we don't mutate the caller's copy.
+	r2 := req.Clone(req.Context())
+	r2.Header.Set(t.header, t.value)
+	return t.inner.RoundTrip(r2)
+}
+
 func probeAuditAttribution(ctx context.Context, bucket, keyFile string) error {
 	// RFC §4.5.4 criterion 5: PUT one object with x-goog-custom-audit-* headers
 	// AND with Object.Metadata["datuplet-run-id"]=spike-<n>. Wait 2 min. Read
 	// the GCS audit log for the bucket. Report which signal(s) surfaced.
-	return fmt.Errorf("TODO: implement in Task A0.6")
+	//
+	// Implementation: Option A — http.Client with a custom RoundTripper that
+	// injects the x-goog-custom-audit-datuplet-run-id header on every request.
+
+	tok, err := loadStaticOAuthToken(ctx, keyFile)
+	if err != nil {
+		return err
+	}
+
+	runID := fmt.Sprintf("spike-%d", time.Now().Unix())
+
+	// Build a storage.Client backed by an http.Client whose transport injects
+	// the custom-audit header.
+	baseTransport := &oauth2.Transport{
+		Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok}),
+		Base:   http.DefaultTransport,
+	}
+	auditTransport := &auditHeaderTransport{
+		inner:  baseTransport,
+		header: "x-goog-custom-audit-datuplet-run-id",
+		value:  runID,
+	}
+	httpClient := &http.Client{Transport: auditTransport}
+
+	cli, err := storage.NewClient(ctx, option.WithHTTPClient(httpClient))
+	if err != nil {
+		return fmt.Errorf("storage.NewClient: %w", err)
+	}
+	defer cli.Close()
+
+	objName := fmt.Sprintf("_spike_audit/probe-%s.txt", runID)
+	w := cli.Bucket(bucket).Object(objName).NewWriter(ctx)
+	// Signal 1: Object.Metadata carries the run-id — surfaced in audit log or
+	// readable via GetObjectAttrs but NOT necessarily in Cloud Audit Logs.
+	w.Metadata = map[string]string{"datuplet-run-id": runID}
+	// Signal 2: x-goog-custom-audit-datuplet-run-id header on the HTTP request
+	// (injected by auditHeaderTransport above). GCS should echo this in the
+	// protoPayload.metadata field of the DATA_WRITE audit log entry.
+	if _, err := w.Write([]byte("spike audit probe\n")); err != nil {
+		return fmt.Errorf("write body: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close writer: %w", err)
+	}
+
+	fmt.Printf("    wrote gs://%s/%s\n", bucket, objName)
+	fmt.Printf("    run-id: %s\n", runID)
+	fmt.Printf("    metadata key: datuplet-run-id=%s\n", runID)
+	fmt.Printf("    custom-audit header: x-goog-custom-audit-datuplet-run-id=%s (Option A: transport interceptor)\n", runID)
+	fmt.Println("    MANUAL STEP: wait 2 min, then check GCS audit log for the bucket;")
+	fmt.Println("    record in the spike memo which signal(s) surfaced.")
+	return nil
 }
