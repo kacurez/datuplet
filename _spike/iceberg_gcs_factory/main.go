@@ -15,7 +15,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+
+	iceio "github.com/apache/iceberg-go/io"
+	_ "github.com/apache/iceberg-go/io/gocloud" // registers the default gs:// factory
+
+	"cloud.google.com/go/storage"
+	"golang.org/x/oauth2/google"
 )
 
 func main() {
@@ -58,11 +65,84 @@ func main() {
 	}
 }
 
+// nopIO is the minimal iceio.IO implementation needed by the probe.
+// The real IO interface uses no context on Open/Remove.
+type nopIO struct{}
+
+func (nopIO) Open(_ string) (iceio.File, error) { return nil, nil }
+func (nopIO) Remove(_ string) error             { return nil }
+
 func probeRegistrationOverride(ctx context.Context, bucket, keyFile string) error {
 	// RFC §4.5.4 criterion 1: iceio.Unregister("gs") + iceio.Register("gs", ...)
 	// must succeed without panic and the new factory must be the one consulted
 	// by subsequent iceio.LoadFS calls.
-	return fmt.Errorf("TODO: implement in Task A0.2")
+
+	// Step 1a: load a static OAuth token so we can pass it as a prop and
+	// verify the factory receives it correctly.
+	tok, err := loadStaticOAuthToken(ctx, keyFile)
+	if err != nil {
+		return fmt.Errorf("load static oauth from key: %w", err)
+	}
+
+	uri := fmt.Sprintf("gs://%s", bucket)
+	props := map[string]string{"gcs.oauth2.token": tok}
+
+	// Step 1b: try to register "gs" again — it was already registered by the
+	// blank import above. Expect a panic.
+	panicked := func() (p bool) {
+		defer func() { p = recover() != nil }()
+		iceio.Register("gs", func(_ context.Context, _ *url.URL, _ map[string]string) (iceio.IO, error) {
+			return nil, nil
+		})
+		return
+	}()
+	if !panicked {
+		return fmt.Errorf("Register did NOT panic on duplicate — RFC §4.5.1 premise is wrong; review upstream change-log")
+	}
+
+	// Step 1c: Unregister, then Register the probe's own factory. This is
+	// exactly what Slice D's production override will do.
+	iceio.Unregister("gs")
+	called := false
+	iceio.Register("gs", func(_ context.Context, parsed *url.URL, gotProps map[string]string) (iceio.IO, error) {
+		called = true
+		if gotProps["gcs.oauth2.token"] != tok {
+			return nil, fmt.Errorf("factory received props missing gcs.oauth2.token")
+		}
+		if parsed.Host != bucket {
+			return nil, fmt.Errorf("factory received wrong bucket in URL: host=%q want %q", parsed.Host, bucket)
+		}
+		return &nopIO{}, nil
+	})
+
+	if _, err := iceio.LoadFS(ctx, props, uri); err != nil {
+		return fmt.Errorf("LoadFS after override returned error: %w", err)
+	}
+	if !called {
+		return fmt.Errorf("LoadFS did NOT invoke the new factory — registry override failed silently")
+	}
+	return nil
+}
+
+// loadStaticOAuthToken mints a short-lived access token from a GCP SA key file.
+func loadStaticOAuthToken(ctx context.Context, keyFile string) (string, error) {
+	if keyFile == "" {
+		return "", fmt.Errorf("--gcs-key-file required for criteria 1/2/5")
+	}
+	keyBytes, err := os.ReadFile(keyFile)
+	if err != nil {
+		return "", err
+	}
+	cfg, err := google.JWTConfigFromJSON(keyBytes, storage.ScopeReadWrite)
+	if err != nil {
+		return "", err
+	}
+	src := cfg.TokenSource(ctx)
+	t, err := src.Token()
+	if err != nil {
+		return "", err
+	}
+	return t.AccessToken, nil
 }
 
 func probeRefreshingTokenSource(ctx context.Context, bucket, keyFile string) error {
