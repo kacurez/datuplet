@@ -13,6 +13,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -482,7 +483,51 @@ func probeLakekeeperRefreshEndpoint(ctx context.Context, lkURL, warehouse string
 	// the SA-key-bootstrapped warehouse; check whether it emits
 	// gcs.oauth2.refresh-credentials-endpoint and (if so) whether that endpoint
 	// responds to a POST with the current bearer.
-	return fmt.Errorf("TODO: implement in Task A0.5")
+	if lkURL == "" || warehouse == "" {
+		return fmt.Errorf("--lakekeeper-url and --warehouse required")
+	}
+	// Issue a loadTable call against an existing test table.
+	// (The spike author bootstraps a throwaway warehouse + creates one
+	// table first; documented in the README.)
+	configURL := fmt.Sprintf("%s/catalog/v1/namespaces/%s/tables/%s",
+		lkURL, "spike_ns", "spike_tbl")
+	req, _ := http.NewRequestWithContext(ctx, "GET", configURL, nil)
+	// Use the same JWT signing as production (signing-key-file) — but the
+	// spike author mints a short-lived one out-of-band.
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("SPIKE_JWT"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("loadTable returned %d: %s", resp.StatusCode, body)
+	}
+
+	var parsed map[string]any
+	json.Unmarshal(body, &parsed)
+	cfg, _ := parsed["config"].(map[string]any)
+
+	ep, _ := cfg["gcs.oauth2.refresh-credentials-endpoint"].(string)
+	if ep == "" {
+		fmt.Println("    NOTE: Lakekeeper did NOT emit gcs.oauth2.refresh-credentials-endpoint")
+		return nil // not a failure; Slice D falls back to loadTable refresh
+	}
+
+	// Try a POST to the refresh endpoint with the current token.
+	postReq, _ := http.NewRequestWithContext(ctx, "POST", ep, nil)
+	postReq.Header.Set("Authorization", "Bearer "+os.Getenv("SPIKE_JWT"))
+	r2, err := http.DefaultClient.Do(postReq)
+	if err != nil {
+		return fmt.Errorf("refresh POST: %w", err)
+	}
+	defer r2.Body.Close()
+	if r2.StatusCode != 200 {
+		b, _ := io.ReadAll(r2.Body)
+		return fmt.Errorf("refresh endpoint returned %d: %s", r2.StatusCode, b)
+	}
+	return nil
 }
 
 func probeAuditAttribution(ctx context.Context, bucket, keyFile string) error {
