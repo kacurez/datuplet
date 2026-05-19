@@ -89,6 +89,9 @@ func (s *gcsSpec) Validate() error {
 		if s.ServiceAccountKeyJSON != "" {
 			return fmt.Errorf("--gcs-credential-type=system-identity cannot be combined with --gcs-sa-key-file/GCS_SA_KEY_FILE")
 		}
+		if !s.StsEnabled {
+			return fmt.Errorf("--gcs-credential-type=system-identity requires --sts-enabled=true (Lakekeeper has no static credentials to return without STS downscoping)")
+		}
 	case "service-account-key":
 		if s.ServiceAccountKeyJSON == "" {
 			return fmt.Errorf("--gcs-credential-type=service-account-key requires --gcs-sa-key-file (or GCS_SA_KEY_FILE)")

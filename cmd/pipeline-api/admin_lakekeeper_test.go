@@ -206,7 +206,8 @@ func TestBuildWarehouseBodySystemIdentity(t *testing.T) {
 		WarehouseName:       "test",
 		LakekeeperProjectID: "00000000-0000-0000-0000-000000000000",
 		Type:                "gcs",
-		GCS:                 &gcsSpec{Bucket: "b", CredentialType: "system-identity"},
+		// system-identity (WIF) requires StsEnabled=true — see gcsSpec.Validate().
+		GCS: &gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: true},
 	}
 	body, err := buildWarehouseBody(spec)
 	if err != nil {
@@ -230,6 +231,8 @@ func TestBuildWarehouseBodyServiceAccountKey(t *testing.T) {
 			Bucket:                "b",
 			CredentialType:        "service-account-key",
 			ServiceAccountKeyJSON: `{"type":"service_account","project_id":"x"}`,
+			// sts=false is valid for service-account-key (Validate doesn't require STS here)
+			StsEnabled: false,
 		},
 	}
 	body, err := buildWarehouseBody(spec)
@@ -249,14 +252,16 @@ func TestBuildWarehouseBodyServiceAccountKey(t *testing.T) {
 // credential type cases.
 
 func TestGCSSpecValidateSystemIdentityDefault(t *testing.T) {
-	s := &gcsSpec{Bucket: "b", CredentialType: ""}
+	// system-identity (WIF) requires STS — see Validate().
+	s := &gcsSpec{Bucket: "b", CredentialType: "", StsEnabled: true}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("default (system-identity) happy path: %v", err)
 	}
 }
 
 func TestGCSSpecValidateSystemIdentityExplicit(t *testing.T) {
-	s := &gcsSpec{Bucket: "b", CredentialType: "system-identity"}
+	// system-identity (WIF) requires STS — see Validate().
+	s := &gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: true}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("system-identity happy path: %v", err)
 	}
@@ -284,6 +289,63 @@ func TestGCSSpecValidateUnknownType(t *testing.T) {
 	err := s.Validate()
 	if err == nil || !strings.Contains(err.Error(), "unknown --gcs-credential-type") {
 		t.Fatalf("expected unknown-type error, got %v", err)
+	}
+}
+
+// TestGCSSpecValidateSystemIdentityRequiresSTS pins the fail-fast guard:
+// `--gcs-credential-type=system-identity` (WIF) has no static credentials
+// Lakekeeper can return verbatim, so `--sts-enabled=false` is structurally
+// invalid. Without this check, the bootstrap succeeds but the first table
+// write fails 15 min later with "lakekeeper response missing gcs.oauth2.token".
+func TestGCSSpecValidateSystemIdentityRequiresSTS(t *testing.T) {
+	s := &gcsSpec{
+		Bucket:         "b",
+		CredentialType: "system-identity",
+		StsEnabled:     false,
+	}
+	err := s.Validate()
+	if err == nil ||
+		!strings.Contains(err.Error(), "system-identity requires --sts-enabled=true") {
+		t.Fatalf("expected sts-enabled rejection, got %v", err)
+	}
+}
+
+// TestGCSSpecValidateSystemIdentityWithSTSPasses is the defensive positive
+// case: WIF + STS=true must still pass after the new rejection rule.
+func TestGCSSpecValidateSystemIdentityWithSTSPasses(t *testing.T) {
+	s := &gcsSpec{
+		Bucket:         "b",
+		CredentialType: "system-identity",
+		StsEnabled:     true,
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("system-identity + sts=true must pass, got %v", err)
+	}
+}
+
+// TestGCSSpecValidateEmptyCredentialTypeRequiresSTS confirms that empty
+// CredentialType (which defaults to system-identity per the gcsSpec docstring)
+// is also caught by the STS check — not just the explicit "system-identity".
+func TestGCSSpecValidateEmptyCredentialTypeRequiresSTS(t *testing.T) {
+	s := &gcsSpec{Bucket: "b", CredentialType: "", StsEnabled: false}
+	if err := s.Validate(); err == nil {
+		t.Fatal("expected sts-enabled rejection for empty CredentialType too")
+	}
+}
+
+// TestGCSSpecValidateServiceAccountKeyAllowsStsDisabled documents that
+// service-account-key mode + sts=false is intentionally allowed — Lakekeeper
+// returns the static key fields directly without STS downscoping. Only
+// system-identity (WIF) requires STS.
+func TestGCSSpecValidateServiceAccountKeyAllowsStsDisabled(t *testing.T) {
+	s := &gcsSpec{
+		Bucket:                "b",
+		CredentialType:        "service-account-key",
+		ServiceAccountKeyJSON: `{"type":"service_account"}`,
+		StsEnabled:            false,
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("S-A-K + sts=false should be valid, got %v", err)
 	}
 }
 
