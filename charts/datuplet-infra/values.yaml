@@ -53,6 +53,14 @@ openfga:
     # only after main resources Ready). The existing charts/datuplet/
     # chart documents this exact gotcha.
     migrationType: initContainer
+    # CNPG ships with max_connections=100 and reserves 3 for superusers, so
+    # only 97 slots are available cluster-wide. OpenFGA's default pool is
+    # 30 conns × replicas — 3 replicas would consume 90 slots and starve
+    # pipeline-api migrations + lakekeeper. Cap at 10/5 so all replicas
+    # together stay well under half the available pool.
+    # See RFC 019 v0.2.1 deploy notes (kacurez-labs live test, 2026-05-19).
+    maxOpenConns: 10
+    maxIdleConns: 5
   authn:
     method: preshared
     preshared:

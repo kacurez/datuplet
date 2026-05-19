@@ -44,6 +44,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   could ever reach a successful TableCommit before this. Surfaced by
   live deploy on 2026-05-19; root-cause confirmed via deepwiki against
   iceberg-go upstream.
+- **Observer silently dropped run-status updates on clusters with large
+  resourceVersions.** `store.UpdateRunPhase` SQL now casts the
+  `observed_rv` parameter as `$7::bigint`, forcing pgx's protocol-level
+  Describe to type it as bigint instead of inferring int4 from the
+  `$7 = 0` literal comparison. Latent v0.2.0 bug — manifested on GKE
+  clusters whose etcd hybrid-clock RVs exceed 2^31 (effectively all
+  long-running clusters). Effect was silent failure: `pipeline-observer`
+  ran fine but UI showed runs stuck in `Pending` forever.
+- **OpenFGA connection-pool default starved CNPG.** Capped
+  `openfga.datastore.maxOpenConns=10` / `maxIdleConns=5` in
+  `charts/datuplet-infra/values.yaml`. Upstream OpenFGA chart defaults
+  to 30 open conns per replica; at 3 replicas that's 90 of CNPG's 97
+  non-superuser slots, starving migrations and lakekeeper. New caps
+  keep cluster-wide OpenFGA usage at ≤30 across replicas, leaving room
+  for the rest of the datuplet stack.
 - **`scripts/register.sh` handles `--warehouse-type=gcs`.** New
   `--gcs-bucket`, `--gcs-credential-type`, `--gcs-key-prefix`, and
   `--gcs-sa-key-file` flags; fail-fast validation rejects missing
