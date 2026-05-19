@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
@@ -96,6 +97,14 @@ type BufferManager struct {
 	// Buffered records
 	batches []arrow.Record
 
+	// Coalescing accumulator. Small (< coalesceFastPathRows) records are
+	// copied row-by-row into acc instead of being retained as individual
+	// arrow.Records. acc finalizes into batches when accRows or accBytes
+	// crosses its threshold, or when Flush/Close runs.
+	acc      *array.RecordBuilder
+	accRows  int64
+	accBytes int64
+
 	// Current state
 	currentBufferSize int64
 	currentFileSize   int64
@@ -153,6 +162,11 @@ func NewBufferManager(
 
 // Add adds a record batch to the buffer.
 // May trigger flush to row group and/or file rotation.
+//
+// Records with at least coalesceFastPathRows rows are appended directly
+// (the caller already batched). Smaller records are copied into the
+// per-manager accumulator so per-Record Arrow scaffolding doesn't pin
+// multiple kilobytes of heap per row.
 func (m *BufferManager) Add(record arrow.Record) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -161,19 +175,45 @@ func (m *BufferManager) Add(record arrow.Record) error {
 		return fmt.Errorf("buffer manager is closed")
 	}
 
-	// Retain the record (we're holding onto it)
-	record.Retain()
-	m.batches = append(m.batches, record)
-	m.currentBufferSize += estimateRecordSize(record)
+	// Reject schema-incompatible records cleanly rather than panicking
+	// deep in the column copy. Field-id metadata differences are fine —
+	// only structural type equality matters.
+	if !schemasCompatible(record.Schema(), m.schema.ArrowSchema()) {
+		return fmt.Errorf("record schema does not match buffer manager schema")
+	}
 
-	// Check if we need to flush buffer to row group
+	if record.NumRows() >= coalesceFastPathRows {
+		// Fast path: already-batched record skips the row-by-row copy.
+		// Flush the accumulator first to preserve append order.
+		if err := m.flushAccumulator(); err != nil {
+			return err
+		}
+		record.Retain()
+		m.batches = append(m.batches, record)
+		m.currentBufferSize += estimateRecordSize(record)
+	} else {
+		// Slow path: small record. Copy rows into the in-flight builder.
+		if m.acc == nil {
+			m.acc = array.NewRecordBuilder(m.allocator, m.schema.ArrowSchema())
+		}
+		if err := appendRecordToBuilder(m.acc, record); err != nil {
+			return fmt.Errorf("coalesce append: %w", err)
+		}
+		m.accRows += record.NumRows()
+		m.accBytes += estimateRecordPayloadBytes(record)
+		if m.accRows >= coalesceFlushRows || m.accBytes >= coalesceFlushBytes {
+			if err := m.flushAccumulator(); err != nil {
+				return err
+			}
+		}
+	}
+
 	if m.shouldFlushBuffer() {
 		if err := m.flushRowGroup(); err != nil {
 			return err
 		}
 	}
 
-	// Check if we need to rotate to a new file
 	if m.shouldRotateFile() {
 		if err := m.rotateFile(); err != nil {
 			return err
@@ -183,9 +223,26 @@ func (m *BufferManager) Add(record arrow.Record) error {
 	return nil
 }
 
+// flushAccumulator finalizes the in-flight builder into a single
+// arrow.Record and appends it to batches. No-op if the accumulator is
+// empty. Caller must hold m.mu.
+func (m *BufferManager) flushAccumulator() error {
+	if m.acc == nil || m.accRows == 0 {
+		return nil
+	}
+	rec := m.acc.NewRecord()
+	m.batches = append(m.batches, rec)
+	m.currentBufferSize += estimateRecordSize(rec)
+	m.accRows = 0
+	m.accBytes = 0
+	return nil
+}
+
 // shouldFlushBuffer returns true if buffer should be flushed to a row group.
+// Triggers on the configured byte size OR on len(batches) crossing the
+// defensive hard cap — the latter guards against estimator undercounts.
 func (m *BufferManager) shouldFlushBuffer() bool {
-	return m.currentBufferSize >= m.config.BufferSize
+	return m.currentBufferSize >= m.config.BufferSize || len(m.batches) >= maxBufferedBatches
 }
 
 // shouldRotateFile returns true if we should rotate to a new file.
@@ -312,6 +369,9 @@ func (m *BufferManager) Flush() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if err := m.flushAccumulator(); err != nil {
+		return err
+	}
 	return m.flushRowGroup()
 }
 
@@ -324,6 +384,15 @@ func (m *BufferManager) Close() error {
 		return nil
 	}
 	m.closed = true
+
+	// Drain accumulator first so its rows land in the final flush.
+	if err := m.flushAccumulator(); err != nil {
+		return err
+	}
+	if m.acc != nil {
+		m.acc.Release()
+		m.acc = nil
+	}
 
 	// Flush any remaining data
 	if err := m.flushRowGroup(); err != nil {
@@ -363,9 +432,15 @@ func (m *BufferManager) Stats() *BufferStats {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// BufferedRecords/Bytes include the in-flight accumulator so callers
+	// observing buffer state don't see a phantom "zero" between Adds.
+	accContribRecords := 0
+	if m.accRows > 0 {
+		accContribRecords = 1
+	}
 	return &BufferStats{
-		BufferedRecords:   len(m.batches),
-		BufferedBytes:     m.currentBufferSize,
+		BufferedRecords:   len(m.batches) + accContribRecords,
+		BufferedBytes:     m.currentBufferSize + m.accBytes,
 		CurrentFileBytes:  m.currentFileSize,
 		TotalRowsFlushed:  m.totalRowsFlushed,
 		TotalBytesFlushed: m.totalBytesFlushed,
@@ -410,14 +485,26 @@ type BufferStats struct {
 	CurrentFileIndex int
 }
 
-// estimateRecordSize estimates the memory size of a record batch.
+// estimateRecordSize estimates the heap memory pinned by retaining a
+// record batch. For records with many rows the per-column buffer bytes
+// dominate. For tiny records (≤ 8 rows) per-Record Arrow scaffolding
+// (schema ref, ArrayData headers, minimum buffer allocations) is the
+// dominant cost; the membench measured ~4 KiB per single-row record on a
+// 5-column schema. Adding that overhead here keeps BufferSize honest as
+// a hard ceiling: defense in depth alongside the coalescer in Add.
 func estimateRecordSize(record arrow.Record) int64 {
-	var size int64
+	var bufBytes int64
 	for i := 0; i < int(record.NumCols()); i++ {
 		col := record.Column(i)
-		size += estimateArraySize(col)
+		bufBytes += estimateArraySize(col)
 	}
-	return size
+	if record.NumRows() <= 8 {
+		// Conservative per-Record overhead: 2 KiB fixed + 256 B per column.
+		// Tuned against the measured ~4 KiB at 5 columns; the constants
+		// over-estimate slightly on purpose so the cap fires defensively.
+		bufBytes += 2048 + 256*int64(record.NumCols())
+	}
+	return bufBytes
 }
 
 // estimateArraySize estimates the memory size of an Arrow array.
