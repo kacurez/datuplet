@@ -287,6 +287,144 @@ func TestGCSSpecValidateUnknownType(t *testing.T) {
 	}
 }
 
+// TestBootstrapGrantsServiceIdentityProjectAdmin exercises
+// `grantServiceIdentityProjectAdminIfMissing`, which is the helper extracted
+// from `adminLakekeeperBootstrap` so we can verify (without a real Lakekeeper):
+//
+//  1. On a non-default project + Check=false → exactly one Write follows.
+//  2. On a non-default project + Check=true (idempotent re-run) → NO Write.
+//  3. On the default lakekeeper project UUID → neither Check nor Write.
+//  4. When fgaURL is empty → neither Check nor Write (local-mode-without-FGA).
+//
+// The helper is the unit-testable seam; the env-driven OPENFGA_URL skip lives
+// in adminLakekeeperBootstrap itself (case 4 below mirrors what the caller
+// does in that branch — calling the helper with fgaURL="").
+func TestBootstrapGrantsServiceIdentityProjectAdmin(t *testing.T) {
+	const (
+		nonDefaultProjectID = "deadbeef-dead-beef-dead-beefdeadbeef"
+		userSub             = bootstrapServiceSubject
+		storeID             = "store-uuid"
+	)
+
+	t.Run("non-default project, missing tuple => Check then Write", func(t *testing.T) {
+		var checks, writes int
+		var writeBody string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/check"):
+				checks++
+				_, _ = w.Write([]byte(`{"allowed":false}`))
+			case strings.HasSuffix(r.URL.Path, "/write"):
+				writes++
+				b, _ := io.ReadAll(r.Body)
+				writeBody = string(b)
+				w.WriteHeader(200)
+			default:
+				t.Errorf("unexpected request to %s", r.URL.Path)
+				w.WriteHeader(404)
+			}
+		}))
+		defer srv.Close()
+
+		if err := grantServiceIdentityProjectAdminIfMissing(context.Background(),
+			srv.URL, "test-key", storeID, userSub, nonDefaultProjectID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if checks != 1 {
+			t.Errorf("checks = %d, want 1", checks)
+		}
+		if writes != 1 {
+			t.Errorf("writes = %d, want 1", writes)
+		}
+		// The write must target user:oidc~<sub>, relation=project_admin,
+		// object=project:<id>.
+		if !strings.Contains(writeBody, `"user":"user:oidc~`+userSub+`"`) ||
+			!strings.Contains(writeBody, `"relation":"project_admin"`) ||
+			!strings.Contains(writeBody, `"object":"project:`+nonDefaultProjectID+`"`) {
+			t.Fatalf("unexpected write body: %s", writeBody)
+		}
+	})
+
+	t.Run("non-default project, existing tuple => Check only, no Write", func(t *testing.T) {
+		var checks, writes int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/check"):
+				checks++
+				_, _ = w.Write([]byte(`{"allowed":true}`))
+			case strings.HasSuffix(r.URL.Path, "/write"):
+				writes++
+				w.WriteHeader(200)
+			default:
+				t.Errorf("unexpected request to %s", r.URL.Path)
+				w.WriteHeader(404)
+			}
+		}))
+		defer srv.Close()
+
+		if err := grantServiceIdentityProjectAdminIfMissing(context.Background(),
+			srv.URL, "test-key", storeID, userSub, nonDefaultProjectID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if checks != 1 {
+			t.Errorf("checks = %d, want 1", checks)
+		}
+		if writes != 0 {
+			t.Errorf("writes = %d, want 0 (idempotent re-run)", writes)
+		}
+	})
+
+	t.Run("default lakekeeper project => skip entirely", func(t *testing.T) {
+		var hits int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(500)
+		}))
+		defer srv.Close()
+
+		if err := grantServiceIdentityProjectAdminIfMissing(context.Background(),
+			srv.URL, "test-key", storeID, userSub, defaultLakekeeperProjectUUID); err != nil {
+			t.Fatalf("unexpected error on default-project skip: %v", err)
+		}
+		if hits != 0 {
+			t.Errorf("hits = %d, want 0 (default project should be skipped)", hits)
+		}
+	})
+
+	t.Run("empty fgaURL => skip entirely", func(t *testing.T) {
+		if err := grantServiceIdentityProjectAdminIfMissing(context.Background(),
+			"", "test-key", storeID, userSub, nonDefaultProjectID); err != nil {
+			t.Fatalf("unexpected error on empty-fgaURL skip: %v", err)
+		}
+		// Nothing to assert beyond "no panic, no error" — there's no server to count
+		// hits against. The caller's own OPENFGA_URL check is the primary guard;
+		// the helper's defensive skip is belt-and-braces.
+	})
+
+	t.Run("write 'already exists' is tolerated", func(t *testing.T) {
+		var writes int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/check"):
+				_, _ = w.Write([]byte(`{"allowed":false}`))
+			case strings.HasSuffix(r.URL.Path, "/write"):
+				writes++
+				w.WriteHeader(400)
+				_, _ = w.Write([]byte(`{"code":"write_failed_due_to_invalid_input","message":"cannot write a tuple which already exists"}`))
+			}
+		}))
+		defer srv.Close()
+
+		if err := grantServiceIdentityProjectAdminIfMissing(context.Background(),
+			srv.URL, "test-key", storeID, userSub, nonDefaultProjectID); err != nil {
+			t.Fatalf("expected idempotent 'already exists' write to be swallowed, got: %v", err)
+		}
+		if writes != 1 {
+			t.Errorf("writes = %d, want 1", writes)
+		}
+	})
+}
+
 // TestPostJSON_WarehouseError_RedactsBody verifies that when redactBodyOnError
 // is true, the response body (which lakekeeper may echo from the request, e.g.
 // an SA key JSON) is not included in the returned error string.
