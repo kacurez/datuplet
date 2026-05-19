@@ -142,6 +142,34 @@ func TestBuildWarehouseBody_GCS_InvalidJSON(t *testing.T) {
 	}
 }
 
+// TestBuildWarehouseBodyRedactsInvalidGCSKeyJSON locks the redaction contract
+// on the GCS service-account-key branch of buildWarehouseBody. The underlying
+// json.Unmarshal error may quote fragments of the input — which can include a
+// private key — so the wrapper must drop the inner error entirely and return
+// only a generic message. Mirrors the manager.go-side
+// TestEnsureGCSWarehouseInProjectRedactsInvalidKeyJSON.
+func TestBuildWarehouseBodyRedactsInvalidGCSKeyJSON(t *testing.T) {
+	const sentinel = "PRIVATE-KEY-DO-NOT-LEAK"
+	_, err := buildWarehouseBody(warehouseSpec{
+		WarehouseName: "wh",
+		Type:          "gcs",
+		GCS: &gcsSpec{
+			Bucket:                "b",
+			CredentialType:        "service-account-key",
+			ServiceAccountKeyJSON: "{not-json " + sentinel + "}",
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected error for malformed SA key JSON, got nil")
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("error message leaked SA-key content: %v", err)
+	}
+	if err.Error() != "invalid GCS service account key JSON" {
+		t.Fatalf("expected exact redacted message, got %q", err.Error())
+	}
+}
+
 func TestBuildWarehouseBody_UnknownType(t *testing.T) {
 	_, err := buildWarehouseBody(warehouseSpec{
 		WarehouseName: "wh",

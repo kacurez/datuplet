@@ -206,9 +206,57 @@ type S3WarehouseProfile struct {
 	PathStyle *bool  // optional; defaults to true (MinIO)
 }
 
-// EnsureWarehouseInProject creates the named warehouse inside the given
-// lakekeeper Project, idempotently. The call is idempotent — if the
-// warehouse already exists the method returns nil without re-creating it.
+// GCSWarehouseProfile carries the storage-profile + storage-credential
+// body lakekeeper expects on POST /management/v1/warehouse for GCS.
+// Mirrors S3WarehouseProfile but for the GCS body shape produced by
+// cmd/pipeline-api/admin_lakekeeper.go::buildWarehouseBody.
+//
+// CredentialType selects:
+//   - "" or "system-identity": Workload Identity Federation (no key).
+//     Requires StsEnabled=true — lakekeeper has no static credentials
+//     to return without STS downscoping.
+//   - "service-account-key": static SA JSON in ServiceAccountKeyJSON.
+type GCSWarehouseProfile struct {
+	Bucket                string
+	KeyPrefix             string // optional
+	StsEnabled            bool
+	CredentialType        string // "" | "system-identity" | "service-account-key"
+	ServiceAccountKeyJSON string // required when CredentialType=="service-account-key"
+}
+
+// Validate enforces the cross-field rules that mirror
+// cmd/pipeline-api/admin_lakekeeper.go::gcsSpec.Validate:
+//   - Bucket is required.
+//   - WIF (system-identity / "") requires StsEnabled=true and cannot carry
+//     a service-account key.
+//   - service-account-key requires a non-empty ServiceAccountKeyJSON.
+//   - Any other CredentialType value is rejected.
+func (p *GCSWarehouseProfile) Validate() error {
+	if p.Bucket == "" {
+		return errors.New("GCSWarehouseProfile.Bucket is required")
+	}
+	switch p.CredentialType {
+	case "", "system-identity":
+		if p.ServiceAccountKeyJSON != "" {
+			return errors.New("GCSWarehouseProfile: CredentialType=system-identity cannot be combined with ServiceAccountKeyJSON")
+		}
+		if !p.StsEnabled {
+			return errors.New("GCSWarehouseProfile: CredentialType=system-identity requires sts-enabled=true (lakekeeper has no static credentials to return without STS downscoping)")
+		}
+	case "service-account-key":
+		if p.ServiceAccountKeyJSON == "" {
+			return errors.New("GCSWarehouseProfile: CredentialType=service-account-key requires ServiceAccountKeyJSON")
+		}
+	default:
+		return fmt.Errorf("GCSWarehouseProfile: unknown CredentialType %q (want system-identity or service-account-key)", p.CredentialType)
+	}
+	return nil
+}
+
+// EnsureS3WarehouseInProject creates the named S3 warehouse inside the
+// given lakekeeper Project, idempotently. The call is idempotent — if
+// the warehouse already exists the method returns nil without
+// re-creating it.
 //
 // The probe-first pattern matches FindProjectIDByName: a 200 with the
 // warehouse name in the listing returns nil; otherwise we POST. On
@@ -218,12 +266,12 @@ type S3WarehouseProfile struct {
 //
 // All calls are scoped via the `x-project-id` HTTP header so lakekeeper
 // routes them to the requested project rather than the default one.
-func (m *Manager) EnsureWarehouseInProject(ctx context.Context, projectID, warehouseName string, profile S3WarehouseProfile) error {
+func (m *Manager) EnsureS3WarehouseInProject(ctx context.Context, projectID, warehouseName string, profile S3WarehouseProfile) error {
 	if projectID == "" || warehouseName == "" {
-		return errors.New("EnsureWarehouseInProject: projectID and warehouseName are required")
+		return errors.New("EnsureS3WarehouseInProject: projectID and warehouseName are required")
 	}
 	if profile.Bucket == "" || profile.Endpoint == "" || profile.AccessKey == "" || profile.SecretKey == "" {
-		return errors.New("EnsureWarehouseInProject: S3WarehouseProfile.Bucket / Endpoint / AccessKey / SecretKey are required")
+		return errors.New("EnsureS3WarehouseInProject: S3WarehouseProfile.Bucket / Endpoint / AccessKey / SecretKey are required")
 	}
 	// Probe: GET /management/v1/warehouse with x-project-id header,
 	// match warehouse-name. lakekeeper scopes the list by project when
@@ -265,6 +313,76 @@ func (m *Manager) EnsureWarehouseInProject(ctx context.Context, projectID, wareh
 			"aws-secret-access-key": profile.SecretKey,
 		},
 		"delete-profile": map[string]any{"type": "hard"},
+	}
+	return m.createWarehouseInProject(ctx, projectID, body)
+}
+
+// EnsureGCSWarehouseInProject is the GCS sibling of
+// EnsureS3WarehouseInProject. It validates the profile, probes for an
+// existing warehouse of that name in the project, and POSTs a GCS
+// create-warehouse body if missing.
+//
+// Body shape mirrors cmd/pipeline-api/admin_lakekeeper.go::buildWarehouseBody
+// (the GCS branch). The intentional duplication keeps the lakekeeper
+// package free of the warehouseSpec/s3Spec/gcsSpec abstraction (those
+// stay private to the admin command). See RFC 019 v0.2.1 Slice 4.
+//
+// TODO(v0.2.2): consolidate with cmd/pipeline-api/admin_lakekeeper.go::buildWarehouseBody.
+func (m *Manager) EnsureGCSWarehouseInProject(ctx context.Context, projectID, warehouseName string, profile GCSWarehouseProfile) error {
+	if projectID == "" || warehouseName == "" {
+		return errors.New("EnsureGCSWarehouseInProject: projectID and warehouseName are required")
+	}
+	if err := profile.Validate(); err != nil {
+		return err
+	}
+
+	probe, err := m.listWarehousesInProject(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("list warehouses in project %q: %w", projectID, err)
+	}
+	for _, w := range probe {
+		if w == warehouseName {
+			return nil
+		}
+	}
+
+	storageProfile := map[string]any{
+		"type":        "gcs",
+		"bucket":      profile.Bucket,
+		"sts-enabled": profile.StsEnabled,
+	}
+	if profile.KeyPrefix != "" {
+		storageProfile["key-prefix"] = profile.KeyPrefix
+	}
+
+	var storageCred map[string]any
+	switch profile.CredentialType {
+	case "", "system-identity":
+		storageCred = map[string]any{
+			"type":            "gcs",
+			"credential-type": "gcp-system-identity",
+		}
+	case "service-account-key":
+		var keyObj map[string]any
+		if err := json.Unmarshal([]byte(profile.ServiceAccountKeyJSON), &keyObj); err != nil {
+			// SECURITY: do NOT echo the JSON content — it may contain a
+			// private key. Surface only a generic message. Matches the
+			// behaviour of admin_lakekeeper.go::buildWarehouseBody.
+			return errors.New("invalid GCS service account key JSON")
+		}
+		storageCred = map[string]any{
+			"type":            "gcs",
+			"credential-type": "service-account-key",
+			"key":             keyObj,
+		}
+	}
+
+	body := map[string]any{
+		"warehouse-name":     warehouseName,
+		"project-id":         projectID,
+		"storage-profile":    storageProfile,
+		"storage-credential": storageCred,
+		"delete-profile":     map[string]any{"type": "hard"},
 	}
 	return m.createWarehouseInProject(ctx, projectID, body)
 }

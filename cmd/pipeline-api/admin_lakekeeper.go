@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -84,6 +85,9 @@ type gcsSpec struct {
 // are self-consistent. Returns an error for mutual-exclusion violations or
 // unknown credential types.
 func (s *gcsSpec) Validate() error {
+	if s.Bucket == "" {
+		return fmt.Errorf("--gcs-bucket required")
+	}
 	switch s.CredentialType {
 	case "", "system-identity":
 		if s.ServiceAccountKeyJSON != "" {
@@ -98,9 +102,6 @@ func (s *gcsSpec) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unknown --gcs-credential-type %q (want system-identity or service-account-key)", s.CredentialType)
-	}
-	if s.Bucket == "" {
-		return fmt.Errorf("--gcs-bucket required")
 	}
 	return nil
 }
@@ -166,7 +167,9 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 			if err := json.Unmarshal([]byte(spec.GCS.ServiceAccountKeyJSON), &keyObj); err != nil {
 				// Do NOT echo the JSON content (could leak the private key
 				// into logs); surface only a generic invalidity message.
-				return nil, fmt.Errorf("invalid GCS service account key JSON: %s", err)
+				// The underlying json.Unmarshal error is intentionally
+				// dropped — its message can quote fragments of the input.
+				return nil, errors.New("invalid GCS service account key JSON")
 			}
 			storageCred = map[string]any{
 				"type":            "gcs",

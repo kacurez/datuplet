@@ -121,9 +121,9 @@ type FGABootstrapConfig struct {
 	// "key-1".
 	SigningKeyID string
 
-	// S3 warehouse profile. Used when EnsureWarehouseInProject has to
+	// S3 warehouse profile. Used when EnsureS3WarehouseInProject has to
 	// create a fresh warehouse. All four fields are required if the
-	// warehouse doesn't exist yet; ignored when EnsureWarehouseInProject
+	// warehouse doesn't exist yet; ignored when EnsureS3WarehouseInProject
 	// finds an existing one.
 	S3Bucket    string
 	S3Endpoint  string
@@ -237,7 +237,7 @@ func SetupFGABootstrap(ctx context.Context, cfg FGABootstrapConfig) (*FGAHarness
 		}
 	}
 
-	if err := mgr.EnsureWarehouseInProject(ctx, projectID, cfg.WarehouseName, lakekeeper.S3WarehouseProfile{
+	if err := mgr.EnsureS3WarehouseInProject(ctx, projectID, cfg.WarehouseName, lakekeeper.S3WarehouseProfile{
 		Bucket:    cfg.S3Bucket,
 		Endpoint:  cfg.S3Endpoint,
 		AccessKey: cfg.S3AccessKey,
