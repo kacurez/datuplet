@@ -42,7 +42,15 @@
 #                              (default: read from minio Secret key 'rootPassword')
 #   --s3-region      REGION    S3 region                    (default: local-01)
 #   --path-style               Enable S3 path-style         (default: true)
-#   --no-sts                   Disable STS-vended creds     (default: sts enabled)
+#   --no-sts                   Disable STS-vended creds     (default: sts enabled,
+#                              REQUIRED for --warehouse-type=gcs + --gcs-credential-type=system-identity)
+#
+# GCS options (for --warehouse-type=gcs):
+#   --gcs-bucket            BUCKET   GCS bucket name (required)
+#   --gcs-key-prefix        PREFIX   Optional key prefix under the bucket
+#   --gcs-credential-type   TYPE     system-identity (default; WIF) | service-account-key
+#   --gcs-sa-key-file       PATH     Path to a Google SA JSON key file
+#                                    (required iff --gcs-credential-type=service-account-key)
 #
 # Misc:
 #   --mode exec|job            Execution mode               (default: exec)
@@ -71,6 +79,10 @@ S3_SECRET_KEY=""
 S3_REGION="local-01"
 PATH_STYLE="true"
 STS_ENABLED="true"
+GCS_BUCKET=""
+GCS_KEY_PREFIX=""
+GCS_CREDENTIAL_TYPE="system-identity"
+GCS_SA_KEY_FILE=""
 MODE="exec"
 KUBECTL_CONTEXT=""
 DRY_RUN="false"
@@ -92,6 +104,10 @@ while [[ $# -gt 0 ]]; do
     --path-style)       PATH_STYLE="true";     shift 1 ;;
     --no-path-style)    PATH_STYLE="false";    shift 1 ;;
     --no-sts)           STS_ENABLED="false";   shift 1 ;;
+    --gcs-bucket)         GCS_BUCKET="$2";          shift 2 ;;
+    --gcs-key-prefix)     GCS_KEY_PREFIX="$2";      shift 2 ;;
+    --gcs-credential-type) GCS_CREDENTIAL_TYPE="$2"; shift 2 ;;
+    --gcs-sa-key-file)    GCS_SA_KEY_FILE="$2";     shift 2 ;;
     --mode)             MODE="$2";             shift 2 ;;
     --context)          KUBECTL_CONTEXT="$2";  shift 2 ;;
     --dry-run)          DRY_RUN="true";        shift 1 ;;
@@ -107,6 +123,33 @@ done
 if [[ "$MODE" != "exec" && "$MODE" != "job" ]]; then
   echo "ERROR: --mode must be 'exec' or 'job'" >&2
   exit 1
+fi
+
+# ─── Validate warehouse-type ─────────────────────────────────────────────────
+if [[ "$WAREHOUSE_TYPE" != "s3" && "$WAREHOUSE_TYPE" != "gcs" ]]; then
+  echo "ERROR: --warehouse-type must be 's3' or 'gcs' (got '${WAREHOUSE_TYPE}')" >&2
+  exit 1
+fi
+
+# ─── Validate GCS args (fail fast before kubectl exec) ───────────────────────
+if [[ "$WAREHOUSE_TYPE" == "gcs" ]]; then
+  if [[ -z "$GCS_BUCKET" ]]; then
+    echo "ERROR: --gcs-bucket is required with --warehouse-type=gcs" >&2
+    exit 1
+  fi
+  case "$GCS_CREDENTIAL_TYPE" in
+    system-identity|service-account-key) ;;
+    *) echo "ERROR: --gcs-credential-type must be 'system-identity' or 'service-account-key' (got '${GCS_CREDENTIAL_TYPE}')" >&2; exit 1 ;;
+  esac
+  if [[ "$GCS_CREDENTIAL_TYPE" == "service-account-key" && -z "$GCS_SA_KEY_FILE" ]]; then
+    echo "ERROR: --gcs-credential-type=service-account-key requires --gcs-sa-key-file" >&2
+    exit 1
+  fi
+  if [[ "$GCS_CREDENTIAL_TYPE" == "system-identity" && "$STS_ENABLED" != "true" ]]; then
+    # Mirrors gcsSpec.Validate (Slice 3 of v0.2.1): WIF requires STS downscoping.
+    echo "ERROR: --gcs-credential-type=system-identity requires --sts-enabled (do not pass --no-sts)" >&2
+    exit 1
+  fi
 fi
 
 # ─── kubectl wrapper ──────────────────────────────────────────────────────────
@@ -344,8 +387,11 @@ PROVISIONING_FLAGS=(
   "--openfga-url=${OPENFGA_URL}"
 )
 
-# ─── S3 warehouse flags ───────────────────────────────────────────────────────
+# ─── Warehouse-type-specific flag arrays ─────────────────────────────────────
+# Exactly one of these is populated based on $WAREHOUSE_TYPE; Steps 1 and 4
+# splice in $WAREHOUSE_FLAGS which is just a pointer to whichever is set.
 S3_FLAGS=()
+GCS_FLAGS=()
 if [[ "$WAREHOUSE_TYPE" == "s3" ]]; then
   S3_FLAGS=(
     "--type=s3"
@@ -360,6 +406,21 @@ if [[ "$WAREHOUSE_TYPE" == "s3" ]]; then
   fi
   if [[ "$STS_ENABLED" == "true" ]]; then
     S3_FLAGS+=("--sts-enabled")
+  fi
+elif [[ "$WAREHOUSE_TYPE" == "gcs" ]]; then
+  GCS_FLAGS=(
+    "--type=gcs"
+    "--gcs-bucket=${GCS_BUCKET}"
+    "--gcs-credential-type=${GCS_CREDENTIAL_TYPE}"
+  )
+  if [[ -n "$GCS_KEY_PREFIX" ]]; then
+    GCS_FLAGS+=("--gcs-key-prefix=${GCS_KEY_PREFIX}")
+  fi
+  if [[ "$GCS_CREDENTIAL_TYPE" == "service-account-key" ]]; then
+    GCS_FLAGS+=("--gcs-sa-key-file=${GCS_SA_KEY_FILE}")
+  fi
+  if [[ "$STS_ENABLED" == "true" ]]; then
+    GCS_FLAGS+=("--sts-enabled")
   fi
 fi
 
@@ -379,7 +440,7 @@ echo ">> Step 1: lakekeeper-bootstrap"
 run_admin lakekeeper-bootstrap \
   "${LK_FLAGS[@]}" \
   "--warehouse-name=${WAREHOUSE_NAME}" \
-  "${S3_FLAGS[@]}"
+  "${S3_FLAGS[@]}" "${GCS_FLAGS[@]}"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Step 2: create-user
@@ -416,7 +477,7 @@ run_admin attach-warehouse \
   "${PROVISIONING_FLAGS[@]}" \
   "--project=${PROJECT_NAME}" \
   "--warehouse=${WAREHOUSE_NAME}" \
-  "${S3_FLAGS[@]}"
+  "${S3_FLAGS[@]}" "${GCS_FLAGS[@]}"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Step 5: grant

@@ -244,8 +244,61 @@ func (g *gcsIO) Close() error {
 	return g.bucket.Close()
 }
 
+// Create satisfies iceio.WriteFileIO.Create. iceberg-go calls this for
+// snapshot manifest avro files and table metadata.json on every
+// TableCommit AddFiles → updateSnapshot path. Without this method,
+// iceberg-go's type-assert to iceio.WriteFileIO panics at write time
+// (v0.2.0 regression fixed in v0.2.1).
+func (g *gcsIO) Create(name string) (iceio.FileWriter, error) {
+	key, err := g.preprocess(name)
+	if err != nil {
+		return nil, &fs.PathError{Op: "create", Path: name, Err: err}
+	}
+	if !fs.ValidPath(key) {
+		return nil, &fs.PathError{Op: "create", Path: name, Err: fs.ErrInvalid}
+	}
+	w, err := g.bucket.NewWriter(g.ctx, key, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gcsIO create %q: %w", name, err)
+	}
+	return &gcsWriteFile{w: w}, nil
+}
+
+// WriteFile is the byte-slice convenience variant of Create. Same path
+// followed by a single Write + Close. If Write fails, we still call
+// Close (which finalises/aborts the multipart upload at the GCS level)
+// and join both errors — the Close error carries authoritative
+// "upload aborted" context the Write error doesn't have.
+func (g *gcsIO) WriteFile(name string, p []byte) error {
+	f, err := g.Create(name)
+	if err != nil {
+		return err
+	}
+	if _, writeErr := f.Write(p); writeErr != nil {
+		return errors.Join(writeErr, f.Close())
+	}
+	return f.Close()
+}
+
+// gcsWriteFile satisfies iceio.FileWriter (io.WriteCloser + io.ReaderFrom)
+// on top of gocloud.dev/blob.Writer. blob.Writer provides Write+Close;
+// we add ReadFrom via io.Copy so streaming writes (e.g. iceberg-go
+// piping avro manifest output through a Reader) don't have to buffer.
+type gcsWriteFile struct {
+	w *blob.Writer
+}
+
+func (f *gcsWriteFile) Write(p []byte) (int, error)        { return f.w.Write(p) }
+func (f *gcsWriteFile) Close() error                       { return f.w.Close() }
+func (f *gcsWriteFile) ReadFrom(r io.Reader) (int64, error) { return io.Copy(f.w, r) }
+
 // Verify gcsIO satisfies io.Closer at compile time.
 var _ io.Closer = (*gcsIO)(nil)
+
+// Compile-time: gcsIO satisfies iceberg-go's full write interface.
+// If iceberg-go's transaction.go assertion fails again, the panic
+// would surface here at build time instead — which is the whole point.
+var _ iceio.WriteFileIO = (*gcsIO)(nil)
 
 // gcsFile satisfies iceio.File = fs.File + io.ReadSeekCloser + io.ReaderAt.
 //

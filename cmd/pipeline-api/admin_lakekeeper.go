@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,24 @@ import (
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
+
+// defaultLakekeeperProjectUUID is Lakekeeper's built-in default project ID.
+// Warehouses created against this project don't need an explicit project-scoped
+// FGA grant for the bootstrap service identity (the server-admin tuple is
+// sufficient). Non-default projects (allocated by `pipeline-api admin
+// create-project`) DO need the service identity to hold `project_admin` on the
+// project before lakekeeper's warehouse-create endpoint will accept the POST.
+const defaultLakekeeperProjectUUID = "00000000-0000-0000-0000-000000000000"
+
+// bootstrapServiceSubject is the synthetic identity used by
+// `pipeline-api admin lakekeeper-bootstrap`: it appears both as the `sub`
+// claim on the short-lived bootstrap JWT minted via MintServiceToken AND
+// as the FGA user-subject on the project_admin tuple written for
+// non-default lakekeeper projects. Both sites MUST use this same value —
+// if they drift, the tuple grants project_admin to one identity while
+// the JWT presents another, and lakekeeper's warehouse-create silently
+// 403s.
+const bootstrapServiceSubject = "pipeline-api-bootstrap"
 
 // warehouseSpec describes the inputs to buildWarehouseBody. The Type
 // field selects which sibling spec (S3 or GCS) is consulted.
@@ -66,10 +85,16 @@ type gcsSpec struct {
 // are self-consistent. Returns an error for mutual-exclusion violations or
 // unknown credential types.
 func (s *gcsSpec) Validate() error {
+	if s.Bucket == "" {
+		return fmt.Errorf("--gcs-bucket required")
+	}
 	switch s.CredentialType {
 	case "", "system-identity":
 		if s.ServiceAccountKeyJSON != "" {
 			return fmt.Errorf("--gcs-credential-type=system-identity cannot be combined with --gcs-sa-key-file/GCS_SA_KEY_FILE")
+		}
+		if !s.StsEnabled {
+			return fmt.Errorf("--gcs-credential-type=system-identity requires --sts-enabled=true (Lakekeeper has no static credentials to return without STS downscoping)")
 		}
 	case "service-account-key":
 		if s.ServiceAccountKeyJSON == "" {
@@ -77,9 +102,6 @@ func (s *gcsSpec) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unknown --gcs-credential-type %q (want system-identity or service-account-key)", s.CredentialType)
-	}
-	if s.Bucket == "" {
-		return fmt.Errorf("--gcs-bucket required")
 	}
 	return nil
 }
@@ -145,7 +167,9 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 			if err := json.Unmarshal([]byte(spec.GCS.ServiceAccountKeyJSON), &keyObj); err != nil {
 				// Do NOT echo the JSON content (could leak the private key
 				// into logs); surface only a generic invalidity message.
-				return nil, fmt.Errorf("invalid GCS service account key JSON: %s", err)
+				// The underlying json.Unmarshal error is intentionally
+				// dropped — its message can quote fragments of the input.
+				return nil, errors.New("invalid GCS service account key JSON")
 			}
 			storageCred = map[string]any{
 				"type":            "gcs",
@@ -346,7 +370,7 @@ Flags:
 	// Lakekeeper's `allowall` authz only checks signature+audience+expiry
 	// for management calls, so the service shape is sufficient.
 	jwt, err := tokens.MintServiceToken(signer, tokens.ServiceTokenSpec{
-		Subject:  "pipeline-api-bootstrap",
+		Subject:  bootstrapServiceSubject,
 		Audience: *audience,
 		Lifetime: 5 * time.Minute,
 	})
@@ -374,25 +398,13 @@ Flags:
 		fmt.Println("  bootstrap: 204 (OK)")
 	}
 
-	// Step 2: warehouse exists probe.
-	exists, err := lakekeeperWarehouseExists(httpc, base, jwt, *warehouseName)
-	if err != nil {
-		return fmt.Errorf("probe warehouse: %w", err)
-	}
-	if exists {
-		fmt.Printf("  warehouse %q: already exists\n", *warehouseName)
-	} else {
-		fmt.Printf("Creating warehouse %q (type=%s)...\n", *warehouseName, *whType)
-		body, err := buildWarehouseBody(spec)
-		if err != nil {
-			return fmt.Errorf("build warehouse body: %w", err)
-		}
-		if err := postJSON(httpc, base+"/management/v1/warehouse", jwt, body, http.StatusCreated, true); err != nil {
-			return fmt.Errorf("create warehouse: %w", err)
-		}
-		fmt.Println("  warehouse: created")
-	}
-	// Write the user:oidc~admin admin server:<uuid> tuple for the lakekeeper server admin.
+	// Step 2: FGA tuples (server-admin + non-default-project project_admin).
+	//
+	// Both grants land BEFORE the warehouse-exists probe + create POST,
+	// because (a) lakekeeper's warehouse-create endpoint enforces
+	// project_admin on non-default projects, and (b) a future change that
+	// scopes the warehouse-exists probe by x-project-id will need the
+	// project_admin tuple in place for that probe too.
 	fgaURL := os.Getenv("OPENFGA_URL")
 	if fgaURL == "" {
 		fmt.Println("  server-admin tuple: skipping (OPENFGA_URL not set)")
@@ -410,6 +422,36 @@ Flags:
 			return fmt.Errorf("write server-admin tuple: %w", err)
 		}
 		fmt.Println("  server-admin tuple: written (or already existed)")
+
+		// Grant the bootstrap service identity project_admin on a non-default
+		// lakekeeper project. The default project is implicitly covered by
+		// the server-admin tuple; non-default projects need an explicit
+		// project-scoped grant or lakekeeper's warehouse-create POST returns 403.
+		if err := grantServiceIdentityProjectAdminIfMissing(context.Background(),
+			fgaURL, apiKey, storeID, bootstrapServiceSubject, *lakekeeperProjectID); err != nil {
+			return err
+		}
+	}
+
+	// Step 3: warehouse exists probe. Scoped by --lakekeeper-project-id so a
+	// warehouse of the same name in the default project doesn't false-positive
+	// the probe for a non-default-project bootstrap.
+	exists, err := lakekeeperWarehouseExists(httpc, base, jwt, *lakekeeperProjectID, *warehouseName)
+	if err != nil {
+		return fmt.Errorf("probe warehouse: %w", err)
+	}
+	if exists {
+		fmt.Printf("  warehouse %q: already exists\n", *warehouseName)
+	} else {
+		fmt.Printf("Creating warehouse %q (type=%s)...\n", *warehouseName, *whType)
+		body, err := buildWarehouseBody(spec)
+		if err != nil {
+			return fmt.Errorf("build warehouse body: %w", err)
+		}
+		if err := postJSON(httpc, base+"/management/v1/warehouse", jwt, body, http.StatusCreated, true); err != nil {
+			return fmt.Errorf("create warehouse: %w", err)
+		}
+		fmt.Println("  warehouse: created")
 	}
 
 	fmt.Println("Bootstrap complete.")
@@ -442,14 +484,20 @@ func lakekeeperBootstrapped(c *http.Client, base, jwt string) (bool, error) {
 	return info.Bootstrapped, nil
 }
 
-// lakekeeperWarehouseExists lists warehouses and returns true iff one with
-// the given name is registered.
-func lakekeeperWarehouseExists(c *http.Client, base, jwt, name string) (bool, error) {
+// lakekeeperWarehouseExists lists warehouses in the given lakekeeper project
+// and returns true iff one with the given name is registered there.
+//
+// The `x-project-id` header is REQUIRED: without it lakekeeper lists
+// warehouses in the default project regardless of caller intent, which
+// produces a false-positive "already exists" when re-bootstrapping against
+// a non-default project (RFC 019 v0.2.1 fix).
+func lakekeeperWarehouseExists(c *http.Client, base, jwt, projectID, name string) (bool, error) {
 	req, err := http.NewRequest("GET", base+"/management/v1/warehouse", nil)
 	if err != nil {
 		return false, fmt.Errorf("build warehouse request: %w", err)
 	}
 	req.Header.Set("authorization", "Bearer "+jwt)
+	req.Header.Set("x-project-id", projectID)
 	resp, err := c.Do(req)
 	if err != nil {
 		return false, err
@@ -457,7 +505,7 @@ func lakekeeperWarehouseExists(c *http.Client, base, jwt, name string) (bool, er
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+		return false, fmt.Errorf("project %s: HTTP %d: %s", projectID, resp.StatusCode, body)
 	}
 	var list struct {
 		Warehouses []struct {
@@ -465,7 +513,7 @@ func lakekeeperWarehouseExists(c *http.Client, base, jwt, name string) (bool, er
 		} `json:"warehouses"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return false, err
+		return false, fmt.Errorf("project %s: decode warehouses: %w", projectID, err)
 	}
 	for _, w := range list.Warehouses {
 		if w.Name == name {
@@ -492,6 +540,118 @@ func writeServerAdminTuple(ctx context.Context, fgaURL, apiKey, storeID string) 
 		"writes": map[string]any{
 			"tuple_keys": []map[string]string{
 				{"user": "user:oidc~admin", "relation": "admin", "object": serverObj},
+			},
+		},
+	})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/stores/%s/write", strings.TrimRight(fgaURL, "/"), storeID),
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 200 || resp.StatusCode == 201 {
+		return nil
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == 400 && bytes.Contains(b, []byte("already exists")) {
+		return nil
+	}
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, b)
+}
+
+// grantServiceIdentityProjectAdminIfMissing ensures the bootstrap service
+// identity (user:oidc~<userSub>) holds project_admin on project:<projectID>.
+// It uses a check-then-write pattern so re-runs don't spam blind writes:
+//
+//   - Skip entirely when projectID is the default lakekeeper project UUID
+//     (the server-admin tuple already covers it) or when fgaURL is empty
+//     (local-mode-without-FGA test path).
+//   - Issue an FGA Check. If allowed=true, return.
+//   - Otherwise Write the tuple. "Already exists" errors are tolerated
+//     (concurrent bootstraps, partial prior runs).
+//
+// This unblocks `pipeline-api admin lakekeeper-bootstrap --lakekeeper-project-id=<non-default>`
+// flows where the warehouse-create POST against a fresh project would
+// otherwise 403 because the service JWT (sub=pipeline-api-bootstrap) has no
+// project-scoped FGA tuples.
+func grantServiceIdentityProjectAdminIfMissing(ctx context.Context, fgaURL, apiKey, storeID, userSub, projectID string) error {
+	if fgaURL == "" {
+		return nil
+	}
+	if projectID == defaultLakekeeperProjectUUID {
+		return nil
+	}
+	has, err := checkProjectAdminTuple(ctx, fgaURL, apiKey, storeID, userSub, projectID)
+	if err != nil {
+		return fmt.Errorf("check service-identity project_admin on project:%s: %w", projectID, err)
+	}
+	fmt.Printf("  service project_admin: target=project:%s already=%v\n", projectID, has)
+	if has {
+		return nil
+	}
+	if err := writeProjectAdminTuple(ctx, fgaURL, apiKey, storeID, userSub, projectID); err != nil {
+		return fmt.Errorf("grant service-identity project_admin on project:%s: %w", projectID, err)
+	}
+	fmt.Printf("  service project_admin: written on project:%s\n", projectID)
+	return nil
+}
+
+// checkProjectAdminTuple issues an FGA Check for
+// (user:oidc~<userSub>, project_admin, project:<projectID>) via the raw
+// OpenFGA REST endpoint. Returns the boolean `allowed` from the response.
+func checkProjectAdminTuple(ctx context.Context, fgaURL, apiKey, storeID, userSub, projectID string) (bool, error) {
+	c := &http.Client{Timeout: 30 * time.Second}
+	body, _ := json.Marshal(map[string]any{
+		"tuple_key": map[string]string{
+			"user":     "user:oidc~" + userSub,
+			"relation": "project_admin",
+			"object":   "project:" + projectID,
+		},
+	})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/stores/%s/check", strings.TrimRight(fgaURL, "/"), storeID),
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, b)
+	}
+	var out struct {
+		Allowed bool `json:"allowed"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, err
+	}
+	return out.Allowed, nil
+}
+
+// writeProjectAdminTuple writes (user:oidc~<userSub>, project_admin,
+// project:<projectID>) via the raw OpenFGA REST Write endpoint. A 400
+// "already exists" response is treated as success (idempotent).
+func writeProjectAdminTuple(ctx context.Context, fgaURL, apiKey, storeID, userSub, projectID string) error {
+	c := &http.Client{Timeout: 30 * time.Second}
+	body, _ := json.Marshal(map[string]any{
+		"writes": map[string]any{
+			"tuple_keys": []map[string]string{
+				{
+					"user":     "user:oidc~" + userSub,
+					"relation": "project_admin",
+					"object":   "project:" + projectID,
+				},
 			},
 		},
 	})

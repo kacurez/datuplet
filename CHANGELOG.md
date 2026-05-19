@@ -6,6 +6,76 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-19
+
+### Fixed
+
+- **`pipeline-api admin lakekeeper-bootstrap` 403 on non-default projects.**
+  Bootstrap now grants the service identity (`oidc~pipeline-api-bootstrap`)
+  `project_admin` on the target project via a check-then-write FGA tuple
+  before issuing the warehouse-create POST. Without this, Lakekeeper rejected
+  the create as forbidden because the bootstrap JWT had no project-scoped
+  tuple. Idempotent: re-runs skip the write when the tuple already exists.
+  Block is skipped entirely for the default project (`00000000-...`) and
+  when `OPENFGA_URL` is empty (local-mode-without-FGA).
+- **`lakekeeperWarehouseExists` probe now scopes by `--lakekeeper-project-id`.**
+  Adds the `x-project-id` HTTP header to the existence probe so bootstrap
+  no longer false-positives "warehouse already exists" when the warehouse
+  name happens to exist in a different project. Error messages on probe
+  failure now include the project ID for diagnostics.
+- **`gcsSpec.Validate` rejects `--gcs-credential-type=system-identity` +
+  `--sts-enabled=false` up front.** Previously surfaced ~15 min later as
+  a confusing runtime "lakekeeper response missing gcs.oauth2.token" at
+  the first TableCommit. Service-account-key mode + `--sts-enabled=false`
+  remains valid (Lakekeeper returns the static key fields without STS
+  downscoping).
+- **`pipeline-api admin attach-warehouse --type=gcs` now works.** The
+  v0.2.0 stub returned `"not yet supported"`; the canonical 5-step
+  bootstrap (`lakekeeper-bootstrap` → `create-user` → `create-project` →
+  `attach-warehouse` → `grant`) is now usable for GCS warehouses.
+  Implementation: `pkg/pipelineapi/lakekeeper/manager.go` gains
+  `GCSWarehouseProfile` + `EnsureGCSWarehouseInProject` siblings to the
+  existing `S3WarehouseProfile` + `EnsureS3WarehouseInProject` (renamed
+  from `EnsureWarehouseInProject`).
+- **TableCommit panic on first GCS write.** `*datupleticeio.gcsIO` now
+  implements `iceio.WriteFileIO` (Create + WriteFile + ReadFrom on the
+  returned writer), unblocking iceberg-go's snapshot-manifest +
+  metadata.json write path. Latent v0.2.0 bug — no GCS `PipelineRun`
+  could ever reach a successful TableCommit before this. Surfaced by
+  live deploy on 2026-05-19; root-cause confirmed via deepwiki against
+  iceberg-go upstream.
+- **Observer silently dropped run-status updates on clusters with large
+  resourceVersions.** `store.UpdateRunPhase` SQL now casts the
+  `observed_rv` parameter as `$7::bigint`, forcing pgx's protocol-level
+  Describe to type it as bigint instead of inferring int4 from the
+  `$7 = 0` literal comparison. Latent v0.2.0 bug — manifested on GKE
+  clusters whose etcd hybrid-clock RVs exceed 2^31 (effectively all
+  long-running clusters). Effect was silent failure: `pipeline-observer`
+  ran fine but UI showed runs stuck in `Pending` forever.
+- **OpenFGA connection-pool default starved CNPG.** Capped
+  `openfga.datastore.maxOpenConns=10` / `maxIdleConns=5` in
+  `charts/datuplet-infra/values.yaml`. Upstream OpenFGA chart defaults
+  to 30 open conns per replica; at 3 replicas that's 90 of CNPG's 97
+  non-superuser slots, starving migrations and lakekeeper. New caps
+  keep cluster-wide OpenFGA usage at ≤30 across replicas, leaving room
+  for the rest of the datuplet stack.
+- **`scripts/register.sh` handles `--warehouse-type=gcs`.** New
+  `--gcs-bucket`, `--gcs-credential-type`, `--gcs-key-prefix`, and
+  `--gcs-sa-key-file` flags; fail-fast validation rejects missing
+  bucket, unknown credential types, `service-account-key` without a key
+  file, and `system-identity` + `--no-sts` (mirrors the in-binary
+  validator).
+
+### Changed
+
+- `pkg/pipelineapi/lakekeeper.EnsureWarehouseInProject` renamed to
+  `EnsureS3WarehouseInProject`. New `EnsureGCSWarehouseInProject`
+  sibling. No compat alias kept — callers in `cmd/pipeline-api/` and
+  `tests/e2e/framework/` were updated in the same change.
+- `cmd/pipeline-api admin attach-warehouse` accepts a new
+  `--gcs-credential-type` flag (default: `system-identity`); existing
+  S3 invocations are unaffected.
+
 ## [0.2.0] — 2026-05-18
 
 ### Added

@@ -152,10 +152,10 @@ func UpdateRunPhase(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, opts 
 		    message = $4,
 		    started_at = COALESCE($5, started_at),
 		    completed_at = COALESCE($6, completed_at),
-		    observed_rv = GREATEST(observed_rv, $7),
+		    observed_rv = GREATEST(observed_rv, $7::bigint),
 		    updated_at = now()
 		  WHERE id = $1
-		    AND ($7 = 0 OR $7 > observed_rv)`,
+		    AND ($7::bigint = 0 OR $7::bigint > observed_rv)`,
 		id, opts.Phase, opts.CurrentStage, opts.Message, opts.StartedAt, opts.CompletedAt, opts.ObservedRV,
 	)
 	if err != nil {

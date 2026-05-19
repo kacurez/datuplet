@@ -14,10 +14,10 @@ import (
 )
 
 // adminAttachWarehouse associates an existing Datuplet project with an
-// existing lakekeeper warehouse by calling EnsureWarehouseInProject. The
-// warehouse must already exist in lakekeeper (created by
-// `admin lakekeeper-bootstrap` first) OR will be created inside the
-// per-project lakekeeper Project if it doesn't exist yet.
+// existing lakekeeper warehouse by calling EnsureS3WarehouseInProject or
+// EnsureGCSWarehouseInProject. The warehouse must already exist in
+// lakekeeper (created by `admin lakekeeper-bootstrap` first) OR will be
+// created inside the per-project lakekeeper Project if it doesn't exist yet.
 //
 // This is the single-purpose interface for wiring a project to a warehouse.
 //
@@ -43,10 +43,12 @@ func adminAttachWarehouse(ctx context.Context, pool *pgxpool.Pool, args []string
 	s3AccessKey := fs.String("s3-access-key", "", "S3 access key (default from S3_ACCESS_KEY env)")
 	s3SecretKey := fs.String("s3-secret-key", "", "S3 secret key (default from S3_SECRET_KEY env)")
 
-	// GCS flags.
+	// GCS flags — mirror lakekeeper-bootstrap (admin_lakekeeper.go).
 	gcsBucket := fs.String("gcs-bucket", "", "GCS bucket name (required when --type=gcs)")
 	gcsKeyPrefix := fs.String("gcs-key-prefix", "", "GCS key prefix")
 	gcsSAKeyFile := fs.String("gcs-sa-key-file", "", "Path to a Google service-account key JSON file (default from GCS_SA_KEY_FILE env)")
+	gcsCredType := fs.String("gcs-credential-type", "system-identity",
+		"GCS credential type: 'system-identity' (default; Workload Identity Federation, no key file) or 'service-account-key' (static SA JSON key; needs --gcs-sa-key-file)")
 
 	// Pass our own FlagSet through dialProjectProvisioning so it adds its
 	// signing-key / lakekeeper-url / openfga flags on the same set. One
@@ -76,27 +78,24 @@ func adminAttachWarehouse(ctx context.Context, pool *pgxpool.Pool, args []string
 		return fmt.Errorf("project %q has no lakekeeper_project_id — was it created via `admin create-project`?", *projectName)
 	}
 
-	// Build the warehouse profile from flags / env vars.
-	profile, err := attachWarehouseProfile(*whType, attachWarehouseS3Opts{
-		bucket:      *bucket,
-		region:      *s3Region,
-		endpoint:    *s3Endpoint,
-		pathStyle:   *s3PathStyle,
-		stsEnabled:  *s3StsEnabled,
-		accessKey:   *s3AccessKey,
-		secretKey:   *s3SecretKey,
-	}, attachWarehouseGCSOpts{
-		bucket:    *gcsBucket,
-		keyPrefix: *gcsKeyPrefix,
-		saKeyFile: *gcsSAKeyFile,
-		// shared --sts-enabled flag (mirrors lakekeeper-bootstrap behaviour)
-		stsEnabled: *s3StsEnabled,
-	})
-	if err != nil {
-		return fmt.Errorf("warehouse profile: %w", err)
-	}
-
-	if err := env.lkManager.EnsureWarehouseInProject(ctx, proj.LakekeeperProjectID, *warehouseName, profile); err != nil {
+	if err := attachWarehouse(ctx, env.lkManager, proj.LakekeeperProjectID, *warehouseName, *whType,
+		attachWarehouseS3Opts{
+			bucket:     *bucket,
+			region:     *s3Region,
+			endpoint:   *s3Endpoint,
+			pathStyle:  *s3PathStyle,
+			stsEnabled: *s3StsEnabled,
+			accessKey:  *s3AccessKey,
+			secretKey:  *s3SecretKey,
+		},
+		attachWarehouseGCSOpts{
+			bucket:    *gcsBucket,
+			keyPrefix: *gcsKeyPrefix,
+			saKeyFile: *gcsSAKeyFile,
+			credType:  *gcsCredType,
+			// shared --sts-enabled flag (mirrors lakekeeper-bootstrap behaviour)
+			stsEnabled: *s3StsEnabled,
+		}); err != nil {
 		return fmt.Errorf("attach warehouse: %w", err)
 	}
 	fmt.Printf("Project %s (lakekeeper-id=%s) attached to warehouse %s.\n",
@@ -110,15 +109,34 @@ type attachWarehouseS3Opts struct {
 }
 
 type attachWarehouseGCSOpts struct {
-	bucket, keyPrefix, saKeyFile string
-	stsEnabled                   bool
+	bucket, keyPrefix, saKeyFile, credType string
+	stsEnabled                             bool
 }
 
-// attachWarehouseProfile constructs the lakekeeper.S3WarehouseProfile from
-// the parsed flags. Only S3 is supported today (EnsureWarehouseInProject
-// accepts S3WarehouseProfile); GCS support via EnsureWarehouseInProject is
-// a future slice.
-func attachWarehouseProfile(whType string, s3 attachWarehouseS3Opts, gcs attachWarehouseGCSOpts) (lakekeeper.S3WarehouseProfile, error) {
+// warehouseEnsurer is the subset of lakekeeper.Manager used by
+// attachWarehouse. The seam keeps the function testable without standing
+// up an httptest server for the CLI-layer unit tests.
+type warehouseEnsurer interface {
+	EnsureS3WarehouseInProject(ctx context.Context, projectID, warehouseName string, profile lakekeeper.S3WarehouseProfile) error
+	EnsureGCSWarehouseInProject(ctx context.Context, projectID, warehouseName string, profile lakekeeper.GCSWarehouseProfile) error
+}
+
+// attachWarehouse builds the per-type warehouse profile from the parsed
+// flags and dispatches to the matching EnsureXxxWarehouseInProject on the
+// lakekeeper Manager. Splitting profile-build + Ensure into one
+// type-dispatched function keeps the caller flat and avoids leaking the
+// per-flavor profile struct types out of this file.
+//
+// GCS env fallbacks mirror admin_lakekeeper.go (GCS_SA_KEY_FILE,
+// GCS_CREDENTIAL_TYPE). S3 fallbacks (S3_ENDPOINT, S3_ACCESS_KEY,
+// S3_SECRET_KEY) are unchanged.
+func attachWarehouse(
+	ctx context.Context,
+	mgr warehouseEnsurer,
+	projectID, warehouseName, whType string,
+	s3 attachWarehouseS3Opts,
+	gcs attachWarehouseGCSOpts,
+) error {
 	switch whType {
 	case "s3":
 		if s3.endpoint == "" {
@@ -131,28 +149,63 @@ func attachWarehouseProfile(whType string, s3 attachWarehouseS3Opts, gcs attachW
 			s3.secretKey = os.Getenv("S3_SECRET_KEY")
 		}
 		if s3.endpoint == "" || s3.accessKey == "" || s3.secretKey == "" {
-			return lakekeeper.S3WarehouseProfile{}, fmt.Errorf("S3 endpoint/access-key/secret-key are all required (flags or env)")
+			return fmt.Errorf("S3 endpoint/access-key/secret-key are all required (flags or env)")
 		}
 		if !strings.HasPrefix(s3.endpoint, "http://") && !strings.HasPrefix(s3.endpoint, "https://") {
 			s3.endpoint = "http://" + s3.endpoint
 		}
 		pathStyle := s3.pathStyle
-		return lakekeeper.S3WarehouseProfile{
+		profile := lakekeeper.S3WarehouseProfile{
 			Bucket:    s3.bucket,
 			Region:    s3.region,
 			Endpoint:  s3.endpoint,
 			AccessKey: s3.accessKey,
 			SecretKey: s3.secretKey,
 			PathStyle: &pathStyle,
-		}, nil
+		}
+		return mgr.EnsureS3WarehouseInProject(ctx, projectID, warehouseName, profile)
+
 	case "gcs":
-		// EnsureWarehouseInProject only accepts S3WarehouseProfile today.
-		// GCS attach-warehouse is deferred; surface a clear error so the
-		// operator uses lakekeeper-bootstrap for GCS warehouses and calls
-		// this subcommand only for S3.
-		_ = gcs
-		return lakekeeper.S3WarehouseProfile{}, fmt.Errorf("--type=gcs is not yet supported by attach-warehouse (use lakekeeper-bootstrap for GCS warehouses)")
+		if gcs.bucket == "" {
+			return fmt.Errorf("--gcs-bucket is required when --type=gcs")
+		}
+		credType := gcs.credType
+		if credType == "" {
+			credType = os.Getenv("GCS_CREDENTIAL_TYPE")
+		}
+		if credType == "" {
+			credType = "system-identity"
+		}
+		profile := lakekeeper.GCSWarehouseProfile{
+			Bucket:         gcs.bucket,
+			KeyPrefix:      gcs.keyPrefix,
+			StsEnabled:     gcs.stsEnabled,
+			CredentialType: credType,
+		}
+		switch credType {
+		case "", "system-identity":
+			if gcs.saKeyFile != "" || os.Getenv("GCS_SA_KEY_FILE") != "" {
+				return fmt.Errorf("--gcs-credential-type=system-identity cannot be combined with --gcs-sa-key-file/GCS_SA_KEY_FILE")
+			}
+		case "service-account-key":
+			path := gcs.saKeyFile
+			if path == "" {
+				path = os.Getenv("GCS_SA_KEY_FILE")
+			}
+			if path == "" {
+				return fmt.Errorf("--gcs-credential-type=service-account-key requires --gcs-sa-key-file (or GCS_SA_KEY_FILE)")
+			}
+			saBytes, err := os.ReadFile(path)
+			if err != nil {
+				return fmt.Errorf("read GCS service account key file: %w", err)
+			}
+			profile.ServiceAccountKeyJSON = string(saBytes)
+		default:
+			return fmt.Errorf("unknown --gcs-credential-type %q (want system-identity or service-account-key)", credType)
+		}
+		return mgr.EnsureGCSWarehouseInProject(ctx, projectID, warehouseName, profile)
+
 	default:
-		return lakekeeper.S3WarehouseProfile{}, fmt.Errorf("unknown --type %q (want s3 or gcs)", whType)
+		return fmt.Errorf("unknown --type %q (want s3 or gcs)", whType)
 	}
 }

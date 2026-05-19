@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/google/uuid"
@@ -195,6 +196,53 @@ func TestUpdateRunPhase_CancelPathIgnoresRVGuard(t *testing.T) {
 	}
 	if applied {
 		t.Fatal("rv=400 should still be filtered after cancel — observed_rv must be preserved")
+	}
+}
+
+// TestUpdateRunPhase_LargeObservedRV pins the bigint cast on the $7
+// parameter (RFC 019 v0.2.1 Slice 9). Without `$7::bigint`, pgx infers
+// int4 from the `$7 = 0` literal context and fails the protocol-level
+// encode for any value > math.MaxInt32. GKE etcd issues hybrid-clock
+// resourceVersions in the 1.7e18 range; the 2026-05-19 live deploy hit
+// ~1.78e18. We test the smallest int4-overflow value to make the
+// regression boundary self-documenting.
+func TestUpdateRunPhase_LargeObservedRV(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
+		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
+	})
+
+	// Smallest value that exceeds int4 (the regression boundary).
+	const largeRV int64 = int64(math.MaxInt32) + 1
+
+	applied, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase:      "Running",
+		ObservedRV: largeRV,
+	})
+	if err != nil {
+		t.Fatalf("UpdateRunPhase with large RV: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected applied=true on first write")
+	}
+
+	// Confirm observed_rv persisted unchanged. Run/GetRunByID don't
+	// surface the column, so probe via the guard: a stale rv probe just
+	// below largeRV must be filtered (applied=false). If observed_rv
+	// were silently truncated/zeroed, the probe would succeed.
+	applied, err = store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase: "Running", ObservedRV: largeRV - 1,
+	})
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if applied {
+		t.Fatalf("probe at largeRV-1 should be filtered; observed_rv did not persist as %d", largeRV)
 	}
 }
 
