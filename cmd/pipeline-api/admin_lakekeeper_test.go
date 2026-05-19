@@ -425,6 +425,89 @@ func TestBootstrapGrantsServiceIdentityProjectAdmin(t *testing.T) {
 	})
 }
 
+// TestLakekeeperWarehouseExistsScopedByProject verifies that
+// lakekeeperWarehouseExists scopes the GET /management/v1/warehouse probe by
+// the caller-supplied projectID via the `x-project-id` header. Without this
+// scoping, a warehouse named "datuplet" in the default project would yield a
+// false-positive "already exists" on a re-run against a non-default project
+// — which is exactly the live-test bug Slice 2 fixes.
+func TestLakekeeperWarehouseExistsScopedByProject(t *testing.T) {
+	const (
+		defaultProjectID    = "00000000-0000-0000-0000-000000000000"
+		nonDefaultProjectID = "019e3f40-test-uuid"
+	)
+
+	var seenProjectIDs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/management/v1/warehouse") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		pid := r.Header.Get("x-project-id")
+		seenProjectIDs = append(seenProjectIDs, pid)
+		w.Header().Set("Content-Type", "application/json")
+		switch pid {
+		case defaultProjectID:
+			_, _ = w.Write([]byte(`{"warehouses":[{"name":"datuplet"}]}`))
+		case nonDefaultProjectID:
+			_, _ = w.Write([]byte(`{"warehouses":[]}`))
+		default:
+			t.Errorf("unexpected x-project-id header: %q", pid)
+			w.WriteHeader(400)
+		}
+	}))
+	defer srv.Close()
+
+	c := &http.Client{}
+
+	// Non-default project: "datuplet" must NOT be reported as existing.
+	exists, err := lakekeeperWarehouseExists(c, srv.URL, "fake-jwt", nonDefaultProjectID, "datuplet")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Fatalf("warehouseExists(non-default, datuplet) = true; want false (the warehouse only exists in the default project)")
+	}
+
+	// Default project: "datuplet" IS present.
+	exists, err = lakekeeperWarehouseExists(c, srv.URL, "fake-jwt", defaultProjectID, "datuplet")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Fatalf("warehouseExists(default, datuplet) = false; want true")
+	}
+
+	// Header presence assertion: every call must have carried x-project-id.
+	if len(seenProjectIDs) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(seenProjectIDs))
+	}
+	if seenProjectIDs[0] != nonDefaultProjectID || seenProjectIDs[1] != defaultProjectID {
+		t.Fatalf("x-project-id headers = %v; want [%s %s]", seenProjectIDs, nonDefaultProjectID, defaultProjectID)
+	}
+}
+
+// TestLakekeeperWarehouseExistsErrorIncludesProjectID locks the diagnostic
+// contract: when the probe fails, the error message must include the project
+// ID so the operator knows which project produced the failure.
+func TestLakekeeperWarehouseExistsErrorIncludesProjectID(t *testing.T) {
+	const projectID = "019e3f40-error-uuid"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden"))
+	}))
+	defer srv.Close()
+
+	_, err := lakekeeperWarehouseExists(&http.Client{}, srv.URL, "fake-jwt", projectID, "datuplet")
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), projectID) {
+		t.Fatalf("error %q must contain projectID %q", err.Error(), projectID)
+	}
+}
+
 // TestPostJSON_WarehouseError_RedactsBody verifies that when redactBodyOnError
 // is true, the response body (which lakekeeper may echo from the request, e.g.
 // an SA key JSON) is not included in the returned error string.

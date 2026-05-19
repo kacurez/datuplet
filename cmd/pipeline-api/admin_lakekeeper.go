@@ -427,8 +427,10 @@ Flags:
 		}
 	}
 
-	// Step 3: warehouse exists probe.
-	exists, err := lakekeeperWarehouseExists(httpc, base, jwt, *warehouseName)
+	// Step 3: warehouse exists probe. Scoped by --lakekeeper-project-id so a
+	// warehouse of the same name in the default project doesn't false-positive
+	// the probe for a non-default-project bootstrap.
+	exists, err := lakekeeperWarehouseExists(httpc, base, jwt, *lakekeeperProjectID, *warehouseName)
 	if err != nil {
 		return fmt.Errorf("probe warehouse: %w", err)
 	}
@@ -476,14 +478,20 @@ func lakekeeperBootstrapped(c *http.Client, base, jwt string) (bool, error) {
 	return info.Bootstrapped, nil
 }
 
-// lakekeeperWarehouseExists lists warehouses and returns true iff one with
-// the given name is registered.
-func lakekeeperWarehouseExists(c *http.Client, base, jwt, name string) (bool, error) {
+// lakekeeperWarehouseExists lists warehouses in the given lakekeeper project
+// and returns true iff one with the given name is registered there.
+//
+// The `x-project-id` header is REQUIRED: without it lakekeeper lists
+// warehouses in the default project regardless of caller intent, which
+// produces a false-positive "already exists" when re-bootstrapping against
+// a non-default project (RFC 019 v0.2.1 fix).
+func lakekeeperWarehouseExists(c *http.Client, base, jwt, projectID, name string) (bool, error) {
 	req, err := http.NewRequest("GET", base+"/management/v1/warehouse", nil)
 	if err != nil {
 		return false, fmt.Errorf("build warehouse request: %w", err)
 	}
 	req.Header.Set("authorization", "Bearer "+jwt)
+	req.Header.Set("x-project-id", projectID)
 	resp, err := c.Do(req)
 	if err != nil {
 		return false, err
@@ -491,7 +499,7 @@ func lakekeeperWarehouseExists(c *http.Client, base, jwt, name string) (bool, er
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+		return false, fmt.Errorf("project %s: HTTP %d: %s", projectID, resp.StatusCode, body)
 	}
 	var list struct {
 		Warehouses []struct {
@@ -499,7 +507,7 @@ func lakekeeperWarehouseExists(c *http.Client, base, jwt, name string) (bool, er
 		} `json:"warehouses"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return false, err
+		return false, fmt.Errorf("project %s: decode warehouses: %w", projectID, err)
 	}
 	for _, w := range list.Warehouses {
 		if w.Name == name {
