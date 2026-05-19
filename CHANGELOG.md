@@ -37,6 +37,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `GCSWarehouseProfile` + `EnsureGCSWarehouseInProject` siblings to the
   existing `S3WarehouseProfile` + `EnsureS3WarehouseInProject` (renamed
   from `EnsureWarehouseInProject`).
+- **TableCommit panic on first GCS write.** `*datupleticeio.gcsIO` now
+  implements `iceio.WriteFileIO` (Create + WriteFile + ReadFrom on the
+  returned writer), unblocking iceberg-go's snapshot-manifest +
+  metadata.json write path. Latent v0.2.0 bug — no GCS `PipelineRun`
+  could ever reach a successful TableCommit before this. Surfaced by
+  live deploy on 2026-05-19; root-cause confirmed via deepwiki against
+  iceberg-go upstream.
 - **`scripts/register.sh` handles `--warehouse-type=gcs`.** New
   `--gcs-bucket`, `--gcs-credential-type`, `--gcs-key-prefix`, and
   `--gcs-sa-key-file` flags; fail-fast validation rejects missing

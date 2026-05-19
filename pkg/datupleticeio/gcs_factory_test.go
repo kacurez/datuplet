@@ -1,9 +1,11 @@
 package datupleticeio
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -11,8 +13,101 @@ import (
 	"time"
 
 	iceio "github.com/apache/iceberg-go/io"
+	"gocloud.dev/blob/memblob"
 	"golang.org/x/oauth2"
 )
+
+// newTestGcsIO returns a *gcsIO backed by memblob (in-memory) so the
+// WriteFileIO path can be exercised end-to-end without touching the
+// network. Use a fixed bucketName so preprocess() can strip the prefix.
+func newTestGcsIO(t *testing.T) *gcsIO {
+	t.Helper()
+	b := memblob.OpenBucket(nil)
+	t.Cleanup(func() { _ = b.Close() })
+	return &gcsIO{
+		bucket:     b,
+		bucketName: "test-bucket",
+		ctx:        context.Background(),
+	}
+}
+
+func TestGcsIOCreateRoundTrip(t *testing.T) {
+	g := newTestGcsIO(t)
+	f, err := g.Create("gs://test-bucket/round-trip/key.bin")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := f.Write([]byte("hello world")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := g.Open("gs://test-bucket/round-trip/key.bin")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != "hello world" {
+		t.Fatalf("round-trip mismatch: got %q", got)
+	}
+}
+
+func TestGcsIOWriteFileByteSlice(t *testing.T) {
+	g := newTestGcsIO(t)
+	payload := []byte("byte-slice payload")
+	if err := g.WriteFile("gs://test-bucket/wf/file.bin", payload); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	r, err := g.Open("gs://test-bucket/wf/file.bin")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+	got, _ := io.ReadAll(r)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("got %q want %q", got, payload)
+	}
+}
+
+// TestGcsIOCreateReadFromCopy validates that *gcsWriteFile's ReadFrom
+// delegates to io.Copy so iceberg-go's chunked-write callers (which
+// pipe data through io.Copy) work without an intermediate Write-loop.
+func TestGcsIOCreateReadFromCopy(t *testing.T) {
+	g := newTestGcsIO(t)
+	f, err := g.Create("gs://test-bucket/readfrom/key.bin")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	payload := bytes.Repeat([]byte("abc"), 4096) // 12 KiB, exceeds any single-Write buffer
+	// Lock in the io.ReaderFrom contract on iceio.FileWriter — callers like
+	// io.Copy dispatch through this assertion, so the test must too.
+	rf, ok := f.(io.ReaderFrom)
+	if !ok {
+		t.Fatal("Create-returned FileWriter must implement io.ReaderFrom")
+	}
+	n, err := rf.ReadFrom(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if n != int64(len(payload)) {
+		t.Fatalf("ReadFrom returned n=%d want %d", n, len(payload))
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	r, _ := g.Open("gs://test-bucket/readfrom/key.bin")
+	defer r.Close()
+	got, _ := io.ReadAll(r)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("ReadFrom round-trip mismatch (len=%d, expected %d)", len(got), len(payload))
+	}
+}
 
 func TestInitRegistersGS(t *testing.T) {
 	// LoadFS with a gs:// URI must call OUR factory, not the upstream one.
