@@ -219,6 +219,57 @@ func readArrowIPCBytes(b []byte) (arrow.Record, *arrow.Schema, error) {
 	return rec, rdr.Schema(), nil
 }
 
+// TestParquetArrowReader_BatchSizeBoundsLargeRowGroups asserts the reader
+// splits a single source row group into Records of at-most BatchSize rows,
+// so wide-row files can't produce one oversize Arrow Record on read.
+func TestParquetArrowReader_BatchSizeBoundsLargeRowGroups(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "big-row-group.parquet")
+
+	// 10K rows in ONE row group forces the reader to split (10K > BatchSize).
+	const totalRows = 10000
+	values := make([]int64, totalRows)
+	for i := range values {
+		values[i] = int64(i)
+	}
+	writeFixtureParquet(t, file, values, totalRows /* rowsPerGroup = ALL in one group */)
+
+	schema := &SchemaInfo{Columns: []ColumnInfo{{Name: "id", Type: "int64", Nullable: false}}}
+	r, err := NewParquetArrowReader(context.Background(), []string{file}, schema)
+	if err != nil {
+		t.Fatalf("NewParquetArrowReader: %v", err)
+	}
+	defer r.Close()
+
+	const expectedBatchCap = 4096 // must match the constant in openNextFile
+
+	var totalSeen int64
+	chunkCount := 0
+	for {
+		chunk, err := r.ReadChunk()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadChunk: %v", err)
+		}
+		if chunk.RowsInChunk > expectedBatchCap {
+			t.Errorf("chunk #%d carries %d rows; want <= %d (BatchSize cap)",
+				chunkCount, chunk.RowsInChunk, expectedBatchCap)
+		}
+		totalSeen += chunk.RowsInChunk
+		chunkCount++
+	}
+	if totalSeen != totalRows {
+		t.Errorf("totalSeen = %d, want %d (no rows lost during split)", totalSeen, totalRows)
+	}
+	// 10000 rows / 4096 = 2.44, so expect ≥ 3 chunks; the fix would be
+	// vacuous if everything still fit in one record.
+	if chunkCount < 3 {
+		t.Errorf("chunkCount = %d, want >= 3 (proves splitting actually happens)", chunkCount)
+	}
+}
+
 // writeFixtureParquet writes a single-column int64 parquet file with the given values, using the requested rowsPerGroup row-group size.
 func writeFixtureParquet(t *testing.T, path string, values []int64, rowsPerGroup int) {
 	t.Helper()
