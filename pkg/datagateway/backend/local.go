@@ -312,6 +312,27 @@ func (b *LocalBackend) PutObject(ctx context.Context, storagePath string, data [
 	return nil
 }
 
+// OpenObjectWriter opens a streaming writer for the given storage path.
+// The returned writer is an os.File; bytes flow directly to disk via the OS
+// page cache — no in-process buffering of the full payload. Detected via
+// the optional objectStreamingBackend interface in pkg/datagateway/buffer
+// and used by BufferManager to avoid materializing whole parquet files.
+func (b *LocalBackend) OpenObjectWriter(ctx context.Context, storagePath string) (io.WriteCloser, error) {
+	localPath := b.toLocalPath(storagePath)
+	fullPath := filepath.Join(b.config.DataDir, localPath)
+
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %s: %w", fullPath, err)
+	}
+	return f, nil
+}
+
 func (b *LocalBackend) RemoveAll(ctx context.Context, prefix string) error {
 	// Strip any leading slash so filepath.Join doesn't treat it as absolute.
 	cleanPrefix := filepath.Clean(strings.TrimPrefix(prefix, "/"))

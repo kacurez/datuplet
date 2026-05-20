@@ -14,6 +14,14 @@ type BackendWriterFactory struct {
 	backend backend.StorageBackend
 }
 
+// objectStreamingBackend is an optional capability: backends that
+// implement it expose a streaming WriteCloser so callers (parquet writer)
+// do not have to materialize the full object in memory before upload.
+// All three production backends (gcs, minio/s3, local) can implement this.
+type objectStreamingBackend interface {
+	OpenObjectWriter(ctx context.Context, path string) (io.WriteCloser, error)
+}
+
 // NewBackendWriterFactory creates a new backend writer factory.
 func NewBackendWriterFactory(ctx context.Context, be backend.StorageBackend) *BackendWriterFactory {
 	return &BackendWriterFactory{
@@ -23,18 +31,19 @@ func NewBackendWriterFactory(ctx context.Context, be backend.StorageBackend) *Ba
 }
 
 // Create implements WriterFactory for backend storage.
-// The path is relative to the backend's base path (e.g., "tablename/data/uuid/file001.parquet").
+// If the backend supports objectStreamingBackend, Create returns its
+// streaming WriteCloser directly (~one chunk peak memory). Otherwise it
+// falls back to buffering the full object before PutObject.
 func (f *BackendWriterFactory) Create(path string) (io.WriteCloser, error) {
-	// Use the backend's PutObject method to create a writer for the given path
-	// We need to return an io.WriteCloser that buffers the data and uploads on Close
-
+	if sb, ok := f.backend.(objectStreamingBackend); ok {
+		return sb.OpenObjectWriter(f.ctx, path)
+	}
 	writer := &backendWriter{
 		ctx:     f.ctx,
 		backend: f.backend,
 		path:    path,
-		buf:     make([]byte, 0, 1024*1024), // 1MB initial buffer
+		buf:     make([]byte, 0, 1024*1024),
 	}
-
 	return writer, nil
 }
 
