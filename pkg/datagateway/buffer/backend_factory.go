@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/backend"
 )
@@ -36,24 +37,28 @@ func NewBackendWriterFactory(ctx context.Context, be backend.StorageBackend) *Ba
 // falls back to buffering the full object before PutObject.
 func (f *BackendWriterFactory) Create(path string) (io.WriteCloser, error) {
 	if sb, ok := f.backend.(objectStreamingBackend); ok {
+		debugf("backend.Create: path=%s mode=streaming", path)
 		return sb.OpenObjectWriter(f.ctx, path)
 	}
+	debugf("backend.Create: path=%s mode=buffered (legacy PutObject path)", path)
 	writer := &backendWriter{
-		ctx:     f.ctx,
-		backend: f.backend,
-		path:    path,
-		buf:     make([]byte, 0, 1024*1024),
+		ctx:        f.ctx,
+		backend:    f.backend,
+		path:       path,
+		buf:        make([]byte, 0, 1024*1024),
+		openedAt:   time.Now(),
 	}
 	return writer, nil
 }
 
 // backendWriter is an io.WriteCloser that buffers data and uploads to backend on Close.
 type backendWriter struct {
-	ctx     context.Context
-	backend backend.StorageBackend
-	path    string
-	buf     []byte
-	closed  bool
+	ctx      context.Context
+	backend  backend.StorageBackend
+	path     string
+	buf      []byte
+	closed   bool
+	openedAt time.Time // for debug-mode upload-duration accounting
 }
 
 // Write appends data to the buffer.
@@ -72,10 +77,23 @@ func (w *backendWriter) Close() error {
 	}
 	w.closed = true
 
+	// Debug-mode upload timing: useful for diagnosing slow GCS / network
+	// uploads on long runs. Captures both the buffered phase (which can
+	// hold up to TargetFileSize before this Close) and the upload itself.
+	bufBytes := len(w.buf)
+	bufferedFor := time.Since(w.openedAt)
+	uploadStart := time.Now()
+	debugf("backendWriter.Close: path=%s bytes=%d buffered_for=%s upload starting",
+		w.path, bufBytes, bufferedFor.Round(time.Millisecond))
+
 	// Upload the buffered data to the backend
 	if err := w.backend.PutObject(w.ctx, w.path, w.buf); err != nil {
+		debugf("backendWriter.Close: path=%s upload FAILED after %s: %v",
+			w.path, time.Since(uploadStart).Round(time.Millisecond), err)
 		return fmt.Errorf("failed to upload %s: %w", w.path, err)
 	}
+	debugf("backendWriter.Close: path=%s bytes=%d upload_took=%s",
+		w.path, bufBytes, time.Since(uploadStart).Round(time.Millisecond))
 
 	return nil
 }
