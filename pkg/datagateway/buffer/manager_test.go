@@ -14,14 +14,19 @@ import (
 func TestDefaultBufferConfig(t *testing.T) {
 	config := DefaultBufferConfig()
 
-	if config.BufferSize != 64*1024*1024 {
-		t.Errorf("Default BufferSize = %d, want 64MB", config.BufferSize)
+	// BufferSize was lowered from 64 MiB to 16 MiB in Phase 1 to bound
+	// gateway-sidecar peak heap. Combined with streaming uploads on the
+	// backend, this keeps the in-flight row group AND parquet open buffer
+	// at ~16 MiB instead of ~64 MiB. Operators can still override via
+	// Config.BufferSize for higher-throughput deployments.
+	if config.BufferSize != 16*1024*1024 {
+		t.Errorf("Default BufferSize = %d, want 16 MiB", config.BufferSize)
 	}
-	if config.RowGroupSize != 64*1024*1024 {
-		t.Errorf("Default RowGroupSize = %d, want 64MB", config.RowGroupSize)
+	if config.RowGroupSize != 16*1024*1024 {
+		t.Errorf("Default RowGroupSize = %d, want 16 MiB", config.RowGroupSize)
 	}
 	if config.TargetFileSize != 128*1024*1024 {
-		t.Errorf("Default TargetFileSize = %d, want 128MB", config.TargetFileSize)
+		t.Errorf("Default TargetFileSize = %d, want 128 MiB", config.TargetFileSize)
 	}
 	if config.FilePrefix != "part" {
 		t.Errorf("Default FilePrefix = %q, want 'part'", config.FilePrefix)

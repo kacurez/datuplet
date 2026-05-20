@@ -216,6 +216,22 @@ func (g *gcsBackend) PutObject(ctx context.Context, storagePath string, data []b
 	return nil
 }
 
+// OpenObjectWriter opens a streaming writer that uploads chunks to GCS as
+// the caller writes. Peak memory inside the storage.Writer is bounded by
+// ChunkSize (4 MiB here) rather than the entire object — this is the
+// streaming-upload optimization. Detected via the optional
+// objectStreamingBackend interface in pkg/datagateway/buffer.
+//
+// Setting ChunkSize=0 would disable resumable uploads (single-shot,
+// no retry); we deliberately keep ChunkSize > 0 so transient failures
+// retry per-chunk rather than re-uploading the whole file.
+func (g *gcsBackend) OpenObjectWriter(ctx context.Context, storagePath string) (io.WriteCloser, error) {
+	objectKey := g.toObjectKey(storagePath)
+	w := g.bkt.Object(objectKey).NewWriter(ctx)
+	w.ChunkSize = 4 * 1024 * 1024 // 4 MiB resumable-upload chunks
+	return w, nil
+}
+
 // Close releases the underlying storage client. Idempotent.
 func (g *gcsBackend) Close() error {
 	if g.client == nil {

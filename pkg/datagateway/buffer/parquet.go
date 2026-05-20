@@ -129,11 +129,21 @@ func NewStreamingParquetWriter(
 	// Wrap with counting writer
 	counter := newCountingWriter(file)
 
-	// Create Parquet writer properties
+	// Create Parquet writer properties.
+	//
+	// WithMaxRowGroupLength = 1M rows is a defensive cap. The primary
+	// row-group size control is BufferManager's flushRowGroup() boundary
+	// (driven by config.BufferSize, default 16 MiB). pqarrow's open row
+	// group is bounded by what we feed before NewBufferedRowGroup(), so
+	// memory stays ~BufferSize. The cap here only kicks in if a single
+	// record carries >1M rows (e.g., a misbehaving partition router),
+	// preventing unbounded pqarrow row-group buffer growth in that case.
+	// Matches the convention in pkg/datagateway/backend/parquet_stamp.go.
 	writerProps := parquet.NewWriterProperties(
 		parquet.WithCompression(config.Compression.toParquetCompression()),
 		parquet.WithDictionaryDefault(config.DictionaryEnabled),
 		parquet.WithStats(config.WriteStatistics),
+		parquet.WithMaxRowGroupLength(1024*1024),
 	)
 
 	// Create Arrow writer properties

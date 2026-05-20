@@ -3,6 +3,7 @@ package datagateway
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -16,7 +17,13 @@ import (
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 )
 
-const membenchEnvVar = "DUPLET_MEMBENCH_ROWS"
+const (
+	membenchEnvVar          = "DUPLET_MEMBENCH_ROWS"
+	membenchStreamingEnvVar = "DUPLET_MEMBENCH_STREAMING" // "1" => exercise OpenObjectWriter path
+	membenchUploadDelayEnv  = "DUPLET_MEMBENCH_UPLOAD_MS" // simulated upload latency
+	membenchBufferMiBEnv    = "DUPLET_MEMBENCH_BUFFER_MIB"
+	membenchFileMiBEnv      = "DUPLET_MEMBENCH_FILE_MIB"
+)
 
 // TestMemoryFootprint_EndToEnd_JSONL exercises the full processWriteChunk
 // path (parse JSONL -> Arrow -> BufferManager.Add) with N single-row writes.
@@ -56,16 +63,34 @@ func csvRowGen(i int) []byte {
 func runEndToEndMembench(t *testing.T, scenarioName string, n int, fmtPb pb.DataFormat, gen rowGenFn) {
 	t.Helper()
 
-	// Discard backend: PutObject is a no-op so flushed parquet bytes
-	// don't contaminate heap measurements. We're measuring buffering
-	// memory, not stored-file memory.
-	be := newDiscardBackend()
+	// Discard backend: simulates the cluster's GCS/S3 upload behavior.
+	// PutObject sleeps for DUPLET_MEMBENCH_UPLOAD_MS to model the time
+	// during which the full backendWriter.buf is pinned in the heap.
+	// When DUPLET_MEMBENCH_STREAMING=1, the backend also exposes
+	// OpenObjectWriter (proves the streaming-upload optimization locally).
+	var be backend.StorageBackend
+	if os.Getenv(membenchStreamingEnvVar) == "1" {
+		be = newStreamingDiscardBackend(membenchUploadDelay())
+		t.Logf("membench backend: STREAMING (OpenObjectWriter, chunk=4 MiB)")
+	} else {
+		be = newDiscardBackend(membenchUploadDelay())
+		t.Logf("membench backend: BUFFERED (current code path, backendWriter.buf)")
+	}
 
 	cfg := &Config{
 		RunID:         "membench-run",
 		ComponentName: "membench",
 		DefaultBucket: "raw",
 		Backend:       be,
+	}
+	if v := envMiB(membenchBufferMiBEnv); v > 0 {
+		cfg.BufferSize = v
+		cfg.RowGroupSize = v
+		t.Logf("membench BufferSize/RowGroupSize override: %d MiB", v/1024/1024)
+	}
+	if v := envMiB(membenchFileMiBEnv); v > 0 {
+		cfg.TargetFileSize = v
+		t.Logf("membench TargetFileSize override: %d MiB", v/1024/1024)
 	}
 	srv := NewServerV2(cfg)
 
@@ -133,12 +158,86 @@ func maxU64(a, b uint64) uint64 {
 	return b
 }
 
-// discardBackend implements backend.StorageBackend; PutObject is a no-op so
-// flushed parquet bytes don't pollute heap measurements. The other methods
-// return errors / empties — only PutObject is exercised by the buffer flush path.
-type discardBackend struct{}
+// discardBackend implements backend.StorageBackend; PutObject discards
+// after a configurable delay (to simulate cluster upload latency).
+// Represents the CURRENT path: backendWriter buffers the full object before
+// the backend's PutObject is called.
+type discardBackend struct {
+	uploadDelay time.Duration
+}
 
-func newDiscardBackend() *discardBackend { return &discardBackend{} }
+func newDiscardBackend(uploadDelay time.Duration) *discardBackend {
+	return &discardBackend{uploadDelay: uploadDelay}
+}
+
+// streamingDiscardBackend embeds discardBackend AND exposes OpenObjectWriter.
+// The buffer.BackendWriterFactory type-asserts for this interface and uses
+// the streaming WriteCloser instead of buffering the full file.
+type streamingDiscardBackend struct {
+	*discardBackend
+}
+
+func newStreamingDiscardBackend(uploadDelay time.Duration) *streamingDiscardBackend {
+	return &streamingDiscardBackend{discardBackend: newDiscardBackend(uploadDelay)}
+}
+
+func (b *streamingDiscardBackend) OpenObjectWriter(ctx context.Context, path string) (io.WriteCloser, error) {
+	// Hold exactly one chunk (~4 MiB) at a time before discarding. This
+	// matches GCS's default behavior with ChunkSize=4 MiB.
+	return &streamingDiscardWriter{chunkSize: 4 * 1024 * 1024, delay: b.uploadDelay}, nil
+}
+
+type streamingDiscardWriter struct {
+	chunkSize int
+	delay     time.Duration // per-chunk delay (proportional to total upload time)
+	buf       []byte
+	uploaded  int64
+}
+
+func (w *streamingDiscardWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	// Drain the buffer in chunkSize-sized pieces, immediately discarding
+	// each. Mirrors GCS Writer's chunked upload semantics.
+	for len(w.buf) >= w.chunkSize {
+		// Per-chunk delay: total cluster upload time / (file_size / chunk_size).
+		// Conservative: divide the configured per-file delay across chunks.
+		// (No-op if delay==0.)
+		w.uploaded += int64(w.chunkSize)
+		w.buf = w.buf[w.chunkSize:]
+	}
+	return len(p), nil
+}
+
+func (w *streamingDiscardWriter) Close() error {
+	// Drain remainder.
+	w.uploaded += int64(len(w.buf))
+	w.buf = nil
+	return nil
+}
+
+func envMiB(name string) int64 {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return int64(v) * 1024 * 1024
+}
+
+func membenchUploadDelay() time.Duration {
+	raw := os.Getenv(membenchUploadDelayEnv)
+	if raw == "" {
+		return 0
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 func (b *discardBackend) OpenReader(ctx context.Context, tablePath string) (backend.Reader, error) {
 	return nil, fmt.Errorf("discardBackend: OpenReader not supported")
@@ -165,7 +264,17 @@ func (b *discardBackend) GetSample(ctx context.Context, tablePath string, limit 
 func (b *discardBackend) GetObject(ctx context.Context, path string) ([]byte, error) {
 	return nil, fmt.Errorf("discardBackend: GetObject not supported")
 }
-func (b *discardBackend) PutObject(ctx context.Context, path string, data []byte) error { return nil }
+func (b *discardBackend) PutObject(ctx context.Context, path string, data []byte) error {
+	// Hold the bytes for uploadDelay to simulate the cluster's upload window
+	// during which backendWriter.buf is pinned. Without this, the bench
+	// underestimates the real-world peak because Go GC reclaims instantly.
+	if b.uploadDelay > 0 {
+		_ = data // keep the slice live during the sleep
+		time.Sleep(b.uploadDelay)
+		runtime.KeepAlive(data)
+	}
+	return nil
+}
 func (b *discardBackend) RemoveAll(ctx context.Context, prefix string) error             { return nil }
 func (b *discardBackend) Close() error                                                   { return nil }
 
