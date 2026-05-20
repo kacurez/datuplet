@@ -270,6 +270,97 @@ func TestParquetArrowReader_BatchSizeBoundsLargeRowGroups(t *testing.T) {
 	}
 }
 
+// TestParquetArrowReader_ByteBoundChunks_WideRows asserts the reader splits a
+// single pqarrow Record into multiple DataChunks when the Record's serialized
+// IPC payload would exceed targetChunkBytes. Wide-row schemas (e.g. 65 KiB/row
+// in prod) busted gRPC's 64 MiB MaxRecvMsgSize before this cap was introduced.
+func TestParquetArrowReader_ByteBoundChunks_WideRows(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "wide.parquet")
+
+	// 4096 rows × ~8 KiB/row ≈ 32 MiB raw payload, well over targetChunkBytes
+	// (16 MiB). Single row group so the reader can't sidestep splitting via
+	// row-group boundaries.
+	const totalRows = 4096
+	const rowBytes = 8 * 1024
+	payload := make([]byte, rowBytes)
+	for i := range payload {
+		payload[i] = 'a' + byte(i%26)
+	}
+	values := make([]string, totalRows)
+	for i := range values {
+		values[i] = string(payload)
+	}
+	writeWideStringParquet(t, file, values, totalRows /* one row group */)
+
+	schema := &SchemaInfo{Columns: []ColumnInfo{{Name: "blob", Type: "string", Nullable: false}}}
+	r, err := NewParquetArrowReader(context.Background(), []string{file}, schema)
+	if err != nil {
+		t.Fatalf("NewParquetArrowReader: %v", err)
+	}
+	defer r.Close()
+
+	var totalSeen int64
+	var maxChunkBytes int
+	chunkCount := 0
+	for {
+		chunk, err := r.ReadChunk()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadChunk: %v", err)
+		}
+		if len(chunk.Data) > targetChunkBytes {
+			t.Errorf("chunk #%d carries %d bytes; want <= %d (targetChunkBytes cap)",
+				chunkCount, len(chunk.Data), targetChunkBytes)
+		}
+		if len(chunk.Data) > maxChunkBytes {
+			maxChunkBytes = len(chunk.Data)
+		}
+		totalSeen += chunk.RowsInChunk
+		chunkCount++
+	}
+	if totalSeen != totalRows {
+		t.Errorf("totalSeen = %d, want %d (no rows lost across slices)", totalSeen, totalRows)
+	}
+	// 32 MiB / 16 MiB = 2 — the byte split must actually split. If we only
+	// got 1 chunk, the byte cap never engaged and this test would be vacuous.
+	if chunkCount < 2 {
+		t.Errorf("chunkCount = %d, want >= 2 (proves byte-bound splitting actually happens); maxChunkBytes=%d", chunkCount, maxChunkBytes)
+	}
+}
+
+// writeWideStringParquet writes a single-column utf8 parquet with the given
+// string values in one row group — used to exercise the byte-bound slicer.
+func writeWideStringParquet(t *testing.T, path string, values []string, rowsPerGroup int) {
+	t.Helper()
+	pool := memory.NewGoAllocator()
+	arrowSchema := arrow.NewSchema([]arrow.Field{{Name: "blob", Type: arrow.BinaryTypes.String, Nullable: false}}, nil)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create fixture: %v", err)
+	}
+	defer f.Close()
+	props := parquet.NewWriterProperties(parquet.WithMaxRowGroupLength(int64(rowsPerGroup)))
+	pqw, err := pqarrow.NewFileWriter(arrowSchema, f, props, pqarrow.DefaultWriterProps())
+	if err != nil {
+		t.Fatalf("pqarrow writer: %v", err)
+	}
+	defer pqw.Close()
+	builder := array.NewStringBuilder(pool)
+	for _, v := range values {
+		builder.Append(v)
+	}
+	arr := builder.NewArray()
+	defer arr.Release()
+	rec := array.NewRecord(arrowSchema, []arrow.Array{arr}, int64(len(values)))
+	defer rec.Release()
+	if err := pqw.Write(rec); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+}
+
 // writeFixtureParquet writes a single-column int64 parquet file with the given values, using the requested rowsPerGroup row-group size.
 func writeFixtureParquet(t *testing.T, path string, values []int64, rowsPerGroup int) {
 	t.Helper()
