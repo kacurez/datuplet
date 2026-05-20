@@ -198,6 +198,21 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 		}
 	}
 
+	// Capture writer stats BEFORE Close so we can report SDK-side activity
+	// (batch threshold, underlying POST count) even if Close fails. These
+	// numbers are the cheapest way to verify Phase 2a SDK batching is
+	// active: if writes/posts is ~10000 with non-zero threshold, batching
+	// kicked in; if the ratio is ~1 with threshold=0, batching is OFF
+	// (image probably wasn't rebuilt against the v0.2.4 SDK).
+	stats := writer.Stats()
+	elapsed := time.Since(startTime)
+	client.Log(ctx, "INFO", fmt.Sprintf( //nolint:errcheck
+		"table %q: writer stats rows=%d elapsed=%s writes=%d posts=%d batch_threshold=%d bytes_in=%d bytes_shipped=%d",
+		t.Name, rowsWritten, elapsed.Round(time.Millisecond),
+		stats.WriteCalls, stats.UnderlyingPosts, stats.BatchThreshold,
+		stats.BytesAccepted, stats.BytesShipped,
+	))
+
 	if _, err := writer.Close(ctx); err != nil {
 		return rowsWritten, fmt.Errorf("table %q: failed to close writer: %w", t.Name, err)
 	}

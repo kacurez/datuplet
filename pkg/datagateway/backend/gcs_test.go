@@ -31,25 +31,89 @@ func (f *fakeFetcher) Get(_ context.Context) (catalogwriter.Creds, error) {
 }
 
 func TestVendedTokenSourceReturnsBearer(t *testing.T) {
-	expiry := time.Now().Add(15 * time.Minute)
+	// Token's reported Expiry is capped to maxTokenCacheLifetime
+	// (60s) — see hotfix in gcs.go. The lakekeeper-reported 15-min
+	// expiry is NOT propagated as-is to the oauth2 layer; otherwise
+	// ReuseTokenSource would cache the token past the STS-side rotation
+	// cadence and PUTs on long uploads would 401.
+	lakekeeperExpiry := time.Now().Add(15 * time.Minute)
+	before := time.Now()
 	f := &fakeFetcher{c: catalogwriter.GCSCreds{
 		OAuthToken: "ya29.test",
 		Issued:     time.Now(),
-		Expires:    expiry,
+		Expires:    lakekeeperExpiry,
 	}}
 	ts := &vendedTokenSource{vc: f}
 	tok, err := ts.Token()
 	if err != nil {
 		t.Fatalf("Token() error: %v", err)
 	}
+	after := time.Now()
 	if tok.AccessToken != "ya29.test" {
 		t.Fatalf("AccessToken = %q, want ya29.test", tok.AccessToken)
 	}
 	if tok.TokenType != "Bearer" {
 		t.Fatalf("TokenType = %q, want Bearer", tok.TokenType)
 	}
-	if !tok.Expiry.Equal(expiry) {
-		t.Fatalf("Expiry = %v, want %v", tok.Expiry, expiry)
+	// Expiry must be within [before+cap, after+cap] — i.e. capped.
+	lo := before.Add(maxTokenCacheLifetime)
+	hi := after.Add(maxTokenCacheLifetime)
+	if tok.Expiry.Before(lo) || tok.Expiry.After(hi) {
+		t.Fatalf("Expiry = %v, want in [%v, %v] (capped to ~now+%s)",
+			tok.Expiry, lo, hi, maxTokenCacheLifetime)
+	}
+	if !tok.Expiry.Before(lakekeeperExpiry) {
+		t.Fatalf("Expiry = %v should be < lakekeeperExpiry = %v (cap not applied)",
+			tok.Expiry, lakekeeperExpiry)
+	}
+}
+
+// TestVendedTokenSourceShortExpiryNotInflated verifies that when lakekeeper
+// reports an Expires shorter than maxTokenCacheLifetime (rare but possible
+// if a credential is nearly expired by the time we receive it), we report
+// that shorter value as-is rather than inflating it to the cap.
+func TestVendedTokenSourceShortExpiryNotInflated(t *testing.T) {
+	shortExpiry := time.Now().Add(10 * time.Second) // < 60s cap
+	f := &fakeFetcher{c: catalogwriter.GCSCreds{
+		OAuthToken: "ya29.short",
+		Issued:     time.Now(),
+		Expires:    shortExpiry,
+	}}
+	ts := &vendedTokenSource{vc: f}
+	tok, err := ts.Token()
+	if err != nil {
+		t.Fatalf("Token() error: %v", err)
+	}
+	if !tok.Expiry.Equal(shortExpiry) {
+		t.Fatalf("Expiry = %v, want shortExpiry %v (no inflation)",
+			tok.Expiry, shortExpiry)
+	}
+}
+
+// TestVendedTokenSourceZeroExpiryUsesCap verifies defensive behavior when
+// lakekeeper reports a zero-time Expires (unset / parse failure): we MUST
+// still set a positive Expiry so oauth2.ReuseTokenSource doesn't treat the
+// token as eternally valid. Defaults to the cap.
+func TestVendedTokenSourceZeroExpiryUsesCap(t *testing.T) {
+	f := &fakeFetcher{c: catalogwriter.GCSCreds{
+		OAuthToken: "ya29.noexp",
+		Issued:     time.Now(),
+		// Expires deliberately zero
+	}}
+	ts := &vendedTokenSource{vc: f}
+	before := time.Now()
+	tok, err := ts.Token()
+	if err != nil {
+		t.Fatalf("Token() error: %v", err)
+	}
+	after := time.Now()
+	if tok.Expiry.IsZero() {
+		t.Fatal("Expiry must not be zero — ReuseTokenSource would treat it as eternal")
+	}
+	lo := before.Add(maxTokenCacheLifetime)
+	hi := after.Add(maxTokenCacheLifetime)
+	if tok.Expiry.Before(lo) || tok.Expiry.After(hi) {
+		t.Fatalf("Expiry = %v, want in [%v, %v] (cap)", tok.Expiry, lo, hi)
 	}
 }
 
