@@ -72,6 +72,22 @@ spec:
             - name: DATUPLET_RUN_TOLERATIONS_JSON
               value: {{ . | toJson | quote }}
             {{- end }}
+            # Per-PipelineRun gateway-sidecar instrumentation toggles.
+            # See values.yaml::pipelineOperator.gatewayInstrumentation.
+            {{- if .Values.pipelineOperator.gatewayInstrumentation.debug }}
+            - name: DATUPLET_GATEWAY_DEBUG
+              value: "true"
+            {{- end }}
+            {{- if .Values.pipelineOperator.gatewayInstrumentation.profiling.enabled }}
+            - name: DATUPLET_GATEWAY_PROFILING
+              value: "true"
+            - name: DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS
+              value: {{ .Values.pipelineOperator.gatewayInstrumentation.profiling.serverAddress | quote }}
+            {{- with .Values.pipelineOperator.gatewayInstrumentation.profiling.existingSecret }}
+            - name: DATUPLET_GATEWAY_PROFILING_SECRET_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
           resources:
             {{- toYaml .Values.pipelineOperator.resources | nindent 12 }}
           securityContext:

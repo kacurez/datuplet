@@ -376,6 +376,16 @@ func runGateway(mode, configPath, dataDir, addr, runTokenPath, podAnnotationsPat
 		fmt.Printf("Legacy outputs: %v\n", gatewayOutputs)
 	}
 
+	// Start Pyroscope continuous profiling when DATUPLET_GATEWAY_PROFILING is set.
+	// Returns nil when disabled. Defer the stop so it runs on graceful shutdown.
+	if stopProfiling := datagateway.StartProfilingIfEnabled(); stopProfiling != nil {
+		defer func() {
+			if err := stopProfiling(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: pyroscope stop error: %v\n", err)
+			}
+		}()
+	}
+
 	// Create and start v2 server
 	server := datagateway.NewServerV2(gatewayCfg)
 

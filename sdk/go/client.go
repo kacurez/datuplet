@@ -292,6 +292,45 @@ type Writer struct {
 	// every Write becomes one immediate WriteChunk).
 	batchBuffer    []byte
 	batchThreshold int64
+
+	// Per-writer accounting for debug reporting. Surfaced via WriterStats
+	// so components can log a one-liner at Close confirming batching was
+	// active and at what amplification factor.
+	statsWriteCalls      int64 // user-visible Write() calls
+	statsWriteChunkCalls int64 // user-visible WriteChunk() calls
+	statsUnderlyingPosts int64 // actual HTTP/gRPC roundtrips dispatched
+	statsBytesIn         int64 // total bytes received via Write/WriteChunk
+	statsBytesOutOnFlush int64 // total bytes shipped via underlying writes
+}
+
+// WriterStats is a snapshot of SDK-side activity for one Writer. Cheap
+// to obtain at any time; intended for end-of-run logging in components.
+// The writes/underlying_posts ratio is the headline tell for whether
+// batching activated (writes >> posts when threshold > 0).
+type WriterStats struct {
+	WriteCalls        int64 // number of Write() calls
+	WriteChunkCalls   int64 // number of WriteChunk() calls
+	UnderlyingPosts   int64 // actual HTTP/gRPC roundtrips dispatched
+	BytesAccepted     int64 // total bytes the caller submitted
+	BytesShipped      int64 // total bytes shipped to the gateway
+	BatchThreshold    int64 // configured batch flush threshold (0 = disabled)
+	PendingBatchBytes int64 // bytes still buffered, not yet shipped
+}
+
+// Stats returns a snapshot of this writer's per-call accounting. Safe to
+// call concurrently with single-goroutine usage of the writer; the SDK
+// does not add a mutex for these counters (matches the existing
+// no-mutex convention).
+func (w *Writer) Stats() WriterStats {
+	return WriterStats{
+		WriteCalls:        w.statsWriteCalls,
+		WriteChunkCalls:   w.statsWriteChunkCalls,
+		UnderlyingPosts:   w.statsUnderlyingPosts,
+		BytesAccepted:     w.statsBytesIn,
+		BytesShipped:      w.statsBytesOutOnFlush,
+		BatchThreshold:    w.batchThreshold,
+		PendingBatchBytes: int64(len(w.batchBuffer)),
+	}
 }
 
 // OpenWriter opens a writer for a table.
@@ -391,6 +430,8 @@ type WriteResult struct {
 // If HTTP endpoint is available, uses HTTP for data transfer (no size limit).
 // Falls back to gRPC if HTTP endpoint is empty.
 func (w *Writer) WriteChunk(ctx context.Context, data []byte) (*WriteResult, error) {
+	w.statsWriteChunkCalls++
+	w.statsBytesIn += int64(len(data))
 	// Preserve call order: any data the caller already gave us via
 	// Write() must reach the gateway before this explicit chunk.
 	if err := w.flushBatchLocked(ctx); err != nil {
@@ -402,6 +443,8 @@ func (w *Writer) WriteChunk(ctx context.Context, data []byte) (*WriteResult, err
 // writeChunkImmediate sends data without consulting the batch buffer.
 // Used by WriteChunk (after flushing) and by flushBatchLocked itself.
 func (w *Writer) writeChunkImmediate(ctx context.Context, data []byte) (*WriteResult, error) {
+	w.statsUnderlyingPosts++
+	w.statsBytesOutOnFlush += int64(len(data))
 	if w.httpEndpoint != "" {
 		return w.writeChunkHTTP(ctx, data)
 	}
@@ -511,6 +554,8 @@ func dataFormatToContentType(f pb.DataFormat) string {
 //   - Flush call (explicit)
 //   - Close call (final flush before commit)
 func (w *Writer) Write(ctx context.Context, data []byte) error {
+	w.statsWriteCalls++
+	w.statsBytesIn += int64(len(data))
 	if w.batchThreshold <= 0 {
 		// Batching disabled — legacy semantics.
 		_, err := w.writeChunkImmediate(ctx, data)
