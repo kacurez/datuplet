@@ -217,7 +217,14 @@ type writerOptions struct {
 	format     pb.DataFormat
 	schema     *pb.Schema
 	transforms *pb.TransformSpec
+	batchSize  int64 // 0 = use defaultBatchSize; <0 = disable batching
 }
+
+// defaultBatchSize is the Write-call accumulator threshold. Sized so a
+// row-at-a-time caller emitting ~100 B JSONL rows triggers a flush every
+// ~10K rows — bounds HTTP roundtrips while keeping each flush's parse
+// cost on the gateway side modest.
+const defaultBatchSize = 1024 * 1024 // 1 MiB
 
 // WithFormat sets the input format for the writer.
 // This tells the gateway what format the data chunks will be in.
@@ -242,6 +249,28 @@ func WithTransforms(spec *pb.TransformSpec) WriterOption {
 	}
 }
 
+// WithBatchSize controls the Write() accumulator's flush threshold (in bytes).
+//
+// Row-at-a-time callers (e.g. data-generator) issue one Write() per row.
+// Without batching that's one HTTP roundtrip per row — transport-bound,
+// minutes of wall clock for millions of rows. With batching, Write() appends
+// the bytes to an internal per-writer buffer and only flushes to the gateway
+// when the buffer reaches `n` bytes, on the next WriteChunk() (to preserve
+// call order), on Flush(), or on Close().
+//
+//   - n > 0: use exactly `n` bytes as the threshold.
+//   - n == 0: use the default (1 MiB).
+//   - n  < 0: disable batching entirely; every Write becomes one immediate
+//     WriteChunk (legacy v0.2.x behavior).
+//
+// Has no effect on WriteChunk() — that path always sends immediately and
+// returns a result.
+func WithBatchSize(n int64) WriterOption {
+	return func(o *writerOptions) {
+		o.batchSize = n
+	}
+}
+
 // =============================================================================
 // Writer
 // =============================================================================
@@ -257,6 +286,12 @@ type Writer struct {
 	inputFormat    pb.DataFormat
 	inferredSchema *pb.Schema
 	totalRows      int64
+
+	// Write-call batching state. See WithBatchSize for semantics.
+	// `batchThreshold == 0` means batching is disabled (legacy behavior:
+	// every Write becomes one immediate WriteChunk).
+	batchBuffer    []byte
+	batchThreshold int64
 }
 
 // OpenWriter opens a writer for a table.
@@ -277,6 +312,17 @@ func (c *Client) OpenWriterToBucket(ctx context.Context, bucket, table string, o
 		opt(options)
 	}
 
+	// Resolve the batch threshold. See WithBatchSize for the encoding.
+	var batchThreshold int64
+	switch {
+	case options.batchSize == 0:
+		batchThreshold = defaultBatchSize // batching ON, default size
+	case options.batchSize > 0:
+		batchThreshold = options.batchSize // batching ON, custom size
+	default:
+		batchThreshold = 0 // batching OFF (legacy behavior)
+	}
+
 	req := &pb.OpenWriterRequest{
 		Bucket:      bucket,
 		Table:       table,
@@ -290,7 +336,7 @@ func (c *Client) OpenWriterToBucket(ctx context.Context, bucket, table string, o
 		return nil, fmt.Errorf("failed to open writer: %w", err)
 	}
 
-	return &Writer{
+	w := &Writer{
 		client:         c.client,
 		httpClient:     c.httpClient,
 		writerID:       resp.WriterId,
@@ -299,7 +345,14 @@ func (c *Client) OpenWriterToBucket(ctx context.Context, bucket, table string, o
 		table:          resp.Table,
 		inputFormat:    options.format,
 		inferredSchema: resp.InferredSchema,
-	}, nil
+		batchThreshold: batchThreshold,
+	}
+	if batchThreshold > 0 {
+		// Pre-size the accumulator at the threshold so we don't pay
+		// growth-by-doubling overhead during normal operation.
+		w.batchBuffer = make([]byte, 0, batchThreshold)
+	}
+	return w, nil
 }
 
 // Bucket returns the resolved bucket name.
@@ -328,16 +381,30 @@ type WriteResult struct {
 	InferredSchema *pb.Schema
 }
 
-// WriteChunk writes a chunk of data.
+// WriteChunk writes a chunk of data immediately and returns the gateway's
+// per-call result (rows accepted, buffer size, inferred schema).
+//
+// If a Write() batch is pending, it is flushed first so the gateway sees
+// chunks in the order they were submitted. The result returned describes
+// only THIS WriteChunk's data, not the pending-batch flush.
+//
 // If HTTP endpoint is available, uses HTTP for data transfer (no size limit).
 // Falls back to gRPC if HTTP endpoint is empty.
 func (w *Writer) WriteChunk(ctx context.Context, data []byte) (*WriteResult, error) {
-	// Use HTTP if endpoint is available
+	// Preserve call order: any data the caller already gave us via
+	// Write() must reach the gateway before this explicit chunk.
+	if err := w.flushBatchLocked(ctx); err != nil {
+		return nil, fmt.Errorf("flush pending Write batch: %w", err)
+	}
+	return w.writeChunkImmediate(ctx, data)
+}
+
+// writeChunkImmediate sends data without consulting the batch buffer.
+// Used by WriteChunk (after flushing) and by flushBatchLocked itself.
+func (w *Writer) writeChunkImmediate(ctx context.Context, data []byte) (*WriteResult, error) {
 	if w.httpEndpoint != "" {
 		return w.writeChunkHTTP(ctx, data)
 	}
-
-	// Fall back to gRPC
 	return w.writeChunkGRPC(ctx, data)
 }
 
@@ -428,10 +495,60 @@ func dataFormatToContentType(f pb.DataFormat) string {
 	}
 }
 
-// Write is a convenience method that calls WriteChunk and ignores the result.
+// Write is the row-at-a-time / streaming convenience method. It does not
+// return per-call results; callers that need them should use WriteChunk.
+//
+// By default Write batches: bytes are appended to a per-writer accumulator
+// and the gateway only sees a WriteChunk when the accumulator reaches the
+// batch threshold (1 MiB by default; see WithBatchSize). This collapses
+// row-at-a-time HTTP traffic by ~1000x for the common case of one row per
+// Write call. To opt out, open the writer with `WithBatchSize(-1)` — every
+// Write becomes one immediate WriteChunk (the legacy v0.2.x behavior).
+//
+// The accumulator is drained on every:
+//   - threshold cross (this method)
+//   - WriteChunk call (to preserve call order)
+//   - Flush call (explicit)
+//   - Close call (final flush before commit)
 func (w *Writer) Write(ctx context.Context, data []byte) error {
-	_, err := w.WriteChunk(ctx, data)
-	return err
+	if w.batchThreshold <= 0 {
+		// Batching disabled — legacy semantics.
+		_, err := w.writeChunkImmediate(ctx, data)
+		return err
+	}
+
+	w.batchBuffer = append(w.batchBuffer, data...)
+	if int64(len(w.batchBuffer)) >= w.batchThreshold {
+		return w.flushBatchLocked(ctx)
+	}
+	return nil
+}
+
+// Flush forces any pending Write-batched data to the gateway immediately.
+// No-op when batching is disabled or the accumulator is empty. Useful for
+// callers that want to checkpoint progress without closing the writer.
+func (w *Writer) Flush(ctx context.Context) error {
+	return w.flushBatchLocked(ctx)
+}
+
+// flushBatchLocked sends the currently-buffered Write payload as a single
+// WriteChunk. Name reflects the intent that the writer is single-threaded —
+// the SDK does not add a mutex (matches the existing convention). If a
+// component shares a Writer across goroutines it must serialize access
+// externally (same requirement as before this PR).
+func (w *Writer) flushBatchLocked(ctx context.Context) error {
+	if len(w.batchBuffer) == 0 {
+		return nil
+	}
+	// Hand the underlying slice to writeChunkImmediate; the HTTP/gRPC
+	// path makes a copy (gRPC marshaler does, http.NewRequest's bytes.Reader
+	// holds a reference until response). We zero-length the slice header
+	// after the call so the next Write reuses the same allocation.
+	if _, err := w.writeChunkImmediate(ctx, w.batchBuffer); err != nil {
+		return err
+	}
+	w.batchBuffer = w.batchBuffer[:0]
+	return nil
 }
 
 // CloseResult holds the result of closing a writer.
@@ -463,6 +580,12 @@ type ExternalFile struct {
 // CloseWithExternalFiles closes the writer and provides metadata for files written directly to storage.
 // This is used when components bypass the DataGateway's buffering and write files directly (e.g., DuckDB).
 func (w *Writer) CloseWithExternalFiles(ctx context.Context, externalFiles []ExternalFile) (*CloseResult, error) {
+	// Drain any pending Write-batched data before closing. Otherwise the
+	// gateway would commit without seeing the tail of the stream.
+	if err := w.flushBatchLocked(ctx); err != nil {
+		return nil, fmt.Errorf("flush pending Write batch on close: %w", err)
+	}
+
 	req := &pb.CloseWriterRequest{
 		WriterId: w.writerID,
 	}
