@@ -85,10 +85,6 @@ spec:
               value: {{ .Values.pipelineOperator.gatewayInstrumentation.profiling.serverAddress | quote }}
             {{- with .Values.pipelineOperator.gatewayInstrumentation.profiling.auth }}
             {{- if .existingSecret }}
-            # Credentials sourced from a Secret in the operator's namespace.
-            # Operator resolves these to plain env at startup, passes through
-            # to each per-run gateway sidecar (cross-namespace constraints
-            # prevent secretKeyRef on the sidecar itself).
             - name: PYROSCOPE_USERNAME
               valueFrom:
                 secretKeyRef:

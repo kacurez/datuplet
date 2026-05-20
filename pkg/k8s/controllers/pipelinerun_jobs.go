@@ -117,19 +117,8 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		})
 	}
 
-	// Optional Pyroscope continuous profiling on the gateway sidecar.
-	// Only injects when explicitly enabled AND a server address is
-	// configured — half-configured profiling is a deployment bug we want
-	// to fail-soft (gateway logs a WARN and continues without profiling).
-	//
-	// Auth credentials are pass-through plain env. They were resolved at
-	// the operator's startup from EITHER a values.yaml literal OR a
-	// secretKeyRef on the operator container (helm chart picks one). The
-	// operator-level secretKeyRef is the secure path: the credential
-	// never appears in values.yaml or helm output. We can't use
-	// secretKeyRef on the gateway sidecar because per-run namespaces are
-	// dynamic and any pre-created Secret would only be visible to its
-	// own namespace.
+	// Pyroscope profiling. Requires both flag + address; auth is
+	// optional. See PipelineRunReconciler doc for why creds are plain.
 	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
 		gatewayEnv = append(gatewayEnv,
 			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},

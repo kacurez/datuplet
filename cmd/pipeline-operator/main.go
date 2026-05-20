@@ -184,18 +184,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Per-run gateway-sidecar instrumentation toggles. Read from the
-	// operator's OWN env vars; the operator injects them into every
-	// gateway sidecar it spawns. Off by default — opt in via helm.
-	//
-	//   DATUPLET_GATEWAY_DEBUG=true                            → verbose DBG logs
-	//   DATUPLET_GATEWAY_PROFILING=true                        → enable Pyroscope
-	//   DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS=https://...  → Grafana Cloud Profiles endpoint
-	//   PYROSCOPE_USERNAME / PYROSCOPE_PASSWORD                → Basic Auth, resolved
-	//     here by the operator (from helm values OR a Secret in the
-	//     operator's namespace via secretKeyRef on the operator container)
-	//     and passed through to each gateway sidecar as plain env. Both
-	//     empty = unauthenticated Pyroscope only.
+	// Gateway-sidecar instrumentation; helm wires these. Off by default.
 	gatewayDebug := envTruthy("DATUPLET_GATEWAY_DEBUG")
 	gatewayProfiling := envTruthy("DATUPLET_GATEWAY_PROFILING")
 	gatewayProfilingAddr := os.Getenv("DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS")

@@ -95,18 +95,10 @@ type PipelineRunReconciler struct {
 	// GatewayProfilingEnabled is true; ignored otherwise.
 	GatewayProfilingServerAddress string
 
-	// GatewayProfilingUsername and GatewayProfilingPassword are the
-	// resolved Basic Auth credentials for the Pyroscope endpoint. The
-	// operator reads these from its OWN env (PYROSCOPE_USERNAME /
-	// PYROSCOPE_PASSWORD) which the helm chart wires from either a
-	// values.yaml literal OR — preferred — a secretKeyRef on the
-	// operator container pointing at a Secret in the operator's namespace.
-	//
-	// We plumb plain values into the per-run gateway sidecar rather
-	// than a secretKeyRef because the gateway sidecar lives in a
-	// dynamic per-run namespace where Secrets pre-created elsewhere
-	// are not visible. Both fields empty disables Basic Auth
-	// (unauthenticated Pyroscope only).
+	// Pyroscope Basic Auth, resolved from the operator's own env
+	// (PYROSCOPE_USERNAME / PYROSCOPE_PASSWORD) and passed plain to
+	// each gateway sidecar. Plain (not secretKeyRef) because per-run
+	// namespaces are dynamic. Both empty = unauthenticated.
 	GatewayProfilingUsername string
 	GatewayProfilingPassword string
 }
