@@ -65,15 +65,6 @@ func runLiteral(ctx context.Context, client *sdk.Client, t *Table) (int, error) 
 		}
 	}
 
-	// See runRandom for rationale: writer.Stats() before Close so the
-	// batching state is visible in pod logs regardless of Close outcome.
-	stats := writer.Stats()
-	client.Log(ctx, "INFO", fmt.Sprintf( //nolint:errcheck
-		"table %q: writer stats rows=%d writes=%d posts=%d batch_threshold=%d bytes_in=%d bytes_shipped=%d",
-		t.Name, rowsWritten, stats.WriteCalls, stats.UnderlyingPosts,
-		stats.BatchThreshold, stats.BytesAccepted, stats.BytesShipped,
-	))
-
 	if _, err := writer.Close(ctx); err != nil {
 		return rowsWritten, fmt.Errorf("table %q: failed to close writer: %w", t.Name, err)
 	}

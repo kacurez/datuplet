@@ -86,13 +86,6 @@ func (s *ServerV2) handleWrite(w http.ResponseWriter, r *http.Request) {
 // the parent of the buffer-manager backend writer, so a cancelled
 // request short-circuits the in-flight S3 PutObject path.
 func (s *ServerV2) processWriteChunk(ctx context.Context, ws *writerState, data []byte) (*pb.WriteChunkResponse, error) {
-	// Per-chunk debug log: the SINGLE most useful signal for diagnosing
-	// SDK batching. With batching active, len(data) is ~1 MiB; without,
-	// it's tens-of-bytes per row. One line per WriteChunk is a lot when
-	// batching is off, which is itself a hint to operators that something
-	// is wrong with their deployment.
-	Debugf("processWriteChunk: writer=%s bytes=%d format=%s", ws.writerID, len(data), ws.inputFormat)
-
 	// Parse input data to Arrow
 	record, inferredSchema, err := ws.adapter.Parse(data, ws.schema)
 	if err != nil {

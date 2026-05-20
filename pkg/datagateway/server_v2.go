@@ -389,10 +389,7 @@ func (s *ServerV2) Serve(addr string) error {
 		}()
 	}
 
-	log.Printf("Data Gateway v2 listening on %s (%s)", addr, GatewayBuildInfo())
-	if DebugEnabled() {
-		log.Printf("DBG gateway debug logging enabled via DUPLET_GATEWAY_DEBUG")
-	}
+	log.Printf("Data Gateway v2 listening on %s", addr)
 
 	return grpcServer.Serve(lis)
 }
