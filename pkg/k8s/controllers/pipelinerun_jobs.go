@@ -107,6 +107,50 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		{Name: "RUN_ID", Value: pr.Status.RunID},
 	}
 
+	// Optional debug logging on the gateway sidecar. Set via the operator's
+	// own env (DATUPLET_GATEWAY_DEBUG -> reconciler field -> per-PipelineRun
+	// sidecar env). Off by default; flip via helm value.
+	if r.GatewayDebug {
+		gatewayEnv = append(gatewayEnv, corev1.EnvVar{
+			Name:  "DATUPLET_GATEWAY_DEBUG",
+			Value: "true",
+		})
+	}
+
+	// Optional Pyroscope continuous profiling on the gateway sidecar.
+	// Only injects when explicitly enabled AND a server address is
+	// configured — half-configured profiling is a deployment bug we want
+	// to fail-soft (gateway logs a WARN and continues without profiling).
+	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
+		gatewayEnv = append(gatewayEnv,
+			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},
+			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
+			// Downward API: surface pod name + namespace as Pyroscope tags.
+			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			}},
+		)
+		// Auth from a Secret keyed by PYROSCOPE_USERNAME + PYROSCOPE_PASSWORD.
+		// Optional: omit the Secret to send unauthenticated to an
+		// in-cluster open Pyroscope.
+		if r.GatewayProfilingSecretName != "" {
+			gatewayEnv = append(gatewayEnv,
+				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: r.GatewayProfilingSecretName},
+						Key:                  "PYROSCOPE_USERNAME",
+					},
+				}},
+				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: r.GatewayProfilingSecretName},
+						Key:                  "PYROSCOPE_PASSWORD",
+					},
+				}},
+			)
+		}
+	}
+
 	ttl := JobTTLSecondsAfterFinished
 	restartPolicyAlways := corev1.ContainerRestartPolicyAlways
 

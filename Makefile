@@ -291,9 +291,13 @@ clean-go-git-cache: ## Free disk space (Go build/test/fuzz cache + git gc; prese
 tidy: ## Run go mod tidy across every go.mod in the monorepo
 	@echo "Tidying root..."
 	@go mod tidy
+	@# Exclude ./.claude/* so stale Claude Code worktrees (with broken
+	@# replace directives pointing back at the parent repo) don't poison
+	@# the tidy loop. Excluding .git / node_modules / vendor is hygiene.
 	@for mod in $$(find . -name go.mod -not -path ./go.mod \
 	    -not -path './.git/*' -not -path './node_modules/*' \
-	    -not -path './vendor/*' -not -path './tests/integration/go.mod'); do \
+	    -not -path './vendor/*' -not -path './.claude/*' \
+	    -not -path './tests/integration/go.mod'); do \
 	  dir=$$(dirname $$mod); \
 	  echo "Tidying $$dir..."; \
 	  (cd $$dir && go mod tidy) || exit 1; \

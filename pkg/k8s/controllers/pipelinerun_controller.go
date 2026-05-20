@@ -77,6 +77,29 @@ type PipelineRunReconciler struct {
 	// Jobs and TableCommit Jobs) spawned by this operator. Populated from
 	// DATUPLET_RUN_TOLERATIONS_JSON at startup. Nil means no injection.
 	RuntimeTolerations []corev1.Toleration
+
+	// GatewayDebug, when true, injects DATUPLET_GATEWAY_DEBUG=true into
+	// the gateway sidecar's env on every PipelineRun. Operators flip this
+	// via the operator Deployment's own env (set from helm values).
+	// Default off — chatty DBG logs are opt-in.
+	GatewayDebug bool
+
+	// GatewayProfilingEnabled controls whether DATUPLET_GATEWAY_PROFILING=true
+	// + PYROSCOPE_SERVER_ADDRESS are injected. The gateway's
+	// StartProfilingIfEnabled boots pyroscope-go only when both are set;
+	// see pkg/datagateway/profiling.go.
+	GatewayProfilingEnabled bool
+
+	// GatewayProfilingServerAddress is the Grafana Cloud Profiles endpoint
+	// (or in-cluster Pyroscope receiver URL). Required when
+	// GatewayProfilingEnabled is true; ignored otherwise.
+	GatewayProfilingServerAddress string
+
+	// GatewayProfilingSecretName names a K8s Secret containing
+	// PYROSCOPE_USERNAME + PYROSCOPE_PASSWORD keys for HTTP Basic auth
+	// to Grafana Cloud Profiles. Empty when profiling to an
+	// unauthenticated in-cluster Pyroscope.
+	GatewayProfilingSecretName string
 }
 
 // +kubebuilder:rbac:groups=datuplet.io,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete

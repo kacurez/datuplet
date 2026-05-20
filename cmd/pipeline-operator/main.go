@@ -36,6 +36,15 @@ func init() {
 	utilruntime.Must(datupletv1.AddToScheme(scheme))
 }
 
+// envTruthy reads an env var and reports whether it parses as "yes / on".
+// Accepts "1", "true", "yes", "on" (case-insensitive). Anything else (including
+// unset) returns false. Mirrors the gateway-side DATUPLET_GATEWAY_DEBUG /
+// DATUPLET_GATEWAY_PROFILING parsing so operators see consistent semantics.
+func envTruthy(name string) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
 // loadRuntimeTolerations reads DATUPLET_RUN_TOLERATIONS_JSON from the
 // environment and returns the parsed slice. Returns nil (no error) when the
 // env var is unset or empty. Fails fast on invalid JSON or unknown fields so
@@ -175,17 +184,35 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Per-run gateway-sidecar instrumentation toggles. Read from the
+	// operator's OWN env vars; the operator injects them into every
+	// gateway sidecar it spawns. Off by default — opt in via helm.
+	//
+	//   DATUPLET_GATEWAY_DEBUG=true                            → verbose DBG logs
+	//   DATUPLET_GATEWAY_PROFILING=true                        → enable Pyroscope
+	//   DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS=https://...  → Grafana Cloud Profiles endpoint
+	//   DATUPLET_GATEWAY_PROFILING_SECRET_NAME=<secret>        → K8s Secret with
+	//     PYROSCOPE_USERNAME + PYROSCOPE_PASSWORD keys (optional)
+	gatewayDebug := envTruthy("DATUPLET_GATEWAY_DEBUG")
+	gatewayProfiling := envTruthy("DATUPLET_GATEWAY_PROFILING")
+	gatewayProfilingAddr := os.Getenv("DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS")
+	gatewayProfilingSecret := os.Getenv("DATUPLET_GATEWAY_PROFILING_SECRET_NAME")
+
 	// Set up PipelineRun controller — the sole reconciler for both
 	// component Jobs and commit Jobs.
 	if err = (&controllers.PipelineRunReconciler{
-		Client:             mgr.GetClient(),
-		Scheme:             mgr.GetScheme(),
-		GatewayImage:       gatewayImage,
-		TableCommitImage:   icebergJobImage,
-		LakekeeperURL:      lakekeeperURL,
-		PipelineAPIURL:     pipelineAPIURL,
-		Clientset:          clientset,
-		RuntimeTolerations: runTolerations,
+		Client:                        mgr.GetClient(),
+		Scheme:                        mgr.GetScheme(),
+		GatewayImage:                  gatewayImage,
+		TableCommitImage:              icebergJobImage,
+		LakekeeperURL:                 lakekeeperURL,
+		PipelineAPIURL:                pipelineAPIURL,
+		Clientset:                     clientset,
+		RuntimeTolerations:            runTolerations,
+		GatewayDebug:                  gatewayDebug,
+		GatewayProfilingEnabled:       gatewayProfiling,
+		GatewayProfilingServerAddress: gatewayProfilingAddr,
+		GatewayProfilingSecretName:    gatewayProfilingSecret,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PipelineRun")
 		os.Exit(1)

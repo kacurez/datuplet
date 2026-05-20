@@ -32,6 +32,14 @@ func main() {
 	defer client.Close()
 
 	cfg := client.Config()
+
+	// Log SDK build info FIRST so cluster operators can verify at a
+	// glance that the running data-generator binary has the SDK behavior
+	// they expect (e.g., Write() batching from v0.2.4+). This is the
+	// single most valuable line for "did the image get rebuilt against
+	// the new SDK?" diagnostics. On by default — minimal overhead, big
+	// debug payoff.
+	client.Log(ctx, "INFO", sdk.BuildInfo().String()) //nolint:errcheck
 	client.Log(ctx, "INFO", fmt.Sprintf("data-generator started: execution=%s", cfg.ExecutionID)) //nolint:errcheck
 
 	// Parse component config.

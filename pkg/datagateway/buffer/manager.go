@@ -283,6 +283,11 @@ func (m *BufferManager) flushRowGroup() error {
 		rowsInBatch += batch.NumRows()
 	}
 
+	// Pre-flush debug log: confirms when row groups land and what they
+	// cost. Gated by DATUPLET_GATEWAY_DEBUG.
+	debugf("flushRowGroup: batches=%d rows=%d est_bytes=%d file=%s",
+		len(m.batches), rowsInBatch, m.currentBufferSize, m.currentFilePath)
+
 	// Write the buffered records as a row group
 	if err := m.writer.WriteRowGroup(m.batches); err != nil {
 		return fmt.Errorf("failed to write row group: %w", err)
@@ -342,6 +347,7 @@ func (m *BufferManager) openNewFile() error {
 	path := m.generateFilePath()
 	m.currentFilePath = path
 	m.currentFileRows = 0
+	debugf("openNewFile: index=%d path=%s", m.fileIndex, path)
 
 	// Create Parquet writer
 	rowGroupSize := m.config.RowGroupSize
