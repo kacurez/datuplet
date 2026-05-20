@@ -11,7 +11,6 @@ import (
 	"os"
 	"path"
 	"strings"
-	"time"
 
 	"cloud.google.com/go/storage"
 	"golang.org/x/oauth2"
@@ -149,21 +148,6 @@ var _ oauth2.TokenSource = (*vendedTokenSource)(nil)
 // this method MUST NOT recurse into the underlying value. RFC 019 §4.10.
 func (t *vendedTokenSource) String() string { return "<vendedTokenSource>" }
 
-// maxTokenCacheLifetime caps the oauth2.Token.Expiry that vendedTokenSource
-// reports to the underlying ReuseTokenSource. Without this cap, ReuseTokenSource
-// would honor whatever Expiry lakekeeper reports (often 15+ minutes) and never
-// call us back until that nominal expiry. During long uploads (e.g. a 12-min
-// streaming parquet write), the cached token can outlive the actual STS-side
-// credential — STS rotates underlying creds on a ~15 s cadence — leading to
-// 401 Invalid Credentials on the final chunk uploads.
-//
-// 60 s gives plenty of headroom past STS rotation while still forcing
-// VendedCreds.Get() to be re-called frequently, which lets VendedCreds
-// internally refresh at its 50%-of-TTL threshold. The cap is well below
-// any reasonable STS lifetime so we never hit the "token revoked but our
-// cache thinks it's valid" failure mode.
-const maxTokenCacheLifetime = 60 * time.Second
-
 // Token fetches the current vended creds, asserts they're GCSCreds, and
 // returns an *oauth2.Token suitable for the storage client. The
 // type-assertion is the load-bearing safety check: even though
@@ -187,20 +171,9 @@ func (t *vendedTokenSource) Token() (*oauth2.Token, error) {
 	if !ok {
 		return nil, fmt.Errorf("vendedTokenSource: expected GCSCreds, got %T", c)
 	}
-
-	// Cap the reported Expiry. See maxTokenCacheLifetime for rationale.
-	// The cap protects against the streaming-upload regression in v0.2.3
-	// where a 12-min file upload outlived the STS-side credential and
-	// failed final-chunk PUT with 401.
-	expiry := gc.ExpiresAt()
-	cap := time.Now().Add(maxTokenCacheLifetime)
-	if expiry.IsZero() || expiry.After(cap) {
-		expiry = cap
-	}
-
 	return &oauth2.Token{
 		AccessToken: gc.OAuthToken,
-		Expiry:      expiry,
+		Expiry:      gc.ExpiresAt(),
 		TokenType:   "Bearer",
 	}, nil
 }
