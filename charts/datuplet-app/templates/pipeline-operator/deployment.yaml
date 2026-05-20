@@ -83,9 +83,32 @@ spec:
               value: "true"
             - name: DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS
               value: {{ .Values.pipelineOperator.gatewayInstrumentation.profiling.serverAddress | quote }}
-            {{- with .Values.pipelineOperator.gatewayInstrumentation.profiling.existingSecret }}
-            - name: DATUPLET_GATEWAY_PROFILING_SECRET_NAME
+            {{- with .Values.pipelineOperator.gatewayInstrumentation.profiling.auth }}
+            {{- if .existingSecret }}
+            # Credentials sourced from a Secret in the operator's namespace.
+            # Operator resolves these to plain env at startup, passes through
+            # to each per-run gateway sidecar (cross-namespace constraints
+            # prevent secretKeyRef on the sidecar itself).
+            - name: PYROSCOPE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret | quote }}
+                  key: PYROSCOPE_USERNAME
+            - name: PYROSCOPE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret | quote }}
+                  key: PYROSCOPE_PASSWORD
+            {{- else }}
+            {{- with .username }}
+            - name: PYROSCOPE_USERNAME
               value: {{ . | quote }}
+            {{- end }}
+            {{- with .password }}
+            - name: PYROSCOPE_PASSWORD
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             {{- end }}
           resources:

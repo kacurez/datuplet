@@ -137,16 +137,32 @@ pipelineOperator:
     profiling:
       enabled: false
       # Grafana Cloud Profiles endpoint, e.g.
-      # "https://profiles-prod-001.grafana.net".
+      # "https://profiles-prod-002.grafana.net".
       # Or in-cluster Pyroscope receiver, e.g.
       # "http://pyroscope.observability.svc.cluster.local:4040".
       # Required when enabled=true; ignored otherwise.
       serverAddress: ""
-      # Name of a K8s Secret in the operator's namespace containing
-      # PYROSCOPE_USERNAME and PYROSCOPE_PASSWORD keys for HTTP Basic
-      # auth (Grafana Cloud uses stack-id / access-policy-token).
-      # Leave empty for an unauthenticated in-cluster Pyroscope.
-      existingSecret: ""
+      # Basic Auth credentials for the Pyroscope endpoint.
+      # Two ways to supply, pick ONE:
+      #
+      #   1) PLAIN VALUES (POC / dev — credentials visible in helm output):
+      #        auth:
+      #          username: "<grafana-cloud-stack-id>"
+      #          password: "glc_..."
+      #
+      #   2) EXISTING SECRET (production — credentials never in values):
+      #      Create a Secret in this chart's release namespace with two
+      #      keys (PYROSCOPE_USERNAME, PYROSCOPE_PASSWORD), then:
+      #        auth:
+      #          existingSecret: my-pyroscope-creds
+      #
+      # When `existingSecret` is set it wins; the operator container's
+      # env is wired via secretKeyRef. Leave both empty for an
+      # unauthenticated in-cluster Pyroscope.
+      auth:
+        username: ""
+        password: ""
+        existingSecret: ""
 
 # Pipeline-observer runs at exactly 1 replica (single-writer to the runs
 # table; no leader election). Failure mode = run-status DB lag, surfaced

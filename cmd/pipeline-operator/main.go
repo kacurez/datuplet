@@ -191,12 +191,16 @@ func main() {
 	//   DATUPLET_GATEWAY_DEBUG=true                            → verbose DBG logs
 	//   DATUPLET_GATEWAY_PROFILING=true                        → enable Pyroscope
 	//   DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS=https://...  → Grafana Cloud Profiles endpoint
-	//   DATUPLET_GATEWAY_PROFILING_SECRET_NAME=<secret>        → K8s Secret with
-	//     PYROSCOPE_USERNAME + PYROSCOPE_PASSWORD keys (optional)
+	//   PYROSCOPE_USERNAME / PYROSCOPE_PASSWORD                → Basic Auth, resolved
+	//     here by the operator (from helm values OR a Secret in the
+	//     operator's namespace via secretKeyRef on the operator container)
+	//     and passed through to each gateway sidecar as plain env. Both
+	//     empty = unauthenticated Pyroscope only.
 	gatewayDebug := envTruthy("DATUPLET_GATEWAY_DEBUG")
 	gatewayProfiling := envTruthy("DATUPLET_GATEWAY_PROFILING")
 	gatewayProfilingAddr := os.Getenv("DATUPLET_GATEWAY_PROFILING_SERVER_ADDRESS")
-	gatewayProfilingSecret := os.Getenv("DATUPLET_GATEWAY_PROFILING_SECRET_NAME")
+	gatewayProfilingUser := os.Getenv("PYROSCOPE_USERNAME")
+	gatewayProfilingPass := os.Getenv("PYROSCOPE_PASSWORD")
 
 	// Set up PipelineRun controller — the sole reconciler for both
 	// component Jobs and commit Jobs.
@@ -212,7 +216,8 @@ func main() {
 		GatewayDebug:                  gatewayDebug,
 		GatewayProfilingEnabled:       gatewayProfiling,
 		GatewayProfilingServerAddress: gatewayProfilingAddr,
-		GatewayProfilingSecretName:    gatewayProfilingSecret,
+		GatewayProfilingUsername:      gatewayProfilingUser,
+		GatewayProfilingPassword:      gatewayProfilingPass,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PipelineRun")
 		os.Exit(1)

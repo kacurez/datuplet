@@ -95,11 +95,20 @@ type PipelineRunReconciler struct {
 	// GatewayProfilingEnabled is true; ignored otherwise.
 	GatewayProfilingServerAddress string
 
-	// GatewayProfilingSecretName names a K8s Secret containing
-	// PYROSCOPE_USERNAME + PYROSCOPE_PASSWORD keys for HTTP Basic auth
-	// to Grafana Cloud Profiles. Empty when profiling to an
-	// unauthenticated in-cluster Pyroscope.
-	GatewayProfilingSecretName string
+	// GatewayProfilingUsername and GatewayProfilingPassword are the
+	// resolved Basic Auth credentials for the Pyroscope endpoint. The
+	// operator reads these from its OWN env (PYROSCOPE_USERNAME /
+	// PYROSCOPE_PASSWORD) which the helm chart wires from either a
+	// values.yaml literal OR — preferred — a secretKeyRef on the
+	// operator container pointing at a Secret in the operator's namespace.
+	//
+	// We plumb plain values into the per-run gateway sidecar rather
+	// than a secretKeyRef because the gateway sidecar lives in a
+	// dynamic per-run namespace where Secrets pre-created elsewhere
+	// are not visible. Both fields empty disables Basic Auth
+	// (unauthenticated Pyroscope only).
+	GatewayProfilingUsername string
+	GatewayProfilingPassword string
 }
 
 // +kubebuilder:rbac:groups=datuplet.io,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete

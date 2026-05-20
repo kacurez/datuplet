@@ -121,32 +121,32 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 	// Only injects when explicitly enabled AND a server address is
 	// configured — half-configured profiling is a deployment bug we want
 	// to fail-soft (gateway logs a WARN and continues without profiling).
+	//
+	// Auth credentials are pass-through plain env. They were resolved at
+	// the operator's startup from EITHER a values.yaml literal OR a
+	// secretKeyRef on the operator container (helm chart picks one). The
+	// operator-level secretKeyRef is the secure path: the credential
+	// never appears in values.yaml or helm output. We can't use
+	// secretKeyRef on the gateway sidecar because per-run namespaces are
+	// dynamic and any pre-created Secret would only be visible to its
+	// own namespace.
 	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
 		gatewayEnv = append(gatewayEnv,
 			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},
 			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
-			// Downward API: surface pod name + namespace as Pyroscope tags.
+			// Downward API: surface pod namespace as a Pyroscope tag.
 			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
 			}},
 		)
-		// Auth from a Secret keyed by PYROSCOPE_USERNAME + PYROSCOPE_PASSWORD.
-		// Optional: omit the Secret to send unauthenticated to an
-		// in-cluster open Pyroscope.
-		if r.GatewayProfilingSecretName != "" {
+		if r.GatewayProfilingUsername != "" {
 			gatewayEnv = append(gatewayEnv,
-				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: r.GatewayProfilingSecretName},
-						Key:                  "PYROSCOPE_USERNAME",
-					},
-				}},
-				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: r.GatewayProfilingSecretName},
-						Key:                  "PYROSCOPE_PASSWORD",
-					},
-				}},
+				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", Value: r.GatewayProfilingUsername},
+			)
+		}
+		if r.GatewayProfilingPassword != "" {
+			gatewayEnv = append(gatewayEnv,
+				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword},
 			)
 		}
 	}
