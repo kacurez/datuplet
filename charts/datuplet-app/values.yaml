@@ -120,33 +120,25 @@ pipelineOperator:
     requests: { cpu: 100m, memory: 128Mi }
     limits:   { cpu: 500m, memory: 512Mi }
 
-  # Per-PipelineRun gateway-sidecar instrumentation toggles. The operator
-  # reads these from its own env and injects them into every gateway
-  # sidecar it spawns. Off by default — opt in when investigating.
+  # Gateway-sidecar instrumentation. Injected by the operator into every
+  # gateway sidecar it spawns. Off by default.
   gatewayInstrumentation:
-    # Verbose DBG log lines from the gateway: per-chunk byte size,
-    # row-group flushes, file rotations, upload timing. Useful for
-    # diagnosing SDK batching, throughput patterns, slow GCS uploads.
-    # Becomes DATUPLET_GATEWAY_DEBUG=true on the sidecar.
+    # Verbose DBG logs: per-chunk, per-flush, per-rotation, upload timing.
     debug: false
 
-    # Pyroscope continuous profiling: CPU + heap (alloc/inuse) + goroutine
-    # flame graphs. Pushed directly to Grafana Cloud Profiles or an
-    # in-cluster Pyroscope receiver. Negligible overhead at the default
-    # sample rate.
+    # Pyroscope continuous profiling (CPU + heap + goroutines).
     profiling:
       enabled: false
-      # Grafana Cloud Profiles endpoint, e.g.
-      # "https://profiles-prod-001.grafana.net".
-      # Or in-cluster Pyroscope receiver, e.g.
-      # "http://pyroscope.observability.svc.cluster.local:4040".
-      # Required when enabled=true; ignored otherwise.
+      # Grafana Cloud Profiles endpoint, or in-cluster Pyroscope URL.
       serverAddress: ""
-      # Name of a K8s Secret in the operator's namespace containing
-      # PYROSCOPE_USERNAME and PYROSCOPE_PASSWORD keys for HTTP Basic
-      # auth (Grafana Cloud uses stack-id / access-policy-token).
-      # Leave empty for an unauthenticated in-cluster Pyroscope.
-      existingSecret: ""
+      # Basic Auth — pick ONE. existingSecret wins when both set.
+      # existingSecret references a Secret in this release's namespace
+      # with PYROSCOPE_USERNAME / PYROSCOPE_PASSWORD keys.
+      # Both empty = unauthenticated Pyroscope only.
+      auth:
+        username: ""
+        password: ""
+        existingSecret: ""
 
 # Pipeline-observer runs at exactly 1 replica (single-writer to the runs
 # table; no leader election). Failure mode = run-status DB lag, surfaced

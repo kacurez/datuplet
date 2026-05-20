@@ -117,36 +117,25 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		})
 	}
 
-	// Optional Pyroscope continuous profiling on the gateway sidecar.
-	// Only injects when explicitly enabled AND a server address is
-	// configured — half-configured profiling is a deployment bug we want
-	// to fail-soft (gateway logs a WARN and continues without profiling).
+	// Pyroscope profiling. Requires both flag + address; auth is
+	// optional. See PipelineRunReconciler doc for why creds are plain.
 	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
 		gatewayEnv = append(gatewayEnv,
 			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},
 			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
-			// Downward API: surface pod name + namespace as Pyroscope tags.
+			// Downward API: surface pod namespace as a Pyroscope tag.
 			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
 			}},
 		)
-		// Auth from a Secret keyed by PYROSCOPE_USERNAME + PYROSCOPE_PASSWORD.
-		// Optional: omit the Secret to send unauthenticated to an
-		// in-cluster open Pyroscope.
-		if r.GatewayProfilingSecretName != "" {
+		if r.GatewayProfilingUsername != "" {
 			gatewayEnv = append(gatewayEnv,
-				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: r.GatewayProfilingSecretName},
-						Key:                  "PYROSCOPE_USERNAME",
-					},
-				}},
-				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: r.GatewayProfilingSecretName},
-						Key:                  "PYROSCOPE_PASSWORD",
-					},
-				}},
+				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", Value: r.GatewayProfilingUsername},
+			)
+		}
+		if r.GatewayProfilingPassword != "" {
+			gatewayEnv = append(gatewayEnv,
+				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword},
 			)
 		}
 	}
