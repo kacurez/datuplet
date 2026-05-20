@@ -309,9 +309,12 @@ func (r *parquetArrowReader) openNextFile() error {
 	if err != nil {
 		return fmt.Errorf("parquet open %s: %w", src.name, err)
 	}
+	// BatchSize is in ROWS. 4096 keeps per-Record memory bounded across
+	// schema widths (wide ~4 KiB/row tables produce ~16 MiB Records that
+	// fit comfortably under the SDK's 64 MiB gRPC MaxRecvMsgSize cap).
 	arrowReader, err := pqarrow.NewFileReader(pr, pqarrow.ArrowReadProperties{
 		Parallel:  false,
-		BatchSize: 64 * 1024,
+		BatchSize: 4 * 1024,
 	}, r.allocator)
 	if err != nil {
 		pr.Close()
