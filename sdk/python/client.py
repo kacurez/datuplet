@@ -236,6 +236,11 @@ class Reader:
         self._stub.CloseReader(pb.CloseReaderRequest(reader_id=self._reader_id))
 
 
+# Default Write-call accumulator threshold (bytes). See Writer.write for semantics.
+# Mirrors the Go SDK's defaultBatchSize so behavior is consistent across languages.
+DEFAULT_BATCH_SIZE = 1024 * 1024  # 1 MiB
+
+
 class Writer:
     """Chunked writer for an output."""
 
@@ -249,6 +254,7 @@ class Writer:
         table: str,
         input_format: int,
         inferred_schema: Optional[Any],
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ):
         self._stub = stub
         self._http_session = http_session
@@ -258,6 +264,16 @@ class Writer:
         self._table = table
         self._input_format = input_format
         self._inferred_schema = inferred_schema  # pb.Schema
+
+        # Write-call batching state. See write() for the contract.
+        #   > 0: batching ON at this byte threshold
+        #   == 0: batching ON at DEFAULT_BATCH_SIZE
+        #   < 0: batching OFF (legacy semantics — every write -> immediate write_chunk)
+        if batch_size == 0:
+            self._batch_threshold = DEFAULT_BATCH_SIZE
+        else:
+            self._batch_threshold = batch_size
+        self._batch_buffer: bytearray = bytearray()
 
     @property
     def bucket(self) -> str:
@@ -275,7 +291,11 @@ class Writer:
         return self._inferred_schema
 
     def write_chunk(self, data: bytes) -> WriteResult:
-        """Write a chunk of data.
+        """Write a chunk of data immediately and return the gateway's result.
+
+        If a write() batch is pending, it is flushed first so the gateway
+        sees chunks in submission order. The returned WriteResult describes
+        only THIS write_chunk's data, not the pending-batch flush.
 
         Uses HTTP if endpoint available (no size limit), falls back to gRPC.
 
@@ -284,6 +304,15 @@ class Writer:
 
         Returns:
             WriteResult with rows accepted and buffer info.
+        """
+        # Preserve call order: drain any pending write() batch first.
+        self._flush_batch()
+        return self._write_chunk_immediate(data)
+
+    def _write_chunk_immediate(self, data: bytes) -> WriteResult:
+        """Send data without consulting the batch buffer.
+
+        Used by write_chunk (after flushing) and by _flush_batch itself.
         """
         if self._http_endpoint:
             return self._write_chunk_http(data)
@@ -333,19 +362,66 @@ class Writer:
         )
 
     def write(self, data: bytes) -> None:
-        """Convenience method that calls write_chunk and ignores result.
+        """Row-at-a-time / streaming convenience method.
+
+        Does not return per-call results; callers that need them should use
+        write_chunk.
+
+        By default write() batches: bytes are appended to a per-writer
+        accumulator and the gateway only sees a write_chunk when the
+        accumulator reaches the batch threshold (1 MiB by default). This
+        collapses row-at-a-time HTTP traffic by ~1000x for the common case
+        of one row per write call. To opt out, open the writer with
+        batch_size=-1 — every write() becomes one immediate write_chunk
+        (the legacy behavior).
+
+        The accumulator is drained on every:
+          * threshold cross (this method)
+          * write_chunk call (to preserve call order)
+          * flush call (explicit)
+          * close call (final flush before commit)
 
         Args:
             data: Data bytes to write.
         """
-        self.write_chunk(data)
+        if self._batch_threshold <= 0:
+            # Batching disabled — legacy semantics.
+            self._write_chunk_immediate(data)
+            return
+
+        self._batch_buffer.extend(data)
+        if len(self._batch_buffer) >= self._batch_threshold:
+            self._flush_batch()
+
+    def flush(self) -> None:
+        """Force any pending write()-batched data to the gateway immediately.
+
+        No-op when batching is disabled or the accumulator is empty. Useful
+        for callers that want to checkpoint progress without closing the
+        writer.
+        """
+        self._flush_batch()
+
+    def _flush_batch(self) -> None:
+        """Send the currently-buffered write() payload as a single write_chunk."""
+        if not self._batch_buffer:
+            return
+        # bytes() copies; the underlying bytearray is then cleared in place.
+        # This is the equivalent of slicing-to-zero-length in the Go SDK.
+        payload = bytes(self._batch_buffer)
+        self._batch_buffer.clear()
+        self._write_chunk_immediate(payload)
 
     def close(self) -> CloseResult:
         """Close the writer and finalize output.
 
+        Drains any pending write()-batched data before closing — otherwise
+        the gateway would commit without seeing the tail of the stream.
+
         Returns:
             CloseResult with stats.
         """
+        self._flush_batch()
         resp = self._stub.CloseWriter(pb.CloseWriterRequest(writer_id=self._writer_id))
         return CloseResult(
             total_rows=resp.total_rows,
@@ -505,6 +581,7 @@ class Client:
         input_format: int = pb.DataFormat.FORMAT_CSV,
         schema: Optional[Any] = None,
         transforms: Optional[Any] = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> Writer:
         """Open a writer for a table.
 
@@ -516,6 +593,11 @@ class Client:
             input_format: Format of data chunks to send (pb.DataFormat enum). Default: CSV.
             schema: Optional pb.Schema. If not provided, inferred from first chunk.
             transforms: Optional pb.TransformSpec for write-time transforms.
+            batch_size: SDK-side write() accumulator threshold in bytes.
+                Defaults to 1 MiB. Pass 0 to use the default explicitly,
+                or a negative value to disable batching (every write becomes
+                one immediate write_chunk — legacy v0.2.x behavior). Has no
+                effect on write_chunk(), which always sends immediately.
 
         Returns:
             Writer for the table.
@@ -538,6 +620,7 @@ class Client:
             resp.table,
             input_format,
             resp.inferred_schema,
+            batch_size=batch_size,
         )
 
     def commit(self, best_effort: bool = False) -> CommitResult:
