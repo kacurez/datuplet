@@ -10,6 +10,8 @@ import (
 	"log"
 	"path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -154,6 +156,26 @@ func NewMinIOBackendWithProvider(cfg MinIOProviderConfig) (*MinIOBackend, error)
 	}, nil
 }
 
+// maxS3CredsCacheLifetime caps how long minio-go is allowed to reuse the
+// credentials.Value we hand back via Retrieve(). Same rationale (and same
+// 60 s value) as maxTokenCacheLifetime in gcs.go: STS rotates underlying
+// credentials on a ~15 s cadence, and Phase 1's streaming uploads keep a
+// minio multipart session open for many minutes — long enough for the
+// cached SessionToken to be invalidated server-side while minio-go
+// happily reuses it client-side and gets 403/401 from S3.
+//
+// Without this cap (and the IsExpired re-check below), the previous
+// implementation hardcoded IsExpired() => false, so the first Retrieve()
+// was the only one that ever ran. Mirror of the GCS hotfix; same cadence
+// works because the underlying STS rotation cadence is the same on both
+// clouds.
+const maxS3CredsCacheLifetime = 60 * time.Second
+
+// s3CredsExpiryGrace is how early IsExpired starts saying "true" before
+// the actual cache expiry, so a request mid-flight doesn't race the
+// cutoff. Mirrors the 10 s default of golang.org/x/oauth2.ReuseTokenSource.
+const s3CredsExpiryGrace = 10 * time.Second
+
 // vendedCredsProvider adapts catalogwriter.VendedCreds to minio-go's
 // credentials.Provider. Each Retrieve call goes through VendedCreds.Get
 // which itself caches the response and only round-trips lakekeeper when
@@ -164,8 +186,18 @@ func NewMinIOBackendWithProvider(cfg MinIOProviderConfig) (*MinIOBackend, error)
 // can't be directly threaded through to VendedCreds.Get. The default
 // HTTP client in catalogwriter.VendedCreds carries its own per-call
 // timeout — that's the bound on the renewal RPC for now.
+//
+// cachedExp tracks when minio-go should call us again (capped to
+// maxS3CredsCacheLifetime — see IsExpired).
+//
+// `vc` is typed as the package-local credsFetcher interface (defined in
+// gcs.go) rather than *catalogwriter.VendedCreds directly so unit tests
+// can inject a fake — same pattern as vendedTokenSource for GCS.
 type vendedCredsProvider struct {
-	vc *catalogwriter.VendedCreds
+	vc credsFetcher
+
+	mu        sync.Mutex
+	cachedExp time.Time // zero when uninitialized → IsExpired returns true
 }
 
 // Retrieve is the deprecated path; minio-go still calls it through
@@ -185,6 +217,11 @@ func (p *vendedCredsProvider) Retrieve() (credentials.Value, error) {
 // signal to forward. The catalogwriter.VendedCreds default HTTPClient
 // carries its own per-call timeout — that's the bound on a hung
 // lakekeeper for now.
+//
+// Side effect: records the effective expiry under which minio-go is
+// allowed to reuse this value. The recorded expiry is capped at
+// maxS3CredsCacheLifetime so IsExpired forces re-fetch well before STS
+// rotation invalidates the SessionToken on the AWS/MinIO side.
 func (p *vendedCredsProvider) RetrieveWithCredContext(_ *credentials.CredContext) (credentials.Value, error) {
 	got, err := p.vc.Get(context.Background())
 	if err != nil {
@@ -194,6 +231,17 @@ func (p *vendedCredsProvider) RetrieveWithCredContext(_ *credentials.CredContext
 	if !ok {
 		return credentials.Value{}, fmt.Errorf("vended creds: expected S3Creds, got %T", got)
 	}
+
+	// Cap the reuse window. See maxS3CredsCacheLifetime for rationale.
+	cap := time.Now().Add(maxS3CredsCacheLifetime)
+	exp := c.ExpiresAt()
+	if exp.IsZero() || exp.After(cap) {
+		exp = cap
+	}
+	p.mu.Lock()
+	p.cachedExp = exp
+	p.mu.Unlock()
+
 	return credentials.Value{
 		AccessKeyID:     c.AccessKeyID,
 		SecretAccessKey: c.SecretAccessKey,
@@ -202,15 +250,26 @@ func (p *vendedCredsProvider) RetrieveWithCredContext(_ *credentials.CredContext
 	}, nil
 }
 
-// IsExpired delegates to VendedCreds' renewal contract: a positive
-// answer triggers minio-go to call RetrieveWithCredContext again.
-// Returning true keeps the upstream cache from skewing past our own.
+// IsExpired tells minio-go's credentials cache when to call Retrieve()
+// again. Without an honest answer here minio-go reuses the first
+// Retrieve()'s value forever — which is exactly the v0.2.4 streaming-
+// upload failure on the AWS/MinIO path:
+//
+//   - First S3 op → Retrieve() → cached
+//   - Subsequent ops → IsExpired() = false → cached value reused
+//   - STS rotation after ~15 s invalidates the SessionToken server-side
+//   - Long multipart upload sends the stale token → 403/401
+//
+// We return true once now+grace is past cachedExp, forcing minio-go to
+// call Retrieve() again. Retrieve() in turn calls VendedCreds.Get(),
+// whose own 50%-of-TTL renewal kicks in and the chain self-heals.
 func (p *vendedCredsProvider) IsExpired() bool {
-	// Conservative: always say "not expired", let VendedCreds.Get make
-	// the call. minio-go re-checks before each request.
-	// Returning false here avoids a redundant fetch path; VendedCreds
-	// already throttles via its 60s floor.
-	return false
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cachedExp.IsZero() {
+		return true // never fetched — minio-go must call Retrieve
+	}
+	return time.Now().Add(s3CredsExpiryGrace).After(p.cachedExp)
 }
 
 // splitEndpoint splits a lakekeeper s3.endpoint URL ("http://minio:9000",
