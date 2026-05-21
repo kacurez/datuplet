@@ -67,7 +67,20 @@ func (r *seekableReaderAt) Seek(offset int64, whence int) (int64, error) {
 	return r.pos, nil
 }
 
+// targetChunkBytes caps each emitted Arrow-IPC DataChunk's payload size. The
+// BatchSize cap in openNextFile is in rows, which is unsafe for wide-row tables
+// (e.g. 65 KiB/row × 4096 rows = 267 MiB, busts the SDK's 64 MiB gRPC
+// MaxRecvMsgSize). 16 MiB leaves comfortable headroom below 64 MiB and matches
+// the buffer chunk granularity used elsewhere in the gateway.
+const targetChunkBytes = 16 * 1024 * 1024
+
 // parquetArrowReader emits Arrow-IPC DataChunks at parquet row-group granularity.
+//
+// When a single pqarrow Record would serialize to more than targetChunkBytes,
+// the reader slices it across multiple ReadChunk calls using state in
+// pendingRec/pendingOffset/pendingRowsPerSlice (see emitPendingSlice). This is
+// a hard byte cap independent of BatchSize, so wide-row tables can't blow past
+// gRPC message limits.
 type parquetArrowReader struct {
 	ctx       context.Context
 	sources   []fileSource
@@ -79,6 +92,12 @@ type parquetArrowReader struct {
 	currentReader *file.Reader
 	currentRR     pqarrow.RecordReader
 	totalSize     int64
+
+	// Byte-bound slicing state. When non-nil, the next ReadChunk emits the
+	// next slice of pendingRec instead of pulling a new Record from currentRR.
+	pendingRec          arrow.RecordBatch
+	pendingOffset       int64
+	pendingRowsPerSlice int64
 }
 
 // NewParquetArrowReader opens a streaming arrow reader over a list of parquet
@@ -149,6 +168,10 @@ func (r *parquetArrowReader) Schema() *SchemaInfo      { return r.schema }
 func (r *parquetArrowReader) TotalSizeEstimate() int64 { return r.totalSize }
 
 func (r *parquetArrowReader) Close() error {
+	if r.pendingRec != nil {
+		r.pendingRec.Release()
+		r.pendingRec = nil
+	}
 	if r.currentRR != nil {
 		r.currentRR.Release()
 		r.currentRR = nil
@@ -169,6 +192,11 @@ func (r *parquetArrowReader) Close() error {
 }
 
 func (r *parquetArrowReader) ReadChunk() (*DataChunk, error) {
+	// If a previous ReadChunk left a Record half-emitted (byte-bound split),
+	// finish it before pulling a fresh one.
+	if r.pendingRec != nil {
+		return r.emitPendingSlice()
+	}
 	for {
 		if r.currentRR == nil {
 			if err := r.openNextFile(); err == io.EOF {
@@ -196,30 +224,128 @@ func (r *parquetArrowReader) ReadChunk() (*DataChunk, error) {
 		if err != nil {
 			return nil, fmt.Errorf("file %s: project record: %w", r.sources[r.fileIdx].name, err)
 		}
-		var buf bytes.Buffer
-		w := ipc.NewWriter(&buf, ipc.WithSchema(r.arrowSch))
-		if err := w.Write(projected); err != nil {
-			projected.Release()
-			return nil, fmt.Errorf("ipc write: %w", err)
-		}
-		if err := w.Close(); err != nil {
-			projected.Release()
-			return nil, fmt.Errorf("ipc close: %w", err)
-		}
+
+		// Byte-bound the emitted chunk. BatchSize caps rows, but wide-row
+		// schemas (e.g. 65 KiB/row) can still produce gRPC-busting payloads
+		// (267 MiB observed in prod at 4096 rows). estimateRecordBytes sums
+		// the underlying Arrow buffers — that's an upper bound on the IPC
+		// payload (IPC framing overhead is < 1 KiB per record). If the
+		// estimate exceeds targetChunkBytes we slice across ReadChunk calls.
 		rows := projected.NumRows()
-		projected.Release()
-		// IsLast is intentionally never set by the streaming reader. The gRPC server
-		// stream's natural io.EOF (after the final ReadChunk returns it) is the only
-		// terminator. Callers MUST handle io.EOF; setting IsLast on the last chunk
-		// would be redundant and would couple chunk emission to file-roll lookahead
-		// (which pqarrow.RecordReader doesn't support).
-		return &DataChunk{
-			Data:        buf.Bytes(),
-			Format:      "arrow_ipc",
-			IsLast:      false,
-			RowsInChunk: rows,
-		}, nil
+		estBytes := estimateRecordBytes(projected)
+		if rows <= 1 || estBytes <= targetChunkBytes {
+			defer projected.Release()
+			return r.serializeSlice(projected, 0, rows)
+		}
+
+		// Split: compute rowsPerSlice from the per-row estimate. Reserve a
+		// headroom budget for IPC framing (schema header + per-batch
+		// envelope; arrow-go adds ~300 bytes for primitive schemas, more
+		// for wider ones). The headroom is a small fraction of the cap so
+		// the loss in chunk fill is negligible (<2%). Clamp to [1, rows-1]
+		// so we always emit at least 2 slices when we got here.
+		const ipcFramingHeadroom = 256 * 1024
+		effectiveCap := int64(targetChunkBytes - ipcFramingHeadroom)
+		bytesPerRow := estBytes / rows
+		if bytesPerRow < 1 {
+			bytesPerRow = 1
+		}
+		rowsPerSlice := effectiveCap / bytesPerRow
+		if rowsPerSlice < 1 {
+			rowsPerSlice = 1
+		}
+		if rowsPerSlice >= rows {
+			rowsPerSlice = rows - 1
+		}
+		r.pendingRec = projected
+		r.pendingOffset = 0
+		r.pendingRowsPerSlice = rowsPerSlice
+		return r.emitPendingSlice()
 	}
+}
+
+// emitPendingSlice returns one chunk from r.pendingRec starting at
+// r.pendingOffset and advancing by up to r.pendingRowsPerSlice rows. When the
+// last slice is emitted, the pending record is released and the state is
+// cleared so the next ReadChunk pulls a fresh Record from currentRR.
+//
+// IsLast is intentionally never set by the streaming reader. The gRPC server
+// stream's natural io.EOF (after the final ReadChunk returns it) is the only
+// terminator. Callers MUST handle io.EOF; setting IsLast on the last chunk
+// would be redundant and would couple chunk emission to file-roll lookahead
+// (which pqarrow.RecordReader doesn't support).
+func (r *parquetArrowReader) emitPendingSlice() (*DataChunk, error) {
+	remaining := r.pendingRec.NumRows() - r.pendingOffset
+	sliceRows := r.pendingRowsPerSlice
+	if sliceRows > remaining {
+		sliceRows = remaining
+	}
+	chunk, err := r.serializeSlice(r.pendingRec, r.pendingOffset, sliceRows)
+	if err != nil {
+		// On error the pending Record's contract is broken; release it so
+		// Close() doesn't double-release and so the next ReadChunk pulls fresh.
+		r.pendingRec.Release()
+		r.pendingRec = nil
+		r.pendingOffset = 0
+		return nil, err
+	}
+	r.pendingOffset += sliceRows
+	if r.pendingOffset >= r.pendingRec.NumRows() {
+		r.pendingRec.Release()
+		r.pendingRec = nil
+		r.pendingOffset = 0
+	}
+	return chunk, nil
+}
+
+// serializeSlice serializes a zero-copy slice [offset, offset+rows) of `rec`
+// into a fresh Arrow IPC stream containing schema + one record batch, and
+// returns it as a DataChunk. The caller retains ownership of `rec`.
+func (r *parquetArrowReader) serializeSlice(rec arrow.RecordBatch, offset, rows int64) (*DataChunk, error) {
+	slice := rec.NewSlice(offset, offset+rows)
+	defer slice.Release()
+	var buf bytes.Buffer
+	w := ipc.NewWriter(&buf, ipc.WithSchema(r.arrowSch))
+	if err := w.Write(slice); err != nil {
+		return nil, fmt.Errorf("ipc write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("ipc close: %w", err)
+	}
+	return &DataChunk{
+		Data:        buf.Bytes(),
+		Format:      "arrow_ipc",
+		IsLast:      false,
+		RowsInChunk: rows,
+	}, nil
+}
+
+// estimateRecordBytes returns an upper-bound on the serialized IPC payload of
+// `rec` by summing every Arrow data buffer across its columns (and nested
+// children, for list/struct types). Excludes the small IPC framing overhead
+// (< 1 KiB per record), which is irrelevant at the 16 MiB cap.
+func estimateRecordBytes(rec arrow.RecordBatch) int64 {
+	var total int64
+	for i := 0; i < int(rec.NumCols()); i++ {
+		total += arrayDataBytes(rec.Column(i).Data())
+	}
+	return total
+}
+
+func arrayDataBytes(d arrow.ArrayData) int64 {
+	if d == nil {
+		return 0
+	}
+	var total int64
+	for _, buf := range d.Buffers() {
+		if buf != nil {
+			total += int64(buf.Len())
+		}
+	}
+	for _, child := range d.Children() {
+		total += arrayDataBytes(child)
+	}
+	return total
 }
 
 // projectRecord reshapes `rec` to match the `target` schema:
@@ -309,9 +435,10 @@ func (r *parquetArrowReader) openNextFile() error {
 	if err != nil {
 		return fmt.Errorf("parquet open %s: %w", src.name, err)
 	}
-	// BatchSize is in ROWS. 4096 keeps per-Record memory bounded across
-	// schema widths (wide ~4 KiB/row tables produce ~16 MiB Records that
-	// fit comfortably under the SDK's 64 MiB gRPC MaxRecvMsgSize cap).
+	// BatchSize is in ROWS — a soft upper bound on rows fetched per
+	// pqarrow Record. The hard byte cap is enforced by targetChunkBytes in
+	// ReadChunk (which slices wide Records across chunks), so this value
+	// just trades pqarrow internal buffering for chunk-emission cadence.
 	arrowReader, err := pqarrow.NewFileReader(pr, pqarrow.ArrowReadProperties{
 		Parallel:  false,
 		BatchSize: 4 * 1024,
