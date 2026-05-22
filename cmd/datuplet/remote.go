@@ -207,6 +207,18 @@ func resolveProject(projects []clusterMetaProject, flag, remote string) (id, lak
 	return "", "", "", fmt.Errorf("project %q not found in your accessible projects\navailable: %s", flag, strings.Join(names, ", "))
 }
 
+// RequireAPIToken returns an error when r.APIToken is empty. Trigger and
+// storage commands must call this right after loadRemoteArgs to surface a
+// clear, actionable message instead of a cryptic 401 from pipeline-api.
+// The condition arises when the user has a token file from an older
+// pipeline-api that did not yet issue cli-api bearer tokens.
+func (r *remoteArgs) RequireAPIToken() error {
+	if r.APIToken == "" {
+		return fmt.Errorf("WARN: ~/.datuplet/api-token not present — your `datuplet login` may be from an older pipeline-api. Re-run `datuplet login --remote %s` against an upgraded server", r.Remote)
+	}
+	return nil
+}
+
 // generateRunID returns a fresh UUID string for use as a pipeline run
 // identifier. Extracted as a function so tests can assert uniqueness without
 // launching Docker containers.

@@ -17,6 +17,13 @@ import (
 // pipeline-api endpoints from hanging the CLI indefinitely.
 var storageHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
+const (
+	// storageMaxResponseBytes caps storage API responses. 16 MiB accommodates
+	// long snapshot histories on wide tables; the server enforces its own
+	// ≤100-row / 1 MiB preview cap on the data-plane side.
+	storageMaxResponseBytes = 16 << 20 // 16 MiB
+)
+
 // parseNsTable splits "<ns>.<table>" into its two parts. Both parts must
 // be non-empty and the single "." separator must appear exactly once.
 func parseNsTable(s string) (ns, table string, err error) {
@@ -30,9 +37,13 @@ func parseNsTable(s string) (ns, table string, err error) {
 // storageGET issues a GET against the storage REST path and returns the
 // raw response body. Storage endpoints already return JSON; callers may
 // decode + reformat for non-default --format flags.
-func storageGET(remote, path, token string) ([]byte, error) {
+//
+// ctx is passed through to the HTTP request; callers currently pass
+// context.Background() — the parameter exists so future --wait semantics
+// can plumb a cancellable context without a signature change.
+func storageGET(ctx context.Context, remote, path, token string) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s/api/v1/storage%s", strings.TrimRight(remote, "/"), path)
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +53,7 @@ func storageGET(remote, path, token string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, storageMaxResponseBytes))
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
@@ -50,7 +61,15 @@ func storageGET(remote, path, token string) ([]byte, error) {
 }
 
 func storageBaseArgs(remoteFlag, tokenFileFlag, projectFlag string) (*remoteArgs, error) {
-	return loadRemoteArgs(remoteFlag, tokenFileFlag, projectFlag)
+	args, err := loadRemoteArgs(remoteFlag, tokenFileFlag, projectFlag)
+	if err != nil {
+		return nil, err
+	}
+	if err := args.RequireAPIToken(); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return nil, err
+	}
+	return args, nil
 }
 
 func runStorageTables(remote, tokenFile, project string) error {
@@ -58,7 +77,7 @@ func runStorageTables(remote, tokenFile, project string) error {
 	if err != nil {
 		return err
 	}
-	body, err := storageGET(args.Remote, fmt.Sprintf("/projects/%s/tables", url.PathEscape(args.ID)), args.APIToken)
+	body, err := storageGET(context.Background(), args.Remote, fmt.Sprintf("/projects/%s/tables", url.PathEscape(args.ID)), args.APIToken)
 	if err != nil {
 		return err
 	}
@@ -76,8 +95,8 @@ func runStorageEndpoint(subPath string) func(remote, tokenFile, project, ref str
 			return err
 		}
 		path := fmt.Sprintf("/projects/%s/tables/%s/%s/%s",
-				url.PathEscape(args.ID), url.PathEscape(ns), url.PathEscape(tbl), subPath)
-		body, err := storageGET(args.Remote, path, args.APIToken)
+			url.PathEscape(args.ID), url.PathEscape(ns), url.PathEscape(tbl), subPath)
+		body, err := storageGET(context.Background(), args.Remote, path, args.APIToken)
 		if err != nil {
 			return err
 		}
@@ -108,7 +127,7 @@ func runStorageSample(remote, tokenFile, project, ref string, rows int) error {
 	if rows > 0 {
 		path = fmt.Sprintf("%s?rows=%d", path, rows)
 	}
-	body, err := storageGET(args.Remote, path, args.APIToken)
+	body, err := storageGET(context.Background(), args.Remote, path, args.APIToken)
 	if err != nil {
 		return err
 	}

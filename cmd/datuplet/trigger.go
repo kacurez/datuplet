@@ -100,6 +100,10 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 	if err != nil {
 		return err
 	}
+	if err := resolved.RequireAPIToken(); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return err
+	}
 
 	// 1. Trigger (no per-call timeout; the parent context governs).
 	ctx := context.Background()
