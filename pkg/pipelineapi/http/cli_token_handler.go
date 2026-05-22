@@ -28,11 +28,18 @@ type cliTokenProject struct {
 }
 
 type cliTokenResponse struct {
-	Token     string            `json:"token"`
-	ExpiresAt string            `json:"expires_at"`
-	UserID    string            `json:"user_id"`
-	Cluster   cliTokenCluster   `json:"cluster"`
-	Projects  []cliTokenProject `json:"projects"`
+	Token        string            `json:"token"`
+	ExpiresAt    string            `json:"expires_at"`
+	UserID       string            `json:"user_id"`
+	Cluster      cliTokenCluster   `json:"cluster"`
+	Projects     []cliTokenProject `json:"projects"`
+	// APIToken is an RS256 JWT scoped to pipeline-api itself
+	// (aud=datuplet-api, token_kind=cli-api). CLI subcommands that call
+	// pipeline-api endpoints (trigger, storage) must use this token via
+	// Authorization: Bearer, NOT the catalog token above. Existing CLI
+	// clients that don't read this field are unaffected (backward-compat).
+	APIToken     string `json:"api_token"`
+	APIExpiresAt string `json:"api_expires_at"`
 }
 
 // cliTokenLifetime is the canonical TTL of a local-cli JWT used by
@@ -168,6 +175,12 @@ func (s *Server) handleCLIToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	apiTok, apiExp, err := tokens.MintCLIAPIToken(ctx, s.signer, cliTokenLifetime)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not mint api token")
+		return
+	}
+
 	// Pull the user's projects so the CLI knows which lakekeeper project
 	// to forward as `x-project-id` on every catalog/STS call. Without
 	// this, the CLI defaults to the all-zeros
@@ -203,6 +216,8 @@ func (s *Server) handleCLIToken(w http.ResponseWriter, r *http.Request) {
 			LakekeeperURL: s.cliLakekeeperURL,
 			WarehouseName: s.cliWarehouseName,
 		},
-		Projects: projectsOut,
+		Projects:     projectsOut,
+		APIToken:     apiTok,
+		APIExpiresAt: apiExp.Format(time.RFC3339),
 	})
 }

@@ -29,6 +29,7 @@ const (
 	TokenKindRun           = "run"
 	TokenKindImpersonation = "impersonation"
 	TokenKindLocalCLI      = "local-cli"
+	TokenKindCLIAPI        = "cli-api"
 )
 
 // Default JWT claim constants — issuer + token-type used by run tokens.
@@ -42,6 +43,11 @@ const (
 // as the source of truth pipeline-api signs against — anything else is
 // verifier-rejected.
 const TableTokenAudience = "datuplet-catalog"
+
+// APITokenAudience is the fixed JWT aud claim for tokens consumed by
+// pipeline-api itself (not lakekeeper). Used by the bearer-JWT auth
+// resolver to scope CLI bearer tokens to this service.
+const APITokenAudience = "datuplet-api"
 
 // ImpersonationLifetime is the short TTL minted on impersonation tokens.
 // 60s is enough for one storage-browse round-trip; a longer ceiling would
