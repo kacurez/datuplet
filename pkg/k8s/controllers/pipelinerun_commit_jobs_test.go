@@ -372,6 +372,21 @@ func TestBuildCommitJobHasRuntimeTolerations(t *testing.T) {
 	}
 }
 
+// TestCommitJobUsesPullAlways: RFC 020 iteration loop requires the commit
+// Job container to pull its image fresh on every run so a new build is
+// picked up without a cache bust.
+func TestCommitJobUsesPullAlways(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	job := r.buildCommitJob(minimalCommitPR(), "raw", datupletv1.WriteModeAppend)
+	containers := job.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		t.Fatal("no containers on commit Job")
+	}
+	if containers[0].ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("commit container ImagePullPolicy = %q, want PullAlways", containers[0].ImagePullPolicy)
+	}
+}
+
 // TestBuildCommitJobNilTolerationsOmitsField verifies that a reconciler
 // with no RuntimeTolerations leaves spec.tolerations nil (not an empty slice).
 func TestBuildCommitJobNilTolerationsOmitsField(t *testing.T) {

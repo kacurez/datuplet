@@ -167,9 +167,13 @@ func (r *PipelineRunReconciler) buildCommitJob(pr *datupletv1.PipelineRun, bucke
 					Tolerations:   r.RuntimeTolerations, // nil-safe: omitted from Pod when nil
 					Containers: []corev1.Container{
 						{
-							Name:            commitContainerName,
-							Image:           image,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							Name:  commitContainerName,
+							Image: image,
+							// Runtime pull policy is configurable via DATUPLET_RUNTIME_PULL_POLICY
+							// (chart wires .Values.image.pullPolicy). Defaults to PullAlways for
+							// the RFC 020 iteration loop; kind/e2e overrides to IfNotPresent
+							// because images are pre-loaded via `kind load docker-image`.
+							ImagePullPolicy: r.runtimePullPolicy(),
 							Env:             env,
 						},
 					},

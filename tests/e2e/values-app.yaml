@@ -5,6 +5,11 @@ platform:
   releaseName: datuplet-infra
 
 image:
+  # e2e loads images into the kind cluster via `kind load docker-image`;
+  # Always would make K8s try to pull from Docker Hub instead of using
+  # the locally-loaded image and time out the chart pre-install hook.
+  # Production iteration deploys override back to Always via values.
+  pullPolicy: IfNotPresent
   pipelineApi:
     repository: datuplet/pipeline-api
     tag: latest

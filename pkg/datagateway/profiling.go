@@ -22,10 +22,10 @@ import (
 //   - PYROSCOPE_PASSWORD          — Grafana Cloud access policy token.
 //     Optional in lockstep with USERNAME.
 //
-// The application name carries pod / namespace / run-id labels via
-// DATUPLET_RUN_ID and standard K8s downward-API env (HOSTNAME,
-// POD_NAMESPACE). Labels make the profiles searchable by run in the
-// Grafana Cloud Profiles UI.
+// The application name carries pod / namespace / run-id / iteration-id
+// labels via RUN_ID, DATUPLET_ITERATION_ID and standard K8s downward-API
+// env (HOSTNAME, POD_NAMESPACE). Labels make the profiles searchable by
+// run in the Grafana Cloud Profiles UI.
 //
 // Profile types enabled — all six that pyroscope-go ships: CPU,
 // AllocObjects, AllocSpace, InuseObjects, InuseSpace, Goroutines. The
@@ -63,6 +63,9 @@ func StartProfilingIfEnabled() (stop func() error) {
 	}
 	if v := os.Getenv("RUN_ID"); v != "" {
 		tags["run_id"] = v
+	}
+	if v := os.Getenv("DATUPLET_ITERATION_ID"); v != "" {
+		tags["iteration_id"] = v
 	}
 
 	cfg := pyroscope.Config{

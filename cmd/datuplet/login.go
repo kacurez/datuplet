@@ -28,11 +28,17 @@ type loginArgs struct {
 // user's project list is a top-level field. The CLI merges them into
 // the on-disk clusterMeta when writing ~/.datuplet/cluster.json.
 type loginResponse struct {
-	Token     string                 `json:"token"`
-	ExpiresAt string                 `json:"expires_at"`
-	UserID    string                 `json:"user_id"`
-	Cluster   loginResponseCluster   `json:"cluster"`
-	Projects  []clusterMetaProject   `json:"projects"`
+	Token        string               `json:"token"`
+	ExpiresAt    string               `json:"expires_at"`
+	UserID       string               `json:"user_id"`
+	Cluster      loginResponseCluster `json:"cluster"`
+	Projects     []clusterMetaProject `json:"projects"`
+	// APIToken is the pipeline-api bearer token (aud=datuplet-api,
+	// token_kind=cli-api). Used by trigger + storage subcommands.
+	// Older server versions that don't emit this field leave it empty;
+	// the CLI surfaces a clear error at subcommand time.
+	APIToken     string `json:"api_token"`
+	APIExpiresAt string `json:"api_expires_at"`
 }
 
 type loginResponseCluster struct {
@@ -125,6 +131,15 @@ func runLogin(args loginArgs) error {
 		return fmt.Errorf("write token file: %w", err)
 	}
 
+	// Persist the api-token (pipeline-api bearer token) separately so
+	// trigger/storage subcommands can use the correct token without
+	// holding the lakekeeper token in memory. Empty api_token means the
+	// server is an older version that doesn't emit the field; we write an
+	// empty file so loadRemoteArgs can detect and report the issue clearly.
+	if err := writeAPITokenFile(dir, loginResp.APIToken); err != nil {
+		return fmt.Errorf("write api-token file: %w", err)
+	}
+
 	meta := clusterMeta{
 		LakekeeperURL:  loginResp.Cluster.LakekeeperURL,
 		WarehouseName:  loginResp.Cluster.WarehouseName,
@@ -132,6 +147,7 @@ func runLogin(args loginArgs) error {
 		UserID:         loginResp.UserID,
 		PipelineAPIURL: args.Remote,
 		Projects:       loginResp.Projects,
+		APIExpiresAt:   loginResp.APIExpiresAt,
 	}
 	if err := writeClusterFile(dir, meta); err != nil {
 		return fmt.Errorf("write cluster file: %w", err)

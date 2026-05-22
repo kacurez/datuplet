@@ -26,6 +26,11 @@ type clusterMeta struct {
 	// and use the first; multi-project selection via `--project <name>`
 	// is a future-cli concern.
 	Projects []clusterMetaProject `json:"projects"`
+	// APIExpiresAt is the expiry of the api-token stored in
+	// ~/.datuplet/api-token. Kept in cluster.json so loadRemoteArgs
+	// can validate expiry in a single file read without having to
+	// parse the JWT itself.
+	APIExpiresAt string `json:"api_expires_at,omitempty"`
 }
 
 type clusterMetaProject struct {
@@ -57,6 +62,14 @@ func datupletDir() (string, error) {
 // would parse inconsistently.
 func writeTokenFile(dir, rawJWT string) error {
 	path := filepath.Join(dir, "token")
+	return os.WriteFile(path, []byte(rawJWT), 0o600)
+}
+
+// writeAPITokenFile writes the raw api-token JWT to ~/.datuplet/api-token
+// with mode 0600. Distinct from the lakekeeper token so subcommands that
+// call pipeline-api can use the correct token without parsing cluster.json.
+func writeAPITokenFile(dir, rawJWT string) error {
+	path := filepath.Join(dir, "api-token")
 	return os.WriteFile(path, []byte(rawJWT), 0o600)
 }
 

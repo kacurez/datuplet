@@ -73,8 +73,14 @@ helm upgrade --install datuplet-infra charts/datuplet-infra \
   -n datuplet --wait --wait-for-jobs --timeout 10m
 
 # Phase 3 — Datuplet control plane (pipeline-api, observer, operator)
+# kind clusters use locally-loaded images (no registry); override the
+# chart-default pullPolicy=Always so Kubernetes uses kind-loaded images
+# rather than trying to pull non-existent "datuplet/*:latest" paths from
+# Docker Hub. Production deploys (chart pinned to versioned registry
+# tags) want the chart default; only override for local/kind/e2e.
 helm upgrade --install datuplet-app charts/datuplet-app \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
+  -n datuplet --wait --wait-for-jobs --timeout 10m \
+  --set image.pullPolicy=IfNotPresent
 
 # Phase 4 — Lakekeeper Iceberg catalog
 helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \

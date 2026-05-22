@@ -191,6 +191,22 @@ func main() {
 	gatewayProfilingUser := os.Getenv("PYROSCOPE_USERNAME")
 	gatewayProfilingPass := os.Getenv("PYROSCOPE_PASSWORD")
 
+	// Pull policy applied to per-PipelineRun runtime pods (gateway sidecar,
+	// component container, commit Job). Chart wires .Values.image.pullPolicy
+	// → DATUPLET_RUNTIME_PULL_POLICY so prod can flip to Always for the
+	// iteration loop while kind/e2e overrides to IfNotPresent. Default
+	// (env unset) is Always — handled in the reconciler's runtimePullPolicy()
+	// helper; we pass whatever the env says verbatim (or zero, which the
+	// helper interprets as Always).
+	runtimePullPolicy := corev1.PullPolicy(os.Getenv("DATUPLET_RUNTIME_PULL_POLICY"))
+	switch runtimePullPolicy {
+	case "", corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever:
+		// accepted
+	default:
+		setupLog.Error(nil, "invalid DATUPLET_RUNTIME_PULL_POLICY", "value", string(runtimePullPolicy))
+		os.Exit(1)
+	}
+
 	// Set up PipelineRun controller — the sole reconciler for both
 	// component Jobs and commit Jobs.
 	if err = (&controllers.PipelineRunReconciler{
@@ -207,6 +223,7 @@ func main() {
 		GatewayProfilingServerAddress: gatewayProfilingAddr,
 		GatewayProfilingUsername:      gatewayProfilingUser,
 		GatewayProfilingPassword:      gatewayProfilingPass,
+		RuntimePullPolicy:             runtimePullPolicy,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PipelineRun")
 		os.Exit(1)

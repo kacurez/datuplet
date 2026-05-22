@@ -1,0 +1,332 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// triggerHTTPClient is a dedicated client for the trigger subcommand's
+// HTTP calls. The 30s timeout is a per-request defensive cap on top of
+// context cancellation — guards against a server that responds slowly
+// without ever stalling.
+var triggerHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// httpStatusError carries the raw HTTP status code from a failed
+// response so retry classification can use type/value rather than
+// fragile error-message substrings.
+type httpStatusError struct {
+	op   string // "trigger" | "get-run" | "cancel"
+	code int
+	body string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s HTTP %d: %s", e.op, e.code, e.body)
+}
+
+// runJSONOut mirrors pipelineapi/http/run_handlers.go::runJSON for the
+// GET-run shape, with ended_at + wallclock_seconds derived client-side
+// at terminal phase. Used both for the GET response and for emitted
+// JSON output.
+type runJSONOut struct {
+	ID               string `json:"id"`
+	ProjectID        string `json:"project_id,omitempty"`
+	PipelineID       string `json:"pipeline_id,omitempty"`
+	PipelineName     string `json:"pipeline_name,omitempty"`
+	Phase            string `json:"phase"`
+	CurrentStage     string `json:"current_stage,omitempty"`
+	Message          string `json:"message,omitempty"`
+	CreatedAt        string `json:"created_at"`
+	EndedAt          string `json:"ended_at,omitempty"`
+	WallclockSeconds int    `json:"wallclock_seconds,omitempty"`
+}
+
+// createRunResp matches POST /pipelines/{name}/runs response, which is a
+// thinner shape — see run_handlers.go:95.
+type createRunResp struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	K8sNS  string `json:"k8s_ns"`
+}
+
+// Phases — pkg/k8s/api/v1/pipelinerun_types.go + runbackend/k8s.go.
+const (
+	phasePending           = "Pending"
+	phaseRunning           = "Running"
+	phaseSucceeded         = "Succeeded"
+	phaseFailedUser        = "FailedUser"
+	phaseFailedApplication = "FailedApplication"
+	phaseCancelled         = "Cancelled"
+	phaseExpired           = "Expired"
+)
+
+func isTerminalPhase(p string) bool {
+	switch p {
+	case phaseSucceeded, phaseFailedUser, phaseFailedApplication,
+		phaseCancelled, phaseExpired:
+		return true
+	}
+	return false
+}
+
+func exitCodeForPhase(p string) int {
+	if p == phaseSucceeded {
+		return 0
+	}
+	return 1
+}
+
+func computeWallclockSeconds(start, end time.Time) int {
+	return int(end.Sub(start).Round(time.Second).Seconds())
+}
+
+// runTrigger implements `datuplet trigger ... <pipeline-name>`.
+func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wait bool, timeout time.Duration, asJSON bool) error {
+	if pipelineName == "" {
+		return fmt.Errorf("pipeline name is required (positional arg)")
+	}
+	resolved, err := loadRemoteArgs(remoteFlag, tokenFileFlag, projectFlag)
+	if err != nil {
+		return err
+	}
+	if err := resolved.RequireAPIToken(); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return err
+	}
+
+	// 1. Trigger (no per-call timeout; the parent context governs).
+	ctx := context.Background()
+	runID, err := triggerRun(ctx, resolved.Remote, resolved.ID, pipelineName, resolved.APIToken)
+	if err != nil {
+		return fmt.Errorf("trigger run: %w", err)
+	}
+
+	// Immediately fetch the full run record so we have created_at + phase.
+	first, err := getRun(ctx, resolved.Remote, resolved.ID, runID, resolved.APIToken)
+	if err != nil {
+		return fmt.Errorf("fetch run after trigger: %w", err)
+	}
+
+	if !wait {
+		return emitResult(*first, asJSON)
+	}
+
+	// If the run already reached a terminal phase between trigger and our
+	// first GET (very fast pipelines, or a tight --timeout), skip polling
+	// entirely.
+	if isTerminalPhase(first.Phase) {
+		startT, perr := time.Parse(time.RFC3339, first.CreatedAt)
+		endT := time.Now().UTC()
+		first.EndedAt = endT.Format(time.RFC3339)
+		if perr == nil {
+			first.WallclockSeconds = computeWallclockSeconds(startT, endT)
+		}
+		if err := emitResult(*first, asJSON); err != nil {
+			return err
+		}
+		if rc := exitCodeForPhase(first.Phase); rc != 0 {
+			return fmt.Errorf("run %s ended in phase %s", first.ID, first.Phase)
+		}
+		return nil
+	}
+
+	// 2. Poll with --timeout + signal cancel.
+	pollCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	// Signal-handler goroutine: forwards SIGINT/SIGTERM to pollCtx.
+	// Exits via either branch — when signals arrive (cancel), or when
+	// pollCtx is cancelled by the deferred cancel() above (no extra
+	// cleanup needed; defer signal.Stop releases the channel registration).
+	go func() {
+		select {
+		case <-sigs:
+			cancel()
+		case <-pollCtx.Done():
+		}
+	}()
+
+	final, pollErr := pollUntilTerminal(pollCtx, resolved.Remote, resolved.ID, runID, resolved.APIToken)
+
+	// 3. On timeout/interrupt, best-effort cancel cluster-side and wait
+	// up to 30s for the Cancelled phase to materialise.
+	if pollErr != nil && (errors.Is(pollErr, context.DeadlineExceeded) || errors.Is(pollErr, context.Canceled)) {
+		// Use a *fresh* context for the cancel post + follow-up poll;
+		// the parent context is already cancelled.
+		ccx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		if cerr := cancelRun(ccx, resolved.Remote, resolved.ID, runID, resolved.APIToken); cerr != nil {
+			fmt.Fprintf(os.Stderr, "WARN: cancel POST failed for run %s: %v (run may still be active)\n", runID, cerr)
+		}
+		cancelled, perr := pollUntilTerminal(ccx, resolved.Remote, resolved.ID, runID, resolved.APIToken)
+		if cancelled != nil {
+			final = cancelled
+		} else if perr != nil {
+			fmt.Fprintf(os.Stderr, "WARN: could not confirm Cancelled phase for run %s within 30s: %v\n", runID, perr)
+		}
+	}
+	if final == nil {
+		if pollErr != nil {
+			return pollErr
+		}
+		return fmt.Errorf("poll ended without terminal phase")
+	}
+
+	// 4. Derive ended_at + wallclock from created_at + poll exit time.
+	startT, perr := time.Parse(time.RFC3339, final.CreatedAt)
+	endT := time.Now().UTC()
+	final.EndedAt = endT.Format(time.RFC3339)
+	if perr == nil {
+		final.WallclockSeconds = computeWallclockSeconds(startT, endT)
+	}
+
+	if err := emitResult(*final, asJSON); err != nil {
+		return err
+	}
+	if rc := exitCodeForPhase(final.Phase); rc != 0 {
+		return fmt.Errorf("run %s ended in phase %s", final.ID, final.Phase)
+	}
+	return nil
+}
+
+// --- HTTP helpers (all ctx-aware) ---
+
+func triggerRun(ctx context.Context, remote, projectID, pipelineName, token string) (runID string, err error) {
+	reqURL := fmt.Sprintf("%s/api/v1/projects/%s/pipelines/%s/runs",
+		strings.TrimRight(remote, "/"), url.PathEscape(projectID), url.PathEscape(pipelineName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := triggerHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return "", &httpStatusError{op: "trigger", code: resp.StatusCode, body: string(body)}
+	}
+	var out createRunResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.ID, nil
+}
+
+func getRun(ctx context.Context, remote, projectID, runID, token string) (*runJSONOut, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/projects/%s/runs/%s",
+		strings.TrimRight(remote, "/"), url.PathEscape(projectID), url.PathEscape(runID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := triggerHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, &httpStatusError{op: "get-run", code: resp.StatusCode, body: string(body)}
+	}
+	var out runJSONOut
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func cancelRun(ctx context.Context, remote, projectID, runID, token string) error {
+	reqURL := fmt.Sprintf("%s/api/v1/projects/%s/runs/%s/cancel",
+		strings.TrimRight(remote, "/"), url.PathEscape(projectID), url.PathEscape(runID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := triggerHTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return &httpStatusError{op: "cancel", code: resp.StatusCode, body: string(body)}
+	}
+	return nil
+}
+
+// isPermanentHTTPErr reports whether a *httpStatusError is in the
+// permanent (non-retryable) bucket. 4xx (except 408/429) are permanent;
+// 5xx and network errors are transient.
+func isPermanentHTTPErr(err error) bool {
+	var se *httpStatusError
+	if !errors.As(err, &se) {
+		return false // network/decode error — transient
+	}
+	if se.code == 408 || se.code == 429 {
+		return false
+	}
+	return se.code >= 400 && se.code < 500
+}
+
+func pollUntilTerminal(ctx context.Context, remote, projectID, runID, token string) (*runJSONOut, error) {
+	const pollInterval = 2 * time.Second
+	t := time.NewTicker(pollInterval)
+	defer t.Stop()
+	var lastErr error
+	for {
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, errors.Join(ctx.Err(), lastErr)
+			}
+			return nil, ctx.Err()
+		case <-t.C:
+			run, err := getRun(ctx, remote, projectID, runID, token)
+			if err != nil {
+				if isPermanentHTTPErr(err) {
+					return nil, err
+				}
+				lastErr = err // retry transient
+				continue
+			}
+			lastErr = nil
+			if isTerminalPhase(run.Phase) {
+				return run, nil
+			}
+		}
+	}
+}
+
+func emitResult(r runJSONOut, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(r)
+	}
+	fmt.Printf("run %s (pipeline=%s) phase=%s wallclock=%ds\n",
+		r.ID, r.PipelineName, r.Phase, r.WallclockSeconds)
+	if r.Message != "" {
+		fmt.Printf("message: %s\n", r.Message)
+	}
+	return nil
+}

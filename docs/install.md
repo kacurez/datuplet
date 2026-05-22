@@ -81,6 +81,9 @@ helm upgrade --install datuplet-infra charts/datuplet-infra \
 # 3. Phase 3 — Datuplet control plane (pipeline-api, observer, operator, CRDs, authz-bootstrap)
 #    --wait-for-jobs is required: the pre-install migrate + authz-bootstrap Jobs must complete
 #    before Deployments become Ready.
+#    Note: chart default is image.pullPolicy=Always (safe with pinned registry tags).
+#    Local/kind clusters that pre-load images via `kind load docker-image` must
+#    add `--set image.pullPolicy=IfNotPresent` here — see docs/quickstart-kind.md.
 helm upgrade --install datuplet-app charts/datuplet-app \
   -n datuplet --wait --wait-for-jobs --timeout 10m
 

@@ -401,3 +401,100 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL_OmittedWhenUnset(t *testing.T)
 		t.Errorf("generated YAML should omit pipeline_api_jwks_url when PipelineAPIURL is unset; got:\n%s", y)
 	}
 }
+
+func TestBuildGatewaySidecarEnvIncludesIterationIDWhenImageMatchesIterForm(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage: "ttl.sh/datuplet-gateway-iter-abc1234:24h",
+	}
+	env := r.buildGatewaySidecarEnv(minimalPipelineRun())
+	got := envVarValue(env, "DATUPLET_ITERATION_ID")
+	if got != "abc1234" {
+		t.Errorf("DATUPLET_ITERATION_ID = %q, want %q", got, "abc1234")
+	}
+}
+
+func TestBuildGatewaySidecarEnvOmitsIterationIDWhenImageHasNoIterTag(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage: "datuplet/gateway:latest",
+	}
+	env := r.buildGatewaySidecarEnv(minimalPipelineRun())
+	if got := envVarValue(env, "DATUPLET_ITERATION_ID"); got != "" {
+		t.Errorf("expected DATUPLET_ITERATION_ID absent, got %q", got)
+	}
+}
+
+// TestComponentJobUsesPullAlwaysOnAllContainers: RFC 020 iteration loop
+// requires that every re-run of a build cycle picks up the freshly-pushed
+// image rather than a kubelet-cached one. PullAlways must be set on:
+//   - the gateway sidecar (init container)
+//   - the component container
+func TestComponentJobUsesPullAlwaysOnAllContainers(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage: "ttl.sh/datuplet-gateway-iter-abc1234:24h",
+	}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+
+	// Gateway sidecar (first init container).
+	initContainers := job.Spec.Template.Spec.InitContainers
+	if len(initContainers) == 0 {
+		t.Fatal("no init containers on component Job")
+	}
+	gw := initContainers[0]
+	if gw.Name != "gateway" {
+		t.Fatalf("first init container is %q, want gateway", gw.Name)
+	}
+	if gw.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("gateway sidecar ImagePullPolicy = %q, want PullAlways", gw.ImagePullPolicy)
+	}
+
+	// Component container.
+	containers := job.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		t.Fatal("no containers on component Job")
+	}
+	comp := containers[0]
+	if comp.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("component container ImagePullPolicy = %q, want PullAlways", comp.ImagePullPolicy)
+	}
+}
+
+// TestComponentJobHonoursRuntimePullPolicyOverride: e2e/kind sets
+// DATUPLET_RUNTIME_PULL_POLICY=IfNotPresent so K8s uses the pre-loaded
+// images instead of trying to pull non-existent datuplet/* repos from
+// Docker Hub.
+func TestComponentJobHonoursRuntimePullPolicyOverride(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage:      "datuplet/gateway:latest",
+		RuntimePullPolicy: corev1.PullIfNotPresent,
+	}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	gw := job.Spec.Template.Spec.InitContainers[0]
+	if gw.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("gateway ImagePullPolicy = %q, want IfNotPresent", gw.ImagePullPolicy)
+	}
+	comp := job.Spec.Template.Spec.Containers[0]
+	if comp.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("component ImagePullPolicy = %q, want IfNotPresent", comp.ImagePullPolicy)
+	}
+}
+
+func envVarValue(envs []corev1.EnvVar, name string) string {
+	for _, e := range envs {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}

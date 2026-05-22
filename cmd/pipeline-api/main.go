@@ -281,11 +281,35 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		// PIPELINE_API_PUBLIC_URL). Warehouse name is not a server-side env
 		// var; it is resolved per-request via lakekeeper.
 		WithCLIClusterInfo(cfg.LakekeeperPublicURL, "")
-	// Cluster-mode auth: Postgres-backed resolver (session cookies) +
-	// fine-grained FGA authz.
+	// Cluster-mode auth: Postgres-backed resolver (session cookies) chained
+	// with a bearer-JWT resolver so CLI subcommands (trigger, storage) can
+	// authenticate via Authorization: Bearer <api_token> minted by
+	// POST /api/v1/auth/token. The ChainResolver tries the bearer path
+	// first, then falls through to the cookie path — browser sessions are
+	// unaffected.
 	if pool != nil {
+		cookieResolver := auth.NewPostgresResolver(pool, cfg.CookieSecure)
+		var chainedResolver auth.UserResolver
+		if signer != nil {
+			chainedResolver = &auth.ChainResolver{
+				Resolvers: []auth.UserResolver{
+					&auth.BearerJWTResolver{
+						PublicKey: signer.Public(),
+						KeyID:     signer.KeyID,
+						Pool:      auth.NewPgxUserLookup(pool),
+					},
+					cookieResolver,
+				},
+				// cookieResolver owns Mode()/SupportsLogin() so the login route
+				// and /auth/me mode reporting reflect deployment mode (cluster),
+				// not the bearer side-channel.
+				Primary: cookieResolver,
+			}
+		} else {
+			chainedResolver = cookieResolver
+		}
 		srv = srv.
-			WithUserResolver(auth.NewPostgresResolver(pool, cfg.CookieSecure)).
+			WithUserResolver(chainedResolver).
 			WithProjectReader(apihttp.NewPgxProjectReader(pool, authzr)).
 			WithPipelineStore(apihttp.NewPgxPipelineStore(pool)).
 			WithRunReader(apihttp.NewPgxRunReader(pool))

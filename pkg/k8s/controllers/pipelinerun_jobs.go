@@ -99,46 +99,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		"--pod-annotations-path", cancelAnnotationMountPath + "/" + cancelAnnotationFile,
 	}
 
-	// Gateway environment. No long-lived S3 credentials — per-write
-	// vended STS creds come from lakekeeper.
-	// DG validates JWT.run_id == os.Getenv("RUN_ID") as a Secret-swap
-	// defence, so RUN_ID must be projected onto the sidecar.
-	gatewayEnv := []corev1.EnvVar{
-		{Name: "RUN_ID", Value: pr.Status.RunID},
-	}
-
-	// Optional debug logging on the gateway sidecar. Set via the operator's
-	// own env (DATUPLET_GATEWAY_DEBUG -> reconciler field -> per-PipelineRun
-	// sidecar env). Off by default; flip via helm value.
-	if r.GatewayDebug {
-		gatewayEnv = append(gatewayEnv, corev1.EnvVar{
-			Name:  "DATUPLET_GATEWAY_DEBUG",
-			Value: "true",
-		})
-	}
-
-	// Pyroscope profiling. Requires both flag + address; auth is
-	// optional. See PipelineRunReconciler doc for why creds are plain.
-	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
-		gatewayEnv = append(gatewayEnv,
-			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},
-			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
-			// Downward API: surface pod namespace as a Pyroscope tag.
-			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-			}},
-		)
-		if r.GatewayProfilingUsername != "" {
-			gatewayEnv = append(gatewayEnv,
-				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", Value: r.GatewayProfilingUsername},
-			)
-		}
-		if r.GatewayProfilingPassword != "" {
-			gatewayEnv = append(gatewayEnv,
-				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword},
-			)
-		}
-	}
+	gatewayEnv := r.buildGatewaySidecarEnv(pr)
 
 	ttl := JobTTLSecondsAfterFinished
 	restartPolicyAlways := corev1.ContainerRestartPolicyAlways
@@ -178,9 +139,11 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 					// Native sidecar in initContainers with restartPolicy: Always
 					InitContainers: []corev1.Container{
 						{
-							Name:            "gateway",
-							Image:           gatewayImage,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							Name:  "gateway",
+							Image: gatewayImage,
+							// PullAlways so each iteration of the loop (RFC 020) gets the
+							// freshly-pushed gateway image rather than a cached one.
+							ImagePullPolicy: r.runtimePullPolicy(),
 							Args:            gatewayArgs,
 							Env:             gatewayEnv,
 							RestartPolicy:   &restartPolicyAlways,
@@ -201,9 +164,12 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 					},
 					Containers: []corev1.Container{
 						{
-							Name:            "component",
-							Image:           comp.Image,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							Name:  "component",
+							Image: comp.Image,
+							// PullAlways: same RFC 020 iteration-loop reasoning as the gateway
+							// sidecar — every iteration pushes a fresh image to ttl.sh, so we
+							// must pull.
+							ImagePullPolicy: r.runtimePullPolicy(),
 							Env:             env,
 							// Component container hardening: makes the
 							// sidecar-only run-token mount a real defense.
@@ -707,6 +673,74 @@ gateway:
 	}
 
 	return string(yamlBytes)
+}
+
+// buildGatewaySidecarEnv returns the env-var slice attached to every
+// gateway sidecar this reconciler spawns. Centralised so per-iteration
+// (DATUPLET_ITERATION_ID) and instrumentation (DATUPLET_GATEWAY_DEBUG,
+// DATUPLET_GATEWAY_PROFILING + Pyroscope auth) plumbing live in one
+// place rather than scattered through the Pod-spec builder.
+func (r *PipelineRunReconciler) buildGatewaySidecarEnv(pr *datupletv1.PipelineRun) []corev1.EnvVar {
+	// Gateway environment. No long-lived S3 credentials — per-write
+	// vended STS creds come from lakekeeper.
+	// DG validates JWT.run_id == os.Getenv("RUN_ID") as a Secret-swap
+	// defence, so RUN_ID must be projected onto the sidecar.
+	env := []corev1.EnvVar{
+		{Name: "RUN_ID", Value: pr.Status.RunID},
+	}
+
+	// Optional debug logging on the gateway sidecar. Set via the operator's
+	// own env (DATUPLET_GATEWAY_DEBUG -> reconciler field -> per-PipelineRun
+	// sidecar env). Off by default; flip via helm value.
+	if r.GatewayDebug {
+		env = append(env, corev1.EnvVar{
+			Name:  "DATUPLET_GATEWAY_DEBUG",
+			Value: "true",
+		})
+	}
+
+	// Pyroscope profiling. Requires both flag + address; auth is
+	// optional. See PipelineRunReconciler doc for why creds are plain.
+	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},
+			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
+			// Downward API: surface pod namespace as a Pyroscope tag.
+			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			}},
+		)
+		if r.GatewayProfilingUsername != "" {
+			env = append(env,
+				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", Value: r.GatewayProfilingUsername},
+			)
+		}
+		if r.GatewayProfilingPassword != "" {
+			env = append(env,
+				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword},
+			)
+		}
+	}
+
+	// Iteration loop: when the gateway image was built for a specific iteration
+	// (ttl.sh/datuplet-gateway-iter-<sha>:24h), surface the short SHA as
+	// DATUPLET_ITERATION_ID so the gateway can tag Pyroscope profiles per
+	// iteration and we can diff profiling runs.
+	//
+	// NB: we read the iteration ID from r.GatewayImage (the reconciler
+	// config) not the resolved gatewayImage. They diverge only when
+	// r.GatewayImage is empty, in which case iterTagFromImage returns ""
+	// and no env is set — correct. If a future change introduces a
+	// per-PipelineRun image override, plumb the resolved image into this
+	// method instead.
+	if iterID := iterTagFromImage(r.GatewayImage); iterID != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "DATUPLET_ITERATION_ID",
+			Value: iterID,
+		})
+	}
+
+	return env
 }
 
 func int32Ptr(i int32) *int32 {

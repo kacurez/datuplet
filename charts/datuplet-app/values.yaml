@@ -19,7 +19,7 @@ runtimeDefaults:
   tolerations: []
 
 image:
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
   pullSecrets: []
   pipelineApi:
     repository: datuplet/pipeline-api
