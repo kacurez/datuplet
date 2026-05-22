@@ -371,6 +371,34 @@ func (g *gcsBackend) OpenReaderForFiles(ctx context.Context, filePaths []string)
 	}, nil
 }
 
+// OpenStreamingArrowReader: GCS analogue of MinIOBackend.OpenStreamingArrowReader.
+// Constructs a parquetArrowReader whose underlying io.ReaderAt is a per-file
+// gcsRangeReaderAt — no full-file download. This is what makes the byte-bound
+// chunk slicer (see parquetArrowReader.ReadChunk) actually engage on GCS-backed
+// tables; without it, server_v2_reading.go's streaming branch silently falls
+// back to gcsReader.readParquetFile (whole-file io.Copy into a bytes.Buffer)
+// and the resulting Arrow IPC chunk busts the SDK's 64 MiB gRPC MaxRecvMsgSize.
+func (g *gcsBackend) OpenStreamingArrowReader(ctx context.Context, filePaths []string, currentSchema *SchemaInfo) (Reader, error) {
+	if len(filePaths) == 0 {
+		return nil, fmt.Errorf("no files provided")
+	}
+	getter := &gcsHandleAdapter{bkt: g.bkt}
+	sources := make([]fileSource, 0, len(filePaths))
+	for _, fp := range filePaths {
+		objectKey := g.toObjectKey(fp)
+		attrs, err := g.bkt.Object(objectKey).Attrs(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("gcs: attrs %s: %w", objectKey, err)
+		}
+		sources = append(sources, fileSource{
+			name: objectKey,
+			ra:   newGCSRangeReaderAt(ctx, getter, objectKey, attrs.Size),
+			size: attrs.Size,
+		})
+	}
+	return newParquetArrowReaderFromSources(ctx, sources, currentSchema)
+}
+
 // Commit assembles per-writer stats into a CommitResult.
 // Mirrors MinIOBackend.Commit: this is the buffered-write commit, not the
 // Iceberg snapshot commit. Iceberg-level commits go through pkg/tablecommit
