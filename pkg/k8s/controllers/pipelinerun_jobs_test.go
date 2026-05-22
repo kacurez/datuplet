@@ -464,6 +464,32 @@ func TestComponentJobUsesPullAlwaysOnAllContainers(t *testing.T) {
 	}
 }
 
+// TestComponentJobHonoursRuntimePullPolicyOverride: e2e/kind sets
+// DATUPLET_RUNTIME_PULL_POLICY=IfNotPresent so K8s uses the pre-loaded
+// images instead of trying to pull non-existent datuplet/* repos from
+// Docker Hub.
+func TestComponentJobHonoursRuntimePullPolicyOverride(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage:      "datuplet/gateway:latest",
+		RuntimePullPolicy: corev1.PullIfNotPresent,
+	}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	gw := job.Spec.Template.Spec.InitContainers[0]
+	if gw.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("gateway ImagePullPolicy = %q, want IfNotPresent", gw.ImagePullPolicy)
+	}
+	comp := job.Spec.Template.Spec.Containers[0]
+	if comp.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("component ImagePullPolicy = %q, want IfNotPresent", comp.ImagePullPolicy)
+	}
+}
+
 func envVarValue(envs []corev1.EnvVar, name string) string {
 	for _, e := range envs {
 		if e.Name == name {

@@ -68,6 +68,13 @@ spec:
               value: "{{ .Values.image.gateway.repository }}:{{ .Values.image.gateway.tag }}"
             - name: ICEBERG_JOB_IMAGE
               value: "{{ .Values.image.icebergJob.repository }}:{{ .Values.image.icebergJob.tag }}"
+            # Runtime pull policy applied by the operator to per-run
+            # pods (gateway sidecar, component container, commit Job).
+            # Mirrors image.pullPolicy so a single helm value drives
+            # both chart-managed Deployments and operator-spawned pods.
+            # Empty = operator default (Always).
+            - name: DATUPLET_RUNTIME_PULL_POLICY
+              value: {{ .Values.image.pullPolicy | quote }}
             {{- with .Values.runtimeDefaults.tolerations }}
             - name: DATUPLET_RUN_TOLERATIONS_JSON
               value: {{ . | toJson | quote }}

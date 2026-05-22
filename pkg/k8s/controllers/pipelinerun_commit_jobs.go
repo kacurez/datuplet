@@ -169,9 +169,11 @@ func (r *PipelineRunReconciler) buildCommitJob(pr *datupletv1.PipelineRun, bucke
 						{
 							Name:  commitContainerName,
 							Image: image,
-							// PullAlways so each iteration of the loop (RFC 020) gets the
-							// freshly-pushed commit-job image rather than a cached one.
-							ImagePullPolicy: corev1.PullAlways,
+							// Runtime pull policy is configurable via DATUPLET_RUNTIME_PULL_POLICY
+							// (chart wires .Values.image.pullPolicy). Defaults to PullAlways for
+							// the RFC 020 iteration loop; kind/e2e overrides to IfNotPresent
+							// because images are pre-loaded via `kind load docker-image`.
+							ImagePullPolicy: r.runtimePullPolicy(),
 							Env:             env,
 						},
 					},

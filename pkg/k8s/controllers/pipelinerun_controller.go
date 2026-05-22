@@ -101,6 +101,28 @@ type PipelineRunReconciler struct {
 	// namespaces are dynamic. Both empty = unauthenticated.
 	GatewayProfilingUsername string
 	GatewayProfilingPassword string
+
+	// RuntimePullPolicy is applied to every container the operator
+	// builds at runtime (gateway sidecar, component container, commit
+	// Job container). Sourced from DATUPLET_RUNTIME_PULL_POLICY env
+	// which the chart wires from .Values.image.pullPolicy.
+	//
+	// Production iteration-loop deploys want PullAlways so re-pushed
+	// ttl.sh images are picked up; kind/e2e runs that pre-load images
+	// via `kind load docker-image` need IfNotPresent so K8s does not
+	// try to pull non-existent `datuplet/*` repositories from Docker
+	// Hub. Empty defaults to PullAlways (chart-iteration default).
+	RuntimePullPolicy corev1.PullPolicy
+}
+
+// runtimePullPolicy returns r.RuntimePullPolicy when set, else PullAlways
+// (the iteration-loop default). Centralised so the three runtime
+// pod-builder sites stay in sync.
+func (r *PipelineRunReconciler) runtimePullPolicy() corev1.PullPolicy {
+	if r.RuntimePullPolicy != "" {
+		return r.RuntimePullPolicy
+	}
+	return corev1.PullAlways
 }
 
 // +kubebuilder:rbac:groups=datuplet.io,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete

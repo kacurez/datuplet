@@ -143,7 +143,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 							Image: gatewayImage,
 							// PullAlways so each iteration of the loop (RFC 020) gets the
 							// freshly-pushed gateway image rather than a cached one.
-							ImagePullPolicy: corev1.PullAlways,
+							ImagePullPolicy: r.runtimePullPolicy(),
 							Args:            gatewayArgs,
 							Env:             gatewayEnv,
 							RestartPolicy:   &restartPolicyAlways,
@@ -169,7 +169,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 							// PullAlways: same RFC 020 iteration-loop reasoning as the gateway
 							// sidecar — every iteration pushes a fresh image to ttl.sh, so we
 							// must pull.
-							ImagePullPolicy: corev1.PullAlways,
+							ImagePullPolicy: r.runtimePullPolicy(),
 							Env:             env,
 							// Component container hardening: makes the
 							// sidecar-only run-token mount a real defense.
