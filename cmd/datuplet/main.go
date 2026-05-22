@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/datuplet/datuplet/pkg/icebergjob"
 
@@ -34,6 +35,14 @@ func main() {
 	runRemoteFlag := runCmd.String("remote", "", "pipeline-api URL of the target cluster (required for remote runs)")
 	runTokenFile := runCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
 	runProject := runCmd.String("project", "", "Project name to run under (required if you have access to >1 project; auto-defaulted if you have exactly one)")
+
+	triggerCmd := flag.NewFlagSet("trigger", flag.ExitOnError)
+	triggerRemote := triggerCmd.String("remote", "", "pipeline-api URL (required)")
+	triggerTokenFile := triggerCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
+	triggerProject := triggerCmd.String("project", "", "Project name (auto-defaulted if you have exactly one)")
+	triggerWait := triggerCmd.Bool("wait", false, "Block until the run reaches a terminal phase")
+	triggerTimeout := triggerCmd.Duration("timeout", time.Hour, "Hard cap on --wait; cancels the run cluster-side on expiry")
+	triggerJSON := triggerCmd.Bool("json", false, "Structured JSON output")
 
 	gatewayCmd := flag.NewFlagSet("gateway", flag.ExitOnError)
 	gatewayLocal := gatewayCmd.Bool("local", false, "Run in local mode (filesystem backend)")
@@ -234,6 +243,22 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "trigger":
+		triggerCmd.Parse(os.Args[2:])
+		if *triggerRemote == "" {
+			fmt.Fprintln(os.Stderr, "Error: --remote is required")
+			fmt.Fprintln(os.Stderr, "Usage: datuplet trigger --remote <pipeline-api-url> [--wait --timeout 1h --json --project <name>] <pipeline-name>")
+			os.Exit(1)
+		}
+		if triggerCmd.NArg() < 1 {
+			fmt.Fprintln(os.Stderr, "Error: pipeline name is required (positional, after flags)")
+			os.Exit(1)
+		}
+		if err := runTrigger(*triggerRemote, *triggerTokenFile, *triggerProject, triggerCmd.Arg(0), *triggerWait, *triggerTimeout, *triggerJSON); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "table-gateway":
 		fmt.Fprintln(os.Stderr, "Error: the `table-gateway` subcommand has been removed. Lakekeeper now serves the catalog directly.")
 		os.Exit(1)
@@ -270,6 +295,7 @@ Usage:
 Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   run                    Run a pipeline against a remote Datuplet cluster
+  trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
   gateway                Start the data gateway server (container entrypoint)
   iceberg-job            Run an Iceberg job (table-commit mode only)
   table-gateway          (REMOVED) Lakekeeper now serves the catalog directly
