@@ -99,46 +99,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		"--pod-annotations-path", cancelAnnotationMountPath + "/" + cancelAnnotationFile,
 	}
 
-	// Gateway environment. No long-lived S3 credentials — per-write
-	// vended STS creds come from lakekeeper.
-	// DG validates JWT.run_id == os.Getenv("RUN_ID") as a Secret-swap
-	// defence, so RUN_ID must be projected onto the sidecar.
-	gatewayEnv := []corev1.EnvVar{
-		{Name: "RUN_ID", Value: pr.Status.RunID},
-	}
-
-	// Optional debug logging on the gateway sidecar. Set via the operator's
-	// own env (DATUPLET_GATEWAY_DEBUG -> reconciler field -> per-PipelineRun
-	// sidecar env). Off by default; flip via helm value.
-	if r.GatewayDebug {
-		gatewayEnv = append(gatewayEnv, corev1.EnvVar{
-			Name:  "DATUPLET_GATEWAY_DEBUG",
-			Value: "true",
-		})
-	}
-
-	// Pyroscope profiling. Requires both flag + address; auth is
-	// optional. See PipelineRunReconciler doc for why creds are plain.
-	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
-		gatewayEnv = append(gatewayEnv,
-			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},
-			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
-			// Downward API: surface pod namespace as a Pyroscope tag.
-			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-			}},
-		)
-		if r.GatewayProfilingUsername != "" {
-			gatewayEnv = append(gatewayEnv,
-				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", Value: r.GatewayProfilingUsername},
-			)
-		}
-		if r.GatewayProfilingPassword != "" {
-			gatewayEnv = append(gatewayEnv,
-				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword},
-			)
-		}
-	}
+	gatewayEnv := r.buildGatewaySidecarEnv(pr)
 
 	ttl := JobTTLSecondsAfterFinished
 	restartPolicyAlways := corev1.ContainerRestartPolicyAlways
@@ -707,6 +668,56 @@ gateway:
 	}
 
 	return string(yamlBytes)
+}
+
+// buildGatewaySidecarEnv returns the env-var slice attached to every
+// gateway sidecar this reconciler spawns. Centralised so per-iteration
+// (DATUPLET_ITERATION_ID) and instrumentation (DATUPLET_GATEWAY_DEBUG,
+// DATUPLET_GATEWAY_PROFILING + Pyroscope auth) plumbing live in one
+// place rather than scattered through the Pod-spec builder.
+func (r *PipelineRunReconciler) buildGatewaySidecarEnv(pr *datupletv1.PipelineRun) []corev1.EnvVar {
+	// Gateway environment. No long-lived S3 credentials — per-write
+	// vended STS creds come from lakekeeper.
+	// DG validates JWT.run_id == os.Getenv("RUN_ID") as a Secret-swap
+	// defence, so RUN_ID must be projected onto the sidecar.
+	env := []corev1.EnvVar{
+		{Name: "RUN_ID", Value: pr.Status.RunID},
+	}
+
+	// Optional debug logging on the gateway sidecar. Set via the operator's
+	// own env (DATUPLET_GATEWAY_DEBUG -> reconciler field -> per-PipelineRun
+	// sidecar env). Off by default; flip via helm value.
+	if r.GatewayDebug {
+		env = append(env, corev1.EnvVar{
+			Name:  "DATUPLET_GATEWAY_DEBUG",
+			Value: "true",
+		})
+	}
+
+	// Pyroscope profiling. Requires both flag + address; auth is
+	// optional. See PipelineRunReconciler doc for why creds are plain.
+	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "DATUPLET_GATEWAY_PROFILING", Value: "true"},
+			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
+			// Downward API: surface pod namespace as a Pyroscope tag.
+			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			}},
+		)
+		if r.GatewayProfilingUsername != "" {
+			env = append(env,
+				corev1.EnvVar{Name: "PYROSCOPE_USERNAME", Value: r.GatewayProfilingUsername},
+			)
+		}
+		if r.GatewayProfilingPassword != "" {
+			env = append(env,
+				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword},
+			)
+		}
+	}
+
+	return env
 }
 
 func int32Ptr(i int32) *int32 {
