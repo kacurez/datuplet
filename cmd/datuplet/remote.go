@@ -26,8 +26,13 @@ type remoteArgs struct {
 	Remote string
 	// PipelineYAML is the host path to the pipeline YAML file.
 	PipelineYAML string
-	// Token is the raw JWT bearer string (NEVER print or log this).
+	// Token is the raw lakekeeper JWT bearer string (NEVER print or log this).
+	// Used by `datuplet run --remote` for lakekeeper / gateway auth.
 	Token string
+	// APIToken is the pipeline-api bearer token (aud=datuplet-api,
+	// token_kind=cli-api, NEVER print or log this). Used by `datuplet
+	// trigger` and `datuplet storage` for pipeline-api auth.
+	APIToken string
 	// TokenPath is the absolute host path to the token file. The Docker
 	// orchestrator bind-mounts this path at
 	// /var/run/secrets/datuplet-runtoken/token in every container.
@@ -130,6 +135,27 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		return nil, fmt.Errorf("cluster.json missing lakekeeper_url\n(run `datuplet login --remote %s` first)", remote)
 	}
 
+	// Read api-token — always from ~/.datuplet/api-token regardless of
+	// --token-file. Validate expiry from meta.APIExpiresAt so we catch
+	// stale tokens before the first HTTP call. Soft-fail: an empty api-token
+	// means the server is an older version; trigger/storage will report a
+	// clear error when they get 401.
+	apiTokenPath := filepath.Join(home, ".datuplet", "api-token")
+	apiTokBytes, apiTokErr := os.ReadFile(apiTokenPath)
+	var rawAPIToken string
+	if apiTokErr == nil {
+		rawAPIToken = string(bytes.TrimSpace(apiTokBytes))
+	}
+	if rawAPIToken != "" && meta.APIExpiresAt != "" {
+		apiExp, apiParseErr := time.Parse(time.RFC3339, meta.APIExpiresAt)
+		if apiParseErr != nil {
+			return nil, fmt.Errorf("api-token metadata corrupt (api_expires_at not RFC3339: %v)\n(run `datuplet login --remote %s` first)", apiParseErr, remote)
+		}
+		if time.Now().After(apiExp) {
+			return nil, fmt.Errorf("api-token expired at %s\n(run `datuplet login --remote %s` first)", meta.APIExpiresAt, remote)
+		}
+	}
+
 	id, projectID, projectName, perr := resolveProject(meta.Projects, projectFlag, remote)
 	if perr != nil {
 		return nil, perr
@@ -137,7 +163,8 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 
 	return &remoteArgs{
 		Remote:              remote,
-		Token:               rawToken, // SECURITY: never logged or printed
+		Token:               rawToken,    // SECURITY: never logged or printed
+		APIToken:            rawAPIToken, // SECURITY: never logged or printed
 		TokenPath:           tokenPath,
 		LakekeeperURL:       meta.LakekeeperURL,
 		WarehouseName:       meta.WarehouseName,
