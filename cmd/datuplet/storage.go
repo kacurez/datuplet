@@ -7,7 +7,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
+
+// storageHTTPClient is dedicated to the storage subcommand. 30s per-request
+// timeout matches trigger.go's pattern — guards against unresponsive
+// pipeline-api endpoints from hanging the CLI indefinitely.
+var storageHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // parseNsTable splits "<ns>.<table>" into its two parts. Both parts must
 // be non-empty and the single "." separator must appear exactly once.
@@ -30,7 +36,7 @@ func storageGET(remote, path, token string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := storageHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
