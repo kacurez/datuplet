@@ -44,6 +44,12 @@ func main() {
 	triggerTimeout := triggerCmd.Duration("timeout", time.Hour, "Hard cap on --wait; cancels the run cluster-side on expiry")
 	triggerJSON := triggerCmd.Bool("json", false, "Structured JSON output")
 
+	storageCmd := flag.NewFlagSet("storage", flag.ExitOnError)
+	storageRemote := storageCmd.String("remote", "", "pipeline-api URL (required)")
+	storageTokenFile := storageCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
+	storageProject := storageCmd.String("project", "", "Project name (auto-defaulted if you have exactly one)")
+	storageRows := storageCmd.Int("rows", 0, "Max preview rows (sample subcommand only; 0 = server default)")
+
 	gatewayCmd := flag.NewFlagSet("gateway", flag.ExitOnError)
 	gatewayLocal := gatewayCmd.Bool("local", false, "Run in local mode (filesystem backend)")
 	gatewayMinio := gatewayCmd.Bool("minio", false, "Run in MinIO mode (S3-compatible backend)")
@@ -259,6 +265,47 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "storage":
+		storageCmd.Parse(os.Args[2:])
+		if *storageRemote == "" {
+			fmt.Fprintln(os.Stderr, "Error: --remote is required")
+			fmt.Fprintln(os.Stderr, "Usage: datuplet storage --remote <url> [--project N] [--rows N] <tables|info|schema|sample|history> [<ns>.<table>]")
+			os.Exit(1)
+		}
+		if storageCmd.NArg() < 1 {
+			fmt.Fprintln(os.Stderr, "Error: missing storage subcommand")
+			os.Exit(1)
+		}
+		sub := storageCmd.Arg(0)
+		var err error
+		switch sub {
+		case "tables":
+			err = runStorageTables(*storageRemote, *storageTokenFile, *storageProject)
+		case "info", "schema", "history", "sample":
+			if storageCmd.NArg() < 2 {
+				fmt.Fprintf(os.Stderr, "Error: %s requires <ns>.<table>\n", sub)
+				os.Exit(1)
+			}
+			ref := storageCmd.Arg(1)
+			switch sub {
+			case "info":
+				err = runStorageInfo(*storageRemote, *storageTokenFile, *storageProject, ref)
+			case "schema":
+				err = runStorageSchema(*storageRemote, *storageTokenFile, *storageProject, ref)
+			case "history":
+				err = runStorageHistory(*storageRemote, *storageTokenFile, *storageProject, ref)
+			case "sample":
+				err = runStorageSample(*storageRemote, *storageTokenFile, *storageProject, ref, *storageRows)
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "Error: unknown storage subcommand %q\n", sub)
+			os.Exit(1)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "table-gateway":
 		fmt.Fprintln(os.Stderr, "Error: the `table-gateway` subcommand has been removed. Lakekeeper now serves the catalog directly.")
 		os.Exit(1)
@@ -296,6 +343,7 @@ Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   run                    Run a pipeline against a remote Datuplet cluster
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
+  storage                Browse iceberg storage (tables, info, schema, sample, history)
   gateway                Start the data gateway server (container entrypoint)
   iceberg-job            Run an Iceberg job (table-commit mode only)
   table-gateway          (REMOVED) Lakekeeper now serves the catalog directly
@@ -320,6 +368,14 @@ Options for 'trigger':
   -timeout duration      Hard cap on --wait; cancels the run cluster-side on expiry (default 1h)
   -json                  Structured JSON output
   <pipeline-name>        Pipeline name (positional, AFTER flags - flag package stops at first non-flag)
+
+Options for 'storage':
+  -remote string         pipeline-api URL (required)
+  -project string        Project name (auto-defaulted if you have exactly one)
+  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
+  -rows int              Max preview rows for 'sample' subcommand (0 = server default)
+  <subcommand>           One of: tables | info | schema | sample | history
+  <ns>.<table>           Namespace.table reference (required for info/schema/sample/history)
 
 Options for 'gateway':
   -local                 Run in local mode (filesystem backend)
