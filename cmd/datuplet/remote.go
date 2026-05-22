@@ -131,9 +131,14 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		return nil, err
 	}
 
-	if meta.LakekeeperURL == "" {
-		return nil, fmt.Errorf("cluster.json missing lakekeeper_url\n(run `datuplet login --remote %s` first)", remote)
-	}
+	// NOTE: lakekeeper_url validation is consumer-specific. `run --remote`
+	// (local-Docker exec) calls requireLakekeeperURL() in runRemote because
+	// it bind-mounts the URL into spawned containers. `trigger` and
+	// `storage` talk only to pipeline-api, which has its own lakekeeper
+	// connection — they don't need this field. Earlier we validated it
+	// unconditionally here, which incorrectly blocked the trigger/storage
+	// paths against clusters where the lakekeeper_url is not advertised
+	// in the /auth/token response (deploy-config-dependent).
 
 	// Read api-token — always from ~/.datuplet/api-token regardless of
 	// --token-file. Validate expiry from meta.APIExpiresAt so we catch
@@ -271,6 +276,12 @@ func runRemote(remoteFlag, tokenFileFlag, projectFlag, pipelineYAML string) erro
 	args, err := loadRemoteArgs(remoteFlag, tokenFileFlag, projectFlag)
 	if err != nil {
 		return err
+	}
+	// Local-Docker exec mode REQUIRES lakekeeper_url — it bind-mounts the
+	// URL into spawned containers as DATUPLET_LAKEKEEPER_URL. Trigger and
+	// storage do not need this and skip the check.
+	if args.LakekeeperURL == "" {
+		return fmt.Errorf("cluster.json missing lakekeeper_url\n(run `datuplet login --remote %s` first against a cluster that publishes it)", remoteFlag)
 	}
 	args.PipelineYAML = pipelineYAML
 
