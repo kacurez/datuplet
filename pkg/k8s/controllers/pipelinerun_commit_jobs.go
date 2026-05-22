@@ -169,7 +169,7 @@ func (r *PipelineRunReconciler) buildCommitJob(pr *datupletv1.PipelineRun, bucke
 						{
 							Name:            commitContainerName,
 							Image:           image,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							ImagePullPolicy: corev1.PullAlways,
 							Env:             env,
 						},
 					},

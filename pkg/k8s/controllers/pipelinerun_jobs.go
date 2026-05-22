@@ -141,7 +141,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 						{
 							Name:            "gateway",
 							Image:           gatewayImage,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							ImagePullPolicy: corev1.PullAlways,
 							Args:            gatewayArgs,
 							Env:             gatewayEnv,
 							RestartPolicy:   &restartPolicyAlways,
@@ -164,7 +164,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 						{
 							Name:            "component",
 							Image:           comp.Image,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							ImagePullPolicy: corev1.PullAlways,
 							Env:             env,
 							// Component container hardening: makes the
 							// sidecar-only run-token mount a real defense.
@@ -715,6 +715,17 @@ func (r *PipelineRunReconciler) buildGatewaySidecarEnv(pr *datupletv1.PipelineRu
 				corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword},
 			)
 		}
+	}
+
+	// Iteration loop: when the gateway image was built for a specific iteration
+	// (ttl.sh/datuplet-gateway-iter-<sha>:24h), surface the short SHA as
+	// DATUPLET_ITERATION_ID so the gateway can tag Pyroscope profiles per
+	// iteration and we can diff profiling runs.
+	if iterID := iterTagFromImage(r.GatewayImage); iterID != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "DATUPLET_ITERATION_ID",
+			Value: iterID,
+		})
 	}
 
 	return env

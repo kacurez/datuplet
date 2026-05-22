@@ -401,3 +401,33 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL_OmittedWhenUnset(t *testing.T)
 		t.Errorf("generated YAML should omit pipeline_api_jwks_url when PipelineAPIURL is unset; got:\n%s", y)
 	}
 }
+
+func TestBuildGatewaySidecarEnvIncludesIterationIDWhenImageMatchesIterForm(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage: "ttl.sh/datuplet-gateway-iter-abc1234:24h",
+	}
+	env := r.buildGatewaySidecarEnv(&datupletv1.PipelineRun{})
+	got := envValue(env, "DATUPLET_ITERATION_ID")
+	if got != "abc1234" {
+		t.Errorf("DATUPLET_ITERATION_ID = %q, want %q", got, "abc1234")
+	}
+}
+
+func TestBuildGatewaySidecarEnvOmitsIterationIDWhenImageHasNoIterTag(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage: "datuplet/gateway:latest",
+	}
+	env := r.buildGatewaySidecarEnv(&datupletv1.PipelineRun{})
+	if got := envValue(env, "DATUPLET_ITERATION_ID"); got != "" {
+		t.Errorf("expected DATUPLET_ITERATION_ID absent, got %q", got)
+	}
+}
+
+func envValue(envs []corev1.EnvVar, name string) string {
+	for _, e := range envs {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}
