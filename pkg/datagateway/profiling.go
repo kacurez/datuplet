@@ -64,6 +64,9 @@ func StartProfilingIfEnabled() (stop func() error) {
 	if v := os.Getenv("RUN_ID"); v != "" {
 		tags["run_id"] = v
 	}
+	if v := os.Getenv("DATUPLET_ITERATION_ID"); v != "" {
+		tags["iteration_id"] = v
+	}
 
 	cfg := pyroscope.Config{
 		ApplicationName:   "datuplet-gateway",
