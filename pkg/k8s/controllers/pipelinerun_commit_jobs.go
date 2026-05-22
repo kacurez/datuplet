@@ -167,8 +167,10 @@ func (r *PipelineRunReconciler) buildCommitJob(pr *datupletv1.PipelineRun, bucke
 					Tolerations:   r.RuntimeTolerations, // nil-safe: omitted from Pod when nil
 					Containers: []corev1.Container{
 						{
-							Name:            commitContainerName,
-							Image:           image,
+							Name:  commitContainerName,
+							Image: image,
+							// PullAlways so each iteration of the loop (RFC 020) gets the
+							// freshly-pushed commit-job image rather than a cached one.
 							ImagePullPolicy: corev1.PullAlways,
 							Env:             env,
 						},

@@ -139,8 +139,10 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 					// Native sidecar in initContainers with restartPolicy: Always
 					InitContainers: []corev1.Container{
 						{
-							Name:            "gateway",
-							Image:           gatewayImage,
+							Name:  "gateway",
+							Image: gatewayImage,
+							// PullAlways so each iteration of the loop (RFC 020) gets the
+							// freshly-pushed commit-job image rather than a cached one.
 							ImagePullPolicy: corev1.PullAlways,
 							Args:            gatewayArgs,
 							Env:             gatewayEnv,
@@ -162,8 +164,11 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 					},
 					Containers: []corev1.Container{
 						{
-							Name:            "component",
-							Image:           comp.Image,
+							Name:  "component",
+							Image: comp.Image,
+							// PullAlways: same RFC 020 iteration-loop reasoning as the gateway
+							// sidecar — every iteration pushes a fresh image to ttl.sh, so we
+							// must pull.
 							ImagePullPolicy: corev1.PullAlways,
 							Env:             env,
 							// Component container hardening: makes the

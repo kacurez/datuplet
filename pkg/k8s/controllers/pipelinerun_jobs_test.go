@@ -406,8 +406,8 @@ func TestBuildGatewaySidecarEnvIncludesIterationIDWhenImageMatchesIterForm(t *te
 	r := &PipelineRunReconciler{
 		GatewayImage: "ttl.sh/datuplet-gateway-iter-abc1234:24h",
 	}
-	env := r.buildGatewaySidecarEnv(&datupletv1.PipelineRun{})
-	got := envValue(env, "DATUPLET_ITERATION_ID")
+	env := r.buildGatewaySidecarEnv(minimalPipelineRun())
+	got := envVarValue(env, "DATUPLET_ITERATION_ID")
 	if got != "abc1234" {
 		t.Errorf("DATUPLET_ITERATION_ID = %q, want %q", got, "abc1234")
 	}
@@ -417,13 +417,13 @@ func TestBuildGatewaySidecarEnvOmitsIterationIDWhenImageHasNoIterTag(t *testing.
 	r := &PipelineRunReconciler{
 		GatewayImage: "datuplet/gateway:latest",
 	}
-	env := r.buildGatewaySidecarEnv(&datupletv1.PipelineRun{})
-	if got := envValue(env, "DATUPLET_ITERATION_ID"); got != "" {
+	env := r.buildGatewaySidecarEnv(minimalPipelineRun())
+	if got := envVarValue(env, "DATUPLET_ITERATION_ID"); got != "" {
 		t.Errorf("expected DATUPLET_ITERATION_ID absent, got %q", got)
 	}
 }
 
-func envValue(envs []corev1.EnvVar, name string) string {
+func envVarValue(envs []corev1.EnvVar, name string) string {
 	for _, e := range envs {
 		if e.Name == name {
 			return e.Value
