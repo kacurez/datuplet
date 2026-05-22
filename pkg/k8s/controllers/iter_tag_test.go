@@ -15,6 +15,8 @@ func TestIterTagFromImage(t *testing.T) {
 		{"iter suffix in middle (not at end)", "ttl.sh/something-iter-x-final:24h", "x-final"},
 		{"registry with port and tag", "localhost:5000/datuplet-gateway-iter-abc1234:24h", "abc1234"},
 		{"registry with port no tag", "localhost:5000/datuplet-gateway-iter-abc1234", "abc1234"},
+		{"digest-pinned iter ref", "ttl.sh/datuplet-gateway-iter-abc1234@sha256:deadbeef", "abc1234"},
+		{"service name contains iter substring", "ttl.sh/datuplet-iter-extractor-iter-abc1234:24h", "abc1234"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -12,6 +12,12 @@ import "strings"
 // DATUPLET_ITERATION_ID onto per-run gateway sidecars so Pyroscope tags
 // every iteration distinctly.
 func iterTagFromImage(img string) string {
+	// Strip optional "@<digest>" first (digest-pinned refs like
+	// "ttl.sh/foo-iter-abc@sha256:...") so the subsequent colon-strip
+	// pass sees the tag colon only.
+	if at := strings.Index(img, "@"); at >= 0 {
+		img = img[:at]
+	}
 	// Strip optional ":<tag>" suffix — but only if the colon comes AFTER
 	// the last "/" (otherwise it's a registry port like "localhost:5000"
 	// and we'd corrupt the path).
