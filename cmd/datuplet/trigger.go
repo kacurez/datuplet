@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -201,9 +202,9 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 // --- HTTP helpers (all ctx-aware) ---
 
 func triggerRun(ctx context.Context, remote, projectID, pipelineName, token string) (runID string, err error) {
-	url := fmt.Sprintf("%s/api/v1/projects/%s/pipelines/%s/runs",
-		strings.TrimRight(remote, "/"), projectID, pipelineName)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	reqURL := fmt.Sprintf("%s/api/v1/projects/%s/pipelines/%s/runs",
+		strings.TrimRight(remote, "/"), url.PathEscape(projectID), url.PathEscape(pipelineName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader([]byte(`{}`)))
 	if err != nil {
 		return "", err
 	}
@@ -215,7 +216,7 @@ func triggerRun(ctx context.Context, remote, projectID, pipelineName, token stri
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return "", &httpStatusError{op: "trigger", code: resp.StatusCode, body: string(body)}
 	}
 	var out createRunResp
@@ -226,9 +227,9 @@ func triggerRun(ctx context.Context, remote, projectID, pipelineName, token stri
 }
 
 func getRun(ctx context.Context, remote, projectID, runID, token string) (*runJSONOut, error) {
-	url := fmt.Sprintf("%s/api/v1/projects/%s/runs/%s",
-		strings.TrimRight(remote, "/"), projectID, runID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	reqURL := fmt.Sprintf("%s/api/v1/projects/%s/runs/%s",
+		strings.TrimRight(remote, "/"), url.PathEscape(projectID), url.PathEscape(runID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +240,7 @@ func getRun(ctx context.Context, remote, projectID, runID, token string) (*runJS
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, &httpStatusError{op: "get-run", code: resp.StatusCode, body: string(body)}
 	}
 	var out runJSONOut
@@ -250,9 +251,9 @@ func getRun(ctx context.Context, remote, projectID, runID, token string) (*runJS
 }
 
 func cancelRun(ctx context.Context, remote, projectID, runID, token string) error {
-	url := fmt.Sprintf("%s/api/v1/projects/%s/runs/%s/cancel",
-		strings.TrimRight(remote, "/"), projectID, runID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	reqURL := fmt.Sprintf("%s/api/v1/projects/%s/runs/%s/cancel",
+		strings.TrimRight(remote, "/"), url.PathEscape(projectID), url.PathEscape(runID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
 	if err != nil {
 		return err
 	}
@@ -263,7 +264,7 @@ func cancelRun(ctx context.Context, remote, projectID, runID, token string) erro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return &httpStatusError{op: "cancel", code: resp.StatusCode, body: string(body)}
 	}
 	return nil

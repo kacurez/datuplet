@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -25,13 +27,12 @@ func parseNsTable(s string) (ns, table string, err error) {
 	return parts[0], parts[1], nil
 }
 
-// storageGET issues a GET against the storage REST path and writes the
-// raw response body to stdout. Storage endpoints already return JSON; we
-// pass it through verbatim. Callers may decode + reformat for non-default
-// --format flags.
+// storageGET issues a GET against the storage REST path and returns the
+// raw response body. Storage endpoints already return JSON; callers may
+// decode + reformat for non-default --format flags.
 func storageGET(remote, path, token string) ([]byte, error) {
-	url := fmt.Sprintf("%s/api/v1/storage%s", strings.TrimRight(remote, "/"), path)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	reqURL := fmt.Sprintf("%s/api/v1/storage%s", strings.TrimRight(remote, "/"), path)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +42,7 @@ func storageGET(remote, path, token string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
@@ -57,7 +58,7 @@ func runStorageTables(remote, tokenFile, project string) error {
 	if err != nil {
 		return err
 	}
-	body, err := storageGET(args.Remote, fmt.Sprintf("/projects/%s/tables", args.ID), args.APIToken)
+	body, err := storageGET(args.Remote, fmt.Sprintf("/projects/%s/tables", url.PathEscape(args.ID)), args.APIToken)
 	if err != nil {
 		return err
 	}
@@ -74,7 +75,8 @@ func runStorageEndpoint(subPath string) func(remote, tokenFile, project, ref str
 		if err != nil {
 			return err
 		}
-		path := fmt.Sprintf("/projects/%s/tables/%s/%s/%s", args.ID, ns, tbl, subPath)
+		path := fmt.Sprintf("/projects/%s/tables/%s/%s/%s",
+				url.PathEscape(args.ID), url.PathEscape(ns), url.PathEscape(tbl), subPath)
 		body, err := storageGET(args.Remote, path, args.APIToken)
 		if err != nil {
 			return err
@@ -101,7 +103,8 @@ func runStorageSample(remote, tokenFile, project, ref string, rows int) error {
 	if err != nil {
 		return err
 	}
-	path := fmt.Sprintf("/projects/%s/tables/%s/%s/preview", args.ID, ns, tbl)
+	path := fmt.Sprintf("/projects/%s/tables/%s/%s/preview",
+		url.PathEscape(args.ID), url.PathEscape(ns), url.PathEscape(tbl))
 	if rows > 0 {
 		path = fmt.Sprintf("%s?rows=%d", path, rows)
 	}
