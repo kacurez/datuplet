@@ -68,11 +68,23 @@ func newFakeServer(t *testing.T, b fakeBehaviour) *httptest.Server {
 	mux.HandleFunc("/api/v1/projects/", func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/runs"):
-			b.onTrigger(w, r)
+			if b.onTrigger != nil {
+				b.onTrigger(w, r)
+			} else {
+				http.Error(w, "onTrigger not configured", http.StatusInternalServerError)
+			}
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/runs/"):
-			b.onGet(w, r)
+			if b.onGet != nil {
+				b.onGet(w, r)
+			} else {
+				http.Error(w, "onGet not configured", http.StatusInternalServerError)
+			}
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel"):
-			b.onCancel(w, r)
+			if b.onCancel != nil {
+				b.onCancel(w, r)
+			} else {
+				http.Error(w, "onCancel not configured", http.StatusInternalServerError)
+			}
 		default:
 			http.NotFound(w, r)
 		}

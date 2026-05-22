@@ -15,6 +15,25 @@ import (
 	"time"
 )
 
+// triggerHTTPClient is a dedicated client for the trigger subcommand's
+// HTTP calls. The 30s timeout is a per-request defensive cap on top of
+// context cancellation — guards against a server that responds slowly
+// without ever stalling.
+var triggerHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// httpStatusError carries the raw HTTP status code from a failed
+// response so retry classification can use type/value rather than
+// fragile error-message substrings.
+type httpStatusError struct {
+	op   string // "trigger" | "get-run" | "cancel"
+	code int
+	body string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s HTTP %d: %s", e.op, e.code, e.body)
+}
+
 // runJSONOut mirrors pipelineapi/http/run_handlers.go::runJSON for the
 // GET-run shape, with ended_at + wallclock_seconds derived client-side
 // at terminal phase. Used both for the GET response and for emitted
@@ -105,6 +124,10 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigs)
+	// Signal-handler goroutine: forwards SIGINT/SIGTERM to pollCtx.
+	// Exits via either branch — when signals arrive (cancel), or when
+	// pollCtx is cancelled by the deferred cancel() above (no extra
+	// cleanup needed; defer signal.Stop releases the channel registration).
 	go func() {
 		select {
 		case <-sigs:
@@ -162,14 +185,14 @@ func triggerRun(ctx context.Context, remote, projectID, pipelineName, token stri
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := triggerHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("trigger HTTP %d: %s", resp.StatusCode, string(body))
+		return "", &httpStatusError{op: "trigger", code: resp.StatusCode, body: string(body)}
 	}
 	var out createRunResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -186,14 +209,14 @@ func getRun(ctx context.Context, remote, projectID, runID, token string) (*runJS
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := triggerHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get-run HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, &httpStatusError{op: "get-run", code: resp.StatusCode, body: string(body)}
 	}
 	var out runJSONOut
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -210,36 +233,30 @@ func cancelRun(ctx context.Context, remote, projectID, runID, token string) erro
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := triggerHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("cancel HTTP %d: %s", resp.StatusCode, string(body))
+		return &httpStatusError{op: "cancel", code: resp.StatusCode, body: string(body)}
 	}
 	return nil
 }
 
-// isPermanentHTTPErr classifies HTTP errors. 4xx (except 408/429) is
-// permanent — auth/not-found/bad request won't fix itself by retrying.
-// Network errors and 5xx are transient.
+// isPermanentHTTPErr reports whether a *httpStatusError is in the
+// permanent (non-retryable) bucket. 4xx (except 408/429) are permanent;
+// 5xx and network errors are transient.
 func isPermanentHTTPErr(err error) bool {
-	if err == nil {
+	var se *httpStatusError
+	if !errors.As(err, &se) {
+		return false // network/decode error — transient
+	}
+	if se.code == 408 || se.code == 429 {
 		return false
 	}
-	s := err.Error()
-	if !strings.Contains(s, "HTTP ") {
-		// network / decode error — transient.
-		return false
-	}
-	for _, code := range []string{"400", "401", "403", "404", "405", "409", "410", "411", "413", "414", "415", "422"} {
-		if strings.Contains(s, "HTTP "+code) {
-			return true
-		}
-	}
-	return false
+	return se.code >= 400 && se.code < 500
 }
 
 func pollUntilTerminal(ctx context.Context, remote, projectID, runID, token string) (*runJSONOut, error) {
