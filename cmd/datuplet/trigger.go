@@ -117,6 +117,25 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 		return emitResult(*first, asJSON)
 	}
 
+	// If the run already reached a terminal phase between trigger and our
+	// first GET (very fast pipelines, or a tight --timeout), skip polling
+	// entirely.
+	if isTerminalPhase(first.Phase) {
+		startT, perr := time.Parse(time.RFC3339, first.CreatedAt)
+		endT := time.Now().UTC()
+		first.EndedAt = endT.Format(time.RFC3339)
+		if perr == nil {
+			first.WallclockSeconds = computeWallclockSeconds(startT, endT)
+		}
+		if err := emitResult(*first, asJSON); err != nil {
+			return err
+		}
+		if rc := exitCodeForPhase(first.Phase); rc != 0 {
+			return fmt.Errorf("run %s ended in phase %s", first.ID, first.Phase)
+		}
+		return nil
+	}
+
 	// 2. Poll with --timeout + signal cancel.
 	pollCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -140,14 +159,19 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 
 	// 3. On timeout/interrupt, best-effort cancel cluster-side and wait
 	// up to 30s for the Cancelled phase to materialise.
-	if pollErr != nil && pollCtx.Err() != nil {
+	if pollErr != nil && (errors.Is(pollErr, context.DeadlineExceeded) || errors.Is(pollErr, context.Canceled)) {
 		// Use a *fresh* context for the cancel post + follow-up poll;
 		// the parent context is already cancelled.
 		ccx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		_ = cancelRun(ccx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token)
-		if cancelled, _ := pollUntilTerminal(ccx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token); cancelled != nil {
+		if cerr := cancelRun(ccx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token); cerr != nil {
+			fmt.Fprintf(os.Stderr, "WARN: cancel POST failed for run %s: %v (run may still be active)\n", runID, cerr)
+		}
+		cancelled, perr := pollUntilTerminal(ccx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token)
+		if cancelled != nil {
 			final = cancelled
+		} else if perr != nil {
+			fmt.Fprintf(os.Stderr, "WARN: could not confirm Cancelled phase for run %s within 30s: %v\n", runID, perr)
 		}
 	}
 	if final == nil {

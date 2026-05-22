@@ -312,6 +312,15 @@ Options for 'run':
   -token-file string     Path to JWT token file (default: ~/.datuplet/token)
   <pipeline.yaml>        Path to pipeline YAML file (positional, required)
 
+Options for 'trigger':
+  -remote string         pipeline-api URL (required)
+  -project string        Project name (auto-defaulted if you have exactly one)
+  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
+  -wait                  Block until the run reaches a terminal phase
+  -timeout duration      Hard cap on --wait; cancels the run cluster-side on expiry (default 1h)
+  -json                  Structured JSON output
+  <pipeline-name>        Pipeline name (positional, AFTER flags - flag package stops at first non-flag)
+
 Options for 'gateway':
   -local                 Run in local mode (filesystem backend)
   -minio                 Run in MinIO mode (S3-compatible backend)
