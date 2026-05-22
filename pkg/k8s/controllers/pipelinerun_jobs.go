@@ -142,7 +142,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 							Name:  "gateway",
 							Image: gatewayImage,
 							// PullAlways so each iteration of the loop (RFC 020) gets the
-							// freshly-pushed commit-job image rather than a cached one.
+							// freshly-pushed gateway image rather than a cached one.
 							ImagePullPolicy: corev1.PullAlways,
 							Args:            gatewayArgs,
 							Env:             gatewayEnv,
@@ -726,6 +726,13 @@ func (r *PipelineRunReconciler) buildGatewaySidecarEnv(pr *datupletv1.PipelineRu
 	// (ttl.sh/datuplet-gateway-iter-<sha>:24h), surface the short SHA as
 	// DATUPLET_ITERATION_ID so the gateway can tag Pyroscope profiles per
 	// iteration and we can diff profiling runs.
+	//
+	// NB: we read the iteration ID from r.GatewayImage (the reconciler
+	// config) not the resolved gatewayImage. They diverge only when
+	// r.GatewayImage is empty, in which case iterTagFromImage returns ""
+	// and no env is set — correct. If a future change introduces a
+	// per-PipelineRun image override, plumb the resolved image into this
+	// method instead.
 	if iterID := iterTagFromImage(r.GatewayImage); iterID != "" {
 		env = append(env, corev1.EnvVar{
 			Name:  "DATUPLET_ITERATION_ID",

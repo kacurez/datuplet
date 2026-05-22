@@ -423,6 +423,47 @@ func TestBuildGatewaySidecarEnvOmitsIterationIDWhenImageHasNoIterTag(t *testing.
 	}
 }
 
+// TestComponentJobUsesPullAlwaysOnAllContainers: RFC 020 iteration loop
+// requires that every re-run of a build cycle picks up the freshly-pushed
+// image rather than a kubelet-cached one. PullAlways must be set on:
+//   - the gateway sidecar (init container)
+//   - the component container
+func TestComponentJobUsesPullAlwaysOnAllContainers(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage: "ttl.sh/datuplet-gateway-iter-abc1234:24h",
+	}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+
+	// Gateway sidecar (first init container).
+	initContainers := job.Spec.Template.Spec.InitContainers
+	if len(initContainers) == 0 {
+		t.Fatal("no init containers on component Job")
+	}
+	gw := initContainers[0]
+	if gw.Name != "gateway" {
+		t.Fatalf("first init container is %q, want gateway", gw.Name)
+	}
+	if gw.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("gateway sidecar ImagePullPolicy = %q, want PullAlways", gw.ImagePullPolicy)
+	}
+
+	// Component container.
+	containers := job.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		t.Fatal("no containers on component Job")
+	}
+	comp := containers[0]
+	if comp.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("component container ImagePullPolicy = %q, want PullAlways", comp.ImagePullPolicy)
+	}
+}
+
 func envVarValue(envs []corev1.EnvVar, name string) string {
 	for _, e := range envs {
 		if e.Name == name {
