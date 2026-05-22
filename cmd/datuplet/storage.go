@@ -57,7 +57,7 @@ func runStorageTables(remote, tokenFile, project string) error {
 	if err != nil {
 		return err
 	}
-	body, err := storageGET(args.Remote, fmt.Sprintf("/projects/%s/tables", args.LakekeeperProjectID), args.Token)
+	body, err := storageGET(args.Remote, fmt.Sprintf("/projects/%s/tables", args.ID), args.Token)
 	if err != nil {
 		return err
 	}
@@ -74,7 +74,7 @@ func runStorageEndpoint(subPath string) func(remote, tokenFile, project, ref str
 		if err != nil {
 			return err
 		}
-		path := fmt.Sprintf("/projects/%s/tables/%s/%s/%s", args.LakekeeperProjectID, ns, tbl, subPath)
+		path := fmt.Sprintf("/projects/%s/tables/%s/%s/%s", args.ID, ns, tbl, subPath)
 		body, err := storageGET(args.Remote, path, args.Token)
 		if err != nil {
 			return err
@@ -101,7 +101,7 @@ func runStorageSample(remote, tokenFile, project, ref string, rows int) error {
 	if err != nil {
 		return err
 	}
-	path := fmt.Sprintf("/projects/%s/tables/%s/%s/preview", args.LakekeeperProjectID, ns, tbl)
+	path := fmt.Sprintf("/projects/%s/tables/%s/%s/preview", args.ID, ns, tbl)
 	if rows > 0 {
 		path = fmt.Sprintf("%s?rows=%d", path, rows)
 	}

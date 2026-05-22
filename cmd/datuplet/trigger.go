@@ -102,13 +102,13 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 
 	// 1. Trigger (no per-call timeout; the parent context governs).
 	ctx := context.Background()
-	runID, err := triggerRun(ctx, resolved.Remote, resolved.LakekeeperProjectID, pipelineName, resolved.Token)
+	runID, err := triggerRun(ctx, resolved.Remote, resolved.ID, pipelineName, resolved.Token)
 	if err != nil {
 		return fmt.Errorf("trigger run: %w", err)
 	}
 
 	// Immediately fetch the full run record so we have created_at + phase.
-	first, err := getRun(ctx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token)
+	first, err := getRun(ctx, resolved.Remote, resolved.ID, runID, resolved.Token)
 	if err != nil {
 		return fmt.Errorf("fetch run after trigger: %w", err)
 	}
@@ -155,7 +155,7 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 		}
 	}()
 
-	final, pollErr := pollUntilTerminal(pollCtx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token)
+	final, pollErr := pollUntilTerminal(pollCtx, resolved.Remote, resolved.ID, runID, resolved.Token)
 
 	// 3. On timeout/interrupt, best-effort cancel cluster-side and wait
 	// up to 30s for the Cancelled phase to materialise.
@@ -164,10 +164,10 @@ func runTrigger(remoteFlag, tokenFileFlag, projectFlag, pipelineName string, wai
 		// the parent context is already cancelled.
 		ccx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		if cerr := cancelRun(ccx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token); cerr != nil {
+		if cerr := cancelRun(ccx, resolved.Remote, resolved.ID, runID, resolved.Token); cerr != nil {
 			fmt.Fprintf(os.Stderr, "WARN: cancel POST failed for run %s: %v (run may still be active)\n", runID, cerr)
 		}
-		cancelled, perr := pollUntilTerminal(ccx, resolved.Remote, resolved.LakekeeperProjectID, runID, resolved.Token)
+		cancelled, perr := pollUntilTerminal(ccx, resolved.Remote, resolved.ID, runID, resolved.Token)
 		if cancelled != nil {
 			final = cancelled
 		} else if perr != nil {

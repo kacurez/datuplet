@@ -37,6 +37,10 @@ type remoteArgs struct {
 	LakekeeperURL string
 	// WarehouseName is the lakekeeper warehouse name.
 	WarehouseName string
+	// ID is the Datuplet project UUID — distinct from LakekeeperProjectID.
+	// pipeline-api's /api/v1/projects/{pid}/... routes parse {pid} as
+	// this Datuplet ID; lakekeeper calls use LakekeeperProjectID.
+	ID string
 	// LakekeeperProjectID is the lakekeeper Project UUID forwarded as
 	// `x-project-id` on every catalog/STS call. Resolved from
 	// cluster.json::projects via the `--project <name>` flag (if set)
@@ -126,7 +130,7 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		return nil, fmt.Errorf("cluster.json missing lakekeeper_url\n(run `datuplet login --remote %s` first)", remote)
 	}
 
-	projectID, projectName, perr := resolveProject(meta.Projects, projectFlag, remote)
+	id, projectID, projectName, perr := resolveProject(meta.Projects, projectFlag, remote)
 	if perr != nil {
 		return nil, perr
 	}
@@ -137,40 +141,43 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		TokenPath:           tokenPath,
 		LakekeeperURL:       meta.LakekeeperURL,
 		WarehouseName:       meta.WarehouseName,
+		ID:                  id,
 		LakekeeperProjectID: projectID,
 		ProjectName:         projectName,
 	}, nil
 }
 
 // resolveProject implements the project-selection rules documented on
-// loadRemoteArgs. Returns (lakekeeper_project_id, name, nil) on success.
+// loadRemoteArgs. Returns (id, lakekeeper_project_id, name, nil) on success,
+// where id is the Datuplet project UUID and lakekeeper_project_id is the
+// corresponding lakekeeper project identifier.
 // On error returns a human-friendly message that lists the user's
 // available projects so they can pick one.
-func resolveProject(projects []clusterMetaProject, flag, remote string) (string, string, error) {
+func resolveProject(projects []clusterMetaProject, flag, remote string) (id, lakekeeperID, name string, err error) {
 	if len(projects) == 0 {
-		return "", "", fmt.Errorf("no projects available — ask an admin to grant you access via\n  pipeline-api admin grant --user <your-email> --project <name> --role editor\n(then re-run `datuplet login --remote %s`)", remote)
+		return "", "", "", fmt.Errorf("no projects available — ask an admin to grant you access via\n  pipeline-api admin grant --user <your-email> --project <name> --role editor\n(then re-run `datuplet login --remote %s`)", remote)
 	}
 	if flag == "" {
 		if len(projects) == 1 {
-			return projects[0].LakekeeperProjectID, projects[0].Name, nil
+			return projects[0].ID, projects[0].LakekeeperProjectID, projects[0].Name, nil
 		}
 		// Ambiguous — list and ask.
 		names := make([]string, 0, len(projects))
 		for _, p := range projects {
 			names = append(names, p.Name)
 		}
-		return "", "", fmt.Errorf("you have access to multiple projects; pass --project <name>\navailable: %s", strings.Join(names, ", "))
+		return "", "", "", fmt.Errorf("you have access to multiple projects; pass --project <name>\navailable: %s", strings.Join(names, ", "))
 	}
 	for _, p := range projects {
 		if p.Name == flag {
-			return p.LakekeeperProjectID, p.Name, nil
+			return p.ID, p.LakekeeperProjectID, p.Name, nil
 		}
 	}
 	names := make([]string, 0, len(projects))
 	for _, p := range projects {
 		names = append(names, p.Name)
 	}
-	return "", "", fmt.Errorf("project %q not found in your accessible projects\navailable: %s", flag, strings.Join(names, ", "))
+	return "", "", "", fmt.Errorf("project %q not found in your accessible projects\navailable: %s", flag, strings.Join(names, ", "))
 }
 
 // generateRunID returns a fresh UUID string for use as a pipeline run
