@@ -13,7 +13,7 @@ import (
 
 // Token kinds. The verifier cross-checks `aud` against `token_kind`:
 //
-//	aud=datuplet-api      requires token_kind=user
+//	aud=datuplet-api      requires token_kind ∈ {user, cli-api}
 //	aud=datuplet-catalog  requires token_kind ∈ {run, impersonation, local-cli}
 //
 // User tokens are emitted by the user-login flow and consumed by

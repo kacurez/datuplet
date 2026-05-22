@@ -460,5 +460,86 @@ type neverAuthResolver struct{}
 func (n *neverAuthResolver) UserFor(_ http.ResponseWriter, _ *http.Request) (*store.User, bool, error) {
 	return nil, false, nil
 }
-func (n *neverAuthResolver) Mode() string         { return "never" }
-func (n *neverAuthResolver) SupportsLogin() bool  { return false }
+func (n *neverAuthResolver) Mode() string        { return "never" }
+func (n *neverAuthResolver) SupportsLogin() bool { return false }
+
+// alwaysLoginResolver always reports SupportsLogin=true and a specific mode.
+// Used to test ChainResolver Primary delegation.
+type alwaysLoginResolver struct{ mode string }
+
+func (a *alwaysLoginResolver) UserFor(_ http.ResponseWriter, _ *http.Request) (*store.User, bool, error) {
+	return nil, false, nil
+}
+func (a *alwaysLoginResolver) Mode() string        { return a.mode }
+func (a *alwaysLoginResolver) SupportsLogin() bool { return true }
+
+// TestChainResolver_PrimaryDelegation asserts that Mode()/SupportsLogin()
+// delegate to Primary, NOT to the first resolver in Resolvers.
+func TestChainResolver_PrimaryDelegation(t *testing.T) {
+	signer, _ := testSignerAndKey(t)
+	bearerR := &auth.BearerJWTResolver{
+		PublicKey: signer.Public(),
+		KeyID:     signer.KeyID,
+		Pool:      &fakeUserLookup{users: map[uuid.UUID]*store.User{}},
+	}
+	cookieR := &alwaysLoginResolver{mode: "cluster"}
+
+	chain := &auth.ChainResolver{
+		Resolvers: []auth.UserResolver{bearerR, cookieR},
+		Primary:   cookieR,
+	}
+
+	if got := chain.Mode(); got != "cluster" {
+		t.Errorf("Mode() = %q, want %q", got, "cluster")
+	}
+	if got := chain.SupportsLogin(); !got {
+		t.Errorf("SupportsLogin() = false, want true (Primary=cookieR)")
+	}
+}
+
+// TestChainResolver_NoPrimaryFallsBackToFirst checks the nil-Primary fallback
+// still works (backward compat).
+func TestChainResolver_NoPrimaryFallsBackToFirst(t *testing.T) {
+	first := &alwaysLoginResolver{mode: "first-mode"}
+	second := &alwaysLoginResolver{mode: "second-mode"}
+
+	chain := &auth.ChainResolver{
+		Resolvers: []auth.UserResolver{first, second},
+		// Primary intentionally nil.
+	}
+
+	if got := chain.Mode(); got != "first-mode" {
+		t.Errorf("Mode() = %q, want %q (no Primary → first)", got, "first-mode")
+	}
+}
+
+// TestBearerJWTResolver_NoExp asserts that a token missing the exp claim is
+// rejected (WithExpirationRequired enforcement).
+func TestBearerJWTResolver_NoExp(t *testing.T) {
+	signer, priv := testSignerAndKey(t)
+	userID := uuid.New()
+
+	// Construct a token with no exp claim at all.
+	claims := jwt.MapClaims{
+		"iss":        "datuplet-api",
+		"aud":        "datuplet-api",
+		"sub":        userID.String(),
+		"token_kind": "cli-api",
+		"iat":        time.Now().Unix(),
+		"nbf":        time.Now().Unix(),
+		// deliberately omitting "exp"
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = signer.KeyID
+	signed, _ := tok.SignedString(priv)
+
+	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
+	req := bearerRequest(t, signed)
+	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("expected rejection of token with no exp claim")
+	}
+}

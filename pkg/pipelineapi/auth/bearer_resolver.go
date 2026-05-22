@@ -76,7 +76,12 @@ func (r *BearerJWTResolver) UserFor(_ http.ResponseWriter, req *http.Request) (*
 			return nil, fmt.Errorf("unknown kid %q", kid)
 		}
 		return r.PublicKey, nil
-	}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithLeeway(bearerClockSkew))
+	},
+		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithLeeway(bearerClockSkew),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+	)
 	if err != nil || !tok.Valid {
 		return nil, false, nil
 	}
@@ -151,10 +156,16 @@ func audienceContains(claim any, want string) bool {
 // ChainResolver tries each child resolver in order, returning the first
 // authenticated result. Errors short-circuit. Use for cookie+bearer.
 //
-// Mode() and SupportsLogin() delegate to the first resolver in the chain,
-// which is expected to be the primary resolver (e.g. PostgresResolver).
+// Mode() and SupportsLogin() delegate to Primary when set; Primary is the
+// resolver that owns deployment-mode and login-route gating (typically the
+// session-cookie resolver). UserFor() still tries every resolver in order.
 type ChainResolver struct {
 	Resolvers []UserResolver
+	// Primary is the resolver that owns Mode()/SupportsLogin() answers
+	// (deployment mode + login-route gating). UserFor() still tries every
+	// Resolver in order. When nil, falls back to the first resolver in the
+	// chain; safe default, but prefer explicit wiring.
+	Primary UserResolver
 }
 
 // UserFor tries each resolver in order, returning the first authenticated
@@ -172,16 +183,24 @@ func (c *ChainResolver) UserFor(w http.ResponseWriter, r *http.Request) (*store.
 	return nil, false, nil
 }
 
-// Mode delegates to the first resolver in the chain.
+// Mode delegates to Primary when set, otherwise falls back to the first
+// resolver in the chain.
 func (c *ChainResolver) Mode() string {
+	if c.Primary != nil {
+		return c.Primary.Mode()
+	}
 	if len(c.Resolvers) > 0 {
 		return c.Resolvers[0].Mode()
 	}
-	return "unknown"
+	return "browser" // safe default; never reached in production
 }
 
-// SupportsLogin delegates to the first resolver in the chain.
+// SupportsLogin delegates to Primary when set, otherwise falls back to the
+// first resolver in the chain.
 func (c *ChainResolver) SupportsLogin() bool {
+	if c.Primary != nil {
+		return c.Primary.SupportsLogin()
+	}
 	if len(c.Resolvers) > 0 {
 		return c.Resolvers[0].SupportsLogin()
 	}

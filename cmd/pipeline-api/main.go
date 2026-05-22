@@ -300,6 +300,10 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 					},
 					cookieResolver,
 				},
+				// cookieResolver owns Mode()/SupportsLogin() so the login route
+				// and /auth/me mode reporting reflect deployment mode (cluster),
+				// not the bearer side-channel.
+				Primary: cookieResolver,
 			}
 		} else {
 			chainedResolver = cookieResolver
