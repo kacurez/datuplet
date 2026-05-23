@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -128,6 +129,17 @@ func (o *GatewayOutputConfig) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func runGateway(mode, configPath, dataDir, addr, runTokenPath, podAnnotationsPath string) error {
+	iterationID := os.Getenv("DATUPLET_ITERATION_ID")
+	if iterationID == "" {
+		iterationID = "(none)"
+	}
+	runIDEnv := os.Getenv("RUN_ID")
+	if runIDEnv == "" {
+		runIDEnv = "(none)"
+	}
+	log.Printf("datuplet-gateway: starting %s iteration_id=%s run_id=%s",
+		datagateway.GatewayBuildInfo(), iterationID, runIDEnv)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
