@@ -52,11 +52,11 @@ type BufferConfig struct {
 // DefaultBufferConfig returns the default buffer configuration.
 //
 // BufferSize is the in-memory cap for retained Arrow records before a
-// row-group flush. Lowered from 64 MiB to 16 MiB to bound peak heap in
+// row-group flush. Lowered from 16 MiB to 8 MiB to bound peak heap in
 // the gateway sidecar: combined with the streaming-upload path
 // (StorageBackend.OpenObjectWriter), this caps the row group buffer
-// AND the parquet writer's open-row-group memory at ~16 MiB instead
-// of ~64 MiB. Operators with looser memory can override via
+// AND the parquet writer's open-row-group memory at ~8 MiB instead
+// of ~16 MiB. Operators with looser memory can override via
 // Config.BufferSize.
 //
 // RowGroupSize stays in sync with BufferSize so the on-disk row group
@@ -66,8 +66,8 @@ type BufferConfig struct {
 // streaming so file size no longer dominates heap usage.
 func DefaultBufferConfig() *BufferConfig {
 	return &BufferConfig{
-		BufferSize:     16 * 1024 * 1024,  // 16 MiB (was 64; lowered for memory bound)
-		RowGroupSize:   16 * 1024 * 1024,  // 16 MiB (matches BufferSize)
+		BufferSize:     8 * 1024 * 1024,   // 8 MiB (was 16; lowered for memory bound)
+		RowGroupSize:   8 * 1024 * 1024,   // 8 MiB (matches BufferSize)
 		TargetFileSize: 128 * 1024 * 1024, // 128 MiB
 		FilePrefix:     "part",
 		Compression:    CompressionSnappy,
