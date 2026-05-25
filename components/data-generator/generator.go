@@ -1,16 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/google/uuid"
 
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
@@ -38,8 +38,11 @@ func newRNG(runID, tableName string) *rand.Rand {
 	return rand.New(rand.NewPCG(seed, seed^0xdeadbeefcafe1234))
 }
 
-// generateValue returns a random value for the given column type.
-// rng must be non-nil.
+// generateValue is retained for the JSONL-based runLiteral path
+// (literal.go) which builds map[string]any rows. The high-throughput
+// random path now writes directly into an Arrow RecordBuilder via
+// arrow_writer.go::appendGeneratedValue, which bypasses the
+// map[string]any allocation entirely.
 func generateValue(rng *rand.Rand, colType string) any {
 	now := time.Now().UTC()
 	switch colType {
@@ -117,16 +120,35 @@ func shouldStop(limit *Limit, rowsWritten int, bytesWritten int, startTime time.
 	return false
 }
 
-// encodeRow encodes a map[string]any as a JSONL line (no trailing newline —
-// the caller adds the separator).
-func encodeRow(row map[string]any) ([]byte, error) {
-	return json.Marshal(row)
-}
-
 // runRandom runs the random-mode write loop for a single table.
-// It opens a writer, generates random rows until a limit is reached or a
-// user-error fires, then closes the writer. Returns an error on infrastructure
-// failures; calls sdk.ExitUserError directly for user-error injection.
+//
+// Wire format: Arrow IPC. Each batch is a self-contained IPC stream
+// (schema header + one record batch + EOS) of up to arrowBatchRows
+// rows. The gateway decodes via ArrowIPCAdapter (zero-copy where
+// possible) and accumulates batches in the BufferManager for parquet
+// flush — see RFC 020 Phase 2b. This replaces the per-row JSONL +
+// json.Marshal path which was the dominant CPU consumer (~65% of
+// gateway-side write CPU per Pyroscope of run 07a2ddec).
+//
+// Behaviour preserved from the JSONL path:
+//   - Deterministic RNG seeded by runID + tableName.
+//   - User-error injection at a chosen row index fires BEFORE the
+//     stop-limit check, so a userErrorMessage with rowsCount=N still
+//     fires somewhere in [0, N-1].
+//   - Limits: rowsCount, sizeInBytes (bytes accounted from the IPC
+//     stream actually sent), timeoutInSeconds.
+//   - Per-row throttle via RowInsertSpeed milliseconds.
+//
+// Behaviour differences from the JSONL path:
+//   - `sizeInBytes` accounting uses the IPC stream size, NOT the raw
+//     JSON size. Arrow IPC for the same logical data is smaller for
+//     numeric columns and similar for strings; users tuning this knob
+//     against the previous JSONL baseline may need to adjust.
+//   - Column ORDER is the same (sortStrings(colNames)) and column
+//     types map to native Arrow types (int->Int32, double->Float64,
+//     etc.) where applicable. string/uuid/date/timestamp/now stay
+//     STRING so the iceberg table schema matches what the JSONL path
+//     produced via gateway-side inference.
 func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Table) (int, error) {
 	r := t.Random
 	rng := newRNG(cfg.ExecutionID, t.Name)
@@ -134,27 +156,57 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 	// Determine user-error injection point (if configured).
 	errAt := errInjectionPoint(rng, r)
 
-	// data-generator emits JSON-encoded rows (encodeRow uses json.Marshal),
-	// one per Write call separated by newlines — i.e. JSONL. The SDK's
-	// default input format is CSV, so we MUST declare JSONL explicitly or
-	// the gateway will try to parse our JSON as CSV and fail at column 1.
-	writer, err := client.OpenWriter(ctx, t.Name, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
-	if err != nil {
-		return 0, fmt.Errorf("table %q: failed to open writer: %w", t.Name, err)
-	}
-
-	// Build ordered column names for stable JSON key ordering.
+	// Build stable column order + Arrow schema.
 	colNames := make([]string, 0, len(r.Schema))
 	for name := range r.Schema {
 		colNames = append(colNames, name)
 	}
 	sortStrings(colNames)
+	arrowSchema := buildArrowSchema(colNames, r.Schema)
+
+	// Open writer in Arrow IPC mode. We don't pass WithSchema — every
+	// IPC chunk we send carries its own schema header, and the gateway
+	// uses that to load-or-create the iceberg table on the first chunk.
+	writer, err := client.OpenWriter(ctx, t.Name, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
+	if err != nil {
+		return 0, fmt.Errorf("table %q: failed to open writer: %w", t.Name, err)
+	}
+
+	pool := memory.NewGoAllocator()
+	// arrowBatch builds rows into typed arrow array builders. We
+	// allocate one RecordBuilder for the lifetime of the table — it's
+	// reset implicitly each NewRecord() call (which builds the current
+	// rows into a Record and clears the internal builders for the next
+	// batch). No per-row allocator churn.
+	rb := array.NewRecordBuilder(pool, arrowSchema)
+	defer rb.Release()
 
 	startTime := time.Now()
 	rowsWritten := 0
+	rowsInBatch := 0
 	bytesWritten := 0
 
-	var buf bytes.Buffer
+	// flushBatch builds the accumulated rows into an Arrow record,
+	// serialises as a complete IPC stream, ships via the SDK, and
+	// updates bytesWritten. No-op when rowsInBatch == 0.
+	flushBatch := func() error {
+		if rowsInBatch == 0 {
+			return nil
+		}
+		rec := rb.NewRecord() // builds + resets internal builders
+		defer rec.Release()
+		data, err := serializeRecordToIPC(rec, pool)
+		if err != nil {
+			return fmt.Errorf("table %q: serialise IPC batch: %w", t.Name, err)
+		}
+		if err := writer.Write(ctx, data); err != nil {
+			return fmt.Errorf("table %q: write IPC batch (rows %d-%d): %w",
+				t.Name, rowsWritten-rowsInBatch, rowsWritten-1, err)
+		}
+		bytesWritten += len(data)
+		rowsInBatch = 0
+		return nil
+	}
 
 	for {
 		// User-error injection check FIRST — must always fire when set.
@@ -170,40 +222,35 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 			break
 		}
 
-		// Generate row.
-		row := make(map[string]any, len(colNames))
-		for _, name := range colNames {
-			row[name] = generateValue(rng, r.Schema[name])
+		// Append one row's typed values into the per-column builders.
+		now := time.Now().UTC()
+		for colIdx, name := range colNames {
+			appendGeneratedValue(rb, colIdx, r.Schema[name], rng, now)
 		}
-
-		lineBytes, err := encodeRow(row)
-		if err != nil {
-			return rowsWritten, fmt.Errorf("table %q: failed to encode row %d: %w", t.Name, rowsWritten, err)
-		}
-
-		buf.Write(lineBytes)
-		buf.WriteByte('\n')
-		lineLen := len(lineBytes) + 1
-
-		if err := writer.Write(ctx, buf.Bytes()); err != nil {
-			return rowsWritten, fmt.Errorf("table %q: failed to write row %d: %w", t.Name, rowsWritten, err)
-		}
-		buf.Reset()
-
 		rowsWritten++
-		bytesWritten += lineLen
+		rowsInBatch++
+
+		// Flush batch boundary. arrowBatchRows is the per-batch row
+		// count (see arrow_writer.go for the tuning rationale).
+		if rowsInBatch >= arrowBatchRows {
+			if err := flushBatch(); err != nil {
+				return rowsWritten, err
+			}
+		}
 
 		if t.RowInsertSpeed > 0 {
 			time.Sleep(time.Duration(t.RowInsertSpeed) * time.Millisecond)
 		}
 	}
 
+	// Flush the final partial batch (rowsInBatch may be 0).
+	if err := flushBatch(); err != nil {
+		return rowsWritten, err
+	}
+
 	// Capture writer stats BEFORE Close so we can report SDK-side activity
 	// (batch threshold, underlying POST count) even if Close fails. These
-	// numbers are the cheapest way to verify SDK batching is active:
-	// writes >> posts means batching kicked in; writes ≈ posts with
-	// non-zero threshold means the image probably wasn't rebuilt against
-	// the right SDK version.
+	// numbers are the cheapest way to verify SDK batching is active.
 	stats := writer.Stats()
 	elapsed := time.Since(startTime)
 	client.Log(ctx, "INFO", fmt.Sprintf( //nolint:errcheck
