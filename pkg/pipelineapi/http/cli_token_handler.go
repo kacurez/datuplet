@@ -2,8 +2,10 @@ package http
 
 import (
 	"errors"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
@@ -42,14 +44,62 @@ type cliTokenResponse struct {
 	APIExpiresAt string `json:"api_expires_at"`
 }
 
-// cliTokenLifetime is the canonical TTL of a local-cli JWT used by
-// `datuplet login --remote`.
-// One hour is long enough that an operator's working session doesn't
-// constantly re-prompt for a password but short enough that a leaked
-// token's blast radius is bounded — the same ceiling applies to
-// lakekeeper-side authz: cancellation goes through FGA tuple deletion,
-// and the user's existing project grants govern what the token can do.
-const cliTokenLifetime = time.Hour
+// defaultCLITokenLifetime is the default TTL for the local-cli + cli-api
+// JWTs minted by `datuplet login --remote`. 24h matches the run-token
+// TTL (runbackend.RunTokenLifetime) and is comfortable for an all-day
+// dev session without forcing a re-login every hour.
+//
+// Operators who want shorter TTLs (production environments where leaked
+// token blast radius matters more) override via the
+// DATUPLET_CLI_TOKEN_LIFETIME env var on pipeline-api — see
+// cliTokenLifetime() below.
+//
+// The same TTL applies to BOTH the local-cli (lakekeeper-catalog scope)
+// AND cli-api (pipeline-api scope) tokens that this handler mints in
+// one response; we keep them in lockstep so the CLI's session lifetime
+// is single-axis from the operator's point of view.
+//
+// Either way, lakekeeper-side authz is what actually governs what the
+// token can do — cancellation goes through FGA tuple deletion, not
+// token-level revocation, so a long TTL doesn't extend privilege
+// beyond the user's current grants.
+const defaultCLITokenLifetime = 24 * time.Hour
+
+// maxCLITokenLifetime is the upper bound on operator overrides — guards
+// against accidental "never expires" tokens (e.g. someone setting the
+// env to "8760h" — a year — by mistake). 30 days is long enough for
+// the longest plausible dev workflow and short enough that a leaked
+// token isn't a forever liability.
+const maxCLITokenLifetime = 30 * 24 * time.Hour
+
+// cliTokenLifetime resolves the CLI-token TTL from env (with bounds
+// + validation), falling back to defaultCLITokenLifetime. Invalid /
+// out-of-range values log a warning and use the default — never panic
+// or fail-closed, because the login flow is the bootstrap-out-of-bad
+// state and shouldn't be undermined by a bad operator env.
+func cliTokenLifetime() time.Duration {
+	raw := os.Getenv("DATUPLET_CLI_TOKEN_LIFETIME")
+	if raw == "" {
+		return defaultCLITokenLifetime
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Printf("pipeline-api: DATUPLET_CLI_TOKEN_LIFETIME=%q is not a valid Go duration (%v); using default %s",
+			raw, err, defaultCLITokenLifetime)
+		return defaultCLITokenLifetime
+	}
+	if d <= 0 {
+		log.Printf("pipeline-api: DATUPLET_CLI_TOKEN_LIFETIME=%q must be positive; using default %s",
+			raw, defaultCLITokenLifetime)
+		return defaultCLITokenLifetime
+	}
+	if d > maxCLITokenLifetime {
+		log.Printf("pipeline-api: DATUPLET_CLI_TOKEN_LIFETIME=%q exceeds %s cap; clamping to %s",
+			raw, maxCLITokenLifetime, maxCLITokenLifetime)
+		return maxCLITokenLifetime
+	}
+	return d
+}
 
 // clientIPFromRemoteAddr strips the port from r.RemoteAddr so the rate
 // limiter keys on the IP rather than the (IP, ephemeral-port) tuple. NAT
@@ -169,13 +219,14 @@ func (s *Server) handleCLIToken(w http.ResponseWriter, r *http.Request) {
 	// ctx, never the caller", and we honour it here.
 	ctx := auth.WithCtxUser(r.Context(), user)
 
-	tok, exp, err := tokens.MintLocalCLIToken(ctx, s.signer, cliTokenLifetime)
+	ttl := cliTokenLifetime()
+	tok, exp, err := tokens.MintLocalCLIToken(ctx, s.signer, ttl)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not mint token")
 		return
 	}
 
-	apiTok, apiExp, err := tokens.MintCLIAPIToken(ctx, s.signer, cliTokenLifetime)
+	apiTok, apiExp, err := tokens.MintCLIAPIToken(ctx, s.signer, ttl)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not mint api token")
 		return
