@@ -5,11 +5,11 @@ package main
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"fmt"
 	"os"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	// Side-effect import: registers the "duckdb" database/sql driver.
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 // openDuckDB opens an in-memory DuckDB instance and applies the component's
@@ -31,9 +31,38 @@ func openDuckDB(ctx context.Context, cfg *ComponentConfig) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
+	// Pinned conservative defaults — the bookkeeping is in config.go but
+	// the rationale lives here next to the SET statements.
+	//
+	//   - `memory_limit` is set explicitly because DuckDB's cgroup
+	//     auto-detect is unreliable inside containers (duckdb/duckdb#15080)
+	//     and go-duckdb has its own per-process bloat on parquet reads
+	//     (marcboeker/go-duckdb#255) that can multiply this budget.
+	//
+	//   - `max_temp_directory_size` is the HARD synchronous cap on spill
+	//     disk usage. Without it, a fast-spilling query can outrun the
+	//     kubelet's ~10-second ephemeral-storage eviction sample window,
+	//     fill the node's boot disk, and lock the host filesystem
+	//     read-only (we hit this on transform-big2 against 5M rows of
+	//     products on a single-node 6 GiB GKE cluster — kubelet went
+	//     NotReady, GKE auto-repair triggered). The internal cap fails
+	//     the query cleanly instead.
+	//
+	//   - `preserve_insertion_order = false` allows sort/aggregate
+	//     operators to discard input ordering for streaming spill.
+	//     See https://duckdb.org/docs/current/guides/performance/oom.
+	//
+	//   - `threads` is set low (default 2) because each thread carries
+	//     its own per-pipeline hash-aggregate + decode buffers, so
+	//     threads multiply both in-memory state and concurrent spill
+	//     writer pressure. On 2-4 vCPU pods the throughput cost is
+	//     dwarfed by the safety win.
 	stmts := []string{
 		fmt.Sprintf("SET threads = %d", cfg.Threads),
 		fmt.Sprintf("SET temp_directory = '%s'", escapeSQL(cfg.TempDirectory)),
+		fmt.Sprintf("SET memory_limit = '%s'", escapeSQL(cfg.Memory)),
+		fmt.Sprintf("SET max_temp_directory_size = '%s'", escapeSQL(cfg.MaxTempSize)),
+		"SET preserve_insertion_order = false",
 	}
 	for _, s := range stmts {
 		if _, err := db.ExecContext(ctx, s); err != nil {
@@ -42,44 +71,6 @@ func openDuckDB(ctx context.Context, cfg *ComponentConfig) (*sql.DB, error) {
 		}
 	}
 	return db, nil
-}
-
-// arrowFromDB returns a DuckDB Arrow handle bound to a *sql.Conn.
-//
-// The returned conn pins the in-memory DuckDB instance so subsequent SQL
-// (RegisterView, the user's SELECT, COPY TO outputs) all run on the same
-// underlying driver connection where the arrow_scan-backed views are
-// visible. The Arrow handle holds a *duckdb.Conn pointer at the C level
-// (see duckdb-go/v2/arrow.go), so the handle stays valid for as long as
-// the *sql.Conn is held — closing the *sql.Conn returns the driver conn
-// to the pool, which (with MaxOpenConns=1) is then unavailable for
-// further use of the handle.
-//
-// The caller MUST:
-//   - run all subsequent DuckDB SQL through the returned *sql.Conn
-//     (NOT db.ExecContext, which would block waiting for the conn that
-//     we are holding under MaxOpenConns=1).
-//   - close the *sql.Conn AFTER releasing the registered views (via the
-//     release funcs returned by RegisterView) so any in-flight scans
-//     drain cleanly before the underlying driver conn goes away.
-//
-// Requires the binary built with -tags=duckdb_arrow.
-func arrowFromDB(db *sql.DB) (*duckdb.Arrow, *sql.Conn, error) {
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		return nil, nil, fmt.Errorf("db.Conn: %w", err)
-	}
-	var a *duckdb.Arrow
-	err = conn.Raw(func(driverConn any) error {
-		var rerr error
-		a, rerr = duckdb.NewArrowFromConn(driverConn.(driver.Conn))
-		return rerr
-	})
-	if err != nil {
-		conn.Close() //nolint:errcheck
-		return nil, nil, fmt.Errorf("NewArrowFromConn: %w", err)
-	}
-	return a, conn, nil
 }
 
 // escapeSQL escapes a value for embedding into a DuckDB single-quoted string

@@ -5,8 +5,12 @@
 // The component:
 //   1. Opens an arrow IPC stream for each declared input via the DataGateway SDK
 //      (FORMAT_ARROW_IPC). DG row-group-streams parquet → arrow internally.
-//   2. Registers each stream as a DuckDB view via Arrow.RegisterView (arrow_scan).
-//      No parquet files are written to the component's local disk.
+//   2. Stream-writes each input's Arrow batches to a temp parquet file on local
+//      ephemeral disk (bounded RAM — only one batch alive at a time) and exposes
+//      it to user SQL as a DuckDB view via `read_parquet(...)`. The disk-stage
+//      replaces an earlier in-memory `CREATE TABLE AS SELECT * FROM <arrow_view>`
+//      that OOM'd on multi-GB inputs and required a multi-scan workaround for
+//      duckdb/duckdb#19040.
 //   3. Executes the user-supplied SQL inside DuckDB.
 //   4. Streams each declared output back through the SDK's OpenWriter +
 //      WriteChunk path so DG owns parquet emission to the iceberg target
@@ -53,6 +57,17 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	// Start Pyroscope continuous profiling when DATUPLET_COMPONENT_PROFILING
+	// is set (the operator injects this together with the gateway's
+	// profiling env when GatewayProfilingEnabled is on). Off otherwise.
+	if stopProfiling := startProfilingIfEnabled(); stopProfiling != nil {
+		defer func() {
+			if err := stopProfiling(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: pyroscope stop error: %v\n", err)
+			}
+		}()
+	}
+
 	client, err := sdk.New(ctx)
 	if err != nil {
 		return fmt.Errorf("connect DataGateway: %w", err)
@@ -75,37 +90,36 @@ func run(ctx context.Context) error {
 		return asUserErr(fmt.Errorf("at least one output table must be declared"))
 	}
 
-	// Workspace for staged output parquet (writeOutput stages COPY TO
-	// targets locally before streaming chunks to DG). Inputs no longer
-	// touch disk — they stream over Arrow IPC directly into DuckDB via
-	// arrow_scan.
+	// Workspace for staged input + output parquet (both registerInput and
+	// writeOutput stage files locally before/after running user SQL).
 	workdir, err := os.MkdirTemp("", "sql-transform-")
 	if err != nil {
 		return fmt.Errorf("mkdir workdir: %w", err)
 	}
 	defer os.RemoveAll(workdir)
 
-	// Open DuckDB and pin a single *sql.Conn via the Arrow handle. All
-	// subsequent SQL must run through `conn` (NOT `db.ExecContext`),
-	// otherwise it would deadlock waiting on the held conn under the
-	// MaxOpenConns=1 contract.
+	// Open DuckDB and pin a single *sql.Conn. All subsequent SQL must run
+	// through `conn` (NOT `db.ExecContext`), otherwise it would deadlock
+	// waiting on the held conn under the MaxOpenConns=1 contract. The
+	// pinning also keeps CREATE VIEW / SELECT visibility consistent
+	// across statements under DuckDB's shared in-memory DB model.
 	db, err := openDuckDB(ctx, compCfg)
 	if err != nil {
 		return fmt.Errorf("open duckdb: %w", err)
 	}
 
-	arrowConn, conn, err := arrowFromDB(db)
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		db.Close() //nolint:errcheck
-		return fmt.Errorf("arrow handle: %w", err)
+		return fmt.Errorf("db.Conn: %w", err)
 	}
 
 	releases := make([]func(), 0, len(cfg.InputTables))
-	// Single ordered cleanup. Deferred order matters — release scans
-	// FIRST (so DuckDB drops its view refs / drains the C-level Arrow
-	// streams), THEN return the *sql.Conn to the pool, THEN close the
-	// pool. This is the inverse of the LIFO stack you'd get from three
-	// separate defers, which is why we collapse into one closure here.
+	// Single ordered cleanup. Deferred order matters — release inputs
+	// FIRST (drops views + unlinks staged files), THEN return the
+	// *sql.Conn to the pool, THEN close the pool. This is the inverse
+	// of the LIFO stack you'd get from three separate defers, which is
+	// why we collapse into one closure here.
 	defer func() {
 		for i := len(releases) - 1; i >= 0; i-- {
 			releases[i]()
@@ -115,7 +129,7 @@ func run(ctx context.Context) error {
 	}()
 
 	for _, in := range cfg.InputTables {
-		rel, err := registerInput(ctx, conn, arrowConn, client, in)
+		rel, err := registerInput(ctx, conn, client, workdir, in)
 		if err != nil {
 			return fmt.Errorf("register input %s.%s: %w", in.Bucket, in.Table, err)
 		}
@@ -123,10 +137,8 @@ func run(ctx context.Context) error {
 	}
 
 	// Run the user's SQL on the held conn. DuckDB resolves `FROM <logical>`
-	// against the CTAS-materialized tables registered above (the streams are
-	// drained via `CREATE TABLE … AS SELECT * FROM <hidden_stream>` to avoid
-	// duckdb/duckdb#19040, where multi-scan plans against single-pass
-	// arrow_scan views produce wrong results). CREATE TABLE <out> AS …
+	// against the read_parquet-backed views registered above, lazy-streaming
+	// row groups from disk on each scan. CREATE TABLE <out> AS …
 	// materializes the result locally inside the DuckDB instance.
 	client.Log(ctx, "INFO", fmt.Sprintf("executing SQL (%d bytes)", len(compCfg.SQL))) //nolint:errcheck
 	if _, err := conn.ExecContext(ctx, compCfg.SQL); err != nil {

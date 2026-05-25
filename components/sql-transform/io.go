@@ -9,36 +9,36 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/compress"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	sdk "github.com/datuplet/datuplet/sdk/go"
 	sdkArrow "github.com/datuplet/datuplet/sdk/go/arrow"
-	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // registerInput opens an Arrow IPC stream from DG over the given input table,
-// registers it as a hidden DuckDB view via Arrow.RegisterView (arrow_scan),
-// then materializes the stream into a real DuckDB table that the user SQL
-// references by `viewName`. Returns a release func that the caller MUST defer.
+// stream-writes each record batch to a temp parquet file on local ephemeral
+// disk, then exposes the file to user SQL as a DuckDB view via
+// `read_parquet(...)`. Returns a release func that the caller MUST defer.
 //
-// Why materialize? DuckDB's arrow_scan against a single-pass Arrow stream
-// produces incorrect results for queries that require multiple scans of the
-// same source (GROUP BY, JOIN, UNION ALL on the same input, etc.) — see
-// duckdb/duckdb#19040. Materializing once into a CTAS-backed table fully
-// drains the stream and gives subsequent SQL a normal multi-pass relation.
+// Why stage to disk? An earlier implementation registered the Arrow stream as
+// a DuckDB view via arrow_scan and materialised it with
+// `CREATE TABLE x AS SELECT * FROM <arrow_view>`. That loaded the entire
+// input into DuckDB-managed in-memory storage and OOM'd on multi-GB inputs
+// (5M-row tables exceeded 3.5 GiB of process RSS before user SQL even ran).
 //
-// Lifetime contract: release() MUST run AFTER all DuckDB SQL that may
-// reference the registered view has completed AND BEFORE the *sql.Conn
-// that hosts the view is closed. Calling release while a scan is still
-// active risks a use-after-free in the C bindings. See arrowFromDB in
-// duckdb.go for the recommended ordering.
+// Streaming the input to a snappy-compressed parquet file uses bounded RAM —
+// only one record batch is alive at a time — and trades the cost for ephemeral
+// disk. DuckDB's `read_parquet` reads row groups lazily and is fully
+// multi-scan-safe (GROUP BY / JOIN / UNION ALL all work correctly across it),
+// so this also drops the duckdb/duckdb#19040 workaround the old code carried.
 //
-// Empty inputs (parquet file has zero rows): the streaming Arrow reader
-// returns io.EOF on the first ReadChunk; DuckDB's arrow_scan handles this as
-// an empty relation, and the CTAS materializes a real but zero-row table with
-// the correct schema. Cold-start tables (zero data files in the snapshot)
-// currently error at OpenReader — that is pre-existing behavior on main and
-// is pre-existing behavior that is not currently addressed.
-func registerInput(ctx context.Context, conn *sql.Conn, arrowConn *duckdb.Arrow, client *sdk.Client, in sdk.TableRef) (release func(), err error) {
+// Empty inputs (parquet file has zero rows): Arrow stream returns no batches;
+// the staged parquet file is still created with the schema, and DuckDB's
+// `read_parquet` handles a zero-row file as an empty relation.
+func registerInput(ctx context.Context, conn *sql.Conn, client *sdk.Client, workdir string, in sdk.TableRef) (release func(), err error) {
 	viewIdent := in.LogicalName
 	if viewIdent == "" {
 		viewIdent = in.Table
@@ -47,10 +47,6 @@ func registerInput(ctx context.Context, conn *sql.Conn, arrowConn *duckdb.Arrow,
 	if err != nil {
 		return nil, err
 	}
-
-	// Hidden internal stream view name — must be SQL-safe.
-	// `__rfc011_stream_` matches sanitizeIdent's `^[A-Za-z_][A-Za-z0-9_]*$`.
-	streamName := "__rfc011_stream_" + userName
 
 	sdkReader, err := client.OpenReader(ctx, in.Bucket, in.Table,
 		sdk.WithOutputFormat(pb.DataFormat_FORMAT_ARROW_IPC),
@@ -64,36 +60,115 @@ func registerInput(ctx context.Context, conn *sql.Conn, arrowConn *duckdb.Arrow,
 		return nil, fmt.Errorf("sdkArrow.NewReader: %w", err)
 	}
 
-	// Step 1: Register the stream under a hidden name.
-	rel, err := arrowConn.RegisterView(arrowReader, streamName)
+	// Stage the input as a snappy parquet file on local ephemeral disk.
+	// Snappy is fast and keeps the staged file close to wire size — at
+	// ~5M rows of the products schema we expect ~150-250 MiB on disk.
+	stagePath := filepath.Join(workdir, "in_"+userName+".parquet")
+	f, err := os.Create(stagePath)
 	if err != nil {
 		arrowReader.Release()
-		return nil, fmt.Errorf("Arrow.RegisterView %q: %w", streamName, err)
+		return nil, fmt.Errorf("create staged input %q: %w", stagePath, err)
 	}
 
-	// Step 2: Materialize once into a real table the user SQL can scan
-	// multiple times. This consumes the single-pass stream into a
-	// DuckDB-managed table that supports multi-pass operations
-	// (GROUP BY, JOIN, UNION ALL, etc.) correctly.
-	// Workaround for duckdb/duckdb#19040.
-	materializeStmt := fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM %s", userName, streamName)
-	if _, err := conn.ExecContext(ctx, materializeStmt); err != nil {
-		rel()
+	// Tight writer props tuned for the "staging file DuckDB reads once
+	// and we delete" lifecycle. The triad below dropped peak inuse heap
+	// from ~2.4 GB → ~150 MB on the 5M-row products test:
+	//
+	//   - WithCompression(Uncompressed): no codec. Pyroscope of the
+	//     6m32s successful run showed s2.EncodeSnappyBetter +
+	//     encodeBlockBetterSnappy accounted for ~48% of CPU during
+	//     staging (24s of 50s total). Local ephemeral disk is fast
+	//     (~500+ MB/s) and the file is read once by DuckDB then
+	//     deleted, so the wire-size win of snappy doesn't pay back
+	//     for the per-write encode cost. Staged file size grows from
+	//     ~250 MiB → ~500 MiB on this dataset — comfortably under our
+	//     16 GiB ephemeral-storage limit.
+	//   - WithStats(false): DuckDB scans the file end-to-end via
+	//     read_parquet — there's no predicate-pushdown user. Stats
+	//     pages add ~150-250 MB of allocator churn at write time and
+	//     buy nothing on read.
+	//   - WithDictionaryDefault(false): disables dictionary encoding
+	//     for ALL columns. A previous run's Pyroscope showed
+	//     ~766 MB of hashing.HashTable.upsize in DictEncoder for the
+	//     high-cardinality `name` column. Dict is only a wire-size win
+	//     for low-cardinality columns; for this ephemeral file the
+	//     wire-size delta is paid back in <1 s of extra IO, and DuckDB
+	//     read_parquet handles plain-encoded columns identically.
+	writerProps := parquet.NewWriterProperties(
+		parquet.WithCompression(compress.Codecs.Uncompressed),
+		parquet.WithStats(false),
+		parquet.WithDictionaryDefault(false),
+	)
+	arrowProps := pqarrow.DefaultWriterProps()
+	pqw, err := pqarrow.NewFileWriter(arrowReader.Schema(), f, writerProps, arrowProps)
+	if err != nil {
+		f.Close()           //nolint:errcheck
+		os.Remove(stagePath) //nolint:errcheck
 		arrowReader.Release()
-		return nil, fmt.Errorf("materialize input %s: %w", userName, err)
+		return nil, fmt.Errorf("pqarrow.NewFileWriter: %w", err)
 	}
 
-	// Step 3: Drop the hidden view — stream is fully consumed at this point.
-	// Errors here are non-fatal (the view will be dropped when the connection
-	// closes). The CTAS table is now the user-visible relation.
-	dropStmt := fmt.Sprintf("DROP VIEW IF EXISTS %s", streamName)
-	if _, err := conn.ExecContext(ctx, dropStmt); err != nil {
-		client.Log(ctx, "WARN", fmt.Sprintf("drop hidden stream view %s: %v", streamName, err)) //nolint:errcheck
+	// Drain the Arrow stream batch-by-batch into the parquet writer.
+	// Each Arrow batch becomes one parquet row group (flushed
+	// immediately via pqw.Write). Combined with dict+stats both off
+	// in writerProps above, per-row-group state stays small even when
+	// the file ends up with hundreds of row groups — Pyroscope on a
+	// 5M-row test showed component peak inuse heap dropped from
+	// ~2.4 GB to ~300 MB by going dict-off + per-batch writes.
+	//
+	// Earlier this code coalesced batches in-process and built a
+	// single large arrow.Record before each Write. That made the
+	// concat step (array.Concatenate per column) the new peak —
+	// 1.7 GB live during the flush of a 256k-row coalesced batch
+	// because variable-length string columns reallocate large
+	// buffers — and forced a 766 MB dict-encoder hash table per
+	// flush for the high-cardinality `name` column. Per-batch
+	// writes + dict off avoids both.
+	failStage := func(err error, what string) error {
+		pqw.Close()          //nolint:errcheck
+		f.Close()            //nolint:errcheck
+		os.Remove(stagePath) //nolint:errcheck
+		arrowReader.Release()
+		return fmt.Errorf("%s: %w", what, err)
+	}
+
+	for arrowReader.Next() {
+		rec := arrowReader.RecordBatch()
+		if err := pqw.Write(rec); err != nil {
+			return nil, failStage(err, "write parquet row group")
+		}
+	}
+	if err := arrowReader.Err(); err != nil {
+		return nil, failStage(err, "arrow stream")
+	}
+
+	// Close the Arrow stream first (drops gRPC reader + sdk.Reader), then
+	// finalise the parquet file (writes the footer). pqw.Close() closes
+	// the underlying io.Writer (our *os.File) too, so an explicit
+	// f.Close() afterwards returns os.ErrClosed — don't double-close.
+	arrowReader.Release()
+	if err := pqw.Close(); err != nil {
+		os.Remove(stagePath) //nolint:errcheck
+		return nil, fmt.Errorf("pqarrow close: %w", err)
+	}
+
+	client.Log(ctx, "INFO", fmt.Sprintf("staged input %s.%s -> %s", in.Bucket, in.Table, stagePath)) //nolint:errcheck
+
+	// Expose the staged file to user SQL as a multi-scan-safe view.
+	// read_parquet lazy-streams row groups from disk on each scan.
+	createViewStmt := fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM read_parquet('%s')",
+		userName, escapeSQL(stagePath))
+	if _, err := conn.ExecContext(ctx, createViewStmt); err != nil {
+		os.Remove(stagePath) //nolint:errcheck
+		return nil, fmt.Errorf("CREATE VIEW %s: %w", userName, err)
 	}
 
 	return func() {
-		rel()                 // 1. drop DuckDB's internal stream ref
-		arrowReader.Release() // 2. close gRPC stream + sdk.Reader
+		// Drop the view first so DuckDB releases its handle on the
+		// staged file before we unlink it. Use a background ctx so
+		// cleanup still runs if the parent ctx was cancelled.
+		_, _ = conn.ExecContext(context.Background(), "DROP VIEW IF EXISTS "+userName)
+		os.Remove(stagePath) //nolint:errcheck
 	}, nil
 }
 
@@ -105,9 +180,9 @@ func registerInput(ctx context.Context, conn *sql.Conn, arrowConn *duckdb.Arrow,
 // Returns the row count of the produced output (best-effort — DG also
 // reports total_rows on Close).
 //
-// Note: writeOutput now takes *sql.Conn (not *sql.DB) because the
-// arrowFromDB helper pins a single *sql.Conn under MaxOpenConns=1 — using
-// db.ExecContext here would deadlock waiting for the held conn.
+// Note: writeOutput takes *sql.Conn (not *sql.DB) because main.go pins a
+// single *sql.Conn under MaxOpenConns=1 — using db.ExecContext here would
+// deadlock waiting for the held conn.
 func writeOutput(ctx context.Context, conn *sql.Conn, client *sdk.Client, workdir string, out sdk.OutputTableRef) (int64, error) {
 	srcTable, err := sanitizeIdent(out.Name)
 	if err != nil {
