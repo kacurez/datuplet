@@ -5,9 +5,9 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,11 +58,18 @@ func registerInput(ctx context.Context, conn *sql.Conn, client *sdk.Client, work
 	if err != nil {
 		return nil, fmt.Errorf("OpenReader: %w", err)
 	}
-	grpcStream, err := sdkReader.OpenGRPCReadChunk(ctx)
-	if err != nil {
+	// HTTP, not gRPC. The gateway's gRPC ReadChunk caps at 64 MiB
+	// (SDK's MaxCallRecvMsgSize); large source parquet files in iceberg
+	// snapshots routinely exceed that (we've observed 246 MiB single
+	// files). The HTTP /data/read/{readerID} endpoint has no
+	// message-size cap — each GET returns one chunk; the gateway sets
+	// X-Datuplet-Is-Last on the final response to terminate the loop.
+	endpoint := sdkReader.HTTPEndpoint()
+	if endpoint == "" {
 		sdkReader.Close(ctx) //nolint:errcheck
-		return nil, fmt.Errorf("OpenGRPCReadChunk: %w", err)
+		return nil, fmt.Errorf("OpenReader: gateway returned empty HTTP endpoint (required for parquet passthrough — large source files exceed gRPC 64 MiB cap)")
 	}
+	httpClient := &http.Client{}
 
 	// Drain chunks → one local parquet file per chunk. Track everything
 	// we wrote so a partial-failure cleanup unlinks all stages, and so
@@ -80,36 +87,20 @@ func registerInput(ctx context.Context, conn *sql.Conn, client *sdk.Client, work
 	}
 
 	for {
-		chunk, recvErr := grpcStream.Recv()
-		if errors.Is(recvErr, io.EOF) {
+		isLast, n, err := readNextChunkToFile(ctx, httpClient, endpoint, workdir, userName, len(stagedFiles))
+		if err != nil {
+			return nil, failStage(err, "parquet stream")
+		}
+		if n > 0 {
+			stagedFiles = append(stagedFiles, filepath.Join(workdir, fmt.Sprintf("in_%s_%04d.parquet", userName, len(stagedFiles))))
+		}
+		if isLast {
 			break
 		}
-		if recvErr != nil {
-			return nil, failStage(recvErr, "parquet stream")
-		}
-		// Format guard: the gateway is contractually obliged to emit
-		// FORMAT_PARQUET on this stream (we asked for it). If a future
-		// backend regresses (or reorders the same-format passthrough
-		// branch) we fail loudly here rather than silently writing junk.
-		if chunk.Format != pb.DataFormat_FORMAT_PARQUET {
-			return nil, failStage(
-				fmt.Errorf("expected FORMAT_PARQUET on the wire, got %s", chunk.Format),
-				"parquet stream")
-		}
-		if len(chunk.Data) == 0 {
-			// Defensive: should never happen on the parquet wire, but
-			// don't write a zero-byte file (DuckDB rejects empty
-			// parquet — no footer to parse).
-			continue
-		}
-		path := filepath.Join(workdir, fmt.Sprintf("in_%s_%04d.parquet", userName, len(stagedFiles)))
-		if err := os.WriteFile(path, chunk.Data, 0o644); err != nil {
-			return nil, failStage(err, "write staged input "+path)
-		}
-		stagedFiles = append(stagedFiles, path)
 	}
-	// Close the gRPC stream + sdk.Reader before continuing — the staged
-	// files own the bytes from here on, the connection has no more work.
+	// Close the sdk.Reader so the gateway drops the readerState entry
+	// and releases the underlying backend reader (which Cancels the
+	// prefetcher goroutines). Idempotent.
 	sdkReader.Close(ctx) //nolint:errcheck
 
 	client.Log(ctx, "INFO", fmt.Sprintf("staged input %s.%s -> %d file(s) in %s",
@@ -148,6 +139,65 @@ func registerInput(ctx context.Context, conn *sql.Conn, client *sdk.Client, work
 		_, _ = conn.ExecContext(context.Background(), "DROP VIEW IF EXISTS "+userName)
 		cleanupStaged()
 	}, nil
+}
+
+// readNextChunkToFile GETs one chunk from the gateway's HTTP read
+// endpoint and streams the response body straight to disk. Returns
+// (isLast, bytesWritten, error). bytesWritten is 0 when the gateway
+// signals end-of-stream with an empty body (X-Datuplet-Is-Last=true and
+// no content); in that case no file is created and the caller should
+// just terminate the loop.
+//
+// Streaming via io.Copy keeps component memory bounded — even on a
+// 250 MiB source parquet file we only hold the HTTP transport's
+// internal read buffer (~32 KiB) plus the os.File buffer in memory,
+// not the whole file. This is the key memory win vs. a naive
+// http.ReadAll → os.WriteFile loop.
+func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir, userName string, idx int) (isLast bool, n int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, 0, fmt.Errorf("build GET %s: %w", endpoint, err)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return false, 0, fmt.Errorf("GET %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// Drain a small amount of the body for the error message
+		// without copying multi-MB of error pages into memory.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, 0, fmt.Errorf("GET %s: status %d body=%q", endpoint, resp.StatusCode, string(body))
+	}
+	isLast = resp.Header.Get("X-Datuplet-Is-Last") == "true"
+
+	// Special case: gateway signals end-of-stream with isLast=true and
+	// no body (Content-Length=0). Don't create a zero-byte file in
+	// that case — DuckDB rejects empty parquet (no footer).
+	if resp.ContentLength == 0 {
+		return isLast, 0, nil
+	}
+
+	path := filepath.Join(workdir, fmt.Sprintf("in_%s_%04d.parquet", userName, idx))
+	f, err := os.Create(path)
+	if err != nil {
+		return false, 0, fmt.Errorf("create %s: %w", path, err)
+	}
+	n, err = io.Copy(f, resp.Body)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(path) //nolint:errcheck
+		return false, 0, fmt.Errorf("write %s: %w", path, err)
+	}
+	if n == 0 {
+		// Header said body, gateway sent nothing — same handling as
+		// ContentLength=0: don't keep the empty file.
+		os.Remove(path) //nolint:errcheck
+		return isLast, 0, nil
+	}
+	return isLast, n, nil
 }
 
 // writeOutput materializes one DuckDB table to local parquet then streams
