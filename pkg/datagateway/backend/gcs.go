@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -92,6 +93,26 @@ func NewGCSBackend(cfg GCSConfig) (*gcsBackend, error) {
 // NewGCSBackendWithProvider constructs a backend using lakekeeper-vended
 // OAuth tokens. The TokenSource refreshes via VendedCreds.Get() — see RFC
 // 019 §4.3.
+//
+// HTTP transport composition:
+//
+//   - Inner: oauth2.Transport (from x/oauth2) wraps net/http's default
+//     transport. Adds Authorization: Bearer <token> to every request,
+//     calling vendedTokenSource.Token() — which hits VendedCreds.Get().
+//
+//   - Outer: catalogwriter.RefreshTransport intercepts 401 / 403
+//     responses, invalidates VendedCreds' cache, and retries the
+//     request once. This is the asymmetry-#5 fix from the parity
+//     audit: lakekeeper's internal credential cache occasionally hands
+//     out an already-stale token that GCS then rejects (observed on
+//     run 6de6e3bb's parquet writer Close). The TokenSource on its own
+//     can't recover from this because Token() returns a value
+//     VendedCreds believes is fresh; only seeing GCS reject it
+//     downstream tells us to force a refetch.
+//
+// Order matters: oauth2.Transport must be innermost so it sees the
+// retried request AFTER Invalidate has expired the cache (which makes
+// the next Token() actually hit lakekeeper).
 func NewGCSBackendWithProvider(cfg GCSProviderConfig) (*gcsBackend, error) {
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("gcs: bucket required")
@@ -104,8 +125,22 @@ func NewGCSBackendWithProvider(cfg GCSProviderConfig) (*gcsBackend, error) {
 	}
 	ctx := context.Background()
 	ts := &vendedTokenSource{vc: cfg.VendedCreds}
+
+	// Refresh callback: invalidate the cache, then force a fresh Get
+	// so any in-flight checks see the new value immediately.
+	vc := cfg.VendedCreds
+	refresh := func() error {
+		vc.Invalidate()
+		_, err := vc.Get(context.Background())
+		return err
+	}
+
+	oauthTransport := &oauth2.Transport{Source: ts, Base: http.DefaultTransport}
+	retryTransport := &catalogwriter.RefreshTransport{Base: oauthTransport, Refresh: refresh}
+	httpClient := &http.Client{Transport: retryTransport}
+
 	client, err := storage.NewClient(ctx,
-		option.WithTokenSource(ts),
+		option.WithHTTPClient(httpClient),
 		option.WithUserAgent("datuplet-datagateway"),
 	)
 	if err != nil {

@@ -254,6 +254,27 @@ func (v *VendedCreds) LastError() error {
 	return v.lastErr
 }
 
+// Invalidate clears the cached credential so the next Get() call forces
+// a fresh roundtrip to lakekeeper, bypassing the normal 50%-of-TTL
+// renewal heuristic. Intended for transport-level recovery paths that
+// detected the storage backend rejected a previously-cached token (e.g.
+// HTTP 401 from GCS / 403 from S3): invalidate, then re-issue the
+// request — the next Token() callback hits Get() which now refetches.
+//
+// Safe for concurrent callers — wait-on-fetchDone in Get() ensures only
+// one goroutine actually contacts lakekeeper even if multiple invoked
+// Invalidate near-simultaneously.
+//
+// Does not interrupt an in-flight fetch (if any). The in-flight fetch
+// completes; its result lands in the cache; the NEXT Get() observes
+// the still-fresh value. To trigger a strictly-after-Invalidate fetch,
+// the caller should re-Get after Invalidate has been seen.
+func (v *VendedCreds) Invalidate() {
+	v.mu.Lock()
+	v.cached = nil
+	v.mu.Unlock()
+}
+
 // fetch performs the single lakekeeper roundtrip. Schema:
 //
 //	GET {LakekeeperURL}/v1/{Prefix}/namespaces/{ns}/tables/{tbl}
