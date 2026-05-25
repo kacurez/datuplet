@@ -2,10 +2,12 @@ package datupleticeio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -19,6 +21,17 @@ import (
 	"gocloud.dev/gcp"
 	"golang.org/x/oauth2"
 )
+
+// refreshHTTPClient is the shared transport used by loadTableRefresh.
+// 30 s timeout matches catalogwriter.defaultHTTPTimeout so both refresh
+// paths fail in similar windows under a hung lakekeeper.
+var refreshHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// maxRefreshResponseBytes caps the body we read from the refresh
+// endpoint. Same posture as catalogwriter.maxResponseBytes — a vended
+// creds response is ~1 KiB; the 1 MiB cap guards against runaway
+// responses without affecting legitimate traffic.
+const maxRefreshResponseBytes = 1 << 20
 
 // refreshFunc returns a fresh *oauth2.Token. Called when the cached
 // token is within 1 minute of Expiry. On error, refreshingTokenSource
@@ -139,21 +152,111 @@ func endpointRefresh(ep string, props map[string]string) refreshFunc {
 	}
 }
 
-// loadTableRefresh is the default fallback. The factory's caller (DG,
-// TableCommit, storage browser) wires a closure that re-issues loadTable
-// against the catalog client for the bound table. Without that closure
-// (which today no caller provides — wiring is a follow-on slice), refresh
-// is a hard error.
+// loadTableRefresh is the default refresh path. It GETs
+// `gcs.oauth2.refresh-credentials-endpoint` (always present in
+// lakekeeper's standard loadTable response) with the package-level
+// bearer installed via SetTokenProvider, parses the same shape
+// lakekeeper returns on loadTable, and extracts the fresh
+// `gcs.oauth2.token` + `gcs.oauth2.token-expires-at` claims.
 //
-// Today's transactions complete within the initial token TTL, so refresh
-// is never invoked in practice; this surface exists so when a long
-// transaction (e.g. a multi-hour ReplaceDataFiles on a very large table)
-// does exceed the TTL, the failure is loud rather than silent.
+// Returns a hard error (NOT a stale token) when:
+//   - the endpoint URL is missing from props,
+//   - no BearerTokenProvider has been installed at the package level,
+//   - the provider returns an error,
+//   - the HTTP call fails or returns non-2xx,
+//   - the response body is malformed or missing the token claim.
+//
+// Per RFC 019 §4.5.3 the refreshingTokenSource propagates the error
+// without falling back to the cached (expired) token — every request
+// that needed a refresh fails fast rather than silently re-using a bad
+// credential.
 func loadTableRefresh(props map[string]string) refreshFunc {
-	_ = props
+	ep := props["gcs.oauth2.refresh-credentials-endpoint"]
 	return func(ctx context.Context) (*oauth2.Token, error) {
-		return nil, fmt.Errorf("loadTableRefresh: caller did not inject a refresh closure (today's transactions complete within the initial token TTL; refresh wiring lands in a follow-on slice)")
+		if ep == "" {
+			return nil, errors.New("loadTableRefresh: gcs.oauth2.refresh-credentials-endpoint missing from props")
+		}
+		provider := getTokenProvider()
+		if provider == nil {
+			return nil, errors.New("loadTableRefresh: no BearerTokenProvider installed (call datupleticeio.SetTokenProvider at startup)")
+		}
+		bearer, err := provider(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: bearer provider: %w", err)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: build request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set("Accept", "application/json")
+		// Standard Iceberg REST opt-in to vended creds (some servers
+		// gate the credential block behind this header even on the
+		// refresh URL). Lakekeeper accepts it as a no-op when the
+		// warehouse is already configured for credential vending, so
+		// it's safe to always send.
+		req.Header.Set("X-Iceberg-Access-Delegation", "vended-credentials")
+
+		resp, err := refreshHTTPClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: GET %s: %w", ep, err)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRefreshResponseBytes))
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: read body: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("loadTableRefresh: GET %s: status %d (body len=%d)", ep, resp.StatusCode, len(body))
+		}
+
+		// Both the loadTable response and the dedicated credentials
+		// endpoint shape are `{ "config": { "gcs.oauth2.token": ... } }`
+		// per the Iceberg REST spec. Parse loosely so we tolerate
+		// either side of the wire.
+		var parsed struct {
+			Config map[string]any `json:"config"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: unmarshal: %w", err)
+		}
+		if parsed.Config == nil {
+			return nil, errors.New("loadTableRefresh: response has no `config` block")
+		}
+		tok, _ := parsed.Config["gcs.oauth2.token"].(string)
+		if tok == "" {
+			return nil, errors.New("loadTableRefresh: response missing gcs.oauth2.token")
+		}
+		expires := parseConfigExpiresAt(parsed.Config["gcs.oauth2.token-expires-at"])
+		return &oauth2.Token{
+			AccessToken: tok,
+			Expiry:      expires,
+			TokenType:   "Bearer",
+		}, nil
 	}
+}
+
+// parseConfigExpiresAt parses the `gcs.oauth2.token-expires-at` claim
+// from the refresh response's config block. The value may arrive as a
+// JSON string ("1234567890000") or a JSON number (1234567890000) per
+// the spec — handle both. Empty / malformed values default to 15
+// minutes from now, matching parseExpiresAt for the initial token.
+func parseConfigExpiresAt(v any) time.Time {
+	switch x := v.(type) {
+	case string:
+		return parseExpiresAt(x)
+	case float64:
+		return time.UnixMilli(int64(x))
+	case int64:
+		return time.UnixMilli(x)
+	case json.Number:
+		if n, err := x.Int64(); err == nil {
+			return time.UnixMilli(n)
+		}
+	}
+	return time.Now().Add(15 * time.Minute)
 }
 
 // parseExpiresAt parses a millisecond-epoch string. Empty / malformed

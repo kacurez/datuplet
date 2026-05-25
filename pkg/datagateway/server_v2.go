@@ -31,6 +31,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/datagateway/jwks"
 	dglakekeeper "github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
 	"github.com/datuplet/datuplet/pkg/datagateway/manifest"
+	"github.com/datuplet/datuplet/pkg/datupleticeio"
 	"github.com/datuplet/datuplet/pkg/datagateway/partition"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/processor"
@@ -253,6 +254,18 @@ func NewServerV2(cfg *Config) *ServerV2 {
 			log.Fatalf("lakekeeper resolver: %v", lkErr)
 		}
 		s.lakekeeperResolver = res
+
+		// Wire the per-gateway run-token into datupleticeio's
+		// loadTable-refresh path so iceberg-go's `gs://` IO factory
+		// can re-fetch fresh GCS vended creds when the initial token
+		// nears expiry (or arrives already-stale from lakekeeper's
+		// own credential cache). Without this hook the refresh path
+		// errors out and reads against multi-table inputs fail with
+		// HTTP 401 the moment the first token TTL elapses.
+		runTokenCapture := runToken
+		datupleticeio.SetTokenProvider(func(context.Context) (string, error) {
+			return runTokenCapture, nil
+		})
 	}
 
 	// Kick off the in-band cancel watcher. WatchCancelAnnotation is a
