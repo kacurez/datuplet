@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"path"
 	"strings"
+	"sync/atomic"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -46,6 +48,20 @@ type MinIOBackend struct {
 	client    *minio.Client
 	bucket    string
 	chunkSize int64
+
+	// credInvalidator is non-nil ONLY on the lakekeeper-vended-creds
+	// construction path (NewMinIOBackendWithProvider). When set, the
+	// high-traffic one-shot operations (PutObject, GetObject) wrap
+	// minio-go calls in retryOnAuthError so a 401 / 403 from S3
+	// (typically caused by lakekeeper handing out an already-stale
+	// STS triple via its internal cache) forces a credential refresh
+	// and one retry instead of propagating the auth failure.
+	//
+	// Nil on the static-key construction path (NewMinIOBackend) —
+	// there's nothing to refresh when the credentials are baked into
+	// config; the auth error is a genuine config bug and should
+	// surface immediately.
+	credInvalidator interface{ Invalidate() }
 }
 
 // NewMinIOBackend creates a new MinIO/S3 backend.
@@ -133,8 +149,9 @@ func NewMinIOBackendWithProvider(cfg MinIOProviderConfig) (*MinIOBackend, error)
 		return nil, fmt.Errorf("parse vended endpoint %q: %w", primed.Endpoint, err)
 	}
 
+	provider := &vendedCredsProvider{vc: cfg.VendedCreds}
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.New(&vendedCredsProvider{vc: cfg.VendedCreds}),
+		Creds:  credentials.New(provider),
 		Secure: useSSL,
 		Region: primed.Region,
 	})
@@ -148,9 +165,10 @@ func NewMinIOBackendWithProvider(cfg MinIOProviderConfig) (*MinIOBackend, error)
 	}
 
 	return &MinIOBackend{
-		client:    client,
-		bucket:    cfg.Bucket,
-		chunkSize: chunkSize,
+		client:          client,
+		bucket:          cfg.Bucket,
+		chunkSize:       chunkSize,
+		credInvalidator: provider,
 	}, nil
 }
 
@@ -164,8 +182,28 @@ func NewMinIOBackendWithProvider(cfg MinIOProviderConfig) (*MinIOBackend, error)
 // can't be directly threaded through to VendedCreds.Get. The default
 // HTTP client in catalogwriter.VendedCreds carries its own per-call
 // timeout — that's the bound on the renewal RPC for now.
+//
+// invalidated is a one-shot "force expiry" flag set by Invalidate (see
+// retryOnAuthError below). minio-go calls IsExpired before each
+// request; while invalidated==true, IsExpired returns true,
+// prompting minio-go to call Retrieve → fresh creds. Retrieve flips
+// the flag back to false so a subsequent (now-fresh) request goes
+// through the normal cache.
 type vendedCredsProvider struct {
-	vc *catalogwriter.VendedCreds
+	vc          *catalogwriter.VendedCreds
+	invalidated atomic.Bool
+}
+
+// Invalidate forces the next IsExpired() to return true, which causes
+// minio-go to call Retrieve again — which in turn hits VendedCreds.Get
+// after we've already cleared the cache. Wired by retryOnAuthError
+// when minio-go surfaces an auth-related error on a request.
+//
+// Concurrency-safe (atomic flag + VendedCreds.Invalidate's own mutex).
+// Idempotent (calling twice has the same effect as once).
+func (p *vendedCredsProvider) Invalidate() {
+	p.invalidated.Store(true)
+	p.vc.Invalidate()
 }
 
 // Retrieve is the deprecated path; minio-go still calls it through
@@ -174,18 +212,11 @@ func (p *vendedCredsProvider) Retrieve() (credentials.Value, error) {
 	return p.RetrieveWithCredContext(nil)
 }
 
-// RetrieveWithCredContext fetches a fresh-or-cached creds triple from
-// VendedCreds. Errors propagate as-is — minio-go wraps them with the
-// originating call (PutObject, etc.) which is exactly what we want for
-// observability (operator logs see "PutObject: vended creds: …").
-//
-// We deliberately pass context.Background() rather than threading the
-// originating request context: minio-go's CredContext exposes only
-// {Client, Endpoint} (no context.Context field), so there's no upstream
-// signal to forward. The catalogwriter.VendedCreds default HTTPClient
-// carries its own per-call timeout — that's the bound on a hung
-// lakekeeper for now.
-func (p *vendedCredsProvider) RetrieveWithCredContext(_ *credentials.CredContext) (credentials.Value, error) {
+// retrieve clears the invalidation flag and fetches fresh creds. Shared
+// between Retrieve() and RetrieveWithCredContext() — keeps the flag-flip
+// and Get() in one place.
+func (p *vendedCredsProvider) retrieve() (credentials.Value, error) {
+	p.invalidated.Store(false)
 	got, err := p.vc.Get(context.Background())
 	if err != nil {
 		return credentials.Value{}, err
@@ -202,15 +233,80 @@ func (p *vendedCredsProvider) RetrieveWithCredContext(_ *credentials.CredContext
 	}, nil
 }
 
-// IsExpired delegates to VendedCreds' renewal contract: a positive
-// answer triggers minio-go to call RetrieveWithCredContext again.
-// Returning true keeps the upstream cache from skewing past our own.
+// RetrieveWithCredContext fetches a fresh-or-cached creds triple from
+// VendedCreds. Errors propagate as-is — minio-go wraps them with the
+// originating call (PutObject, etc.) which is exactly what we want for
+// observability (operator logs see "PutObject: vended creds: …").
+//
+// We deliberately pass context.Background() rather than threading the
+// originating request context: minio-go's CredContext exposes only
+// {Client, Endpoint} (no context.Context field), so there's no upstream
+// signal to forward. The catalogwriter.VendedCreds default HTTPClient
+// carries its own per-call timeout — that's the bound on a hung
+// lakekeeper for now.
+func (p *vendedCredsProvider) RetrieveWithCredContext(_ *credentials.CredContext) (credentials.Value, error) {
+	return p.retrieve()
+}
+
+// IsExpired triggers minio-go to call Retrieve when true. The default
+// "always false" path defers to VendedCreds' own 60s renewal cadence
+// so we don't double-cache. When Invalidate has been called (e.g. by
+// retryOnAuthError after a 401/403), we return true ONCE — the next
+// Retrieve flips the flag back to false and refreshes the credential
+// triple from lakekeeper.
 func (p *vendedCredsProvider) IsExpired() bool {
-	// Conservative: always say "not expired", let VendedCreds.Get make
-	// the call. minio-go re-checks before each request.
-	// Returning false here avoids a redundant fetch path; VendedCreds
-	// already throttles via its 60s floor.
+	return p.invalidated.Load()
+}
+
+// isS3AuthError matches the minio-go ErrorResponse codes that indicate
+// stale-credentials at the S3 layer. Returning true triggers
+// retryOnAuthError to invalidate the credentials cache and retry once.
+//
+// Code list mirrors what real S3 / MinIO endpoints surface when an
+// STS-vended token has been revoked or rotated since signing:
+//
+//	ExpiredToken          — STS token past its expiry
+//	InvalidAccessKeyId    — credentials don't exist (anymore)
+//	SignatureDoesNotMatch — signature derived from a different secret
+//	AccessDenied          — bucket / object IAM said no with the
+//	                         current identity (lakekeeper-side denied)
+//	InvalidToken          — alternate spelling some MinIO builds use
+//
+// Anything else (404, 500, network) is NOT an auth error and is
+// surfaced as-is so retry-on-auth doesn't mask real failures.
+func isS3AuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var er minio.ErrorResponse
+	if !errors.As(err, &er) {
+		return false
+	}
+	switch er.Code {
+	case "ExpiredToken", "InvalidAccessKeyId", "SignatureDoesNotMatch", "AccessDenied", "InvalidToken":
+		return true
+	}
 	return false
+}
+
+// retryOnAuthError runs op once. If it returns an auth error and
+// invalidator is non-nil, invalidates the cached credentials and runs
+// op a second time. At most one retry — sustained auth failures
+// surface to the caller (no infinite loop, no silent masking of a
+// genuinely-broken credential).
+//
+// Used by the high-traffic one-shot backend methods (GetObject,
+// PutObject). NOT used for OpenObjectWriter — the multipart-upload
+// session's body has already been streamed by the time a 401 can
+// arrive on Close, and we can't rewind in-process. Matches the
+// GCS-side equivalent gap (RefreshTransport guards rewindable bodies
+// only).
+func retryOnAuthError(invalidator interface{ Invalidate() }, op func() error) error {
+	if err := op(); err == nil || !isS3AuthError(err) || invalidator == nil {
+		return err
+	}
+	invalidator.Invalidate()
+	return op()
 }
 
 // splitEndpoint splits a lakekeeper s3.endpoint URL ("http://minio:9000",
@@ -445,19 +541,32 @@ func (b *MinIOBackend) GetObject(ctx context.Context, storagePath string) ([]byt
 	// Convert storage path (may be S3 URL) to object key
 	objectKey := b.toObjectKey(storagePath)
 
-	// Download object from MinIO
-	obj, err := b.client.GetObject(ctx, b.bucket, objectKey, minio.GetObjectOptions{})
+	// Wrapped in retryOnAuthError so a stale STS triple from lakekeeper's
+	// internal credential cache forces a refresh + retry instead of
+	// surfacing a 401 to the caller (mirrors the GCS-side
+	// RefreshTransport fix; lakekeeper-restart is no longer the only
+	// recovery path).
+	var data []byte
+	err := retryOnAuthError(b.credInvalidator, func() error {
+		obj, err := b.client.GetObject(ctx, b.bucket, objectKey, minio.GetObjectOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get object %s: %w", objectKey, err)
+		}
+		defer obj.Close()
+		// minio-go's GetObject returns the reader before fetching the
+		// body; the actual auth error surfaces on the io.ReadAll below
+		// when the request is dispatched. Either error site is caught
+		// by isS3AuthError so retryOnAuthError sees it correctly.
+		d, err := io.ReadAll(obj)
+		if err != nil {
+			return fmt.Errorf("failed to read object %s: %w", objectKey, err)
+		}
+		data = d
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get object %s: %w", objectKey, err)
+		return nil, err
 	}
-	defer obj.Close()
-
-	// Read all data
-	data, err := io.ReadAll(obj)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read object %s: %w", objectKey, err)
-	}
-
 	return data, nil
 }
 
@@ -465,21 +574,26 @@ func (b *MinIOBackend) PutObject(ctx context.Context, storagePath string, data [
 	// Convert storage path (may be S3 URL) to object key
 	objectKey := b.toObjectKey(storagePath)
 
-	// Upload data to MinIO
-	_, err := b.client.PutObject(
-		ctx,
-		b.bucket,
-		objectKey,
-		bytes.NewReader(data),
-		int64(len(data)),
-		minio.PutObjectOptions{
-			ContentType: "application/octet-stream",
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to upload %s: %w", objectKey, err)
-	}
-	return nil
+	// Wrapped in retryOnAuthError so a stale STS triple from lakekeeper's
+	// internal credential cache forces a refresh + retry instead of
+	// surfacing a 401 to the caller. The bytes.NewReader is freshly
+	// constructed inside the closure so the retry has a rewound body.
+	return retryOnAuthError(b.credInvalidator, func() error {
+		_, err := b.client.PutObject(
+			ctx,
+			b.bucket,
+			objectKey,
+			bytes.NewReader(data),
+			int64(len(data)),
+			minio.PutObjectOptions{
+				ContentType: "application/octet-stream",
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to upload %s: %w", objectKey, err)
+		}
+		return nil
+	})
 }
 
 // minioRemoveAPI is the minimal minio client surface used by RemoveAll.
