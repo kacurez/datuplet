@@ -55,6 +55,19 @@ const arrowBatchRows = 8192
 // date / timestamp / uuid stay STRING for the same reason — the JSONL
 // path produces strings (via Go's time.Format), and downstream
 // pipelines reading the iceberg table see string columns.
+//
+// Nullable: false on every column. The random-mode generator never
+// emits nulls (every row has every column populated). JSON schema
+// inference at inference.go:234 — `Nullable: state.hasNull ||
+// state.totalNonNull == 0` — therefore stamps every column as
+// non-nullable (iceberg "required") on the first JSONL chunk that
+// creates the table. iceberg-go's txn.AddFiles strict-mode schema
+// check rejects an optional parquet column against a required iceberg
+// field with the same "invalid schema: mismatch in fields" surface
+// (observed: run 944823d3). Marking all fields non-nullable here
+// matches the iceberg table that any prior JSONL run would have
+// produced, AND matches the actual data shape (the generator's row
+// emit loop appends a non-null value for every column on every row).
 func arrowFieldFor(name, colType string) arrow.Field {
 	var t arrow.DataType
 	switch colType {
@@ -68,7 +81,7 @@ func arrowFieldFor(name, colType string) arrow.Field {
 		// string, uuid, date, timestamp, now -> String
 		t = arrow.BinaryTypes.String
 	}
-	return arrow.Field{Name: name, Type: t, Nullable: true}
+	return arrow.Field{Name: name, Type: t, Nullable: false}
 }
 
 // buildArrowSchema constructs the Arrow schema from the user's declared
