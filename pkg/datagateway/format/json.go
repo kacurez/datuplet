@@ -198,6 +198,25 @@ func (a *JSONLAdapter) Format() DataFormat {
 
 // Parse converts JSON Lines bytes to an Arrow RecordBatch.
 func (a *JSONLAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
+	// Fast path: schema known. Stream-decode lines directly into the
+	// arrow RecordBuilder — no []map[string]any intermediate. Previous
+	// run 07a2ddec showed JSONLAdapter.buildRecord holding ~706 MB
+	// of [N]map[string]any across the in-flight chunk; with the
+	// streaming-decode pattern only ONE map[string]any is alive at any
+	// moment (GC'd after each row append).
+	//
+	// The hot path in production hits this branch: the first write-chunk
+	// per (writer, table) infers the schema (slow path below), the
+	// gateway caches it on writerState, and every subsequent chunk for
+	// that writer passes the cached schema in.
+	if s != nil {
+		return a.parseWithKnownSchema(data, s)
+	}
+
+	// Slow path: schema unknown. Buffer all objects, infer schema (the
+	// inference may widen types across rows, e.g. int -> double if any
+	// row has a float), then build. Only the FIRST chunk of a writer's
+	// lifetime takes this path.
 	var objects []map[string]any
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
@@ -224,22 +243,69 @@ func (a *JSONLAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *sche
 		return nil, nil, fmt.Errorf("JSON Lines data is empty")
 	}
 
-	// Infer schema if not provided
-	var err error
-	if s == nil {
-		s, err = schema.InferSchemaFromJSONWithConfig(objects, a.parseOpts.InferenceConfig)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to infer schema: %w", err)
-		}
+	// Infer schema from the buffered objects.
+	inferred, err := schema.InferSchemaFromJSONWithConfig(objects, a.parseOpts.InferenceConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to infer schema: %w", err)
 	}
 
-	// Build the RecordBatch
-	record, err := a.buildRecord(s, objects)
+	// Build the RecordBatch.
+	record, err := a.buildRecord(inferred, objects)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return record, s, nil
+	return record, inferred, nil
+}
+
+// parseWithKnownSchema is the streaming-direct JSONL decoder used when
+// the gateway already has the writer's schema cached. It avoids
+// building a []map[string]any of all rows: each line allocates a
+// single map[string]any, the values are appended into the
+// RecordBuilder, and the map is dropped (eligible for GC) before the
+// next line is decoded. Peak live heap is therefore one map per
+// in-flight chunk, not (rows-in-chunk) maps.
+func (a *JSONLAdapter) parseWithKnownSchema(data []byte, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
+	builder := array.NewRecordBuilder(a.allocator, s.ArrowSchema())
+	defer builder.Release()
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	// Default bufio.Scanner line buffer is 64 KiB. Very wide JSONL rows
+	// (long strings, many columns) can exceed that; bump the cap to
+	// 16 MiB so we don't reject legitimate inputs. The initial buffer
+	// stays small — bufio grows on demand within the cap.
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		// One transient map per line. Without buffering across rows the
+		// allocator can reuse the same memory arena for each — Go's
+		// runtime hits this pattern hard but cheaply.
+		var obj map[string]any
+		if err := json.Unmarshal(line, &obj); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse JSON at line %d: %w", lineNum, err)
+		}
+		for colIdx := 0; colIdx < s.NumColumns(); colIdx++ {
+			col := s.Column(colIdx)
+			value, exists := obj[col.Name]
+			if !exists || value == nil {
+				builder.Field(colIdx).AppendNull()
+				continue
+			}
+			if err := appendValueFromInterface(builder.Field(colIdx), value); err != nil {
+				return nil, nil, fmt.Errorf("line %d, column %q: %w", lineNum, col.Name, err)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("failed to read JSON Lines: %w", err)
+	}
+	return builder.NewRecord(), s, nil
 }
 
 // buildRecord creates an Arrow RecordBatch from JSON objects.
