@@ -361,6 +361,23 @@ func (c *Client) OpenWriterToBucket(ctx context.Context, bucket, table string, o
 	default:
 		batchThreshold = 0 // batching OFF (legacy behavior)
 	}
+	// Hard override for self-framing formats: Arrow IPC chunks each
+	// carry a schema header + record + EOS marker. Concatenating two
+	// IPC streams into one HTTP body produces invalid IPC — the
+	// gateway's ArrowIPCAdapter.Parse reads the first stream's records,
+	// stops at the first EOS, and silently discards everything after.
+	// On the gen-big-pipeline write benchmark this dropped exactly half
+	// the rows (5M generated → 2,501,440 committed) because the
+	// 1 MiB default batchSize fit ~2 IPC chunks per POST.
+	//
+	// Other formats are append-safe (JSONL: newline-separated; CSV:
+	// row-separated text; raw parquet bytes get one-chunk-per-Write
+	// from typical callers). For Arrow IPC, force batching off
+	// regardless of WithBatchSize so callers can't accidentally
+	// re-enable it.
+	if options.format == pb.DataFormat_FORMAT_ARROW_IPC {
+		batchThreshold = 0
+	}
 
 	req := &pb.OpenWriterRequest{
 		Bucket:      bucket,

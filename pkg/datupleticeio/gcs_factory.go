@@ -2,10 +2,12 @@ package datupleticeio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -18,7 +20,20 @@ import (
 	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/gcp"
 	"golang.org/x/oauth2"
+
+	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
+
+// refreshHTTPClient is the shared transport used by loadTableRefresh.
+// 30 s timeout matches catalogwriter.defaultHTTPTimeout so both refresh
+// paths fail in similar windows under a hung lakekeeper.
+var refreshHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// maxRefreshResponseBytes caps the body we read from the refresh
+// endpoint. Same posture as catalogwriter.maxResponseBytes — a vended
+// creds response is ~1 KiB; the 1 MiB cap guards against runaway
+// responses without affecting legitimate traffic.
+const maxRefreshResponseBytes = 1 << 20
 
 // refreshFunc returns a fresh *oauth2.Token. Called when the cached
 // token is within 1 minute of Expiry. On error, refreshingTokenSource
@@ -58,6 +73,20 @@ func (r *refreshingTokenSource) Token() (*oauth2.Token, error) {
 	return tok, nil
 }
 
+// Invalidate clears the cached token so the next Token() call MUST fire
+// the refresh callback regardless of the cached Expiry. Used by the
+// 401-retry HTTP transport: when GCS rejects a token we still believed
+// was fresh (lakekeeper's own credential cache handed out a
+// pre-expired value), Invalidate + Token forces a refetch instead of
+// returning the same bad token again.
+//
+// Concurrency-safe — holds r.mu just like Token does.
+func (r *refreshingTokenSource) Invalidate() {
+	r.mu.Lock()
+	r.cur = nil
+	r.mu.Unlock()
+}
+
 func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]string) (iceio.IO, error) {
 	tok := props["gcs.oauth2.token"]
 	if tok == "" {
@@ -79,17 +108,43 @@ func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]s
 		TokenType:   "Bearer",
 	}, refresh)
 
-	// Wire the TokenSource into a gocloud GCP HTTP client so every storage
-	// request picks up a freshly-issued bearer when the cached one nears
-	// expiry. Slice A0 probe 2 confirmed this contract is honored by
-	// iceberg-go's GCS client (Token() is invoked per-request once the
-	// cached token enters the refresh-ahead window).
-	client, err := gcp.NewHTTPClient(
-		gcp.DefaultTransport(),
-		oauth2.ReuseTokenSource(nil, ts),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("datupletGCSFactory: new HTTP client: %w", err)
+	// HTTP transport composition (mirrors the WRITE-side pattern in
+	// pkg/datagateway/backend/gcs.go::NewGCSBackendWithProvider):
+	//
+	//   gcp.DefaultTransport()   — net/http transport with GCP defaults
+	//     + gcp's TokenSource wrapper (adds Authorization header per
+	//       request via refreshingTokenSource.Token)
+	//     + catalogwriter.RefreshTransport (intercepts 401/403; on
+	//       reject, Invalidate the cached token, retry once)
+	//
+	// Why we removed the prior oauth2.ReuseTokenSource wrapper: it
+	// caches Token() results independently of refreshingTokenSource's
+	// own cache, so even ts.Invalidate() can't force a re-fetch — the
+	// outer cache would still return the stale value. ts already
+	// caches via the (Expiry > 1 min) check, so the ReuseTokenSource
+	// layer was redundant AND blocked the retry path.
+	//
+	// What this fixes: when lakekeeper's internal credential cache
+	// serves an already-expired token at loadTable time (RFC 019 §4.5
+	// known issue, observed: run 4b0cbd51 required a lakekeeper
+	// restart). Now: first GCS read 401s → RefreshTransport
+	// invalidates ts → re-issues request → Token() goes to lakekeeper
+	// for a fresh token. Self-recovers in-process.
+	// Compose the gcp.HTTPClient transport stack manually so we can
+	// inject RefreshTransport on top of oauth2.Transport. gcp's own
+	// NewHTTPClient produces an oauth2.Transport-wrapped client; we
+	// rebuild that with the same shape and then layer the retry
+	// transport on top.
+	oauthT := &oauth2.Transport{
+		Base:   gcp.DefaultTransport(),
+		Source: ts,
+	}
+	retryT := &catalogwriter.RefreshTransport{
+		Base:    oauthT,
+		Refresh: func() error { ts.Invalidate(); return nil },
+	}
+	client := &gcp.HTTPClient{
+		Client: http.Client{Transport: retryT},
 	}
 	bkt, err := gcsblob.OpenBucket(ctx, client, bucket, nil)
 	if err != nil {
@@ -139,21 +194,111 @@ func endpointRefresh(ep string, props map[string]string) refreshFunc {
 	}
 }
 
-// loadTableRefresh is the default fallback. The factory's caller (DG,
-// TableCommit, storage browser) wires a closure that re-issues loadTable
-// against the catalog client for the bound table. Without that closure
-// (which today no caller provides — wiring is a follow-on slice), refresh
-// is a hard error.
+// loadTableRefresh is the default refresh path. It GETs
+// `gcs.oauth2.refresh-credentials-endpoint` (always present in
+// lakekeeper's standard loadTable response) with the package-level
+// bearer installed via SetTokenProvider, parses the same shape
+// lakekeeper returns on loadTable, and extracts the fresh
+// `gcs.oauth2.token` + `gcs.oauth2.token-expires-at` claims.
 //
-// Today's transactions complete within the initial token TTL, so refresh
-// is never invoked in practice; this surface exists so when a long
-// transaction (e.g. a multi-hour ReplaceDataFiles on a very large table)
-// does exceed the TTL, the failure is loud rather than silent.
+// Returns a hard error (NOT a stale token) when:
+//   - the endpoint URL is missing from props,
+//   - no BearerTokenProvider has been installed at the package level,
+//   - the provider returns an error,
+//   - the HTTP call fails or returns non-2xx,
+//   - the response body is malformed or missing the token claim.
+//
+// Per RFC 019 §4.5.3 the refreshingTokenSource propagates the error
+// without falling back to the cached (expired) token — every request
+// that needed a refresh fails fast rather than silently re-using a bad
+// credential.
 func loadTableRefresh(props map[string]string) refreshFunc {
-	_ = props
+	ep := props["gcs.oauth2.refresh-credentials-endpoint"]
 	return func(ctx context.Context) (*oauth2.Token, error) {
-		return nil, fmt.Errorf("loadTableRefresh: caller did not inject a refresh closure (today's transactions complete within the initial token TTL; refresh wiring lands in a follow-on slice)")
+		if ep == "" {
+			return nil, errors.New("loadTableRefresh: gcs.oauth2.refresh-credentials-endpoint missing from props")
+		}
+		provider := getTokenProvider()
+		if provider == nil {
+			return nil, errors.New("loadTableRefresh: no BearerTokenProvider installed (call datupleticeio.SetTokenProvider at startup)")
+		}
+		bearer, err := provider(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: bearer provider: %w", err)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: build request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set("Accept", "application/json")
+		// Standard Iceberg REST opt-in to vended creds (some servers
+		// gate the credential block behind this header even on the
+		// refresh URL). Lakekeeper accepts it as a no-op when the
+		// warehouse is already configured for credential vending, so
+		// it's safe to always send.
+		req.Header.Set("X-Iceberg-Access-Delegation", "vended-credentials")
+
+		resp, err := refreshHTTPClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: GET %s: %w", ep, err)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRefreshResponseBytes))
+		if err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: read body: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("loadTableRefresh: GET %s: status %d (body len=%d)", ep, resp.StatusCode, len(body))
+		}
+
+		// Both the loadTable response and the dedicated credentials
+		// endpoint shape are `{ "config": { "gcs.oauth2.token": ... } }`
+		// per the Iceberg REST spec. Parse loosely so we tolerate
+		// either side of the wire.
+		var parsed struct {
+			Config map[string]any `json:"config"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("loadTableRefresh: unmarshal: %w", err)
+		}
+		if parsed.Config == nil {
+			return nil, errors.New("loadTableRefresh: response has no `config` block")
+		}
+		tok, _ := parsed.Config["gcs.oauth2.token"].(string)
+		if tok == "" {
+			return nil, errors.New("loadTableRefresh: response missing gcs.oauth2.token")
+		}
+		expires := parseConfigExpiresAt(parsed.Config["gcs.oauth2.token-expires-at"])
+		return &oauth2.Token{
+			AccessToken: tok,
+			Expiry:      expires,
+			TokenType:   "Bearer",
+		}, nil
 	}
+}
+
+// parseConfigExpiresAt parses the `gcs.oauth2.token-expires-at` claim
+// from the refresh response's config block. The value may arrive as a
+// JSON string ("1234567890000") or a JSON number (1234567890000) per
+// the spec — handle both. Empty / malformed values default to 15
+// minutes from now, matching parseExpiresAt for the initial token.
+func parseConfigExpiresAt(v any) time.Time {
+	switch x := v.(type) {
+	case string:
+		return parseExpiresAt(x)
+	case float64:
+		return time.UnixMilli(int64(x))
+	case int64:
+		return time.UnixMilli(x)
+	case json.Number:
+		if n, err := x.Int64(); err == nil {
+			return time.UnixMilli(n)
+		}
+	}
+	return time.Now().Add(15 * time.Minute)
 }
 
 // parseExpiresAt parses a millisecond-epoch string. Empty / malformed

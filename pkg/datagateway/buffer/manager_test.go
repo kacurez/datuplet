@@ -14,16 +14,16 @@ import (
 func TestDefaultBufferConfig(t *testing.T) {
 	config := DefaultBufferConfig()
 
-	// BufferSize was lowered from 64 MiB to 16 MiB in Phase 1 to bound
-	// gateway-sidecar peak heap. Combined with streaming uploads on the
-	// backend, this keeps the in-flight row group AND parquet open buffer
-	// at ~16 MiB instead of ~64 MiB. Operators can still override via
-	// Config.BufferSize for higher-throughput deployments.
-	if config.BufferSize != 16*1024*1024 {
-		t.Errorf("Default BufferSize = %d, want 16 MiB", config.BufferSize)
+	// Defaults trace:
+	//   - BufferSize / RowGroupSize: 64 MiB → 16 MiB (Phase 1) → 8 MiB
+	//     (iter-buf8mib in 53e7d6b) to halve the open-row-group heap.
+	//   - Compression: Snappy → Zstd (this commit) for ~30% smaller
+	//     parquet files at acceptable encode-CPU cost.
+	if config.BufferSize != 8*1024*1024 {
+		t.Errorf("Default BufferSize = %d, want 8 MiB", config.BufferSize)
 	}
-	if config.RowGroupSize != 16*1024*1024 {
-		t.Errorf("Default RowGroupSize = %d, want 16 MiB", config.RowGroupSize)
+	if config.RowGroupSize != 8*1024*1024 {
+		t.Errorf("Default RowGroupSize = %d, want 8 MiB", config.RowGroupSize)
 	}
 	if config.TargetFileSize != 128*1024*1024 {
 		t.Errorf("Default TargetFileSize = %d, want 128 MiB", config.TargetFileSize)
@@ -31,8 +31,8 @@ func TestDefaultBufferConfig(t *testing.T) {
 	if config.FilePrefix != "part" {
 		t.Errorf("Default FilePrefix = %q, want 'part'", config.FilePrefix)
 	}
-	if config.Compression != CompressionSnappy {
-		t.Errorf("Default Compression = %v, want Snappy", config.Compression)
+	if config.Compression != CompressionZstd {
+		t.Errorf("Default Compression = %v, want Zstd", config.Compression)
 	}
 }
 

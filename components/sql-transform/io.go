@@ -6,39 +6,43 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	sdk "github.com/datuplet/datuplet/sdk/go"
-	sdkArrow "github.com/datuplet/datuplet/sdk/go/arrow"
-	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
-// registerInput opens an Arrow IPC stream from DG over the given input table,
-// registers it as a hidden DuckDB view via Arrow.RegisterView (arrow_scan),
-// then materializes the stream into a real DuckDB table that the user SQL
-// references by `viewName`. Returns a release func that the caller MUST defer.
+// registerInput opens a parquet byte-passthrough stream from DG over the
+// given input table, drains each source parquet file 1:1 to local
+// ephemeral disk, then exposes the file list to user SQL as a DuckDB
+// view via `read_parquet([...])`. Returns a release func that the
+// caller MUST defer.
 //
-// Why materialize? DuckDB's arrow_scan against a single-pass Arrow stream
-// produces incorrect results for queries that require multiple scans of the
-// same source (GROUP BY, JOIN, UNION ALL on the same input, etc.) — see
-// duckdb/duckdb#19040. Materializing once into a CTAS-backed table fully
-// drains the stream and gives subsequent SQL a normal multi-pass relation.
+// Wire shape: DG's gcsReader.readParquetFile emits each source parquet
+// file as ONE DataChunk{Format: parquet, Data: <whole file bytes>}.
+// server_v2_reading.go's same-format passthrough branch sends those
+// bytes verbatim — no decode/encode hops between GCS and the component.
+// Earlier we routed this same data through FORMAT_ARROW_IPC, which
+// forced the gateway to decode parquet→Arrow row groups + re-encode
+// them as IPC, and the component to re-decode IPC + re-encode as
+// parquet. That round-trip ate ~50% of CPU on the staging phase per
+// Pyroscope.
 //
-// Lifetime contract: release() MUST run AFTER all DuckDB SQL that may
-// reference the registered view has completed AND BEFORE the *sql.Conn
-// that hosts the view is closed. Calling release while a scan is still
-// active risks a use-after-free in the C bindings. See arrowFromDB in
-// duckdb.go for the recommended ordering.
+// Each chunk in this stream is one self-contained source parquet file
+// (one element of lakekeeper's iceberg snapshot data-file list), so we
+// dump each chunk to its own local path under `workdir/in_<name>_NNN.parquet`
+// and feed the list to DuckDB's read_parquet(['…','…']) — which
+// natively scans across multiple files and is multi-pass-safe.
 //
-// Empty inputs (parquet file has zero rows): the streaming Arrow reader
-// returns io.EOF on the first ReadChunk; DuckDB's arrow_scan handles this as
-// an empty relation, and the CTAS materializes a real but zero-row table with
-// the correct schema. Cold-start tables (zero data files in the snapshot)
-// currently error at OpenReader — that is pre-existing behavior on main and
-// is pre-existing behavior that is not currently addressed.
-func registerInput(ctx context.Context, conn *sql.Conn, arrowConn *duckdb.Arrow, client *sdk.Client, in sdk.TableRef) (release func(), err error) {
+// Empty input (lakekeeper returned no data files): the gRPC stream
+// closes immediately with no chunks. We still create the DuckDB view
+// over an empty file list so the user SQL sees an empty relation
+// without erroring.
+func registerInput(ctx context.Context, conn *sql.Conn, client *sdk.Client, workdir string, in sdk.TableRef) (release func(), err error) {
 	viewIdent := in.LogicalName
 	if viewIdent == "" {
 		viewIdent = in.Table
@@ -48,53 +52,152 @@ func registerInput(ctx context.Context, conn *sql.Conn, arrowConn *duckdb.Arrow,
 		return nil, err
 	}
 
-	// Hidden internal stream view name — must be SQL-safe.
-	// `__rfc011_stream_` matches sanitizeIdent's `^[A-Za-z_][A-Za-z0-9_]*$`.
-	streamName := "__rfc011_stream_" + userName
-
 	sdkReader, err := client.OpenReader(ctx, in.Bucket, in.Table,
-		sdk.WithOutputFormat(pb.DataFormat_FORMAT_ARROW_IPC),
+		sdk.WithOutputFormat(pb.DataFormat_FORMAT_PARQUET),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("OpenReader: %w", err)
 	}
-	arrowReader, err := sdkArrow.NewReader(ctx, sdkReader)
-	if err != nil {
+	// HTTP, not gRPC. The gateway's gRPC ReadChunk caps at 64 MiB
+	// (SDK's MaxCallRecvMsgSize); large source parquet files in iceberg
+	// snapshots routinely exceed that (we've observed 246 MiB single
+	// files). The HTTP /data/read/{readerID} endpoint has no
+	// message-size cap — each GET returns one chunk; the gateway sets
+	// X-Datuplet-Is-Last on the final response to terminate the loop.
+	endpoint := sdkReader.HTTPEndpoint()
+	if endpoint == "" {
 		sdkReader.Close(ctx) //nolint:errcheck
-		return nil, fmt.Errorf("sdkArrow.NewReader: %w", err)
+		return nil, fmt.Errorf("OpenReader: gateway returned empty HTTP endpoint (required for parquet passthrough — large source files exceed gRPC 64 MiB cap)")
+	}
+	httpClient := &http.Client{}
+
+	// Drain chunks → one local parquet file per chunk. Track everything
+	// we wrote so a partial-failure cleanup unlinks all stages, and so
+	// the success-path release func has the list.
+	var stagedFiles []string
+	cleanupStaged := func() {
+		for _, p := range stagedFiles {
+			os.Remove(p) //nolint:errcheck
+		}
+	}
+	failStage := func(err error, what string) error {
+		cleanupStaged()
+		sdkReader.Close(ctx) //nolint:errcheck
+		return fmt.Errorf("%s: %w", what, err)
 	}
 
-	// Step 1: Register the stream under a hidden name.
-	rel, err := arrowConn.RegisterView(arrowReader, streamName)
-	if err != nil {
-		arrowReader.Release()
-		return nil, fmt.Errorf("Arrow.RegisterView %q: %w", streamName, err)
+	for {
+		isLast, n, err := readNextChunkToFile(ctx, httpClient, endpoint, workdir, userName, len(stagedFiles))
+		if err != nil {
+			return nil, failStage(err, "parquet stream")
+		}
+		if n > 0 {
+			stagedFiles = append(stagedFiles, filepath.Join(workdir, fmt.Sprintf("in_%s_%04d.parquet", userName, len(stagedFiles))))
+		}
+		if isLast {
+			break
+		}
 	}
+	// Close the sdk.Reader so the gateway drops the readerState entry
+	// and releases the underlying backend reader (which Cancels the
+	// prefetcher goroutines). Idempotent.
+	sdkReader.Close(ctx) //nolint:errcheck
 
-	// Step 2: Materialize once into a real table the user SQL can scan
-	// multiple times. This consumes the single-pass stream into a
-	// DuckDB-managed table that supports multi-pass operations
-	// (GROUP BY, JOIN, UNION ALL, etc.) correctly.
-	// Workaround for duckdb/duckdb#19040.
-	materializeStmt := fmt.Sprintf("CREATE TABLE %s AS SELECT * FROM %s", userName, streamName)
-	if _, err := conn.ExecContext(ctx, materializeStmt); err != nil {
-		rel()
-		arrowReader.Release()
-		return nil, fmt.Errorf("materialize input %s: %w", userName, err)
+	client.Log(ctx, "INFO", fmt.Sprintf("staged input %s.%s -> %d file(s) in %s",
+		in.Bucket, in.Table, len(stagedFiles), workdir)) //nolint:errcheck
+
+	// Build CREATE VIEW. DuckDB's read_parquet([...]) accepts a
+	// single-quoted list of paths. We single-quote-escape each path
+	// against pathological filenames (workdir is mktemp'd so this is
+	// belt-and-braces — should never contain a quote).
+	var viewSQL string
+	if len(stagedFiles) == 0 {
+		// No data files: emit a SELECT NULL-shaped view that satisfies
+		// user-SQL FROM lookups but resolves to zero rows. Use the
+		// gateway-reported schema if available; otherwise an empty
+		// SELECT will do — DuckDB will surface a column-not-found error
+		// from user SQL, which is the same behaviour as a real
+		// zero-row table when columns are referenced.
+		viewSQL = fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM (SELECT 1) WHERE 1=0", userName)
+	} else {
+		quoted := make([]string, len(stagedFiles))
+		for i, p := range stagedFiles {
+			quoted[i] = "'" + escapeSQL(p) + "'"
+		}
+		viewSQL = fmt.Sprintf("CREATE VIEW %s AS SELECT * FROM read_parquet([%s])",
+			userName, strings.Join(quoted, ", "))
 	}
-
-	// Step 3: Drop the hidden view — stream is fully consumed at this point.
-	// Errors here are non-fatal (the view will be dropped when the connection
-	// closes). The CTAS table is now the user-visible relation.
-	dropStmt := fmt.Sprintf("DROP VIEW IF EXISTS %s", streamName)
-	if _, err := conn.ExecContext(ctx, dropStmt); err != nil {
-		client.Log(ctx, "WARN", fmt.Sprintf("drop hidden stream view %s: %v", streamName, err)) //nolint:errcheck
+	if _, err := conn.ExecContext(ctx, viewSQL); err != nil {
+		cleanupStaged()
+		return nil, fmt.Errorf("CREATE VIEW %s: %w", userName, err)
 	}
 
 	return func() {
-		rel()                 // 1. drop DuckDB's internal stream ref
-		arrowReader.Release() // 2. close gRPC stream + sdk.Reader
+		// Drop the view first so DuckDB releases its handles on the
+		// staged files before we unlink them. Background ctx so
+		// cleanup still runs if the parent ctx was cancelled.
+		_, _ = conn.ExecContext(context.Background(), "DROP VIEW IF EXISTS "+userName)
+		cleanupStaged()
 	}, nil
+}
+
+// readNextChunkToFile GETs one chunk from the gateway's HTTP read
+// endpoint and streams the response body straight to disk. Returns
+// (isLast, bytesWritten, error). bytesWritten is 0 when the gateway
+// signals end-of-stream with an empty body (X-Datuplet-Is-Last=true and
+// no content); in that case no file is created and the caller should
+// just terminate the loop.
+//
+// Streaming via io.Copy keeps component memory bounded — even on a
+// 250 MiB source parquet file we only hold the HTTP transport's
+// internal read buffer (~32 KiB) plus the os.File buffer in memory,
+// not the whole file. This is the key memory win vs. a naive
+// http.ReadAll → os.WriteFile loop.
+func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir, userName string, idx int) (isLast bool, n int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, 0, fmt.Errorf("build GET %s: %w", endpoint, err)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return false, 0, fmt.Errorf("GET %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// Drain a small amount of the body for the error message
+		// without copying multi-MB of error pages into memory.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, 0, fmt.Errorf("GET %s: status %d body=%q", endpoint, resp.StatusCode, string(body))
+	}
+	isLast = resp.Header.Get("X-Datuplet-Is-Last") == "true"
+
+	// Special case: gateway signals end-of-stream with isLast=true and
+	// no body (Content-Length=0). Don't create a zero-byte file in
+	// that case — DuckDB rejects empty parquet (no footer).
+	if resp.ContentLength == 0 {
+		return isLast, 0, nil
+	}
+
+	path := filepath.Join(workdir, fmt.Sprintf("in_%s_%04d.parquet", userName, idx))
+	f, err := os.Create(path)
+	if err != nil {
+		return false, 0, fmt.Errorf("create %s: %w", path, err)
+	}
+	n, err = io.Copy(f, resp.Body)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(path) //nolint:errcheck
+		return false, 0, fmt.Errorf("write %s: %w", path, err)
+	}
+	if n == 0 {
+		// Header said body, gateway sent nothing — same handling as
+		// ContentLength=0: don't keep the empty file.
+		os.Remove(path) //nolint:errcheck
+		return isLast, 0, nil
+	}
+	return isLast, n, nil
 }
 
 // writeOutput materializes one DuckDB table to local parquet then streams
@@ -105,9 +208,9 @@ func registerInput(ctx context.Context, conn *sql.Conn, arrowConn *duckdb.Arrow,
 // Returns the row count of the produced output (best-effort — DG also
 // reports total_rows on Close).
 //
-// Note: writeOutput now takes *sql.Conn (not *sql.DB) because the
-// arrowFromDB helper pins a single *sql.Conn under MaxOpenConns=1 — using
-// db.ExecContext here would deadlock waiting for the held conn.
+// Note: writeOutput takes *sql.Conn (not *sql.DB) because main.go pins a
+// single *sql.Conn under MaxOpenConns=1 — using db.ExecContext here would
+// deadlock waiting for the held conn.
 func writeOutput(ctx context.Context, conn *sql.Conn, client *sdk.Client, workdir string, out sdk.OutputTableRef) (int64, error) {
 	srcTable, err := sanitizeIdent(out.Name)
 	if err != nil {

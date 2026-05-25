@@ -72,13 +72,42 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		},
 	}
 
-	// Build environment for component
-	// Use 127.0.0.1 instead of localhost to force IPv4 (K8s pods may default to IPv6)
+	// Build environment for component.
+	// Use 127.0.0.1 instead of localhost to force IPv4 (K8s pods may default to IPv6).
 	env := []corev1.EnvVar{
 		{
 			Name:  "DATUPLET_GATEWAY_ADDR",
 			Value: fmt.Sprintf("127.0.0.1:%d", PipelineRunGatewayPort),
 		},
+		// RUN_ID is also useful as a Pyroscope tag on the component
+		// (only consumed when profiling is enabled below). Keeping it
+		// here unconditionally is cheap and matches what the gateway
+		// gets via buildGatewaySidecarEnv.
+		{Name: "RUN_ID", Value: pr.Status.RunID},
+	}
+
+	// Pyroscope profiling on the component container, gated by the
+	// same operator-level flag as the gateway. Components that don't
+	// start Pyroscope (most of them) simply ignore the envs; the
+	// sql-transform component reads DATUPLET_COMPONENT_PROFILING and
+	// boots a continuous profiler with ApplicationName="datuplet-sql-transform".
+	if r.GatewayProfilingEnabled && r.GatewayProfilingServerAddress != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "DATUPLET_COMPONENT_PROFILING", Value: "true"},
+			corev1.EnvVar{Name: "PYROSCOPE_SERVER_ADDRESS", Value: r.GatewayProfilingServerAddress},
+			corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			}},
+		)
+		if r.GatewayProfilingUsername != "" {
+			env = append(env, corev1.EnvVar{Name: "PYROSCOPE_USERNAME", Value: r.GatewayProfilingUsername})
+		}
+		if r.GatewayProfilingPassword != "" {
+			env = append(env, corev1.EnvVar{Name: "PYROSCOPE_PASSWORD", Value: r.GatewayProfilingPassword})
+		}
+		if iterID := iterTagFromImage(r.GatewayImage); iterID != "" {
+			env = append(env, corev1.EnvVar{Name: "DATUPLET_ITERATION_ID", Value: iterID})
+		}
 	}
 
 	// Build gateway arguments. Per-table vended creds are fetched from

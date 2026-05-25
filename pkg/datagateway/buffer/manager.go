@@ -52,11 +52,11 @@ type BufferConfig struct {
 // DefaultBufferConfig returns the default buffer configuration.
 //
 // BufferSize is the in-memory cap for retained Arrow records before a
-// row-group flush. Lowered from 64 MiB to 16 MiB to bound peak heap in
+// row-group flush. Lowered from 16 MiB to 8 MiB to bound peak heap in
 // the gateway sidecar: combined with the streaming-upload path
 // (StorageBackend.OpenObjectWriter), this caps the row group buffer
-// AND the parquet writer's open-row-group memory at ~16 MiB instead
-// of ~64 MiB. Operators with looser memory can override via
+// AND the parquet writer's open-row-group memory at ~8 MiB instead
+// of ~16 MiB. Operators with looser memory can override via
 // Config.BufferSize.
 //
 // RowGroupSize stays in sync with BufferSize so the on-disk row group
@@ -66,11 +66,33 @@ type BufferConfig struct {
 // streaming so file size no longer dominates heap usage.
 func DefaultBufferConfig() *BufferConfig {
 	return &BufferConfig{
-		BufferSize:     16 * 1024 * 1024,  // 16 MiB (was 64; lowered for memory bound)
-		RowGroupSize:   16 * 1024 * 1024,  // 16 MiB (matches BufferSize)
+		BufferSize:     8 * 1024 * 1024,   // 8 MiB (was 16; lowered for memory bound)
+		RowGroupSize:   8 * 1024 * 1024,   // 8 MiB (matches BufferSize)
 		TargetFileSize: 128 * 1024 * 1024, // 128 MiB
 		FilePrefix:     "part",
-		Compression:    CompressionSnappy,
+		// Default codec is Zstd (level inherited from arrow-go's
+		// pqarrow default = ZSTD level 1). Snappy was the prior
+		// default; Pyroscope on run 156b0c19 showed it eating ~40%
+		// of gateway CPU during writes (s2.encodeBlockBetterSnappy).
+		//
+		// Trade-off ZSTD-1 vs Snappy:
+		//   - Compression ratio: ZSTD-1 is ~30-40% better on the
+		//     parquet column data we typically write. Smaller files
+		//     = lower GCS storage cost AND faster downstream reads
+		//     (pqarrow read throughput is bytes-bound through the
+		//     decompression pipeline).
+		//   - Encode CPU: ZSTD-1 is ~1.5-2x slower than Snappy per
+		//     byte. On our most recent benchmark gateway CPU was
+		//     only ~4.5 s for a 74 s wallclock — even doubling the
+		//     compression CPU adds < 5 s, lost in the I/O
+		//     overlap with the streaming upload.
+		//   - Decode CPU: ZSTD is comparable to or faster than
+		//     Snappy in arrow-go's read path.
+		//
+		// Pipelines that want the prior Snappy behaviour (or LZ4 for
+		// even lower encode CPU at the cost of weaker ratio) override
+		// via BufferConfig.Compression at construction time.
+		Compression: CompressionZstd,
 	}
 }
 
