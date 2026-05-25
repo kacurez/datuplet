@@ -20,6 +20,8 @@ import (
 	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/gcp"
 	"golang.org/x/oauth2"
+
+	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
 
 // refreshHTTPClient is the shared transport used by loadTableRefresh.
@@ -71,6 +73,20 @@ func (r *refreshingTokenSource) Token() (*oauth2.Token, error) {
 	return tok, nil
 }
 
+// Invalidate clears the cached token so the next Token() call MUST fire
+// the refresh callback regardless of the cached Expiry. Used by the
+// 401-retry HTTP transport: when GCS rejects a token we still believed
+// was fresh (lakekeeper's own credential cache handed out a
+// pre-expired value), Invalidate + Token forces a refetch instead of
+// returning the same bad token again.
+//
+// Concurrency-safe — holds r.mu just like Token does.
+func (r *refreshingTokenSource) Invalidate() {
+	r.mu.Lock()
+	r.cur = nil
+	r.mu.Unlock()
+}
+
 func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]string) (iceio.IO, error) {
 	tok := props["gcs.oauth2.token"]
 	if tok == "" {
@@ -92,17 +108,43 @@ func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]s
 		TokenType:   "Bearer",
 	}, refresh)
 
-	// Wire the TokenSource into a gocloud GCP HTTP client so every storage
-	// request picks up a freshly-issued bearer when the cached one nears
-	// expiry. Slice A0 probe 2 confirmed this contract is honored by
-	// iceberg-go's GCS client (Token() is invoked per-request once the
-	// cached token enters the refresh-ahead window).
-	client, err := gcp.NewHTTPClient(
-		gcp.DefaultTransport(),
-		oauth2.ReuseTokenSource(nil, ts),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("datupletGCSFactory: new HTTP client: %w", err)
+	// HTTP transport composition (mirrors the WRITE-side pattern in
+	// pkg/datagateway/backend/gcs.go::NewGCSBackendWithProvider):
+	//
+	//   gcp.DefaultTransport()   — net/http transport with GCP defaults
+	//     + gcp's TokenSource wrapper (adds Authorization header per
+	//       request via refreshingTokenSource.Token)
+	//     + catalogwriter.RefreshTransport (intercepts 401/403; on
+	//       reject, Invalidate the cached token, retry once)
+	//
+	// Why we removed the prior oauth2.ReuseTokenSource wrapper: it
+	// caches Token() results independently of refreshingTokenSource's
+	// own cache, so even ts.Invalidate() can't force a re-fetch — the
+	// outer cache would still return the stale value. ts already
+	// caches via the (Expiry > 1 min) check, so the ReuseTokenSource
+	// layer was redundant AND blocked the retry path.
+	//
+	// What this fixes: when lakekeeper's internal credential cache
+	// serves an already-expired token at loadTable time (RFC 019 §4.5
+	// known issue, observed: run 4b0cbd51 required a lakekeeper
+	// restart). Now: first GCS read 401s → RefreshTransport
+	// invalidates ts → re-issues request → Token() goes to lakekeeper
+	// for a fresh token. Self-recovers in-process.
+	// Compose the gcp.HTTPClient transport stack manually so we can
+	// inject RefreshTransport on top of oauth2.Transport. gcp's own
+	// NewHTTPClient produces an oauth2.Transport-wrapped client; we
+	// rebuild that with the same shape and then layer the retry
+	// transport on top.
+	oauthT := &oauth2.Transport{
+		Base:   gcp.DefaultTransport(),
+		Source: ts,
+	}
+	retryT := &catalogwriter.RefreshTransport{
+		Base:    oauthT,
+		Refresh: func() error { ts.Invalidate(); return nil },
+	}
+	client := &gcp.HTTPClient{
+		Client: http.Client{Transport: retryT},
 	}
 	bkt, err := gcsblob.OpenBucket(ctx, client, bucket, nil)
 	if err != nil {
