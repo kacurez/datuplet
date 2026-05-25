@@ -376,8 +376,9 @@ func (g *gcsBackend) OpenReaderForFiles(ctx context.Context, filePaths []string)
 // gcsRangeReaderAt — no full-file download. This is what makes the byte-bound
 // chunk slicer (see parquetArrowReader.ReadChunk) actually engage on GCS-backed
 // tables; without it, server_v2_reading.go's streaming branch silently falls
-// back to gcsReader.readParquetFile (whole-file io.Copy into a bytes.Buffer)
-// and the resulting Arrow IPC chunk busts the SDK's 64 MiB gRPC MaxRecvMsgSize.
+// back to gcsReader.readParquetFile (which now bounded-parallel-prefetches
+// whole files via parquetPrefetcher; fine for the FORMAT_PARQUET byte-passthrough
+// path that the sql-transform component uses, but the wrong shape for Arrow IPC).
 func (g *gcsBackend) OpenStreamingArrowReader(ctx context.Context, filePaths []string, currentSchema *SchemaInfo) (Reader, error) {
 	if len(filePaths) == 0 {
 		return nil, fmt.Errorf("no files provided")
@@ -550,6 +551,13 @@ type gcsReader struct {
 	totalSize   int64
 	initialized bool
 	parquetDone bool // tracks if all Parquet files have been read
+
+	// parquet-only: prefetcher that downloads source files in bounded
+	// parallel. Non-nil exactly when format == "parquet" (and init has
+	// run). readParquetFile drains from this instead of r.object so the
+	// gRPC stream emits at GCS-egress speed × parquetPrefetchConcurrency
+	// rather than serial-per-file.
+	parquetPrefetcher *parquetPrefetcher
 }
 
 func (r *gcsReader) ReadChunk() (*DataChunk, error) {
@@ -570,6 +578,17 @@ func (r *gcsReader) ReadChunk() (*DataChunk, error) {
 func (r *gcsReader) init() error {
 	for _, f := range r.files {
 		r.totalSize += f.size
+	}
+	// Parquet uses a bounded-parallel prefetcher; we don't open a
+	// streaming GCS object directly. CSV / other formats stay on the
+	// pre-existing serial openNextFile path.
+	if r.format == "parquet" {
+		// Detach from any caller-bound ctx — the reader lifetime is
+		// governed by Close(), not by the OpenReader request ctx
+		// (which is Done by the time the SDK starts ReadChunk).
+		r.parquetPrefetcher = newParquetPrefetcher(context.Background(), r.bkt, r.files)
+		r.initialized = true
+		return nil
 	}
 	if err := r.openNextFile(); err != nil {
 		return err
@@ -699,36 +718,43 @@ func (r *gcsReader) readRawChunk() (*DataChunk, error) {
 	}, nil
 }
 
-// readParquetFile reads an entire Parquet file into memory.
-// Parquet files require reading the footer to parse, so they can't be
-// streamed in chunks. Mirrors minioReader.readParquetFile.
+// readParquetFile returns the next source parquet file's bytes as one
+// DataChunk. The bytes come from the bounded-parallel parquetPrefetcher
+// (started in init()), so up to parquetPrefetchConcurrency files are
+// in flight from GCS at any moment — the gRPC stream emits at GCS
+// egress × concurrency rather than serial-per-file.
+//
+// Each chunk is one self-contained parquet file. The downstream
+// passthrough branch in server_v2_reading.go (input format == output
+// format) sends the bytes verbatim to the SDK consumer, which writes
+// each chunk as its own local file and feeds the list to DuckDB's
+// read_parquet([...]) — no decode/encode round-trip.
 func (r *gcsReader) readParquetFile() (*DataChunk, error) {
 	if r.parquetDone {
 		return nil, io.EOF
 	}
-	if r.currentFile > len(r.files) {
+	if r.parquetPrefetcher == nil {
+		// Shouldn't happen — init() always allocates the prefetcher for
+		// parquet — but fail loudly rather than null-deref.
+		return nil, fmt.Errorf("gcs: parquet prefetcher not initialised")
+	}
+	data, isLast, err := r.parquetPrefetcher.Next(context.Background())
+	if err == io.EOF {
 		r.parquetDone = true
 		return nil, io.EOF
 	}
-
-	var buf bytes.Buffer
-	_, err := io.Copy(&buf, r.object)
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("gcs: read parquet: %w", err)
-	}
-
-	isLast := r.currentFile >= len(r.files)
-	if !isLast {
-		if err := r.openNextFile(); err == io.EOF {
-			isLast = true
-		}
+	if err != nil {
+		// Worker error (network, auth, etc.) — surface verbatim and
+		// stop pulling further chunks. Caller's retry policy decides
+		// whether to re-open.
+		r.parquetDone = true
+		return nil, err
 	}
 	if isLast {
 		r.parquetDone = true
 	}
-
 	return &DataChunk{
-		Data:   buf.Bytes(),
+		Data:   data,
 		Format: r.format,
 		IsLast: isLast,
 	}, nil
@@ -743,6 +769,10 @@ func (r *gcsReader) TotalSizeEstimate() int64 {
 }
 
 func (r *gcsReader) Close() error {
+	if r.parquetPrefetcher != nil {
+		r.parquetPrefetcher.Close()
+		r.parquetPrefetcher = nil
+	}
 	if r.object != nil {
 		return r.object.Close()
 	}

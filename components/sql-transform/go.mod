@@ -3,18 +3,14 @@ module github.com/datuplet/datuplet/components/sql-transform
 go 1.25.7
 
 require (
-	github.com/apache/arrow-go/v18 v18.6.0
 	github.com/datuplet/datuplet v0.0.0
 	github.com/datuplet/datuplet/sdk/go v0.0.0
-	github.com/datuplet/datuplet/sdk/go/arrow v0.0.0
 	github.com/duckdb/duckdb-go/v2 v2.10503.0
 	github.com/grafana/pyroscope-go v1.3.0
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.1 // indirect
-	github.com/apache/thrift v0.22.0 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/apache/arrow-go/v18 v18.6.0 // indirect
 	github.com/duckdb/duckdb-go-bindings v0.10503.0 // indirect
 	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.10503.0 // indirect
 	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10503.0 // indirect
@@ -32,7 +28,6 @@ require (
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
 	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260427160629-7cedc36a6bc4 // indirect
