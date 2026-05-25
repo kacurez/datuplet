@@ -33,28 +33,34 @@ const arrowBatchRows = 8192
 // arrowFieldFor returns the Arrow Field for a given column declared in
 // the data-generator's user schema. Mapping:
 //
-//   int     -> Int32        (matches iceberg int)
-//   long    -> Int64
-//   float   -> Float32
-//   double  -> Float64
-//   boolean -> Bool
+//   int, long       -> Int64
+//   float, double   -> Float64
+//   boolean         -> Bool
 //   string, uuid, date, timestamp, now -> String
 //
-// date / timestamp / uuid stay STRING so the resulting iceberg table
-// schema matches what the JSONL path produced via gateway-side schema
-// inference (which sees strings). Switching to Arrow's native Date32 /
-// Timestamp_ms here would break any downstream pipeline that already
-// reads these columns as strings.
+// "int" and "float" map to the wider 64-bit variants deliberately. The
+// gateway's JSON schema inference (pkg/datagateway/schema/inference.go)
+// maps every JSON integer to TypeInt64 and every JSON float to
+// TypeFloat64 because JSON numbers don't distinguish bit widths.
+// Existing iceberg tables created by the JSONL path therefore have
+// Int64 / Float64 columns for the user's "int" / "float" declarations.
+//
+// Mapping to narrower Int32 / Float32 here would create a schema-width
+// mismatch on every iceberg table previously written by the JSONL
+// path: iceberg-go's txn.AddFiles validates the new parquet's column
+// types against the catalog schema and rejects bit-width mismatches
+// with "error encountered during file conversion: invalid schema:
+// mismatch in fields" (observed: run 99ebb24e).
+//
+// date / timestamp / uuid stay STRING for the same reason — the JSONL
+// path produces strings (via Go's time.Format), and downstream
+// pipelines reading the iceberg table see string columns.
 func arrowFieldFor(name, colType string) arrow.Field {
 	var t arrow.DataType
 	switch colType {
-	case "int":
-		t = arrow.PrimitiveTypes.Int32
-	case "long":
+	case "int", "long":
 		t = arrow.PrimitiveTypes.Int64
-	case "float":
-		t = arrow.PrimitiveTypes.Float32
-	case "double":
+	case "float", "double":
 		t = arrow.PrimitiveTypes.Float64
 	case "boolean":
 		t = arrow.FixedWidthTypes.Boolean
@@ -89,13 +95,21 @@ func appendGeneratedValue(rb *array.RecordBuilder, colIdx int, colType string, r
 	b := rb.Field(colIdx)
 	switch colType {
 	case "int":
-		b.(*array.Int32Builder).Append(rng.Int32())
+		// User declared "int" → Arrow Int64 (see arrowFieldFor for the
+		// reason). The generator's old JSONL path emitted rng.Int32()
+		// for "int"; we widen here to int64 with the same value-range
+		// distribution. Downstream iceberg readers see no behavioural
+		// change beyond the storage type widening to int64.
+		b.(*array.Int64Builder).Append(int64(rng.Int32()))
 
 	case "long":
 		b.(*array.Int64Builder).Append(rng.Int64())
 
 	case "float":
-		b.(*array.Float32Builder).Append(rng.Float32())
+		// User declared "float" → Arrow Float64 (see arrowFieldFor).
+		// Same value distribution as the old Float32 path (cast on
+		// append); downstream iceberg readers see a float64 column.
+		b.(*array.Float64Builder).Append(float64(rng.Float32()))
 
 	case "double":
 		b.(*array.Float64Builder).Append(rng.Float64())
