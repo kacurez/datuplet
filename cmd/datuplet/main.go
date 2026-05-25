@@ -306,6 +306,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "pipeline":
+		if err := runPipeline(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "table-gateway":
 		fmt.Fprintln(os.Stderr, "Error: the `table-gateway` subcommand has been removed. Lakekeeper now serves the catalog directly.")
 		os.Exit(1)
@@ -343,6 +349,7 @@ Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   run                    Run a pipeline against a remote Datuplet cluster
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
+  pipeline               CRUD for pipeline specs (list, get, put, delete)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   gateway                Start the data gateway server (container entrypoint)
   iceberg-job            Run an Iceberg job (table-commit mode only)
