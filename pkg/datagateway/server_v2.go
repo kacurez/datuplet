@@ -303,7 +303,7 @@ func NewServerV2(cfg *Config) *ServerV2 {
 	// Kick off the in-band cancel watcher. WatchCancelAnnotation is a
 	// no-op when PodAnnotationsPath is empty (Docker / non-K8s).
 	go func() {
-		if err := WatchCancelAnnotation(cancelCtx, cfg.PodAnnotationsPath, 0); err == nil {
+		if err := WatchCancelAnnotation(cancelCtx, cfg.PodAnnotationsPath, cfg.CancelPollInterval); err == nil {
 			// Returning nil means cancellation was requested. Signal
 			// the rest of the server by cancelling cancelCtx; the
 			// gateway's main loop watches it and exits gracefully.
@@ -311,6 +311,10 @@ func NewServerV2(cfg *Config) *ServerV2 {
 			// TODO: also abort in-flight S3 uploads here so we exit faster
 			// than the gRPC graceful-stop timeout (future improvement).
 			log.Printf("datuplet.io/cancel=true observed on pod annotations; initiating graceful shutdown")
+			if s.commitPool != nil {
+				log.Printf("cancel: cancelling commit pool")
+				s.commitPool.Cancel()
+			}
 			cancelStop()
 		}
 	}()
