@@ -229,13 +229,11 @@ func (s *ServerV2) CloseWriter(ctx context.Context, req *pb.CloseWriterRequest) 
 		return nil, fmt.Errorf("unknown writer: %s", req.WriterId)
 	}
 
-	// CRITICAL DIAGNOSTIC: Log external files received
 	extFilesCount := len(req.GetExternalFiles())
-	log.Printf("CloseWriter received: writerID=%s, external_files_count=%d, bucket=%s, table=%s",
-		req.WriterId, extFilesCount, ws.bucket, ws.table)
 
 	// Check if component provided external files (e.g., DuckDB writing directly to S3)
 	if extFilesCount > 0 {
+		log.Printf("CloseWriter: writerID=%s external_files=%d bucket=%s table=%s", req.WriterId, extFilesCount, ws.bucket, ws.table)
 		// Reject external files for partitioned tables
 		if len(ws.partitionFields) > 0 {
 			return nil, fmt.Errorf("external files not supported for partitioned tables")
@@ -363,7 +361,7 @@ func (s *ServerV2) finalizeAndDispatch(ctx context.Context, ws *writerState, run
 		}
 	}
 
-	if ws.schema != nil {
+	if ws.schema != nil && len(paths) > 0 {
 		if err := s.writeSchemaAndManifest(ctx, ws, runID); err != nil {
 			if len(ws.externalFiles) > 0 {
 				return fmt.Errorf("write manifest %s.%s: %w", ws.bucket, ws.table, err)
