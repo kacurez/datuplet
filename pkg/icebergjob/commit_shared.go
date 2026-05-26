@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -261,6 +262,35 @@ func findSnapshotByCommitKey(tbl *icebergtable.Table, key string) string {
 		}
 	}
 	return ""
+}
+
+// isNotFoundErr is a best-effort detector for "object not found" errors
+// surfaced by iceberg-go's FS abstraction. The iceberg-go library
+// doesn't expose a sentinel for s3 NoSuchKey or filesystem
+// os.ErrNotExist — both bubble up as wrapped errors with provider-
+// specific messages. We match on substring rather than type because
+// that's what the surface gives us today; if iceberg-go grows a real
+// sentinel in the future this is the one place to switch over.
+//
+// Backends seen in the wild:
+//   - s3:        `NoSuchKey`, `404`, "key does not exist"
+//   - GCS:       "object doesn't exist" (note the contraction — doesn't,
+//                so `strings.Contains(msg, "not exist")` does NOT match),
+//                and a gocloud `(code=NotFound)` suffix on the wrapped error
+//   - localfs:   "no such file or directory"
+//   - iceberg-go's own paths: "not found"
+func isNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not exist") ||
+		strings.Contains(msg, "doesn't exist") || // GCS via gocloud.dev
+		strings.Contains(msg, "code=notfound") || // gocloud.dev wrapping
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "nosuchkey") ||
+		strings.Contains(msg, "404") ||
+		strings.Contains(msg, "no such file")
 }
 
 // readManifestFromTableFS reads the per-table files.json blob via the
