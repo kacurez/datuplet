@@ -96,6 +96,7 @@ func (p *CommitPool) Dispatch(_ context.Context, j CommitJob) error {
 		return fmt.Errorf("%w (max %d)", ErrCommitQueueFull, p.cfg.MaxQueueSize)
 	}
 	p.inflight++
+	commitQueueDepth.Set(float64(p.inflight))
 	p.wg.Add(1)
 	p.mu.Unlock()
 
@@ -107,6 +108,7 @@ func (p *CommitPool) Dispatch(_ context.Context, j CommitJob) error {
 		defer func() {
 			p.mu.Lock()
 			p.inflight--
+			commitQueueDepth.Set(float64(p.inflight))
 			p.mu.Unlock()
 			p.wg.Done()
 		}()
@@ -131,6 +133,8 @@ func (p *CommitPool) run(sid uint64, j CommitJob) {
 	if err != nil {
 		cr.Err = err
 		cr.Duration = time.Since(start)
+		commitErrors.WithLabelValues(classifyCommitError(cr.Err)).Inc()
+		commitDuration.WithLabelValues(string(j.Mode), "err").Observe(cr.Duration.Seconds())
 		p.record(sid, cr)
 		return
 	}
@@ -142,6 +146,17 @@ func (p *CommitPool) run(sid uint64, j CommitJob) {
 		cr.SnapshotIDBefore = res.SnapshotIDBefore
 		cr.SnapshotIDAfter = res.SnapshotIDAfter
 		cr.DataFilesAdded = res.DataFilesAdded
+	}
+	mode := string(j.Mode)
+	switch {
+	case cr.Err != nil:
+		commitErrors.WithLabelValues(classifyCommitError(cr.Err)).Inc()
+		commitDuration.WithLabelValues(mode, "err").Observe(cr.Duration.Seconds())
+	case cr.DataFilesAdded == 0 && cr.SnapshotIDAfter != "":
+		commitIdempotencySkips.Inc()
+		commitDuration.WithLabelValues(mode, "idempotent").Observe(cr.Duration.Seconds())
+	default:
+		commitDuration.WithLabelValues(mode, "ok").Observe(cr.Duration.Seconds())
 	}
 	p.record(sid, cr)
 }
