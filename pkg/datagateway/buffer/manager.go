@@ -41,21 +41,6 @@ func asyncRotateQueueDepth() int {
 	return defaultAsyncCloseQueueDepth
 }
 
-// dictEncodingEnabled controls whether the parquet writer enables
-// dictionary encoding by default on data-plane writes. See the
-// commentary above the DictionaryEnabled field assignment in
-// openNewFile for the profiling-based rationale.
-//
-// Defaults to false. Operator override:
-//
-//	DATUPLET_GATEWAY_DICT_ENCODING=1
-//
-// Any value other than "1" / "true" leaves dict encoding off.
-func dictEncodingEnabled() bool {
-	v := os.Getenv("DATUPLET_GATEWAY_DICT_ENCODING")
-	return v == "1" || v == "true"
-}
-
 // joinStoragePath joins a base path with a filename in a URL-safe way.
 // It handles both URL schemes (s3://, file://) and plain relative paths.
 // This avoids filepath.Join corrupting URLs (e.g., s3://bucket → s3:/bucket).
@@ -521,26 +506,9 @@ func (m *BufferManager) openNewFile() error {
 		rowGroupSize = m.config.BufferSize // Fall back to BufferSize
 	}
 	parquetConfig := &ParquetWriterConfig{
-		Compression:  m.config.Compression,
-		RowGroupSize: rowGroupSize,
-		// Dictionary encoding is disabled by default on data-plane writes.
-		// Profiling on run 99bba07f (50M-row demo2-distribution) showed
-		// HashTable.upsize at 8.7 GB cumulative allocation (21% of all
-		// gateway allocations) and ~12% of on-CPU time in the dict-lookup
-		// hot path. For random / high-cardinality columns (transaction_id,
-		// user_id, amount, created_at — typical of synthetic and event
-		// streams), the dict grows past the parquet page-size limit and
-		// falls back to plain encoding ANYWAY, just after wasting heap
-		// and CPU. For low-cardinality dimension columns at small row
-		// counts (the demo's users.name / users.country with 10 rows)
-		// the marginal compression win is negligible vs Zstd's
-		// column-level compression.
-		//
-		// Operators with a genuinely dict-friendly workload (lots of
-		// repeated short strings in wide tables) can re-enable by
-		// setting DATUPLET_GATEWAY_DICT_ENCODING=1 — see
-		// dictEncodingEnabled().
-		DictionaryEnabled: dictEncodingEnabled(),
+		Compression:       m.config.Compression,
+		RowGroupSize:      rowGroupSize,
+		DictionaryEnabled: true,
 		WriteStatistics:   true,
 	}
 
