@@ -251,7 +251,7 @@ func findSnapshotByCommitKey(tbl *icebergtable.Table, key string) string {
 	snaps := tbl.Metadata().Snapshots()
 	for i := len(snaps) - 1; i >= 0; i-- {
 		s := snaps[i]
-		if s.Summary != nil && s.Summary.Properties["datuplet.commit-key"] == key {
+		if s.Summary != nil && s.Summary.Properties != nil && s.Summary.Properties["datuplet.commit-key"] == key {
 			return fmt.Sprintf("%d", s.SnapshotID)
 		}
 	}

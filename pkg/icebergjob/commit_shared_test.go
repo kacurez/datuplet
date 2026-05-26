@@ -510,3 +510,18 @@ func TestParseFilesManifest_Empty(t *testing.T) {
 		t.Errorf("err=%v want ErrManifestEmpty", err)
 	}
 }
+
+// TestCommitTableFiles_RejectsCallerCommitKey: CommitTableFiles must return
+// an error immediately when the caller places "datuplet.commit-key" in
+// snapshotProps (the idempotency key must only be passed via idempotencyKey).
+func TestCommitTableFiles_RejectsCallerCommitKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fx := newCommitSharedFixture(t, icebergtable.Identifier{"ns1", "tbl1"})
+	_, err := CommitTableFiles(ctx, fx.cat, icebergtable.Identifier{"ns1", "tbl1"},
+		[]string{"s3://b/data/a.parquet"}, WriteModeAppend,
+		iceberg.Properties{"datuplet.commit-key": "x"}, "y")
+	if err == nil {
+		t.Fatal("expected error when caller sets snapshotProps[datuplet.commit-key]")
+	}
+}
