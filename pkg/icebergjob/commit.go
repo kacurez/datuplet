@@ -52,27 +52,6 @@ func jsonUnmarshalStrict(body []byte, out any) error {
 	return json.Unmarshal(body, out)
 }
 
-// WriteMode specifies how data should be written to the table.
-//
-// Both APPEND and FULL_LOAD are implemented end-to-end against
-// lakekeeper: APPEND uses iceberg-go's `txn.AddFiles`, FULL_LOAD uses
-// `txn.ReplaceDataFiles`. The `CommitTable` function in commit_shared.go
-// owns the actual dispatch.
-//
-// UPSERT is a future addition and would extend this type plus the
-// files.json schema (delete_paths) without changing CommitTable's
-// locked signature.
-type WriteMode string
-
-const (
-	// WriteModeAppend adds new data files to the table.
-	WriteModeAppend WriteMode = "APPEND"
-	// WriteModeFullLoad replaces all existing data in the table —
-	// implemented via iceberg-go's `txn.ReplaceDataFiles` against
-	// the table's current snapshot.
-	WriteModeFullLoad WriteMode = "FULL_LOAD"
-)
-
 // Config configures the TableCommit job.
 //
 // Per-table manifests live inside each table's iceberg-managed prefix
