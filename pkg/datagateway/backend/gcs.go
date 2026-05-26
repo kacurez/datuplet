@@ -253,9 +253,18 @@ func (g *gcsBackend) PutObject(ctx context.Context, storagePath string, data []b
 
 // OpenObjectWriter opens a streaming writer that uploads chunks to GCS as
 // the caller writes. Peak memory inside the storage.Writer is bounded by
-// ChunkSize (4 MiB here) rather than the entire object — this is the
-// streaming-upload optimization. Detected via the optional
-// objectStreamingBackend interface in pkg/datagateway/buffer.
+// ChunkSize rather than the entire object — this is the streaming-upload
+// optimization. Detected via the optional objectStreamingBackend interface
+// in pkg/datagateway/buffer.
+//
+// ChunkSize=16 MiB matches the async-upload wrapper's default buffer size
+// in pkg/datagateway/buffer/async_writer.go. Each buffer the wrapper
+// hands off becomes a single GCS resumable-upload PUT — alignment cuts
+// the round-trip count (vs the prior 4 MiB) by 4× without enlarging the
+// in-flight memory because the wrapper's queue already caps it. See
+// profiling on run 99bba07f: 1.4 GB at 4 MiB chunks = ~350 round-trips,
+// each adding 50-200 ms; at 16 MiB chunks = ~90 round-trips for the same
+// payload.
 //
 // Setting ChunkSize=0 would disable resumable uploads (single-shot,
 // no retry); we deliberately keep ChunkSize > 0 so transient failures
@@ -263,7 +272,7 @@ func (g *gcsBackend) PutObject(ctx context.Context, storagePath string, data []b
 func (g *gcsBackend) OpenObjectWriter(ctx context.Context, storagePath string) (io.WriteCloser, error) {
 	objectKey := g.toObjectKey(storagePath)
 	w := g.bkt.Object(objectKey).NewWriter(ctx)
-	w.ChunkSize = 4 * 1024 * 1024 // 4 MiB resumable-upload chunks
+	w.ChunkSize = 16 * 1024 * 1024 // 16 MiB resumable-upload chunks
 	return w, nil
 }
 
