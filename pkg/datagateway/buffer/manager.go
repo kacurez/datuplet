@@ -2,6 +2,8 @@ package buffer
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -11,6 +13,33 @@ import (
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
+
+// asyncCloseQueueDepth controls how many parquet writers can be in
+// "pending close" state at once when file rotation hands off the dying
+// writer to a background goroutine. Each pending close still holds the
+// underlying asyncWriter's bounded byte buffers (≈80 MiB by default at
+// queueCap=4 × bufSize=16 MiB), so the cap is also a memory ceiling.
+//
+// Default 2 → at most 2 × 80 MiB = 160 MiB extra peak per active table
+// writer, on top of the active writer's own 80 MiB. Larger queue gives
+// the producer more headroom between rotations at proportional memory
+// cost. Operators override via DATUPLET_GATEWAY_ASYNC_ROTATE_QUEUE.
+//
+// Set to 0 (or DATUPLET_GATEWAY_ASYNC_ROTATE=0) to disable async rotation
+// entirely and fall back to the pre-iter-2 synchronous close path.
+const defaultAsyncCloseQueueDepth = 2
+
+func asyncRotateQueueDepth() int {
+	if v := os.Getenv("DATUPLET_GATEWAY_ASYNC_ROTATE"); v == "0" || v == "false" {
+		return 0
+	}
+	if v := os.Getenv("DATUPLET_GATEWAY_ASYNC_ROTATE_QUEUE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 16 {
+			return n
+		}
+	}
+	return defaultAsyncCloseQueueDepth
+}
 
 // joinStoragePath joins a base path with a filename in a URL-safe way.
 // It handles both URL schemes (s3://, file://) and plain relative paths.
@@ -161,6 +190,27 @@ type BufferManager struct {
 
 	// Closed state
 	closed bool
+
+	// Async file-rotation pipeline. When queueDepth > 0, rotateFile()
+	// hands the dying writer to closeQueue and immediately returns;
+	// a single background worker drains the queue, calls Close()+Stats()
+	// on each writer, and appends to filesWritten under m.mu. Producer
+	// blocks on a full queue — that's the natural memory back-pressure.
+	//
+	// closeWG tracks the worker goroutine for BufferManager.Close()
+	// to wait on before returning.
+	closeQueue   chan pendingClose
+	closeWG      sync.WaitGroup
+	closeErrOnce sync.Once
+	closeErr     error // first error from background close, surfaced via Close()
+}
+
+// pendingClose carries the state a background closer needs to finalise
+// a parquet file and record it in filesWritten.
+type pendingClose struct {
+	writer   StreamingWriter
+	filePath string
+	fileRows int64
 }
 
 // NewBufferManager creates a new buffer manager.
@@ -186,14 +236,82 @@ func NewBufferManager(
 		factory = &LocalWriterFactory{}
 	}
 
-	return &BufferManager{
+	m := &BufferManager{
 		config:       config,
 		schema:       s,
 		allocator:    allocator,
 		factory:      factory,
 		batches:      make([]arrow.Record, 0),
 		filesWritten: make([]FileInfo, 0),
-	}, nil
+	}
+
+	// Spin up the async-rotate close worker iff enabled. queueDepth==0
+	// keeps the legacy synchronous close path inside rotateFile().
+	//
+	// We pass the channel by value to closeWorker so its range loop
+	// captures the channel reference at goroutine creation, immune to
+	// later field reassignments / nils in Close().
+	if depth := asyncRotateQueueDepth(); depth > 0 {
+		m.closeQueue = make(chan pendingClose, depth)
+		m.closeWG.Add(1)
+		go m.closeWorker(m.closeQueue)
+	}
+	return m, nil
+}
+
+// closeWorker drains pendingClose items from queue, calls Close() +
+// Stats() on each writer, and updates filesWritten / totalFiles
+// counters under m.mu. The worker exits when the channel is closed.
+//
+// Errors from Close are sticky: the first one is recorded in m.closeErr
+// (via closeErrOnce) and surfaced by BufferManager.Close. Subsequent
+// closes still run so we don't leak resumable-upload state.
+func (m *BufferManager) closeWorker(queue chan pendingClose) {
+	defer m.closeWG.Done()
+	for pc := range queue {
+		if err := pc.writer.Close(); err != nil {
+			m.closeErrOnce.Do(func() {
+				m.closeErr = fmt.Errorf("failed to close file: %w", err)
+			})
+			continue
+		}
+		stats := pc.writer.Stats()
+		m.mu.Lock()
+		m.totalRowsFlushed += stats.RowsWritten
+		m.totalBytesFlushed += stats.BytesWritten
+		m.totalFiles++
+		if pc.filePath != "" {
+			m.filesWritten = append(m.filesWritten, FileInfo{
+				Path:      pc.filePath,
+				RowCount:  pc.fileRows,
+				SizeBytes: stats.BytesWritten,
+			})
+		}
+		m.mu.Unlock()
+	}
+}
+
+// finalizeWriterSync runs the synchronous close path: blocks on
+// writer.Close(), reads Stats(), and appends to filesWritten under the
+// caller-held m.mu. Used when async rotation is disabled OR when the
+// final writer is being closed in BufferManager.Close() after the queue
+// has already been drained.
+func (m *BufferManager) finalizeWriterSync(w StreamingWriter, filePath string, fileRows int64) error {
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+	stats := w.Stats()
+	m.totalRowsFlushed += stats.RowsWritten
+	m.totalBytesFlushed += stats.BytesWritten
+	m.totalFiles++
+	if filePath != "" {
+		m.filesWritten = append(m.filesWritten, FileInfo{
+			Path:      filePath,
+			RowCount:  fileRows,
+			SizeBytes: stats.BytesWritten,
+		})
+	}
+	return nil
 }
 
 // Add adds a record batch to the buffer.
@@ -332,29 +450,40 @@ func (m *BufferManager) flushRowGroup() error {
 }
 
 // rotateFile closes the current file and opens a new one.
+//
+// When async rotation is enabled (m.closeQueue != nil), the dying
+// writer is handed off to the background closeWorker and the foreground
+// returns immediately. The producer briefly drops m.mu while sending
+// on the channel — safe because m.closed/m.writer state is already
+// reset, and other Add()/Flush()/Close() callers serialize on m.mu.
+//
+// Caller must hold m.mu on entry. m.mu is held on return (briefly
+// released during the channel send when async).
 func (m *BufferManager) rotateFile() error {
 	if m.writer != nil {
-		// Close writer first (this flushes all buffered data for Parquet)
-		if err := m.writer.Close(); err != nil {
-			return fmt.Errorf("failed to close file: %w", err)
+		if m.closeQueue != nil {
+			// Async path: hand off, immediately reset state.
+			pc := pendingClose{
+				writer:   m.writer,
+				filePath: m.currentFilePath,
+				fileRows: m.currentFileRows,
+			}
+			m.writer = nil
+			// Surface any prior background-close error before queuing
+			// more work. Keeps the failure visible quickly.
+			if m.closeErr != nil {
+				return m.closeErr
+			}
+			m.mu.Unlock()
+			m.closeQueue <- pc
+			m.mu.Lock()
+		} else {
+			// Sync path (legacy): close in foreground.
+			if err := m.finalizeWriterSync(m.writer, m.currentFilePath, m.currentFileRows); err != nil {
+				return err
+			}
+			m.writer = nil
 		}
-
-		// Get stats AFTER close to get accurate byte counts
-		stats := m.writer.Stats()
-		m.totalRowsFlushed += stats.RowsWritten
-		m.totalBytesFlushed += stats.BytesWritten
-		m.totalFiles++
-
-		// Record file info for manifest
-		if m.currentFilePath != "" {
-			m.filesWritten = append(m.filesWritten, FileInfo{
-				Path:      m.currentFilePath,
-				RowCount:  m.currentFileRows,
-				SizeBytes: stats.BytesWritten,
-			})
-		}
-
-		m.writer = nil
 	}
 
 	m.currentFileSize = 0
@@ -418,6 +547,12 @@ func (m *BufferManager) Flush() error {
 }
 
 // Close flushes remaining data and closes the writer.
+//
+// With async rotation enabled, the final writer is handed to the
+// closeQueue alongside any prior pending closes, then the queue is
+// closed and we wait for the worker goroutine to drain everything. The
+// returned error is the first close error encountered (foreground or
+// background).
 func (m *BufferManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -436,36 +571,56 @@ func (m *BufferManager) Close() error {
 		m.acc = nil
 	}
 
-	// Flush any remaining data
+	// Flush any remaining data into the active writer (creates one if
+	// none is open yet and there is buffered data).
 	if err := m.flushRowGroup(); err != nil {
 		return err
 	}
 
-	// Close the current file
-	if m.writer != nil {
-		// Close writer first (this flushes all buffered data for Parquet)
-		if err := m.writer.Close(); err != nil {
-			return fmt.Errorf("failed to close file: %w", err)
+	if m.writer == nil {
+		// Nothing to close on the producer side; still drain the queue.
+		if m.closeQueue != nil {
+			close(m.closeQueue)
+			m.closeQueue = nil
+			m.mu.Unlock()
+			m.closeWG.Wait()
+			m.mu.Lock()
+			if m.closeErr != nil {
+				return m.closeErr
+			}
 		}
-
-		// Get stats AFTER close to get accurate byte counts
-		stats := m.writer.Stats()
-		m.totalRowsFlushed += stats.RowsWritten
-		m.totalBytesFlushed += stats.BytesWritten
-		m.totalFiles++
-
-		// Record file info for manifest
-		if m.currentFilePath != "" {
-			m.filesWritten = append(m.filesWritten, FileInfo{
-				Path:      m.currentFilePath,
-				RowCount:  m.currentFileRows,
-				SizeBytes: stats.BytesWritten,
-			})
-		}
-
-		m.writer = nil
+		return nil
 	}
 
+	if m.closeQueue != nil {
+		// Async path: enqueue the final writer, close the channel so
+		// the worker exits after draining, wait. We must release the
+		// lock during the send AND during the Wait so the worker can
+		// take m.mu inside its loop without deadlocking.
+		pc := pendingClose{
+			writer:   m.writer,
+			filePath: m.currentFilePath,
+			fileRows: m.currentFileRows,
+		}
+		m.writer = nil
+		queue := m.closeQueue
+		m.closeQueue = nil
+		m.mu.Unlock()
+		queue <- pc
+		close(queue)
+		m.closeWG.Wait()
+		m.mu.Lock()
+		if m.closeErr != nil {
+			return m.closeErr
+		}
+		return nil
+	}
+
+	// Sync legacy path.
+	if err := m.finalizeWriterSync(m.writer, m.currentFilePath, m.currentFileRows); err != nil {
+		return err
+	}
+	m.writer = nil
 	return nil
 }
 
