@@ -402,16 +402,37 @@ func (s *ServerV2) finalizeAndDispatch(ctx context.Context, ws *writerState, run
 // table) pair, or "" if no explicit mode is set (caller defaults to APPEND).
 // Matches on BOTH bucket AND table — never on table name alone — to prevent
 // accidentally applying FULL_LOAD to a same-named table in a different bucket.
+//
+// Resolution order:
+//  1. Explicit OutputTables entry matching (bucket, table) — highest priority.
+//  2. DefaultBucket + DefaultWriteMode: applies to every table written to the
+//     default bucket (the common "defaultBucket: FULL_LOAD" pipeline form).
+//  3. No match → "" (caller defaults to APPEND).
+//
+// OutputBuckets entries are plain strings with no per-bucket write mode, so
+// they are intentionally not consulted here.
 func (s *ServerV2) writeModeForTable(bucket, table string) icebergjob.WriteMode {
+	// 1. Explicit per-table config wins.
 	for _, t := range s.config.OutputTables {
 		if t.Bucket == bucket && t.Name == table {
-			switch t.WriteMode {
+			switch strings.ToUpper(t.WriteMode) {
 			case "FULL_LOAD":
 				return icebergjob.WriteModeFullLoad
 			default:
 				return icebergjob.WriteModeAppend
 			}
 		}
+	}
+	// 2. DefaultBucket + DefaultWriteMode fallback: covers the common pipeline
+	// form where all outputs go to a single default bucket and the operator
+	// sets default_write_mode (defaults to "FULL_LOAD" when not specified).
+	if s.config.DefaultBucket != "" && s.config.DefaultBucket == bucket {
+		if strings.ToUpper(s.config.DefaultWriteMode) == "FULL_LOAD" {
+			return icebergjob.WriteModeFullLoad
+		}
+		// DefaultBucket set but mode is APPEND (or empty → operator defaults
+		// FULL_LOAD, so empty here means something unusual — default to APPEND).
+		return icebergjob.WriteModeAppend
 	}
 	return ""
 }

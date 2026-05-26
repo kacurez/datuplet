@@ -197,6 +197,66 @@ func TestWriteModeForTable_NoMatch(t *testing.T) {
 	}
 }
 
+// TestWriteModeForTable_DefaultBucketFullLoad covers the common pipeline form:
+// defaultBucket + defaultWriteMode=FULL_LOAD with no explicit OutputTables.
+// A second run of such a pipeline must replace data (ReplaceDataFiles), not
+// accumulate duplicates (AddFiles).
+func TestWriteModeForTable_DefaultBucketFullLoad(t *testing.T) {
+	s := &ServerV2{
+		config: &Config{
+			RunID:            "r",
+			DefaultBucket:    "out",
+			DefaultWriteMode: "FULL_LOAD",
+			// Deliberate: no OutputTables — this is the defaultBucket form.
+		},
+	}
+
+	// Any table in the default bucket should resolve to FULL_LOAD.
+	if got := s.writeModeForTable("out", "orders"); got != icebergjob.WriteModeFullLoad {
+		t.Errorf("out.orders (default bucket FULL_LOAD) = %q, want WriteModeFullLoad", got)
+	}
+	if got := s.writeModeForTable("out", "users"); got != icebergjob.WriteModeFullLoad {
+		t.Errorf("out.users (default bucket FULL_LOAD) = %q, want WriteModeFullLoad", got)
+	}
+
+	// A table in a different bucket → no default-bucket match → "".
+	if got := s.writeModeForTable("other", "orders"); got != "" {
+		t.Errorf("other.orders (non-default bucket) = %q, want empty", got)
+	}
+
+	// Explicit OutputTables entry in the default bucket overrides the default.
+	sWithExplicit := &ServerV2{
+		config: &Config{
+			RunID:            "r",
+			DefaultBucket:    "out",
+			DefaultWriteMode: "FULL_LOAD",
+			OutputTables: []OutputTableConfig{
+				{Bucket: "out", Name: "archive", WriteMode: "APPEND"},
+			},
+		},
+	}
+	if got := sWithExplicit.writeModeForTable("out", "archive"); got != icebergjob.WriteModeAppend {
+		t.Errorf("out.archive (explicit APPEND overrides FULL_LOAD default) = %q, want WriteModeAppend", got)
+	}
+	// Other tables in same default bucket still get FULL_LOAD.
+	if got := sWithExplicit.writeModeForTable("out", "orders"); got != icebergjob.WriteModeFullLoad {
+		t.Errorf("out.orders (non-explicit, default bucket FULL_LOAD) = %q, want WriteModeFullLoad", got)
+	}
+
+	// Table not matching anything at all → "".
+	sNoDefault := &ServerV2{
+		config: &Config{
+			RunID: "r",
+			OutputTables: []OutputTableConfig{
+				{Bucket: "raw", Name: "events", WriteMode: "APPEND"},
+			},
+		},
+	}
+	if got := sNoDefault.writeModeForTable("unknown", "events"); got != "" {
+		t.Errorf("unknown.events (no default bucket, no match) = %q, want empty", got)
+	}
+}
+
 // TestCommit_NoPool_WriterWithFiles verifies that in nil-pool (test) mode,
 // a writer that produced files reports STATUS_COMMITTED.
 func TestCommit_NoPool_WriterWithFiles(t *testing.T) {

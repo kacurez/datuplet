@@ -85,8 +85,9 @@ type ServerV2 struct {
 
 	// filesManifest accumulates the parquet paths written during the
 	// run, grouped by (namespace, table). Persisted at end-of-stream
-	// to `<table-base>/.run-state/<run-id>/files.json` for TableCommit
-	// to consume.
+	// to `<table-base>/.run-state/<run-id>/files.json` as a
+	// recovery/observability breadcrumb (RFC 021 — DG commits inline;
+	// no external TableCommit Job consumes this anymore).
 	filesManifest *FilesManifest
 
 	// lakekeeperResolver is constructed at boot when Config.LakekeeperURL
