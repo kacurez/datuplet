@@ -84,6 +84,10 @@ type CommitResult struct {
 	// WriteMode echoes the mode the caller selected, preserved for
 	// downstream observability.
 	WriteMode WriteMode
+
+	// IdempotencyHit is true when the commit was skipped because a
+	// snapshot with the same commit-key already existed.
+	IdempotencyHit bool
 }
 
 // errIdempotencyHit is an internal sentinel that short-circuits the
@@ -236,6 +240,7 @@ func CommitTableFiles(
 	})
 	if runErr != nil {
 		if errors.Is(runErr, errIdempotencyHit) {
+			result.IdempotencyHit = true
 			return &result, nil // success-zero, SnapshotIDAfter populated
 		}
 		return nil, runErr

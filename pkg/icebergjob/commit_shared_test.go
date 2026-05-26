@@ -469,6 +469,9 @@ func TestCommitTableFiles_IdempotencyHit(t *testing.T) {
 	if res1.SnapshotIDAfter == "" {
 		t.Errorf("first commit SnapshotIDAfter empty")
 	}
+	if res1.IdempotencyHit {
+		t.Errorf("first commit IdempotencyHit=true; want false (real commit)")
+	}
 
 	// Second call: same key, different path — must be idempotency hit.
 	shouldNotBeAdded := fx.writeParquet("data/SHOULD_NOT_BE_ADDED.parquet", 999)
@@ -482,6 +485,9 @@ func TestCommitTableFiles_IdempotencyHit(t *testing.T) {
 	}
 	if res2.SnapshotIDAfter == "" {
 		t.Errorf("second commit SnapshotIDAfter empty; want it populated via idempotency hit")
+	}
+	if !res2.IdempotencyHit {
+		t.Errorf("second commit IdempotencyHit=false; want true (skipped commit)")
 	}
 	// Table must still have exactly 1 data file.
 	tbl, err := fx.cat.LoadTable(context.Background(), icebergtable.Identifier{"ns1", "idem_tbl"})

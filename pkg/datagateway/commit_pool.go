@@ -40,6 +40,7 @@ type CommitResult struct {
 	SnapshotIDBefore, SnapshotIDAfter string
 	DataFilesAdded                    int
 	IdempotencyKey                    string
+	IdempotencyHit                    bool
 	Duration                          time.Duration
 }
 
@@ -146,13 +147,14 @@ func (p *CommitPool) run(sid uint64, j CommitJob) {
 		cr.SnapshotIDBefore = res.SnapshotIDBefore
 		cr.SnapshotIDAfter = res.SnapshotIDAfter
 		cr.DataFilesAdded = res.DataFilesAdded
+		cr.IdempotencyHit = res.IdempotencyHit
 	}
 	mode := string(j.Mode)
 	switch {
 	case cr.Err != nil:
 		commitErrors.WithLabelValues(classifyCommitError(cr.Err)).Inc()
 		commitDuration.WithLabelValues(mode, "err").Observe(cr.Duration.Seconds())
-	case cr.DataFilesAdded == 0 && cr.SnapshotIDAfter != "":
+	case cr.IdempotencyHit:
 		commitIdempotencySkips.Inc()
 		commitDuration.WithLabelValues(mode, "idempotent").Observe(cr.Duration.Seconds())
 	default:
