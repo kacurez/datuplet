@@ -66,6 +66,7 @@ type CommitPool struct {
 	closed    bool
 	resultsMu sync.Mutex
 	results   []CommitResult
+	sessionID uint64
 }
 
 func NewCommitPool(cfg CommitPoolConfig) *CommitPool {
@@ -84,7 +85,7 @@ func NewCommitPool(cfg CommitPoolConfig) *CommitPool {
 
 // Dispatch enqueues a job. Non-blocking; returns ErrCommitQueueFull at
 // capacity, or the parent ctx error after Cancel.
-func (p *CommitPool) Dispatch(ctx context.Context, j CommitJob) error {
+func (p *CommitPool) Dispatch(_ context.Context, j CommitJob) error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -98,6 +99,10 @@ func (p *CommitPool) Dispatch(ctx context.Context, j CommitJob) error {
 	p.wg.Add(1)
 	p.mu.Unlock()
 
+	p.resultsMu.Lock()
+	sid := p.sessionID
+	p.resultsMu.Unlock()
+
 	go func() {
 		defer func() {
 			p.mu.Lock()
@@ -109,15 +114,15 @@ func (p *CommitPool) Dispatch(ctx context.Context, j CommitJob) error {
 		case p.sem <- struct{}{}:
 			defer func() { <-p.sem }()
 		case <-p.parentCtx.Done():
-			p.record(CommitResult{WriterID: j.WriterID, Namespace: j.Namespace, Table: j.Table, Err: p.parentCtx.Err()})
+			p.record(sid, CommitResult{WriterID: j.WriterID, Namespace: j.Namespace, Table: j.Table, Err: p.parentCtx.Err()})
 			return
 		}
-		p.run(j)
+		p.run(sid, j)
 	}()
 	return nil
 }
 
-func (p *CommitPool) run(j CommitJob) {
+func (p *CommitPool) run(sid uint64, j CommitJob) {
 	start := time.Now()
 	key := ComputeIdempotencyKey(j.RunID, j.Namespace, j.Table, j.DataPaths)
 	cr := CommitResult{WriterID: j.WriterID, Namespace: j.Namespace, Table: j.Table, IdempotencyKey: key}
@@ -126,7 +131,7 @@ func (p *CommitPool) run(j CommitJob) {
 	if err != nil {
 		cr.Err = err
 		cr.Duration = time.Since(start)
-		p.record(cr)
+		p.record(sid, cr)
 		return
 	}
 	res, err := p.cfg.CommitFn(p.parentCtx, cat, icebergtable.Identifier{j.Namespace, j.Table}, j.DataPaths, j.Mode, key)
@@ -138,12 +143,14 @@ func (p *CommitPool) run(j CommitJob) {
 		cr.SnapshotIDAfter = res.SnapshotIDAfter
 		cr.DataFilesAdded = res.DataFilesAdded
 	}
-	p.record(cr)
+	p.record(sid, cr)
 }
 
-func (p *CommitPool) record(cr CommitResult) {
+func (p *CommitPool) record(sid uint64, cr CommitResult) {
 	p.resultsMu.Lock()
-	p.results = append(p.results, cr)
+	if p.sessionID == sid {
+		p.results = append(p.results, cr)
+	}
 	p.resultsMu.Unlock()
 }
 
@@ -163,6 +170,7 @@ func (p *CommitPool) Wait(ctx context.Context) []CommitResult {
 	p.resultsMu.Lock()
 	out := p.results
 	p.results = nil
+	p.sessionID++
 	p.resultsMu.Unlock()
 	return out
 }

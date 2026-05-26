@@ -149,6 +149,39 @@ func TestCommitPool_WaitRespectsDeadline(t *testing.T) {
 	}
 }
 
+func TestCommitPool_ReuseAcrossSessions(t *testing.T) {
+	pool := NewCommitPool(CommitPoolConfig{Workers: 2, MaxQueueSize: 8, CatalogFn: okCatalogFn,
+		CommitFn: func(_ context.Context, _ catalog.Catalog, _ icebergtable.Identifier, paths []string, mode icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			return &icebergjob.CommitResult{DataFilesAdded: len(paths), WriteMode: mode}, nil
+		}})
+	defer pool.Cancel()
+	// Session 1
+	_ = pool.Dispatch(context.Background(), CommitJob{WriterID: "a", Namespace: "ns", Table: "t1", DataPaths: []string{"p"}, Mode: icebergjob.WriteModeAppend, RunID: "r"})
+	if got := pool.Wait(context.Background()); len(got) != 1 {
+		t.Fatalf("session1 results=%d want 1", len(got))
+	}
+	// Session 2 — must be clean, no carryover
+	_ = pool.Dispatch(context.Background(), CommitJob{WriterID: "b", Namespace: "ns", Table: "t2", DataPaths: []string{"p"}, Mode: icebergjob.WriteModeAppend, RunID: "r"})
+	got := pool.Wait(context.Background())
+	if len(got) != 1 || got[0].WriterID != "b" {
+		t.Fatalf("session2 results=%v want exactly [b]", got)
+	}
+}
+
+func TestCommitPool_WaitTwiceNoWork(t *testing.T) {
+	pool := NewCommitPool(CommitPoolConfig{Workers: 1, MaxQueueSize: 4, CatalogFn: okCatalogFn,
+		CommitFn: func(context.Context, catalog.Catalog, icebergtable.Identifier, []string, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
+			return &icebergjob.CommitResult{}, nil
+		}})
+	defer pool.Cancel()
+	if got := pool.Wait(context.Background()); len(got) != 0 {
+		t.Errorf("first wait results=%d want 0", len(got))
+	}
+	if got := pool.Wait(context.Background()); len(got) != 0 {
+		t.Errorf("second wait results=%d want 0", len(got))
+	}
+}
+
 func TestComputeIdempotencyKey_Stable(t *testing.T) {
 	k1 := ComputeIdempotencyKey("r", "ns", "t", []string{"s3://b/b.parquet", "s3://b/a.parquet"})
 	k2 := ComputeIdempotencyKey("r", "ns", "t", []string{"s3://b/a.parquet", "s3://b/b.parquet"})
