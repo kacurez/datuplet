@@ -164,7 +164,12 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	  -f tests/e2e/values-lakekeeper.yaml \
 	  --wait --wait-for-jobs --timeout 10m
 	./scripts/register.sh --namespace datuplet-e2e
-	cd tests/e2e && E2E_K8S=1 go test -v -count=1 -timeout 30m ./...
+	# Run the suite with host-side port-forwards for the framework's
+	# localhost endpoints (OpenFGA/Lakekeeper/pipeline-api/MinIO). Needed
+	# on CI kind (no host port exposure); a no-op on OrbStack where the
+	# NodePorts are already bound. Without this the FGA bootstrap can't
+	# reach OpenFGA and every K8s scenario silently SKIPs.
+	./scripts/e2e-port-forward.sh datuplet-e2e
 	helm uninstall datuplet-lakekeeper -n datuplet-e2e || true
 	helm uninstall datuplet-app -n datuplet-e2e || true
 	helm uninstall datuplet-infra -n datuplet-e2e || true
