@@ -24,6 +24,13 @@ type ArrowIPCAdapter struct {
 	allocator memory.Allocator
 }
 
+// Compile-time assertions: ArrowIPCAdapter is both a FormatAdapter and a
+// (streaming-capable) StreamingAdapter.
+var (
+	_ FormatAdapter    = (*ArrowIPCAdapter)(nil)
+	_ StreamingAdapter = (*ArrowIPCAdapter)(nil)
+)
+
 // NewArrowIPCAdapter creates a new Arrow IPC adapter.
 // If allocator is nil, uses the default Go allocator.
 func NewArrowIPCAdapter(allocator memory.Allocator) *ArrowIPCAdapter {
@@ -47,8 +54,25 @@ func (a *ArrowIPCAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *s
 	if len(data) == 0 {
 		return nil, nil, fmt.Errorf("empty Arrow IPC data")
 	}
+	return a.parseFromReader(bytes.NewReader(data), s)
+}
 
-	reader, err := ipc.NewReader(bytes.NewReader(data), ipc.WithAllocator(a.allocator))
+// ParseReader implements StreamingAdapter: it decodes the Arrow IPC stream
+// directly off r without buffering the whole payload first. The arrow-go
+// ipc.Reader is natively streaming (single forward pass over the message
+// frames), so this is a zero-extra-copy path — the HTTP data-plane uses it
+// to avoid io.ReadAll of the request body.
+//
+// Unlike Parse, there is no upfront len==0 guard: an empty stream surfaces
+// as an ipc.NewReader error ("failed to create Arrow IPC reader") which is
+// the functionally-equivalent failure.
+func (a *ArrowIPCAdapter) ParseReader(r io.Reader, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
+	return a.parseFromReader(r, s)
+}
+
+// parseFromReader is the shared core behind Parse and ParseReader.
+func (a *ArrowIPCAdapter) parseFromReader(r io.Reader, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
+	reader, err := ipc.NewReader(r, ipc.WithAllocator(a.allocator))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create Arrow IPC reader: %w", err)
 	}

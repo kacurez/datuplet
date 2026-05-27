@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/apache/arrow-go/v18/arrow"
+
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/backend"
 	"github.com/datuplet/datuplet/pkg/datagateway/buffer"
@@ -15,6 +17,20 @@ import (
 	"github.com/datuplet/datuplet/pkg/datagateway/partition"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
+
+// countingReader wraps an io.Reader and tallies bytes read. Used by the
+// streaming-ingest path to keep the per-chunk byte count (ws.totalBytes)
+// accurate without buffering the payload.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
 
 // httpWriteResponse is the JSON body returned by the HTTP write endpoint.
 type httpWriteResponse struct {
@@ -53,17 +69,29 @@ func (s *ServerV2) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read request body (streaming)
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.httpError(w, http.StatusBadRequest, fmt.Sprintf("failed to read body: %v", err), "READ_ERROR")
-		return
+	// Process the chunk. Pass the request's context through so a
+	// cancellation at the HTTP layer short-circuits the deferred
+	// lakekeeper round-trip.
+	//
+	// Fast path: if the writer's adapter can stream (Arrow IPC, JSONL),
+	// parse directly off r.Body — no io.ReadAll copy of the whole chunk.
+	// Otherwise (CSV/Parquet, or any non-streaming adapter) fall back to
+	// buffering the body and calling the []byte path.
+	var (
+		resp *pb.WriteChunkResponse
+		err  error
+	)
+	if sa, ok := ws.adapter.(format.StreamingAdapter); ok {
+		resp, err = s.processWriteChunkReader(r.Context(), ws, r.Body, sa)
+	} else {
+		var data []byte
+		data, err = io.ReadAll(r.Body)
+		if err != nil {
+			s.httpError(w, http.StatusBadRequest, fmt.Sprintf("failed to read body: %v", err), "READ_ERROR")
+			return
+		}
+		resp, err = s.processWriteChunk(r.Context(), ws, data)
 	}
-
-	// Process the data (same logic as WriteChunk gRPC). Pass the
-	// request's context through so a cancellation at the HTTP layer
-	// short-circuits the deferred lakekeeper round-trip.
-	resp, err := s.processWriteChunk(r.Context(), ws, data)
 	if err != nil {
 		s.httpError(w, http.StatusInternalServerError, err.Error(), "PROCESS_ERROR")
 		return
@@ -97,6 +125,36 @@ func (s *ServerV2) processWriteChunk(ctx context.Context, ws *writerState, data 
 		return nil, fmt.Errorf("failed to parse input: %w", err)
 	}
 	defer record.Release()
+
+	return s.processParsedRecord(ctx, ws, record, inferredSchema, int64(len(data)))
+}
+
+// processWriteChunkReader is the streaming-ingest sibling of
+// processWriteChunk. It parses directly off r (the HTTP request body) via a
+// StreamingAdapter, avoiding the io.ReadAll copy of the whole chunk — the
+// gateway's #1 ingest allocation site (run 40556560 profile). A
+// byte-counting reader keeps ws.totalBytes accurate without materialising
+// the payload.
+func (s *ServerV2) processWriteChunkReader(ctx context.Context, ws *writerState, r io.Reader, sa format.StreamingAdapter) (*pb.WriteChunkResponse, error) {
+	Debugf("processWriteChunkReader: writer=%s format=%s mode=streaming", ws.writerID, ws.inputFormat)
+
+	cr := &countingReader{r: r}
+	record, inferredSchema, err := sa.ParseReader(cr, ws.schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse input: %w", err)
+	}
+	defer record.Release()
+
+	return s.processParsedRecord(ctx, ws, record, inferredSchema, cr.n)
+}
+
+// processParsedRecord holds the post-parse write path shared by the
+// buffered (processWriteChunk) and streaming (processWriteChunkReader)
+// entry points: deferred lakekeeper create, buffer-manager init, transform,
+// and the Add into the buffer/partition router. inputBytes is the raw
+// chunk size used only for the ws.totalBytes counter.
+func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, record arrow.Record, inferredSchema *schema.Schema, inputBytes int64) (*pb.WriteChunkResponse, error) {
+	var err error
 
 	// Deferred-create + buffer-manager init: serialize under ws.initMu so
 	// two parallel chunk requests for the same writer don't race on
@@ -225,7 +283,7 @@ func (s *ServerV2) processWriteChunk(ctx context.Context, ws *writerState, data 
 
 	// Update statistics
 	ws.totalRows += outputRecord.NumRows()
-	ws.totalBytes += int64(len(data))
+	ws.totalBytes += inputBytes
 
 	// Get buffer size for monitoring
 	var bufferSize int64

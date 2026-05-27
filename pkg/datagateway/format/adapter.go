@@ -3,6 +3,7 @@ package format
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/apache/arrow-go/v18/arrow"
 
@@ -106,6 +107,27 @@ type FormatAdapter interface {
 
 	// Format returns the data format this adapter handles.
 	Format() DataFormat
+}
+
+// StreamingAdapter is an OPTIONAL capability a FormatAdapter may implement
+// to parse directly from an io.Reader, avoiding a full in-memory copy of
+// the input (the io.ReadAll the HTTP data-plane would otherwise do before
+// calling Parse).
+//
+// Why: profiling the gateway ingest path (gen-big-pipeline, run 40556560)
+// showed io.ReadAll of the incoming HTTP request body as the #1 allocation
+// site (~44% of gateway alloc_space) once the JSON-parse path was removed.
+// Streaming the parser straight off r.Body removes that transient copy.
+//
+// The data-plane (handleWrite) type-asserts for this interface and uses
+// ParseReader when present, falling back to Parse(io.ReadAll(body)) when a
+// format can't stream (e.g. Parquet needs random access: ReaderAt + size).
+//
+// Contract mirrors Parse exactly: if s is nil the schema is inferred (a
+// streaming adapter MAY internally buffer in that case — inference often
+// needs the full input); the caller owns Release() on the returned record.
+type StreamingAdapter interface {
+	ParseReader(r io.Reader, s *schema.Schema) (arrow.Record, *schema.Schema, error)
 }
 
 // ParseOptions configures parsing behavior.

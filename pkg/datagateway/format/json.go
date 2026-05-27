@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -14,6 +15,9 @@ import (
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
+
+// Compile-time assertion: JSONLAdapter is a streaming-capable adapter.
+var _ StreamingAdapter = (*JSONLAdapter)(nil)
 
 // JSONAdapter converts between JSON arrays and Arrow RecordBatches.
 // Expects input in the form: [{"col1": val1, ...}, {"col1": val2, ...}]
@@ -210,7 +214,7 @@ func (a *JSONLAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *sche
 	// gateway caches it on writerState, and every subsequent chunk for
 	// that writer passes the cached schema in.
 	if s != nil {
-		return a.parseWithKnownSchema(data, s)
+		return a.parseWithKnownSchema(bytes.NewReader(data), s)
 	}
 
 	// Slow path: schema unknown. Buffer all objects, infer schema (the
@@ -258,6 +262,28 @@ func (a *JSONLAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *sche
 	return record, inferred, nil
 }
 
+// ParseReader implements StreamingAdapter for JSON Lines.
+//
+// Known-schema (the hot path: every chunk after the first for a writer):
+// streams line-by-line straight off r via bufio.Scanner into the
+// RecordBuilder — no io.ReadAll of the body, one transient map[string]any
+// alive at a time.
+//
+// Unknown-schema (first chunk only): inference needs every row up front, so
+// we fall back to buffering the reader and delegating to Parse. This keeps
+// the inference semantics identical; the streaming win applies to the 99%
+// of chunks that arrive once the schema is cached on the writer.
+func (a *JSONLAdapter) ParseReader(r io.Reader, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
+	if s != nil {
+		return a.parseWithKnownSchema(r, s)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read JSON Lines: %w", err)
+	}
+	return a.Parse(data, nil)
+}
+
 // parseWithKnownSchema is the streaming-direct JSONL decoder used when
 // the gateway already has the writer's schema cached. It avoids
 // building a []map[string]any of all rows: each line allocates a
@@ -265,11 +291,11 @@ func (a *JSONLAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *sche
 // RecordBuilder, and the map is dropped (eligible for GC) before the
 // next line is decoded. Peak live heap is therefore one map per
 // in-flight chunk, not (rows-in-chunk) maps.
-func (a *JSONLAdapter) parseWithKnownSchema(data []byte, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
+func (a *JSONLAdapter) parseWithKnownSchema(r io.Reader, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
 	builder := array.NewRecordBuilder(a.allocator, s.ArrowSchema())
 	defer builder.Release()
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner := bufio.NewScanner(r)
 	// Default bufio.Scanner line buffer is 64 KiB. Very wide JSONL rows
 	// (long strings, many columns) can exceed that; bump the cap to
 	// 16 MiB so we don't reject legitimate inputs. The initial buffer
