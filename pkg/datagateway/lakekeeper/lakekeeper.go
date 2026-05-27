@@ -289,6 +289,19 @@ func (r *Resolver) LoadTableForRead(ctx context.Context, ns, tbl string) (*Reade
 	}, nil
 }
 
+// Catalog returns an iceberg catalog handle bound to the resolver's run
+// token. A fresh *catalogwriter.Client is opened per call (same pattern
+// as LoadTableForRead / LoadOrCreateForWrite) — there is no shared
+// catalog state, so no lifecycle coupling with concurrent callers.
+// Used by the inline commit pool (RFC 021).
+func (r *Resolver) Catalog(ctx context.Context) (catalog.Catalog, error) {
+	cli, err := r.newClient(ctx, r.Token)
+	if err != nil {
+		return nil, fmt.Errorf("lakekeeper: open catalog client: %w", err)
+	}
+	return cli.Catalog, nil
+}
+
 // newClient builds a per-call catalogwriter.Client backed by lakekeeper's
 // REST API (the only supported catalog backend).
 func (r *Resolver) newClient(ctx context.Context, token string) (*catalogwriter.Client, error) {

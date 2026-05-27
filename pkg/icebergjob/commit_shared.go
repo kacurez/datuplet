@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -31,10 +32,25 @@ import (
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
 
-// (WriteMode and its constants are defined in commit.go — single source
-// of truth.) Future addition: WriteModeUpsert lands when UPSERT does;
-// extends WriteMode + the files.json schema (delete_paths) but does not
-// change CommitTable's signature.
+// WriteMode specifies how data should be written to the table.
+//
+// Both APPEND and FULL_LOAD are implemented end-to-end against
+// lakekeeper: APPEND uses iceberg-go's `txn.AddFiles`, FULL_LOAD uses
+// `txn.ReplaceDataFiles`. CommitTable / CommitTableFiles own the
+// actual dispatch.
+//
+// UPSERT is a future addition and would extend this type plus the
+// files.json schema (delete_paths) without changing the locked signature.
+type WriteMode string
+
+const (
+	// WriteModeAppend adds new data files to the table.
+	WriteModeAppend WriteMode = "APPEND"
+	// WriteModeFullLoad replaces all existing data in the table —
+	// implemented via iceberg-go's `txn.ReplaceDataFiles` against
+	// the table's current snapshot.
+	WriteModeFullLoad WriteMode = "FULL_LOAD"
+)
 
 // ErrManifestEmpty signals that the manifest exists but its DataPaths
 // list is empty. CommitTable catches this internally and returns nil
@@ -69,7 +85,19 @@ type CommitResult struct {
 	// WriteMode echoes the mode the caller selected, preserved for
 	// downstream observability.
 	WriteMode WriteMode
+
+	// IdempotencyHit is true when the commit was skipped because a
+	// snapshot with the same commit-key already existed.
+	IdempotencyHit bool
 }
+
+// errIdempotencyHit is an internal sentinel that short-circuits the
+// RetryOnConflict envelope when a prior attempt's snapshot is found via
+// commit-key. It is NOT a commit conflict, so RetryOnConflict returns it
+// immediately without retrying (pkg/catalogwriter/retry.go: `if
+// !IsCommitConflict(err) { return err }`). Do not change this coupling
+// without updating the retry predicate.
+var errIdempotencyHit = errors.New("icebergjob: idempotency hit")
 
 // filesManifest is the on-the-wire shape of the per-table `files.json`
 // manifest, supporting both v1 (`paths`) and v2 (`data_paths` +
@@ -119,90 +147,150 @@ func CommitTable(
 	mode WriteMode,
 	snapshotProps iceberg.Properties,
 ) (*CommitResult, error) {
-	// LoadTable once up front to obtain the per-table FS handle (vended
-	// creds). The catalog's LoadTable returns ErrNoSuchTable when the
-	// table doesn't exist; the caller handles that as success-zero for
-	// the table-commit flow.
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return nil, fmt.Errorf("CommitTable: load table %v: %w", ident, err)
 	}
-
-	manifest, err := readManifestFromTableFS(ctx, tbl, manifestPath)
-	if errors.Is(err, ErrManifestMissing) {
-		return &CommitResult{WriteMode: mode}, nil // success-zero
-	}
-	if errors.Is(err, ErrManifestEmpty) {
-		return &CommitResult{WriteMode: mode}, nil // success-zero
+	m, err := readManifestFromTableFS(ctx, tbl, manifestPath)
+	if errors.Is(err, ErrManifestMissing) || errors.Is(err, ErrManifestEmpty) {
+		return &CommitResult{WriteMode: mode}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("CommitTable: read manifest %s: %w", manifestPath, err)
 	}
+	return CommitTableFiles(ctx, cat, ident, m.DataPaths, mode, snapshotProps, "")
+}
 
-	snapBefore := snapshotIDOrEmpty(tbl)
-
-	// Validate mode up front so the unsupported-mode error short-
-	// circuits the retry envelope. RetryOnConflict only retries 409s,
-	// so an unsupported mode would still bubble out — but failing here
-	// means we never even open the transaction.
+// CommitTableFiles is the in-memory-paths variant of CommitTable: the
+// caller supplies dataPaths directly instead of via a files.json URL.
+// Used by Data Gateway's inline commit path (RFC 021).
+//
+// idempotencyKey, when non-empty, is (a) checked against existing
+// snapshot summaries (key "datuplet.commit-key") on every attempt — a
+// match short-circuits to success-zero (protects against
+// committed-server-side-but-client-missed-the-response), and (b) written
+// into the new snapshot summary. Callers must NOT also place
+// "datuplet.commit-key" in snapshotProps.
+func CommitTableFiles(
+	ctx context.Context,
+	cat catalog.Catalog,
+	ident icebergtable.Identifier,
+	dataPaths []string,
+	mode WriteMode,
+	snapshotProps iceberg.Properties,
+	idempotencyKey string,
+) (*CommitResult, error) {
+	if len(dataPaths) == 0 {
+		return &CommitResult{WriteMode: mode}, nil // success-zero
+	}
 	switch mode {
 	case WriteModeAppend, WriteModeFullLoad:
-		// supported
 	default:
-		return nil, fmt.Errorf("CommitTable: unsupported write mode %q", mode)
+		return nil, fmt.Errorf("CommitTableFiles: unsupported write mode %q", mode)
 	}
 
-	// Retry envelope: re-load the table fresh per attempt so a
-	// concurrent commit landing between attempts gets observed (same
-	// pattern as legacy defaultCommitFiles).
-	if err := catalogwriter.RetryOnConflict(ctx, catalogwriter.RetryOpts{}, func(ctx context.Context) error {
+	props := iceberg.Properties{}
+	for k, v := range snapshotProps {
+		if k == "datuplet.commit-key" {
+			return nil, fmt.Errorf("CommitTableFiles: caller must not set snapshotProps[datuplet.commit-key]; pass idempotencyKey")
+		}
+		props[k] = v
+	}
+	if idempotencyKey != "" {
+		props["datuplet.commit-key"] = idempotencyKey
+	}
+
+	tbl, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		return nil, fmt.Errorf("CommitTableFiles: load table %v: %w", ident, err)
+	}
+	result := CommitResult{WriteMode: mode, SnapshotIDBefore: snapshotIDOrEmpty(tbl), DataFilesAdded: len(dataPaths)}
+
+	runErr := catalogwriter.RetryOnConflict(ctx, catalogwriter.RetryOpts{}, func(ctx context.Context) error {
 		fresh, err := cat.LoadTable(ctx, ident)
 		if err != nil {
 			return err
 		}
+		if idempotencyKey != "" {
+			if sid := findSnapshotByCommitKey(fresh, idempotencyKey); sid != "" {
+				result.SnapshotIDAfter = sid
+				return errIdempotencyHit
+			}
+		}
 		txn := fresh.NewTransaction()
 		switch mode {
 		case WriteModeAppend:
-			if err := txn.AddFiles(ctx, manifest.DataPaths, snapshotProps, false); err != nil {
+			if err := txn.AddFiles(ctx, dataPaths, props, false); err != nil {
 				return err
 			}
 		case WriteModeFullLoad:
-			// Read the current snapshot's data files, mark them for delete,
-			// replace with the new file list. If the table has no current
-			// snapshot (initial FULL_LOAD into a fresh table), iceberg-go's
-			// ReplaceDataFiles delegates to AddFiles internally for
-			// the empty-delete-set case — we pass an empty slice.
 			oldPaths, err := listCurrentSnapshotFilePaths(ctx, fresh)
 			if err != nil {
 				return fmt.Errorf("list current snapshot files: %w", err)
 			}
-			if err := txn.ReplaceDataFiles(ctx, oldPaths, manifest.DataPaths, snapshotProps); err != nil {
+			if err := txn.ReplaceDataFiles(ctx, oldPaths, dataPaths, props); err != nil {
 				return err
 			}
 		}
-		if _, err := txn.Commit(ctx); err != nil {
+		committed, err := txn.Commit(ctx)
+		if err != nil {
 			return err
 		}
+		result.SnapshotIDAfter = snapshotIDOrEmpty(committed)
 		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("CommitTable: commit transaction: %w", err)
+	})
+	if runErr != nil {
+		if errors.Is(runErr, errIdempotencyHit) {
+			result.IdempotencyHit = true
+			return &result, nil // success-zero, SnapshotIDAfter populated
+		}
+		return nil, runErr
 	}
+	return &result, nil
+}
 
-	// Reload post-commit so SnapshotIDAfter reflects the committed
-	// snapshot. Best-effort: a reload failure here doesn't invalidate
-	// the commit (which already landed), so we surface the result
-	// with empty SnapshotIDAfter rather than failing the call.
-	snapAfter := ""
-	if reloaded, rerr := cat.LoadTable(ctx, ident); rerr == nil {
-		snapAfter = snapshotIDOrEmpty(reloaded)
+// findSnapshotByCommitKey scans ALL snapshots newest-to-oldest for a
+// matching "datuplet.commit-key" summary value. Returns the snapshot ID
+// (decimal string) or "". Full scan — no windowing. POC tables have few
+// snapshots; bound it later if it ever becomes hot.
+func findSnapshotByCommitKey(tbl *icebergtable.Table, key string) string {
+	snaps := tbl.Metadata().Snapshots()
+	for i := len(snaps) - 1; i >= 0; i-- {
+		s := snaps[i]
+		if s.Summary != nil && s.Summary.Properties != nil && s.Summary.Properties["datuplet.commit-key"] == key {
+			return fmt.Sprintf("%d", s.SnapshotID)
+		}
 	}
+	return ""
+}
 
-	return &CommitResult{
-		SnapshotIDBefore: snapBefore,
-		SnapshotIDAfter:  snapAfter,
-		DataFilesAdded:   len(manifest.DataPaths),
-		WriteMode:        mode,
-	}, nil
+// isNotFoundErr is a best-effort detector for "object not found" errors
+// surfaced by iceberg-go's FS abstraction. The iceberg-go library
+// doesn't expose a sentinel for s3 NoSuchKey or filesystem
+// os.ErrNotExist — both bubble up as wrapped errors with provider-
+// specific messages. We match on substring rather than type because
+// that's what the surface gives us today; if iceberg-go grows a real
+// sentinel in the future this is the one place to switch over.
+//
+// Backends seen in the wild:
+//   - s3:        `NoSuchKey`, `404`, "key does not exist"
+//   - GCS:       "object doesn't exist" (note the contraction — doesn't,
+//                so `strings.Contains(msg, "not exist")` does NOT match),
+//                and a gocloud `(code=NotFound)` suffix on the wrapped error
+//   - localfs:   "no such file or directory"
+//   - iceberg-go's own paths: "not found"
+func isNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not exist") ||
+		strings.Contains(msg, "doesn't exist") || // GCS via gocloud.dev
+		strings.Contains(msg, "code=notfound") || // gocloud.dev wrapping
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "nosuchkey") ||
+		strings.Contains(msg, "404") ||
+		strings.Contains(msg, "no such file")
 }
 
 // readManifestFromTableFS reads the per-table files.json blob via the

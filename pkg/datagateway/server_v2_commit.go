@@ -14,184 +14,154 @@ import (
 	"github.com/datuplet/datuplet/pkg/lib/controlfile"
 )
 
+// Commit is the session-level barrier. CloseWriter already finalizes and
+// dispatches each writer's iceberg commit to the pool; Commit drains the
+// pool and reconciles results. Writers that were not yet closed at Commit
+// time (e.g. the session was aborted mid-stream) are swept here as a
+// defensive fallback.
 func (s *ServerV2) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	runID := s.config.GetRunID()
 
-	// Group writers by bucket for the response
+	// Snapshot the writer map under lock; release before any I/O so we
+	// don't hold s.mu across storage calls.
+	s.mu.Lock()
+	expected := make(map[string]*writerState, len(s.writers))
+	sweepList := make([]*writerState, 0, len(s.writers))
+	for id, ws := range s.writers {
+		expected[id] = ws
+		if !ws.committed {
+			sweepList = append(sweepList, ws)
+		}
+	}
+	s.mu.Unlock()
+
+	// Defensive sweep: close + finalize any writers that CloseWriter
+	// didn't process (e.g. abandoned stream).
+	var sweepErr error
+	for _, ws := range sweepList {
+		s.mu.Lock()
+		needClose := !ws.closed && (ws.partitionRouter != nil || ws.bufferMgr != nil)
+		if needClose {
+			ws.closed = true
+		}
+		s.mu.Unlock()
+
+		if needClose {
+			var cerr error
+			if ws.partitionRouter != nil {
+				cerr = ws.partitionRouter.Close()
+			} else if ws.bufferMgr != nil {
+				cerr = ws.bufferMgr.Close()
+			}
+			if cerr != nil {
+				if sweepErr == nil {
+					sweepErr = fmt.Errorf("sweep close %s.%s: %w", ws.bucket, ws.table, cerr)
+				}
+				continue
+			}
+		}
+		if err := s.finalizeAndDispatch(ctx, ws, runID); err != nil && sweepErr == nil {
+			sweepErr = err
+		}
+	}
+
+	// Block until all dispatched commits finish.
+	var poolResults []CommitResult
+	if s.commitPool != nil {
+		poolResults = s.commitPool.Wait(ctx)
+	}
+
+	// Build response table results from pool outcomes.
 	bucketTables := make(map[string][]*pb.TableCommitResult)
-	allSuccess := true
+	seen := make(map[string]bool)
+	allSuccess := sweepErr == nil
 
-	// Each per-table writer carries its own backend + basePath.
-	// Snapshot them into perTableManifest so we can write one files.json
-	// per (ns, tbl) AFTER the writer-close loop has finished. Writing
-	// per-table inside the loop would couple manifest emission to
-	// writer-close ordering; deferring it keeps the close path
-	// uncluttered and makes the per-table writes a single well-defined phase.
-	type tableManifestTarget struct {
-		backend  backend.StorageBackend
-		basePath string
-		ns       string
-		table    string
-	}
-	var perTableManifest []tableManifestTarget
-
-	for writerID, ws := range s.writers {
-		result := &pb.TableCommitResult{
-			Table:  ws.table,
-			Bucket: ws.bucket,
+	for _, r := range poolResults {
+		seen[r.WriterID] = true
+		tcr := &pb.TableCommitResult{Table: r.Table, Bucket: r.Namespace}
+		switch {
+		case r.Err != nil:
+			tcr.Status = pb.TableCommitResult_STATUS_FAILED
+			tcr.Error = r.Err.Error()
+			allSuccess = false
+		case r.DataFilesAdded == 0 && r.SnapshotIDAfter == "":
+			tcr.Status = pb.TableCommitResult_STATUS_SKIPPED
+		default:
+			tcr.Status = pb.TableCommitResult_STATUS_COMMITTED
+			tcr.FilesAdded = int32(r.DataFilesAdded)
 		}
+		bucketTables[r.Namespace] = append(bucketTables[r.Namespace], tcr)
+	}
 
-		if ws.writerBackend != nil {
-			perTableManifest = append(perTableManifest, tableManifestTarget{
-				backend:  ws.writerBackend,
-				basePath: ws.basePath,
-				ns:       ws.bucket,
-				table:    ws.table,
+	// Reconciliation: handle writers not in the pool results.
+	// In nil-pool (test/static-backend) mode no commit is dispatched, so
+	// writers that produced files legitimately have no pool result →
+	// report COMMITTED. Writers that produced no files → SKIPPED.
+	// In pool mode, an absent result is a bug → FAILED.
+	for id, ws := range expected {
+		if seen[id] {
+			continue
+		}
+		switch {
+		case !writerProducedFiles(ws):
+			bucketTables[ws.bucket] = append(bucketTables[ws.bucket], &pb.TableCommitResult{
+				Table: ws.table, Bucket: ws.bucket,
+				Status: pb.TableCommitResult_STATUS_SKIPPED,
 			})
-		}
-
-		// Close buffer/router and write schema/manifest
-		if ws.partitionRouter != nil {
-			// Partitioned writer flow
-			if err := ws.partitionRouter.Close(); err != nil {
-				result.Status = pb.TableCommitResult_STATUS_FAILED
-				result.Error = err.Error()
-				allSuccess = false
-			} else {
-				stats := ws.partitionRouter.Stats()
-				result.Status = pb.TableCommitResult_STATUS_COMMITTED
-				result.FilesAdded = int32(stats.TotalFiles)
-				result.RowsAdded = stats.TotalRowsFlushed
-				result.BytesAdded = stats.TotalBytesFlushed
-
-				// Record paths into the run's files.json manifest.
-				// Append before writeSchemaAndManifest so we capture
-				// them even if the schema writer fails.
-				for _, pf := range ws.partitionRouter.FilesWritten() {
-					s.filesManifest.Append(ws.bucket, ws.table, pf.FileInfo.Path)
-				}
-
-				if ws.schema != nil {
-					if err := s.writeSchemaAndManifest(ctx, ws, runID); err != nil {
-						log.Printf("Warning: failed to write schema/manifest for %s.%s: %v", ws.bucket, ws.table, err)
-					}
-				}
-			}
-		} else if ws.bufferMgr != nil {
-			// Standard unpartitioned flow
-			if err := ws.bufferMgr.Close(); err != nil {
-				result.Status = pb.TableCommitResult_STATUS_FAILED
-				result.Error = err.Error()
-				allSuccess = false
-			} else {
-				stats := ws.bufferMgr.Stats()
-				result.Status = pb.TableCommitResult_STATUS_COMMITTED
-				result.FilesAdded = int32(stats.TotalFiles)
-				result.RowsAdded = stats.TotalRowsFlushed
-				result.BytesAdded = stats.TotalBytesFlushed
-
-				// Record paths into the run's files.json manifest.
-				for _, f := range ws.bufferMgr.FilesWritten() {
-					s.filesManifest.Append(ws.bucket, ws.table, f.Path)
-				}
-
-				// Write schema and manifest files
-				if ws.schema != nil {
-					if err := s.writeSchemaAndManifest(ctx, ws, runID); err != nil {
-						log.Printf("Warning: failed to write schema/manifest for %s.%s: %v", ws.bucket, ws.table, err)
-						// Don't fail the commit for this - files are already written
-					}
-				}
-			}
-		} else if len(ws.externalFiles) > 0 {
-			// External files flow (component wrote files directly, e.g., DuckDB)
-			result.Status = pb.TableCommitResult_STATUS_COMMITTED
-			result.FilesAdded = int32(len(ws.externalFiles))
-			result.RowsAdded = ws.totalRows
-			result.BytesAdded = ws.totalBytes
-
-			// Record paths into the run's files.json manifest.
-			// External files flow through the catalog the same way
-			// buffered files do.
-			for _, f := range ws.externalFiles {
-				s.filesManifest.Append(ws.bucket, ws.table, f.Path)
-			}
-
-			// Require schema for manifest generation
-			if ws.schema == nil {
-				err := fmt.Errorf("external files provided but no schema available for %s.%s", ws.bucket, ws.table)
-				result.Status = pb.TableCommitResult_STATUS_FAILED
-				result.Error = err.Error()
-				allSuccess = false
-			} else {
-				// Patch Parquet files with Iceberg field IDs (if needed)
-				if err := s.patchParquetFieldIDs(ctx, ws); err != nil {
-					result.Status = pb.TableCommitResult_STATUS_FAILED
-					result.Error = fmt.Sprintf("failed to patch Parquet field IDs: %v", err)
-					allSuccess = false
-				} else {
-					// Only write manifest if patching succeeded
-					if err := s.writeSchemaAndManifest(ctx, ws, runID); err != nil {
-						result.Status = pb.TableCommitResult_STATUS_FAILED
-						result.Error = fmt.Sprintf("failed to write manifest: %v", err)
-						allSuccess = false
-					}
-				}
-			}
-		} else {
-			// No data written
-			result.Status = pb.TableCommitResult_STATUS_SKIPPED
-		}
-
-		bucketTables[ws.bucket] = append(bucketTables[ws.bucket], result)
-		delete(s.writers, writerID)
-	}
-
-	// Emit per-table files.json manifests. Each (namespace, table) the
-	// run touched gets its own manifest at
-	// `<table-base>/.run-state/<run-id>/files.json`, written through
-	// the per-writer backend (the same lakekeeper-vended STS creds DG
-	// already used for parquet uploads to that table). TableCommit reads
-	// each manifest in turn and replays the paths via iceberg-go's
-	// `txn.AddFiles(paths, nil, false)`.
-	//
-	// Failure here is fatal for the run: a successful pipeline that
-	// produced parquet but no manifest is unrecoverable downstream
-	// (TableCommit cannot find the files). We surface the first error
-	// so the SDK propagates it and the component exits non-zero
-	// (FailedApplication territory).
-	for _, t := range perTableManifest {
-		if err := s.persistTableManifest(ctx, t.backend, t.basePath, t.ns, t.table, runID); err != nil {
-			log.Printf("ERROR: failed to write files.json manifest for %s.%s: %v", t.ns, t.table, err)
-			return nil, fmt.Errorf("write files.json manifest %s.%s: %w", t.ns, t.table, err)
+		case s.commitPool == nil:
+			// Nil-pool: metadata was written by finalizeAndDispatch; no
+			// iceberg commit happens, which is expected in test mode.
+			bucketTables[ws.bucket] = append(bucketTables[ws.bucket], &pb.TableCommitResult{
+				Table: ws.table, Bucket: ws.bucket,
+				Status: pb.TableCommitResult_STATUS_COMMITTED,
+			})
+		default:
+			// Pool is live but this writer has no result — should not happen.
+			bucketTables[ws.bucket] = append(bucketTables[ws.bucket], &pb.TableCommitResult{
+				Table: ws.table, Bucket: ws.bucket,
+				Status: pb.TableCommitResult_STATUS_FAILED,
+				Error:  "commit not dispatched (reconciliation failure)",
+			})
+			allSuccess = false
 		}
 	}
 
-	// Build bucket results
+	// N5 (documented assumption): one session per sidecar, no concurrent
+	// second session between barrier and clear. Clear writers map so a
+	// future defensive sweep in a next Commit finds nothing.
+	s.mu.Lock()
+	s.writers = make(map[string]*writerState)
+	s.mu.Unlock()
+
+	// Build bucket-level results.
 	buckets := make([]*pb.BucketCommitResult, 0, len(bucketTables))
 	for bucket, tables := range bucketTables {
-		// Determine bucket status from table statuses
-		bucketStatus := pb.BucketCommitResult_STATUS_COMMITTED
+		st := pb.BucketCommitResult_STATUS_COMMITTED
 		for _, t := range tables {
 			if t.Status == pb.TableCommitResult_STATUS_FAILED {
-				bucketStatus = pb.BucketCommitResult_STATUS_FAILED
+				st = pb.BucketCommitResult_STATUS_FAILED
 				break
 			}
 		}
-		buckets = append(buckets, &pb.BucketCommitResult{
-			Bucket: bucket,
-			Status: bucketStatus,
-			Tables: tables,
-		})
+		buckets = append(buckets, &pb.BucketCommitResult{Bucket: bucket, Status: st, Tables: tables})
 	}
 
-	return &pb.CommitResponse{
-		Success: allSuccess,
-		Buckets: buckets,
-	}, nil
+	if sweepErr != nil {
+		log.Printf("ERROR: commit sweep error: %v", sweepErr)
+	}
+	return &pb.CommitResponse{Success: allSuccess, Buckets: buckets}, nil
+}
+
+// writerProducedFiles reports whether the writer wrote any parquet files.
+func writerProducedFiles(ws *writerState) bool {
+	switch {
+	case ws.partitionRouter != nil:
+		return len(ws.partitionRouter.FilesWritten()) > 0
+	case ws.bufferMgr != nil:
+		return len(ws.bufferMgr.FilesWritten()) > 0
+	default:
+		return len(ws.externalFiles) > 0
+	}
 }
 
 // writeSchemaAndManifest writes the _schema.json and _manifest.json files for a writer.

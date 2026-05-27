@@ -418,6 +418,140 @@ func TestParseFilesManifest_V2(t *testing.T) {
 	}
 }
 
+// TestCommitTableFiles_SucceedsWithInMemoryPaths: CommitTableFiles with 2
+// in-memory paths and WriteModeAppend should succeed and report DataFilesAdded=2.
+func TestCommitTableFiles_SucceedsWithInMemoryPaths(t *testing.T) {
+	t.Parallel()
+	fx := newCommitSharedFixture(t, icebergtable.Identifier{"ns1", "tbl1"})
+
+	paths := []string{
+		fx.writeParquet("data/a.parquet", 1),
+		fx.writeParquet("data/b.parquet", 2),
+	}
+
+	res, err := CommitTableFiles(context.Background(), fx.cat, icebergtable.Identifier{"ns1", "tbl1"},
+		paths, WriteModeAppend, nil, "")
+	if err != nil {
+		t.Fatalf("CommitTableFiles: %v", err)
+	}
+	if res == nil {
+		t.Fatalf("nil result")
+	}
+	if res.DataFilesAdded != 2 {
+		t.Errorf("DataFilesAdded=%d want 2", res.DataFilesAdded)
+	}
+	if res.SnapshotIDAfter == "" {
+		t.Errorf("SnapshotIDAfter empty; want a snapshot ID after append")
+	}
+	if res.WriteMode != WriteModeAppend {
+		t.Errorf("WriteMode=%q want APPEND", res.WriteMode)
+	}
+}
+
+// TestCommitTableFiles_StampsSnapshotProps: caller-supplied audit props
+// (the BuildSnapshotSummary output the Data Gateway passes) must land on the
+// committed snapshot's summary, merged with the idempotency commit-key. This
+// is the audit-trail parity restored after RFC 021 (the inline-commit path
+// initially passed nil snapshotProps, so snapshots had empty actor/run-id).
+func TestCommitTableFiles_StampsSnapshotProps(t *testing.T) {
+	t.Parallel()
+	ident := icebergtable.Identifier{"ns1", "audit_tbl"}
+	fx := newCommitSharedFixture(t, ident)
+	path := fx.writeParquet("data/a.parquet", 1)
+
+	props := iceberg.Properties{
+		"datuplet.actor":        "user-123",
+		"datuplet.run-id":       "run-abc",
+		"datuplet.run-mode":     "cluster",
+		"datuplet.pipeline-api": "datuplet-api",
+	}
+	res, err := CommitTableFiles(context.Background(), fx.cat, ident,
+		[]string{path}, WriteModeAppend, props, "commit-key-xyz")
+	if err != nil {
+		t.Fatalf("CommitTableFiles: %v", err)
+	}
+	if res.SnapshotIDAfter == "" {
+		t.Fatal("expected a snapshot after append")
+	}
+
+	tbl, err := fx.cat.LoadTable(context.Background(), ident)
+	if err != nil {
+		t.Fatalf("load table: %v", err)
+	}
+	snaps := tbl.Metadata().Snapshots()
+	latest := snaps[len(snaps)-1]
+	if latest.Summary == nil || latest.Summary.Properties == nil {
+		t.Fatal("latest snapshot summary/properties nil")
+	}
+	got := latest.Summary.Properties
+	for k, want := range map[string]string{
+		"datuplet.actor":        "user-123",
+		"datuplet.run-id":       "run-abc",
+		"datuplet.run-mode":     "cluster",
+		"datuplet.pipeline-api": "datuplet-api",
+		"datuplet.commit-key":   "commit-key-xyz", // added by CommitTableFiles on top of audit props
+	} {
+		if got[k] != want {
+			t.Errorf("snapshot summary[%q]=%q want %q", k, got[k], want)
+		}
+	}
+}
+
+// TestCommitTableFiles_IdempotencyHit: first commit with key "test-key-abc"
+// should succeed; second commit with the same key but different paths should
+// short-circuit (idempotency hit) and leave the table with exactly 1 file.
+func TestCommitTableFiles_IdempotencyHit(t *testing.T) {
+	t.Parallel()
+	fx := newCommitSharedFixture(t, icebergtable.Identifier{"ns1", "idem_tbl"})
+
+	firstPath := fx.writeParquet("data/a.parquet", 1)
+	const key = "test-key-abc"
+
+	res1, err := CommitTableFiles(context.Background(), fx.cat, icebergtable.Identifier{"ns1", "idem_tbl"},
+		[]string{firstPath}, WriteModeAppend, nil, key)
+	if err != nil {
+		t.Fatalf("first CommitTableFiles: %v", err)
+	}
+	if res1.DataFilesAdded != 1 {
+		t.Errorf("first commit DataFilesAdded=%d want 1", res1.DataFilesAdded)
+	}
+	if res1.SnapshotIDAfter == "" {
+		t.Errorf("first commit SnapshotIDAfter empty")
+	}
+	if res1.IdempotencyHit {
+		t.Errorf("first commit IdempotencyHit=true; want false (real commit)")
+	}
+
+	// Second call: same key, different path — must be idempotency hit.
+	shouldNotBeAdded := fx.writeParquet("data/SHOULD_NOT_BE_ADDED.parquet", 999)
+	res2, err := CommitTableFiles(context.Background(), fx.cat, icebergtable.Identifier{"ns1", "idem_tbl"},
+		[]string{shouldNotBeAdded}, WriteModeAppend, nil, key)
+	if err != nil {
+		t.Fatalf("second CommitTableFiles: %v", err)
+	}
+	if res2 == nil {
+		t.Fatalf("second commit nil result")
+	}
+	if res2.SnapshotIDAfter == "" {
+		t.Errorf("second commit SnapshotIDAfter empty; want it populated via idempotency hit")
+	}
+	if !res2.IdempotencyHit {
+		t.Errorf("second commit IdempotencyHit=false; want true (skipped commit)")
+	}
+	// Table must still have exactly 1 data file.
+	tbl, err := fx.cat.LoadTable(context.Background(), icebergtable.Identifier{"ns1", "idem_tbl"})
+	if err != nil {
+		t.Fatalf("post-idempotency LoadTable: %v", err)
+	}
+	postFiles, err := listCurrentSnapshotFilePaths(context.Background(), tbl)
+	if err != nil {
+		t.Fatalf("listCurrentSnapshotFilePaths: %v", err)
+	}
+	if len(postFiles) != 1 {
+		t.Errorf("post-idempotency file count=%d want 1 (paths=%v)", len(postFiles), postFiles)
+	}
+}
+
 // TestParseFilesManifest_Empty: an empty paths/data_paths produces
 // ErrManifestEmpty.
 func TestParseFilesManifest_Empty(t *testing.T) {
@@ -429,5 +563,20 @@ func TestParseFilesManifest_Empty(t *testing.T) {
 	}
 	if err != ErrManifestEmpty {
 		t.Errorf("err=%v want ErrManifestEmpty", err)
+	}
+}
+
+// TestCommitTableFiles_RejectsCallerCommitKey: CommitTableFiles must return
+// an error immediately when the caller places "datuplet.commit-key" in
+// snapshotProps (the idempotency key must only be passed via idempotencyKey).
+func TestCommitTableFiles_RejectsCallerCommitKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fx := newCommitSharedFixture(t, icebergtable.Identifier{"ns1", "tbl1"})
+	_, err := CommitTableFiles(ctx, fx.cat, icebergtable.Identifier{"ns1", "tbl1"},
+		[]string{"s3://b/data/a.parquet"}, WriteModeAppend,
+		iceberg.Properties{"datuplet.commit-key": "x"}, "y")
+	if err == nil {
+		t.Fatal("expected error when caller sets snapshotProps[datuplet.commit-key]")
 	}
 }

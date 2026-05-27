@@ -1,6 +1,10 @@
 package datagateway
 
-import "github.com/datuplet/datuplet/pkg/datagateway/backend"
+import (
+	"time"
+
+	"github.com/datuplet/datuplet/pkg/datagateway/backend"
+)
 
 // Config contains the gateway server configuration.
 type Config struct {
@@ -47,6 +51,11 @@ type Config struct {
 	// short-circuits the ≤15-min STS-cred leak window after a cancel.
 	// Empty path = no cancel watcher (Docker + non-K8s deployments).
 	PodAnnotationsPath string `yaml:"pod_annotations_path,omitempty"`
+
+	// CancelPollInterval overrides the default 5s poll cadence for the cancel
+	// watcher. Zero means DefaultCancelPollInterval. Tests use a short value
+	// (e.g. 50ms) to avoid slow test runs.
+	CancelPollInterval time.Duration `yaml:"cancel_poll_interval,omitempty"`
 
 	// LakekeeperURL is the base URL of the Iceberg REST catalog (lakekeeper).
 	// When set, the gateway constructs a `pkg/datagateway/lakekeeper.Resolver`

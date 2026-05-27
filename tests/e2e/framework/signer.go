@@ -29,8 +29,8 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
 
-// loadClusterSigner shells to `kubectl get secret pipeline-api-signing-key`
-// in the e2e namespace (default `datuplet-e2e`, override via
+// loadClusterSigner shells to `kubectl get secret signing-key` in the
+// e2e namespace (default `datuplet-e2e`, override via
 // DATUPLET_E2E_NAMESPACE), decodes the embedded PEM, writes it to a
 // temp file, and loads it via tokens.LoadPrivateKeyFromPEMFile.
 func loadClusterSigner(ctx context.Context, keyID string) (*tokens.Signer, error) {
@@ -38,13 +38,21 @@ func loadClusterSigner(ctx context.Context, keyID string) (*tokens.Signer, error
 	if ns == "" {
 		ns = "datuplet-e2e"
 	}
+	// The platform signing-key Secret is named "signing-key" by the charts
+	// (datuplet-infra keygen Job; the prefix helper is intentionally empty —
+	// "namespace disambiguates" — and register.sh references
+	// SIGNING_KEY_SECRET="signing-key"). Overridable for non-default installs.
+	secretName := os.Getenv("DATUPLET_SIGNING_KEY_SECRET")
+	if secretName == "" {
+		secretName = "signing-key"
+	}
 	out, err := exec.CommandContext(ctx, "kubectl",
-		"-n", ns, "get", "secret", "pipeline-api-signing-key",
+		"-n", ns, "get", "secret", secretName,
 		"-o", `jsonpath={.data.signing-key\.pem}`).Output()
 	if err != nil {
 		return nil, fmt.Errorf(
-			"read pipeline-api-signing-key Secret via kubectl (is pipeline-api deployed in the %s namespace? "+
-				"set DATUPLET_LOCAL_DIR for local-mode runs): %w", ns, err)
+			"read %s Secret via kubectl (is the platform deployed in the %s namespace? "+
+				"set DATUPLET_LOCAL_DIR for local-mode runs): %w", secretName, ns, err)
 	}
 	b64 := strings.TrimSpace(string(out))
 	if b64 == "" {

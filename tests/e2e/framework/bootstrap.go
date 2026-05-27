@@ -202,16 +202,24 @@ func (c FGABootstrapConfig) Defaults() FGABootstrapConfig {
 func SetupFGABootstrap(ctx context.Context, cfg FGABootstrapConfig) (*FGAHarness, error) {
 	cfg = cfg.Defaults()
 
-	storeID, err := lookupFGAStore(ctx, cfg.OpenFGAURL, cfg.OpenFGAStoreName)
+	// OpenFGA runs with authn.method=preshared in the chart, so the
+	// store/model lookups need the bearer token too (not just the
+	// authorizer). Sourced from the OPENFGA_API_KEY env — set by
+	// scripts/e2e-port-forward.sh from the cluster secret, or exported by
+	// the developer on OrbStack. Empty token => no header (works against
+	// an authn=none OpenFGA).
+	fgaToken := os.Getenv("OPENFGA_API_KEY")
+
+	storeID, err := lookupFGAStore(ctx, cfg.OpenFGAURL, cfg.OpenFGAStoreName, fgaToken)
 	if err != nil {
 		return nil, fmt.Errorf("lookup OpenFGA store %q: %w", cfg.OpenFGAStoreName, err)
 	}
-	modelID, err := lookupFGAModel(ctx, cfg.OpenFGAURL, storeID, cfg.OpenFGAModelVersion)
+	modelID, err := lookupFGAModel(ctx, cfg.OpenFGAURL, storeID, cfg.OpenFGAModelVersion, fgaToken)
 	if err != nil {
 		return nil, fmt.Errorf("lookup OpenFGA model collaboration-%s: %w", cfg.OpenFGAModelVersion, err)
 	}
 
-	authzr, err := authz.NewOpenFGAAuthorizer(cfg.OpenFGAURL, storeID, modelID, os.Getenv("OPENFGA_API_KEY"), 5*time.Second)
+	authzr, err := authz.NewOpenFGAAuthorizer(cfg.OpenFGAURL, storeID, modelID, fgaToken, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("new OpenFGAAuthorizer: %w", err)
 	}
@@ -368,12 +376,15 @@ func LoadSigner(ctx context.Context, path, keyID string) (*tokens.Signer, error)
 // lookupFGAStore returns the ULID of the named store, or an error if
 // it doesn't exist. The store must already exist (created by the
 // install-time `pipeline-api admin authz-bootstrap` job).
-func lookupFGAStore(ctx context.Context, baseURL, name string) (string, error) {
+func lookupFGAStore(ctx context.Context, baseURL, name, token string) (string, error) {
 	c := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		strings.TrimRight(baseURL, "/")+"/stores", nil)
 	if err != nil {
 		return "", err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := c.Do(req)
 	if err != nil {
@@ -407,7 +418,7 @@ func lookupFGAStore(ctx context.Context, baseURL, name string) (string, error) {
 // lookupFGAModel reads the model_version:collaboration-<version> /
 // openfga_id tuple to resolve the active model ID. Mirrors
 // fgaFindVersionPinnedModelID in cmd/pipeline-api/admin_authz.go.
-func lookupFGAModel(ctx context.Context, baseURL, storeID, version string) (string, error) {
+func lookupFGAModel(ctx context.Context, baseURL, storeID, version, token string) (string, error) {
 	c := &http.Client{Timeout: 10 * time.Second}
 	url := strings.TrimRight(baseURL, "/") + "/stores/" + storeID + "/read"
 	body, _ := json.Marshal(map[string]any{
@@ -421,6 +432,9 @@ func lookupFGAModel(ctx context.Context, baseURL, storeID, version string) (stri
 		return "", err
 	}
 	req.Header.Set("content-type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	resp, err := c.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("POST /read: %w", err)

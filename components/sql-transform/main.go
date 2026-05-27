@@ -14,8 +14,8 @@
 //   3. Executes the user-supplied SQL inside DuckDB.
 //   4. Streams each declared output back through the SDK's OpenWriter +
 //      WriteChunk path so DG owns parquet emission to the iceberg target
-//      prefix. The post-stage iceberg-job table-commit Job picks up the
-//      per-target files.json and runs txn.AddFiles / txn.ReplaceDataFiles.
+//      prefix. DG commits the iceberg transaction inline (RFC 021); the
+//      per-target files.json is a recovery/observability breadcrumb only.
 //
 // The component never touches S3 — DG mediates both sides (read + write).
 package main
@@ -154,7 +154,7 @@ func run(ctx context.Context) error {
 		client.Log(ctx, "INFO", fmt.Sprintf("output %s.%s wrote %d rows", out.Bucket, out.Table, rows)) //nolint:errcheck
 	}
 
-	// Commit (DG flushes per-target files.json; iceberg-job picks it up post-stage).
+	// Commit (DG runs the inline iceberg transaction; files.json is a breadcrumb only).
 	if _, err := client.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}

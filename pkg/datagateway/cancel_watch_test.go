@@ -6,6 +6,11 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/apache/iceberg-go/catalog"
+	icebergtable "github.com/apache/iceberg-go/table"
+
+	"github.com/datuplet/datuplet/pkg/icebergjob"
 )
 
 // TestWatchCancelAnnotation_FiresOnTrue exercises the happy path:
@@ -116,5 +121,96 @@ func TestReadCancelAnnotation_MultilineFormat(t *testing.T) {
 	}
 	if got {
 		t.Fatal("readCancelAnnotation should ignore false")
+	}
+}
+
+// TestCancelAnnotation_CancelsCommitPool verifies that when the pod-annotations
+// cancel marker fires, the commit pool is cancelled so in-flight commit
+// goroutines are unblocked and return a non-nil error.
+//
+// This test MUST fail if the wiring in server_v2.go (the `s.commitPool.Cancel()`
+// call inside the cancel-watcher goroutine) is removed.
+func TestCancelAnnotation_CancelsCommitPool(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	annotationsPath := filepath.Join(dir, "annotations")
+
+	// Start with non-cancel content so the watcher doesn't fire prematurely.
+	if err := os.WriteFile(annotationsPath, []byte("other.io/foo=\"bar\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		RunID:              "cancel-pool-test-run",
+		ComponentName:      "test",
+		DefaultBucket:      "raw",
+		Backend:            newMockBackend(),
+		PodAnnotationsPath: annotationsPath,
+		CancelPollInterval: 50 * time.Millisecond,
+	}
+	server := NewServerV2(cfg)
+
+	// blockCh lets the test control when the CommitFn unblocks.
+	// The CommitFn blocks until its context is cancelled.
+	// Buffered so the send never races with the test's receive.
+	commitStarted := make(chan struct{}, 1)
+	pool := NewCommitPool(CommitPoolConfig{
+		Workers:      2,
+		MaxQueueSize: 16,
+		CatalogFn:    func(context.Context) (catalog.Catalog, error) { return nil, nil },
+		CommitFn: func(ctx context.Context, _ catalog.Catalog, _ icebergtable.Identifier,
+			_ []string, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			// Signal that the commit goroutine is running, then block until
+			// the pool's context is cancelled.
+			commitStarted <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	server.setCommitPoolForTest(pool)
+
+	// Dispatch one job so the blocking CommitFn is in flight.
+	err := pool.Dispatch(context.Background(), CommitJob{
+		WriterID:  "w1",
+		Namespace: "ns",
+		Table:     "orders",
+		RunID:     "cancel-pool-test-run",
+		DataPaths: []string{"s3://b/f.parquet"},
+		Mode:      icebergjob.WriteModeAppend,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+
+	// Wait until the commit goroutine is actually blocked inside CommitFn.
+	select {
+	case <-commitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit goroutine did not start within 5s")
+	}
+
+	// Now flip the annotations file to trigger the cancel watcher.
+	body := "other.io/foo=\"bar\"\ndatuplet.io/cancel=\"true\"\n"
+	if err := os.WriteFile(annotationsPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// pool.Wait must return once the pool is cancelled. Use a short-poll
+	// goroutine so the test can impose its own deadline.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+
+	results := pool.Wait(waitCtx)
+
+	if waitCtx.Err() != nil {
+		t.Fatal("pool.Wait timed out — commit pool was not cancelled by the cancel watcher (wiring missing?)")
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 commit result, got %d", len(results))
+	}
+	if results[0].Err == nil {
+		t.Error("expected in-flight commit to have a non-nil error after pool cancel, got nil")
 	}
 }

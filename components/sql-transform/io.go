@@ -203,7 +203,8 @@ func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir
 // writeOutput materializes one DuckDB table to local parquet then streams
 // it to DG via OpenWriter + WriteChunk. The DG writer handles parquet
 // re-emission to the iceberg target prefix using lakekeeper-vended creds
-// and writes the per-target files.json the post-stage iceberg-job consumes.
+// and commits the iceberg transaction inline (RFC 021). The per-target
+// files.json is a recovery/observability breadcrumb, not an iceberg-job input.
 //
 // Returns the row count of the produced output (best-effort — DG also
 // reports total_rows on Close).

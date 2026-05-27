@@ -14,6 +14,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/datagateway/manifest"
 	"github.com/datuplet/datuplet/pkg/datagateway/processor"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
+	"github.com/datuplet/datuplet/pkg/icebergjob"
 	"github.com/datuplet/datuplet/pkg/lib/controlfile"
 )
 
@@ -228,13 +229,11 @@ func (s *ServerV2) CloseWriter(ctx context.Context, req *pb.CloseWriterRequest) 
 		return nil, fmt.Errorf("unknown writer: %s", req.WriterId)
 	}
 
-	// CRITICAL DIAGNOSTIC: Log external files received
 	extFilesCount := len(req.GetExternalFiles())
-	log.Printf("CloseWriter received: writerID=%s, external_files_count=%d, bucket=%s, table=%s",
-		req.WriterId, extFilesCount, ws.bucket, ws.table)
 
 	// Check if component provided external files (e.g., DuckDB writing directly to S3)
 	if extFilesCount > 0 {
+		log.Printf("CloseWriter: writerID=%s external_files=%d bucket=%s table=%s", req.WriterId, extFilesCount, ws.bucket, ws.table)
 		// Reject external files for partitioned tables
 		if len(ws.partitionFields) > 0 {
 			return nil, fmt.Errorf("external files not supported for partitioned tables")
@@ -267,6 +266,14 @@ func (s *ServerV2) CloseWriter(ctx context.Context, req *pb.CloseWriterRequest) 
 		ws.totalRows = totalRows
 		ws.totalBytes = totalBytes
 
+		// Dispatch inline commit for external-files writers. The closed
+		// flag is intentionally NOT set here — external-files writers have
+		// no buffer/router to close, so the Commit sweep's needClose check
+		// is already a no-op for them.
+		if err := s.finalizeAndDispatch(ctx, ws, s.config.GetRunID()); err != nil {
+			return nil, err
+		}
+
 		return &pb.CloseWriterResponse{
 			TotalRows:    totalRows,
 			TotalBytes:   totalBytes,
@@ -292,9 +299,140 @@ func (s *ServerV2) CloseWriter(ctx context.Context, req *pb.CloseWriterRequest) 
 		ws.totalBytes = stats.TotalBytesFlushed
 	}
 
+	// Mark buffer/router as closed so the Commit sweep doesn't attempt a
+	// second Close (which is not guaranteed idempotent).
+	s.mu.Lock()
+	ws.closed = true
+	s.mu.Unlock()
+
+	// Dispatch inline commit for the now-closed buffer/router.
+	if err := s.finalizeAndDispatch(ctx, ws, s.config.GetRunID()); err != nil {
+		return nil, err
+	}
+
 	return &pb.CloseWriterResponse{
 		TotalRows:    ws.totalRows,
 		TotalBytes:   ws.totalBytes,
 		FilesWritten: filesWritten,
 	}, nil
+}
+
+// finalizeAndDispatch collects a closed writer's parquet paths, writes the
+// schema/manifest + files.json breadcrumb, then dispatches the iceberg commit
+// to the pool. The writer's buffer/router must already be closed before calling
+// this for standard writers; for external-files writers the buffer/router is
+// never opened, so there is nothing to close first.
+//
+// Claims the writer under s.mu (sets ws.committed) then releases the lock for
+// all I/O. MUST be called WITHOUT s.mu held. No-op when the writer is already
+// claimed. When s.commitPool is nil (test/static-backend mode) the writer is
+// still claimed and metadata is written, but no commit is dispatched.
+func (s *ServerV2) finalizeAndDispatch(ctx context.Context, ws *writerState, runID string) error {
+	s.mu.Lock()
+	if ws.committed {
+		s.mu.Unlock()
+		return nil
+	}
+	ws.committed = true
+	s.mu.Unlock()
+
+	var paths []string
+	switch {
+	case ws.partitionRouter != nil:
+		for _, pf := range ws.partitionRouter.FilesWritten() {
+			paths = append(paths, pf.FileInfo.Path)
+		}
+	case ws.bufferMgr != nil:
+		for _, f := range ws.bufferMgr.FilesWritten() {
+			paths = append(paths, f.Path)
+		}
+	case len(ws.externalFiles) > 0:
+		for _, f := range ws.externalFiles {
+			paths = append(paths, f.Path)
+		}
+	}
+
+	if len(ws.externalFiles) > 0 {
+		if ws.schema == nil {
+			return fmt.Errorf("external files but no schema for %s.%s", ws.bucket, ws.table)
+		}
+		if err := s.patchParquetFieldIDs(ctx, ws); err != nil {
+			return fmt.Errorf("patch parquet field IDs %s.%s: %w", ws.bucket, ws.table, err)
+		}
+	}
+
+	if ws.schema != nil && len(paths) > 0 {
+		if err := s.writeSchemaAndManifest(ctx, ws, runID); err != nil {
+			if len(ws.externalFiles) > 0 {
+				return fmt.Errorf("write manifest %s.%s: %w", ws.bucket, ws.table, err)
+			}
+			log.Printf("Warning: schema/manifest write failed for %s.%s: %v", ws.bucket, ws.table, err)
+		}
+	}
+	if ws.writerBackend != nil {
+		for _, p := range paths {
+			s.filesManifest.Append(ws.bucket, ws.table, p)
+		}
+		if err := s.persistTableManifest(ctx, ws.writerBackend, ws.basePath, ws.bucket, ws.table, runID); err != nil {
+			log.Printf("Warning: files.json breadcrumb write failed for %s.%s: %v", ws.bucket, ws.table, err)
+		}
+	}
+
+	if s.commitPool == nil {
+		return nil
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	mode := icebergjob.WriteModeAppend
+	if m := s.writeModeForTable(ws.bucket, ws.table); m != "" {
+		mode = m
+	}
+	if err := s.commitPool.Dispatch(ctx, CommitJob{
+		WriterID: ws.writerID, Namespace: ws.bucket, Table: ws.table,
+		DataPaths: paths, Mode: mode, RunID: runID,
+	}); err != nil {
+		return fmt.Errorf("dispatch commit %s.%s: %w", ws.bucket, ws.table, err)
+	}
+	log.Printf("dispatched inline commit: writer=%s table=%s.%s files=%d mode=%s", ws.writerID, ws.bucket, ws.table, len(paths), mode)
+	return nil
+}
+
+// writeModeForTable returns the configured WriteMode for the given (bucket,
+// table) pair, or "" if no explicit mode is set (caller defaults to APPEND).
+// Matches on BOTH bucket AND table — never on table name alone — to prevent
+// accidentally applying FULL_LOAD to a same-named table in a different bucket.
+//
+// Resolution order:
+//  1. Explicit OutputTables entry matching (bucket, table) — highest priority.
+//  2. DefaultBucket + DefaultWriteMode: applies to every table written to the
+//     default bucket (the common "defaultBucket: FULL_LOAD" pipeline form).
+//  3. No match → "" (caller defaults to APPEND).
+//
+// OutputBuckets entries are plain strings with no per-bucket write mode, so
+// they are intentionally not consulted here.
+func (s *ServerV2) writeModeForTable(bucket, table string) icebergjob.WriteMode {
+	// 1. Explicit per-table config wins.
+	for _, t := range s.config.OutputTables {
+		if t.Bucket == bucket && t.Name == table {
+			switch strings.ToUpper(t.WriteMode) {
+			case "FULL_LOAD":
+				return icebergjob.WriteModeFullLoad
+			default:
+				return icebergjob.WriteModeAppend
+			}
+		}
+	}
+	// 2. DefaultBucket + DefaultWriteMode fallback: covers the common pipeline
+	// form where all outputs go to a single default bucket and the operator
+	// sets default_write_mode (defaults to "FULL_LOAD" when not specified).
+	if s.config.DefaultBucket != "" && s.config.DefaultBucket == bucket {
+		if strings.ToUpper(s.config.DefaultWriteMode) == "FULL_LOAD" {
+			return icebergjob.WriteModeFullLoad
+		}
+		// DefaultBucket set but mode is APPEND (or empty → operator defaults
+		// FULL_LOAD, so empty here means something unusual — default to APPEND).
+		return icebergjob.WriteModeAppend
+	}
+	return ""
 }

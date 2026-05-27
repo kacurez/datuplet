@@ -3,7 +3,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
@@ -52,29 +51,20 @@ type PipelineRunReconciler struct {
 	Scheme       *runtime.Scheme
 	GatewayImage string
 
-	// The fields below drive commit Job construction.
-	// The TableCommit CRD and tablecommit-operator have been removed;
-	// the PipelineRun controller builds commit Jobs directly.
-
-	// TableCommitImage is the image used for the spawned commit Jobs.
-	TableCommitImage string
-	// LakekeeperURL is the catalog REST base URL the spawned commit
-	// container points at (e.g.
+	// LakekeeperURL is the catalog REST base URL injected into the
+	// Data Gateway sidecar configMap (e.g.
 	// http://lakekeeper.lakekeeper.svc.cluster.local:8181/catalog).
 	// Required in production K8s; empty in tests.
 	LakekeeperURL string
 	// PipelineAPIURL is the base URL of pipeline-api. The operator derives the
 	// JWKS URL (PipelineAPIURL + "/api/v1/auth/jwks.json") and injects it into
-	// every DG sidecar configMap + commit Job env. Empty disables the injection
-	// (dev paths).
+	// every DG sidecar configMap. Empty disables the injection (dev paths).
 	PipelineAPIURL string
-	// S3 long-lived credentials are not used. Commit Jobs use the run-token
-	// JWT and lakekeeper-vended STS credentials exclusively.
 
 	Clientset kubernetes.Interface
 
 	// RuntimeTolerations are injected onto every per-run Pod spec (component
-	// Jobs and TableCommit Jobs) spawned by this operator. Populated from
+	// Jobs) spawned by this operator. Populated from
 	// DATUPLET_RUN_TOLERATIONS_JSON at startup. Nil means no injection.
 	RuntimeTolerations []corev1.Toleration
 
@@ -103,8 +93,8 @@ type PipelineRunReconciler struct {
 	GatewayProfilingPassword string
 
 	// RuntimePullPolicy is applied to every container the operator
-	// builds at runtime (gateway sidecar, component container, commit
-	// Job container). Sourced from DATUPLET_RUNTIME_PULL_POLICY env
+	// builds at runtime (gateway sidecar, component container). Sourced from
+	// DATUPLET_RUNTIME_PULL_POLICY env
 	// which the chart wires from .Values.image.pullPolicy.
 	//
 	// Production iteration-loop deploys want PullAlways so re-pushed
@@ -316,9 +306,6 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 	case datupletv1.StagePhaseRunning:
 		// Check component status
 		return r.checkStageComponents(ctx, pr, pipeline, currentStageIdx)
-	case datupletv1.StagePhaseCommitting:
-		// Check TableCommit status
-		return r.checkStageCommits(ctx, pr, pipeline, currentStageIdx)
 	case datupletv1.StagePhaseFailedUser:
 		// Stage failed due to user error - fail the entire run
 		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
@@ -554,8 +541,16 @@ func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *da
 	}
 
 	if allSucceeded {
-		// All components done - start committing
-		return r.startStageCommits(ctx, pr, pipeline, stageIdx)
+		// All components done - DG already owns commit; transition directly to Succeeded.
+		stageStatus.Phase = datupletv1.StagePhaseSucceeded
+		now := metav1.Now()
+		stageStatus.CompletionTime = &now
+		logger.Info("Stage completed successfully", "stage", stage.Name)
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
 	}
 
 	// Still running - keep requeue cadence; log Update failures (next tick will retry).
@@ -565,213 +560,7 @@ func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *da
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
 }
 
-// startStageCommits schedules a `batch/v1.Job` per (stage, bucket).
-// The TableCommit CRD and tablecommit-operator have been removed; the
-// PipelineRun controller creates commit Jobs directly. The builder lives
-// in pipelinerun_commit_jobs.go (`buildCommitJob`); owner reference points
-// at the PipelineRun so kubectl-driven deletion + GC stay consistent.
-// K8s native Job machinery (BackoffLimit, TTLSecondsAfterFinished) handles
-// retry and cleanup.
-func (r *PipelineRunReconciler) startStageCommits(ctx context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, stageIdx int) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	stage := &pipeline.Spec.Stages[stageIdx]
-	stageStatus := &pr.Status.StageStatuses[stageIdx]
-
-	logger.Info("Starting commits for stage", "stage", stage.Name)
-
-	// Collect unique buckets to commit (commits happen at bucket level)
-	// For each bucket, track the write mode (if any output uses FULL_LOAD, use FULL_LOAD)
-	type bucketInfo struct {
-		writeMode datupletv1.WriteMode
-	}
-	bucketsToCommit := make(map[string]bucketInfo)
-	for _, comp := range stage.Components {
-		if comp.Outputs == nil {
-			continue
-		}
-
-		// Include defaultBucket mode
-		if comp.Outputs.DefaultBucket != "" {
-			info := bucketsToCommit[comp.Outputs.DefaultBucket]
-			writeMode := strings.ToUpper(comp.Outputs.DefaultWriteMode)
-			if writeMode == "FULL_LOAD" {
-				info.writeMode = datupletv1.WriteModeFullLoad
-			} else if info.writeMode == "" {
-				info.writeMode = datupletv1.WriteModeAppend
-			}
-			bucketsToCommit[comp.Outputs.DefaultBucket] = info
-		}
-
-		// Include explicit bucket outputs
-		for _, bucketSpec := range comp.Outputs.Buckets {
-			info := bucketsToCommit[bucketSpec.Name]
-			writeMode := strings.ToUpper(bucketSpec.WriteMode)
-			if writeMode == "FULL_LOAD" {
-				info.writeMode = datupletv1.WriteModeFullLoad
-			} else if info.writeMode == "" {
-				info.writeMode = datupletv1.WriteModeAppend
-			}
-			bucketsToCommit[bucketSpec.Name] = info
-		}
-
-		// Include explicit table outputs (aggregate by bucket)
-		for _, tableSpec := range comp.Outputs.Tables {
-			info := bucketsToCommit[tableSpec.Bucket]
-			writeMode := strings.ToUpper(tableSpec.WriteMode)
-			// Default to APPEND, but if any output uses FULL_LOAD, use FULL_LOAD
-			if writeMode == "FULL_LOAD" {
-				info.writeMode = datupletv1.WriteModeFullLoad
-			} else if info.writeMode == "" {
-				info.writeMode = datupletv1.WriteModeAppend
-			}
-			bucketsToCommit[tableSpec.Bucket] = info
-		}
-	}
-
-	// Create commit Job for each bucket. The PipelineRun.Status.TableCommits
-	// surface stays — it's already exposed to UI/pipeline-api consumers.
-	// We just stop pointing at TableCommit CRDs and start pointing at the
-	// commit Job names instead.
-	pr.Status.TableCommits = nil
-	for bucket, info := range bucketsToCommit {
-		job := r.buildCommitJob(pr, bucket, info.writeMode)
-
-		// Owner-ref to the PipelineRun: kubectl-driven delete or run
-		// reaper sweeps the commit Job along with its sibling component
-		// Jobs / ConfigMaps / run-token Secret.
-		if err := ctrl.SetControllerReference(pr, job, r.Scheme); err != nil {
-			logger.Error(err, "Failed to set controller reference for commit Job")
-			return ctrl.Result{}, err
-		}
-
-		if err := r.Create(ctx, job); err != nil && !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create commit Job", "bucket", bucket)
-			return ctrl.Result{}, err
-		}
-
-		pr.Status.TableCommits = append(pr.Status.TableCommits, datupletv1.TableCommitRef{
-			Name:   job.Name,
-			Bucket: bucket,
-			Phase:  datupletv1.TableCommitPhasePending,
-		})
-
-		logger.Info("Created commit Job", "job", job.Name, "bucket", bucket)
-	}
-
-	// No buckets to commit (stage has no output declarations).
-	// Mark stage Succeeded directly.
-	if len(bucketsToCommit) == 0 {
-		stageStatus.Phase = datupletv1.StagePhaseSucceeded
-		now := metav1.Now()
-		stageStatus.CompletionTime = &now
-		logger.Info("Stage succeeded (no output buckets to commit)", "stage", stage.Name)
-		if err := r.Status().Update(ctx, pr); err != nil {
-			logger.Error(err, "Failed to update PipelineRun status")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
-	}
-
-	stageStatus.Phase = datupletv1.StagePhaseCommitting
-
-	if err := r.Status().Update(ctx, pr); err != nil {
-		logger.Error(err, "Failed to update PipelineRun status")
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
-}
-
-// checkStageCommits inspects the commit Jobs scheduled for a stage and
-// folds their results back into pr.Status. Job failures are always
-// classified as FailedApplication — same contract the deleted
-// TableCommit CRD documented.
-func (r *PipelineRunReconciler) checkStageCommits(ctx context.Context, pr *datupletv1.PipelineRun, _ *datupletv1.Pipeline, stageIdx int) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	stageStatus := &pr.Status.StageStatuses[stageIdx]
-
-	allSucceeded := true
-	anyFailed := false
-	var failedBucket string
-	var failedMessage string
-
-	for i, ref := range pr.Status.TableCommits {
-		job, ok, err := r.commitJobLookup(ctx, pr, ref.Bucket)
-		if err != nil {
-			logger.Error(err, "Failed to get commit Job", "bucket", ref.Bucket)
-			return ctrl.Result{}, err
-		}
-		if !ok {
-			logger.Info("Commit Job not found, waiting...", "bucket", ref.Bucket)
-			allSucceeded = false
-			continue
-		}
-
-		phase := commitJobPhase(job)
-		pr.Status.TableCommits[i].Phase = phase
-
-		switch phase {
-		case datupletv1.TableCommitPhaseSucceeded:
-			// Good. The DUPLET_STATUS_MESSAGE log-tail is opportunistic
-			// for success — no need to surface per-bucket success blurbs
-			// up to the run unless we eventually want to.
-		case datupletv1.TableCommitPhaseFailedApplication:
-			anyFailed = true
-			failedBucket = ref.Bucket
-			// Pull the structured DUPLET_STATUS_MESSAGE from the commit
-			// Pod's logs so the operator's `kubectl describe` shows the
-			// real failure rather than the opaque Job condition.
-			exitCode := r.extractCommitJobExitCode(ctx, job)
-			code := -1
-			if exitCode != nil {
-				code = int(*exitCode)
-			}
-			if msg := r.extractCommitJobStatusMessage(ctx, job, code); msg != "" {
-				failedMessage = msg
-			}
-		default:
-			allSucceeded = false
-		}
-	}
-
-	// Check final state - commit Job failures are always application errors
-	if anyFailed {
-		stageStatus.Phase = datupletv1.StagePhaseFailedApplication
-		if failedMessage != "" {
-			stageStatus.Message = fmt.Sprintf("Commit Job for bucket '%s' failed: %s", failedBucket, failedMessage)
-		} else {
-			stageStatus.Message = fmt.Sprintf("Commit Job for bucket '%s' failed", failedBucket)
-		}
-		now := metav1.Now()
-		stageStatus.CompletionTime = &now
-		if err := r.Status().Update(ctx, pr); err != nil {
-			logger.Error(err, "Failed to update PipelineRun status")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
-	if allSucceeded {
-		// All commits done - stage succeeded
-		stageStatus.Phase = datupletv1.StagePhaseSucceeded
-		now := metav1.Now()
-		stageStatus.CompletionTime = &now
-		logger.Info("Stage completed successfully", "stage", stageStatus.Name)
-	}
-
-	if err := r.Status().Update(ctx, pr); err != nil {
-		logger.Error(err, "Failed to update PipelineRun status")
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
-}
-
 // SetupWithManager sets up the controller with the Manager.
-// Both component Jobs and commit Jobs are owned directly by the
-// PipelineRun, so a single `Owns(&batchv1.Job{})` watch covers both.
 func (r *PipelineRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&datupletv1.PipelineRun{}).

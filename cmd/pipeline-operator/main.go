@@ -96,23 +96,18 @@ func validateToleration(t corev1.Toleration) error {
 func main() {
 	var probeAddr string
 	var gatewayImage string
-	// Commit-Job image flag (formerly on tablecommit-operator, now on this
-	// operator). The image is named iceberg-job.
-	var icebergJobImage string
 	var lakekeeperURL string
 	var pipelineAPIURL string
 
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&gatewayImage, "gateway-image", "datuplet/gateway:latest", "The image to use for gateway sidecars.")
-	flag.StringVar(&icebergJobImage, "iceberg-job-image", "datuplet/iceberg-job:latest",
-		"The image to use for iceberg-job (table-commit) jobs scheduled directly by this operator.")
 	flag.StringVar(&lakekeeperURL, "lakekeeper-url", "",
-		"Catalog REST base URL the spawned commit container "+
-			"uses (e.g. http://lakekeeper.lakekeeper.svc.cluster.local:8181/catalog). "+
+		"Catalog REST base URL injected into the Data Gateway sidecar configMap "+
+			"(e.g. http://lakekeeper.lakekeeper.svc.cluster.local:8181/catalog). "+
 			"Also LAKEKEEPER_URL env var.")
 	flag.StringVar(&pipelineAPIURL, "pipeline-api-url", "",
 		"Base URL of pipeline-api (e.g. http://pipeline-api.datuplet.svc.cluster.local:8081). "+
-			"Spawned DG sidecars + commit Jobs use this to fetch the JWKS for run-token validation. "+
+			"Injected into DG sidecars for JWKS-based run-token validation. "+
 			"Also PIPELINE_API_URL env var.")
 
 	opts := zap.Options{
@@ -141,15 +136,9 @@ func main() {
 			gatewayImage = env
 		}
 	}
-	if !explicit["iceberg-job-image"] {
-		if env := os.Getenv("ICEBERG_JOB_IMAGE"); env != "" {
-			icebergJobImage = env
-		}
-	}
 	// S3_ENDPOINT / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY /
-	// S3_USE_PATH_STYLE are no longer read. Commit Job Pods carry zero long-
-	// lived S3 credentials; all storage access uses lakekeeper-vended STS
-	// credentials via the run-token JWT.
+	// S3_USE_PATH_STYLE are not read. Data Gateway sidecars use only
+	// lakekeeper-vended STS credentials via the run-token JWT.
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -207,14 +196,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set up PipelineRun controller — the sole reconciler for both
-	// component Jobs and commit Jobs.
+	// Set up PipelineRun controller.
 	if err = (&controllers.PipelineRunReconciler{
-		Client:                        mgr.GetClient(),
-		Scheme:                        mgr.GetScheme(),
-		GatewayImage:                  gatewayImage,
-		TableCommitImage:              icebergJobImage,
-		LakekeeperURL:                 lakekeeperURL,
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		GatewayImage: gatewayImage,
+		LakekeeperURL: lakekeeperURL,
 		PipelineAPIURL:                pipelineAPIURL,
 		Clientset:                     clientset,
 		RuntimeTolerations:            runTolerations,

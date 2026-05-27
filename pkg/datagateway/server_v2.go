@@ -20,6 +20,9 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go/catalog"
+	icebergtable "github.com/apache/iceberg-go/table"
+	"github.com/datuplet/datuplet/pkg/icebergjob"
 	"github.com/datuplet/datuplet/pkg/lib/secrets"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -82,8 +85,9 @@ type ServerV2 struct {
 
 	// filesManifest accumulates the parquet paths written during the
 	// run, grouped by (namespace, table). Persisted at end-of-stream
-	// to `<table-base>/.run-state/<run-id>/files.json` for TableCommit
-	// to consume.
+	// to `<table-base>/.run-state/<run-id>/files.json` as a
+	// recovery/observability breadcrumb (RFC 021 — DG commits inline;
+	// no external TableCommit Job consumes this anymore).
 	filesManifest *FilesManifest
 
 	// lakekeeperResolver is constructed at boot when Config.LakekeeperURL
@@ -91,6 +95,12 @@ type ServerV2 struct {
 	// backend construction for both writes and reads.
 	// nil when DG runs without lakekeeper (tests, legacy Docker).
 	lakekeeperResolver *dglakekeeper.Resolver
+
+	// commitPool dispatches per-table iceberg commits inline after
+	// CloseWriter. nil when lakekeeperResolver is nil (test/static-backend
+	// mode). In that case CloseWriter still writes metadata but skips the
+	// commit dispatch.
+	commitPool *CommitPool
 
 	// validatedClaims holds the validated run-token JWT claims set during
 	// boot. Non-nil only when the run-token was successfully validated
@@ -155,6 +165,17 @@ type writerState struct {
 	// basePath == "" (or schema == nil) and race on building duplicate
 	// BufferManager / partitionRouter / per-writer backend instances.
 	initMu sync.Mutex
+
+	// committed is set once finalizeAndDispatch has CLAIMED this writer,
+	// so a later defensive sweep in Commit() does not double-process it.
+	// Set under s.mu.
+	committed bool
+
+	// closed is set the first time this writer's buffer/router is closed
+	// (by CloseWriter). The Commit sweep checks it to avoid a second
+	// Close() call (buffer/router Close is not guaranteed idempotent).
+	// Set under s.mu.
+	closed bool
 }
 
 // readerState holds the state for an active reader.
@@ -255,6 +276,27 @@ func NewServerV2(cfg *Config) *ServerV2 {
 		}
 		s.lakekeeperResolver = res
 
+		// Audit summary stamped on every inline-commit snapshot: actor /
+		// run-id / run-mode / pipeline-api, parsed from the run-token JWT
+		// claims (same shape the deleted TableCommit Job wrote via
+		// BuildSnapshotSummary). Computed once — the token is fixed for the
+		// gateway's lifetime. nil when there's no run-token (dev/test); then
+		// snapshots carry only the commit-key, as before. CommitTableFiles
+		// merges these with the idempotency key it adds.
+		auditProps := icebergjob.BuildSnapshotSummary(runToken, cfg.GetRunID())
+
+		// Inline-commit pool: dispatches per-table iceberg commits after
+		// CloseWriter. Workers/queue are small fixed defaults — RFC 021
+		// open-question: make them env-configurable in a later slice.
+		s.commitPool = NewCommitPool(CommitPoolConfig{
+			Workers:      4,
+			MaxQueueSize: 256,
+			CatalogFn:    s.lakekeeperResolver.Catalog,
+			CommitFn: func(ctx context.Context, cat catalog.Catalog, ident icebergtable.Identifier, paths []string, mode icebergjob.WriteMode, key string) (*icebergjob.CommitResult, error) {
+				return icebergjob.CommitTableFiles(ctx, cat, ident, paths, mode, auditProps, key)
+			},
+		})
+
 		// Wire the per-gateway run-token into datupleticeio's
 		// loadTable-refresh path so iceberg-go's `gs://` IO factory
 		// can re-fetch fresh GCS vended creds when the initial token
@@ -271,7 +313,7 @@ func NewServerV2(cfg *Config) *ServerV2 {
 	// Kick off the in-band cancel watcher. WatchCancelAnnotation is a
 	// no-op when PodAnnotationsPath is empty (Docker / non-K8s).
 	go func() {
-		if err := WatchCancelAnnotation(cancelCtx, cfg.PodAnnotationsPath, 0); err == nil {
+		if err := WatchCancelAnnotation(cancelCtx, cfg.PodAnnotationsPath, cfg.CancelPollInterval); err == nil {
 			// Returning nil means cancellation was requested. Signal
 			// the rest of the server by cancelling cancelCtx; the
 			// gateway's main loop watches it and exits gracefully.
@@ -279,6 +321,10 @@ func NewServerV2(cfg *Config) *ServerV2 {
 			// TODO: also abort in-flight S3 uploads here so we exit faster
 			// than the gRPC graceful-stop timeout (future improvement).
 			log.Printf("datuplet.io/cancel=true observed on pod annotations; initiating graceful shutdown")
+			if s.commitPool != nil {
+				log.Printf("cancel: cancelling commit pool")
+				s.commitPool.Cancel()
+			}
 			cancelStop()
 		}
 	}()
@@ -677,6 +723,17 @@ func (s *ServerV2) Close() error {
 		if err := s.httpServer.Shutdown(ctx); err != nil {
 			log.Printf("Warning: HTTP server shutdown error: %v", err)
 		}
+	}
+
+	// Drain the inline-commit pool before releasing the lakekeeper
+	// resolver. Cancel first so new Dispatches are rejected; then Wait
+	// with a bounded timeout so in-flight commits can finish cleanly
+	// before the catalog connection goes away.
+	if s.commitPool != nil {
+		s.commitPool.Cancel()
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		s.commitPool.Wait(drainCtx)
+		drainCancel()
 	}
 
 	// Release the lakekeeper resolver's resources. For SQLite-filesystem
