@@ -68,6 +68,23 @@ maybe_pf 8181  lakekeeper   8181 Lakekeeper
 maybe_pf 30081 pipeline-api 8081 pipeline-api
 maybe_pf 30900 minio        9000 MinIO
 
+# OpenFGA runs with authn.method=preshared (chart default), so the test
+# framework must send a bearer token to OpenFGA's HTTP API. The keygen Job
+# stores it in the <release>-openfga-api-key Secret under key "keys". Source
+# it into OPENFGA_API_KEY (which framework/bootstrap.go reads) unless the
+# caller already exported one. kubectl does the base64 decode (base64decode)
+# so this stays portable across GNU/BSD base64.
+if [ -z "${OPENFGA_API_KEY:-}" ]; then
+	secret="$(kubectl get secret -n "$NS" -o name 2>/dev/null | grep openfga-api-key | head -1 || true)"
+	if [ -n "$secret" ]; then
+		OPENFGA_API_KEY="$(kubectl get "$secret" -n "$NS" -o go-template='{{index .data "keys" | base64decode}}')"
+		export OPENFGA_API_KEY
+		echo "e2e: sourced OPENFGA_API_KEY from $secret"
+	else
+		echo "e2e: WARNING — no *openfga-api-key secret found in $NS; FGA bootstrap may 401" >&2
+	fi
+fi
+
 echo "e2e: endpoints ready; running suite"
 cd "$REPO_ROOT/tests/e2e"
 E2E_K8S=1 \
