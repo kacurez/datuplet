@@ -276,6 +276,15 @@ func NewServerV2(cfg *Config) *ServerV2 {
 		}
 		s.lakekeeperResolver = res
 
+		// Audit summary stamped on every inline-commit snapshot: actor /
+		// run-id / run-mode / pipeline-api, parsed from the run-token JWT
+		// claims (same shape the deleted TableCommit Job wrote via
+		// BuildSnapshotSummary). Computed once — the token is fixed for the
+		// gateway's lifetime. nil when there's no run-token (dev/test); then
+		// snapshots carry only the commit-key, as before. CommitTableFiles
+		// merges these with the idempotency key it adds.
+		auditProps := icebergjob.BuildSnapshotSummary(runToken, cfg.GetRunID())
+
 		// Inline-commit pool: dispatches per-table iceberg commits after
 		// CloseWriter. Workers/queue are small fixed defaults — RFC 021
 		// open-question: make them env-configurable in a later slice.
@@ -284,7 +293,7 @@ func NewServerV2(cfg *Config) *ServerV2 {
 			MaxQueueSize: 256,
 			CatalogFn:    s.lakekeeperResolver.Catalog,
 			CommitFn: func(ctx context.Context, cat catalog.Catalog, ident icebergtable.Identifier, paths []string, mode icebergjob.WriteMode, key string) (*icebergjob.CommitResult, error) {
-				return icebergjob.CommitTableFiles(ctx, cat, ident, paths, mode, nil, key)
+				return icebergjob.CommitTableFiles(ctx, cat, ident, paths, mode, auditProps, key)
 			},
 		})
 

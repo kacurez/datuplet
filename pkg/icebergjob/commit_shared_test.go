@@ -448,6 +448,55 @@ func TestCommitTableFiles_SucceedsWithInMemoryPaths(t *testing.T) {
 	}
 }
 
+// TestCommitTableFiles_StampsSnapshotProps: caller-supplied audit props
+// (the BuildSnapshotSummary output the Data Gateway passes) must land on the
+// committed snapshot's summary, merged with the idempotency commit-key. This
+// is the audit-trail parity restored after RFC 021 (the inline-commit path
+// initially passed nil snapshotProps, so snapshots had empty actor/run-id).
+func TestCommitTableFiles_StampsSnapshotProps(t *testing.T) {
+	t.Parallel()
+	ident := icebergtable.Identifier{"ns1", "audit_tbl"}
+	fx := newCommitSharedFixture(t, ident)
+	path := fx.writeParquet("data/a.parquet", 1)
+
+	props := iceberg.Properties{
+		"datuplet.actor":        "user-123",
+		"datuplet.run-id":       "run-abc",
+		"datuplet.run-mode":     "cluster",
+		"datuplet.pipeline-api": "datuplet-api",
+	}
+	res, err := CommitTableFiles(context.Background(), fx.cat, ident,
+		[]string{path}, WriteModeAppend, props, "commit-key-xyz")
+	if err != nil {
+		t.Fatalf("CommitTableFiles: %v", err)
+	}
+	if res.SnapshotIDAfter == "" {
+		t.Fatal("expected a snapshot after append")
+	}
+
+	tbl, err := fx.cat.LoadTable(context.Background(), ident)
+	if err != nil {
+		t.Fatalf("load table: %v", err)
+	}
+	snaps := tbl.Metadata().Snapshots()
+	latest := snaps[len(snaps)-1]
+	if latest.Summary == nil || latest.Summary.Properties == nil {
+		t.Fatal("latest snapshot summary/properties nil")
+	}
+	got := latest.Summary.Properties
+	for k, want := range map[string]string{
+		"datuplet.actor":        "user-123",
+		"datuplet.run-id":       "run-abc",
+		"datuplet.run-mode":     "cluster",
+		"datuplet.pipeline-api": "datuplet-api",
+		"datuplet.commit-key":   "commit-key-xyz", // added by CommitTableFiles on top of audit props
+	} {
+		if got[k] != want {
+			t.Errorf("snapshot summary[%q]=%q want %q", k, got[k], want)
+		}
+	}
+}
+
 // TestCommitTableFiles_IdempotencyHit: first commit with key "test-key-abc"
 // should succeed; second commit with the same key but different paths should
 // short-circuit (idempotency hit) and leave the table with exactly 1 file.
