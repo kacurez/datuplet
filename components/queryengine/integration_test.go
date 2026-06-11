@@ -87,7 +87,8 @@ func TestAttachIntegration(t *testing.T) {
 	seedPostsTable(ctx, t, fx)
 
 	// --- Attach + read via the production lifecycle: open → attach → lock. ---
-	e, err := openEngine(ctx, Request{TempDir: t.TempDir()})
+	engineTempDir := t.TempDir()
+	e, err := openEngine(ctx, Request{TempDir: engineTempDir})
 	if err != nil {
 		t.Fatalf("openEngine: %v", err)
 	}
@@ -116,6 +117,11 @@ func TestAttachIntegration(t *testing.T) {
 		t.Fatalf("lock: %v", err)
 	}
 	assertCount(ctx, t, e, `SELECT count(*) FROM lk."qe"."posts"`, seedRowCount, "post-lock")
+
+	// RFC 022 Task 1.4 (D): post-attach, post-lock deny additions that require
+	// the live fixture + loaded iceberg/httpfs. Run on THIS same engine so the
+	// fixture is provisioned exactly once per test run.
+	runLockdownDenyIntegration(ctx, t, e, engineTempDir)
 }
 
 func assertCount(ctx context.Context, t *testing.T, e *engine, query string, want int, label string) {
