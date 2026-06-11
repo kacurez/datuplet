@@ -40,6 +40,10 @@ type Server struct {
 	// cliTokenLimiter rate-limits POST /api/v1/auth/token by client IP.
 	// Initialised in NewServer; never nil.
 	cliTokenLimiter *auth.Limiter
+	// queryHandler is a pre-built http.Handler for POST /api/v1/query,
+	// constructed in main.go at config time (same pattern as storage.NewForLakekeeper).
+	// Nil when the query service is not configured; the route stays unregistered.
+	queryHandler http.Handler
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -163,6 +167,18 @@ func (s *Server) WithCLIClusterInfo(lakekeeperPublicURL, warehouseName string) *
 	return s
 }
 
+// WithQueryService wires the pre-built http.Handler for POST /api/v1/query.
+// The handler must have been constructed by the caller (e.g. via
+// queryproxy.Handler in main.go) so that construction errors surface as a
+// normal return error at config time rather than a panic at request time.
+// When h is nil, the endpoint is left unregistered (callers get 404).
+// The route is also gated on a non-nil UserResolver (WithUserResolver) so the
+// auth.WithUser middleware can identify the caller.
+func (s *Server) WithQueryService(h http.Handler) *Server {
+	s.queryHandler = h
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -236,6 +252,15 @@ func (s *Server) Handler() http.Handler {
 	if s.resolver != nil && s.authzr != nil && s.backend != nil && s.pipelines != nil {
 		mux.Handle("POST /api/v1/projects/{pid}/pipelines/{name}/runs",
 			auth.WithUser(s.resolver, http.HandlerFunc(s.handleTriggerRun)))
+	}
+
+	// Query service route. When a pre-built queryHandler + resolver are wired,
+	// register POST /api/v1/query behind auth.WithUser middleware.
+	// The handler is constructed in main.go at config time (same pattern as
+	// storage.NewForLakekeeper), so no construction can fail here.
+	// Absent env → queryHandler is nil → route stays unregistered (404).
+	if s.queryHandler != nil && s.resolver != nil {
+		mux.Handle("POST /api/v1/query", auth.WithUser(s.resolver, s.queryHandler))
 	}
 
 	// Storage routes. When a storage.Service + resolver + authzr

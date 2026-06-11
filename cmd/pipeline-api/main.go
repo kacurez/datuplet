@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	pipelineapidb "github.com/datuplet/datuplet/pkg/pipelineapi/db"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -222,6 +224,12 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	if err != nil {
 		return fmt.Errorf("storage service: %w", err)
 	}
+
+	// warehouseResolver is used by the storage service only (per-request warehouse
+	// resolution for the storage UI). The query service uses the static
+	// DATUPLET_QUERY_WAREHOUSE env var set at boot — not this resolver.
+	var warehouseResolver func(ctx context.Context, lakekeeperProjectID string) (string, error)
+
 	if storageSvc != nil {
 		if signer == nil {
 			log.Printf("storage proxy: signer not loaded — impersonation JWT minting unavailable; storage handlers will return 500 on every catalog call (check SIGNING_KEY_FILE)")
@@ -254,7 +262,7 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 			// Per-request warehouse resolution from lakekeeper. The resolver
 			// picks the first warehouse the user has FGA visibility into for
 			// the requested project; multi-warehouse selector is deferred.
-			warehouseResolver := storage.NewLakekeeperWarehouseResolver(storage.WarehouseResolverConfig{
+			warehouseResolver = storage.NewLakekeeperWarehouseResolver(storage.WarehouseResolverConfig{
 				LakekeeperURL: lakekeeperURL,
 				Minter:        impersonationMinter,
 			})
@@ -264,6 +272,57 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	} else {
 		log.Printf("storage proxy not wired: DATUPLET_LAKEKEEPER_URL=%q (storage handlers return 503 — set the env var in your deployment manifest)",
 			lakekeeperURL)
+	}
+
+	// Query service: POST /api/v1/query ad-hoc SQL queries on lakekeeper tables.
+	// Routes to the query-worker Service with JWT credentials. Soft-degrade when
+	// DATUPLET_QUERY_WORKER_URL is absent — the endpoint stays unregistered
+	// (clients get 404).
+	//
+	// Warehouse: the query-worker must attach to a specific lakekeeper warehouse
+	// to resolve table metadata. The warehouse must be project-qualified
+	// (format: "lakekeeper_project_id/warehouse_name") as lakekeeper requires for
+	// attach (RFC 022 §6.1). Unlike storage handlers which resolve the warehouse
+	// per-request, the query service uses a single static warehouse configured at
+	// boot via DATUPLET_QUERY_WAREHOUSE. This design supports single-warehouse
+	// deployments; multi-warehouse support is deferred (would require per-request
+	// warehouse selection based on run context).
+	//
+	// The handler is built here at config time (same pattern as
+	// storage.NewForLakekeeper) so that a present-but-invalid WorkerURL
+	// hard-fails runServeCluster with a normal error rather than panicking at
+	// request time. Absent env → soft-degrade → route unregistered → 404.
+	var queryHandler http.Handler
+	queryWorkerURL := os.Getenv("DATUPLET_QUERY_WORKER_URL")
+	if queryWorkerURL != "" {
+		queryWarehouse := os.Getenv("DATUPLET_QUERY_WAREHOUSE")
+		if queryWarehouse == "" {
+			log.Printf("query service: DATUPLET_QUERY_WAREHOUSE not set (POST /api/v1/query unavailable); set to enable (format: projectID/warehouse)")
+		} else if lakekeeperURL == "" {
+			log.Printf("query service: DATUPLET_LAKEKEEPER_URL not set (POST /api/v1/query unavailable); required for table catalog access")
+		} else {
+			queryProxyCfg := queryproxy.Config{
+				WorkerURL:            queryWorkerURL,
+				Warehouse:            queryWarehouse,
+				DefaultTimeoutS:      envIntOr("DATUPLET_QUERY_DEFAULT_TIMEOUT_S", 0),      // 0 → use package default (60s)
+				MaxTimeoutS:          envIntOr("DATUPLET_QUERY_MAX_TIMEOUT_S", 0),          // 0 → use package default (300s)
+				DefaultMaxRows:       envIntOr("DATUPLET_QUERY_DEFAULT_MAX_ROWS", 0),       // 0 → use package default (1000)
+				MaxMaxRows:           envIntOr("DATUPLET_QUERY_MAX_MAX_ROWS", 0),           // 0 → use package default (10000)
+				DefaultMaxBytes:      envIntOr("DATUPLET_QUERY_DEFAULT_MAX_BYTES", 0),      // 0 → use package default (1 MiB)
+				MaxMaxBytes:          envIntOr("DATUPLET_QUERY_MAX_MAX_BYTES", 0),          // 0 → use package default (10 MiB)
+				PerPrincipalInflight: envIntOr("DATUPLET_QUERY_PER_PRINCIPAL_INFLIGHT", 0), // 0 → use package default (2)
+			}
+			// Build the handler now so an invalid WorkerURL (e.g. unparseable URL)
+			// surfaces as a runServeCluster error rather than a panic on first request.
+			h, err := queryproxy.Handler(queryProxyCfg, signer)
+			if err != nil {
+				return fmt.Errorf("query service: %w", err)
+			}
+			queryHandler = h
+			fmt.Printf("  Query service: %s (warehouse: %s)\n", queryWorkerURL, queryWarehouse)
+		}
+	} else {
+		log.Printf("query service not wired: DATUPLET_QUERY_WORKER_URL not set (POST /api/v1/query returns 404)")
 	}
 
 	srv := apihttp.NewServer(pool).
@@ -281,6 +340,12 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		// PIPELINE_API_PUBLIC_URL). Warehouse name is not a server-side env
 		// var; it is resolved per-request via lakekeeper.
 		WithCLIClusterInfo(cfg.LakekeeperPublicURL, "")
+	// Query service: POST /api/v1/query ad-hoc SQL. Wired only when
+	// DATUPLET_QUERY_WORKER_URL is set and handler construction succeeded above.
+	// nil → route stays unregistered → 404.
+	if queryHandler != nil {
+		srv = srv.WithQueryService(queryHandler)
+	}
 	// Cluster-mode auth: Postgres-backed resolver (session cookies) chained
 	// with a bearer-JWT resolver so CLI subcommands (trigger, storage) can
 	// authenticate via Authorization: Bearer <api_token> minted by
@@ -372,3 +437,13 @@ Env:
 // Note: the former `lookupOpenFGAStoreAndModel` helper (latest-model lookup)
 // was removed — pipeline-api now uses `pkg/pipelineapi/authz.ResolveStoreAndModel`
 // which queries the version-pin tuple at startup instead of picking the latest model.
+
+// envIntOr parses the env var as an int, returning def if absent or malformed.
+func envIntOr(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return def
+}
