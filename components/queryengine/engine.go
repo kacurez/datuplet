@@ -11,19 +11,10 @@ import (
 	"time"
 )
 
-// ErrTimeout is returned (wrapped) when a Run is aborted by its deadline. It
-// fires when the call fails AND either the context cause is
-// context.DeadlineExceeded OR DuckDB's native interrupt error
-// ("INTERRUPT Error") is present. The duckdb-go interrupt routine fires 0–500ms
-// AFTER the deadline (one interruptInterval tick), so the timeout is detected
-// from the error, never from a wall-clock comparison (Spike 0.3). Callers use
-// errors.Is(err, ErrTimeout); the underlying DuckDB message is preserved.
-var ErrTimeout = errors.New("query timed out")
-
-// ErrResultTooLarge is returned when the result envelope alone (schema + stats +
-// punctuation, zero rows) already exceeds Request.MaxBytes, so no row could ever
-// fit. See buildResult.
-var ErrResultTooLarge = errors.New("result exceeds byte cap")
+// ErrTimeout and ErrResultTooLarge are declared in errors.go (untagged) so that
+// server.go / server_test.go can reference them without the duckdb_arrow build tag.
+// They are referenced here by name; the sentinel identities are identical
+// because both declarations live in the same package.
 
 // errInterruptMarker is DuckDB's own C++ engine interrupt string, surfaced
 // verbatim by duckdb-go when duckdb_interrupt() aborts a running query (Spike

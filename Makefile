@@ -13,7 +13,7 @@ export DOCKER_BUILDKIT=1
 	k8s-retry-simple k8s-retry-duckdb k8s-retry-full \
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
-	prune-images \
+	prune-images prune-docker-cache \
 	lint chart-render-check tidy all help
 
 # =============================================================================
@@ -53,6 +53,7 @@ build-components: build-gateway ## Build all component Docker images
 	docker build -t datuplet/stdout-writer:latest -f components/stdout-writer/Dockerfile .
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
 	docker build -t datuplet/finnhub-extractor:latest -f components/finnhub-extractor/Dockerfile .
+	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 #   docker build -t datuplet/pandas-transform:latest -f components/pandas-transform/Dockerfile .
 
 # E2E-only component subset: skips finnhub-extractor (no scenario references it).
@@ -344,3 +345,21 @@ prune-images: ## Prune unused Docker images and system volumes
 	docker image prune -f
 	docker system prune -a --volumes
 	@echo "Docker images pruned."
+
+# BuildKit layer + cache-mount caches accumulate per builder and are NOT
+# touched by `docker system prune` (the named datuplet-builder once held
+# 37GB and filled the disk, causing OrbStack VM resets + kubelet image GC).
+# Keeps tagged images — safe to run while a cluster uses locally-built images.
+prune-docker-cache: ## Purge ALL Docker build caches (every buildx builder + dangling images; keeps tagged images)
+	@echo "Docker disk usage before:"
+	@docker system df
+	@# `buildx ls --format` emits builder AND node rows (e.g. datuplet-builder0);
+	@# dedupe, and let prune no-op on node names via `|| true`.
+	@for b in $$(docker buildx ls --format '{{.Name}}' | sort -u); do \
+	  echo "--- pruning buildx builder: $$b"; \
+	  docker buildx prune --builder $$b --all --force || true; \
+	done
+	@echo "--- pruning dangling images"
+	docker image prune --force
+	@echo "Docker disk usage after:"
+	@docker system df
