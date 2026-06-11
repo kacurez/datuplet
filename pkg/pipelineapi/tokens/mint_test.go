@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,6 +186,262 @@ func TestImpersonationToken_RedactsInFmt(t *testing.T) {
 	}
 	if got := tok.Reveal(); got != "eyJ-secret-jwt" {
 		t.Errorf("Reveal(): got=%q want=eyJ-secret-jwt", got)
+	}
+}
+
+// --- MintQueryToken / MintInternalQueryToken (RFC 022 Task 2.1) ---
+
+func TestMintQueryToken_ClaimsShape(t *testing.T) {
+	signer := sharedSigner(t)
+	caller := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	ctx := userCtx(t, caller)
+
+	before := time.Now()
+	tok, err := tokens.MintQueryToken(ctx, signer, 120*time.Second)
+	if err != nil {
+		t.Fatalf("MintQueryToken: %v", err)
+	}
+	after := time.Now()
+
+	parser := jwt.NewParser()
+	parsed, _, err := parser.ParseUnverified(tok.Reveal(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	claims := parsed.Claims.(jwt.MapClaims)
+
+	// sub = ctx user (raw UUID, same derivation as MintImpersonation).
+	want := caller.String()
+	if got, _ := claims["sub"].(string); got != want {
+		t.Errorf("sub = %q, want %q", got, want)
+	}
+	if got, _ := claims["actor"].(string); got != want {
+		t.Errorf("actor = %q, want %q", got, want)
+	}
+	if got, _ := claims["iss"].(string); got != "datuplet-api" {
+		t.Errorf("iss = %q, want datuplet-api", got)
+	}
+	if got, _ := claims["aud"].(string); got != tokens.TableTokenAudience {
+		t.Errorf("aud = %q, want %q", got, tokens.TableTokenAudience)
+	}
+	if got, _ := claims["token_kind"].(string); got != tokens.TokenKindQuery {
+		t.Errorf("token_kind = %q, want %q", got, tokens.TokenKindQuery)
+	}
+
+	// exp = now+ttl (ttl < clamp, so honoured exactly within wall-clock skew).
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		t.Fatalf("exp missing or not numeric: %v", claims["exp"])
+	}
+	wantMin := before.Add(120 * time.Second).Unix()
+	wantMax := after.Add(120 * time.Second).Unix()
+	if int64(exp) < wantMin || int64(exp) > wantMax {
+		t.Errorf("exp = %d, want in [%d,%d]", int64(exp), wantMin, wantMax)
+	}
+
+	// nbf/iat sane: both present, <= exp, within the mint window.
+	nbf, ok := claims["nbf"].(float64)
+	if !ok {
+		t.Fatalf("nbf missing or not numeric: %v", claims["nbf"])
+	}
+	iat, ok := claims["iat"].(float64)
+	if !ok {
+		t.Fatalf("iat missing or not numeric: %v", claims["iat"])
+	}
+	if int64(nbf) < before.Unix() || int64(nbf) > after.Unix() {
+		t.Errorf("nbf = %d, want in [%d,%d]", int64(nbf), before.Unix(), after.Unix())
+	}
+	if int64(iat) < before.Unix() || int64(iat) > after.Unix() {
+		t.Errorf("iat = %d, want in [%d,%d]", int64(iat), before.Unix(), after.Unix())
+	}
+	if int64(nbf) > int64(exp) {
+		t.Errorf("nbf %d after exp %d", int64(nbf), int64(exp))
+	}
+
+	// jti present and unique across two mints.
+	jti1, _ := claims["jti"].(string)
+	if jti1 == "" {
+		t.Error("jti missing")
+	}
+	tok2, err := tokens.MintQueryToken(ctx, signer, 120*time.Second)
+	if err != nil {
+		t.Fatalf("MintQueryToken #2: %v", err)
+	}
+	parsed2, _, err := parser.ParseUnverified(tok2.Reveal(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse #2: %v", err)
+	}
+	jti2, _ := parsed2.Claims.(jwt.MapClaims)["jti"].(string)
+	if jti1 == jti2 {
+		t.Errorf("jti not unique across mints: %q == %q", jti1, jti2)
+	}
+}
+
+func TestMintQueryToken_TTLClamp(t *testing.T) {
+	signer := sharedSigner(t)
+	ctx := userCtx(t, uuid.New())
+
+	// Requesting a TTL > 330s clamps exp to now+330s.
+	before := time.Now()
+	tok, err := tokens.MintQueryToken(ctx, signer, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("MintQueryToken: %v", err)
+	}
+	after := time.Now()
+
+	parser := jwt.NewParser()
+	parsed, _, err := parser.ParseUnverified(tok.Reveal(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	exp, _ := parsed.Claims.(jwt.MapClaims)["exp"].(float64)
+	wantMin := before.Add(330 * time.Second).Unix()
+	wantMax := after.Add(330 * time.Second).Unix()
+	if int64(exp) < wantMin || int64(exp) > wantMax {
+		t.Errorf("clamped exp = %d, want in [%d,%d] (now+330s)", int64(exp), wantMin, wantMax)
+	}
+
+	// A TTL <= 0 must error — tokens without a sane exp are rejected,
+	// mirroring the sibling minters' Lifetime<=0 guard.
+	if _, err := tokens.MintQueryToken(ctx, signer, 0); err == nil {
+		t.Error("expected error for zero ttl")
+	}
+	if _, err := tokens.MintQueryToken(ctx, signer, -1*time.Second); err == nil {
+		t.Error("expected error for negative ttl")
+	}
+}
+
+func TestMintQueryToken_RejectsAnonymous(t *testing.T) {
+	signer := sharedSigner(t)
+	if _, err := tokens.MintQueryToken(context.Background(), signer, 60*time.Second); err == nil {
+		t.Error("expected error: minting without an authenticated user must fail")
+	}
+}
+
+func TestMintInternalQueryToken_ClaimsShape(t *testing.T) {
+	signer := sharedSigner(t)
+	caller := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	ctx := userCtx(t, caller)
+
+	tok, err := tokens.MintInternalQueryToken(ctx, signer, 120*time.Second)
+	if err != nil {
+		t.Fatalf("MintInternalQueryToken: %v", err)
+	}
+
+	parser := jwt.NewParser()
+	parsed, _, err := parser.ParseUnverified(tok.Reveal(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	claims := parsed.Claims.(jwt.MapClaims)
+
+	want := caller.String()
+	if got, _ := claims["sub"].(string); got != want {
+		t.Errorf("sub = %q, want %q", got, want)
+	}
+	if got, _ := claims["actor"].(string); got != want {
+		t.Errorf("actor = %q, want %q", got, want)
+	}
+	if got, _ := claims["iss"].(string); got != "datuplet-api" {
+		t.Errorf("iss = %q, want datuplet-api", got)
+	}
+	if got, _ := claims["aud"].(string); got != tokens.QueryWorkerAudience {
+		t.Errorf("aud = %q, want %q", got, tokens.QueryWorkerAudience)
+	}
+	if got, _ := claims["token_kind"].(string); got != tokens.TokenKindInternalQuery {
+		t.Errorf("token_kind = %q, want %q", got, tokens.TokenKindInternalQuery)
+	}
+
+	// jti present and unique across two mints (same discipline as query token).
+	jti1, _ := claims["jti"].(string)
+	if jti1 == "" {
+		t.Error("jti missing")
+	}
+	tok2, err := tokens.MintInternalQueryToken(ctx, signer, 120*time.Second)
+	if err != nil {
+		t.Fatalf("MintInternalQueryToken #2: %v", err)
+	}
+	parsed2, _, err := parser.ParseUnverified(tok2.Reveal(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse #2: %v", err)
+	}
+	jti2, _ := parsed2.Claims.(jwt.MapClaims)["jti"].(string)
+	if jti1 == jti2 {
+		t.Errorf("jti not unique across mints: %q == %q", jti1, jti2)
+	}
+}
+
+func TestMintInternalQueryToken_TTLClamp(t *testing.T) {
+	signer := sharedSigner(t)
+	ctx := userCtx(t, uuid.New())
+
+	before := time.Now()
+	tok, err := tokens.MintInternalQueryToken(ctx, signer, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("MintInternalQueryToken: %v", err)
+	}
+	after := time.Now()
+
+	parser := jwt.NewParser()
+	parsed, _, err := parser.ParseUnverified(tok.Reveal(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	exp, _ := parsed.Claims.(jwt.MapClaims)["exp"].(float64)
+	wantMin := before.Add(330 * time.Second).Unix()
+	wantMax := after.Add(330 * time.Second).Unix()
+	if int64(exp) < wantMin || int64(exp) > wantMax {
+		t.Errorf("clamped exp = %d, want in [%d,%d] (now+330s)", int64(exp), wantMin, wantMax)
+	}
+
+	if _, err := tokens.MintInternalQueryToken(ctx, signer, 0); err == nil {
+		t.Error("expected error for zero ttl")
+	}
+	if _, err := tokens.MintInternalQueryToken(ctx, signer, -1*time.Second); err == nil {
+		t.Error("expected error for negative ttl")
+	}
+}
+
+func TestMintInternalQueryToken_RejectsAnonymous(t *testing.T) {
+	signer := sharedSigner(t)
+	if _, err := tokens.MintInternalQueryToken(context.Background(), signer, 60*time.Second); err == nil {
+		t.Error("expected error: minting without an authenticated user must fail")
+	}
+}
+
+// TestQueryToken_RedactsInFmt mirrors TestImpersonationToken_RedactsInFmt:
+// %s / %v / %#v and json.Marshal must never leak the raw JWT.
+func TestQueryToken_RedactsInFmt(t *testing.T) {
+	tok := tokens.QueryToken("eyJ-secret-jwt")
+	const redactedLiteral = "[redacted query token]"
+	if got := tok.String(); got != redactedLiteral {
+		t.Errorf("%%s: got=%q want=%q", got, redactedLiteral)
+	}
+	if got := tok.GoString(); got != redactedLiteral {
+		t.Errorf("%%#v: got=%q want=%q", got, redactedLiteral)
+	}
+	b, err := json.Marshal(struct{ T tokens.QueryToken }{tok})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(b), "eyJ-secret-jwt") {
+		t.Errorf("json.Marshal leaked the raw token: %s", b)
+	}
+	if got := tok.Reveal(); got != "eyJ-secret-jwt" {
+		t.Errorf("Reveal(): got=%q want=eyJ-secret-jwt", got)
+	}
+}
+
+// TestImpersonationToken_RedactsInJSON pins the MarshalJSON guard added
+// alongside QueryToken's (encoding/json bypasses Stringer).
+func TestImpersonationToken_RedactsInJSON(t *testing.T) {
+	tok := tokens.ImpersonationToken("eyJ-secret-jwt")
+	b, err := json.Marshal(struct{ T tokens.ImpersonationToken }{tok})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(b), "eyJ-secret-jwt") {
+		t.Errorf("json.Marshal leaked the raw token: %s", b)
 	}
 }
 

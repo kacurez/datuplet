@@ -28,9 +28,10 @@ type ctxKey struct{}
 // # Token-kind cross-validation
 //
 // Every JWT the API mints carries token_kind ∈ {user, run, impersonation,
-// local-cli}. The cross-check `aud=datuplet-api ⇒
+// local-cli, query, internal-query}. The cross-check `aud=datuplet-api ⇒
 // token_kind=user; aud=datuplet-catalog ⇒ token_kind ∈ {run,
-// impersonation, local-cli}` is enforced at the JWT-verifying party:
+// impersonation, local-cli, query}; aud=datuplet-query-worker ⇒
+// token_kind=internal-query` is enforced at the JWT-verifying party:
 //
 //   - pipeline-api's own browser/CLI handlers use OPAQUE session cookies
 //     (see PostgresResolver / LocalResolver). There is NO JWT to inspect

@@ -13,8 +13,9 @@ import (
 
 // Token kinds. The verifier cross-checks `aud` against `token_kind`:
 //
-//	aud=datuplet-api      requires token_kind ∈ {user, cli-api}
-//	aud=datuplet-catalog  requires token_kind ∈ {run, impersonation, local-cli}
+//	aud=datuplet-api           requires token_kind ∈ {user, cli-api}
+//	aud=datuplet-catalog       requires token_kind ∈ {run, impersonation, local-cli, query}
+//	aud=datuplet-query-worker  requires token_kind = internal-query
 //
 // User tokens are emitted by the user-login flow and consumed by
 // pipeline-api itself (NOT lakekeeper). Run tokens are emitted at run
@@ -24,12 +25,20 @@ import (
 // --remote` flow and consumed by lakekeeper exactly like impersonation
 // tokens, but with a 1h TTL so a developer's laptop session lasts a
 // working hour.
+// TokenKindQuery and TokenKindInternalQuery are the RFC 022 ad-hoc-query
+// kinds. A `query` token is presented by the DuckDB engine to lakekeeper
+// (aud=datuplet-catalog) — lakekeeper authorizes via FGA using `sub`, so
+// the caller's own grants apply (viewers get read-only vended creds). An
+// `internal-query` token authenticates pipeline-api→query-worker hops
+// (aud=datuplet-query-worker) and must never be accepted by lakekeeper.
 const (
 	TokenKindUser          = "user"
 	TokenKindRun           = "run"
 	TokenKindImpersonation = "impersonation"
 	TokenKindLocalCLI      = "local-cli"
 	TokenKindCLIAPI        = "cli-api"
+	TokenKindQuery         = "query"
+	TokenKindInternalQuery = "internal-query"
 )
 
 // Default JWT claim constants — issuer + token-type used by run tokens.
@@ -48,6 +57,18 @@ const TableTokenAudience = "datuplet-catalog"
 // pipeline-api itself (not lakekeeper). Used by the bearer-JWT auth
 // resolver to scope CLI bearer tokens to this service.
 const APITokenAudience = "datuplet-api"
+
+// QueryWorkerAudience is the fixed JWT aud claim for internal-query tokens
+// authenticating the pipeline-api→query-worker hop (RFC 022). The
+// query-worker verifier rejects any other audience.
+const QueryWorkerAudience = "datuplet-query-worker"
+
+// MaxQueryTokenLifetime caps the TTL minted on query / internal-query
+// tokens: RFC 022 §5.2 max query timeout (300s) + 30s slack. A leaked
+// query JWT can vend storage creds for at most this window. Callers
+// typically pass min(timeout+30s, this) — MintQueryToken /
+// MintInternalQueryToken clamp to it defensively regardless.
+const MaxQueryTokenLifetime = 330 * time.Second
 
 // ImpersonationLifetime is the short TTL minted on impersonation tokens.
 // 60s is enough for one storage-browse round-trip; a longer ceiling would
@@ -214,6 +235,81 @@ func MintImpersonation(ctx context.Context, signer *Signer) (ImpersonationToken,
 		return "", fmt.Errorf("sign: %w", err)
 	}
 	return ImpersonationToken(s), nil
+}
+
+// MintQueryToken produces a query-scoped catalog JWT for the
+// authenticated subject in ctx (RFC 022). The DuckDB engine presents it
+// to lakekeeper's iceberg-REST endpoint; lakekeeper authorizes via FGA
+// using `sub`, so the caller's own grants apply — viewers get read-only
+// vended creds. Subject derivation matches MintImpersonation
+// (subjectFromCtx → raw UUID), so MintQueryToken cannot mint on behalf
+// of someone else.
+//
+// Claims: iss=datuplet-api, aud=datuplet-catalog, token_kind="query",
+// sub=actor=<caller-uuid>, per-request jti, iat/nbf=now,
+// exp=now+min(ttl, MaxQueryTokenLifetime).
+//
+// ttl is clamped to MaxQueryTokenLifetime (330s = §5.2 timeout 300s +
+// 30s slack). A non-positive ttl is an error — tokens without a sane exp
+// are rejected, mirroring the Lifetime<=0 guard on MintRunToken /
+// MintServiceToken.
+//
+// Returns the redacting QueryToken wrapper (RFC 019 §4.10); callers
+// attach it via Reveal() at the HTTP-header audit point.
+func MintQueryToken(ctx context.Context, signer *Signer, ttl time.Duration) (QueryToken, error) {
+	return mintQueryFamily(ctx, signer, ttl, TableTokenAudience, TokenKindQuery, "qry")
+}
+
+// MintInternalQueryToken produces the internal hop token authenticating
+// pipeline-api→query-worker requests (RFC 022). Same iss/sub/actor/jti
+// discipline and TTL clamp as MintQueryToken, but aud=datuplet-query-worker
+// and token_kind="internal-query" so it is verifier-rejected anywhere
+// else (notably lakekeeper). Short-lived: clamped to MaxQueryTokenLifetime.
+func MintInternalQueryToken(ctx context.Context, signer *Signer, ttl time.Duration) (QueryToken, error) {
+	return mintQueryFamily(ctx, signer, ttl, QueryWorkerAudience, TokenKindInternalQuery, "iqry")
+}
+
+// mintQueryFamily is the shared body for the RFC 022 query / internal-query
+// minters: identical claim shape and TTL clamp, differing only in aud,
+// token_kind, and jti prefix.
+func mintQueryFamily(ctx context.Context, signer *Signer, ttl time.Duration, aud, kind, jtiPrefix string) (QueryToken, error) {
+	if signer == nil {
+		return "", errors.New("signer is required")
+	}
+	if ttl <= 0 {
+		return "", errors.New("ttl must be positive (tokens without exp are rejected)")
+	}
+	sub, err := subjectFromCtx(ctx)
+	if err != nil {
+		return "", err
+	}
+	if ttl > MaxQueryTokenLifetime {
+		ttl = MaxQueryTokenLifetime
+	}
+
+	now := time.Now()
+	// token_type deliberately omitted: it is a MintRunToken/MintServiceToken
+	// legacy field (lakekeeper ignores it); new kinds carry token_kind only.
+	claims := jwt.MapClaims{
+		"iss":        tokenIssuer,
+		"aud":        aud,
+		"sub":        sub,
+		"actor":      sub,
+		"token_kind": kind,
+		"iat":        now.Unix(),
+		"nbf":        now.Unix(),
+		"exp":        now.Add(ttl).Unix(),
+		"jti":        fmt.Sprintf("%s-%s-%d", jtiPrefix, sub, now.UnixNano()),
+	}
+
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = signer.KeyID
+
+	s, err := tok.SignedString(signer.Private())
+	if err != nil {
+		return "", fmt.Errorf("sign: %w", err)
+	}
+	return QueryToken(s), nil
 }
 
 // subjectFromCtx extracts the raw user UUID from ctx. Returns an error
