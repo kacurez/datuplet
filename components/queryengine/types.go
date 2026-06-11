@@ -5,15 +5,23 @@ import "time"
 type Request struct {
 	SQL           string
 	LakekeeperURL string
-	Warehouse     string
-	CatalogJWT    string
-	Timeout       time.Duration
-	MaxRows       int
-	MaxBytes      int
-	MemoryLimit   string
-	TempDir       string
-	MaxTempSize   string
-	Threads       int
+	// Warehouse is the ATTACH warehouse argument, passed verbatim to DuckDB.
+	// It MUST be project-qualified as "<lakekeeper-project-id>/<warehouse>"
+	// whenever a project id is known: the iceberg extension's /v1/config
+	// handshake sends no x-project-id header, so a bare name resolves against
+	// lakekeeper's nil-UUID default project → 401/403 (RFC 022 Spike 0.1 §1).
+	// There is no separate ProjectID field by design — the caller assembles
+	// the qualified string and attachCatalog treats it as an opaque value
+	// (the repo's opaque-storage-string principle).
+	Warehouse   string
+	CatalogJWT  string
+	Timeout     time.Duration
+	MaxRows     int
+	MaxBytes    int
+	MemoryLimit string
+	TempDir     string
+	MaxTempSize string
+	Threads     int
 }
 
 type Column struct {
