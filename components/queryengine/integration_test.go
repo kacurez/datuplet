@@ -118,10 +118,67 @@ func TestAttachIntegration(t *testing.T) {
 	}
 	assertCount(ctx, t, e, `SELECT count(*) FROM lk."qe"."posts"`, seedRowCount, "post-lock")
 
+	// RFC 022 Task 1.5 (h): exercise the PUBLIC Run entrypoint against the same
+	// live fixture (the same single provision — Run opens its OWN engine and
+	// attaches per-engine, which is fine). This proves the catalog-attached read
+	// path through Run end-to-end, plus the MaxRows cap on a real iceberg scan.
+	//
+	// ORDERING CONTRACT: must run before runLockdownDenyIntegration (its INSERT
+	// probe mutates the table off seedRowCount); do not add t.Parallel() to
+	// either. The count assertions here must see the pristine seeded table.
+	runPublicEntrypointIntegration(ctx, t, fx)
+
 	// RFC 022 Task 1.4 (D): post-attach, post-lock deny additions that require
 	// the live fixture + loaded iceberg/httpfs. Run on THIS same engine so the
 	// fixture is provisioned exactly once per test run.
 	runLockdownDenyIntegration(ctx, t, e, engineTempDir)
+}
+
+// runPublicEntrypointIntegration drives the public Run (open → attach → lock →
+// query → build-result) against the already-provisioned fixture. It does NOT
+// re-provision: it reuses fx's lakekeeper URL / project-qualified warehouse /
+// dummy JWT. Each Run opens its own single-use engine.
+func runPublicEntrypointIntegration(ctx context.Context, t *testing.T, fx *fixture) {
+	t.Helper()
+	warehouse := fx.projectID + "/" + fx.warehouseName
+
+	// (h.1) count(*) over the seeded table via the public Run.
+	t.Run("run-count", func(t *testing.T) {
+		res, err := Run(ctx, Request{
+			SQL:           `SELECT count(*) AS n FROM lk."qe"."posts"`,
+			LakekeeperURL: fx.catalogURL(),
+			Warehouse:     warehouse,
+			CatalogJWT:    dummyCatalogJWT,
+			TempDir:       t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("Run count: %v", err)
+		}
+		if len(res.Rows) != 1 || res.Rows[0][0] != int64(seedRowCount) {
+			t.Fatalf("count result = %+v, want one row [%d]", res, seedRowCount)
+		}
+	})
+
+	// (h.2) MaxRows cap on a real iceberg scan: 3 of the seedRowCount rows.
+	t.Run("run-maxrows", func(t *testing.T) {
+		res, err := Run(ctx, Request{
+			SQL:           `SELECT * FROM lk."qe"."posts"`,
+			LakekeeperURL: fx.catalogURL(),
+			Warehouse:     warehouse,
+			CatalogJWT:    dummyCatalogJWT,
+			MaxRows:       3,
+			TempDir:       t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("Run maxrows: %v", err)
+		}
+		if !res.Truncated {
+			t.Fatalf("Truncated should be true (%d rows, cap 3)", seedRowCount)
+		}
+		if len(res.Rows) != 3 {
+			t.Fatalf("len(Rows) = %d, want 3", len(res.Rows))
+		}
+	})
 }
 
 func assertCount(ctx context.Context, t *testing.T, e *engine, query string, want int, label string) {

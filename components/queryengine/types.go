@@ -3,7 +3,12 @@ package queryengine
 import "time"
 
 type Request struct {
-	SQL           string
+	SQL string
+	// LakekeeperURL is the iceberg-REST catalog base URL. An empty string =
+	// pure-compute mode: Run SKIPS attachCatalog (no catalog is wired) but the
+	// lockdown posture still applies. Only unit tests and ad-hoc compute-only
+	// callers run pure-compute; production frontends MUST validate this is
+	// non-empty at their call site (the Phase 2 query-worker does).
 	LakekeeperURL string
 	// Warehouse is the ATTACH warehouse argument, passed verbatim to DuckDB.
 	// It MUST be project-qualified as "<lakekeeper-project-id>/<warehouse>"

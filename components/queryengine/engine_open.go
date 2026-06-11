@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	// Side-effect import: registers the "duckdb" database/sql driver.
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -31,10 +32,20 @@ type engine struct {
 	locked bool
 }
 
+// defaultTimeout is the floor applied when Request.Timeout is unset or
+// non-positive. The engine NEVER runs unbounded: Run always derives a context
+// deadline from r.Timeout, so the watchdog is always armed. Frontends clamp to
+// their own, stricter policy (RFC §5.2: query-worker max 300s); this floor only
+// guards direct callers (BYO-local CLI, tests) that forgot to set one.
+const defaultTimeout = 60 * time.Second
+
 // applyDefaults fills in conservative fallbacks for unset resource knobs. The
 // worker injects a real scratch dir; the "/tmp" TempDir fallback is for tests
 // and BYO-local invocations that don't supply one.
 func applyDefaults(r *Request) {
+	if r.Timeout <= 0 {
+		r.Timeout = defaultTimeout
+	}
 	if r.Threads <= 0 {
 		r.Threads = 2
 	}
