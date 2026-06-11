@@ -148,6 +148,107 @@ pipelineObserver:
     requests: { cpu: 50m,  memory: 128Mi }
     limits:   { cpu: 500m, memory: 512Mi }
 
+# ─── Query Worker (RFC 022) ───────────────────────────────────────────────────
+#
+# Ad-hoc SQL query service backed by an embedded DuckDB engine that attaches to
+# the lakekeeper Iceberg catalog. The query-worker is an EXPERIMENTAL feature
+# and is disabled by default. Set queryWorker.enabled=true to opt in.
+#
+# Bootstrap-ordering note: queryWorker.query.warehouse must be the
+# lakekeeper project-qualified warehouse name ("projectID/warehouse_name"),
+# e.g. "019eb2b6-659b-72c0-b8e1-2a193ca238fe/datuplet". This value is only
+# known AFTER `pipeline-api admin lakekeeper-bootstrap` has been run (the
+# project ID comes from the lakekeeper-bootstrap output). Set it post-install:
+#
+#   helm upgrade datuplet-app charts/datuplet-app --reuse-values \
+#     --set queryWorker.query.warehouse="<projectID>/datuplet"
+#
+# pipeline-api soft-degrades (route unregistered → 404) when warehouse is
+# empty; this is the intentional v1 behaviour. Multi-warehouse support is
+# deferred.
+#
+# No autoscaling block: DuckDB's in-process concurrency knob (queryWorker.concurrency)
+# is the primary throughput lever for v1. HPA / KEDA integration is deferred.
+queryWorker:
+  # enabled: false → no Deployment, Service, or NetworkPolicy resources are
+  # rendered; pipeline-api also skips the DATUPLET_QUERY_WORKER_URL env var.
+  enabled: false
+
+  # replicas: number of query-worker Deployment replicas. Each replica runs
+  # its own embedded DuckDB at full concurrency. Keep at 1 for v1 (single
+  # DuckDB instance; scale via concurrency knob inside the pod).
+  replicas: 1
+
+  image:
+    # repository: image repository for the query-worker binary.
+    repository: datuplet/query-worker
+    # tag: image tag. Defaults to :latest (matches all other chart images).
+    tag: latest
+    # pullPolicy: overrides the chart-global image.pullPolicy for the
+    # query-worker only. Leave empty ("") to inherit the global setting.
+    pullPolicy: ""
+
+  # resources: Guaranteed QoS — requests == limits (required by DuckDB memory
+  # accounting: the engine trusts SET memory_limit to stay within the cgroup).
+  # ephemeral-storage matches scratch.sizeLimit so the Pod is not evicted
+  # before DuckDB hits its own MaxTempSize cap.
+  resources:
+    requests:
+      # memory: must match limits. Helm template arithmetic derives
+      # DATUPLET_QUERY_WORKER_MEMORY_LIMIT from this value minus headroom.
+      #   formula: floor((memLimitBytes * (100 - memoryHeadroomPct) / 100) / concurrency)
+      #   example: 2Gi, 25% headroom, concurrency 2
+      #            → 2048 * 75% / 2 = 768 MiB per DuckDB slot.
+      memory: 2Gi
+      cpu: 500m
+      ephemeral-storage: 2Gi
+    limits:
+      memory: 2Gi
+      cpu: 2
+      ephemeral-storage: 2Gi
+
+  # concurrency: number of simultaneous query slots (semaphore size). Each
+  # slot runs one DuckDB query. Memory per slot = derived from memory_limit
+  # formula above. Matches DATUPLET_QUERY_WORKER_CONCURRENCY.
+  concurrency: 2
+
+  # memoryHeadroomPct: percentage of the container memory limit reserved for
+  # Go runtime overhead (HTTP server, JWKS cache, etc.) before dividing the
+  # remainder among DuckDB slots. Valid range: 0–90.
+  # memory_limit = floor(memLimitBytes * (100 - memoryHeadroomPct) / 100 / concurrency)
+  memoryHeadroomPct: 25
+
+  # scratch: emptyDir volume mounted at /scratch for DuckDB spill-to-disk.
+  scratch:
+    # sizeLimit: total emptyDir size. Shared across all concurrency slots.
+    # max_temp_directory_size per slot = sizeLimit / concurrency (helm math).
+    sizeLimit: 2Gi
+
+  # query: controls forwarded to pipeline-api's queryproxy layer.
+  query:
+    # defaultTimeoutS: default query timeout in seconds when the client
+    # does not specify one. Must be ≤ maxTimeoutS.
+    defaultTimeoutS: 60
+    # maxTimeoutS: hard ceiling on per-query timeout the client may request.
+    maxTimeoutS: 300
+    # defaultMaxRows: default row limit returned per query.
+    defaultMaxRows: 1000
+    # maxMaxRows: hard ceiling on rows the client may request.
+    maxMaxRows: 10000
+    # defaultMaxBytesMiB: default result-set size limit in MiB (1 MiB).
+    defaultMaxBytesMiB: 1
+    # maxMaxBytesMiB: hard ceiling on result bytes the client may request (10 MiB).
+    maxMaxBytesMiB: 10
+    # perPrincipalInflight: max concurrent in-flight requests per authenticated
+    # principal (pipeline-api proxy layer). Prevents a single user from
+    # exhausting the worker's semaphore.
+    perPrincipalInflight: 2
+    # warehouse: lakekeeper project-qualified warehouse name. REQUIRED for the
+    # query route to be active. Format: "<lakekeeperProjectID>/<warehouseName>".
+    # Leave "" until after `pipeline-api admin lakekeeper-bootstrap` runs.
+    # Example: "019eb2b6-659b-72c0-b8e1-2a193ca238fe/datuplet"
+    warehouse: ""
+
 bootstrap:
   externalImages:
     # bitnami/kubectl:1.31 retired when Bitnami restructured the registry —

@@ -1,0 +1,28 @@
+{{- /*
+query-worker Service (RFC 022 Task 2.6).
+
+ClusterIP only — the query-worker is an internal service reached exclusively
+by pipeline-api. No NodePort or Ingress. pipeline-api reaches the worker via:
+  http://query-worker.<namespace>.svc.cluster.local:8090
+
+Gated on queryWorker.enabled — renders nothing when false.
+*/ -}}
+{{- if .Values.queryWorker.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}query-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: query-worker
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+  selector:
+    {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "query-worker") | nindent 4 }}
+{{- end }}

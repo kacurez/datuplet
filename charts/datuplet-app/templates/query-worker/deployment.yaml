@@ -1,0 +1,209 @@
+{{- /*
+query-worker Deployment (RFC 022 Task 2.6).
+
+Single-replica DuckDB-backed SQL query service. pipeline-api proxies
+POST /api/v1/query to this worker; the worker attaches to lakekeeper as
+an Iceberg catalog, runs user SQL inside DuckDB, and returns JSON.
+
+MEMORY ACCOUNTING (Guaranteed QoS):
+  Container limit      = queryWorker.resources.limits.memory  (e.g. 2Gi = 2048 MiB)
+  Usable DuckDB budget = floor(memLimitMiB * (100 - memoryHeadroomPct) / 100)
+  Per-slot budget      = floor(usableMiB / concurrency)
+  → DATUPLET_QUERY_WORKER_MEMORY_LIMIT  (passed verbatim as DuckDB SET memory_limit)
+
+  For default values (2Gi limit, 25% headroom, concurrency 2):
+    usable  = 2048 * 75 / 100 = 1536 MiB
+    per-slot = 1536 / 2       =  768 MiB
+    DATUPLET_QUERY_WORKER_MEMORY_LIMIT = "768MiB"
+
+TEMP SPILL:
+  DATUPLET_QUERY_WORKER_MAX_TEMP_SIZE = (scratch.sizeLimit in MiB) / concurrency
+  For default values (2Gi scratch, concurrency 2):
+    per-slot = 2048 / 2 = 1024 MiB → "1024MiB"
+
+JWKS URL: uses the same in-cluster pipeline-api endpoint as DG sidecars
+and tablecommit Jobs ({pipelineApiInClusterUrl}/api/v1/auth/jwks.json).
+
+Pod hardening matches the repo convention:
+  automountServiceAccountToken: false — query-worker needs no K8s API access.
+  runAsNonRoot + runAsUser 1000 (datuplet UID in the image).
+  drop ALL caps + seccompProfile RuntimeDefault.
+
+Gated on queryWorker.enabled — renders nothing when false.
+*/ -}}
+{{- if .Values.queryWorker.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}query-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: query-worker
+spec:
+  replicas: {{ .Values.queryWorker.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "query-worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "query-worker") | nindent 8 }}
+    spec:
+      # query-worker needs NO K8s API access — disable SA token automount to
+      # match the pod-hardening convention applied to component Pods.
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: query-worker
+          image: "{{ ((.Values.queryWorker).image).repository | default "datuplet/query-worker" }}:{{ ((.Values.queryWorker).image).tag | default "latest" }}"
+          imagePullPolicy: {{ ((.Values.queryWorker).image).pullPolicy | default .Values.image.pullPolicy }}
+          ports:
+            - { containerPort: 8090, name: http }
+          env:
+            # ---- Required ------------------------------------------------
+            # JWKS endpoint: same in-cluster pipeline-api URL used by DG
+            # sidecars and tablecommit Jobs for run-token validation.
+            - name: DATUPLET_QUERY_WORKER_JWKS_URL
+              value: "{{ include "datuplet-app.pipelineApiInClusterUrl" . }}/api/v1/auth/jwks.json"
+            # Lakekeeper catalog: same in-cluster URL as all other components.
+            - name: DATUPLET_LAKEKEEPER_URL
+              value: {{ include "datuplet-app.lakekeeperUrl" . | quote }}
+
+            # ---- Listen address -----------------------------------------
+            - name: DATUPLET_QUERY_WORKER_LISTEN
+              value: ":8090"
+
+            # ---- Concurrency / resource limits ---------------------------
+            # Number of simultaneous DuckDB query slots.
+            - name: DATUPLET_QUERY_WORKER_CONCURRENCY
+              value: {{ .Values.queryWorker.concurrency | default 2 | quote }}
+
+            # memory_limit per DuckDB slot.
+            # Formula: floor(memLimitMiB * (100 - headroomPct) / 100 / concurrency)
+            # Default: floor(2048 * 75 / 100 / 2) = 768 MiB
+            # Supported units: Gi (gigibytes) and Mi (mebibytes) only.
+            # Any other suffix causes a hard template failure with a clear message.
+            {{- $memStr        := "" }}
+            {{- if and .Values.queryWorker.resources (index .Values.queryWorker.resources "limits") }}
+            {{- $memStr = index .Values.queryWorker.resources.limits "memory" | default "2Gi" }}
+            {{- else }}
+            {{- $memStr = "2Gi" }}
+            {{- end }}
+            {{- $memLimitMiB   := 0 }}
+            {{- if hasSuffix "Gi" $memStr }}
+            {{- $memLimitMiB    = trimSuffix "Gi" $memStr | float64 | mul 1024 | int }}
+            {{- else if hasSuffix "Mi" $memStr }}
+            {{- $memLimitMiB    = trimSuffix "Mi" $memStr | float64 | int }}
+            {{- else }}
+            {{- fail (printf "queryWorker.resources.limits.memory value %q uses an unsupported unit — must end with Gi or Mi (e.g. '2Gi' or '1536Mi')" $memStr) }}
+            {{- end }}
+            {{- $headroom      := .Values.queryWorker.memoryHeadroomPct | default 25 }}
+            {{- $concurrency   := .Values.queryWorker.concurrency | default 2 }}
+            {{- $perSlotMiB    := div (div (mul $memLimitMiB (sub 100 $headroom)) 100) $concurrency }}
+            - name: DATUPLET_QUERY_WORKER_MEMORY_LIMIT
+              value: {{ printf "%dMiB" $perSlotMiB | quote }}
+
+            # max_temp_directory_size per slot.
+            # Formula: floor(scratchMiB / concurrency)
+            # Default: floor(2048 / 2) = 1024 MiB
+            # Supported units: Gi and Mi only (same rule as memory above).
+            {{- $scratchStr    := "" }}
+            {{- if .Values.queryWorker.scratch }}
+            {{- $scratchStr = .Values.queryWorker.scratch.sizeLimit | default "2Gi" }}
+            {{- else }}
+            {{- $scratchStr = "2Gi" }}
+            {{- end }}
+            {{- $scratchMiB    := 0 }}
+            {{- if hasSuffix "Gi" $scratchStr }}
+            {{- $scratchMiB     = trimSuffix "Gi" $scratchStr | float64 | mul 1024 | int }}
+            {{- else if hasSuffix "Mi" $scratchStr }}
+            {{- $scratchMiB     = trimSuffix "Mi" $scratchStr | float64 | int }}
+            {{- else }}
+            {{- fail (printf "queryWorker.scratch.sizeLimit value %q uses an unsupported unit — must end with Gi or Mi (e.g. '2Gi' or '512Mi')" $scratchStr) }}
+            {{- end }}
+            {{- $perSlotTmpMiB := div $scratchMiB $concurrency }}
+            - name: DATUPLET_QUERY_WORKER_MAX_TEMP_SIZE
+              value: {{ printf "%dMiB" $perSlotTmpMiB | quote }}
+
+            # DuckDB thread count (0 = engine default = 2 threads).
+            - name: DATUPLET_QUERY_WORKER_THREADS
+              value: "0"
+
+            # ---- Worker-enforced query limits ----------------------------
+            # Hard ceiling on per-query timeout the client may request.
+            - name: DATUPLET_QUERY_WORKER_MAX_TIMEOUT_S
+              value: {{ ((.Values.queryWorker).query).maxTimeoutS | default 300 | quote }}
+            # Hard ceiling on rows returned per query.
+            - name: DATUPLET_QUERY_WORKER_MAX_ROWS
+              value: {{ ((.Values.queryWorker).query).maxMaxRows | default 10000 | quote }}
+            # Hard ceiling on result bytes (maxMaxBytesMiB → bytes).
+            - name: DATUPLET_QUERY_WORKER_MAX_BYTES
+              value: {{ mul (((.Values.queryWorker).query).maxMaxBytesMiB | default 10) 1048576 | quote }}
+
+            # ---- Scratch dir ---------------------------------------------
+            - name: DATUPLET_QUERY_WORKER_TEMP_DIR
+              value: "/scratch"
+
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+
+          resources:
+            {{- if .Values.queryWorker.resources }}
+            {{- toYaml .Values.queryWorker.resources | nindent 12 }}
+            {{- else }}
+            requests:
+              memory: 2Gi
+              cpu: 500m
+              ephemeral-storage: 2Gi
+            limits:
+              memory: 2Gi
+              cpu: "2"
+              ephemeral-storage: 2Gi
+            {{- end }}
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 20
+
+          securityContext:
+            runAsNonRoot: true
+            # UID 1000 = datuplet user created in the query-worker Dockerfile
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+            # readOnlyRootFilesystem deliberately omitted (effective: false).
+            # DuckDB's extension autoloader reads the baked ~/.duckdb extension
+            # tree at its real location in the image — a tmpfs overlay over /home
+            # would hide the pre-installed extensions on every pod start. The
+            # secret-manager init also writes to ~/.duckdb/stored_secrets before
+            # the process lock is taken. /scratch is the only intended write
+            # surface at runtime. Revisit if the image relocates extensions to a
+            # path that can be mounted read-only (e.g. /opt/duckdb/extensions).
+
+      volumes:
+        - name: scratch
+          emptyDir:
+            sizeLimit: {{ ((.Values.queryWorker).scratch).sizeLimit | default "2Gi" }}
+{{- end }}
