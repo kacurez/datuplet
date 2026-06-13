@@ -199,6 +199,13 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	// unwinding through the deferred emit) never mints an empty-string
 	// Prometheus label.
 	rec := &auditRecord{principal: sub, outcome: "internal"}
+	// Snapshot the active logger at request entry rather than re-reading
+	// slog.Default() inside the deferred emit. The emit can fire after the
+	// request goroutine has handed back (and, in tests that swap the global
+	// logger per-case, after a different test has taken over slog.Default());
+	// binding it here keeps each request's audit line on the logger that was
+	// active when the request started.
+	logger := slog.Default()
 	// Exactly one emit per call — structural guarantee from deferred.
 	defer func() {
 		rec.durationMS = time.Since(start).Milliseconds()
@@ -206,7 +213,7 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 		if counter == nil {
 			counter = queryRequestsTotal
 		}
-		emitAudit(nil, counter, rec)
+		emitAudit(logger, counter, rec)
 	}()
 
 	// 2. Decode + validate the body (≤64 KiB SQL-text cap).
