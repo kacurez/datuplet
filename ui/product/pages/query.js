@@ -467,18 +467,8 @@ export async function renderQuery() {
     const displayRows = allRows.slice(0, UI_ROW_CAP);
     const displayCapped = allRows.length > UI_ROW_CAP;
 
-    // Detect multi-statement shape: server returns results from multiple
-    // statements as a single schema+rows of the LAST statement.
-    // The query engine populates stats.statements_executed > 1 when present.
-    // We surface this as an informational note.
-    const stmtCount = (stats.statements_executed != null) ? Number(stats.statements_executed) : null;
-    const isMultiStmt = stmtCount != null && stmtCount > 1;
-
     const truncatedBanner = truncated
       ? `<div class="callout callout--warn">${icons.alertTriangle} Results truncated at the server cap — not all rows are shown.</div>`
-      : '';
-    const multiStmtNote = isMultiStmt
-      ? `<div class="callout">${icons.info} Showing the final statement's result; earlier statements ran as setup (${stmtCount} statements total).</div>`
       : '';
     const capNote = displayCapped
       ? `<div class="callout">Showing ${UI_ROW_CAP.toLocaleString()} of ${allRows.length.toLocaleString()} returned rows (UI display cap).</div>`
@@ -490,7 +480,7 @@ export async function renderQuery() {
 
     if (schema.length === 0 && displayRows.length === 0) {
       resultsPane.innerHTML = `
-        ${truncatedBanner}${multiStmtNote}${capNote}
+        ${truncatedBanner}${capNote}
         <p class="qc-empty">Query ran successfully — no rows returned.</p>
         <div class="qc-results-footer">
           ${durationMs != null ? `<span class="qc-stat">${icons.clock} ${durationMs.toLocaleString()} ms</span>` : ''}
@@ -521,7 +511,7 @@ export async function renderQuery() {
       : `${displayRows.length.toLocaleString()} row${displayRows.length !== 1 ? 's' : ''}`;
 
     resultsPane.innerHTML = `
-      ${truncatedBanner}${multiStmtNote}${capNote}
+      ${truncatedBanner}${capNote}
       <div class="qc-results-scroll">
         <table class="table qc-results-table">
           <thead><tr>${headerCells}</tr></thead>
