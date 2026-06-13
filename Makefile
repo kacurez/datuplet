@@ -59,10 +59,12 @@ build-components: build-gateway ## Build all component Docker images
 # E2E-only component subset: skips finnhub-extractor (no scenario references it).
 # Keeps gateway as a build dep (sidecar is required for every run). RFC 010
 # scenarios (duckdb-etl, multi-table-join) need datuplet/sql-transform too.
-build-components-e2e: build-gateway build-component-sql-transform ## Build only the components actively used by e2e (data-generator + http-json-extractor + stdout-writer + sql-transform)
+# RFC 022 Task 2.7: query-worker is needed for the query e2e scenarios.
+build-components-e2e: build-gateway build-component-sql-transform ## Build only the components actively used by e2e (data-generator + http-json-extractor + stdout-writer + sql-transform + query-worker)
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
 	docker build -t datuplet/stdout-writer:latest -f components/stdout-writer/Dockerfile .
+	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
 build-component-sql-transform: ## Build sql-transform component image (RFC 010)
 	docker build -t datuplet/sql-transform:latest -f components/sql-transform/Dockerfile .
