@@ -90,14 +90,31 @@ var queryAdminSessionErr error
 func getAdminSession(t *testing.T) string {
 	t.Helper()
 	queryAdminSessionOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		cookie, _, err := querySessionLogin(ctx, framework.PipelineAPIBaseURL(), queryAdminEmail, queryAdminPassword)
-		if err != nil {
-			queryAdminSessionErr = fmt.Errorf("admin login: %w", err)
-			return
+		// Retry across a ~90s window. getAdminSession is first called right after
+		// EnsureQueryWarehouseEnv rolls pipeline-api, and on OrbStack the NodePort
+		// the framework reaches (:30081) can briefly stop serving while
+		// kube-proxy re-points it at the new pods. Tolerating that settling
+		// window beats skipping the entire query suite on one transient timeout
+		// (the pods are Ready — kubectl rollout status already returned — it's
+		// purely NodePort routing catching up).
+		var lastErr error
+		deadline := time.Now().Add(90 * time.Second)
+		for attempt := 1; ; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			cookie, _, err := querySessionLogin(ctx, framework.PipelineAPIBaseURL(), queryAdminEmail, queryAdminPassword)
+			cancel()
+			if err == nil {
+				queryAdminSession = cookie
+				return
+			}
+			lastErr = err
+			if time.Now().After(deadline) {
+				break
+			}
+			t.Logf("query: admin login attempt %d failed (%v); retrying after pipeline-api rollout…", attempt, err)
+			time.Sleep(3 * time.Second)
 		}
-		queryAdminSession = cookie
+		queryAdminSessionErr = fmt.Errorf("admin login: %w", lastErr)
 	})
 	if queryAdminSessionErr != nil {
 		t.Skipf("admin session login failed: %v", queryAdminSessionErr)

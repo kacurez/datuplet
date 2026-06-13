@@ -54,3 +54,13 @@ queryWorker:
     maxTimeoutS: 300
     defaultMaxRows: 1000
     maxMaxRows: 10000
+
+# RFC 022 Task 3.3: enable the client-side query mint endpoint
+# (POST /api/v1/query/token) for the BYO-local e2e (TestQuery_LocalMint_Enabled).
+# Production defaults this OFF (chart values.yaml); the e2e fixes it ON at deploy
+# time so the mint path is exercised against a live pipeline-api WITHOUT toggling
+# the env at test time — a runtime toggle forces a pipeline-api rollout, and the
+# rollout churn destabilizes the NodePort the framework reaches pipeline-api
+# through, skipping unrelated query scenarios. The policy-off 403 refusal is
+# covered by the pkg/pipelineapi/http unit test instead.
+allowClientSideQuery: true
