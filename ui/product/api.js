@@ -111,3 +111,51 @@ export async function getTablePreview(projectId, namespace, name) {
 export async function getTableSnapshots(projectId, namespace, name) {
   return api(`/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/snapshots`);
 }
+
+// runQuery submits ad-hoc SQL to the server-side query service (RFC 022 mode a)
+// and returns the queryengine Result JSON: { schema:[{name,type}], rows:[[...]],
+// truncated:bool, stats:{duration_ms,...} }.
+//
+// The warehouse is server-configured (one per deploy via DATUPLET_QUERY_WAREHOUSE),
+// so `projectId` is NOT sent in the body — it is accepted for parity with the
+// storage API and so the console can pass its active project for future
+// per-project routing. `opts` may carry { timeoutS, maxRows, maxBytes } (clamped
+// server-side).
+//
+// This does NOT use the api() wrapper: query errors (400 sql_error, 403,
+// 408 timeout, 429 rate_limited) are EXPECTED outcomes the console renders
+// inline, so we surface the HTTP status + the {error,kind} envelope rather than
+// flattening everything to a string. It still reuses the wrapper's 401 →
+// redirect-to-login contract. On non-2xx it throws an Error augmented with
+// `.status`, `.kind`, and `.retryAfter` so the console can map RFC 022 §10 codes.
+export async function runQuery(projectId, sql, opts = {}) {
+  const body = { sql };
+  if (opts.timeoutS != null) body.timeout_s = opts.timeoutS;
+  if (opts.maxRows != null) body.max_rows = opts.maxRows;
+  if (opts.maxBytes != null) body.max_bytes = opts.maxBytes;
+
+  const r = await fetch('/api/v1/query', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (r.status === 401) {
+    if (typeof window.__datupletGoToLogin === 'function') {
+      window.__datupletGoToLogin();
+    }
+    throw new Error('not authenticated');
+  }
+  const ct = r.headers.get('content-type') || '';
+  const payload = ct.includes('application/json') ? await r.json() : await r.text();
+  if (!r.ok) {
+    const err = new Error(
+      (payload && payload.error) || `query failed (HTTP ${r.status})`,
+    );
+    err.status = r.status;
+    err.kind = payload && payload.kind;
+    err.retryAfter = r.headers.get('Retry-After');
+    throw err;
+  }
+  return payload; // queryengine Result
+}
