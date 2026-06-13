@@ -67,6 +67,7 @@ jobs:
             datuplet/sql-transform:latest \
             datuplet/stdout-writer:latest \
             datuplet/http-json-extractor:latest \
+            datuplet/query-worker:latest \
           ; do
             kind load docker-image --name datuplet-e2e "$img"
           done
