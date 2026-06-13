@@ -325,6 +325,24 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		log.Printf("query service not wired: DATUPLET_QUERY_WORKER_URL not set (POST /api/v1/query returns 404)")
 	}
 
+	// Local query-JWT mint endpoint: POST /api/v1/query/token (RFC 022 §5.3).
+	// The laptop-side `datuplet-query` CLI calls it per-invocation to obtain a
+	// fresh short-lived query JWT for BYO-local (mode c) execution. Gated by the
+	// allowClientSideQuery policy (DATUPLET_ALLOW_CLIENT_SIDE_QUERY), default
+	// FALSE — an explicit operator opt-in. The endpoint is wired whenever the
+	// signer exists so the policy-off path returns a clear 403 refusal (NOT a
+	// 404): the refusal is server-enforced, so an old CLI cannot bypass it.
+	var localQueryMintHandler http.Handler
+	if signer != nil {
+		allowClientSideQuery := envBoolOr("DATUPLET_ALLOW_CLIENT_SIDE_QUERY", false)
+		localQueryMintHandler = apihttp.NewLocalQueryMintHandler(signer, allowClientSideQuery)
+		if allowClientSideQuery {
+			fmt.Printf("  Client-side query mint: ENABLED (POST /api/v1/query/token mints query JWTs)\n")
+		} else {
+			log.Printf("client-side query mint: DISABLED (POST /api/v1/query/token returns 403; set DATUPLET_ALLOW_CLIENT_SIDE_QUERY=true to opt in)")
+		}
+	}
+
 	srv := apihttp.NewServer(pool).
 		WithCookieSecure(cfg.CookieSecure).
 		WithSigner(signer).
@@ -345,6 +363,11 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// nil → route stays unregistered → 404.
 	if queryHandler != nil {
 		srv = srv.WithQueryService(queryHandler)
+	}
+	// Local query-JWT mint route. Wired whenever the signer exists; the
+	// handler returns 403 when the allowClientSideQuery policy is off.
+	if localQueryMintHandler != nil {
+		srv = srv.WithLocalQueryMint(localQueryMintHandler)
 	}
 	// Cluster-mode auth: Postgres-backed resolver (session cookies) chained
 	// with a bearer-JWT resolver so CLI subcommands (trigger, storage) can
@@ -446,4 +469,19 @@ func envIntOr(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// envBoolOr reads a boolean env var. Only "true" and "1" enable; anything
+// else (including unset, "false", "0", or a typo) returns def. The
+// allowClientSideQuery policy is security-sensitive and default-off, so we
+// treat unrecognised values as the safe default rather than erroring.
+func envBoolOr(key string, def bool) bool {
+	switch os.Getenv(key) {
+	case "true", "1":
+		return true
+	case "":
+		return def
+	default:
+		return false
+	}
 }

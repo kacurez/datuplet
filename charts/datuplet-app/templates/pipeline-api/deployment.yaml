@@ -126,6 +126,13 @@ spec:
             # per-request from lakekeeper based on the user's project.
             - name: DATUPLET_LAKEKEEPER_URL
               value: {{ include "datuplet-app.lakekeeperUrl" . | quote }}
+            # Client-side query mint policy (RFC 022 §5.3). Default false: the
+            # POST /api/v1/query/token endpoint returns a 403 refusal. Set
+            # allowClientSideQuery=true to let the laptop-side `datuplet-query`
+            # CLI mint short-lived query JWTs. Independent of queryWorker.enabled
+            # — the endpoint is always registered when a signing key is present.
+            - name: DATUPLET_ALLOW_CLIENT_SIDE_QUERY
+              value: {{ .Values.allowClientSideQuery | default false | quote }}
             {{- if .Values.queryWorker.enabled }}
             # ── Query Worker (RFC 022) ──────────────────────────────────────
             # Route POST /api/v1/query to the in-cluster query-worker Service.

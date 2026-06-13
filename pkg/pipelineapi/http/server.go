@@ -44,6 +44,12 @@ type Server struct {
 	// constructed in main.go at config time (same pattern as storage.NewForLakekeeper).
 	// Nil when the query service is not configured; the route stays unregistered.
 	queryHandler http.Handler
+	// localQueryMintHandler is the pre-built http.Handler for
+	// POST /api/v1/query/token (RFC 022 §5.3) — the per-invocation query-JWT
+	// mint endpoint the laptop-side `datuplet-query` CLI calls. Built in
+	// main.go whenever the signer exists (so the policy-off 403 path works
+	// even when client-side query is disabled). Nil → route unregistered.
+	localQueryMintHandler http.Handler
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -179,6 +185,20 @@ func (s *Server) WithQueryService(h http.Handler) *Server {
 	return s
 }
 
+// WithLocalQueryMint wires the pre-built http.Handler for
+// POST /api/v1/query/token (RFC 022 §5.3): the per-invocation query-JWT mint
+// endpoint the laptop-side `datuplet-query` CLI calls. Unlike WithQueryService,
+// the handler should be wired whenever a signer exists — the endpoint is
+// registered and returns a 403 refusal when the allowClientSideQuery policy is
+// off (NOT a 404), because the client expects a clear refusal rather than a
+// missing route. The route is gated on a non-nil UserResolver (WithUserResolver)
+// so the auth.WithUser middleware can identify the caller. When h is nil, the
+// route is left unregistered.
+func (s *Server) WithLocalQueryMint(h http.Handler) *Server {
+	s.localQueryMintHandler = h
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -261,6 +281,15 @@ func (s *Server) Handler() http.Handler {
 	// Absent env → queryHandler is nil → route stays unregistered (404).
 	if s.queryHandler != nil && s.resolver != nil {
 		mux.Handle("POST /api/v1/query", auth.WithUser(s.resolver, s.queryHandler))
+	}
+
+	// Local query-JWT mint route (RFC 022 §5.3). Registered whenever the
+	// handler + resolver are wired — the handler itself returns a 403 refusal
+	// when the allowClientSideQuery policy is off (NOT a 404), so the
+	// `datuplet-query` CLI gets a clear refusal. Behind auth.WithUser: the
+	// caller authenticates with the api-token bearer (aud=datuplet-api).
+	if s.localQueryMintHandler != nil && s.resolver != nil {
+		mux.Handle("POST /api/v1/query/token", auth.WithUser(s.resolver, s.localQueryMintHandler))
 	}
 
 	// Storage routes. When a storage.Service + resolver + authzr

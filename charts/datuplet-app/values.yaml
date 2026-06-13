@@ -249,6 +249,17 @@ queryWorker:
     # Example: "019eb2b6-659b-72c0-b8e1-2a193ca238fe/datuplet"
     warehouse: ""
 
+# allowClientSideQuery gates the POST /api/v1/query/token mint endpoint (RFC 022
+# §5.3): the per-invocation query-JWT mint the laptop-side `datuplet-query` CLI
+# calls to run ad-hoc SQL locally (BYO-local, mode c). DEFAULT FALSE — an
+# explicit operator opt-in. When false, pipeline-api returns a 403 refusal
+# (never a 404): the gate is server-enforced, so an old/rogue CLI cannot bypass
+# it. Setting true mints short-lived catalog JWTs to laptops, which then read
+# warehouse data directly via lakekeeper-vended STS creds — enable only when
+# that egress posture is acceptable. Independent of queryWorker.enabled (which
+# controls the server-side POST /api/v1/query path).
+allowClientSideQuery: false
+
 bootstrap:
   externalImages:
     # bitnami/kubectl:1.31 retired when Bitnami restructured the registry —
