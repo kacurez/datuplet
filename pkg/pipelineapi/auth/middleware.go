@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -55,10 +56,20 @@ func WithUser(resolver UserResolver, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, authed, err := resolver.UserFor(w, r)
 		if err != nil {
+			// Infrastructure failure (DB/session backend). Previously the error
+			// was swallowed behind a bare 500 — log it so operators can see why
+			// auth is failing. Never logs tokens/cookies, only the request line.
+			slog.Error("auth: resolver error",
+				"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr, "err", err)
 			writeJSONError(w, http.StatusInternalServerError, "auth error")
 			return
 		}
 		if !authed {
+			// Visibility into rejected requests (debugging + a signal for
+			// credential probing). Info level keeps the expected
+			// session-expiry → 401 → re-login flow from being alarming.
+			slog.Info("auth: unauthenticated request rejected",
+				"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 			writeJSONError(w, http.StatusUnauthorized, "not authenticated")
 			return
 		}
