@@ -16,3 +16,41 @@ image:
   pipelineOperator:
     repository: datuplet/pipeline-operator
     tag: latest
+
+# RFC 022 Task 2.7: enable the query-worker for e2e query scenarios.
+#
+# Bootstrap-ordering note: queryWorker.query.warehouse cannot be set here
+# because the lakekeeper project-id is only known after SetupFGABootstrap runs
+# (Go-test runtime). The e2e framework helper EnsureQueryWarehouseEnv (in
+# scenarios_query_test.go) patches DATUPLET_QUERY_WAREHOUSE on the pipeline-api
+# Deployment via `kubectl set env` once per test run, after bootstrap completes.
+# Leaving warehouse empty here is intentional: pipeline-api soft-degrades
+# (route unregistered → 404) until the patch lands. TestQueryBootstrap verifies
+# the patch and skips the query suite if the worker is not ready.
+queryWorker:
+  enabled: true
+  image:
+    repository: datuplet/query-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Reduced resources for the e2e cluster (OrbStack / kind has limited RAM).
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 250m
+      ephemeral-storage: 1Gi
+    limits:
+      memory: 1Gi
+      cpu: "1"
+      ephemeral-storage: 1Gi
+  concurrency: 2
+  memoryHeadroomPct: 25
+  scratch:
+    sizeLimit: 1Gi
+  query:
+    # Leave warehouse empty — patched post-bootstrap by EnsureQueryWarehouseEnv.
+    warehouse: ""
+    defaultTimeoutS: 60
+    maxTimeoutS: 300
+    defaultMaxRows: 1000
+    maxMaxRows: 10000
