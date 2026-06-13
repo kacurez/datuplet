@@ -416,8 +416,15 @@ func TestAudit_RateLimited_EmptyJTI(t *testing.T) {
 	h := newHandlerWithCounter(t, cfg, counter)
 	sub := uuid.New()
 
-	// First query: blocks inside worker.
+	// First query: blocks inside worker. done is closed when it fully
+	// returns (including its deferred audit emit) so the test can await it
+	// before returning — otherwise the late emit fires after the NEXT test
+	// has swapped the global slog default (slog.SetDefault also redirects the
+	// stdlib log package), leaking this query's audit line into that test's
+	// captured buffer.
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, authedReq(t, sub, `{"sql":"SELECT 1"}`))
 	}()
@@ -450,6 +457,7 @@ func TestAudit_RateLimited_EmptyJTI(t *testing.T) {
 	}
 
 	closeRelease()
+	<-done // ensure the in-flight query finishes (and emits) before returning
 }
 
 // TestAudit_TransportError_InternalOutcome covers the path where the worker
