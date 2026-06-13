@@ -707,6 +707,9 @@ func TestQuery_Truncation(t *testing.T) {
 	if os.Getenv("E2E_K8S") != "1" {
 		t.Skip("E2E_K8S=1 required")
 	}
+	if err := framework.PreCheck(); err != nil {
+		t.Skipf("precheck failed: %v", err)
+	}
 	h := framework.SharedHarness()
 	if h == nil {
 		t.Skip("SharedHarness nil")
@@ -752,6 +755,9 @@ func TestQuery_Truncation(t *testing.T) {
 func TestQuery_Timeout(t *testing.T) {
 	if os.Getenv("E2E_K8S") != "1" {
 		t.Skip("E2E_K8S=1 required")
+	}
+	if err := framework.PreCheck(); err != nil {
+		t.Skipf("precheck failed: %v", err)
 	}
 	h := framework.SharedHarness()
 	if h == nil {
@@ -822,6 +828,9 @@ func TestQuery_Timeout(t *testing.T) {
 func TestQuery_Concurrency(t *testing.T) {
 	if os.Getenv("E2E_K8S") != "1" {
 		t.Skip("E2E_K8S=1 required")
+	}
+	if err := framework.PreCheck(); err != nil {
+		t.Skipf("precheck failed: %v", err)
 	}
 	h := framework.SharedHarness()
 	if h == nil {
