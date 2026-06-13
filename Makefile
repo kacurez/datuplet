@@ -4,7 +4,7 @@ export DOCKER_BUILDKIT=1
 .PHONY: \
 	build build-pipeline-api build-gateway build-iceberg-job build-services \
 	build-components build-components-e2e build-component-data-generator build-operators \
-	build-component-sql-transform \
+	build-component-sql-transform build-component-datuplet-query \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
 	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
@@ -68,6 +68,12 @@ build-components-e2e: build-gateway build-component-sql-transform ## Build only 
 
 build-component-sql-transform: ## Build sql-transform component image (RFC 010)
 	docker build -t datuplet/sql-transform:latest -f components/sql-transform/Dockerfile .
+
+# datuplet-query (RFC 022 Task 3.1): BYO-local ad-hoc SQL binary. SEPARATE
+# install from the duckdb-free root `datuplet` CLI — the root binary cannot run
+# DuckDB locally; this duckdb-tagged image/binary is required for `--local`.
+build-component-datuplet-query: ## Build datuplet-query image (RFC 022, BYO-local SQL)
+	docker build -t datuplet/datuplet-query:latest -f utils/docker/datuplet-query.Dockerfile .
 
 build-component-data-generator: ## Build data-generator component image
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .

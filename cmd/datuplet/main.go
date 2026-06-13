@@ -48,6 +48,15 @@ func main() {
 	storageProject := storageCmd.String("project", "", "Project name (auto-defaulted if you have exactly one)")
 	storageRows := storageCmd.Int("rows", 0, "Max preview rows (sample subcommand only; 0 = server default)")
 
+	queryCmd := flag.NewFlagSet("query", flag.ExitOnError)
+	queryRemote := queryCmd.String("remote", "", "pipeline-api URL (required)")
+	queryTokenFile := queryCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
+	queryProject := queryCmd.String("project", "", "Project name (auto-defaulted if you have exactly one)")
+	querySQL := queryCmd.String("sql", "", "Inline SQL to run (takes precedence over -f and stdin)")
+	queryFile := queryCmd.String("f", "", "Path to a .sql file to run (used when --sql is empty)")
+	queryFormat := queryCmd.String("format", "table", "Output format: table | csv | json")
+	queryLocal := queryCmd.Bool("local", false, "Force local execution (requires the separate duckdb-enabled datuplet-query binary)")
+
 	gatewayCmd := flag.NewFlagSet("gateway", flag.ExitOnError)
 	gatewayLocal := gatewayCmd.Bool("local", false, "Run in local mode (filesystem backend)")
 	gatewayMinio := gatewayCmd.Bool("minio", false, "Run in MinIO mode (S3-compatible backend)")
@@ -206,6 +215,20 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "query":
+		queryCmd.Parse(os.Args[2:])
+		// --local does not need --remote: it routes nowhere (the root binary
+		// is duckdb-free and errors clearly). The server-routing path does.
+		if !*queryLocal && *queryRemote == "" {
+			fmt.Fprintln(os.Stderr, "Error: --remote is required (omit it only with --local)")
+			fmt.Fprintln(os.Stderr, `Usage: datuplet query --remote <url> [--project N] [--format table|csv|json] (--sql "..." | -f FILE | stdin)`)
+			os.Exit(1)
+		}
+		if err := runQuery(*queryRemote, *queryTokenFile, *queryProject, *querySQL, *queryFile, *queryFormat, *queryLocal); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "pipeline":
 		if err := runPipeline(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -250,6 +273,7 @@ Commands:
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
   pipeline               CRUD for pipeline specs (list, get, put, delete)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
+  query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
   gateway                Start the data gateway server (container entrypoint)
   iceberg-job            (REMOVED in RFC 021) Inline commit now lives in the data gateway sidecar
   table-gateway          (REMOVED) Lakekeeper now serves the catalog directly
@@ -282,6 +306,15 @@ Options for 'storage':
   -rows int              Max preview rows for 'sample' subcommand (0 = server default)
   <subcommand>           One of: tables | info | schema | sample | history
   <ns>.<table>           Namespace.table reference (required for info/schema/sample/history)
+
+Options for 'query':
+  -remote string         pipeline-api URL (required unless --local)
+  -project string        Project name (auto-defaulted if you have exactly one)
+  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
+  -sql string            Inline SQL (takes precedence over -f and stdin)
+  -f string              Path to a .sql file (used when --sql is empty; else stdin)
+  -format string         Output format: table | csv | json (default: table)
+  -local                 Force local execution (requires the separate duckdb-enabled datuplet-query binary)
 
 Options for 'gateway':
   -local                 Run in local mode (filesystem backend)
