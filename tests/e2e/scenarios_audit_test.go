@@ -94,7 +94,7 @@ func TestAuditTrail_ClusterRun(t *testing.T) {
 	}
 	cli, err := catalogwriter.NewClient(ctx, catalogwriter.ClientConfig{
 		Name:          "datuplet-e2e-audit",
-		URI:           h.LakekeeperBaseURL,
+		URI:           h.CatalogURI(),
 		Warehouse:     h.WarehouseName,
 		ProjectID:     h.LakekeeperProjectID,
 		TokenProvider: catalogwriter.TokenProvider(tp),

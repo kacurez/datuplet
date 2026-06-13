@@ -3,5 +3,14 @@ postgres:
     storageSize: 1Gi  # smaller for e2e
 
 minio:
+  # Pin MinIO root creds to the static minioadmin/minioadmin pair the test
+  # framework's SetupFGABootstrap defaults to (framework/bootstrap.go). The
+  # production chart sets rootUser: datuplet and leaves rootPassword unset, so
+  # the subchart generates a random password the host-side framework can't
+  # discover when it creates its own lakekeeper warehouse on a from-scratch
+  # deploy (the create path runs an S3 write-validation against MinIO).
+  # register.sh reads whatever is in the Secret, so it works with either.
+  rootUser: minioadmin
+  rootPassword: minioadmin
   persistence:
     size: 1Gi

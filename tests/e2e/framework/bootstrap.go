@@ -69,11 +69,22 @@ type FGAHarness struct {
 	// per-test impersonation/run tokens.
 	Signer *tokens.Signer
 
-	// LakekeeperBaseURL is the URL the harness uses for management calls
-	// and that scenarios feed into catalogwriter for LoadTable lookups.
-	// Includes the `/catalog` suffix when querying the iceberg REST
-	// surface; omits it for management calls.
+	// LakekeeperBaseURL is the management base URL (e.g.
+	// http://localhost:8181, set bare by scripts/e2e-port-forward.sh). The
+	// management API lives at the root; the iceberg REST surface lives under
+	// `/catalog`. Use CatalogURI() — never this field directly — when
+	// constructing a catalogwriter client for LoadTable lookups.
 	LakekeeperBaseURL string
+}
+
+// CatalogURI returns LakekeeperBaseURL normalized to carry exactly one
+// `/catalog` suffix — the iceberg REST base pkg/catalogwriter requires
+// (see pkg/catalogwriter/client.go). LakekeeperBaseURL is the bare
+// management URL, so passing it straight to catalogwriter would hit
+// :8181/v1/config → 404. Idempotent if the suffix is already present
+// (inverse of warehouse_resolver.go's TrimSuffix for management calls).
+func (h *FGAHarness) CatalogURI() string {
+	return strings.TrimSuffix(strings.TrimRight(h.LakekeeperBaseURL, "/"), "/catalog") + "/catalog"
 }
 
 // FGABootstrapConfig drives SetupFGABootstrap. All fields are
@@ -270,6 +281,58 @@ func SetupFGABootstrap(ctx context.Context, cfg FGABootstrapConfig) (*FGAHarness
 		return nil, fmt.Errorf("seed FGA grants: %w", err)
 	}
 	return h, nil
+}
+
+// seedProjectGrant writes one project-relation tuple for a DB user UUID on the
+// e2e lakekeeper project. Idempotent: an already-exists error is treated as
+// success. The relation is the Datuplet project relation (project_admin |
+// editor | viewer per pkg/pipelineapi/authz/reconciler.go) that chains into
+// lakekeeper's canonical read/write relations.
+func seedProjectGrant(ctx context.Context, h *FGAHarness, userUUID, relation string) error {
+	if h == nil || h.Authorizer == nil {
+		return errors.New("seedProjectGrant: harness not initialised")
+	}
+	tuple := authz.Tuple{
+		User:     authz.UserObject(userUUID).String(),
+		Relation: relation,
+		Object:   authz.ProjectObject(h.LakekeeperProjectID),
+	}
+	if err := h.Authorizer.WriteTuples(ctx, []authz.Tuple{tuple}); err != nil {
+		if isAlreadyExistsErr(err) {
+			return nil // already present — idempotent
+		}
+		return fmt.Errorf("write %s tuple for user %s: %w", relation, userUUID, err)
+	}
+	return nil
+}
+
+// SeedAdminFGAGrant writes a project_admin (read+write) tuple for the given DB
+// user UUID on the e2e lakekeeper project. Called by the query e2e suite to
+// ensure the real DB admin user (admin@datuplet.local, whose UUID is not the
+// hard-coded AliceID etc.) can attach to the e2e warehouse.
+//
+// register.sh grants the admin user on the "default" pipeline-api project,
+// but the e2e harness creates a SEPARATE lakekeeper project. Without this
+// grant the query-worker's catalog JWT (sub=<admin-uuid>) gets 403 from
+// lakekeeper on ATTACH.
+//
+// Idempotent: already-exists errors are silently ignored.
+func SeedAdminFGAGrant(ctx context.Context, h *FGAHarness, adminUserUUID string) error {
+	return seedProjectGrant(ctx, h, adminUserUUID, "project_admin")
+}
+
+// SeedViewerFGAGrant writes a viewer (read-only) tuple for the given DB user
+// UUID on the e2e lakekeeper project. `viewer` is the read-only Datuplet
+// relation: it chains into lakekeeper's describe/select read relations but NOT
+// data_admin (writes), so lakekeeper vends the principal read-only STS creds —
+// catalog reads succeed, catalog-qualified writes are denied catalog-side.
+// Used by TestQuery_WriteProbe to prove the read-only enforcement locus is the
+// caller's FGA grant (the DuckDB posture deliberately does not block iceberg
+// writes — see components/queryengine/lockdown_deny_integration_test.go).
+//
+// Idempotent: already-exists errors are silently ignored.
+func SeedViewerFGAGrant(ctx context.Context, h *FGAHarness, userUUID string) error {
+	return seedProjectGrant(ctx, h, userUUID, "viewer")
 }
 
 // SeedFGAGrants writes one project-relation tuple per TestUser whose

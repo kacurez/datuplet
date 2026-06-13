@@ -64,7 +64,7 @@ func (v *LakekeeperVerifier) LocationFor(ctx context.Context, namespace, table s
 	}
 	cli, err := catalogwriter.NewClient(ctx, catalogwriter.ClientConfig{
 		Name:          "datuplet-e2e-verifier",
-		URI:           v.harness.LakekeeperBaseURL,
+		URI:           v.harness.CatalogURI(),
 		Warehouse:     v.harness.WarehouseName,
 		ProjectID:     v.harness.LakekeeperProjectID,
 		TokenProvider: v.provider,
