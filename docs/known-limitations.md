@@ -159,6 +159,39 @@ pipeline-api + DNS) is recommended for production use.
 
 ---
 
+## Ad-hoc SQL query
+
+**BYO-local (`datuplet-query`) requires live pipeline-api connectivity.** The
+CLI calls `POST /api/v1/query/token` on every invocation to mint a short-lived
+query JWT. There is no offline mode — queries fail when pipeline-api is
+unreachable. The feature is also operator-gated (`allowClientSideQuery: false`
+by default); when the gate is off, the server returns 403 and the CLI refuses.
+
+**BYO-local audit is mint-level only.** The server records `principal` +
+timestamp when it issues a query JWT. The statement the CLI runs is never sent
+to the server — no statement-level audit is available for off-cluster queries.
+Lakekeeper's own access logs (storage-layer attribution) are the only downstream
+record.
+
+**Result caps are return-side, not scan-side.** The server's `max_rows` /
+`max_bytes` caps limit the rows returned to the caller (`truncated: true`), not
+the underlying DuckDB scan. The browser UI adds a separate client-side display
+cap of 2 000 rows on top of the server cap. A capped result is a prefix of the
+full answer; it may not be representative.
+
+**`datuplet-query` is a separate binary from the root `datuplet` CLI.** It must
+be built with `-tags duckdb_arrow` (CGO). The root `datuplet` binary is
+duckdb-free. Install and version them independently.
+
+**NetworkPolicy on the query-worker requires a policy-enforcing CNI.** The
+query-worker's Kubernetes NetworkPolicy (allow egress only to lakekeeper + object
+store + DNS) is enforced only when the cluster runs a policy-capable CNI such as
+GKE Dataplane V2 or Calico. Clusters without such a CNI (e.g. a local OrbStack
+dev cluster) do not enforce the policy — the query-worker has unrestricted egress
+in those environments.
+
+---
+
 ## Validated deployment targets
 
 GKE is the only validated cloud target for v0.1. EKS and AKS quickstarts are
