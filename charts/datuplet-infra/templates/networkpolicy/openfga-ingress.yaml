@@ -21,10 +21,12 @@ spec:
   policyTypes: ["Ingress"]
   ingress:
     - from:
-        # Lakekeeper (subchart, part-of=lakekeeper)
+        # Lakekeeper main Deployment. part-of=datuplet (datuplet-lakekeeper
+        # chart overlay, last-key-wins over the subchart's part-of=lakekeeper —
+        # which would match no pods); scope by name=lakekeeper.
         - podSelector:
             matchLabels:
-              app.kubernetes.io/part-of: lakekeeper
+              app.kubernetes.io/part-of: datuplet
               app.kubernetes.io/name: lakekeeper
         # Pipeline-api + reaper (Layer 2)
         - podSelector:
