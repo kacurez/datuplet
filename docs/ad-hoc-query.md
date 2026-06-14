@@ -35,17 +35,53 @@ staging PUT or commit. Do not rely on engine-level write blocking.
 
 ### Enabling
 
-```yaml
-# charts/datuplet-app/values.yaml
-queryWorker:
-  enabled: true
-  query:
-    warehouse: "<lakekeeperProjectID>/<warehouseName>"  # required; set after lakekeeper-bootstrap
-```
+The query service ships **disabled by default** (`queryWorker.enabled: false`)
+— it is experimental, so a stock install does not deploy it. Enabling it is a
+**post-install** step because the warehouse value depends on the lakekeeper
+project created during registration.
 
-The warehouse value is only known after `pipeline-api admin lakekeeper-bootstrap`
-runs. Pipeline-api soft-degrades to 404 on `POST /api/v1/query` when the
-warehouse is empty or `DATUPLET_QUERY_WORKER_URL` is unset.
+1. **Build the query-worker image.** It bakes the DuckDB iceberg/httpfs
+   extensions and is NOT built by `make deploy-local` / `docker-build-k8s` — build
+   it explicitly:
+
+   ```bash
+   make build-components      # builds query-worker (+ the other components)
+   # or only the worker:
+   # docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
+   # kind only — load it into the cluster node:
+   # kind load docker-image datuplet/query-worker:latest --name <cluster>
+   ```
+
+2. **Register first.** The standard install's Phase 5 (`scripts/register.sh`)
+   creates the lakekeeper project + warehouse; the query service reuses them.
+
+3. **Resolve the project-qualified warehouse.** The `warehouse` value MUST be
+   `<lakekeeper-project-id>/<warehouse-name>` (e.g. `<id>/datuplet`) — a bare name
+   resolves against lakekeeper's nil-UUID default project and 401s. The id is the
+   `lakekeeper_project_id` column of pipeline-api's `projects` table (also
+   returned by `GET /api/v1/projects` and stored in `~/.datuplet/cluster.json`
+   after `datuplet login --remote`):
+
+   ```sql
+   SELECT lakekeeper_project_id FROM projects WHERE name = 'default';
+   ```
+
+4. **Enable + set the warehouse** via a helm upgrade (per-deploy opt-in; the chart
+   default stays off):
+
+   ```bash
+   helm upgrade datuplet-app charts/datuplet-app -n datuplet --reuse-values \
+     --set queryWorker.enabled=true \
+     --set queryWorker.query.warehouse="<lakekeeper-project-id>/datuplet"
+   # optional: also allow the laptop-side datuplet-query CLI (see below)
+   #   --set allowClientSideQuery=true
+   ```
+
+5. **Verify.** The `query-worker` Pod is Running and `POST /api/v1/query` returns
+   rows (or open the console at `/ui/query`).
+
+Until the warehouse is set, pipeline-api soft-degrades to 404 on
+`POST /api/v1/query` (also 404 when `DATUPLET_QUERY_WORKER_URL` is unset).
 
 ### POST /api/v1/query
 
