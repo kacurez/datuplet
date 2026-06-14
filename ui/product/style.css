@@ -520,6 +520,217 @@ code.inline {
   word-break: break-all;
 }
 
+/* ---------- Query console (RFC 022 §5.6) ---------- */
+
+/* Three-pane layout: schema tree on the left, editor + results stacked right. */
+.qc-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: var(--s-3);
+  height: calc(100vh - 120px); /* fill viewport minus header */
+  min-height: 400px;
+}
+
+.qc-schema-pane {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.qc-schema-inner {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s-2) 0;
+}
+
+.qc-right {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+}
+
+/* Editor pane: textarea + run toolbar */
+.qc-editor-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  flex: 0 0 auto;
+}
+
+.qc-editor {
+  /* Override .textarea max-width so it fills the pane */
+  max-width: 100%;
+  width: 100%;
+  min-height: 140px;
+  max-height: 300px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.qc-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+
+.qc-run-status {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--fg-2);
+  font-size: var(--text-sm);
+}
+
+/* Results pane: scrollable grid + footer */
+.qc-results-pane {
+  flex: 1;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 120px;
+}
+
+.qc-results-scroll {
+  flex: 1;
+  overflow: auto;
+}
+
+.qc-results-table {
+  /* Prevent table from collapsing below its content width */
+  min-width: max-content;
+}
+/* Override default row hover cursor — results are not clickable rows */
+.qc-results-table tbody tr:hover { cursor: default; }
+
+.qc-results-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-2) var(--s-3);
+  border-top: 1px solid var(--border);
+  font-size: var(--text-sm);
+  color: var(--fg-2);
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+
+.qc-export-actions {
+  margin-left: auto;
+  display: flex;
+  gap: var(--s-2);
+}
+
+.qc-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+}
+
+/* Null cell rendering */
+.qc-null {
+  color: var(--fg-2);
+  font-style: italic;
+  font-family: var(--font-mono);
+}
+
+/* Schema tree elements */
+.qc-ns { border-bottom: 1px solid var(--border); }
+.qc-ns:last-child { border-bottom: none; }
+
+.qc-ns-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-2) var(--s-3);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-1);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+}
+.qc-ns-toggle:hover { background: var(--bg-2); color: var(--fg-0); }
+.qc-ns-toggle[aria-expanded="true"] > svg:first-child {
+  transform: rotate(90deg);
+}
+.qc-ns-toggle > svg:first-child { transition: transform 120ms ease; flex-shrink: 0; }
+
+.qc-ns-count {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--fg-2);
+}
+
+.qc-ns-tables {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.qc-table-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-1) var(--s-3) var(--s-1) var(--s-5);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-1);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.qc-table-item:hover { background: var(--bg-2); color: var(--fg-0); }
+.qc-table-item svg { flex-shrink: 0; }
+
+.qc-col-list {
+  padding: 0 var(--s-3) var(--s-2) var(--s-6);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.qc-col-loading {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--fg-2);
+  font-size: var(--text-xs);
+  padding: var(--s-1) 0;
+}
+
+.qc-col-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--text-xs);
+  color: var(--fg-1);
+  padding: 1px 0;
+}
+.qc-col-type {
+  color: var(--fg-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.qc-empty-cols { color: var(--fg-2); font-style: italic; }
+.qc-schema-error { padding: var(--s-3); }
+.qc-empty { color: var(--fg-2); font-size: var(--text-sm); padding: var(--s-3); margin: 0; }
+
 /* ----- Snapshot history section (RFC 013 C.2) ----- */
 .snapshot-history {
   margin-top: var(--s-5);

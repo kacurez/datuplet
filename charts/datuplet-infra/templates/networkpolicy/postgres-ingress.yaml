@@ -4,7 +4,9 @@ postgres-ingress NetworkPolicy.
 
 Allows port 5432 only from named-component Pods. The selectors below
 match what each chart actually emits:
-  - lakekeeper (main + db-migration Job) emits part-of=lakekeeper
+  - lakekeeper (main Deployment) emits part-of=datuplet (the
+    datuplet-lakekeeper chart overlays part-of, last-key-wins over the
+    subchart default — so part-of=lakekeeper would match no pods)
   - openfga emits part-of=openfga
   - our Jobs + pipeline-api emit part-of=datuplet
 Per-component name labels keep the allowlist explicit (no umbrella selector).
@@ -23,10 +25,11 @@ spec:
   policyTypes: ["Ingress"]
   ingress:
     - from:
-        # Lakekeeper main Deployment (subchart, part-of=lakekeeper)
+        # Lakekeeper main Deployment. part-of=datuplet (chart overlay, not the
+        # subchart's part-of=lakekeeper); scope by name=lakekeeper.
         - podSelector:
             matchLabels:
-              app.kubernetes.io/part-of: lakekeeper
+              app.kubernetes.io/part-of: datuplet
               app.kubernetes.io/name: lakekeeper
         # OpenFGA main Deployment + initContainer migrate (subchart, part-of=openfga)
         - podSelector:

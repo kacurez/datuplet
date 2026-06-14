@@ -1,0 +1,122 @@
+{{- /*
+query-worker NetworkPolicy (RFC 022 Task 2.6 — Spike 0.2 primary lockdown).
+
+ENFORCEMENT WARNING:
+  OrbStack/dev clusters without a policy CNI (e.g. plain kindnet) do NOT
+  enforce NetworkPolicies — the rules are stored in etcd but never applied
+  to iptables/eBPF. This was verified on 2026-06-11 during RFC 022 Spike 0.2.
+  Production deployments REQUIRE a policy-capable CNI:
+    • GKE Dataplane V2 (eBPF)  — recommended
+    • Calico, Cilium, Antrea   — supported
+  The e2e suite self-checks enforcement via a probe pod; CI fails loudly
+  when the CNI is not configured correctly.
+
+EGRESS — four destinations are permitted:
+  1. kube-dns (UDP + TCP :53) — scoped to kube-system/kube-dns pods only
+     (k8s >= 1.21 guarantees the kubernetes.io/metadata.name label on
+     namespaces; earlier clusters require manual namespace labelling).
+  2. lakekeeper Service (:8181) — Iceberg REST catalog for ATTACH + STS creds.
+     NOTE: the lakekeeper pod template sets app.kubernetes.io/part-of twice
+     (upstream 'lakekeeper', then overlay 'datuplet'); last-key-wins in K8s
+     label maps, so the effective label is part-of=datuplet. Selector must
+     use part-of=datuplet or it matches zero pods (production-only breakage
+     when a policy CNI is active).
+  3. minio / object-store Service (:9000) — S3-compatible data plane for
+     reading Parquet files after ATTACH. DuckDB's iceberg extension follows
+     the presigned URL returned by lakekeeper; that URL points at minio:9000
+     in a standard datuplet-infra install.
+  4. pipeline-api (:8081) — JWKS endpoint fetched at worker boot for
+     run-token validation (DATUPLET_QUERY_WORKER_JWKS_URL). Without this
+     rule the worker fails to start in any cluster that enforces NetworkPolicy
+     (production-only breakage — dev clusters with plain kindnet don't enforce).
+
+INGRESS — only pipeline-api pods on :8090.
+
+Selector conventions match what each chart actually emits:
+  lakekeeper:   app.kubernetes.io/part-of=datuplet, name=lakekeeper  (last-key-wins, see above)
+  minio:        app.kubernetes.io/part-of=datuplet,   name=minio       (datuplet-infra chart, fullnameOverride=minio)
+  pipeline-api: app.kubernetes.io/part-of=datuplet, name=pipeline-api
+
+Gated on queryWorker.enabled — renders nothing when false.
+*/ -}}
+{{- if .Values.queryWorker.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}query-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: query-worker
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "query-worker") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+
+  ingress:
+    # Accept query requests only from pipeline-api pods.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-api
+      ports:
+        - { protocol: TCP, port: 8090 }
+
+  egress:
+    # 1. kube-dns — scoped to kube-system namespace + kube-dns pod label.
+    #    Prevents DNS-tunnel exfiltration via a hostile query (kube-system
+    #    namespace guaranteed to have kubernetes.io/metadata.name label on
+    #    k8s >= 1.21; earlier clusters must label the namespace manually).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+
+    # 2. lakekeeper — Iceberg REST catalog (ATTACH + STS credential vending).
+    #    Uses part-of=datuplet because the lakekeeper pod template sets the key
+    #    twice (upstream chart sets 'lakekeeper', overlay sets 'datuplet');
+    #    last-key-wins → effective value is 'datuplet'. The old selector
+    #    part-of=lakekeeper matches zero pods in a running cluster.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: lakekeeper
+      ports:
+        - { protocol: TCP, port: 8181 }
+
+    # 3. minio / object-store — S3-compatible data plane (:9000).
+    #    DuckDB follows the presigned S3 URL returned by lakekeeper after ATTACH.
+    #    In a datuplet-infra install this is minio (fullnameOverride=minio, port 9000).
+    #    External S3: replace this egress rule with a broader CIDR block or use
+    #    an egress-gateway; the in-cluster minio selector is not valid for GCS/S3.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: minio
+      ports:
+        - { protocol: TCP, port: 9000 }
+
+    # 4. pipeline-api — JWKS endpoint (:8081) fetched at worker boot for
+    #    run-token validation (DATUPLET_QUERY_WORKER_JWKS_URL).
+    #    Without this rule the worker fails to validate JWTs in any cluster
+    #    that enforces NetworkPolicy (production-only breakage — dev clusters
+    #    with plain kindnet/no-CNI don't enforce).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-api
+      ports:
+        - { protocol: TCP, port: 8081 }
+{{- end }}

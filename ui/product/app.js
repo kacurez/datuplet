@@ -16,6 +16,7 @@ import { renderRunDetail } from '/ui/pages/run-detail.js';
 import { renderSecrets } from '/ui/pages/settings-secrets.js';
 import { renderStorageCatalog } from '/ui/pages/storage-catalog.js';
 import { renderStorageTable } from '/ui/pages/storage-table.js';
+import { renderQuery } from '/ui/pages/query.js';
 import { install as installHotkeys } from '/ui/hotkeys.js';
 import { install as installOverlay } from '/ui/overlay.js';
 import * as icons from '/ui/icons.js';
@@ -41,6 +42,7 @@ const routes = [
   { pattern: /^\/ui\/runs\/([^/]+)\/?$/, render: renderRunDetail },
   { pattern: /^\/ui\/storage\/?$/, render: renderStorageCatalog },
   { pattern: /^\/ui\/storage\/t\/([^/]+)\/([^/]+)\/?$/, render: renderStorageTable },
+  { pattern: /^\/ui\/query\/?$/, render: renderQuery },
   { pattern: /^\/ui\/settings\/secrets\/?$/, render: renderSecrets },
 ];
 
@@ -63,6 +65,7 @@ const NAV_ITEMS = [
   { href: '/ui/pipelines',        label: 'Pipelines', icon: 'play'     },
   { href: '/ui/runs',             label: 'Runs',      icon: 'activity' },
   { href: '/ui/storage',          label: 'Storage',   icon: 'database' },
+  { href: '/ui/query',            label: 'Query',     icon: 'terminal' },
   { href: '/ui/settings/secrets', label: 'Secrets',   icon: 'key'      },
 ];
 

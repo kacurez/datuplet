@@ -4,7 +4,7 @@ export DOCKER_BUILDKIT=1
 .PHONY: \
 	build build-pipeline-api build-gateway build-iceberg-job build-services \
 	build-components build-components-e2e build-component-data-generator build-operators \
-	build-component-sql-transform \
+	build-component-sql-transform build-component-datuplet-query \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
 	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
@@ -13,7 +13,7 @@ export DOCKER_BUILDKIT=1
 	k8s-retry-simple k8s-retry-duckdb k8s-retry-full \
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
-	prune-images \
+	prune-images prune-docker-cache \
 	lint chart-render-check tidy all help
 
 # =============================================================================
@@ -53,18 +53,27 @@ build-components: build-gateway ## Build all component Docker images
 	docker build -t datuplet/stdout-writer:latest -f components/stdout-writer/Dockerfile .
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
 	docker build -t datuplet/finnhub-extractor:latest -f components/finnhub-extractor/Dockerfile .
+	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 #   docker build -t datuplet/pandas-transform:latest -f components/pandas-transform/Dockerfile .
 
 # E2E-only component subset: skips finnhub-extractor (no scenario references it).
 # Keeps gateway as a build dep (sidecar is required for every run). RFC 010
 # scenarios (duckdb-etl, multi-table-join) need datuplet/sql-transform too.
-build-components-e2e: build-gateway build-component-sql-transform ## Build only the components actively used by e2e (data-generator + http-json-extractor + stdout-writer + sql-transform)
+# RFC 022 Task 2.7: query-worker is needed for the query e2e scenarios.
+build-components-e2e: build-gateway build-component-sql-transform ## Build only the components actively used by e2e (data-generator + http-json-extractor + stdout-writer + sql-transform + query-worker)
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
 	docker build -t datuplet/stdout-writer:latest -f components/stdout-writer/Dockerfile .
+	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
 build-component-sql-transform: ## Build sql-transform component image (RFC 010)
 	docker build -t datuplet/sql-transform:latest -f components/sql-transform/Dockerfile .
+
+# datuplet-query (RFC 022 Task 3.1): BYO-local ad-hoc SQL binary. SEPARATE
+# install from the duckdb-free root `datuplet` CLI — the root binary cannot run
+# DuckDB locally; this duckdb-tagged image/binary is required for `--local`.
+build-component-datuplet-query: ## Build datuplet-query image (RFC 022, BYO-local SQL)
+	docker build -t datuplet/datuplet-query:latest -f utils/docker/datuplet-query.Dockerfile .
 
 build-component-data-generator: ## Build data-generator component image
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
@@ -344,3 +353,21 @@ prune-images: ## Prune unused Docker images and system volumes
 	docker image prune -f
 	docker system prune -a --volumes
 	@echo "Docker images pruned."
+
+# BuildKit layer + cache-mount caches accumulate per builder and are NOT
+# touched by `docker system prune` (the named datuplet-builder once held
+# 37GB and filled the disk, causing OrbStack VM resets + kubelet image GC).
+# Keeps tagged images — safe to run while a cluster uses locally-built images.
+prune-docker-cache: ## Purge ALL Docker build caches (every buildx builder + dangling images; keeps tagged images)
+	@echo "Docker disk usage before:"
+	@docker system df
+	@# `buildx ls --format` emits builder AND node rows (e.g. datuplet-builder0);
+	@# dedupe, and let prune no-op on node names via `|| true`.
+	@for b in $$(docker buildx ls --format '{{.Name}}' | sort -u); do \
+	  echo "--- pruning buildx builder: $$b"; \
+	  docker buildx prune --builder $$b --all --force || true; \
+	done
+	@echo "--- pruning dangling images"
+	docker image prune --force
+	@echo "Docker disk usage after:"
+	@docker system df

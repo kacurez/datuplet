@@ -23,6 +23,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Free disk space
+        run: |
+          # The query-worker image (CGO + baked DuckDB iceberg/httpfs
+          # extensions) is large, and every built image is duplicated into
+          # kind's containerd on load — together with the deployed pods'
+          # Postgres/MinIO volumes that overran the hosted runner's default
+          # free disk ("no space left on device" during deploy). Reclaim
+          # toolchains this job never uses.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -67,9 +79,18 @@ jobs:
             datuplet/sql-transform:latest \
             datuplet/stdout-writer:latest \
             datuplet/http-json-extractor:latest \
+            datuplet/query-worker:latest \
           ; do
             kind load docker-image --name datuplet-e2e "$img"
           done
+
+      - name: Reclaim disk after kind load
+        run: |
+          # The images now live in kind's containerd; the host docker copies
+          # and the buildx cache are dead weight during deploy.
+          docker image prune --all --force || true
+          docker builder prune --all --force || true
+          df -h /
 
       - name: Run e2e (deploy + test + teardown)
         run: make e2e-k8s-deploy
