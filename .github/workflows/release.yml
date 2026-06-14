@@ -68,21 +68,22 @@ jobs:
           APP_VALUES=charts/datuplet-app/values.yaml
           INFRA_VALUES=charts/datuplet-infra/values.yaml
 
-          # Repoint image.repository to ghcr.io/<owner>/<image>. The five
+          # Repoint image.repository to ghcr.io/<owner>/<image>. The six
           # image refs in datuplet-app and the one in datuplet-infra are
           # the only "repository: datuplet/X" lines in these files, so
           # bare-line sed is unambiguous.
-          for img in pipeline-api pipeline-operator pipeline-observer gateway iceberg-job; do
+          for img in pipeline-api pipeline-operator pipeline-observer gateway iceberg-job query-worker; do
             sed -i "s|repository: datuplet/${img}\$|repository: ${REGISTRY}/${OWNER}/${img}|" "$APP_VALUES"
           done
           sed -i "s|repository: datuplet/pipeline-api\$|repository: ${REGISTRY}/${OWNER}/pipeline-api|" "$INFRA_VALUES"
 
-          # Pin every `tag: latest` line in both values files to the
-          # release version. No other "tag: latest" lines appear in these
-          # files (grep verifies before substitution). Note: -P (PCRE)
-          # cannot be combined with -E (ERE) in GNU grep — drop -E.
+          # Pin every `tag: latest` value line in both values files to the
+          # release version. The guard refuses a blanket replace if a real
+          # tag: value is non-latest — anchored to ^\s*tag: so descriptive
+          # comments (e.g. queryWorker's "# tag: image tag.") are not flagged.
+          # Note: -P (PCRE) cannot be combined with -E (ERE) in GNU grep.
           for f in "$APP_VALUES" "$INFRA_VALUES"; do
-            if grep -qP "tag:[[:space:]]+(?!latest$)" "$f"; then
+            if grep -qP "^[[:space:]]*tag:[[:space:]]+(?!latest$)" "$f"; then
               echo "ERROR: $f has a non-'latest' tag line; refusing blanket replace" >&2
               grep -nE "tag:" "$f" >&2 || true
               exit 1

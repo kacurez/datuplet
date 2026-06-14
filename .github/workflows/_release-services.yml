@@ -1,10 +1,10 @@
 name: release-services
 
-# Reusable: builds + manifests the five datuplet service images
-# (pipeline-api, pipeline-observer, pipeline-operator, gateway, iceberg-job).
-# Each is a call to _release-image.yml. Called once from release.yml as
-# the `services` job; appears as a collapsible group in the run-detail
-# UI containing 15 flat entries (5 images × 3 sub-jobs).
+# Reusable: builds + manifests the six datuplet service images
+# (pipeline-api, pipeline-observer, pipeline-operator, gateway, iceberg-job,
+# query-worker). Each is a call to _release-image.yml. Called once from
+# release.yml as the `services` job; appears as a collapsible group in the
+# run-detail UI containing 18 flat entries (6 images × 3 sub-jobs).
 
 on:
   workflow_call:
@@ -47,4 +47,15 @@ jobs:
     with:
       name: iceberg-job
       dockerfile: utils/docker/Dockerfile.iceberg-job
+    secrets: inherit
+
+  # query-worker (RFC 022): the ad-hoc SQL query service Deployment image,
+  # referenced by datuplet-app's queryWorker.image. Distinct dockerfile path
+  # (query-worker.Dockerfile, not Dockerfile.query-worker) — it bakes the
+  # DuckDB iceberg/httpfs extensions, so it is CGO + multi-arch like gateway.
+  query-worker:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: query-worker
+      dockerfile: utils/docker/query-worker.Dockerfile
     secrets: inherit
