@@ -14,13 +14,19 @@ import (
 )
 
 // queryHTTPClient is dedicated to the `datuplet query` server-routing path.
-// The 5-minute timeout is a defensive ceiling on top of the server's own
-// per-query clamp (RFC 022 §5.2 default 60s, max 300s) so a slow-responding
-// pipeline-api can't hang the CLI forever. CheckRedirect refuses ALL redirects
-// so the api-token bearer (and the SQL body on a 307) can never be forwarded to
-// a redirect target (mirrors pkg/pipelineapi/queryproxy/client.go).
+// The 6-minute timeout is a defensive ceiling that must sit ABOVE the whole
+// server-side chain, so a long-but-valid query yields pipeline-api's structured
+// 408/JSON instead of the CLI firing its own (opaque) transport timeout first:
+// the server clamps a query to max 300s (RFC 022 §5.2) and the proxy's worker
+// client itself waits maxTimeoutS+slack (~330s — see
+// pkg/pipelineapi/queryproxy/client.go), so the client ceiling has to exceed
+// that ~330s, not merely equal the 300s server max. 6m clears it with margin
+// for proxy + network while still bounding a wedged pipeline-api so the CLI
+// can't hang forever. CheckRedirect refuses ALL redirects so the api-token
+// bearer (and the SQL body on a 307) can never be forwarded to a redirect
+// target (mirrors pkg/pipelineapi/queryproxy/client.go).
 var queryHTTPClient = &http.Client{
-	Timeout: 5 * time.Minute,
+	Timeout: 6 * time.Minute,
 	CheckRedirect: func(*http.Request, []*http.Request) error {
 		return fmt.Errorf("datuplet query: unexpected redirect from pipeline-api (refused)")
 	},
