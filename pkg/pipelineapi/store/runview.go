@@ -15,19 +15,20 @@ import (
 // name. The pgx converter populates it from the joined pipelines row when
 // callers have it available; otherwise left empty.
 type RunView struct {
-	ID           uuid.UUID
-	PipelineID   uuid.UUID // zero in local mode
-	PipelineName string    // zero if not joined
-	Phase        string
-	CurrentStage string
-	Message      string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	StartedAt    *time.Time
-	CompletedAt  *time.Time
-	ProjectID    *uuid.UUID // nil in local mode
-	TriggeredBy  *uuid.UUID // nil if system-triggered or local mode
-	ObservedRV   int64      // 0 in local mode
+	ID            uuid.UUID
+	PipelineID    uuid.UUID // zero in local mode
+	PipelineName  string    // zero if not joined
+	Phase         string
+	CurrentStage  string
+	Message       string
+	StageStatuses []byte // raw JSON snapshot; nil when none recorded
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	StartedAt     *time.Time
+	CompletedAt   *time.Time
+	ProjectID     *uuid.UUID // nil in local mode
+	TriggeredBy   *uuid.UUID // nil if system-triggered or local mode
+	ObservedRV    int64      // 0 in local mode
 }
 
 // ToRunView converts a pgx-loaded Run into the shared DTO. A nil-uuid
@@ -39,6 +40,8 @@ func ToRunView(r *Run) RunView {
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		StartedAt: r.StartedAt, CompletedAt: r.CompletedAt,
 	}
+	v.PipelineName = r.PipelineName
+	v.StageStatuses = r.StageStatuses
 	if r.ProjectID != uuid.Nil {
 		pid := r.ProjectID
 		v.ProjectID = &pid

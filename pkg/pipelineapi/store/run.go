@@ -19,11 +19,17 @@ type Run struct {
 	Phase        string
 	CurrentStage string
 	Message      string
-	StartedAt    *time.Time
-	CompletedAt  *time.Time
-	TriggeredBy  uuid.UUID // zero-value if system-triggered
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// PipelineName is populated only when a query joins the pipelines table
+	// (ListRunsPage, GetRunByID). Empty otherwise.
+	PipelineName string
+	// StageStatuses is the raw JSON snapshot of PipelineRun.Status.StageStatuses,
+	// or nil when no timeline has been recorded. Populated by GetRunByID only.
+	StageStatuses []byte
+	StartedAt     *time.Time
+	CompletedAt   *time.Time
+	TriggeredBy   uuid.UUID // zero-value if system-triggered
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // ErrRunNotFound is returned when no run matches the lookup.
@@ -67,11 +73,15 @@ func GetRunByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (*Run, er
 	r := &Run{}
 	var triggeredBy *uuid.UUID
 	err := pool.QueryRow(ctx,
-		`SELECT id, project_id, pipeline_id, phase, current_stage, message,
-		        started_at, completed_at, triggered_by, created_at, updated_at
-		   FROM runs WHERE id = $1`, id,
-	).Scan(&r.ID, &r.ProjectID, &r.PipelineID, &r.Phase, &r.CurrentStage, &r.Message,
-		&r.StartedAt, &r.CompletedAt, &triggeredBy, &r.CreatedAt, &r.UpdatedAt)
+		`SELECT r.id, r.project_id, r.pipeline_id, pl.name, r.phase, r.current_stage,
+		        r.message, r.started_at, r.completed_at, r.triggered_by,
+		        r.created_at, r.updated_at, r.stage_statuses
+		   FROM runs r
+		   JOIN pipelines pl ON pl.id = r.pipeline_id
+		  WHERE r.id = $1`, id,
+	).Scan(&r.ID, &r.ProjectID, &r.PipelineID, &r.PipelineName, &r.Phase, &r.CurrentStage,
+		&r.Message, &r.StartedAt, &r.CompletedAt, &triggeredBy,
+		&r.CreatedAt, &r.UpdatedAt, &r.StageStatuses)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrRunNotFound
@@ -135,7 +145,7 @@ type UpdateRunPhaseOpts struct {
 // UpdateRunPhase writes the phase transition. Returns:
 //   - (true,  nil)                   row updated
 //   - (false, nil)                   ObservedRV > 0 and the guard filtered
-//                                    the write (stale event from informer)
+//     the write (stale event from informer)
 //   - (false, ErrRunNotFound)        no matching row, ObservedRV == 0
 //   - (false, err)                   other DB error
 //

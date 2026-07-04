@@ -255,3 +255,26 @@ func TestUpdateRunPhase_MissingRunReturnsErrRunNotFound(t *testing.T) {
 		t.Errorf("err = %v, want ErrRunNotFound", err)
 	}
 }
+
+func TestGetRunByID_ReturnsPipelineNameAndNilSnapshot(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
+		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
+	})
+
+	got, err := store.GetRunByID(ctx, pool, run.ID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if got.PipelineName != "etl" {
+		t.Errorf("PipelineName = %q, want etl", got.PipelineName)
+	}
+	if got.StageStatuses != nil {
+		t.Errorf("StageStatuses = %q, want nil for a fresh run", got.StageStatuses)
+	}
+}
