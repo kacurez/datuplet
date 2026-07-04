@@ -2,8 +2,10 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -276,5 +278,66 @@ func TestGetRunByID_ReturnsPipelineNameAndNilSnapshot(t *testing.T) {
 	}
 	if got.StageStatuses != nil {
 		t.Errorf("StageStatuses = %q, want nil for a fresh run", got.StageStatuses)
+	}
+}
+
+func TestUpdateRunPhase_PersistsSnapshotAndCoalesceNilPreserves(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+
+	snap := []byte(`[{"name":"extract","phase":"Running"}]`)
+	if _, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase: "Running", CurrentStage: "extract", ObservedRV: 10, StageStatuses: snap,
+	}); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	// A later write with nil snapshot must PRESERVE the stored JSON.
+	if _, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase: "Running", CurrentStage: "transform", ObservedRV: 11,
+	}); err != nil {
+		t.Fatalf("nil-snapshot write: %v", err)
+	}
+	got, _ := store.GetRunByID(ctx, pool, run.ID)
+	var gotJSON, wantJSON any
+	if err := json.Unmarshal(got.StageStatuses, &gotJSON); err != nil {
+		t.Fatalf("unmarshal got: %v", err)
+	}
+	if err := json.Unmarshal(snap, &wantJSON); err != nil {
+		t.Fatalf("unmarshal want: %v", err)
+	}
+	if !reflect.DeepEqual(gotJSON, wantJSON) {
+		t.Errorf("snapshot = %s, want preserved %s", got.StageStatuses, snap)
+	}
+}
+
+func TestUpdateRunPhase_GuardTerminalBlocksResurrection(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+
+	// Out-of-band cancel (rv=0, no guard) — like runbackend.CancelRun.
+	if _, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{Phase: "Cancelled"}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	// Stale observer reconcile (rv>0, GuardTerminal) must NOT resurrect Running.
+	applied, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase: "Running", CurrentStage: "extract", ObservedRV: 999, GuardTerminal: true,
+	})
+	if err != nil {
+		t.Fatalf("guarded write: %v", err)
+	}
+	if applied {
+		t.Fatal("applied=true: guarded write resurrected a Cancelled run")
+	}
+	got, _ := store.GetRunByID(ctx, pool, run.ID)
+	if got.Phase != "Cancelled" {
+		t.Errorf("phase = %q, want Cancelled", got.Phase)
 	}
 }

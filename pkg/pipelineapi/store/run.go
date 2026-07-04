@@ -140,6 +140,14 @@ type UpdateRunPhaseOpts struct {
 	StartedAt    *time.Time
 	CompletedAt  *time.Time
 	ObservedRV   int64
+	// StageStatuses is the raw JSON timeline snapshot. nil means "preserve the
+	// existing value" (COALESCE) — terminal writers (cancel/reaper) pass nil so
+	// they never null a snapshot the observer already captured.
+	StageStatuses []byte
+	// GuardTerminal, when true, refuses to overwrite a row already in an
+	// out-of-band terminal phase (Cancelled/Expired). Set by the observer's
+	// DBRunUpdater so a stale Running reconcile cannot resurrect a cancelled run.
+	GuardTerminal bool
 }
 
 // UpdateRunPhase writes the phase transition. Returns:
@@ -155,6 +163,10 @@ type UpdateRunPhaseOpts struct {
 // (ObservedRV == 0) still get ErrRunNotFound so the HTTP handler can
 // surface a 404.
 func UpdateRunPhase(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, opts UpdateRunPhaseOpts) (bool, error) {
+	guard := ""
+	if opts.GuardTerminal {
+		guard = ` AND phase <> ALL('{Cancelled,Expired}')`
+	}
 	tag, err := pool.Exec(ctx,
 		`UPDATE runs SET
 		    phase = $2,
@@ -162,17 +174,19 @@ func UpdateRunPhase(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, opts 
 		    message = $4,
 		    started_at = COALESCE($5, started_at),
 		    completed_at = COALESCE($6, completed_at),
+		    stage_statuses = COALESCE($8, stage_statuses),
 		    observed_rv = GREATEST(observed_rv, $7::bigint),
 		    updated_at = now()
 		  WHERE id = $1
-		    AND ($7::bigint = 0 OR $7::bigint > observed_rv)`,
-		id, opts.Phase, opts.CurrentStage, opts.Message, opts.StartedAt, opts.CompletedAt, opts.ObservedRV,
+		    AND ($7::bigint = 0 OR $7::bigint > observed_rv)`+guard,
+		id, opts.Phase, opts.CurrentStage, opts.Message, opts.StartedAt, opts.CompletedAt,
+		opts.ObservedRV, opts.StageStatuses,
 	)
 	if err != nil {
 		return false, fmt.Errorf("update run: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		if opts.ObservedRV == 0 {
+		if opts.ObservedRV == 0 && !opts.GuardTerminal {
 			return false, ErrRunNotFound
 		}
 		return false, nil
