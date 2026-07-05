@@ -4,6 +4,7 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -49,6 +50,9 @@ type RunStatus struct {
 	StartedAt       *time.Time
 	CompletedAt     *time.Time
 	ResourceVersion int64
+	// StageStatuses is the marshalled PipelineRun.Status.StageStatuses, or nil
+	// when the CRD has no stage statuses yet. Persisted verbatim as runs.stage_statuses.
+	StageStatuses []byte
 }
 
 // RunStatusUpdater is the seam between observer and DB. The coalesce
@@ -241,6 +245,11 @@ func reconcileOne(ctx context.Context, c client.Client, req reconcile.Request, u
 	if pr.Status.CompletionTime != nil {
 		t := pr.Status.CompletionTime.Time
 		status.CompletedAt = &t
+	}
+	if len(pr.Status.StageStatuses) > 0 {
+		if b, err := json.Marshal(pr.Status.StageStatuses); err == nil {
+			status.StageStatuses = b
+		}
 	}
 	if _, err := u.Update(ctx, status); err != nil {
 		// Return the error so controller-runtime's workqueue requeues

@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"time"
@@ -135,7 +136,8 @@ func (a RunStatus) equalsForDB(b RunStatus) bool {
 		a.CurrentStage == b.CurrentStage &&
 		a.Message == b.Message &&
 		timePtrEqual(a.StartedAt, b.StartedAt) &&
-		timePtrEqual(a.CompletedAt, b.CompletedAt)
+		timePtrEqual(a.CompletedAt, b.CompletedAt) &&
+		bytes.Equal(a.StageStatuses, b.StageStatuses)
 }
 
 func timePtrEqual(a, b *time.Time) bool {
