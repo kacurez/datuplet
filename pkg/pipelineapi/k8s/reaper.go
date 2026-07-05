@@ -135,12 +135,14 @@ func ReapOnce(ctx context.Context, c client.Client, maxAge time.Duration, u RunS
 		deleted := err == nil
 		if u != nil && wasNonTerminal && deleted {
 			if rid, parseErr := uuid.Parse(pr.Labels["datuplet.io/run-id"]); parseErr == nil {
+				expiredAt := time.Now().UTC()
 				if _, err := u.Update(ctx, RunStatus{
 					RunID:           rid,
 					Namespace:       pr.Namespace,
 					PipelineRunName: pr.Name,
 					Phase:           "Expired",
 					Message:         fmt.Sprintf("reaped after %s", maxAge),
+					CompletedAt:     &expiredAt,
 				}); err != nil {
 					log.Printf("pipeline-api reaper: expired mark run=%s: %v", rid, err)
 				}

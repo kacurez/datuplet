@@ -398,9 +398,11 @@ func (b *K8sBackend) CancelRun(ctx context.Context, req CancelRequest) error {
 	if !alreadyTerminal {
 		bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer bgCancel()
+		cancelNow := time.Now().UTC()
 		if _, err := store.UpdateRunPhase(bgCtx, b.db, req.RunID, store.UpdateRunPhaseOpts{
-			Phase:   "Cancelled",
-			Message: "cancelled by user",
+			Phase:       "Cancelled",
+			Message:     "cancelled by user",
+			CompletedAt: &cancelNow,
 		}); err != nil {
 			return fmt.Errorf("update run phase: %w", err)
 		}
