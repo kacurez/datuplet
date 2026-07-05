@@ -74,6 +74,6 @@ type PipelineDetail struct {
 // RunReader serves read-only run endpoints. Trigger/Cancel go through
 // runbackend.Backend (already wired).
 type RunReader interface {
-	ListForProject(ctx context.Context, projectID uuid.UUID, limit int) ([]store.RunView, error)
+	ListPage(ctx context.Context, projectID uuid.UUID, opts store.RunListOpts) (store.RunPage, error)
 	GetByID(ctx context.Context, projectID, runID uuid.UUID) (store.RunView, error)
 }
