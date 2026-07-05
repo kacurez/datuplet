@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -124,6 +125,97 @@ func ListRunsForProject(ctx context.Context, pool *pgxpool.Pool, projectID uuid.
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// RunListOpts are the filters + paging knobs for ListRunsPage. Zero values
+// disable each filter; Cursor == "" starts at the newest row.
+type RunListOpts struct {
+	Limit          int
+	Cursor         string
+	PipelineSubstr string    // case-insensitive substring on pipeline name
+	PipelineID     uuid.UUID // uuid.Nil = no filter
+	Phase          string    // "" = no filter
+}
+
+// RunPage is one keyset page. NextCursor == "" means this is the last page.
+type RunPage struct {
+	Runs       []*Run
+	NextCursor string
+}
+
+// ListRunsPage returns one keyset page of runs (newest first) for a project.
+// Ordering is (created_at DESC, id DESC); the id tiebreaker keeps pages stable
+// while new runs stream in at the top. Fetches limit+1 rows to detect a next page.
+func ListRunsPage(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, opts RunListOpts) (RunPage, error) {
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 50 // default page size
+	} else if limit > 200 {
+		limit = 200 // hard ceiling (RFC: clamp to 1..200)
+	}
+	args := []any{projectID}
+	where := []string{"r.project_id = $1"}
+	if opts.Cursor != "" {
+		ct, cid, err := decodeCursor(opts.Cursor)
+		if err != nil {
+			return RunPage{}, err
+		}
+		args = append(args, ct, cid)
+		where = append(where, fmt.Sprintf("(r.created_at, r.id) < ($%d, $%d)", len(args)-1, len(args)))
+	}
+	if opts.PipelineID != uuid.Nil {
+		args = append(args, opts.PipelineID)
+		where = append(where, fmt.Sprintf("r.pipeline_id = $%d", len(args)))
+	}
+	if opts.Phase != "" {
+		args = append(args, opts.Phase)
+		where = append(where, fmt.Sprintf("r.phase = $%d", len(args)))
+	}
+	if opts.PipelineSubstr != "" {
+		args = append(args, opts.PipelineSubstr)
+		where = append(where, fmt.Sprintf("pl.name ILIKE '%%' || $%d || '%%'", len(args)))
+	}
+	args = append(args, limit+1)
+	q := fmt.Sprintf(`
+		SELECT r.id, r.project_id, r.pipeline_id, pl.name, r.phase, r.current_stage,
+		       r.message, r.started_at, r.completed_at, r.triggered_by,
+		       r.created_at, r.updated_at
+		  FROM runs r
+		  JOIN pipelines pl ON pl.id = r.pipeline_id
+		 WHERE %s
+		 ORDER BY r.created_at DESC, r.id DESC
+		 LIMIT $%d`, strings.Join(where, " AND "), len(args))
+
+	rows, err := pool.Query(ctx, q, args...)
+	if err != nil {
+		return RunPage{}, fmt.Errorf("query runs page: %w", err)
+	}
+	defer rows.Close()
+	var out []*Run
+	for rows.Next() {
+		r := &Run{}
+		var triggeredBy *uuid.UUID
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.PipelineID, &r.PipelineName, &r.Phase,
+			&r.CurrentStage, &r.Message, &r.StartedAt, &r.CompletedAt, &triggeredBy,
+			&r.CreatedAt, &r.UpdatedAt); err != nil {
+			return RunPage{}, fmt.Errorf("scan: %w", err)
+		}
+		if triggeredBy != nil {
+			r.TriggeredBy = *triggeredBy
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return RunPage{}, err
+	}
+	page := RunPage{}
+	if len(out) > limit {
+		last := out[limit-1]
+		page.NextCursor = encodeCursor(last.CreatedAt, last.ID)
+		out = out[:limit]
+	}
+	page.Runs = out
+	return page, nil
 }
 
 // UpdateRunPhaseOpts is the input to UpdateRunPhase. ObservedRV activates
