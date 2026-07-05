@@ -139,6 +139,10 @@ func (s *pgxPipelineStore) GetByName(ctx context.Context, projectID uuid.UUID, n
 	}, nil
 }
 
+func (s *pgxPipelineStore) GetYAMLByID(ctx context.Context, pipelineID uuid.UUID) (string, error) {
+	return store.GetPipelineYAMLByID(ctx, s.pool, pipelineID)
+}
+
 func (s *pgxPipelineStore) Put(ctx context.Context, projectID uuid.UUID, name string, yaml []byte) error {
 	yamlStr := string(yaml)
 	// Upsert: update if exists, insert otherwise. Concurrent PUTs can

@@ -192,7 +192,21 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "get run")
 		return
 	}
-	writeJSON(w, http.StatusOK, runToJSON(run))
+	detail := struct {
+		runJSON
+		Timeline []timelineStage `json:"timeline"`
+	}{runJSON: runToJSON(run)}
+
+	// Best-effort timeline: a missing YAML or parse error leaves Timeline nil
+	// (UI shows "no stage timeline recorded"); it never fails the run fetch.
+	if run.PipelineID != uuid.Nil {
+		if yaml, err := s.pipelines.GetYAMLByID(r.Context(), run.PipelineID); err == nil {
+			if tl, err := buildTimeline(run.StageStatuses, yaml); err == nil {
+				detail.Timeline = tl
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 // handleCancelRun is POST /api/v1/projects/:pid/runs/:id/cancel.

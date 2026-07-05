@@ -50,6 +50,7 @@ type ProjectView struct {
 type PipelineStore interface {
 	List(ctx context.Context, projectID uuid.UUID) ([]PipelineRef, error)
 	GetByName(ctx context.Context, projectID uuid.UUID, name string) (*PipelineDetail, error)
+	GetYAMLByID(ctx context.Context, pipelineID uuid.UUID) (string, error)
 	Put(ctx context.Context, projectID uuid.UUID, name string, yaml []byte) error
 	Delete(ctx context.Context, projectID uuid.UUID, name string) error
 }

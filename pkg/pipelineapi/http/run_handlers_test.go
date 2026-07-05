@@ -332,6 +332,86 @@ func TestListRuns_EnvelopeAndFilters(t *testing.T) {
 	}
 }
 
+const tlYAML = `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: daily-orders
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: api
+          image: x
+          inputs: {buckets: [api]}
+          outputs:
+            tables: [{name: orders, bucket: raw, writeMode: FULL_LOAD}]
+`
+
+func TestGetRun_AssemblesTimeline(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
+
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", tlYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+	snap := []byte(`[{"name":"extract","phase":"Succeeded","startTime":"2026-06-16T14:02:12Z","completionTime":"2026-06-16T14:03:40Z"}]`)
+	_, _ = store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded", StageStatuses: snap})
+
+	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs/"+run.ID.String(), nil)
+	req.AddCookie(cookie)
+	resp, err := stdhttp.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("get: status = %d", resp.StatusCode)
+	}
+	var got struct {
+		Timeline []struct {
+			Name     string `json:"name"`
+			Exported []struct {
+				Label string `json:"label"`
+			} `json:"exported"`
+		} `json:"timeline"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Timeline) != 1 || got.Timeline[0].Name != "extract" {
+		t.Fatalf("timeline = %+v, want 1 extract stage", got.Timeline)
+	}
+	if len(got.Timeline[0].Exported) != 1 || got.Timeline[0].Exported[0].Label != "raw.orders" {
+		t.Errorf("exported = %+v, want raw.orders", got.Timeline[0].Exported)
+	}
+
+	// A run with no snapshot returns "timeline": null.
+	run2, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+	_, _ = store.UpdateRunPhase(ctx, pool, run2.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded"})
+
+	req2, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs/"+run2.ID.String(), nil)
+	req2.AddCookie(cookie)
+	resp2, err := stdhttp.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("get run2: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("get run2: status = %d", resp2.StatusCode)
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp2.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode run2: %v", err)
+	}
+	if v, ok := raw["timeline"]; !ok || v != nil {
+		t.Errorf("timeline = %v, want null", v)
+	}
+}
+
 func parseUUID(t *testing.T, s string) uuid.UUID {
 	t.Helper()
 	id, err := uuid.Parse(s)
