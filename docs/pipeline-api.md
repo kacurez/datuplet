@@ -186,6 +186,56 @@ curl -sS -b /tmp/cookies http://127.0.0.1:8081/api/v1/projects/$PID/runs
 curl -sS -b /tmp/cookies http://127.0.0.1:8081/api/v1/projects/$PID/runs/<id>
 ```
 
+`GET /api/v1/projects/{pid}/runs` returns a paged envelope, not a bare array:
+
+```json
+{
+  "runs": [
+    {
+      "id": "…", "project_id": "…", "pipeline_id": "…", "pipeline_name": "daily-sync",
+      "phase": "Succeeded", "current_stage": "load", "message": "",
+      "created_at": "2026-07-05T12:00:00Z",
+      "started_at": "2026-07-05T12:00:01Z",
+      "completed_at": "2026-07-05T12:03:44Z"
+    }
+  ],
+  "next_cursor": "eyJ0IjoiMjAyNi0wNy0wNVQxMjowMDowMFoiLCJpIjoiLi4uIn0="
+}
+```
+
+Each run object gains `started_at`, `completed_at` (both omitted until set), and `pipeline_name` (joined from the pipeline row).
+
+Query parameters (all optional):
+
+| Param | Meaning |
+|-------|---------|
+| `limit` | Page size, clamped to 1..200 (default 50). |
+| `cursor` | Opaque keyset cursor copied from a prior response's `next_cursor`. Omit for page 1. An invalid/tampered cursor returns 400. |
+| `pipeline` | Case-insensitive substring match on pipeline name. |
+| `pipeline_id` | Exact pipeline UUID. Invalid UUID returns 400. |
+| `phase` | One of `Pending`, `Running`, `Succeeded`, `FailedUser`, `FailedApplication`, `Cancelled`, `Expired`. Unknown value returns 400. |
+
+Pages are ordered newest-first. `next_cursor` is `null` (JSON) once there are no more rows.
+
+`GET /api/v1/projects/{pid}/runs/{id}` returns the same run object plus a `timeline` array reconstructed from the persisted stage-status snapshot:
+
+```json
+{
+  "id": "…", "phase": "Succeeded", "…": "…",
+  "timeline": [
+    {
+      "name": "extract", "phase": "Succeeded",
+      "started_at": "2026-07-05T12:00:01Z", "completed_at": "2026-07-05T12:01:10Z",
+      "duration_ms": 69000, "message": "",
+      "imported": [{ "kind": "table", "bucket": "raw", "table": "orders", "label": "raw.orders" }],
+      "exported": [{ "kind": "bucket", "bucket": "staging", "label": "staging" }]
+    }
+  ]
+}
+```
+
+`imported`/`exported` entries describe tables or buckets declared in the pipeline YAML for that stage; `kind` is `"table"` or `"bucket"`. `timeline` is `null` when no stage-status snapshot has been recorded yet for the run.
+
 ### Cancel a run
 
 ```bash

@@ -162,13 +162,12 @@ func TestReapRunTuples_OrphanRowGetsCleanedUp(t *testing.T) {
 	ctx := context.Background()
 
 	// Insert a run_tuples row directly with NO matching runs row and a
-	// stale created_at (>30m ago). The migration's FK to runs has
-	// ON DELETE CASCADE — there's no matching runs row at all here, so
-	// the row exists as a pure orphan (mimics the trigger crashing
-	// between RecordRunTuples and CreateRun).
+	// stale created_at (>30m ago) — a pure orphan (mimics the trigger
+	// crashing between RecordRunTuples and CreateRun).
 	//
-	// We bypass store.RecordRunTuples because that would require a runs
-	// row; we want the orphan precondition.
+	// Migration 009 dropped run_tuples' FK to runs, so the orphan row
+	// inserts directly (no FK to violate). We bypass store.RecordRunTuples
+	// because that would require a runs row; we want the orphan precondition.
 	orphanID := uuid.New()
 	tup := authz.Tuple{
 		User:     authz.UserObject(orphanID.String()).String(),
@@ -176,17 +175,6 @@ func TestReapRunTuples_OrphanRowGetsCleanedUp(t *testing.T) {
 		Object:   authz.ProjectObject("lk-proj-orphan"),
 	}
 	tuplesJSON := []byte(`[{"user":"` + tup.User + `","relation":"` + tup.Relation + `","object":"` + tup.Object.String() + `"}]`)
-
-	// The FK is ON DELETE CASCADE — the runs row's existence is
-	// required at INSERT time. Drop the FK temporarily for this test
-	// so we can simulate the "trigger crashed before CreateRun" state.
-	if _, err := pool.Exec(ctx, `ALTER TABLE run_tuples DROP CONSTRAINT run_tuples_run_id_fkey`); err != nil {
-		t.Fatalf("drop fk: %v", err)
-	}
-	defer func() {
-		_, _ = pool.Exec(ctx,
-			`ALTER TABLE run_tuples ADD CONSTRAINT run_tuples_run_id_fkey FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE`)
-	}()
 
 	staleTime := time.Now().Add(-1 * time.Hour)
 	if _, err := pool.Exec(ctx,
@@ -229,14 +217,8 @@ func TestReapRunTuples_FreshOrphanRowIsLeftAlone(t *testing.T) {
 	}
 	tuplesJSON := []byte(`[{"user":"` + tup.User + `","relation":"` + tup.Relation + `","object":"` + tup.Object.String() + `"}]`)
 
-	if _, err := pool.Exec(ctx, `ALTER TABLE run_tuples DROP CONSTRAINT run_tuples_run_id_fkey`); err != nil {
-		t.Fatalf("drop fk: %v", err)
-	}
-	defer func() {
-		_, _ = pool.Exec(ctx,
-			`ALTER TABLE run_tuples ADD CONSTRAINT run_tuples_run_id_fkey FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE`)
-	}()
-
+	// Migration 009 dropped run_tuples' FK to runs, so this orphan row
+	// inserts directly (no FK to violate).
 	freshTime := time.Now().Add(-1 * time.Minute)
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO run_tuples (run_id, tuples, committed, created_at) VALUES ($1, $2, false, $3)`,

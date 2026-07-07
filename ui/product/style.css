@@ -768,3 +768,92 @@ code.inline {
   color: var(--fg-2);
   border: 1px solid var(--border);
 }
+
+/* ---------- Run-detail rail timeline (RFC 023 Task 15) ----------
+ * Per-stage vertical rail: a left rule connects a series of nodes,
+ * each with a dot colored by terminal/running/pending status (same
+ * status-token idiom as .pill above). */
+.timeline {
+  list-style: none;
+  margin: var(--s-5) 0 0;
+  padding: 0 0 0 var(--s-5);
+  border-left: 2px solid var(--border);
+}
+.timeline-node {
+  position: relative;
+  padding-bottom: var(--s-5);
+}
+.timeline-node:last-child {
+  padding-bottom: 0;
+}
+.timeline-node::before {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: calc(-1 * var(--s-5) - 5px);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--status-pending-bg);
+  border: 2px solid var(--bg-0);
+}
+.timeline-node--succeeded::before { background: var(--status-ok-bg); }
+.timeline-node--running::before { background: var(--status-running-bg); }
+.timeline-node--failedapplication::before,
+.timeline-node--faileduser::before { background: var(--status-fail-bg); }
+.timeline-node--pending::before { background: var(--status-pending-bg); }
+.timeline-node--cancelled::before { background: var(--status-pending-bg); }
+.timeline-node--expired::before { background: var(--status-fail-bg); }
+
+.timeline-hd {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--fg-0);
+}
+.timeline-meta {
+  margin-top: 2px;
+  font-size: var(--text-sm);
+}
+.timeline-io {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-2);
+  margin-top: var(--s-2);
+}
+.timeline-io .lbl {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-2);
+  width: 24px;
+  flex: 0 0 auto;
+}
+
+/* ---------- Chips (timeline in/out) ----------
+ * Table vs bucket are visually distinct: tables use the ok-status
+ * tint (they're the concrete unit of work), buckets use a neutral
+ * bordered tint (they're storage-grant context, not the data itself). */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--s-2);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  font-size: var(--text-xs);
+}
+.chip--table {
+  background: color-mix(in srgb, var(--status-ok-bg) 15%, transparent);
+  border-color: color-mix(in srgb, var(--status-ok-bg) 30%, var(--border));
+}
+.chip--bucket {
+  background: var(--bg-2);
+  border-color: var(--border);
+}
+.chip .mono {
+  font-family: var(--font-mono);
+  color: var(--fg-0);
+}

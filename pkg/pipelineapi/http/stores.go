@@ -50,6 +50,7 @@ type ProjectView struct {
 type PipelineStore interface {
 	List(ctx context.Context, projectID uuid.UUID) ([]PipelineRef, error)
 	GetByName(ctx context.Context, projectID uuid.UUID, name string) (*PipelineDetail, error)
+	GetYAMLByID(ctx context.Context, pipelineID uuid.UUID) (string, error)
 	Put(ctx context.Context, projectID uuid.UUID, name string, yaml []byte) error
 	Delete(ctx context.Context, projectID uuid.UUID, name string) error
 }
@@ -74,6 +75,6 @@ type PipelineDetail struct {
 // RunReader serves read-only run endpoints. Trigger/Cancel go through
 // runbackend.Backend (already wired).
 type RunReader interface {
-	ListForProject(ctx context.Context, projectID uuid.UUID, limit int) ([]store.RunView, error)
+	ListPage(ctx context.Context, projectID uuid.UUID, opts store.RunListOpts) (store.RunPage, error)
 	GetByID(ctx context.Context, projectID, runID uuid.UUID) (store.RunView, error)
 }

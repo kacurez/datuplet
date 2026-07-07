@@ -139,6 +139,10 @@ func (s *pgxPipelineStore) GetByName(ctx context.Context, projectID uuid.UUID, n
 	}, nil
 }
 
+func (s *pgxPipelineStore) GetYAMLByID(ctx context.Context, pipelineID uuid.UUID) (string, error) {
+	return store.GetPipelineYAMLByID(ctx, s.pool, pipelineID)
+}
+
 func (s *pgxPipelineStore) Put(ctx context.Context, projectID uuid.UUID, name string, yaml []byte) error {
 	yamlStr := string(yaml)
 	// Upsert: update if exists, insert otherwise. Concurrent PUTs can
@@ -189,16 +193,8 @@ func NewPgxRunReader(pool *pgxpool.Pool) RunReader {
 	return &pgxRunReader{pool: pool}
 }
 
-func (r *pgxRunReader) ListForProject(ctx context.Context, projectID uuid.UUID, limit int) ([]store.RunView, error) {
-	runs, err := store.ListRunsForProject(ctx, r.pool, projectID, limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]store.RunView, 0, len(runs))
-	for _, rn := range runs {
-		out = append(out, store.ToRunView(rn))
-	}
-	return out, nil
+func (r *pgxRunReader) ListPage(ctx context.Context, projectID uuid.UUID, opts store.RunListOpts) (store.RunPage, error) {
+	return store.ListRunsPage(ctx, r.pool, projectID, opts)
 }
 
 func (r *pgxRunReader) GetByID(ctx context.Context, projectID, runID uuid.UUID) (store.RunView, error) {

@@ -2,8 +2,10 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -253,5 +255,151 @@ func TestUpdateRunPhase_MissingRunReturnsErrRunNotFound(t *testing.T) {
 	_, err := store.UpdateRunPhase(context.Background(), pool, uuid.New(), store.UpdateRunPhaseOpts{Phase: "Cancelled"})
 	if !errors.Is(err, store.ErrRunNotFound) {
 		t.Errorf("err = %v, want ErrRunNotFound", err)
+	}
+}
+
+func TestGetRunByID_ReturnsPipelineNameAndNilSnapshot(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
+		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
+	})
+
+	got, err := store.GetRunByID(ctx, pool, run.ID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if got.PipelineName != "etl" {
+		t.Errorf("PipelineName = %q, want etl", got.PipelineName)
+	}
+	if got.StageStatuses != nil {
+		t.Errorf("StageStatuses = %q, want nil for a fresh run", got.StageStatuses)
+	}
+}
+
+func TestUpdateRunPhase_PersistsSnapshotAndCoalesceNilPreserves(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+
+	snap := []byte(`[{"name":"extract","phase":"Running"}]`)
+	if _, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase: "Running", CurrentStage: "extract", ObservedRV: 10, StageStatuses: snap,
+	}); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	// A later write with nil snapshot must PRESERVE the stored JSON.
+	if _, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase: "Running", CurrentStage: "transform", ObservedRV: 11,
+	}); err != nil {
+		t.Fatalf("nil-snapshot write: %v", err)
+	}
+	got, _ := store.GetRunByID(ctx, pool, run.ID)
+	var gotJSON, wantJSON any
+	if err := json.Unmarshal(got.StageStatuses, &gotJSON); err != nil {
+		t.Fatalf("unmarshal got: %v", err)
+	}
+	if err := json.Unmarshal(snap, &wantJSON); err != nil {
+		t.Fatalf("unmarshal want: %v", err)
+	}
+	if !reflect.DeepEqual(gotJSON, wantJSON) {
+		t.Errorf("snapshot = %s, want preserved %s", got.StageStatuses, snap)
+	}
+}
+
+func TestUpdateRunPhase_GuardTerminalBlocksResurrection(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+
+	// Out-of-band cancel (rv=0, no guard) — like runbackend.CancelRun.
+	if _, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{Phase: "Cancelled"}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	// Stale observer reconcile (rv>0, GuardTerminal) must NOT resurrect Running.
+	applied, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
+		Phase: "Running", CurrentStage: "extract", ObservedRV: 999, GuardTerminal: true,
+	})
+	if err != nil {
+		t.Fatalf("guarded write: %v", err)
+	}
+	if applied {
+		t.Fatal("applied=true: guarded write resurrected a Cancelled run")
+	}
+	got, _ := store.GetRunByID(ctx, pool, run.ID)
+	if got.Phase != "Cancelled" {
+		t.Errorf("phase = %q, want Cancelled", got.Phase)
+	}
+}
+
+func TestListRunsPage_KeysetNoSkipNoDupe(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	for i := 0; i < 5; i++ {
+		_, _ = store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+	}
+	seen := map[uuid.UUID]bool{}
+	cursor := ""
+	pages := 0
+	for {
+		page, err := store.ListRunsPage(ctx, pool, proj.ID, store.RunListOpts{Limit: 2, Cursor: cursor})
+		if err != nil {
+			t.Fatalf("page: %v", err)
+		}
+		for _, r := range page.Runs {
+			if seen[r.ID] {
+				t.Fatalf("duplicate run %s across pages", r.ID)
+			}
+			seen[r.ID] = true
+		}
+		pages++
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+		if pages > 10 {
+			t.Fatal("pagination did not terminate")
+		}
+	}
+	if len(seen) != 5 {
+		t.Errorf("saw %d runs across pages, want 5", len(seen))
+	}
+}
+
+func TestListRunsPage_FiltersByPhaseAndPipelineName(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	daily, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", minimalYAML)
+	sync, _ := store.CreatePipeline(ctx, pool, proj.ID, "customer-sync", minimalYAML)
+	rA, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: daily.ID})
+	_, _ = store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: sync.ID})
+	_, _ = store.UpdateRunPhase(ctx, pool, rA.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded"})
+
+	byName, _ := store.ListRunsPage(ctx, pool, proj.ID, store.RunListOpts{PipelineSubstr: "daily"})
+	if len(byName.Runs) != 1 || byName.Runs[0].PipelineName != "daily-orders" {
+		t.Fatalf("name filter = %+v, want 1 daily-orders", byName.Runs)
+	}
+	byPhase, _ := store.ListRunsPage(ctx, pool, proj.ID, store.RunListOpts{Phase: "Succeeded"})
+	if len(byPhase.Runs) != 1 || byPhase.Runs[0].Phase != "Succeeded" {
+		t.Fatalf("phase filter = %+v, want 1 Succeeded", byPhase.Runs)
+	}
+	byPipe, _ := store.ListRunsPage(ctx, pool, proj.ID, store.RunListOpts{PipelineID: sync.ID})
+	if len(byPipe.Runs) != 1 || byPipe.Runs[0].PipelineID != sync.ID {
+		t.Fatalf("pipeline_id filter = %+v, want 1 customer-sync", byPipe.Runs)
 	}
 }

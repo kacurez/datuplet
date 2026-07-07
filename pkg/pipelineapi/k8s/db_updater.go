@@ -58,12 +58,14 @@ func (d *DBRunUpdater) Update(ctx context.Context, s RunStatus) (bool, error) {
 		return false, nil
 	}
 	applied, err := store.UpdateRunPhase(ctx, d.pool, s.RunID, store.UpdateRunPhaseOpts{
-		Phase:        s.Phase,
-		CurrentStage: s.CurrentStage,
-		Message:      s.Message,
-		StartedAt:    s.StartedAt,
-		CompletedAt:  s.CompletedAt,
-		ObservedRV:   s.ResourceVersion,
+		Phase:         s.Phase,
+		CurrentStage:  s.CurrentStage,
+		Message:       s.Message,
+		StartedAt:     s.StartedAt,
+		CompletedAt:   s.CompletedAt,
+		ObservedRV:    s.ResourceVersion,
+		StageStatuses: s.StageStatuses,
+		GuardTerminal: true,
 	})
 	if errors.Is(err, store.ErrRunNotFound) {
 		return false, nil

@@ -152,6 +152,29 @@ func TestCoalesce_JanitorDropsOldEntries(t *testing.T) {
 	}
 }
 
+func TestCoalesce_SnapshotOnlyChangeIsNotCoalesced(t *testing.T) {
+	inner := &countingUpdater{applied: true}
+	c := pkg8s.NewCoalescedUpdater(inner)
+	runID := uuid.New()
+
+	base := statusFor(runID, "Running", 1)
+	base.CurrentStage = "extract"
+	base.StageStatuses = []byte(`[{"name":"extract","phase":"Running"}]`)
+	if _, err := c.Update(context.Background(), base); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	// Same scalars, DIFFERENT snapshot (a component finished) + higher rv.
+	next := base
+	next.ResourceVersion = 2
+	next.StageStatuses = []byte(`[{"name":"extract","phase":"Succeeded"}]`)
+	if _, err := c.Update(context.Background(), next); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if inner.count() != 2 {
+		t.Fatalf("inner calls = %d, want 2 (snapshot-only change must flush)", inner.count())
+	}
+}
+
 func TestCoalesce_JanitorKeepsFreshEntries(t *testing.T) {
 	inner := &countingUpdater{applied: true}
 	fake := time.Now()

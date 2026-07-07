@@ -3,6 +3,7 @@ package http
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/google/uuid"
 
@@ -21,6 +22,8 @@ type runJSON struct {
 	CurrentStage string `json:"current_stage,omitempty"`
 	Message      string `json:"message,omitempty"`
 	CreatedAt    string `json:"created_at"`
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
 }
 
 func runToJSON(v store.RunView) runJSON {
@@ -35,6 +38,12 @@ func runToJSON(v store.RunView) runJSON {
 	}
 	if v.ProjectID != nil {
 		j.ProjectID = v.ProjectID.String()
+	}
+	if v.StartedAt != nil {
+		j.StartedAt = v.StartedAt.Format("2006-01-02T15:04:05Z07:00")
+	}
+	if v.CompletedAt != nil {
+		j.CompletedAt = v.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
 	}
 	return j
 }
@@ -99,19 +108,67 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// knownPhases bounds the ?phase= filter to the run phases the system emits.
+var knownPhases = map[string]bool{
+	"Pending": true, "Running": true, "Succeeded": true,
+	"FailedUser": true, "FailedApplication": true,
+	"Cancelled": true, "Expired": true,
+}
+
+type runsPageJSON struct {
+	Runs       []runJSON `json:"runs"`
+	NextCursor *string   `json:"next_cursor"` // nil → JSON null on the last page (RFC contract)
+}
+
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	_, projectID, ok := s.mustHaveRelation(w, r, "describe")
 	if !ok {
 		return
 	}
-	runs, err := s.runs.ListForProject(r.Context(), projectID, 100)
+	q := r.URL.Query()
+	opts := store.RunListOpts{
+		Cursor:         q.Get("cursor"),
+		PipelineSubstr: q.Get("pipeline"),
+		Phase:          q.Get("phase"),
+	}
+	if opts.Phase != "" && !knownPhases[opts.Phase] {
+		writeError(w, http.StatusBadRequest, "unknown phase")
+		return
+	}
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n < 1 {
+				n = 1
+			} else if n > 200 {
+				n = 200
+			}
+			opts.Limit = n // explicit ?limit= clamped to 1..200; absent → store default 50
+		}
+	}
+	if v := q.Get("pipeline_id"); v != "" {
+		pid, err := uuid.Parse(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid pipeline_id")
+			return
+		}
+		opts.PipelineID = pid
+	}
+	page, err := s.runs.ListPage(r.Context(), projectID, opts)
 	if err != nil {
+		if errors.Is(err, store.ErrBadCursor) {
+			writeError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "list runs")
 		return
 	}
-	out := make([]runJSON, 0, len(runs))
-	for _, rn := range runs {
-		out = append(out, runToJSON(rn))
+	out := runsPageJSON{Runs: make([]runJSON, 0, len(page.Runs))}
+	if page.NextCursor != "" {
+		out.NextCursor = &page.NextCursor // last page → stays nil → JSON null
+	}
+	for _, rn := range page.Runs {
+		// page.Runs is []*store.Run; runToJSON takes store.RunView.
+		out.Runs = append(out.Runs, runToJSON(store.ToRunView(rn)))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -135,7 +192,21 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "get run")
 		return
 	}
-	writeJSON(w, http.StatusOK, runToJSON(run))
+	detail := struct {
+		runJSON
+		Timeline []timelineStage `json:"timeline"`
+	}{runJSON: runToJSON(run)}
+
+	// Best-effort timeline: a missing YAML or parse error leaves Timeline nil
+	// (UI shows "no stage timeline recorded"); it never fails the run fetch.
+	if run.PipelineID != uuid.Nil {
+		if yaml, err := s.pipelines.GetYAMLByID(r.Context(), run.PipelineID); err == nil {
+			if tl, err := buildTimeline(run.StageStatuses, yaml); err == nil {
+				detail.Timeline = tl
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 // handleCancelRun is POST /api/v1/projects/:pid/runs/:id/cancel.

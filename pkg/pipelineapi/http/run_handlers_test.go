@@ -215,12 +215,15 @@ func TestListAndGetRun(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("list: status = %d", resp.StatusCode)
 	}
-	var list []map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&list)
-	if len(list) != 1 {
-		t.Fatalf("list len = %d", len(list))
+	var list struct {
+		Runs       []map[string]any `json:"runs"`
+		NextCursor *string          `json:"next_cursor"`
 	}
-	runID := list[0]["id"].(string)
+	_ = json.NewDecoder(resp.Body).Decode(&list)
+	if len(list.Runs) != 1 {
+		t.Fatalf("list len = %d", len(list.Runs))
+	}
+	runID := list.Runs[0]["id"].(string)
 
 	req2, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs/"+runID, nil)
 	req2.AddCookie(cookie)
@@ -258,6 +261,154 @@ func TestCancelRun(t *testing.T) {
 	run, _ := store.GetRunByID(ctx, pool, parseUUID(t, runID))
 	if run.Phase != "Cancelled" {
 		t.Errorf("phase = %q, want Cancelled", run.Phase)
+	}
+}
+
+func TestListRuns_EnvelopeAndFilters(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
+
+	daily, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", validPipelineYAML)
+	sync, _ := store.CreatePipeline(ctx, pool, proj.ID, "customer-sync", validPipelineYAML)
+	rA, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: daily.ID})
+	_, _ = store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: sync.ID})
+	_, _ = store.UpdateRunPhase(ctx, pool, rA.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded"})
+
+	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs?pipeline=daily", nil)
+	req.AddCookie(cookie)
+	resp, err := stdhttp.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("list: status = %d", resp.StatusCode)
+	}
+	var got struct {
+		Runs []struct {
+			ID           string `json:"id"`
+			PipelineName string `json:"pipeline_name"`
+			StartedAt    string `json:"started_at"`
+		} `json:"runs"`
+		NextCursor *string `json:"next_cursor"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Runs) != 1 || got.Runs[0].PipelineName != "daily-orders" {
+		t.Fatalf("runs = %+v, want 1 daily-orders", got.Runs)
+	}
+	if got.NextCursor != nil {
+		t.Errorf("next_cursor = %v, want null on last page", *got.NextCursor)
+	}
+
+	// Unknown phase -> 400.
+	reqBadPhase, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs?phase=Bogus", nil)
+	reqBadPhase.AddCookie(cookie)
+	respBadPhase, err := stdhttp.DefaultClient.Do(reqBadPhase)
+	if err != nil {
+		t.Fatalf("phase filter: %v", err)
+	}
+	defer respBadPhase.Body.Close()
+	if respBadPhase.StatusCode != 400 {
+		t.Errorf("phase=Bogus: status = %d, want 400", respBadPhase.StatusCode)
+	}
+
+	// Malformed cursor -> 400.
+	reqBadCursor, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs?cursor=!!!", nil)
+	reqBadCursor.AddCookie(cookie)
+	respBadCursor, err := stdhttp.DefaultClient.Do(reqBadCursor)
+	if err != nil {
+		t.Fatalf("cursor filter: %v", err)
+	}
+	defer respBadCursor.Body.Close()
+	if respBadCursor.StatusCode != 400 {
+		t.Errorf("cursor=!!!: status = %d, want 400", respBadCursor.StatusCode)
+	}
+}
+
+const tlYAML = `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: daily-orders
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: api
+          image: x
+          inputs: {buckets: [api]}
+          outputs:
+            tables: [{name: orders, bucket: raw, writeMode: FULL_LOAD}]
+`
+
+func TestGetRun_AssemblesTimeline(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
+
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", tlYAML)
+	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+	snap := []byte(`[{"name":"extract","phase":"Succeeded","startTime":"2026-06-16T14:02:12Z","completionTime":"2026-06-16T14:03:40Z"}]`)
+	_, _ = store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded", StageStatuses: snap})
+
+	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs/"+run.ID.String(), nil)
+	req.AddCookie(cookie)
+	resp, err := stdhttp.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("get: status = %d", resp.StatusCode)
+	}
+	var got struct {
+		Timeline []struct {
+			Name     string `json:"name"`
+			Exported []struct {
+				Label string `json:"label"`
+			} `json:"exported"`
+		} `json:"timeline"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Timeline) != 1 || got.Timeline[0].Name != "extract" {
+		t.Fatalf("timeline = %+v, want 1 extract stage", got.Timeline)
+	}
+	if len(got.Timeline[0].Exported) != 1 || got.Timeline[0].Exported[0].Label != "raw.orders" {
+		t.Errorf("exported = %+v, want raw.orders", got.Timeline[0].Exported)
+	}
+
+	// A run with no snapshot returns "timeline": null.
+	run2, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
+	_, _ = store.UpdateRunPhase(ctx, pool, run2.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded"})
+
+	req2, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs/"+run2.ID.String(), nil)
+	req2.AddCookie(cookie)
+	resp2, err := stdhttp.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("get run2: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("get run2: status = %d", resp2.StatusCode)
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp2.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode run2: %v", err)
+	}
+	if v, ok := raw["timeline"]; !ok || v != nil {
+		t.Errorf("timeline = %v, want null", v)
 	}
 }
 

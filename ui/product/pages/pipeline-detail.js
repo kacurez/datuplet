@@ -14,7 +14,7 @@
 // Delete is a separate button with a confirm prompt.
 
 import { api, putYAML, esc } from '/ui/api.js';
-import { timeTag } from '/ui/format.js';
+import { timeTag, phaseToPillClass, formatDuration, durationFrom } from '/ui/format.js';
 
 const STARTER_YAML = `apiVersion: datuplet.io/v1
 kind: Pipeline
@@ -45,10 +45,12 @@ export async function renderPipelineDetail(ctx) {
 
   let yaml = STARTER_YAML;
   let updatedAt = '';
+  let pipelineID = '';
   if (!isNew) {
     const pipe = await api(`/api/v1/projects/${encodeURIComponent(pid)}/pipelines/${encodeURIComponent(name)}`);
     yaml = pipe.yaml;
     updatedAt = pipe.updated_at;
+    pipelineID = pipe.id;
   }
 
   if (head) {
@@ -84,6 +86,11 @@ export async function renderPipelineDetail(ctx) {
         <button type="submit" class="btn btn--primary">${isNew ? 'Create' : 'Save'}</button>
       </div>
     </form>
+    ${isNew ? '' : `
+    <section style="margin-top:var(--s-4);">
+      <h2>Recent runs</h2>
+      <div id="pipeline-runs"><p><small>Loading…</small></p></div>
+    </section>`}
   `;
 
   const form = document.getElementById('pipeline-form');
@@ -139,4 +146,62 @@ export async function renderPipelineDetail(ctx) {
       });
     }
   }
+
+  if (!isNew && pipelineID) {
+    // Best-effort: a slow or failing runs fetch must not block the editor
+    // above, which has already been painted and is usable.
+    loadRecentRuns(pid, pipelineID).catch((err) => {
+      if (String(err.message) === 'not authenticated') return;
+      const container = document.getElementById('pipeline-runs');
+      if (container) container.innerHTML = `<p><small>Couldn't load recent runs: ${esc(err.message)}</small></p>`;
+    });
+  }
+}
+
+// loadRecentRuns fetches the pipeline's most recent runs via the paged
+// runs API (filtered by pipeline_id) and renders a compact table into
+// #pipeline-runs. Fired once on page load — no live poll here (unlike
+// the runs list page).
+async function loadRecentRuns(pid, pipelineID) {
+  const resp = await api(`/api/v1/projects/${encodeURIComponent(pid)}/runs?pipeline_id=${encodeURIComponent(pipelineID)}&limit=10`);
+  const container = document.getElementById('pipeline-runs');
+  if (!container) return; // navigated away
+  const runs = resp.runs || [];
+  if (runs.length === 0) {
+    container.innerHTML = '<p><small>No runs yet.</small></p>';
+    return;
+  }
+  const rows = runs.map((r) => {
+    const id = String(r.id || '');
+    const href = `/ui/runs/${encodeURIComponent(id)}`;
+    const pill = phaseToPillClass(r.phase);
+    const started = r.started_at ? timeTag(r.started_at) : '<span class="muted">—</span>';
+    const dur = r.completed_at || r.started_at
+      ? formatDuration(durationFrom(r.started_at, r.completed_at))
+      : '—';
+    return `
+      <tr>
+        <td><a href="${href}"><code class="mono">${esc(id.slice(0, 8))}</code></a></td>
+        <td><span class="pill ${pill}">${esc(r.phase)}</span></td>
+        <td>${started}</td>
+        <td>${dur}</td>
+      </tr>`;
+  }).join('');
+  const viewAll = resp.next_cursor
+    ? `<p><a href="/ui/runs">View all &rarr;</a></p>`
+    : '';
+  container.innerHTML = `
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Phase</th>
+          <th>Started</th>
+          <th>Duration</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${viewAll}
+  `;
 }

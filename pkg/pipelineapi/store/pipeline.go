@@ -81,6 +81,19 @@ func GetPipelineNameByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) 
 	return name, nil
 }
 
+// GetPipelineYAMLByID returns the stored YAML for a pipeline, or ErrPipelineNotFound.
+func GetPipelineYAMLByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (string, error) {
+	var yaml string
+	err := pool.QueryRow(ctx, `SELECT yaml FROM pipelines WHERE id = $1`, id).Scan(&yaml)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrPipelineNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("select pipeline yaml: %w", err)
+	}
+	return yaml, nil
+}
+
 // ListPipelines returns every pipeline in the project sorted by name.
 func ListPipelines(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID) ([]*Pipeline, error) {
 	rows, err := pool.Query(ctx,

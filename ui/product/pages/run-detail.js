@@ -11,7 +11,7 @@
 // next tick.
 
 import { api, esc } from '/ui/api.js';
-import { timeTag, phaseToPillClass } from '/ui/format.js';
+import { timeTag, phaseToPillClass, formatDuration, durationFrom } from '/ui/format.js';
 
 const TERMINAL = new Set([
   'Succeeded',
@@ -20,6 +20,24 @@ const TERMINAL = new Set([
   'Cancelled',
   'Expired',
 ]);
+
+function renderStage(stage) {
+  const pill = phaseToPillClass(stage.phase);
+  const when = stage.started_at
+    ? `${timeTag(stage.started_at)}${stage.completed_at ? ` → ${timeTag(stage.completed_at)}` : ''} · ${formatDuration(stage.duration_ms)}`
+    : '';
+  const chips = (list) => (list || []).map((c) =>
+    `<span class="chip chip--${esc(c.kind)}" title="${esc(c.kind)}"><code class="mono">${esc(c.label)}</code></span>`
+  ).join('') || '<span class="muted">—</span>';
+  return `
+    <li class="timeline-node timeline-node--${esc((stage.phase || '').toLowerCase())}">
+      <div class="timeline-hd"><strong>${esc(stage.name)}</strong> <span class="pill ${pill}">${esc(stage.phase)}</span></div>
+      <div class="timeline-meta muted">${when}</div>
+      <div class="timeline-io"><span class="lbl">in</span> ${chips(stage.imported)}</div>
+      <div class="timeline-io"><span class="lbl">out</span> ${chips(stage.exported)}</div>
+      ${stage.message ? `<pre class="code">${esc(stage.message)}</pre>` : ''}
+    </li>`;
+}
 
 function clearExistingPoller() {
   if (window.__datupletPoller) {
@@ -87,8 +105,13 @@ export async function renderRunDetail(ctx) {
           <tr><td style="color:var(--fg-2);">Pipeline</td><td class="mono">${esc(run.pipeline_id || '')}</td></tr>
           <tr><td style="color:var(--fg-2);">Phase</td><td><span class="pill ${pill}">${esc(run.phase)}</span></td></tr>
           <tr><td style="color:var(--fg-2);">Created</td><td>${timeTag(run.created_at)}</td></tr>
+          <tr><td style="color:var(--fg-2);">Started</td><td>${timeTag(run.started_at)}</td></tr>
+          <tr><td style="color:var(--fg-2);">Duration</td><td>${formatDuration(durationFrom(run.started_at, run.completed_at))}</td></tr>
         </tbody>
       </table>
+      ${Array.isArray(run.timeline) && run.timeline.length
+        ? `<ol class="timeline">${run.timeline.map(renderStage).join('')}</ol>`
+        : '<p class="muted">No stage timeline recorded.</p>'}
     `;
 
     if (!terminal) {
