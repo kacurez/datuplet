@@ -1,0 +1,45 @@
+---
+# Simple HTTP Extract — extracts JSON from a public API and writes it to a table
+#
+# Components: http-json-extractor
+# Prerequisites: running Datuplet install (lakekeeper + pipeline-api), see docs/install.md
+#
+# Run it:
+#   UI:      Pipelines → New → paste this YAML → Save → Trigger
+#   REST:    see docs/pipeline-api.md "Upload a pipeline" + "Trigger a run"
+#   kubectl: kubectl apply -f examples/pipelines/simple-http-extract.yaml   (applies Pipeline + PipelineRun)
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: simple-pipeline
+  namespace: datuplet
+spec:
+  # Gateway settings (optional - these are defaults)
+  gateway:
+    chunkSize: 33554432       # 32MB - component streaming chunks
+    bufferSize: 67108864      # 64MB - gateway memory buffer
+    rowGroupSize: 67108864    # 64MB - Parquet row groups
+    targetFileSize: 134217728 # 128MB - Parquet file rotation
+
+  stages:
+    - name: extract
+      components:
+        - name: json-extractor
+          image: ghcr.io/kacurez/http-json-extractor:latest
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
+          # Dynamic table creation: component can create any table under 'raw' bucket
+          outputs:
+            defaultBucket: raw
+            defaultWriteMode: APPEND
+
+---
+# PipelineRun to execute the pipeline
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: simple-pipeline-run-1
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: simple-pipeline
