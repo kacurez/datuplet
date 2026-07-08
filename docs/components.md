@@ -1,6 +1,6 @@
 # Built-in Components
 
-Datuplet ships five component images. Each runs as an ordinary container alongside
+Datuplet ships six component images. Each runs as an ordinary container alongside
 the Data Gateway sidecar; the component communicates with the sidecar via gRPC and
 HTTP — it never touches S3 directly.
 
@@ -87,7 +87,9 @@ single-request and paginated modes.
                             # omit if the response is a top-level array
     table_name: "items"     # output table name (defaults to array_path or "data")
     headers:
-      Authorization: "Bearer $[api_token]"  # use $[name] for secrets
+      # $[name] refs must be a whole scalar, so the Secret value carries the
+      # full header, "Bearer " prefix included (see docs/secrets.md).
+      Authorization: "$[api_token]"
   outputs:
     defaultBucket: raw
     defaultWriteMode: APPEND
@@ -243,6 +245,63 @@ the component.
   is not yet honoured by the Lakekeeper read path; full-snapshot reads are used.
 - Schema evolution: if your SQL creates an output table with a different schema than
   the existing Iceberg target, the TableCommit Job will fail with `FailedUser`.
+
+---
+
+## pandas-transform
+
+Applies a sequence of pandas operations to input data. Reads the input table as
+CSV from the Data Gateway, applies the operations in order, and writes the
+result back as CSV — no S3 or Lakekeeper credentials touch the component.
+
+**Image:** `ghcr.io/kacurez/pandas-transform:v0.1.0`
+
+**Config schema:**
+
+```yaml
+- name: clean
+  image: ghcr.io/kacurez/pandas-transform:v0.1.0
+  inputs:
+    tables:
+      - bucket: raw
+        table: events
+  outputs:
+    defaultBucket: curated
+    defaultWriteMode: FULL_LOAD
+  config:
+    output_table: events_clean   # optional, defaults to the input table name
+    operations:
+      - type: filter
+        column: value
+        op: ">"                  # ">", ">=", "<", "<=", "==", "!=", "in", "contains"
+        value: 0
+      - type: select
+        columns: [id, value, label]
+      - type: rename
+        columns:
+          value: amount
+      - type: sort
+        by: [id]                 # string or list
+        ascending: true
+      - type: fillna
+        column: amount           # omit to fill all columns
+        value: 0
+```
+
+**Supported operations (applied in order):**
+
+| Type | Fields | Description |
+|---|---|---|
+| `filter` | `column`, `op`, `value` | Keep rows matching the condition |
+| `select` | `columns` | Keep only the listed columns |
+| `sort` | `by`, `ascending` (default `true`) | Sort rows |
+| `rename` | `columns` (map of old name → new name) | Rename columns |
+| `drop` | `columns` (string or list) | Drop columns |
+| `fillna` | `column` (optional), `value` | Fill missing values |
+
+Only one input table is read (the first entry under `inputs.tables`). Unknown
+operation types and references to missing columns are logged as warnings and
+skipped rather than failing the run.
 
 ---
 

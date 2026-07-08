@@ -1,0 +1,71 @@
+---
+# Processors: Drop — data-generator seeds a table, a drop processor removes
+# columns before they're committed, then stdout-writer prints what's left
+#
+# Components: data-generator, stdout-writer
+# Prerequisites: running Datuplet install (lakekeeper + pipeline-api), see docs/install.md
+#
+# Run it:
+#   UI:      Pipelines → New → paste this YAML → Save → Trigger
+#   REST:    see docs/pipeline-api.md "Upload a pipeline" + "Trigger a run"
+#   kubectl: kubectl apply -f examples/pipelines/processors-drop.yaml   (applies Pipeline + PipelineRun)
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: processors-drop
+  namespace: datuplet
+spec:
+  gateway:
+    chunkSize: 33554432       # 32MB
+    bufferSize: 67108864      # 64MB
+    rowGroupSize: 67108864    # 64MB
+    targetFileSize: 134217728 # 128MB
+
+  stages:
+    # Stage 1: Generate rows, drop columns before they reach the raw bucket
+    - name: extract
+      components:
+        - name: data-generator
+          image: ghcr.io/kacurez/data-generator:latest
+          config:
+            tables:
+              - name: products
+                random:
+                  schema:
+                    id: int
+                    name: string
+                    category: string
+                    price: double
+                    quantity: int
+                  limit:
+                    rowsCount: 10
+          # Drop processor removes price and quantity before commit — only
+          # id, name, category reach the raw bucket.
+          outputs:
+            defaultBucket: raw
+            defaultWriteMode: FULL_LOAD
+            processors:
+              - type: drop
+                columns:
+                  - price
+                  - quantity
+
+    # Stage 2: Print what's left (id, name, category)
+    - name: load
+      components:
+        - name: stdout-writer
+          image: ghcr.io/kacurez/stdout-writer:latest
+          inputs:
+            buckets:
+              - raw
+          config:
+            format: json
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: processors-drop-run-1
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: processors-drop
