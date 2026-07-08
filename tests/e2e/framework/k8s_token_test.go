@@ -24,7 +24,8 @@ spec:
     - name: extract
       components:
         - name: json-extractor
-          image: datuplet/http-json-extractor:latest
+          component: http-json-extractor
+          version: dev
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
           outputs:

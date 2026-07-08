@@ -60,8 +60,14 @@ build-components: build-gateway ## Build all component Docker images
 # Keeps gateway as a build dep (sidecar is required for every run). RFC 010
 # scenarios (duckdb-etl, multi-table-join) need datuplet/sql-transform too.
 # RFC 022 Task 2.7: query-worker is needed for the query e2e scenarios.
+# RFC 026 Task R11: data-generator is additionally tagged v0.0.1 — a second,
+# STABLE tag of the same local image — so the e2e ComponentDefinition
+# bootstrap (tests/e2e/framework/components_bootstrap.go) has a real stable
+# version to register alongside the mutable "dev" tag, giving the
+# unpinned-resolution and schema-invalid scenarios something to pin against.
 build-components-e2e: build-gateway build-component-sql-transform ## Build only the components actively used by e2e (data-generator + http-json-extractor + stdout-writer + sql-transform + query-worker)
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
+	docker tag datuplet/data-generator:latest datuplet/data-generator:v0.0.1
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
 	docker build -t datuplet/stdout-writer:latest -f components/stdout-writer/Dockerfile .
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .

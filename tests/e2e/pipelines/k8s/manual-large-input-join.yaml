@@ -18,7 +18,8 @@ spec:
     - name: generate
       components:
         - name: data-generator
-          image: datuplet/data-generator:latest
+          component: data-generator
+          version: dev
           config:
             tables:
               - name: facts
@@ -52,7 +53,8 @@ spec:
     - name: transform
       components:
         - name: sql-transform
-          image: datuplet/sql-transform:latest
+          component: sql-transform
+          version: dev
           resources:
             limits:
               memory: 2Gi

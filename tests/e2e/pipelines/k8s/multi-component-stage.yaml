@@ -9,7 +9,8 @@ spec:
     - name: extract
       components:
         - name: posts-extractor
-          image: datuplet/http-json-extractor:latest
+          component: http-json-extractor
+          version: dev
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
             table_name: "posts"
@@ -19,7 +20,8 @@ spec:
                 bucket: "{{.RunPrefix}}-multi"
                 writeMode: FULL_LOAD
         - name: users-extractor
-          image: datuplet/http-json-extractor:latest
+          component: http-json-extractor
+          version: dev
           config:
             url: "https://jsonplaceholder.typicode.com/users"
             table_name: "users"

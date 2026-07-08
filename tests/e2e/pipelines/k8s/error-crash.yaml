@@ -9,7 +9,8 @@ spec:
     - name: transform
       components:
         - name: sql-transform
-          image: datuplet/sql-transform:latest
+          component: sql-transform
+          version: dev
           inputs:
             tables:
               - bucket: "{{.RunPrefix}}-nonexistent"

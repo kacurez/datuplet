@@ -32,6 +32,13 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
 				"E2E: FGA bootstrap failed (K8s scenarios will skip): %v\n", err)
+		} else if err := framework.RegisterBuiltinComponents(ctx); err != nil {
+			// Registration failing (e.g. ComponentDefinition CRD not installed on
+			// an older cluster) must not silently let every scenario run against
+			// an empty registry and fail FailedUser with a confusing "unknown
+			// component" — skip cleanly instead, same as an FGA bootstrap failure.
+			fmt.Fprintf(os.Stderr,
+				"E2E: component registration failed (K8s scenarios will skip): %v\n", err)
 		} else {
 			framework.SetSharedHarness(h)
 			fmt.Printf("E2E: bootstrap OK — lakekeeper project=%s, FGA store=%s\n",
