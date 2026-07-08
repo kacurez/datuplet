@@ -259,21 +259,21 @@ k8s-rebuild-services: build-gateway build-iceberg-job ## Rebuild gateway + icebe
 	@echo "Services rebuilt!"
 
 # Clean up pipelineruns and retry the example (with CRD reload)
-k8s-retry-simple: k8s-reload-crds ## Delete all PipelineRuns + re-apply simple-pipeline.yaml
+k8s-retry-simple: k8s-reload-crds ## Delete all PipelineRuns + re-apply simple-http-extract.yaml
 	kubectl delete pipelinerun --all -n datuplet-e2e --ignore-not-found
 	kubectl delete pipeline simple-pipeline -n datuplet-e2e --ignore-not-found
-	kubectl apply -f examples/k8s/simple-pipeline.yaml
+	kubectl apply -f examples/pipelines/simple-http-extract.yaml
 
-k8s-retry-duckdb: k8s-reload-crds ## Delete all PipelineRuns + re-apply duckdb-pipeline.yaml
+k8s-retry-duckdb: k8s-reload-crds ## Delete all PipelineRuns + re-apply etl-duckdb.yaml
 	kubectl delete pipelinerun --all -n datuplet-e2e --ignore-not-found
 	kubectl delete pipeline duckdb-transform -n datuplet-e2e --ignore-not-found
-	kubectl apply -f examples/k8s/duckdb-pipeline.yaml
+	kubectl apply -f examples/pipelines/etl-duckdb.yaml
 
 # Clean up pipelineruns and retry the example (with CRD reload)
-k8s-retry-full: k8s-reload-crds ## Delete all PipelineRuns + re-apply full-pipeline.yaml
+k8s-retry-full: k8s-reload-crds ## Delete all PipelineRuns + re-apply full-etl.yaml
 	kubectl delete pipelinerun --all -n datuplet-e2e --ignore-not-found
 	kubectl delete pipeline full-pipeline -n datuplet-e2e --ignore-not-found
-	kubectl apply -f examples/k8s/full-pipeline.yaml
+	kubectl apply -f examples/pipelines/full-etl.yaml
 
 # Rebuild operators and retry example pipeline (comprehensive)
 k8s-rebuild-retry-simple: k8s-rebuild-operators k8s-retry-simple ## Rebuild operators + retry simple-pipeline (comprehensive)

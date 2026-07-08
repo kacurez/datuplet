@@ -26,7 +26,7 @@ a configured cluster.
    Ready node.
 2. The datuplet stack is already deployed: `make deploy-local` (OrbStack)
    or the equivalent on a GKE cluster.
-3. `examples/k8s/simple-pipeline.yaml` runs successfully on the same
+3. `examples/pipelines/simple-http-extract.yaml` runs successfully on the same
    cluster (proves the stack is healthy before adding GCS into the mix).
 
 ## How fake-gcs-server is configured

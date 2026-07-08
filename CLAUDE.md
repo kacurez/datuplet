@@ -185,8 +185,8 @@ These are conventions a new contributor wouldn't infer from the code:
   helm's pre-flight REST-mapper validation issue for
   `Cluster.postgresql.cnpg.io`).
 - **Monorepo `go mod tidy`**: the repo has multiple Go modules
-  (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`,
-  `examples/local-dev/`). Tidying root in isolation drifts the others —
+  (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`).
+  Tidying root in isolation drifts the others —
   their Docker builds + e2e enforce parity and fail CI. Always run
   `make tidy` (covers every module).
 
@@ -214,4 +214,4 @@ These are conventions a new contributor wouldn't infer from the code:
 | `ui/product/` | Browser SPA (vanilla ES modules). |
 | `charts/` | Four Helm charts: `datuplet-operators`, `-infra`, `-app`, `-lakekeeper`. |
 | `utils/docker/` | Dockerfiles for all services. |
-| `examples/k8s/`, `examples/pipelines/` | Example manifests. |
+| `examples/pipelines/` | Example K8s pipeline manifests (CI-guarded). |

@@ -275,7 +275,7 @@ Apply the example pipeline (update the image tag to `ghcr.io/kacurez/*:v0.1.0`
 once 0.1.0 is released):
 
 ```bash
-kubectl apply -f examples/k8s/simple-pipeline.yaml
+kubectl apply -f examples/pipelines/simple-http-extract.yaml
 kubectl get pipelineruns -n datuplet -w
 ```
 
