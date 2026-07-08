@@ -150,7 +150,7 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "body exceeds 1 MiB: "+err.Error())
 		return
 	}
-	pl, findings, err := validate.ValidatePipeline(body)
+	pl, findings, err := validate.ValidatePipeline(body, nil)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid pipeline: "+err.Error())
 		return

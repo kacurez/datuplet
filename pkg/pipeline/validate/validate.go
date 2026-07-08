@@ -25,7 +25,10 @@ type Finding struct {
 	Severity string `json:"severity"` // "error" | "warning"
 }
 
-const severityError = "error"
+const (
+	severityError   = "error"
+	severityWarning = "warning"
+)
 
 // Validation patterns (ported verbatim from pkg/pipeline/config/parser.go).
 var (
@@ -59,18 +62,22 @@ var validPartitionTransforms = map[string]bool{
 // Findings (a strict-decode failure is a single Finding carrying the decode
 // error text with an empty Path).
 //
-// Phase 2 extends this signature with (reg RegistryView, pol Policy).
-func ValidatePipeline(data []byte) (*datupletv1.Pipeline, []Finding, error) {
+// reg resolves each component against the component registry and validates its
+// config against the resolved version's JSON Schema; a nil reg skips all
+// registry resolution and schema checks (the non-registry semantic checks still
+// run). Phase 3 extends this signature with a pol *Policy argument.
+func ValidatePipeline(data []byte, reg RegistryView) (*datupletv1.Pipeline, []Finding, error) {
 	var p datupletv1.Pipeline
 	if err := yaml.UnmarshalStrict(data, &p); err != nil {
 		return nil, []Finding{{Path: "", Message: err.Error(), Severity: severityError}}, nil
 	}
-	return &p, ValidateTyped(&p), nil
+	return &p, ValidateTyped(&p, reg), nil
 }
 
 // ValidateTyped runs the semantic checks on an already-decoded Pipeline.
-// Controllers that hold typed CRs (not YAML) call this directly.
-func ValidateTyped(p *datupletv1.Pipeline) []Finding {
+// Controllers that hold typed CRs (not YAML) call this directly. A nil reg
+// skips registry resolution and config-schema validation (see ValidatePipeline).
+func ValidateTyped(p *datupletv1.Pipeline, reg RegistryView) []Finding {
 	if p == nil {
 		return []Finding{{Path: "", Message: "pipeline is nil", Severity: severityError}}
 	}
@@ -117,6 +124,7 @@ func ValidateTyped(p *datupletv1.Pipeline) []Finding {
 		for j := range stage.Components {
 			comp := &stage.Components[j]
 			findings = append(findings, validateComponent(comp, i, j, availableTables, availableBuckets)...)
+			findings = append(findings, validateRegistry(comp, i, j, reg)...)
 
 			// Register this component's outputs for subsequent stages.
 			if comp.Outputs != nil {
@@ -510,6 +518,43 @@ func validateSecretRefs(c *datupletv1.ComponentSpec, stageIdx, compIdx int) []Fi
 			findings = append(findings, Finding{Path: path, Message: err.Error(), Severity: severityError})
 		}
 	})
+	return findings
+}
+
+// validateRegistry resolves a component against reg and validates its config
+// against the resolved version's JSON Schema. A nil reg skips both (Phase-1
+// callers during the R5 cutover; R6/R9 pass a real view). Resolution findings
+// come back from reg.Resolve with component-relative paths ("component" /
+// "version"), rewritten here under the component's stages[i].components[j] path.
+func validateRegistry(c *datupletv1.ComponentSpec, stageIdx, compIdx int, reg RegistryView) []Finding {
+	if reg == nil {
+		return nil
+	}
+	base := fmt.Sprintf("stages[%d].components[%d]", stageIdx, compIdx)
+
+	// R6 switches the resolution key to c.Component / c.Version once those
+	// fields replace Image on ComponentSpec.
+	rc, resolveFindings := reg.Resolve(c.Name, "")
+
+	var findings []Finding
+	for _, f := range resolveFindings {
+		findings = append(findings, Finding{
+			Path:     joinKey(base, f.Path),
+			Message:  f.Message,
+			Severity: f.Severity,
+		})
+	}
+
+	if rc == nil || rc.ConfigSchema == nil {
+		return findings
+	}
+
+	cfg, err := c.ConfigMap()
+	if err != nil {
+		// A malformed config map is already reported by validateSecretRefs.
+		return findings
+	}
+	findings = append(findings, ValidateConfig(rc.ConfigSchema, rc.rawConfigSchema, cfg, base+".config")...)
 	return findings
 }
 

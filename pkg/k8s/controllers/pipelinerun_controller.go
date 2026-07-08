@@ -223,7 +223,7 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	// pipeline.Status.Phase, so a run is never admitted (and no Job is ever
 	// built) against an invalid Pipeline regardless of whether the Pipeline
 	// controller has reconciled it yet.
-	if findings := validate.ValidateTyped(pipeline); len(findings) > 0 {
+	if findings := validate.ValidateTyped(pipeline, nil); len(findings) > 0 {
 		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
 		pr.Status.Message = findings[0].Message
 		if err := r.Status().Update(ctx, pr); err != nil {

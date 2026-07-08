@@ -341,7 +341,7 @@ spec:
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, findings, err := ValidatePipeline([]byte(c.yaml))
+			_, findings, err := ValidatePipeline([]byte(c.yaml), nil)
 			if err != nil {
 				t.Fatalf("ValidatePipeline returned unexpected error: %v", err)
 			}
@@ -378,7 +378,7 @@ spec:
 // TestValidatePipeline_ParsesNestedConfig proves the returned typed object
 // carries the nested component config through the decode.
 func TestValidatePipeline_ParsesNestedConfig(t *testing.T) {
-	p, findings, err := ValidatePipeline([]byte(validYAML))
+	p, findings, err := ValidatePipeline([]byte(validYAML), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -414,7 +414,7 @@ func TestValidateTyped_Direct(t *testing.T) {
 		},
 	}
 	// Empty metadata.name is the only violation.
-	findings := ValidateTyped(p)
+	findings := ValidateTyped(p, nil)
 	if len(findings) != 1 {
 		t.Fatalf("want exactly 1 finding, got %d: %+v", len(findings), findings)
 	}
@@ -427,12 +427,12 @@ func TestValidateTyped_Direct(t *testing.T) {
 
 	// Filling the name yields zero findings.
 	p.Name = "ok"
-	if findings := ValidateTyped(p); len(findings) != 0 {
+	if findings := ValidateTyped(p, nil); len(findings) != 0 {
 		t.Fatalf("want 0 findings for valid typed pipeline, got %+v", findings)
 	}
 
 	t.Run("nil pipeline", func(t *testing.T) {
-		findings := ValidateTyped(nil)
+		findings := ValidateTyped(nil, nil)
 		if len(findings) == 0 {
 			t.Fatal("want a non-empty findings slice for a nil pipeline, got none")
 		}
