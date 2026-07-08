@@ -15,6 +15,7 @@ require (
 	github.com/moby/moby/api v1.54.1
 	github.com/openfga/go-sdk v0.8.0
 	github.com/prometheus/client_golang v1.22.0
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.42.0
 	gocloud.dev v0.45.0
