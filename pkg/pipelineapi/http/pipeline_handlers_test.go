@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	stdhttp "net/http"
+	"strings"
 	"testing"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
@@ -36,6 +37,37 @@ spec:
             defaultBucket: raw
             defaultWriteMode: APPEND
 `
+
+// pipelineYAMLWithSecretRef references the "api_token" secret key via the
+// whole-scalar $[name] syntax (pkg/lib/secrets), so validate.ReferencedSecrets
+// picks it up and the S7 save/trigger ladder has something to check.
+const pipelineYAMLWithSecretRef = `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: etl-secret
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: c1
+          image: datuplet/test:latest
+          config:
+            token: "$[api_token]"
+          outputs:
+            defaultBucket: raw
+            defaultWriteMode: APPEND
+`
+
+// secretsFindingsBody is the wire shape of a 200 warning response from
+// PUT /pipelines under the S7 ladder: {"findings":[{path,message,severity}]}
+// — note no top-level "error" field, unlike findingsBody's 400 shape.
+type secretsFindingsBody struct {
+	Findings []struct {
+		Path     string `json:"path"`
+		Message  string `json:"message"`
+		Severity string `json:"severity"`
+	} `json:"findings"`
+}
 
 func putYAML(t *testing.T, url string, yaml []byte, cookie *stdhttp.Cookie) *stdhttp.Response {
 	t.Helper()
@@ -316,5 +348,103 @@ spec:
 	}
 	if body.Findings[0].Path == "" {
 		t.Error("want non-empty path for a semantic validation finding")
+	}
+}
+
+// TestPutPipeline_UnknownSecretKey_ReturnsWarning covers the S7 save-warn
+// rung: a pipeline referencing "$[api_token]" saved into a project whose
+// managed Secret doesn't have that key yet gets a 200 with a warning
+// Finding naming the key — the save itself still succeeds (unlike the
+// hard-validation 400 path).
+func TestPutPipeline_UnknownSecretKey_ReturnsWarning(t *testing.T) {
+	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-secret-warn"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret", []byte(pipelineYAMLWithSecretRef), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := readAll(resp)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	var body secretsFindingsBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly 1", body.Findings)
+	}
+	if body.Findings[0].Severity != "warning" {
+		t.Errorf("severity = %q, want warning", body.Findings[0].Severity)
+	}
+	if !strings.Contains(body.Findings[0].Message, "api_token") {
+		t.Errorf("message = %q, want it to name the missing key api_token", body.Findings[0].Message)
+	}
+
+	// The pipeline must still be persisted despite the warning-level response.
+	saved, err := store.GetPipelineByName(ctx, pool, proj.ID, "etl-secret")
+	if err != nil {
+		t.Fatalf("GetPipelineByName: %v", err)
+	}
+	if saved.YAML != pipelineYAMLWithSecretRef {
+		t.Error("pipeline YAML not persisted despite the 200-with-warning response")
+	}
+}
+
+// TestPutPipeline_KnownSecretKey_Returns204 covers the clean-save rung:
+// once the referenced key exists in the project's managed Secret, the
+// same YAML saves as a plain 204 — no findings envelope.
+func TestPutPipeline_KnownSecretKey_Returns204(t *testing.T) {
+	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-secret-known"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/api_token", "shh", cookie).Body.Close()
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret", []byte(pipelineYAMLWithSecretRef), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 204 {
+		body, _ := readAll(resp)
+		t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, body)
+	}
+}
+
+// TestPutPipeline_HardValidationError_StaysBadRequestWithSecretsWired proves
+// the secrets ladder never masks a hard validation failure: even with
+// WithSecrets wired, a structurally invalid pipeline still 400s before the
+// ladder ever runs.
+func TestPutPipeline_HardValidationError_StaysBadRequestWithSecretsWired(t *testing.T) {
+	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-secret-hardfail"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/broken", []byte("not: [valid yaml"), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }

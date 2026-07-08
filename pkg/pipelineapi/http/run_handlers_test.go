@@ -7,11 +7,14 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -92,7 +95,13 @@ func freshServerWithK8s(t *testing.T) (*httptest.Server, *pgxpool.Pool, *authzte
 		WithAuthorizer(authzr).
 		WithProjectReader(apihttp.NewPgxProjectReader(pool, authzr)).
 		WithPipelineStore(apihttp.NewPgxPipelineStore(pool)).
-		WithRunReader(apihttp.NewPgxRunReader(pool))
+		WithRunReader(apihttp.NewPgxRunReader(pool)).
+		// Reuses the same fake k8s client as run-trigger — mirrors main.go's
+		// wiring (WithSecrets shares WithK8sClient's client). Existing
+		// fixtures (validPipelineYAML, tlYAML) reference no secrets, so the
+		// S7 ladder no-ops for every test above; only the secret-ladder
+		// tests below exercise it.
+		WithSecrets(c, time.Now)
 	ts := httptest.NewServer(srv.Handler())
 	cleanup := func() { ts.Close(); pool.Close() }
 	return ts, pool, authzr, cleanup
@@ -409,6 +418,63 @@ func TestGetRun_AssemblesTimeline(t *testing.T) {
 	}
 	if v, ok := raw["timeline"]; !ok || v != nil {
 		t.Errorf("timeline = %v, want null", v)
+	}
+}
+
+// TestTriggerRun_UnknownSecretKey_Returns400 covers the S7 trigger-reject
+// rung: a pipeline referencing "$[api_token]" is rejected hard (400) at
+// trigger time when the project's managed Secret doesn't have that key.
+// The controller admission check (S3) remains the authoritative gate for
+// the pod itself; this is the fast user-facing reject before a run row is
+// even inserted.
+func TestTriggerRun_UnknownSecretKey_Returns400(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", pipelineYAMLWithSecretRef)
+
+	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "api_token") {
+		t.Errorf("body = %s, want it to name the missing key api_token", body)
+	}
+
+	// No run row must have been inserted — the reject happens before any
+	// DB write.
+	runs, _ := store.ListRunsForProject(ctx, pool, proj.ID, 10)
+	if len(runs) != 0 {
+		t.Errorf("runs len = %d, want 0 (reject must happen before insert)", len(runs))
+	}
+}
+
+// TestTriggerRun_KnownSecretKey_Returns201 proves the ladder's happy path:
+// once the referenced key exists in the project's managed Secret, the same
+// pipeline triggers normally (201, as today).
+func TestTriggerRun_KnownSecretKey_Returns201(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", pipelineYAMLWithSecretRef)
+
+	putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/api_token", "shh", cookie).Body.Close()
+
+	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 201; body=%s", resp.StatusCode, body)
 	}
 }
 

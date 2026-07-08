@@ -177,6 +177,28 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "put pipeline")
 		return
 	}
+
+	// Secrets save-warn ladder (RFC 026 P1.5 §7): the pipeline is saved
+	// regardless — a missing $[key] is a warning here, not a hard failure.
+	// Trigger time (handleTriggerRun) is where a missing key hard-rejects.
+	refs := validate.ReferencedSecrets(pl)
+	missing, err := s.missingSecretRefs(r.Context(), projectID, refs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check secrets")
+		return
+	}
+	if len(missing) > 0 {
+		findings := make([]validate.Finding, 0, len(missing))
+		for _, key := range missing {
+			findings = append(findings, validate.Finding{
+				Path:     "secrets." + key,
+				Message:  fmt.Sprintf("secret %q is referenced but not yet set in this project's secret store", key),
+				Severity: "warning",
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"findings": findings})
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

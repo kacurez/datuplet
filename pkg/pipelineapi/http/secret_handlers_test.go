@@ -63,6 +63,7 @@ func freshServerWithSecrets(t *testing.T) (ts *httptest.Server, pool *pgxpool.Po
 		WithUserResolver(auth.NewPostgresResolver(p, false)).
 		WithAuthorizer(authzr).
 		WithProjectReader(apihttp.NewPgxProjectReader(p, authzr)).
+		WithPipelineStore(apihttp.NewPgxPipelineStore(p)).
 		WithSecrets(c, clk.now)
 	server := httptest.NewServer(srv.Handler())
 	return server, p, authzr, c, clk, func() { server.Close(); p.Close() }

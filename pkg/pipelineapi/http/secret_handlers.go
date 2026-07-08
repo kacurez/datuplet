@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,6 +50,35 @@ func (s *Server) getManagedSecret(ctx context.Context, namespace string) (sec *c
 		return nil, false, getErr
 	}
 	return sec, true, nil
+}
+
+// missingSecretRefs is the shared read side of the S7 save-warn/trigger-reject
+// ladder: given the $[name] keys a pipeline references (validate.ReferencedSecrets),
+// it returns the subset absent from the project's managed Secret. An absent
+// managed Secret (project has never saved a secret) means every ref is
+// missing. Returns (nil, nil) when there are no refs to check, or when
+// s.secretsK8s is nil — the secrets endpoints aren't wired (e.g. no K8s
+// client in this deployment/test), so the ladder soft-degrades to a no-op
+// rather than nil-dereferencing the client.
+func (s *Server) missingSecretRefs(ctx context.Context, projectID uuid.UUID, refs []string) ([]string, error) {
+	if len(refs) == 0 || s.secretsK8s == nil {
+		return nil, nil
+	}
+	namespace := pkg8s.NamespaceForProject(projectID)
+	sec, found, err := s.getManagedSecret(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, ref := range refs {
+		if found {
+			if _, ok := sec.Data[ref]; ok {
+				continue
+			}
+		}
+		missing = append(missing, ref)
+	}
+	return missing, nil
 }
 
 // handleListSecrets is GET /api/v1/projects/{pid}/secrets. Any project

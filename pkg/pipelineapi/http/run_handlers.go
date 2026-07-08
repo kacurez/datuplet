@@ -2,12 +2,15 @@ package http
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/pipeline/config"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -85,6 +88,29 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 	parsed, err := config.Parse([]byte(pipe.YAML))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "pipeline YAML invalid: "+err.Error())
+		return
+	}
+
+	// Secrets trigger-reject ladder (RFC 026 P1.5 §7): hard-reject before any
+	// run row is inserted when a referenced $[key] isn't set in the
+	// project's managed Secret. config.Parse above already proved this YAML
+	// decodes and validates cleanly, so the re-decode here (needed for the
+	// typed CRD ReferencedSecrets walks) cannot fail in practice; a failure
+	// would mean the store returned different bytes than were just parsed.
+	crd, _, err := validate.ValidatePipeline([]byte(pipe.YAML))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "re-validate pipeline")
+		return
+	}
+	refs := validate.ReferencedSecrets(crd)
+	missing, err := s.missingSecretRefs(r.Context(), projectID, refs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check secrets")
+		return
+	}
+	if len(missing) > 0 {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("pipeline references secret(s) not set in this project: %s", strings.Join(missing, ", ")))
 		return
 	}
 

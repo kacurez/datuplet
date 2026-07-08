@@ -352,6 +352,11 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		WithRunBackend(backend).
 		WithStorage(storageSvc).
 		WithAuthorizer(authzr).
+		// Project-secrets endpoints reuse the same k8sClient as run-trigger
+		// (WithK8sClient above) — one client, one credential set. nil
+		// k8sClient (no KUBECONFIG / in-cluster hint) leaves the secrets
+		// routes unregistered, same soft-degrade shape as WithK8sClient.
+		WithSecrets(k8sClient, time.Now).
 		// Cluster info is embedded in POST /api/v1/auth/token responses so
 		// `datuplet run --remote` can reach lakekeeper. The lakekeeper URL
 		// is the deployment-time public URL (distinct from
