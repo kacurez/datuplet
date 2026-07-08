@@ -1,3 +1,4 @@
+{{- if .Values.components.builtins }}
 {{- /*
 ComponentDefinition CR for the built-in data-generator component (RFC 026
 Task R10). ComponentDefinition is cluster-scoped and shared across all
@@ -129,3 +130,4 @@ spec:
           cpu: "2"
           memory: 2Gi
           ephemeral-storage: 10Gi
+{{- end }}

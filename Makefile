@@ -156,6 +156,14 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	helm dependency update charts/datuplet-infra
 	helm dependency update charts/datuplet-app
 	helm dependency update charts/datuplet-lakekeeper
+	# Refresh the Datuplet CRDs up front. Helm installs CRDs from a chart's
+	# crds/ dir only on FIRST install and never upgrades them (nor removes
+	# them on uninstall), so on a reused cluster (the OrbStack dev loop) a
+	# CRD schema change never lands via helm alone — every pipeline apply
+	# then fails strict decoding on the new fields. kubectl apply updates
+	# the schema in place; a no-op on a fresh cluster the first helm install
+	# would populate anyway.
+	kubectl apply -f charts/datuplet-app/crds/
 	# Five-phase install: operators → infra → app → lakekeeper → register.
 	# Sequential, each --wait --wait-for-jobs. Phases 2-4 are strict order:
 	#   - infra owns CNPG + OpenFGA + MinIO + keygen (no Datuplet code)

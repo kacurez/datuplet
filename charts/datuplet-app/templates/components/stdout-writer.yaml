@@ -1,3 +1,4 @@
+{{- if .Values.components.builtins }}
 {{- /*
 ComponentDefinition CR for the built-in stdout-writer component (RFC 026
 Task R10). See data-generator.yaml in this directory for the cluster-scoped
@@ -49,3 +50,4 @@ spec:
           cpu: "2"
           memory: 2Gi
           ephemeral-storage: 10Gi
+{{- end }}

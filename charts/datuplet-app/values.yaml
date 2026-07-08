@@ -264,6 +264,12 @@ allowClientSideQuery: false
 # image ref is "<components.registry>/<component-name>:<components.tag>",
 # rendered by charts/datuplet-app/templates/components/*.yaml.
 components:
+  # builtins: install the six built-in ComponentDefinition CRs shipped by
+  # this chart. Disable in environments that register their own definitions
+  # out-of-band (the K8s e2e harness registers locally-built ":latest"
+  # images via tests/e2e/framework/components_bootstrap.go, so it sets this
+  # false to avoid two owners of the same cluster-scoped object).
+  builtins: true
   registry: ghcr.io/kacurez
   # tag: a stable vMAJOR.MINOR.PATCH version — never "latest" (the
   # ComponentDefinition CRD's CEL rule and the R8 registration-time

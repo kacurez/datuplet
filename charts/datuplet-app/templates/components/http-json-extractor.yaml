@@ -1,3 +1,4 @@
+{{- if .Values.components.builtins }}
 {{- /*
 ComponentDefinition CR for the built-in http-json-extractor component (RFC
 026 Task R10). See data-generator.yaml in this directory for the
@@ -98,3 +99,4 @@ spec:
           cpu: "2"
           memory: 2Gi
           ephemeral-storage: 10Gi
+{{- end }}
