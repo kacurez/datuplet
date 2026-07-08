@@ -118,8 +118,8 @@ single-request and paginated modes.
     defaultWriteMode: APPEND
 ```
 
-For API keys, use `$[name]` in the `headers` map and provide the secret via
-`spec.secretsRef` on the Pipeline. See [docs/secrets.md](secrets.md).
+For API keys, use `$[name]` in the `headers` map and set the value in the
+project's managed secrets. See [docs/secrets.md](secrets.md).
 
 ---
 
@@ -167,18 +167,13 @@ config:
   apiKey: $[finnhub_key]
 ```
 
-Store the API key as a K8s Secret and reference it:
-
-```yaml
-spec:
-  secretsRef:
-    name: finnhub-secrets
-```
+Set the key in the project's managed secrets (UI: Settings → Secrets, or the API):
 
 ```bash
-kubectl create secret generic finnhub-secrets \
-  --from-literal=finnhub_key=<your-api-key> \
-  -n datuplet
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value":"<your-api-key>"}' \
+  https://<host>/api/v1/projects/$PROJECT_ID/secrets/finnhub_key
 ```
 
 See [docs/secrets.md](secrets.md) for the full secret resolution flow.

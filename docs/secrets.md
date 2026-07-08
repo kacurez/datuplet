@@ -1,9 +1,11 @@
 # Secrets
 
 Pipeline configs can reference secret values without embedding them in YAML.
-The DataGateway sidecar resolves every reference at boot and delivers a
-plain, resolved config to the component. Components never see the marker,
-and the Docker/Kubernetes paths are identical at the pipeline-YAML level.
+Secrets live in one **managed, write-only** Kubernetes Secret per project —
+you never create or edit that Secret directly. You set values through the
+pipeline-api or the UI, and the Data Gateway sidecar resolves every
+reference at boot into a plain, resolved config for the component. The
+component never sees the `$[name]` marker or the raw Secret.
 
 ## Syntax
 
@@ -17,7 +19,9 @@ config:
 
 Rules:
 
-- Whole-value only. `url: "postgres://user:$[pw]@host"` is rejected at parse time.
+- Whole-value only. `url: "postgres://user:$[pw]@host"` is rejected at parse
+  time — put the full value (e.g. `postgres://user:hunter2@host`) in the
+  secret instead.
 - Names match `[A-Za-z0-9_-]+`.
 - To write a literal `$[x]`, escape it as `$$[x]`.
 - Multiple refs in one scalar (`"$[a] $[b]"`) are rejected.
@@ -26,114 +30,82 @@ Rules:
 Syntax errors are caught at pipeline parse / CRD admission time with a
 path-aware message, e.g. `stages[0].components[0].config.password`.
 
-## Docker
+## Setting secret values
 
-Put one file per secret in a directory. The file name is the `$[name]`;
-the file contents are the value. A single trailing `\n` or `\r\n` is
-stripped; other whitespace is preserved.
+Each project has exactly one managed Secret, `datuplet-project-secrets`, in
+the project's Kubernetes namespace. Pipeline-api creates and owns it — you
+never `kubectl apply` a Secret yourself. Two ways to set values:
 
-```bash
-mkdir -p ./secrets
-printf '%s' 'hunter2'    > ./secrets/db_password
-printf '%s' 'abc-123'    > ./secrets/api_token
-chmod 400 ./secrets/*
+### UI
 
-./bin/datuplet run my-pipeline.yaml --secrets-dir ./secrets
-```
+Settings → Secrets lists key names and their last-updated time (values are
+never shown or returned) and lets you set or delete a key.
 
-The CLI resolves the path to absolute, verifies the directory exists, and
-bind-mounts it read-only at `/var/run/secrets/datuplet` on the gateway
-sidecar — never on the component container.
+### API
 
-**Fail-fast checks (in order)**:
-
-1. **Parser** — rejects malformed `$[...]` markers.
-2. **Runner** — if any `$[...]` is referenced and `--secrets-dir` was not
-   provided, exits before any container starts and lists the missing names.
-3. **Gateway boot** — if a referenced secret's file is missing or
-   unreadable, the gateway crashes with a clear message and the pipeline
-   fails with `FailedApplication`.
-
-### Makefile example
-
-The common pattern: read a secret from an env var, materialise it as a file,
-pass the directory to `datuplet run --secrets-dir`.
-
-```makefile
-run-my-pipeline: build
-	@if [ -z "$(MY_API_KEY)" ]; then \
-		echo "Error: MY_API_KEY is not set." >&2; exit 1; \
-	fi
-	@mkdir -p $(PWD)/tmp/secrets
-	@printf '%s' "$(MY_API_KEY)" > $(PWD)/tmp/secrets/my_api_key
-	@chmod 400 $(PWD)/tmp/secrets/my_api_key
-	./bin/datuplet run my-pipeline.yaml \
-		--secrets-dir $(PWD)/tmp/secrets
-```
-
-## Kubernetes
-
-Add `spec.secretsRef.name` to your `Pipeline` and create a matching
-Kubernetes `Secret` in the same namespace. The keys of the Secret become
-your `$[name]` references.
-
-```yaml
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: my-pipeline
-  namespace: datuplet
-spec:
-  secretsRef:
-    name: my-pipeline-secrets
-  stages:
-    - name: extract
-      components:
-        - name: extractor
-          image: my-registry/my-extractor:latest
-          config:
-            api_key: $[api_token]
-          outputs:
-            defaultBucket: raw
-```
+Requires the `data_admin` role on the project.
 
 ```bash
-kubectl create secret generic my-pipeline-secrets \
-  --from-literal=api_token=abc-123 \
-  -n datuplet
+# List keys (names + updatedAt only — values are never returned)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://<host>/api/v1/projects/$PROJECT_ID/secrets
+
+# Set a key (creates the managed Secret on first write)
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value":"hunter2"}' \
+  https://<host>/api/v1/projects/$PROJECT_ID/secrets/db_password
+
+# Delete a key
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+  https://<host>/api/v1/projects/$PROJECT_ID/secrets/api_token
 ```
 
-A sample manifest lives at
-[`utils/deploy/k8s/rbac/sample-pipeline-secret.yaml`](../utils/deploy/k8s/rbac/sample-pipeline-secret.yaml).
+Keys must match `^[A-Za-z0-9_-]+$`.
 
-### What the operator does
+## Validation ladder
 
-When `secretsRef` is set, the PipelineRun Pod is built with:
+- **Save** (`PUT /api/v1/projects/{pid}/pipelines/{name}`): the pipeline is
+  saved regardless of whether its `$[name]` refs resolve. A reference to a
+  key that isn't set yet comes back as a `warning` finding, not a save
+  failure — useful when you're setting up a pipeline before its secrets.
+- **Trigger** (`POST /api/v1/projects/{pid}/pipelines/{name}/runs`): a
+  missing key hard-rejects with `400` before any run row is created.
 
-- a `Secret` volume backed by `secretsRef.name` (`Optional: false`), mounted
-  at `/var/run/secrets/datuplet` on the **gateway sidecar only**;
-- `DefaultMode: 0440` + pod `fsGroup: 65532`, gateway running as non-root
-  (`RunAsUser/RunAsGroup: 65532`) so only the gateway process can read the files;
-- `AutomountServiceAccountToken: false` — nothing in the Pod needs the K8s
-  API, so the SA token is stripped to remove an unused exfiltration path.
+## Per-run snapshots
+
+At run admission the PipelineRun controller reads the *exact* set of
+`$[name]` keys the pipeline references, copies only those keys from the
+managed project Secret into a per-run Secret (`datuplet-runsecrets-<id>`),
+and mounts that snapshot read-only at `/var/run/secrets/datuplet` on the
+**gateway sidecar only** — never on the component container. If a
+referenced key is missing from the project Secret at admission time (e.g.
+it was deleted after trigger but before admission), the run fails
+`FailedUser` and no snapshot or component Job is created.
+
+Because the snapshot is copied once at admission and is immutable for the
+run's lifetime, **rotating or deleting a project secret never affects an
+in-flight run** — only runs admitted afterward see the new value. The
+snapshot Secret is owned by the `PipelineRun` and garbage-collected with it.
 
 ### Observing resolution status
 
-The PipelineRun's `status.conditions` reports a `SecretsResolved` condition:
+The PipelineRun's `status.conditions` reports a `SecretsResolved` condition
+(absent when the pipeline references no secrets):
 
-| Status | Reason              | Meaning                                                     |
-|--------|---------------------|-------------------------------------------------------------|
-| True   | `Resolved`          | Gateway booted and served its first `GetConfig`.            |
-| False  | `SecretsRefMissing` | `FailedMount` on the `datuplet-secrets` volume — the Secret object does not exist or `secretsRef.name` is wrong. |
-| False  | `SecretNotFound`    | Gateway crashed at boot; a key referenced by `$[name]` is not present in the mounted Secret. |
+| Status | Reason            | Meaning                                                        |
+|--------|-------------------|-----------------------------------------------------------------|
+| True   | `Resolved`        | The per-run snapshot was created; every referenced key was found. |
+| False  | `SnapshotMissing` | One or more referenced keys were absent from the project Secret at admission — the run is `FailedUser`. |
 
 ```bash
-kubectl get pipelinerun <name> -n datuplet \
+kubectl get pipelinerun <name> -n <project-namespace> \
   -o jsonpath='{.status.conditions}' | jq
 ```
 
 ## Limits (v1)
 
 No mid-string substitution, no external providers (Vault, SOPS, cloud
-secret managers), no rotation/reload (gateway reads once at boot), no
-structured/JSON values.
+secret managers), no structured/JSON values, no per-pipeline secret scoping
+(all keys live in one project-wide Secret; a pipeline only pulls in the
+keys it actually references).
