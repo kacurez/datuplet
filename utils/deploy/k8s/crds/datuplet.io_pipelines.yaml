@@ -98,15 +98,11 @@ spec:
                         description: ComponentSpec defines a pipeline component
                         properties:
                           config:
-                            additionalProperties:
-                              type: string
-                            description: Config contains component-specific configuration
-                              (simple key-value pairs)
+                            description: Component-specific configuration as an
+                              arbitrary structured object (validated against the
+                              component's registry schema).
                             type: object
-                          configJSON:
-                            description: ConfigJSON contains component-specific configuration
-                              as JSON (for complex/nested values)
-                            type: string
+                            x-kubernetes-preserve-unknown-fields: true
                           image:
                             description: Image is the container image to run
                             type: string
