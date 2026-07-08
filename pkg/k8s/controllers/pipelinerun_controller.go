@@ -462,9 +462,6 @@ func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *da
 			return ctrl.Result{}, err
 		}
 
-		// Observe Secret mount/resolve state and surface it as a condition.
-		r.updateSecretsResolvedCondition(ctx, pr, pipeline, job)
-
 		// Try to extract exit code from pod
 		exitCode := r.extractExitCodeFromJob(ctx, job)
 

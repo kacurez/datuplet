@@ -76,20 +76,6 @@ spec:
                     format: int64
                     type: integer
                 type: object
-              secretsRef:
-                description: |
-                  SecretsRef names a Kubernetes Secret in the same namespace whose keys
-                  are resolvable via $[name] references in component configs. Optional.
-                properties:
-                  name:
-                    description: Name is the Secret's name in the same namespace as the PipelineRun.
-                    maxLength: 253
-                    minLength: 1
-                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                    type: string
-                required:
-                  - name
-                type: object
               stages:
                 description: Stages defines the pipeline stages
                 items:

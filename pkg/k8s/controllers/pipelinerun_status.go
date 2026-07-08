@@ -4,90 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 
-	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/status"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
-
-// updateSecretsResolvedCondition inspects the given job's latest pod and
-// events and, when a signal is present, sets the SecretsResolved condition
-// on pr.Status. No-op when the pipeline has no secretsRef or when the pod
-// has not produced an observable signal yet.
-func (r *PipelineRunReconciler) updateSecretsResolvedCondition(
-	ctx context.Context,
-	pr *datupletv1.PipelineRun,
-	pipeline *datupletv1.Pipeline,
-	job *batchv1.Job,
-) {
-	if pipeline.Spec.SecretsRef == nil {
-		return
-	}
-
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{"job-name": job.Name}); err != nil {
-		return
-	}
-	if len(pods.Items) == 0 {
-		return
-	}
-	pod := &pods.Items[len(pods.Items)-1]
-
-	// FailedMount on the datuplet-secrets volume -> the Secret object is missing.
-	// (We list namespace-wide and filter in memory; indexing involvedObject.name
-	// would require a manager-level FieldIndexer and isn't worth it for the event
-	// volume of a pipeline namespace.)
-	events := &corev1.EventList{}
-	if err := r.List(ctx, events, client.InNamespace(pod.Namespace)); err == nil {
-		for _, e := range events.Items {
-			if e.InvolvedObject.Name != pod.Name {
-				continue
-			}
-			if e.Reason == "FailedMount" && strings.Contains(e.Message, "datuplet-secrets") {
-				meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
-					Type:    datupletv1.PipelineRunSecretsResolved,
-					Status:  metav1.ConditionFalse,
-					Reason:  datupletv1.PipelineRunReasonSecretsRefMissing,
-					Message: e.Message,
-				})
-				return
-			}
-		}
-	}
-
-	// Gateway init container observations: terminated non-zero before Ready
-	// means a missing key file (or unmarshal error); Ready means it resolved
-	// everything and served its first GetConfig.
-	for _, c := range pod.Status.InitContainerStatuses {
-		if c.Name != "gateway" {
-			continue
-		}
-		if c.LastTerminationState.Terminated != nil && c.LastTerminationState.Terminated.ExitCode != 0 {
-			meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
-				Type:    datupletv1.PipelineRunSecretsResolved,
-				Status:  metav1.ConditionFalse,
-				Reason:  datupletv1.PipelineRunReasonSecretNotFound,
-				Message: c.LastTerminationState.Terminated.Message,
-			})
-			return
-		}
-		if c.Ready {
-			meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
-				Type:   datupletv1.PipelineRunSecretsResolved,
-				Status: metav1.ConditionTrue,
-				Reason: datupletv1.PipelineRunReasonSecretsResolved,
-			})
-			return
-		}
-	}
-}
 
 // extractExitCodeFromJob extracts the exit code from the first pod of a job.
 func (r *PipelineRunReconciler) extractExitCodeFromJob(ctx context.Context, job *batchv1.Job) *int32 {

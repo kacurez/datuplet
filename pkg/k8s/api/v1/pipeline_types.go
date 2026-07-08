@@ -28,24 +28,9 @@ type PipelineSpec struct {
 	// +optional
 	Gateway GatewaySpec `json:"gateway,omitempty"`
 
-	// SecretsRef names a Kubernetes Secret in the same namespace whose keys
-	// are resolvable via $[name] references in component configs. Optional.
-	// +optional
-	SecretsRef *SecretsRef `json:"secretsRef,omitempty"`
-
 	// Stages defines the pipeline stages
 	// +kubebuilder:validation:MinItems=1
 	Stages []StageSpec `json:"stages"`
-}
-
-// SecretsRef is a reference to a Kubernetes Secret whose keys back $[name]
-// secret references in the pipeline's component configs.
-type SecretsRef struct {
-	// Name is the Secret's name in the same namespace as the PipelineRun.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	Name string `json:"name"`
 }
 
 // GatewaySpec configures the data gateway sidecar
@@ -385,11 +370,6 @@ func (in *PipelineList) DeepCopyObject() runtime.Object {
 func (in *PipelineSpec) DeepCopyInto(out *PipelineSpec) {
 	*out = *in
 	out.Gateway = in.Gateway
-	if in.SecretsRef != nil {
-		in, out := &in.SecretsRef, &out.SecretsRef
-		*out = new(SecretsRef)
-		**out = **in
-	}
 	if in.Stages != nil {
 		in, out := &in.Stages, &out.Stages
 		*out = make([]StageSpec, len(*in))
@@ -397,21 +377,6 @@ func (in *PipelineSpec) DeepCopyInto(out *PipelineSpec) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
-}
-
-// DeepCopyInto for SecretsRef
-func (in *SecretsRef) DeepCopyInto(out *SecretsRef) {
-	*out = *in
-}
-
-// DeepCopy creates a deep copy of SecretsRef
-func (in *SecretsRef) DeepCopy() *SecretsRef {
-	if in == nil {
-		return nil
-	}
-	out := new(SecretsRef)
-	in.DeepCopyInto(out)
-	return out
 }
 
 // DeepCopyInto for StageSpec

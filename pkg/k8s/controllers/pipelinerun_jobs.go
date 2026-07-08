@@ -237,13 +237,6 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		job.Spec.Template.Spec.Containers[0].Resources = *comp.Resources
 	}
 
-	// Mount the referenced Secret on the gateway sidecar (only) when secretsRef is set.
-	applySecretsMount(
-		&job.Spec.Template.Spec,
-		&job.Spec.Template.Spec.InitContainers[0],
-		pipeline,
-	)
-
 	// Mount the referenced Secret on the gateway sidecar (only) when runTokenRef is set.
 	applyRunTokenMount(
 		&job.Spec.Template.Spec,
@@ -263,69 +256,16 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 	// Pod-level automount of the ServiceAccount token is disabled
 	// unconditionally. Nothing in the gateway sidecar or component container
 	// talks to the K8s API; removing the token closes an unused bypass path
-	// even for pipelines without secretsRef or runTokenRef.
+	// even for pipelines without runTokenRef.
 	automount := false
 	job.Spec.Template.Spec.AutomountServiceAccountToken = &automount
 
 	return job, configMap, nil
 }
 
-// secretsMountPath is the in-container directory where pkg/lib/secrets.FileProvider
-// looks up $[name] references.
-const secretsMountPath = "/var/run/secrets/datuplet"
-
 // secretsMountFSGroup is the GID the gateway process runs as so it can read files
 // from the Secret volume when DefaultMode is 0440.
 const secretsMountFSGroup = int64(65532)
-
-// applySecretsMount augments podSpec with the Secret volume + gateway mount + pod
-// security context needed to deliver Pipeline.spec.secretsRef.Name to the gateway
-// sidecar. No-op when SecretsRef is nil.
-func applySecretsMount(podSpec *corev1.PodSpec, gatewayContainer *corev1.Container, pipeline *datupletv1.Pipeline) {
-	if pipeline.Spec.SecretsRef == nil {
-		return
-	}
-
-	// Volume-owned files get the fsGroup; combined with DefaultMode 0440 the
-	// gateway process (runAsGroup matching fsGroup) can read them while the
-	// component — which has no mount — still cannot.
-	if podSpec.SecurityContext == nil {
-		podSpec.SecurityContext = &corev1.PodSecurityContext{}
-	}
-	fsGroup := secretsMountFSGroup
-	podSpec.SecurityContext.FSGroup = &fsGroup
-
-	optional := false
-	mode := int32(0o440)
-	podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
-		Name: "datuplet-secrets",
-		VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{
-				SecretName:  pipeline.Spec.SecretsRef.Name,
-				Optional:    &optional, // FailedMount if absent
-				DefaultMode: &mode,     // root:fsGroup, readable by group
-			},
-		},
-	})
-
-	// Gateway sidecar only — NOT the component container. Do not use subPath:
-	// atomic Secret updates (future rotation) only propagate to non-subPath mounts.
-	gatewayContainer.VolumeMounts = append(gatewayContainer.VolumeMounts, corev1.VolumeMount{
-		Name:      "datuplet-secrets",
-		MountPath: secretsMountPath,
-		ReadOnly:  true,
-	})
-
-	runAsNonRoot := true
-	uid := int64(65532)
-	gid := int64(65532)
-	if gatewayContainer.SecurityContext == nil {
-		gatewayContainer.SecurityContext = &corev1.SecurityContext{}
-	}
-	gatewayContainer.SecurityContext.RunAsNonRoot = &runAsNonRoot
-	gatewayContainer.SecurityContext.RunAsUser = &uid
-	gatewayContainer.SecurityContext.RunAsGroup = &gid
-}
 
 // runTokenMountPath is the in-container directory where the gateway sidecar
 // reads the run-scoped JWT written by pipeline-api into a K8s Secret.
@@ -668,13 +608,6 @@ func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun
 		if r.PipelineAPIURL != "" {
 			configMap["pipeline_api_jwks_url"] = strings.TrimSuffix(r.PipelineAPIURL, "/") + "/api/v1/auth/jwks.json"
 		}
-	}
-
-	// Tell the gateway where the mounted Secret files live (Task 10 wires the
-	// corresponding volume + mount on the gateway sidecar). Only set when the
-	// pipeline actually references a Secret.
-	if pipeline.Spec.SecretsRef != nil {
-		configMap["secrets_dir"] = secretsMountPath
 	}
 
 	// Marshal to YAML

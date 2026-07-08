@@ -12,7 +12,7 @@ import (
 )
 
 // minimalPipeline returns a Pipeline with one stage and one component,
-// no SecretsRef, no inputs, no outputs — just enough for buildComponentJob.
+// no inputs, no outputs — just enough for buildComponentJob.
 func minimalPipeline() *datupletv1.Pipeline {
 	return &datupletv1.Pipeline{
 		Spec: datupletv1.PipelineSpec{
@@ -52,23 +52,6 @@ func TestBuildComponentJob_AutomountDisabled_NoSecretsRef(t *testing.T) {
 	}
 	if *am != false {
 		t.Errorf("AutomountServiceAccountToken = %v, want false", *am)
-	}
-}
-
-func TestBuildComponentJob_AutomountDisabled_WithSecretsRef(t *testing.T) {
-	r := &PipelineRunReconciler{}
-	pipeline := minimalPipeline()
-	pipeline.Spec.SecretsRef = &datupletv1.SecretsRef{Name: "mysecrets"}
-	pr := minimalPipelineRun()
-
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
-	if err != nil {
-		t.Fatalf("buildComponentJob: %v", err)
-	}
-
-	am := job.Spec.Template.Spec.AutomountServiceAccountToken
-	if am == nil || *am != false {
-		t.Errorf("AutomountServiceAccountToken must be false even with SecretsRef set; got %v", am)
 	}
 }
 
@@ -219,39 +202,6 @@ func TestBuildComponentJob_RunTokenNil_NoVolume(t *testing.T) {
 		if v.Name == "datuplet-runtoken" {
 			t.Error("datuplet-runtoken volume must not be added when RunTokenRef is nil")
 		}
-	}
-}
-
-func TestBuildComponentJob_RunTokenAndSecretsRef_BothCoexist(t *testing.T) {
-	r := &PipelineRunReconciler{}
-	pipeline := minimalPipeline()
-	pipeline.Spec.SecretsRef = &datupletv1.SecretsRef{Name: "my-secrets"}
-	pr := minimalPipelineRun()
-	pr.Spec.RunTokenRef = &datupletv1.RunTokenRef{Name: "runtoken-pr1"}
-
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
-	if err != nil {
-		t.Fatalf("buildComponentJob: %v", err)
-	}
-
-	volumeNames := map[string]bool{}
-	for _, v := range job.Spec.Template.Spec.Volumes {
-		volumeNames[v.Name] = true
-	}
-	if !volumeNames["datuplet-secrets"] {
-		t.Error("SecretsRef volume 'datuplet-secrets' missing when both refs are set")
-	}
-	if !volumeNames["datuplet-runtoken"] {
-		t.Error("RunTokenRef volume 'datuplet-runtoken' missing when both refs are set")
-	}
-
-	gw := &job.Spec.Template.Spec.InitContainers[0]
-	gwMounts := map[string]bool{}
-	for _, m := range gw.VolumeMounts {
-		gwMounts[m.Name] = true
-	}
-	if !gwMounts["datuplet-secrets"] || !gwMounts["datuplet-runtoken"] {
-		t.Errorf("gateway missing mounts: %v", gwMounts)
 	}
 }
 
