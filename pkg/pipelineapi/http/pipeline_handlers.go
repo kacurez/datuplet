@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	"github.com/datuplet/datuplet/pkg/pipeline/config"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 )
@@ -150,18 +150,24 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "body exceeds 1 MiB: "+err.Error())
 		return
 	}
-	parsed, err := config.Parse(body)
+	pl, findings, err := validate.ValidatePipeline(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid pipeline: "+err.Error())
+		return
+	}
+	if len(findings) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "validation failed", "findings": findings,
+		})
 		return
 	}
 	// metadata.name must match the URL name: otherwise ApplyPipelineCRD at
 	// run-trigger time would create a CRD under the YAML's name while the
 	// PipelineRun would reference the URL name, and the operator would fail
 	// to find the Pipeline.
-	if parsed.Metadata.Name != "" && parsed.Metadata.Name != name {
+	if pl.Name != "" && pl.Name != name {
 		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("YAML metadata.name %q does not match URL name %q", parsed.Metadata.Name, name))
+			fmt.Sprintf("YAML metadata.name %q does not match URL name %q", pl.Name, name))
 		return
 	}
 
