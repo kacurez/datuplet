@@ -7,6 +7,7 @@ import (
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/status"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/google/uuid"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -199,21 +200,20 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		return ctrl.Result{}, err
 	}
 
-	// Check if Pipeline is ready
-	if pipeline.Status.Phase == datupletv1.PipelinePhaseInvalid {
-		// Pipeline is invalid - fail the run
+	// Run admission: validate the fetched Pipeline with the same semantic
+	// checks the pipeline-api save path runs (validate.ValidateTyped). This
+	// is authoritative on its own — it does NOT gate on
+	// pipeline.Status.Phase, so a run is never admitted (and no Job is ever
+	// built) against an invalid Pipeline regardless of whether the Pipeline
+	// controller has reconciled it yet.
+	if findings := validate.ValidateTyped(pipeline); len(findings) > 0 {
 		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
-		pr.Status.Message = fmt.Sprintf("Pipeline '%s' is invalid: %s", pipeline.Name, pipeline.Status.Message)
+		pr.Status.Message = findings[0].Message
 		if err := r.Status().Update(ctx, pr); err != nil {
 			logger.Error(err, "Failed to update PipelineRun status")
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
-	}
-	if pipeline.Status.Phase != datupletv1.PipelinePhaseReady {
-		// Pipeline not ready yet - requeue and wait
-		logger.Info("Pipeline not ready yet, waiting", "pipeline", pipeline.Name, "phase", pipeline.Status.Phase)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	// Determine run ID: use spec value if provided, otherwise generate
