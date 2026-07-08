@@ -112,6 +112,39 @@ export async function getTableSnapshots(projectId, namespace, name) {
   return api(`/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/snapshots`);
 }
 
+// ----- Secrets endpoints (RFC 026 P1.5) -----
+//
+// Write-only: the server never returns secret values, only key +
+// updatedAt. All three go through the api() wrapper for consistent
+// auth/401 and error handling.
+
+/**
+ * List secret names + last-updated timestamps for a project.
+ * Returns [{ key, updatedAt }, ...]. Values are never included.
+ */
+export async function listSecrets(projectId) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/secrets`);
+}
+
+/**
+ * Create or overwrite a secret's value. 204 on success.
+ */
+export async function putSecret(projectId, key, value) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/secrets/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ value }),
+  });
+}
+
+/**
+ * Delete a secret. 204 on success.
+ */
+export async function deleteSecret(projectId, key) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/secrets/${encodeURIComponent(key)}`, {
+    method: 'DELETE',
+  });
+}
+
 // runQuery submits ad-hoc SQL to the server-side query service (RFC 022 mode a)
 // and returns the queryengine Result JSON: { schema:[{name,type}], rows:[[...]],
 // truncated:bool, stats:{duration_ms,...} }.

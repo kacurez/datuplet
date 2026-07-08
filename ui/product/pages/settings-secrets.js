@@ -1,61 +1,144 @@
-// Secrets placeholder. The pipeline-api has no secrets endpoints yet;
-// see docs/secrets.md for the resolution model. Today secrets are
-// managed via `kubectl create secret` in the project's K8s namespace
-// (datuplet-<project-uuid>) and referenced from a pipeline YAML via
-// spec.secretsRef.name + $[key] substitutions.
+// Secrets page: write-only key management for the active project
+// (RFC 026 P1.5). Backed by:
+//   GET    /api/v1/projects/{pid}/secrets              -> [{key, updatedAt}]
+//   PUT    /api/v1/projects/{pid}/secrets/{key} {value} -> 204
+//   DELETE /api/v1/projects/{pid}/secrets/{key}         -> 204
 //
-// This page renders the relevant commands with the user's project ID
-// filled in so they can copy-paste without looking it up. RFC 005 B-8
-// restyles it with the new component vocabulary; no behaviour change.
+// The server never returns a secret's value, and this page never
+// echoes one back into the DOM either: the form is reset immediately
+// after a successful save, and only `key` + `updatedAt` ever reach
+// innerHTML. Secrets are referenced from a pipeline YAML via
+// spec.secretsRef.name + $[key] substitutions — see docs/secrets.md.
 
-import { esc } from '/ui/api.js';
+import { esc, listSecrets, putSecret, deleteSecret } from '/ui/api.js';
+import { timeTag } from '/ui/format.js';
+import { skeletonRows } from '/ui/components.js';
 
-export function renderSecrets() {
+const KEY_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+export async function renderSecrets() {
   const app = document.getElementById('app');
   const head = document.getElementById('page-head');
-  const pid = window.__datupletActiveProjectID || '<project-uuid>';
-  const ns = `datuplet-${pid}`;
-  const yaml = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: my-pipeline
-spec:
-  secretsRef:
-    name: my-creds
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          image: datuplet/csv-extractor:latest
-          config:
-            db_password: $[db_password]
-            api_token: $[api_token]`;
+  const pid = window.__datupletActiveProjectID;
 
-  if (head) {
-    head.innerHTML = `<h1>Secrets</h1>`;
+  if (head) head.innerHTML = `<h1>Secrets</h1>`;
+
+  if (!pid) {
+    app.innerHTML = `<p>No active project.</p>`;
+    return;
   }
 
   app.innerHTML = `
-    <p>A user-facing secrets API is not shipped yet. Until it lands, an
-    admin manages project secrets via <code class="inline">kubectl</code>
-    in the project's Kubernetes namespace.</p>
-
-    <h3 style="margin-top: var(--s-5); margin-bottom: var(--s-2); font-size: var(--text-lg);">Create or update secrets for this project</h3>
-    <pre class="code">kubectl create secret generic my-creds \\
-  -n ${esc(ns)} \\
-  --from-literal=db_password='...' \\
-  --from-literal=api_token='...' \\
-  --dry-run=client -o yaml | kubectl apply -f -</pre>
-
-    <h3 style="margin-top: var(--s-5); margin-bottom: var(--s-2); font-size: var(--text-lg);">Reference them from a pipeline YAML</h3>
-    <pre class="code">${esc(yaml)}</pre>
-
-    <p style="margin-top: var(--s-4); color: var(--fg-1); font-size: var(--text-sm);">
-      The gateway sidecar mounts <code class="inline">secretsRef.name</code> at
-      <code class="inline">/var/run/secrets/datuplet/</code> and resolves
-      <code class="inline">$[key]</code> refs at boot. Values reach the component
-      as part of its config only — no secret is ever visible to the component's
-      filesystem. See <code class="inline">docs/secrets.md</code>.
+    <p style="color: var(--fg-1);">
+      Reference these from a pipeline YAML via
+      <code class="inline">spec.secretsRef.name</code> and
+      <code class="inline">$[key]</code> substitutions. Values cannot be
+      read back once saved — only the key and last-updated time are shown.
     </p>
+
+    <table class="table" style="margin-top: var(--s-4);">
+      <thead>
+        <tr><th>Key</th><th>Updated</th><th></th></tr>
+      </thead>
+      <tbody id="secrets-body">${skeletonRows(3, 3)}</tbody>
+    </table>
+
+    <h3 style="margin-top: var(--s-5); margin-bottom: var(--s-2); font-size: var(--text-lg);">Add / update secret</h3>
+    <form id="secret-form">
+      <label class="field">Key
+        <input class="input" type="text" name="key" placeholder="db_password" required
+          pattern="[A-Za-z0-9_-]+" title="Letters, digits, underscore, and hyphen only.">
+      </label>
+      <label class="field">Value
+        <input class="input" type="password" name="value" required autocomplete="off">
+      </label>
+      <p style="color: var(--fg-2); font-size: var(--text-sm);">Values cannot be read back — keep a copy somewhere safe before saving.</p>
+      <div id="secret-msg"></div>
+      <div class="actions" style="margin-top: var(--s-3);">
+        <button type="submit" class="btn btn--primary">Save secret</button>
+      </div>
+    </form>
   `;
+
+  const body = document.getElementById('secrets-body');
+  let secrets = [];
+
+  function renderRows() {
+    if (!secrets || secrets.length === 0) {
+      body.innerHTML = `<tr><td colspan="3" style="color: var(--fg-2); text-align:center; padding: var(--s-5);">No secrets yet.</td></tr>`;
+      return;
+    }
+    body.innerHTML = secrets.map((s) => `
+      <tr>
+        <td><code class="inline">${esc(s.key)}</code></td>
+        <td>${timeTag(s.updatedAt)}</td>
+        <td><button type="button" class="btn btn--ghost" data-delete="${esc(s.key)}">Delete</button></td>
+      </tr>
+    `).join('');
+
+    body.querySelectorAll('[data-delete]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const key = btn.getAttribute('data-delete');
+        if (!confirm(`Delete secret "${key}"? Pipelines referencing $[${key}] will fail to resolve it.`)) return;
+        btn.disabled = true;
+        try {
+          await deleteSecret(pid, key);
+          await reload();
+        } catch (err) {
+          if (String(err.message) !== 'not authenticated') {
+            document.getElementById('secret-msg').innerHTML = `<div class="banner error">${esc(err.message)}</div>`;
+          }
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  async function reload() {
+    try {
+      secrets = await listSecrets(pid);
+    } catch (err) {
+      if (String(err.message) !== 'not authenticated') {
+        body.innerHTML = `<tr><td colspan="3" style="color: var(--status-fail-fg);">Failed to load secrets: ${esc(err.message)}</td></tr>`;
+      }
+      return;
+    }
+    renderRows();
+  }
+
+  await reload();
+
+  const form = document.getElementById('secret-form');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = document.getElementById('secret-msg');
+    msg.innerHTML = '';
+    const fd = new FormData(form);
+    const key = String(fd.get('key') || '').trim();
+    const value = String(fd.get('value') || '');
+    if (!KEY_PATTERN.test(key)) {
+      msg.innerHTML = `<div class="banner error">Key must contain only letters, digits, underscore, and hyphen.</div>`;
+      return;
+    }
+    if (!value) {
+      msg.innerHTML = `<div class="banner error">Value is required.</div>`;
+      return;
+    }
+    const btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    try {
+      await putSecret(pid, key, value);
+      // Clear the whole form — the value must never linger in the DOM
+      // or be echoed back anywhere, successful save or not.
+      form.reset();
+      msg.innerHTML = `<div class="banner success">Saved.</div>`;
+      await reload();
+    } catch (err) {
+      if (String(err.message) !== 'not authenticated') {
+        msg.innerHTML = `<div class="banner error">${esc(err.message)}</div>`;
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }
