@@ -207,20 +207,11 @@ var scenarios = []framework.Scenario{
 		},
 	},
 
-	// ============================================
-	// Secret handling ($[name] resolution)
-	// ============================================
-	{
-		Name:        "secrets-resolved",
-		Description: "Pipeline with $[api_token] resolves via K8s Secret and runs to completion",
-		K8sPipeline: "k8s/secrets-happy.yaml",
-		SecretsData: map[string]string{
-			"api_token": "super-secret-token",
-		},
-		// K8s tier uses http-json-extractor writing 100 posts to
-		// {{.RunPrefix}}-api/data; the "did the secret resolve" proof
-		// is the pipeline succeeding at all.
-	},
+	// Secret handling ($[name] resolution via the managed write-only secrets
+	// API) is exercised by TestSecretsLadder in scenarios_secrets_test.go —
+	// it needs a dedicated Datuplet project (for literal PUT /secrets/{key}
+	// + PUT /pipelines calls) and both an HTTP-triggered and a kubectl-applied
+	// run, which don't fit the declarative Scenario{} shape used here.
 
 	// ============================================================
 	// FGA-grant-matrix scenarios

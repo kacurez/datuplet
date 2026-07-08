@@ -71,13 +71,6 @@ type Scenario struct {
 	// per-user authorization outcomes.
 	User uuid.UUID
 
-	// SecretsData provisions secrets for the pipeline run. When non-empty:
-	//   K8s tier: framework creates a Kubernetes Secret named
-	//   "<runPrefix>-secrets" in the datuplet namespace before apply and
-	//   deletes it on cleanup. The pipeline YAML template must reference it
-	//   via spec.secretsRef.name: "{{.RunPrefix}}-secrets".
-	SecretsData map[string]string
-
 	// SkipReason, when non-empty, causes RunScenario to t.Skip the scenario
 	// with the given message. Used to mark scenarios blocked on upstream-library
 	// or component-redesign work that's tracked separately.
@@ -164,20 +157,6 @@ func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir strin
 		t.Fatalf("build lakekeeper verifier: %v", err)
 	}
 	queryTarget.Resolver = resolver
-
-	// Provision secrets if the scenario declares any.
-	// Creates a K8s Secret named "<runPrefix>-secrets" and deletes it on cleanup.
-	// The pipeline template is expected to reference it via spec.secretsRef.name.
-	if len(sc.SecretsData) > 0 {
-		secretName := runPrefix + "-secrets"
-		// PipelineRuns apply to the per-project namespace (datuplet-<lkP>),
-		// so secretsRef resolves against that namespace.
-		ns := kb.Namespace
-		if err := createK8sSecret(ctx, secretName, ns, sc.SecretsData); err != nil {
-			t.Fatalf("create k8s secret: %v", err)
-		}
-		defer deleteK8sSecret(context.Background(), secretName, ns)
-	}
 
 	vars := TemplateVars{
 		RunPrefix:   runPrefix,
