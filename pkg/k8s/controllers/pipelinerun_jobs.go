@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -443,18 +442,13 @@ func applyCancelAnnotationMount(podSpec *corev1.PodSpec, gatewayContainer *corev
 
 // generateGatewayConfig creates the gateway configuration YAML.
 func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, comp *datupletv1.ComponentSpec) string {
-	// Convert config - handle both Config map and ConfigJSON
-	config := make(map[string]any)
-	for k, v := range comp.Config {
-		config[k] = v
-	}
-	if comp.ConfigJSON != "" {
-		var jsonConfig map[string]any
-		if err := json.Unmarshal([]byte(comp.ConfigJSON), &jsonConfig); err == nil {
-			for k, v := range jsonConfig {
-				config[k] = v
-			}
-		}
+	// Decode the structured Config. Mirrors the old ConfigJSON-unmarshal-error
+	// handling: malformed config is logged and treated as empty rather than
+	// failing the build (B6 replaces this with a hard failure + tests).
+	config, err := comp.ConfigMap()
+	if err != nil {
+		fmt.Printf("WARNING: component %s: %v (ignoring config)\n", comp.Name, err)
+		config = nil
 	}
 
 	// Build gateway settings

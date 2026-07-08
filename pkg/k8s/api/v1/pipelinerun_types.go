@@ -45,10 +45,6 @@ type PipelineRunSpec struct {
 	// PipelineRef references the Pipeline to run
 	PipelineRef PipelineRef `json:"pipelineRef"`
 
-	// Parameters allows overriding component config values
-	// +optional
-	Parameters map[string]string `json:"parameters,omitempty"`
-
 	// RunID optionally specifies the execution identifier. If empty, the controller generates one.
 	// Must be a valid UUID.
 	// +optional
@@ -309,13 +305,6 @@ func (in *PipelineRunList) DeepCopyObject() runtime.Object {
 func (in *PipelineRunSpec) DeepCopyInto(out *PipelineRunSpec) {
 	*out = *in
 	out.PipelineRef = in.PipelineRef
-	if in.Parameters != nil {
-		in, out := &in.Parameters, &out.Parameters
-		*out = make(map[string]string, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
-		}
-	}
 	if in.RunTokenRef != nil {
 		in, out := &in.RunTokenRef, &out.RunTokenRef
 		*out = new(RunTokenRef)

@@ -1,7 +1,11 @@
 package v1
 
 import (
+	"encoding/json"
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -144,13 +148,12 @@ type ComponentSpec struct {
 	// Image is the container image to run
 	Image string `json:"image"`
 
-	// Config contains component-specific configuration (simple key-value pairs)
+	// Config contains component-specific configuration as an arbitrary
+	// structured object, validated against the component's registry
+	// schema (RFC 026). Nested YAML is first-class.
+	// +kubebuilder:pruning:PreserveUnknownFields
 	// +optional
-	Config map[string]string `json:"config,omitempty"`
-
-	// ConfigJSON contains component-specific configuration as JSON (for complex/nested values)
-	// +optional
-	ConfigJSON string `json:"configJSON,omitempty"`
+	Config apiextensionsv1.JSON `json:"config,omitempty"`
 
 	// Inputs defines input configuration
 	// +optional
@@ -163,6 +166,19 @@ type ComponentSpec struct {
 	// Resources defines resource requirements
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// ConfigMap decodes Config into a generic map. Nil-safe: an unset
+// config yields (nil, nil).
+func (c *ComponentSpec) ConfigMap() (map[string]any, error) {
+	if len(c.Config.Raw) == 0 {
+		return nil, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(c.Config.Raw, &m); err != nil {
+		return nil, fmt.Errorf("component %q config: %w", c.Name, err)
+	}
+	return m, nil
 }
 
 // OutputSpec defines output configuration for a component.
@@ -413,13 +429,7 @@ func (in *StageSpec) DeepCopyInto(out *StageSpec) {
 // DeepCopyInto for ComponentSpec
 func (in *ComponentSpec) DeepCopyInto(out *ComponentSpec) {
 	*out = *in
-	if in.Config != nil {
-		in, out := &in.Config, &out.Config
-		*out = make(map[string]string, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
-		}
-	}
+	in.Config.DeepCopyInto(&out.Config)
 	if in.Inputs != nil {
 		in, out := &in.Inputs, &out.Inputs
 		*out = new(InputSpec)
@@ -435,6 +445,16 @@ func (in *ComponentSpec) DeepCopyInto(out *ComponentSpec) {
 		*out = new(corev1.ResourceRequirements)
 		(*in).DeepCopyInto(*out)
 	}
+}
+
+// DeepCopy for ComponentSpec
+func (in *ComponentSpec) DeepCopy() *ComponentSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(ComponentSpec)
+	in.DeepCopyInto(out)
+	return out
 }
 
 // DeepCopyInto for InputSpec
