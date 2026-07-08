@@ -50,10 +50,12 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Secrets - read the managed project Secret; create per-run snapshots
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create"]
+  # Secrets: NO cluster-wide verbs (RFC 026 P1.5). The operator reads the
+  # managed project Secret (uncached APIReader) and creates the per-run
+  # snapshot Secret via the `datuplet-secrets-operator` Role (secrets
+  # get,create) bound to this SA in each project namespace by pipeline-api.
+  # It runs no Secret informer (SetupWithManager: For(PipelineRun)+Owns(Job)
+  # only), so it never needs cluster list/watch.
   # Services - discover lakekeeper / pipeline-api
   - apiGroups: [""]
     resources: ["services"]
