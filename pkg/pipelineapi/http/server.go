@@ -50,6 +50,14 @@ type Server struct {
 	// main.go whenever the signer exists (so the policy-off 403 path works
 	// even when client-side query is disabled). Nil → route unregistered.
 	localQueryMintHandler http.Handler
+	// secretsK8s is the K8s client the project-secrets handlers use to
+	// lazily ensure the managed Secret and apply merge-PATCHes. Wired via
+	// WithSecrets; when nil, the secrets routes are left unregistered.
+	secretsK8s client.Client
+	// secretsClock supplies "now" for the "datuplet.io/updated-<key>"
+	// annotation. Injected (not read inside the patch helper) so tests get
+	// deterministic timestamps.
+	secretsClock func() time.Time
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -199,6 +207,19 @@ func (s *Server) WithLocalQueryMint(h http.Handler) *Server {
 	return s
 }
 
+// WithSecrets wires the project-scoped secrets endpoints
+// (GET/PUT/DELETE /api/v1/projects/{pid}/secrets...). k8sClient lazily
+// ensures the project namespace + managed Secret exist and applies the
+// per-key merge-PATCHes; clock supplies "now" for the
+// "datuplet.io/updated-<key>" annotation so tests get deterministic
+// timestamps instead of the handler reading time.Now() itself. When
+// k8sClient is nil, the secrets routes are left unregistered.
+func (s *Server) WithSecrets(k8sClient client.Client, clock func() time.Time) *Server {
+	s.secretsK8s = k8sClient
+	s.secretsClock = clock
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -256,6 +277,15 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("GET /api/v1/projects/{pid}/pipelines", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListPipelines)))
 		mux.Handle("GET /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleGetPipeline)))
 		mux.Handle("DELETE /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeletePipeline)))
+	}
+
+	// Project-secrets handlers gate on s.secretsK8s in addition to the
+	// standard resolver/authzr/projects trio — mirrors the pipeline routes'
+	// gate shape above.
+	if s.resolver != nil && s.authzr != nil && s.projects != nil && s.secretsK8s != nil {
+		mux.Handle("GET /api/v1/projects/{pid}/secrets", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListSecrets)))
+		mux.Handle("PUT /api/v1/projects/{pid}/secrets/{key}", auth.WithUser(s.resolver, http.HandlerFunc(s.handlePutSecret)))
+		mux.Handle("DELETE /api/v1/projects/{pid}/secrets/{key}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeleteSecret)))
 	}
 
 	if s.resolver != nil && s.authzr != nil && s.runs != nil {
