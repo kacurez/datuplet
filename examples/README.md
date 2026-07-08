@@ -31,8 +31,8 @@ You can run a pipeline using any of these methods:
 
 ### 2. REST API
 See [`docs/pipeline-api.md`](../docs/pipeline-api.md) for:
-- **Upload a pipeline** — POST `/api/v1/pipelines` with the YAML
-- **Trigger a run** — POST `/api/v1/pipelines/{name}/runs`
+- **Upload a pipeline** — `PUT /api/v1/projects/{pid}/pipelines/{name}` with the YAML
+- **Trigger a run** — `POST /api/v1/projects/{pid}/pipelines/{name}/runs`
 
 ### 3. kubectl (Direct Kubernetes Deployment)
 ```bash

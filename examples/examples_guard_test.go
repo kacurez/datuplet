@@ -28,6 +28,8 @@ func TestExamplesAreValid(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			pipelineNames := map[string]bool{}
+			var pipelineRefs []string
 			for i, doc := range splitDocs(string(raw)) {
 				var probe struct {
 					Kind string `json:"kind"`
@@ -44,13 +46,26 @@ func TestExamplesAreValid(t *testing.T) {
 					if _, err := pipelineconfig.Parse([]byte(doc)); err != nil {
 						t.Errorf("doc %d semantic validation: %v", i, err)
 					}
+					pipelineNames[p.Name] = true
 				case "PipelineRun":
 					var pr datupletv1.PipelineRun
 					if err := yaml.UnmarshalStrict([]byte(doc), &pr); err != nil {
 						t.Errorf("doc %d strict decode: %v", i, err)
 					}
+					pipelineRefs = append(pipelineRefs, pr.Spec.PipelineRef.Name)
 				default:
 					t.Errorf("doc %d: unexpected kind %q", i, probe.Kind)
+				}
+			}
+			if len(pipelineNames) == 0 {
+				t.Errorf("no Pipeline doc found in %s", f)
+			}
+			if len(pipelineRefs) == 0 {
+				t.Errorf("no PipelineRun doc found in %s", f)
+			}
+			for _, ref := range pipelineRefs {
+				if !pipelineNames[ref] {
+					t.Errorf("PipelineRun.spec.pipelineRef.name %q does not match any Pipeline metadata.name in %s", ref, f)
 				}
 			}
 		})
