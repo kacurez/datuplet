@@ -26,6 +26,8 @@ spec:
       components:
         - name: json-extractor
           component: http-json-extractor
+          # pin a version for reproducibility; omit to float on the registry default
+          version: v0.1.0
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
           # Dynamic table creation: component can create any table under 'raw' bucket

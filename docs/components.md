@@ -15,11 +15,13 @@ pipelines without an external data source.
 
 **Image:** `ghcr.io/kacurez/data-generator:v0.1.0`
 
+**Registry name:** `data-generator` · default version from the chart
+
 **Config schema (random mode):**
 
 ```yaml
 - name: gen
-  image: ghcr.io/kacurez/data-generator:v0.1.0
+  component: data-generator
   config:
     tables:
       - name: events
@@ -42,7 +44,7 @@ pipelines without an external data source.
 
 ```yaml
 - name: seed
-  image: ghcr.io/kacurez/data-generator:v0.1.0
+  component: data-generator
   config:
     tables:
       - name: lookup
@@ -76,11 +78,13 @@ single-request and paginated modes.
 
 **Image:** `ghcr.io/kacurez/http-json-extractor:v0.1.0`
 
+**Registry name:** `http-json-extractor` · default version from the chart
+
 **Config schema (single request):**
 
 ```yaml
 - name: fetch
-  image: ghcr.io/kacurez/http-json-extractor:v0.1.0
+  component: http-json-extractor
   config:
     url: "https://api.example.com/items"
     array_path: "items"     # key of the JSON array in the response object
@@ -99,7 +103,7 @@ single-request and paginated modes.
 
 ```yaml
 - name: fetch-paged
-  image: ghcr.io/kacurez/http-json-extractor:v0.1.0
+  component: http-json-extractor
   config:
     url: "https://api.example.com/records"
     array_path: "records"
@@ -130,11 +134,13 @@ Finnhub API key.
 
 **Image:** `ghcr.io/kacurez/finnhub-extractor:v0.1.0`
 
+**Registry name:** `finnhub-extractor` · default version from the chart
+
 **Config schema:**
 
 ```yaml
 - name: market
-  image: ghcr.io/kacurez/finnhub-extractor:v0.1.0
+  component: finnhub-extractor
   config:
     mode: quote             # see modes below
     symbols: [AAPL, MSFT, GOOG]
@@ -189,11 +195,13 @@ the component.
 
 **Image:** `ghcr.io/kacurez/sql-transform:v0.1.0`
 
+**Registry name:** `sql-transform` · default version from the chart
+
 **Config schema:**
 
 ```yaml
 - name: transform
-  image: ghcr.io/kacurez/sql-transform:v0.1.0
+  component: sql-transform
   inputs:
     tables:
       - bucket: raw
@@ -251,11 +259,13 @@ result back as CSV — no S3 or Lakekeeper credentials touch the component.
 
 **Image:** `ghcr.io/kacurez/pandas-transform:v0.1.0`
 
+**Registry name:** `pandas-transform` · default version from the chart
+
 **Config schema:**
 
 ```yaml
 - name: clean
-  image: ghcr.io/kacurez/pandas-transform:v0.1.0
+  component: pandas-transform
   inputs:
     tables:
       - bucket: raw
@@ -307,11 +317,13 @@ output.
 
 **Image:** `ghcr.io/kacurez/stdout-writer:v0.1.0`
 
+**Registry name:** `stdout-writer` · default version from the chart
+
 **Config schema:**
 
 ```yaml
 - name: print
-  image: ghcr.io/kacurez/stdout-writer:v0.1.0
+  component: stdout-writer
   inputs:
     tables:
       - bucket: raw
@@ -333,7 +345,7 @@ spec:
     - name: generate
       components:
         - name: gen
-          image: ghcr.io/kacurez/data-generator:v0.1.0
+          component: data-generator
           config:
             tables:
               - name: events
@@ -346,7 +358,7 @@ spec:
     - name: print
       components:
         - name: printer
-          image: ghcr.io/kacurez/stdout-writer:v0.1.0
+          component: stdout-writer
           inputs:
             tables:
               - bucket: raw
