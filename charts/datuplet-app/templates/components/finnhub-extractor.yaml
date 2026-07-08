@@ -1,0 +1,80 @@
+{{- /*
+ComponentDefinition CR for the built-in finnhub-extractor component (RFC 026
+Task R10). See data-generator.yaml in this directory for the cluster-scoped
+naming rationale.
+
+configSchema derived from docs/components.md ("finnhub-extractor" section,
+7 documented modes) and components/finnhub-extractor/main.go (mode is
+required at runtime via sdk.ExitUserError; apiKey may fall back to the
+FINNHUB_API_KEY env var, so it is not marked required here — only
+annotated x-datuplet-secret so a plaintext literal is rejected when present).
+*/ -}}
+---
+apiVersion: datuplet.io/v1
+kind: ComponentDefinition
+metadata:
+  name: finnhub-extractor
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: finnhub-extractor
+spec:
+  displayName: Finnhub Extractor
+  description: Fetches market data from the Finnhub API (quotes, news, financials, earnings, recommendations, insider transactions).
+  maintainer: datuplet
+  defaultVersion: {{ .Values.components.tag }}
+  versions:
+    - version: {{ .Values.components.tag }}
+      image: "{{ .Values.components.registry }}/finnhub-extractor:{{ .Values.components.tag }}"
+      configSchema: |
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "quote",
+                "news",
+                "company-news",
+                "basic-financials",
+                "earnings",
+                "recommendations",
+                "insider-transactions"
+              ]
+            },
+            "symbols": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "apiKey": {
+              "type": "string",
+              "x-datuplet-secret": true
+            },
+            "lookback_days": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      resources:
+        default:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        max:
+          cpu: "2"
+          memory: 2Gi
+          ephemeral-storage: 10Gi

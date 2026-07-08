@@ -260,6 +260,19 @@ queryWorker:
 # controls the server-side POST /api/v1/query path).
 allowClientSideQuery: false
 
+# Built-in ComponentDefinition catalog (RFC 026 Task R10). Each component's
+# image ref is "<components.registry>/<component-name>:<components.tag>",
+# rendered by charts/datuplet-app/templates/components/*.yaml.
+components:
+  registry: ghcr.io/kacurez
+  # tag: a stable vMAJOR.MINOR.PATCH version — never "latest" (the
+  # ComponentDefinition CRD's CEL rule and the R8 registration-time
+  # reconciler both reject a stable version pinned to a ":latest" image).
+  # Chart.yaml's appVersion ("1.0") is not vX.Y.Z-shaped, so this is pinned
+  # explicitly instead of deriving from appVersion; it matches the image tag
+  # documented for all six built-in components in docs/components.md.
+  tag: v0.1.0
+
 bootstrap:
   externalImages:
     # bitnami/kubectl:1.31 retired when Bitnami restructured the registry —

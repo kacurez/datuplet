@@ -1,0 +1,133 @@
+{{- /*
+ComponentDefinition CR for the built-in pandas-transform component (RFC 026
+Task R10). See data-generator.yaml in this directory for the cluster-scoped
+naming rationale.
+
+configSchema derived from components/pandas-transform/main.py (the actual
+source, not docs/components.md, per the task brief — the two agree):
+  - output_table: optional string (comp_config.get("output_table", ...)).
+  - operations: array of op objects, each requiring "type" (dispatched in
+    apply_operation: filter/select/sort/rename/drop/fillna).
+    - filter: column, op (enum of the 8 comparison operators handled in
+      apply_filter), value (untyped — compared against arbitrary column
+      values, so left schema-free).
+    - select/drop: columns (apply_select always takes a list; apply_drop
+      accepts a bare string or a list — modeled as a oneOf).
+    - sort: by (apply_sort accepts a bare string or a list) + ascending.
+    - rename: columns (apply_rename takes a dict of old->new names).
+    - fillna: column (optional — omitted fills every column) + value.
+*/ -}}
+---
+apiVersion: datuplet.io/v1
+kind: ComponentDefinition
+metadata:
+  name: pandas-transform
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pandas-transform
+spec:
+  displayName: Pandas Transform
+  description: Applies a sequence of pandas operations (filter, select, sort, rename, drop, fillna) to input data.
+  maintainer: datuplet
+  defaultVersion: {{ .Values.components.tag }}
+  versions:
+    - version: {{ .Values.components.tag }}
+      image: "{{ .Values.components.registry }}/pandas-transform:{{ .Values.components.tag }}"
+      configSchema: |
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "output_table": {
+              "type": "string"
+            },
+            "operations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "filter",
+                      "select",
+                      "sort",
+                      "rename",
+                      "drop",
+                      "fillna"
+                    ]
+                  },
+                  "column": {
+                    "type": "string"
+                  },
+                  "op": {
+                    "type": "string",
+                    "enum": [
+                      ">",
+                      ">=",
+                      "<",
+                      "<=",
+                      "==",
+                      "!=",
+                      "in",
+                      "contains"
+                    ]
+                  },
+                  "value": {},
+                  "columns": {
+                    "oneOf": [
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "string"
+                        }
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "by": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  },
+                  "ascending": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      resources:
+        default:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        max:
+          cpu: "2"
+          memory: 2Gi
+          ephemeral-storage: 10Gi

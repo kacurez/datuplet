@@ -1,0 +1,69 @@
+{{- /*
+ComponentDefinition CR for the built-in sql-transform component (RFC 026
+Task R10). See data-generator.yaml in this directory for the cluster-scoped
+naming rationale.
+
+configSchema derived from docs/components.md ("sql-transform" section) and
+components/sql-transform/config.go (ComponentConfig — sql is required at
+runtime via parseConfig; memory/max_temp_size/threads/temp_directory all
+default when omitted).
+
+Resources: bigger defaults than the other five built-ins — sql-transform
+runs an embedded DuckDB engine and materializes inputs into in-memory
+tables before the user SQL executes.
+*/ -}}
+---
+apiVersion: datuplet.io/v1
+kind: ComponentDefinition
+metadata:
+  name: sql-transform
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: sql-transform
+spec:
+  displayName: SQL Transform
+  description: Runs user-supplied SQL inside an embedded DuckDB engine. Credentials-clean — no S3, GCS, or Lakekeeper credentials touch the component.
+  maintainer: datuplet
+  defaultVersion: {{ .Values.components.tag }}
+  versions:
+    - version: {{ .Values.components.tag }}
+      image: "{{ .Values.components.registry }}/sql-transform:{{ .Values.components.tag }}"
+      configSchema: |
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sql"
+          ],
+          "properties": {
+            "sql": {
+              "type": "string"
+            },
+            "threads": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "temp_directory": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            },
+            "max_temp_size": {
+              "type": "string"
+            }
+          }
+        }
+      resources:
+        default:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        max:
+          cpu: "2"
+          memory: 2Gi
+          ephemeral-storage: 10Gi
