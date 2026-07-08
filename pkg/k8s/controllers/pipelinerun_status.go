@@ -5,13 +5,34 @@ import (
 	"fmt"
 	"io"
 
+	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/status"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// updateSecretsResolvedCondition sets the SecretsResolved condition based on
+// whether the run references any $[name] secrets. When it does, the per-run
+// snapshot was validated + created at admission (snapshotRunSecrets), so the
+// condition is True/Resolved. When it references none, the condition is left
+// absent. The False/SnapshotMissing case is set at admission on the
+// missing-key failure path, not here.
+func (r *PipelineRunReconciler) updateSecretsResolvedCondition(pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline) {
+	if len(validate.ReferencedSecrets(pipeline)) == 0 {
+		return
+	}
+	meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
+		Type:   datupletv1.PipelineRunSecretsResolved,
+		Status: metav1.ConditionTrue,
+		Reason: datupletv1.PipelineRunReasonSecretsResolved,
+	})
+}
 
 // extractExitCodeFromJob extracts the exit code from the first pod of a job.
 func (r *PipelineRunReconciler) extractExitCodeFromJob(ctx context.Context, job *batchv1.Job) *int32 {

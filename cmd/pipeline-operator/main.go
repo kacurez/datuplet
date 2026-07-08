@@ -198,7 +198,10 @@ func main() {
 
 	// Set up PipelineRun controller.
 	if err = (&controllers.PipelineRunReconciler{
-		Client:       mgr.GetClient(),
+		Client: mgr.GetClient(),
+		// Uncached reader for the managed project Secret at admission — avoids
+		// a cluster-wide Secret informer; per-namespace secrets:get suffices.
+		APIReader:    mgr.GetAPIReader(),
 		Scheme:       mgr.GetScheme(),
 		GatewayImage: gatewayImage,
 		LakekeeperURL: lakekeeperURL,

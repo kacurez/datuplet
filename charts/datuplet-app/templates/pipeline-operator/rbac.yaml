@@ -50,10 +50,10 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Secrets - read credentials
+  # Secrets - read the managed project Secret; create per-run snapshots
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create"]
   # Services - discover lakekeeper / pipeline-api
   - apiGroups: [""]
     resources: ["services"]

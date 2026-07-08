@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,7 +16,11 @@ import (
 // ProjectSecretsName is the name of the single managed Secret pipeline-api
 // stores project-scoped user secrets in (RFC 026 P1.5) — one per project
 // namespace, keyed by the caller-supplied secret name under Data.
-const ProjectSecretsName = "datuplet-project-secrets"
+//
+// Aliased to the canonical constant in the leaf CRD-types package so the
+// operator controllers and pipeline-api share one source of truth without the
+// controllers having to import this (db/authz/store-heavy) package.
+const ProjectSecretsName = datupletv1.ProjectSecretsName
 
 // EnsureProjectSecret creates the empty managed project-secrets Secret in
 // namespace if it does not already exist. Idempotent: treats AlreadyExists

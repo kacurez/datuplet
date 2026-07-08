@@ -23,20 +23,19 @@ const (
 
 const (
 	// PipelineRunSecretsResolved is the condition Type reported on PipelineRun.Status
-	// to surface the result of the gateway sidecar's $[name] secret resolution.
-	// True once the gateway has resolved all references; False with a Reason below
-	// on failure. Absent until the pod has progressed far enough to observe either.
+	// to surface the result of per-run secret snapshotting at admission. True once
+	// every referenced $[name] key was copied into the per-run snapshot Secret;
+	// False with a Reason below when a referenced key was missing. Absent when the
+	// pipeline references no secrets.
 	PipelineRunSecretsResolved = "SecretsResolved"
 
-	// PipelineRunReasonSecretsRefMissing: the Secret object referenced by
-	// Pipeline.spec.secretsRef.Name does not exist (surfaced via FailedMount).
-	PipelineRunReasonSecretsRefMissing = "SecretsRefMissing"
+	// PipelineRunReasonSnapshotMissing: the run references $[name] secrets but
+	// the per-run snapshot Secret could not be built — a referenced key was
+	// absent from the managed project Secret at admission.
+	PipelineRunReasonSnapshotMissing = "SnapshotMissing"
 
-	// PipelineRunReasonSecretNotFound: the Secret mounts successfully but a
-	// $[name] reference pointed at a missing key file at gateway boot.
-	PipelineRunReasonSecretNotFound = "SecretNotFound"
-
-	// PipelineRunReasonSecretsResolved: all references resolved at gateway boot.
+	// PipelineRunReasonSecretsResolved: the per-run snapshot holds every
+	// referenced key; the gateway resolves them from the mounted snapshot.
 	PipelineRunReasonSecretsResolved = "Resolved"
 )
 

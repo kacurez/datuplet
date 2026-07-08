@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
@@ -13,6 +14,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -49,6 +51,13 @@ func shortID(id string) string {
 // PipelineRunReconciler reconciles a PipelineRun object
 type PipelineRunReconciler struct {
 	client.Client
+
+	// APIReader is an UNCACHED reader (mgr.GetAPIReader) used to read the
+	// managed project Secret at admission. Reading via the cached client
+	// would spin up a cluster-wide Secret informer; a direct Get needs only
+	// per-namespace `secrets:get` RBAC. Never used for the run's own objects.
+	APIReader client.Reader
+
 	Scheme       *runtime.Scheme
 	GatewayImage string
 
@@ -123,7 +132,7 @@ func (r *PipelineRunReconciler) runtimePullPolicy() corev1.PullPolicy {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 
@@ -232,10 +241,37 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 			return ctrl.Result{}, nil
 		}
 	}
+	// RunID must be set before snapshotRunSecrets: the per-run snapshot name
+	// (runSecretsName) is derived from it.
+	pr.Status.RunID = runID
+
+	// Snapshot the referenced project secrets into a per-run Secret at
+	// admission — before any Job is built. A missing key fails the run
+	// FailedUser here, so no snapshot and no Jobs are ever created for it.
+	missing, err := r.snapshotRunSecrets(ctx, pr, pipeline)
+	if err != nil {
+		logger.Error(err, "Failed to snapshot run secrets")
+		return ctrl.Result{}, err
+	}
+	if len(missing) > 0 {
+		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+		pr.Status.Message = fmt.Sprintf("%s referenced secret(s) not found in project secrets: %s",
+			status.StatusMessagePrefix, strings.Join(missing, ", "))
+		meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
+			Type:    datupletv1.PipelineRunSecretsResolved,
+			Status:  metav1.ConditionFalse,
+			Reason:  datupletv1.PipelineRunReasonSnapshotMissing,
+			Message: pr.Status.Message,
+		})
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
 	// Initialize status
 	pr.Status.Phase = datupletv1.PipelineRunPhaseRunning
-	pr.Status.RunID = runID
 	now := metav1.Now()
 	pr.Status.StartTime = &now
 
@@ -248,6 +284,10 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		}
 	}
 
+	// The snapshot exists (or the pipeline references no secrets); reflect that
+	// on the SecretsResolved condition. Absent when there are no references.
+	r.updateSecretsResolvedCondition(pr, pipeline)
+
 	if err := r.Status().Update(ctx, pr); err != nil {
 		logger.Error(err, "Failed to update PipelineRun status")
 		return ctrl.Result{}, err
@@ -255,6 +295,99 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 
 	logger.Info("Initialized PipelineRun", "runID", runID)
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
+}
+
+// snapshotRunSecrets copies the exact set of $[name] keys the pipeline
+// references from the managed project Secret into a per-run snapshot Secret
+// owned by the run. It is the admission gate for secret resolution:
+//
+//   - returns (nil, nil) when the pipeline references no secrets (skip), the
+//     snapshot already exists (run already admitted), or the snapshot was just
+//     created;
+//   - returns (missing, nil) — a sorted list of referenced keys absent from the
+//     project Secret (or the whole ref set when the project Secret itself is
+//     missing) — signalling a user error the caller surfaces as FailedUser;
+//   - returns (nil, err) on a transient API error the caller requeues on.
+//
+// The snapshot's EXISTENCE is authoritative. It is checked FIRST, before the
+// project Secret is touched: once the snapshot exists the run has already been
+// admitted for secrets, so a re-reconcile (e.g. after a partial admission where
+// the snapshot was created but the status Update that flips the run to Running
+// failed) must NOT re-read the project Secret and must NOT re-run the
+// missing-key check. Otherwise a project-Secret rotation / key removal between
+// the two reconciles could flip a run with a valid, immutable snapshot to
+// FailedUser. Reading the project Secret only when the snapshot is absent keeps
+// the snapshot immutable for the run's life — rotation-exact isolation.
+//
+// Both Gets use the UNCACHED APIReader — the project Secret and the operator's
+// own run-snapshot Secret alike. Using the cached client for the snapshot would
+// spin up a cluster-wide Secret informer (the very thing APIReader avoids); a
+// direct read needs only per-namespace secrets:get RBAC and is strongly
+// consistent, which is exactly what an authoritative existence check wants.
+func (r *PipelineRunReconciler) snapshotRunSecrets(ctx context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline) ([]string, error) {
+	refs := validate.ReferencedSecrets(pipeline)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	// Authoritative: an existing snapshot means the run is already admitted.
+	// Do not read the project Secret, re-run the missing-key check, or rewrite.
+	snapName := runSecretsName(pr)
+	existing := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: snapName, Namespace: pr.Namespace}, existing); err == nil {
+		return nil, nil
+	} else if !errors.IsNotFound(err) {
+		return nil, err
+	}
+
+	// Snapshot absent → first admission: read the project Secret and run the
+	// missing-key check before creating the snapshot.
+	project := &corev1.Secret{}
+	err := r.APIReader.Get(ctx, types.NamespacedName{
+		Name:      datupletv1.ProjectSecretsName,
+		Namespace: pr.Namespace,
+	}, project)
+	if err != nil && !errors.IsNotFound(err) {
+		return nil, err
+	}
+	// On NotFound, project.Data is nil and every referenced key is missing.
+
+	data := make(map[string][]byte, len(refs))
+	var missing []string
+	for _, name := range refs {
+		v, ok := project.Data[name]
+		if !ok {
+			missing = append(missing, name)
+			continue
+		}
+		data[name] = v
+	}
+	if len(missing) > 0 {
+		return missing, nil
+	}
+
+	snap := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      snapName,
+			Namespace: pr.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/component": "run-secrets",
+				"app.kubernetes.io/part-of":   "datuplet",
+				"datuplet.io/pipelinerun":     pr.Name,
+				"datuplet.io/run-id":          pr.Status.RunID,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: data,
+	}
+	// OwnerRef -> PipelineRun so the snapshot is garbage-collected with the run.
+	if err := ctrl.SetControllerReference(pr, snap, r.Scheme); err != nil {
+		return nil, err
+	}
+	if err := r.Create(ctx, snap); err != nil && !errors.IsAlreadyExists(err) {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // handleRunning continues the PipelineRun execution.
