@@ -19,6 +19,16 @@ rules:
   - apiGroups: ["datuplet.io"]
     resources: ["pipelines/status", "pipelineruns/status"]
     verbs: ["get", "update", "patch"]
+  # ComponentDefinitions - cluster-scoped registry, watched by both the
+  # ComponentDefinition reconciler (registration-time validation, RFC 026 P2)
+  # and PipelineRun admission (ComponentRegistry.Resolve). Read-only: the
+  # operator never creates/deletes definitions.
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions/status"]
+    verbs: ["get", "update", "patch"]
   # Pods - create and monitor component pods
   - apiGroups: [""]
     resources: ["pods"]

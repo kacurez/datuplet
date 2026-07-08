@@ -166,6 +166,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Set up ComponentDefinition controller (registration-time validation).
+	if err = (&controllers.ComponentDefinitionReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ComponentDefinition")
+		os.Exit(1)
+	}
+
 	// Create Kubernetes clientset for pod log access
 	clientset, err := kubernetes.NewForConfig(ctrl.GetConfigOrDie())
 	if err != nil {
