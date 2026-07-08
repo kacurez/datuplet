@@ -448,3 +448,40 @@ func TestPutPipeline_HardValidationError_StaysBadRequestWithSecretsWired(t *test
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestPutPipeline_FreshProjectForbiddenSecretRead_ReturnsWarning proves the S7
+// save-warn rung survives a BRAND-NEW project whose managed-Secret Get is
+// RBAC-Forbidden. After S6 removed pipeline-api's cluster-wide Secret verbs, a
+// project that has never had a secret PUT has no per-namespace `datuplet-
+// secrets` Role/RoleBinding yet, so the ladder's read is denied. The handler
+// must treat that denial as "no keys set" → 200 warning naming the key, NEVER
+// a 500. (The NotFound/absent variant is covered by
+// TestPutPipeline_UnknownSecretKey_ReturnsWarning; the fake client can't model
+// RBAC, so this test injects Forbidden via an interceptor client.)
+func TestPutPipeline_FreshProjectForbiddenSecretRead_ReturnsWarning(t *testing.T) {
+	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecretsClient(t, forbiddenSecretGetClient(t))
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-secret-forbidden"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret", []byte(pipelineYAMLWithSecretRef), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := readAll(resp)
+		t.Fatalf("status = %d, want 200 (fresh-project ladder, not 500); body=%s", resp.StatusCode, body)
+	}
+	var body secretsFindingsBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Findings) != 1 || body.Findings[0].Severity != "warning" || !strings.Contains(body.Findings[0].Message, "api_token") {
+		t.Fatalf("findings = %+v, want exactly one warning naming api_token", body.Findings)
+	}
+}

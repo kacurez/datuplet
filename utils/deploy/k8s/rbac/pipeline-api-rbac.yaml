@@ -31,12 +31,20 @@ rules:
   - apiGroups: ["datuplet.io"]
     resources: ["pipelineruns/status"]
     verbs: ["get"]
-  # Run-token Secret: create + ownerReference patch + reaper delete of
-  # orphans. Namespaced resource but we allow cluster-wide because the
-  # target namespace is per-project and created lazily.
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  # Per-project-namespace secret RBAC (RFC 026 P1.5) — mirrors
+  # charts/datuplet-app/templates/pipeline-api/rbac.yaml. pipeline-api holds
+  # NO cluster-wide Secret verbs; it manages Secrets only within each project
+  # namespace via the `datuplet-secrets` + `datuplet-secrets-operator` Roles it
+  # creates there (EnsureProjectNamespace). Creating those Roles + their
+  # RoleBindings while lacking cluster Secret verbs would otherwise trip
+  # Kubernetes' privilege-escalation guard, so the roles rule carries
+  # `escalate` (on roles) + `bind` (on the referenced role).
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["get", "create", "escalate", "bind"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

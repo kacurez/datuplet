@@ -37,13 +37,23 @@ type secretListEntryJSON struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-// getManagedSecret fetches the project's managed Secret. A NotFound Secret
-// is not an error to callers that treat "no secrets yet" as a valid state
-// (list, delete's not-found path) — ok=false with err=nil signals that.
+// getManagedSecret fetches the project's managed Secret. Callers that treat
+// "no secrets yet" as a valid state (list, delete's not-found path, and the
+// S7 save/trigger secrets ladder) get ok=false with err=nil for BOTH an
+// absent Secret (NotFound) AND a not-yet-provisioned project (Forbidden).
+//
+// RFC 026 P1.5 (S6) removed pipeline-api's cluster-wide Secret verbs: Secret
+// access now lives in a per-project-namespace `datuplet-secrets` Role that
+// pipeline-api creates lazily (EnsureProjectNamespace). A brand-new project
+// that has never had a secret PUT has no such Role/RoleBinding yet, so this
+// Get is RBAC-denied (Forbidden) rather than NotFound. Both mean the same
+// thing to these callers — the managed Secret holds no keys — so collapsing
+// them to ok=false keeps the ladder working (save-warn / trigger-400) instead
+// of surfacing an opaque 500 on the very first pipeline a fresh project saves.
 func (s *Server) getManagedSecret(ctx context.Context, namespace string) (sec *corev1.Secret, ok bool, err error) {
 	sec = &corev1.Secret{}
 	getErr := s.secretsK8s.Get(ctx, types.NamespacedName{Name: pkg8s.ProjectSecretsName, Namespace: namespace}, sec)
-	if apierrors.IsNotFound(getErr) {
+	if apierrors.IsNotFound(getErr) || apierrors.IsForbidden(getErr) {
 		return nil, false, nil
 	}
 	if getErr != nil {
@@ -55,8 +65,9 @@ func (s *Server) getManagedSecret(ctx context.Context, namespace string) (sec *c
 // missingSecretRefs is the shared read side of the S7 save-warn/trigger-reject
 // ladder: given the $[name] keys a pipeline references (validate.ReferencedSecrets),
 // it returns the subset absent from the project's managed Secret. An absent
-// managed Secret (project has never saved a secret) means every ref is
-// missing. Returns (nil, nil) when there are no refs to check, or when
+// managed Secret — whether NotFound or RBAC-Forbidden because the project has
+// never saved a secret (see getManagedSecret) — means every ref is missing.
+// Returns (nil, nil) when there are no refs to check, or when
 // s.secretsK8s is nil — the secrets endpoints aren't wired (e.g. no K8s
 // client in this deployment/test), so the ladder soft-degrades to a no-op
 // rather than nil-dereferencing the client.

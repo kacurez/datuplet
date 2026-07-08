@@ -132,9 +132,17 @@ func (r *PipelineRunReconciler) runtimePullPolicy() corev1.PullPolicy {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+//
+// Secrets: intentionally NO cluster-wide +kubebuilder:rbac marker (RFC 026
+// P1.5). Secret access is per-project-namespace only: the operator gets `get`
+// (managed project Secret) + `create` (per-run snapshot Secret) via the
+// `datuplet-secrets-operator` Role that pipeline-api binds to this SA in each
+// project namespace (EnsureProjectNamespace) — never a cluster-wide grant.
+// NB: this repo hand-maintains RBAC (charts/datuplet-app/templates/ +
+// utils/deploy/k8s/rbac/); there is no controller-gen `make manifests` target,
+// so these markers are documentation only and do not generate any manifest.
 
 // Reconcile handles PipelineRun reconciliation.
 func (r *PipelineRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

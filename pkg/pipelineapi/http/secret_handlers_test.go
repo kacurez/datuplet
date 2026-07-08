@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"os"
@@ -13,9 +14,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
@@ -39,6 +43,15 @@ func (c *testClock) now() time.Time { return c.t }
 // directly and drive deterministic timestamps.
 func freshServerWithSecrets(t *testing.T) (ts *httptest.Server, pool *pgxpool.Pool, fakeAuthz *authztest.Fake, k8sClient client.Client, clock *testClock, cleanup func()) {
 	t.Helper()
+	return freshServerWithSecretsClient(t, fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build())
+}
+
+// freshServerWithSecretsClient is freshServerWithSecrets parameterised on the
+// K8s client, so tests can inject an interceptor client (e.g. one that returns
+// RBAC-Forbidden on the managed-Secret Get to simulate a fresh project that
+// has never had a secret PUT and so has no per-namespace secret Role yet).
+func freshServerWithSecretsClient(t *testing.T, c client.Client) (ts *httptest.Server, pool *pgxpool.Pool, fakeAuthz *authztest.Fake, k8sClient client.Client, clock *testClock, cleanup func()) {
+	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set")
@@ -56,7 +69,6 @@ func freshServerWithSecrets(t *testing.T) (ts *httptest.Server, pool *pgxpool.Po
 		t.Fatalf("migrate: %v", err)
 	}
 
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
 	authzr := authztest.New()
 	clk := &testClock{t: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
 	srv := apihttp.NewServer(p).
@@ -67,6 +79,27 @@ func freshServerWithSecrets(t *testing.T) (ts *httptest.Server, pool *pgxpool.Po
 		WithSecrets(c, clk.now)
 	server := httptest.NewServer(srv.Handler())
 	return server, p, authzr, c, clk, func() { server.Close(); p.Close() }
+}
+
+// forbiddenSecretGetClient wraps a fresh fake client so a Get of the managed
+// project Secret returns an RBAC Forbidden error — reproducing a brand-new
+// project in a real cluster where S6 removed pipeline-api's cluster-wide
+// Secret verbs and no per-namespace `datuplet-secrets` Role/RoleBinding
+// exists yet (it's only created lazily on the first secret PUT). Every other
+// call delegates to the fake so namespace/pipeline/run objects behave normally.
+func forbiddenSecretGetClient(t *testing.T) client.WithWatch {
+	t.Helper()
+	base := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
+	return interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok && key.Name == pkg8s.ProjectSecretsName {
+				return apierrors.NewForbidden(
+					schema.GroupResource{Resource: "secrets"}, key.Name,
+					fmt.Errorf("no per-namespace secret role provisioned yet"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
 }
 
 func putSecretReq(t *testing.T, url, value string, cookie *stdhttp.Cookie) *stdhttp.Response {

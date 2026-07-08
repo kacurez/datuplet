@@ -34,10 +34,13 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Secrets - read credentials
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+  # Secrets: NO cluster-wide verbs (RFC 026 P1.5) — mirrors
+  # charts/datuplet-app/templates/pipeline-operator/rbac.yaml. The operator
+  # reads the managed project Secret and creates the per-run snapshot Secret
+  # via the `datuplet-secrets-operator` Role (secrets get,create) that
+  # pipeline-api binds to this SA in each project namespace
+  # (EnsureProjectNamespace). It runs no Secret informer, so it never needs
+  # cluster-wide secret list/watch.
   # Services - discover lakekeeper / pipeline-api
   - apiGroups: [""]
     resources: ["services"]

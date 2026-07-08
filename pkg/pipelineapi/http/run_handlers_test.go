@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
@@ -36,6 +37,15 @@ import (
 // caller's seam to grant per-user `viewer` / `editor` tuples on the
 // lakekeeper project so mustHaveRelation lets the request through.
 func freshServerWithK8s(t *testing.T) (*httptest.Server, *pgxpool.Pool, *authztest.Fake, func()) {
+	t.Helper()
+	return freshServerWithK8sClient(t, fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build())
+}
+
+// freshServerWithK8sClient is freshServerWithK8s parameterised on the K8s
+// client, so tests can inject an interceptor client (e.g. Forbidden on the
+// managed-Secret Get). The run-trigger backend AND WithSecrets share this one
+// client, mirroring main.go's wiring.
+func freshServerWithK8sClient(t *testing.T, c client.Client) (*httptest.Server, *pgxpool.Pool, *authztest.Fake, func()) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -77,7 +87,6 @@ func freshServerWithK8s(t *testing.T) (*httptest.Server, *pgxpool.Pool, *authzte
 		t.Fatalf("load signer: %v", err)
 	}
 
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
 	authzr := authztest.New()
 	backend := runbackend.NewK8sBackend(runbackend.K8sOpts{
 		Client:      c,
@@ -475,6 +484,39 @@ func TestTriggerRun_KnownSecretKey_Returns201(t *testing.T) {
 	if resp.StatusCode != 201 {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 201; body=%s", resp.StatusCode, body)
+	}
+}
+
+// TestTriggerRun_FreshProjectForbiddenSecretRead_Returns400 proves the trigger
+// hard-reject ladder survives a BRAND-NEW project whose managed-Secret Get is
+// RBAC-Forbidden (S6 removed pipeline-api's cluster-wide Secret verbs; the
+// per-namespace `datuplet-secrets` Role is created lazily only on the first
+// secret PUT). The ladder must reject the missing $[api_token] with a 400,
+// NEVER a 500 — and insert no run row. (The NotFound/absent variant is covered
+// by TestTriggerRun_UnknownSecretKey_Returns400; the fake client can't model
+// RBAC, so this test injects Forbidden via an interceptor client.)
+func TestTriggerRun_FreshProjectForbiddenSecretRead_Returns400(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerWithK8sClient(t, forbiddenSecretGetClient(t))
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", pipelineYAMLWithSecretRef)
+
+	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400 (fresh-project ladder, not 500); body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "api_token") {
+		t.Errorf("body = %s, want it to name the missing key api_token", body)
+	}
+	runs, _ := store.ListRunsForProject(ctx, pool, proj.ID, 10)
+	if len(runs) != 0 {
+		t.Errorf("runs len = %d, want 0 (reject must happen before insert)", len(runs))
 	}
 }
 

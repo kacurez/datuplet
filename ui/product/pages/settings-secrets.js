@@ -7,8 +7,9 @@
 // The server never returns a secret's value, and this page never
 // echoes one back into the DOM either: the form is reset immediately
 // after a successful save, and only `key` + `updatedAt` ever reach
-// innerHTML. Secrets are referenced from a pipeline YAML via
-// spec.secretsRef.name + $[key] substitutions — see docs/secrets.md.
+// innerHTML. A pipeline references a saved secret by setting a component
+// `config` value to the whole-scalar `$[key]` (the entire value must be
+// exactly `$[key]`) — see docs/secrets.md.
 
 import { esc, listSecrets, putSecret, deleteSecret } from '/ui/api.js';
 import { timeTag } from '/ui/format.js';
@@ -30,10 +31,11 @@ export async function renderSecrets() {
 
   app.innerHTML = `
     <p style="color: var(--fg-1);">
-      Reference these from a pipeline YAML via
-      <code class="inline">spec.secretsRef.name</code> and
-      <code class="inline">$[key]</code> substitutions. Values cannot be
-      read back once saved — only the key and last-updated time are shown.
+      Reference a saved secret from a pipeline by setting a component
+      <code class="inline">config</code> value to
+      <code class="inline">$[key]</code> — the entire value must be exactly
+      <code class="inline">$[key]</code>. Values cannot be read back once
+      saved — only the key and last-updated time are shown.
     </p>
 
     <table class="table" style="margin-top: var(--s-4);">
