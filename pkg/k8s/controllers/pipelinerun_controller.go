@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
@@ -37,7 +38,37 @@ const (
 	// PipelineRunRequeueInterval is the requeue interval when execution is in progress.
 	PipelineRunRequeueInterval = 5 * time.Second
 
+	// admissionTransientRetryBudget caps CONSECUTIVE transient registry
+	// errors at run admission (see the taxonomy comment on
+	// ComponentRegistry.Resolve). Exhausting the budget escalates the run to
+	// FailedApplication — a wedged registry must not requeue forever.
+	admissionTransientRetryBudget = 5
+
+	// admissionTransientRetryInterval is the requeue backoff applied while
+	// the transient retry budget has not yet been exhausted.
+	admissionTransientRetryInterval = 2 * time.Second
 )
+
+// severityTransient marks a validate.Finding returned by
+// ComponentRegistry.Resolve as a TRANSIENT infrastructure error (K8s API
+// timeout/5xx, registry informer not yet synced) rather than a terminal,
+// user-facing verdict. It is a controller-local extension of the shared
+// Finding.Severity string — recognized only by handlePending's admission
+// path below, never by pipeline-api (which never wires a ComponentRegistry).
+//
+// Controller error taxonomy (spec §7 — explicit, because pre-R7 code
+// blanket-classified every registry/job-build error as FailedApplication):
+//
+//   - spec/schema/policy validation failure, unresolvable component or
+//     version, reference to an Invalid definition
+//     -> FailedUser (exit-code contract 1), first finding in the status
+//     message.
+//   - registry informer not synced, K8s API errors, image-pull
+//     infrastructure failures
+//     -> transient requeue with backoff, escalating to FailedApplication
+//     (exit-code contract >=20) after admissionTransientRetryBudget
+//     CONSECUTIVE occurrences — never FailedUser.
+const severityTransient = "transient"
 
 // shortID returns the first 8 chars of id, or the whole string if shorter.
 // Used to build K8s resource names; avoids panicking on unexpectedly short IDs.
@@ -119,6 +150,15 @@ type PipelineRunReconciler struct {
 	// tests inject a fake-client-backed one. Never re-read after admission —
 	// the resolution is frozen into status.resolvedSpec.
 	Registry validate.RegistryView
+
+	// transientRetries tracks CONSECUTIVE transient registry-Get failures at
+	// admission, keyed by the PipelineRun's NamespacedName (see
+	// requeueOnTransientAdmissionError). Deliberately in-memory, not CRD
+	// status: a purely operational retry budget. An operator restart resets
+	// it, which is the safe direction — it never prematurely fails a run
+	// that would otherwise have succeeded.
+	transientRetries   map[types.NamespacedName]int
+	transientRetriesMu sync.Mutex
 }
 
 // ComponentRegistry adapts a cached, cluster-scoped client.Reader into a
@@ -142,10 +182,15 @@ func (cr ComponentRegistry) Resolve(component, version string) (*validate.Resolv
 				Severity: "error",
 			}}
 		}
+		// Any other Get error (API server timeout/5xx, informer not yet
+		// synced) is TRANSIENT infrastructure noise, not a statement about
+		// the component reference itself. Tagged severityTransient so
+		// handlePending requeues instead of failing the run FailedUser —
+		// see the taxonomy comment above.
 		return nil, []validate.Finding{{
 			Path:     "component",
 			Message:  fmt.Sprintf("component %q: %v", component, err),
-			Severity: "error",
+			Severity: severityTransient,
 		}}
 	}
 	return validate.StaticRegistry{component: *def}.Resolve(component, version)
@@ -167,6 +212,19 @@ func componentPullPolicy(version string) corev1.PullPolicy {
 func firstErrorFinding(findings []validate.Finding) (validate.Finding, bool) {
 	for _, f := range findings {
 		if f.Severity == "error" {
+			return f, true
+		}
+	}
+	return validate.Finding{}, false
+}
+
+// firstTransientFinding returns the first severityTransient finding, if any.
+// Checked BEFORE firstErrorFinding at every admission call site: a transient
+// registry error must never be classified FailedUser, even when it happens
+// to be bundled alongside genuine validation findings for other components.
+func firstTransientFinding(findings []validate.Finding) (validate.Finding, bool) {
+	for _, f := range findings {
+		if f.Severity == severityTransient {
 			return f, true
 		}
 	}
@@ -326,8 +384,14 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	// pipeline.Status.Phase, so a run is never admitted against an invalid
 	// Pipeline regardless of whether the Pipeline controller reconciled it.
 	// A registry resolution error (unknown component, invalid definition,
-	// unresolvable version) surfaces as a finding here, before any Job.
-	if f, ok := firstErrorFinding(validate.ValidateTyped(pipeline, r.Registry)); ok {
+	// unresolvable version) surfaces as a finding here, before any Job. A
+	// TRANSIENT registry error (checked first) never fails the run — see the
+	// taxonomy comment on ComponentRegistry.Resolve.
+	admissionFindings := validate.ValidateTyped(pipeline, r.Registry)
+	if tf, ok := firstTransientFinding(admissionFindings); ok {
+		return r.requeueOnTransientAdmissionError(ctx, pr, tf.Message)
+	}
+	if f, ok := firstErrorFinding(admissionFindings); ok {
 		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
 		pr.Status.Message = f.Message
 		if err := r.Status().Update(ctx, pr); err != nil {
@@ -350,6 +414,9 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 			comp := &stage.Components[j]
 			rc, findings := r.Registry.Resolve(comp.Component, comp.Version)
 			if rc == nil {
+				if tf, ok := firstTransientFinding(findings); ok {
+					return r.requeueOnTransientAdmissionError(ctx, pr, tf.Message)
+				}
 				f, _ := firstErrorFinding(findings)
 				pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
 				pr.Status.Message = f.Message
@@ -370,6 +437,12 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	pr.Status.ResolvedSpec = resolvedSpec
 	pr.Status.PipelineGeneration = pipeline.Generation
 	pr.Status.Components = resolvedComponents
+
+	// Admission succeeded past every transient check — clear any
+	// accumulated retry count so a later, unrelated admission (e.g. this
+	// PipelineRun name reused after delete/recreate) starts with a fresh
+	// budget.
+	r.clearTransientRetries(types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name})
 
 	// Initialize status
 	pr.Status.Phase = datupletv1.PipelineRunPhaseRunning
@@ -396,6 +469,61 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 
 	logger.Info("Initialized PipelineRun", "runID", runID)
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
+}
+
+// requeueOnTransientAdmissionError implements the transient half of the
+// admission error taxonomy (see the comment on severityTransient /
+// ComponentRegistry.Resolve): a registry Get failing with anything other than
+// NotFound is infrastructure noise, not a verdict on the pipeline, so the run
+// is NOT failed here. It requeues with backoff for up to
+// admissionTransientRetryBudget CONSECUTIVE occurrences (tracked in-memory,
+// per PipelineRun); once the budget is exhausted the run is failed
+// FailedApplication (exit-code contract >=20).
+func (r *PipelineRunReconciler) requeueOnTransientAdmissionError(ctx context.Context, pr *datupletv1.PipelineRun, msg string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	key := types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name}
+	attempt := r.noteTransientRetry(key)
+
+	if attempt < admissionTransientRetryBudget {
+		logger.Info("Transient registry error at admission, requeueing",
+			"attempt", attempt, "budget", admissionTransientRetryBudget, "error", msg)
+		return ctrl.Result{RequeueAfter: admissionTransientRetryInterval}, nil
+	}
+
+	logger.Info("Transient registry error retry budget exhausted, failing run FailedApplication",
+		"attempts", attempt, "error", msg)
+	r.clearTransientRetries(key)
+	pr.Status.Phase = datupletv1.PipelineRunPhaseFailedApplication
+	pr.Status.Message = fmt.Sprintf("registry unavailable after %d consecutive attempts: %s", attempt, msg)
+	now := metav1.Now()
+	pr.Status.CompletionTime = &now
+	if err := r.Status().Update(ctx, pr); err != nil {
+		logger.Error(err, "Failed to update PipelineRun status")
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// noteTransientRetry increments and returns the CONSECUTIVE transient-error
+// count for key.
+func (r *PipelineRunReconciler) noteTransientRetry(key types.NamespacedName) int {
+	r.transientRetriesMu.Lock()
+	defer r.transientRetriesMu.Unlock()
+	if r.transientRetries == nil {
+		r.transientRetries = make(map[types.NamespacedName]int)
+	}
+	r.transientRetries[key]++
+	return r.transientRetries[key]
+}
+
+// clearTransientRetries resets the CONSECUTIVE transient-error count for key,
+// called once admission proceeds past every transient check (success or a
+// terminal failure) so a stale count never leaks into an unrelated future
+// admission of the same name.
+func (r *PipelineRunReconciler) clearTransientRetries(key types.NamespacedName) {
+	r.transientRetriesMu.Lock()
+	defer r.transientRetriesMu.Unlock()
+	delete(r.transientRetries, key)
 }
 
 // snapshotRunSecrets copies the exact set of $[name] keys the pipeline
@@ -706,6 +834,12 @@ func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *da
 
 		// Try to extract exit code from pod
 		exitCode := r.extractExitCodeFromJob(ctx, job)
+
+		// Observe the pulled image digest (RFC 026 §4.3). Captured from
+		// whichever reconcile first sees it on the pod's containerStatuses
+		// — while the component is still Running, or on the terminal
+		// reconcile below — and never overwritten afterward.
+		recordComponentImageID(pr, compStatus.Name, r.extractImageIDFromJob(ctx, job))
 
 		// Check Job conditions
 		for _, condition := range job.Status.Conditions {

@@ -71,6 +71,55 @@ func extractExitCodeFromPod(pod *corev1.Pod, containerName string) *int32 {
 	return nil
 }
 
+// extractImageIDFromJob returns the observed
+// containerStatuses[name=="component"].imageID from the job's most recent
+// pod, or "" if not yet reported (pod/job not found, or the image hasn't
+// been pulled yet — the kubelet only populates ImageID once the container
+// has started).
+func (r *PipelineRunReconciler) extractImageIDFromJob(ctx context.Context, job *batchv1.Job) string {
+	logger := log.FromContext(ctx)
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{"job-name": job.Name}); err != nil {
+		logger.V(1).Info("Failed to list pods for job", "job", job.Name, "error", err)
+		return ""
+	}
+	if len(pods.Items) == 0 {
+		return ""
+	}
+
+	return extractImageIDFromPod(&pods.Items[len(pods.Items)-1], "component")
+}
+
+// extractImageIDFromPod returns the imageID reported for a named container,
+// or "" if the container status isn't present yet.
+func extractImageIDFromPod(pod *corev1.Pod, containerName string) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == containerName {
+			return cs.ImageID
+		}
+	}
+	return ""
+}
+
+// recordComponentImageID copies imageID into the status.components[] entry
+// matching name — ONCE. A component instance's imageID is "first observed,
+// frozen thereafter": once set, a later reconcile observing a different
+// value (e.g. after a pod recreation) must never overwrite it (RFC 026
+// §4.3: observed runtime fields are appended, not repeatedly rewritten).
+// No-op if imageID is empty or no matching, not-yet-recorded entry exists.
+func recordComponentImageID(pr *datupletv1.PipelineRun, name, imageID string) {
+	if imageID == "" {
+		return
+	}
+	for i := range pr.Status.Components {
+		if pr.Status.Components[i].Name == name && pr.Status.Components[i].ImageID == "" {
+			pr.Status.Components[i].ImageID = imageID
+			return
+		}
+	}
+}
+
 // extractComponentStatusMessage fetches pod logs and extracts a status message.
 func (r *PipelineRunReconciler) extractComponentStatusMessage(ctx context.Context, job *batchv1.Job, exitCode int) string {
 	if r.Clientset == nil {
