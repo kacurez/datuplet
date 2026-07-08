@@ -25,10 +25,12 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/csv-extractor:latest
+          component: http-json-extractor
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
           outputs:
             defaultBucket: raw
-            defaultWriteMode: FULL_LOAD
+            defaultWriteMode: APPEND
 `;
 
 export async function renderPipelineDetail(ctx) {
