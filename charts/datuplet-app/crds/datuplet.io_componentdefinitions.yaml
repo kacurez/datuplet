@@ -56,6 +56,7 @@ spec:
                 description: |-
                   DefaultVersion is the version a pipeline resolves to when it omits
                   version. Empty resolves to the highest registered stable semver.
+                maxLength: 64
                 type: string
               deprecated:
                 description: Deprecated marks the component as no longer recommended
@@ -63,12 +64,15 @@ spec:
                 type: boolean
               description:
                 description: Description explains what the component does.
+                maxLength: 4096
                 type: string
               displayName:
                 description: DisplayName is the human-readable component name.
+                maxLength: 256
                 type: string
               maintainer:
                 description: Maintainer identifies who owns this component definition.
+                maxLength: 256
                 type: string
               versions:
                 description: Versions lists the available versions of this component.
@@ -78,9 +82,11 @@ spec:
                     configSchema:
                       description: ConfigSchema is a JSON Schema (draft 2020-12)
                         string blob validating component config.
+                      maxLength: 262144
                       type: string
                     image:
                       description: Image is the container image for this version.
+                      maxLength: 512
                       type: string
                     prerelease:
                       description: |-
@@ -167,6 +173,7 @@ spec:
                       description: |-
                         Version is the version identifier (e.g. "v0.1.0", or a mutable tag
                         such as "dev" when Prerelease is true).
+                      maxLength: 64
                       type: string
                   required:
                   - image
@@ -175,6 +182,7 @@ spec:
                   x-kubernetes-validations:
                   - rule: "self.prerelease == true || (self.image.contains(':') && !self.image.endsWith(':latest'))"
                     message: "stable versions must pin a non-latest image tag"
+                maxItems: 50
                 type: array
             required:
             - versions
@@ -186,6 +194,7 @@ spec:
               message:
                 description: Message provides additional information about the
                   current phase.
+                maxLength: 4096
                 type: string
               observedGeneration:
                 description: ObservedGeneration is the last generation observed
@@ -194,6 +203,7 @@ spec:
                 type: integer
               phase:
                 description: Phase is "Valid" or "Invalid".
+                maxLength: 32
                 type: string
             type: object
         type: object
