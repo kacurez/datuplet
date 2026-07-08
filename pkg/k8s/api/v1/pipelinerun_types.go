@@ -113,6 +113,41 @@ type PipelineRunStatus struct {
 	// Conditions represent the latest available observations of the PipelineRun's state
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// PipelineGeneration is the Pipeline generation this run was admitted against.
+	// +optional
+	PipelineGeneration int64 `json:"pipelineGeneration,omitempty"`
+
+	// ResolvedSpec is the fully-resolved pipeline spec snapshotted at
+	// admission (RFC 026 §4.3): component/version references are frozen so
+	// later registry changes cannot affect an in-flight run.
+	// +optional
+	ResolvedSpec *PipelineSpec `json:"resolvedSpec,omitempty"`
+
+	// Components records the resolved component/version/image mapping for
+	// each component instance admitted into this run.
+	// +optional
+	Components []ResolvedComponentStatus `json:"components,omitempty"`
+}
+
+// ResolvedComponentStatus records the component/version/image resolution
+// snapshotted for one component instance at run admission.
+type ResolvedComponentStatus struct {
+	// Name is the component instance name (ComponentSpec.Name).
+	Name string `json:"name"`
+
+	// Component is the registry component name (ComponentDefinition.Name).
+	Component string `json:"component"`
+
+	// Version is the resolved version identifier.
+	Version string `json:"version"`
+
+	// Image is the resolved container image.
+	Image string `json:"image"`
+
+	// ImageID is the digest observed after pull (populated post-admission, R7).
+	// +optional
+	ImageID string `json:"imageID,omitempty"`
 }
 
 // StageStatus tracks the status of a pipeline stage
@@ -354,6 +389,16 @@ func (in *PipelineRunStatus) DeepCopyInto(out *PipelineRunStatus) {
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
+	}
+	if in.ResolvedSpec != nil {
+		in, out := &in.ResolvedSpec, &out.ResolvedSpec
+		*out = new(PipelineSpec)
+		(*in).DeepCopyInto(*out)
+	}
+	if in.Components != nil {
+		in, out := &in.Components, &out.Components
+		*out = make([]ResolvedComponentStatus, len(*in))
+		copy(*out, *in)
 	}
 }
 
