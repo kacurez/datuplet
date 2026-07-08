@@ -151,6 +151,12 @@ Project provisioning creates the `datuplet-<uuid>` K8s namespace (labelled `datu
 
 ### Upload a pipeline
 
+> The example files under `examples/pipelines/` bundle a `Pipeline` document
+> followed by a `PipelineRun` document (the `PipelineRun` is there so
+> `kubectl apply -f ...` works standalone). `PUT` parses only the first YAML
+> document, so it stores the `Pipeline` and silently ignores the bundled
+> `PipelineRun`; runs are triggered via the `POST .../runs` call below.
+
 ```bash
 PID=<project-uuid>
 curl -sS -b /tmp/cookies -X PUT \
