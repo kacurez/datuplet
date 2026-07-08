@@ -81,9 +81,10 @@ These are conventions a new contributor wouldn't infer from the code:
 - **`UseSSL` and `UsePathStyle`** are independent storage-credential
   concerns — never infer one from the other.
 - **Secret references use `$[name]`** (whole-scalar only) inside
-  `component.config`. Resolved by the Data Gateway sidecar at boot from
-  files mounted under `/var/run/secrets/datuplet/`. The K8s
-  `Pipeline.spec.secretsRef.name` names a Secret in the same namespace.
+  `component.config`. Secrets are stored in a managed per-project Secret
+  named `datuplet-project-secrets` (written via the project secrets API/UI).
+  The Data Gateway sidecar resolves `$[name]` values at boot from the
+  per-run snapshot Secret mounted at `/var/run/secrets/datuplet/`.
 - **Run-token references** use `PipelineRun.spec.runTokenRef.name`. The
   named Secret carries a `token` key projected at
   `/var/run/secrets/datuplet-runtoken/token` **on the gateway sidecar

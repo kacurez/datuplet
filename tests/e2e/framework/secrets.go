@@ -23,11 +23,8 @@ func writeSecretsDir(data map[string]string) (string, error) {
 	return dir, nil
 }
 
-// Managed-secrets era (RFC 026 P1.5): the old createK8sSecret/deleteK8sSecret
-// pair hand-created a Secret named "<runPrefix>-secrets" for a pipeline's
-// (now-deleted) spec.secretsRef.name to point at. That whole mechanism is
-// gone — secrets are written through pipeline-api's write-only managed API
-// (PUT /api/v1/projects/{pid}/secrets/{key}) into the single per-project
-// Secret (datuplet-project-secrets), and referenced from component.config via
-// a whole-scalar $[name]. See scenarios_secrets_test.go for the scenario that
-// exercises this end to end.
+// Managed-secrets era (RFC 026 P1.5): secrets are written through pipeline-api's
+// write-only managed API (PUT /api/v1/projects/{pid}/secrets/{key}) into the
+// single per-project Secret (datuplet-project-secrets), and referenced from
+// component.config via a whole-scalar $[name]. See scenarios_secrets_test.go
+// for the scenario that exercises this end to end.

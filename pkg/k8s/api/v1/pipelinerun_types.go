@@ -58,7 +58,6 @@ type PipelineRunSpec struct {
 }
 
 // RunTokenRef is a reference to a Kubernetes Secret holding the run-scoped JWT.
-// Mirrors the shape of SecretsRef in pipeline_types.go.
 type RunTokenRef struct {
 	// Name is the Secret's name in the same namespace as the PipelineRun.
 	// +kubebuilder:validation:MinLength=1
