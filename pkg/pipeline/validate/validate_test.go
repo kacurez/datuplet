@@ -236,6 +236,107 @@ spec:
 `,
 			msgContains: "week",
 		},
+		{
+			name: "input since and sinceSnapshot mutually exclusive",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          image: extractor:latest
+          inputs:
+            tables:
+              - bucket: raw
+                table: orders
+                since: "3d"
+                sinceSnapshot: 12345
+`,
+			msgContains: "mutually exclusive",
+		},
+		{
+			name: "input invalid since duration",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          image: extractor:latest
+          inputs:
+            tables:
+              - bucket: raw
+                table: orders
+                since: "invalid"
+`,
+			msgContains: "invalid since duration",
+		},
+		{
+			name: "input valid since",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          image: extractor:latest
+          inputs:
+            tables:
+              - bucket: raw
+                table: orders
+                since: "3d"
+`,
+			wantZero: true,
+		},
+		{
+			name: "input sinceDays not positive",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          image: extractor:latest
+          inputs:
+            tables:
+              - bucket: raw
+                table: orders
+                sinceDays: 0
+`,
+			msgContains: "sinceDays must be positive",
+		},
+		{
+			name: "input valid sinceDays",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          image: extractor:latest
+          inputs:
+            tables:
+              - bucket: raw
+                table: orders
+                sinceDays: 7
+`,
+			wantZero: true,
+		},
 	}
 
 	for _, c := range cases {
