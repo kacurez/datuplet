@@ -214,6 +214,9 @@ func main() {
 		GatewayProfilingUsername:      gatewayProfilingUser,
 		GatewayProfilingPassword:      gatewayProfilingPass,
 		RuntimePullPolicy:             runtimePullPolicy,
+		// Registry resolves component/version references at run admission
+		// against cluster-scoped ComponentDefinitions via the manager cache.
+		Registry: controllers.ComponentRegistry{Reader: mgr.GetClient()},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PipelineRun")
 		os.Exit(1)

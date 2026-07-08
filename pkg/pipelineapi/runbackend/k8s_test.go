@@ -43,7 +43,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
           outputs:
             tables:
               - bucket: events
@@ -195,7 +195,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
           outputs:
             tables:
               - bucket: events

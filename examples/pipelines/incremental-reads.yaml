@@ -20,7 +20,7 @@ spec:
     - name: read
       components:
         - name: stdout-writer
-          image: ghcr.io/kacurez/stdout-writer:latest
+          component: stdout-writer
           inputs:
             tables:
               - bucket: raw

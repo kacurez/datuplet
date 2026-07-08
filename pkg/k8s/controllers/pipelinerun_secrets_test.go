@@ -37,10 +37,10 @@ func pipelineRefSecret(name, secretRef string) *datupletv1.Pipeline {
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:    "c1",
-					Image:   "datuplet/test:latest",
-					Config:  apiextensionsv1.JSON{Raw: []byte(cfg)},
-					Outputs: &datupletv1.OutputSpec{DefaultBucket: "output-bucket"},
+					Name:      "c1",
+					Component: "comp-a",
+					Config:    apiextensionsv1.JSON{Raw: []byte(cfg)},
+					Outputs:   &datupletv1.OutputSpec{DefaultBucket: "output-bucket"},
 				}},
 			}},
 		},
@@ -55,9 +55,9 @@ func pipelineNoSecret(name string) *datupletv1.Pipeline {
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:    "c1",
-					Image:   "datuplet/test:latest",
-					Outputs: &datupletv1.OutputSpec{DefaultBucket: "output-bucket"},
+					Name:      "c1",
+					Component: "comp-a",
+					Outputs:   &datupletv1.OutputSpec{DefaultBucket: "output-bucket"},
 				}},
 			}},
 		},
@@ -106,11 +106,11 @@ func TestAdmission_SnapshotCreated_ReferencedKeyOnly(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pipeline, pr, proj).
+		WithObjects(pipeline, pr, proj, compDef("comp-a", ver("v1.0.0", "datuplet/test:latest"))).
 		WithStatusSubresource(pr).
 		Build()
 
-	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme}
+	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Registry: ComponentRegistry{Reader: fakeClient}}
 
 	// Admission.
 	reconcilePR(t, r, "pr1")
@@ -173,11 +173,11 @@ func TestAdmission_MissingKey_FailsUser_NoJobsNoSnapshot(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pipeline, pr, proj).
+		WithObjects(pipeline, pr, proj, compDef("comp-a", ver("v1.0.0", "datuplet/test:latest"))).
 		WithStatusSubresource(pr).
 		Build()
 
-	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme}
+	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Registry: ComponentRegistry{Reader: fakeClient}}
 
 	reconcilePR(t, r, "pr1")
 
@@ -223,11 +223,11 @@ func TestAdmission_RotationIsolation_SnapshotImmutable(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pipeline, pr, proj).
+		WithObjects(pipeline, pr, proj, compDef("comp-a", ver("v1.0.0", "datuplet/test:latest"))).
 		WithStatusSubresource(pr).
 		Build()
 
-	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme}
+	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Registry: ComponentRegistry{Reader: fakeClient}}
 
 	// Admission snapshots v1.
 	reconcilePR(t, r, "pr1")
@@ -281,11 +281,11 @@ func TestAdmission_NoRefs_NoSnapshotNoMountNoCondition(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pipeline, pr).
+		WithObjects(pipeline, pr, compDef("comp-a", ver("v1.0.0", "datuplet/test:latest"))).
 		WithStatusSubresource(pr).
 		Build()
 
-	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme}
+	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Registry: ComponentRegistry{Reader: fakeClient}}
 
 	reconcilePR(t, r, "pr1")
 
@@ -353,11 +353,11 @@ func TestAdmission_PartialAdmission_SnapshotExists_ProjectKeyRemoved_NotFailed(t
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pipeline, pr, proj, preSnap).
+		WithObjects(pipeline, pr, proj, preSnap, compDef("comp-a", ver("v1.0.0", "datuplet/test:latest"))).
 		WithStatusSubresource(pr).
 		Build()
 
-	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme}
+	r := &PipelineRunReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Registry: ComponentRegistry{Reader: fakeClient}}
 
 	// Re-reconcile the still-Pending run.
 	reconcilePR(t, r, "pr1")

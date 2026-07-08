@@ -17,7 +17,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           config:
             password: $[db_password]
             user: alice
@@ -40,7 +40,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           config:
             password: "prefix $[db_password] suffix"
           outputs:
@@ -68,7 +68,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           config:
             literal: $$[not_a_secret]
           outputs:
@@ -93,7 +93,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           config:
             tables:
               - name: t1
@@ -124,7 +124,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           configJSON: "{}"
           outputs:
             defaultBucket: raw

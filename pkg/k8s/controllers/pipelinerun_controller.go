@@ -113,6 +113,64 @@ type PipelineRunReconciler struct {
 	// try to pull non-existent `datuplet/*` repositories from Docker
 	// Hub. Empty defaults to PullAlways (chart-iteration default).
 	RuntimePullPolicy corev1.PullPolicy
+
+	// Registry resolves component/version references at run admission. In
+	// production it is a ComponentRegistry over the manager's cached client;
+	// tests inject a fake-client-backed one. Never re-read after admission —
+	// the resolution is frozen into status.resolvedSpec.
+	Registry validate.RegistryView
+}
+
+// ComponentRegistry adapts a cached, cluster-scoped client.Reader into a
+// validate.RegistryView. Resolve Gets the ComponentDefinition named by the
+// component reference and delegates to a validate.StaticRegistry built from it,
+// so the resolved component retains the full config-schema (secret-ref)
+// validation semantics that only StaticRegistry populates. An Invalid-phase
+// definition is refused by StaticRegistry.Resolve.
+type ComponentRegistry struct {
+	Reader client.Reader
+}
+
+// Resolve implements validate.RegistryView.
+func (cr ComponentRegistry) Resolve(component, version string) (*validate.ResolvedComponent, []validate.Finding) {
+	def := &datupletv1.ComponentDefinition{}
+	if err := cr.Reader.Get(context.Background(), types.NamespacedName{Name: component}, def); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, []validate.Finding{{
+				Path:     "component",
+				Message:  fmt.Sprintf("unknown component %q", component),
+				Severity: "error",
+			}}
+		}
+		return nil, []validate.Finding{{
+			Path:     "component",
+			Message:  fmt.Sprintf("component %q: %v", component, err),
+			Severity: "error",
+		}}
+	}
+	return validate.StaticRegistry{component: *def}.Resolve(component, version)
+}
+
+// componentPullPolicy governs the COMPONENT container's image pull policy from
+// the frozen resolved version: stable (semver) versions are immutable →
+// IfNotPresent; prerelease versions use mutable tags → Always so a re-pushed
+// tag is picked up. The gateway sidecar keeps runtimePullPolicy separately.
+func componentPullPolicy(version string) corev1.PullPolicy {
+	if datupletv1.IsStableVersion(version) {
+		return corev1.PullIfNotPresent
+	}
+	return corev1.PullAlways
+}
+
+// firstErrorFinding returns the first error-severity finding, if any. Warning
+// findings (e.g. deprecation) do not fail admission.
+func firstErrorFinding(findings []validate.Finding) (validate.Finding, bool) {
+	for _, f := range findings {
+		if f.Severity == "error" {
+			return f, true
+		}
+	}
+	return validate.Finding{}, false
 }
 
 // runtimePullPolicy returns r.RuntimePullPolicy when set, else PullAlways
@@ -217,22 +275,6 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		return ctrl.Result{}, err
 	}
 
-	// Run admission: validate the fetched Pipeline with the same semantic
-	// checks the pipeline-api save path runs (validate.ValidateTyped). This
-	// is authoritative on its own — it does NOT gate on
-	// pipeline.Status.Phase, so a run is never admitted (and no Job is ever
-	// built) against an invalid Pipeline regardless of whether the Pipeline
-	// controller has reconciled it yet.
-	if findings := validate.ValidateTyped(pipeline, nil); len(findings) > 0 {
-		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
-		pr.Status.Message = findings[0].Message
-		if err := r.Status().Update(ctx, pr); err != nil {
-			logger.Error(err, "Failed to update PipelineRun status")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
 	// Determine run ID: use spec value if provided, otherwise generate
 	runID := pr.Spec.RunID
 	if runID == "" {
@@ -278,14 +320,65 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		return ctrl.Result{}, nil
 	}
 
+	// Run admission: validate the fetched Pipeline with the same semantic
+	// checks the pipeline-api save path runs, now resolving every component
+	// against the registry (r.Registry). This does NOT gate on
+	// pipeline.Status.Phase, so a run is never admitted against an invalid
+	// Pipeline regardless of whether the Pipeline controller reconciled it.
+	// A registry resolution error (unknown component, invalid definition,
+	// unresolvable version) surfaces as a finding here, before any Job.
+	if f, ok := firstErrorFinding(validate.ValidateTyped(pipeline, r.Registry)); ok {
+		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+		pr.Status.Message = f.Message
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Resolve every component and FREEZE the result into status: the run
+	// executes exclusively from this snapshot, so later registry changes or
+	// mid-run edits to the Pipeline spec cannot change what runs (RFC 026
+	// §4.3). resolvedSpec is a DeepCopy of the validated spec; components[]
+	// records the resolved component/version/image per instance.
+	resolvedSpec := pipeline.Spec.DeepCopy()
+	var resolvedComponents []datupletv1.ResolvedComponentStatus
+	for i := range resolvedSpec.Stages {
+		stage := &resolvedSpec.Stages[i]
+		for j := range stage.Components {
+			comp := &stage.Components[j]
+			rc, findings := r.Registry.Resolve(comp.Component, comp.Version)
+			if rc == nil {
+				f, _ := firstErrorFinding(findings)
+				pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+				pr.Status.Message = f.Message
+				if err := r.Status().Update(ctx, pr); err != nil {
+					logger.Error(err, "Failed to update PipelineRun status")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+			resolvedComponents = append(resolvedComponents, datupletv1.ResolvedComponentStatus{
+				Name:      comp.Name,
+				Component: rc.Component,
+				Version:   rc.Version,
+				Image:     rc.Image,
+			})
+		}
+	}
+	pr.Status.ResolvedSpec = resolvedSpec
+	pr.Status.PipelineGeneration = pipeline.Generation
+	pr.Status.Components = resolvedComponents
+
 	// Initialize status
 	pr.Status.Phase = datupletv1.PipelineRunPhaseRunning
 	now := metav1.Now()
 	pr.Status.StartTime = &now
 
-	// Initialize stage statuses
-	pr.Status.StageStatuses = make([]datupletv1.StageStatus, len(pipeline.Spec.Stages))
-	for i, stage := range pipeline.Spec.Stages {
+	// Initialize stage statuses from the FROZEN spec (not the live Pipeline).
+	pr.Status.StageStatuses = make([]datupletv1.StageStatus, len(resolvedSpec.Stages))
+	for i, stage := range resolvedSpec.Stages {
 		pr.Status.StageStatuses[i] = datupletv1.StageStatus{
 			Name:  stage.Name,
 			Phase: datupletv1.StagePhasePending,
@@ -398,19 +491,25 @@ func (r *PipelineRunReconciler) snapshotRunSecrets(ctx context.Context, pr *datu
 	return nil, nil
 }
 
-// handleRunning continues the PipelineRun execution.
+// handleRunning continues the PipelineRun execution. It reads exclusively from
+// the FROZEN status.resolvedSpec — never the live Pipeline — so mid-run edits
+// and registry changes cannot alter what executes.
 func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv1.PipelineRun) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the Pipeline
-	pipeline := &datupletv1.Pipeline{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      pr.Spec.PipelineRef.Name,
-		Namespace: pr.Namespace,
-	}, pipeline); err != nil {
-		logger.Error(err, "Failed to get Pipeline")
-		return ctrl.Result{}, err
+	if pr.Status.ResolvedSpec == nil {
+		// A Running run must carry the frozen spec written at admission.
+		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedApplication
+		pr.Status.Message = "internal: resolvedSpec missing on a Running PipelineRun"
+		now := metav1.Now()
+		pr.Status.CompletionTime = &now
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
+	resolvedSpec := pr.Status.ResolvedSpec
 
 	// Find the current stage to execute
 	currentStageIdx := -1
@@ -435,7 +534,7 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 		return ctrl.Result{}, nil
 	}
 
-	stage := &pipeline.Spec.Stages[currentStageIdx]
+	stage := &resolvedSpec.Stages[currentStageIdx]
 	stageStatus := &pr.Status.StageStatuses[currentStageIdx]
 	pr.Status.CurrentStage = stage.Name
 
@@ -443,10 +542,10 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 	switch stageStatus.Phase {
 	case datupletv1.StagePhasePending:
 		// Start the stage
-		return r.startStage(ctx, pr, pipeline, currentStageIdx)
+		return r.startStage(ctx, pr, currentStageIdx)
 	case datupletv1.StagePhaseRunning:
 		// Check component status
-		return r.checkStageComponents(ctx, pr, pipeline, currentStageIdx)
+		return r.checkStageComponents(ctx, pr, currentStageIdx)
 	case datupletv1.StagePhaseFailedUser:
 		// Stage failed due to user error - fail the entire run
 		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
@@ -474,11 +573,12 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
 }
 
-// startStage creates Jobs for all components in the stage.
-func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, stageIdx int) (ctrl.Result, error) {
+// startStage creates Jobs for all components in the stage, reading from the
+// FROZEN status.resolvedSpec.
+func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.PipelineRun, stageIdx int) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	stage := &pipeline.Spec.Stages[stageIdx]
+	stage := &pr.Status.ResolvedSpec.Stages[stageIdx]
 	stageStatus := &pr.Status.StageStatuses[stageIdx]
 
 	logger.Info("Starting stage", "stage", stage.Name)
@@ -497,7 +597,7 @@ func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.P
 		comp := &stage.Components[i]
 		compStatus := &stageStatus.ComponentStatuses[i]
 
-		job, configMap, err := r.buildComponentJob(ctx, pr, pipeline, comp)
+		job, configMap, err := r.buildComponentJob(ctx, pr, comp)
 		if err != nil {
 			logger.Error(err, "Failed to build component job", "component", comp.Name)
 			compStatus.Phase = datupletv1.ComponentPhaseFailedApplication
@@ -553,11 +653,12 @@ func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.P
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
 }
 
-// checkStageComponents checks the status of all component Jobs in a stage.
-func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, stageIdx int) (ctrl.Result, error) {
+// checkStageComponents checks the status of all component Jobs in a stage,
+// reading from the FROZEN status.resolvedSpec.
+func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *datupletv1.PipelineRun, stageIdx int) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	stage := &pipeline.Spec.Stages[stageIdx]
+	stage := &pr.Status.ResolvedSpec.Stages[stageIdx]
 	stageStatus := &pr.Status.StageStatuses[stageIdx]
 
 	allSucceeded := true

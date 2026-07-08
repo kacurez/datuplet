@@ -25,7 +25,7 @@ spec:
     - name: extract
       components:
         - name: json-extractor
-          image: ghcr.io/kacurez/http-json-extractor:latest
+          component: http-json-extractor
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
           # Dynamic table creation: component can create any table under 'raw' bucket

@@ -54,14 +54,16 @@ func TestStageRunningToSucceededDirect(t *testing.T) {
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:  "c1",
-					Image: "datuplet/test:latest",
+					Name:      "c1",
+					Component: "comp-a",
+					Version:   "v1.0.0",
 				}},
 			}},
 		},
 	}
 
 	// PipelineRun already in Running/stage-Running state, component succeeded.
+	// The frozen resolvedSpec is what handleRunning reads (never the live Pipeline).
 	pr := &datupletv1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pr1",
@@ -71,8 +73,9 @@ func TestStageRunningToSucceededDirect(t *testing.T) {
 			PipelineRef: datupletv1.PipelineRef{Name: "p1"},
 		},
 		Status: datupletv1.PipelineRunStatus{
-			Phase: datupletv1.PipelineRunPhaseRunning,
-			RunID: "00000000-0000-0000-0000-000000000001",
+			Phase:        datupletv1.PipelineRunPhaseRunning,
+			RunID:        "00000000-0000-0000-0000-000000000001",
+			ResolvedSpec: pipeline.Spec.DeepCopy(),
 			StageStatuses: []datupletv1.StageStatus{{
 				Name:  "extract",
 				Phase: datupletv1.StagePhaseRunning,
@@ -166,8 +169,8 @@ func TestPipelineRunReconcile_InvalidPipeline_FailsUser_NoJobs(t *testing.T) {
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:  "c1",
-					Image: "datuplet/test:latest",
+					Name:      "c1",
+					Component: "comp-a",
 					Outputs: &datupletv1.OutputSpec{
 						DefaultBucket: "Bad_Bucket",
 					},

@@ -359,7 +359,7 @@ spec:
     - name: extract
       components:
         - name: api
-          image: x
+          component: x
           inputs: {buckets: [api]}
           outputs:
             tables: [{name: orders, bucket: raw, writeMode: FULL_LOAD}]

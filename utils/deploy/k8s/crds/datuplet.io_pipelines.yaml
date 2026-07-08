@@ -89,8 +89,10 @@ spec:
                               component's registry schema).
                             type: object
                             x-kubernetes-preserve-unknown-fields: true
-                          image:
-                            description: Image is the container image to run
+                          component:
+                            description: Component is the registry component name
+                              (ComponentDefinition.Name) this instance runs. Resolved
+                              against the component registry at run admission.
                             type: string
                           inputs:
                             description: Inputs defines input configuration
@@ -351,8 +353,13 @@ spec:
                                   More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                                 type: object
                             type: object
+                          version:
+                            description: Version pins the registry version. Empty
+                              resolves to the component's default version (its
+                              DefaultVersion, or the highest registered stable semver).
+                            type: string
                         required:
-                        - image
+                        - component
                         - name
                         type: object
                       minItems: 1

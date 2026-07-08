@@ -173,10 +173,10 @@ func validateComponent(c *datupletv1.ComponentSpec, stageIdx, compIdx int, avail
 			Severity: severityError,
 		})
 	}
-	if c.Image == "" {
+	if c.Component == "" {
 		findings = append(findings, Finding{
-			Path:     base + ".image",
-			Message:  fmt.Sprintf("component %s: image is required", c.Name),
+			Path:     base + ".component",
+			Message:  fmt.Sprintf("component %s: component is required", c.Name),
 			Severity: severityError,
 		})
 	}
@@ -532,9 +532,7 @@ func validateRegistry(c *datupletv1.ComponentSpec, stageIdx, compIdx int, reg Re
 	}
 	base := fmt.Sprintf("stages[%d].components[%d]", stageIdx, compIdx)
 
-	// R6 switches the resolution key to c.Component / c.Version once those
-	// fields replace Image on ComponentSpec.
-	rc, resolveFindings := reg.Resolve(c.Name, "")
+	rc, resolveFindings := reg.Resolve(c.Component, c.Version)
 
 	var findings []Finding
 	for _, f := range resolveFindings {

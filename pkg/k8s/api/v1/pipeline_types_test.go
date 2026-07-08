@@ -9,7 +9,7 @@ import (
 func TestComponentSpecStructuredConfig(t *testing.T) {
 	in := []byte(`
 name: gen
-image: x:latest
+component: x
 config:
   sql: |
     SELECT 1;

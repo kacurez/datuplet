@@ -33,8 +33,8 @@ func TestPipelineReconcile_InvalidBucketName_SetsInvalidPhase(t *testing.T) {
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:  "c1",
-					Image: "datuplet/test:latest",
+					Name:      "c1",
+					Component: "comp-a",
 					Outputs: &datupletv1.OutputSpec{
 						// Uppercase + underscore: fails validate's
 						// bucketNameRegex (lowercase alnum + hyphens only).

@@ -19,7 +19,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           config:
             url: "https://example.com"
             nested:
@@ -51,7 +51,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           config:
             a:
               b:
@@ -73,7 +73,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           outputs:
             tables:
               - name: summary
@@ -93,7 +93,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           configJSON: "{}"
           outputs:
             defaultBucket: raw
@@ -111,7 +111,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           outputs:
             defaultBucket: "RAW!"
 `,
@@ -128,7 +128,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           outputs:
             defaultBucket: raw
             tables:
@@ -148,7 +148,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           config:
             nested:
               url: "x-$[a]-y"
@@ -168,7 +168,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           outputs:
             defaultBucket: raw
 `,
@@ -185,7 +185,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           outputs:
             tables:
               - name: summary
@@ -205,7 +205,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           outputs:
             defaultBucket: raw
             processors:
@@ -225,7 +225,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           outputs:
             tables:
               - name: summary
@@ -247,7 +247,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           inputs:
             tables:
               - bucket: raw
@@ -268,7 +268,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           inputs:
             tables:
               - bucket: raw
@@ -288,7 +288,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           inputs:
             tables:
               - bucket: raw
@@ -308,7 +308,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           inputs:
             tables:
               - bucket: raw
@@ -328,7 +328,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           inputs:
             tables:
               - bucket: raw
@@ -406,9 +406,9 @@ func TestValidateTyped_Direct(t *testing.T) {
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:    "extractor",
-					Image:   "extractor:latest",
-					Outputs: &datupletv1.OutputSpec{DefaultBucket: "raw"},
+					Name:      "extractor",
+					Component: "extractor",
+					Outputs:   &datupletv1.OutputSpec{DefaultBucket: "raw"},
 				}},
 			}},
 		},

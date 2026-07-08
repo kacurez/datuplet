@@ -32,7 +32,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
           outputs:
             defaultBucket: raw
             defaultWriteMode: APPEND
@@ -50,7 +50,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
           config:
             token: "$[api_token]"
           outputs:
@@ -231,7 +231,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
           outputs:
             defaultBucket: raw
             defaultWriteMode: APPEND
@@ -273,7 +273,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
           outputs:
             buckets:
               - name: raw
@@ -326,7 +326,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
           outputs:
             defaultBucket: "RAW!"
             defaultWriteMode: APPEND

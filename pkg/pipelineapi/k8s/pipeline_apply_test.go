@@ -21,7 +21,7 @@ spec:
     - name: extract
       components:
         - name: c1
-          image: datuplet/test:latest
+          component: datuplet/test:latest
 `
 
 func TestApplyPipelineCRD_CreatesWhenMissing(t *testing.T) {
@@ -50,7 +50,7 @@ func TestApplyPipelineCRD_UpdatesWhenPresent(t *testing.T) {
 	existing := &datupletv1.Pipeline{}
 	existing.Name = "etl"
 	existing.Namespace = ns
-	existing.Spec.Stages = []datupletv1.StageSpec{{Name: "old", Components: []datupletv1.ComponentSpec{{Name: "c", Image: "old"}}}}
+	existing.Spec.Stages = []datupletv1.StageSpec{{Name: "old", Components: []datupletv1.ComponentSpec{{Name: "c", Component: "old"}}}}
 
 	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(existing).Build()
 	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, ns, testPipelineYAML); err != nil {

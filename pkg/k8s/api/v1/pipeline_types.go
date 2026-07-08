@@ -130,8 +130,16 @@ type ComponentSpec struct {
 	// Name is the component name
 	Name string `json:"name"`
 
-	// Image is the container image to run
-	Image string `json:"image"`
+	// Component is the registry component name (ComponentDefinition.Name)
+	// this instance runs. Resolved against the component registry at run
+	// admission (RFC 026).
+	Component string `json:"component"`
+
+	// Version pins the registry version. Empty resolves to the component's
+	// default version (its DefaultVersion, or the highest registered stable
+	// semver).
+	// +optional
+	Version string `json:"version,omitempty"`
 
 	// Config contains component-specific configuration as an arbitrary
 	// structured object, validated against the component's registry
@@ -377,6 +385,16 @@ func (in *PipelineSpec) DeepCopyInto(out *PipelineSpec) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+}
+
+// DeepCopy creates a deep copy of PipelineSpec
+func (in *PipelineSpec) DeepCopy() *PipelineSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(PipelineSpec)
+	in.DeepCopyInto(out)
+	return out
 }
 
 // DeepCopyInto for StageSpec

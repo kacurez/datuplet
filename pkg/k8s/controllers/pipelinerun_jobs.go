@@ -41,10 +41,17 @@ func runSecretsName(pr *datupletv1.PipelineRun) string {
 	return "datuplet-runsecrets-" + shortID(pr.Status.RunID)
 }
 
-// buildComponentJob builds the Job + gateway ConfigMap for a single component.
-func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, comp *datupletv1.ComponentSpec) (*batchv1.Job, *corev1.ConfigMap, error) {
+// buildComponentJob builds the Job + gateway ConfigMap for a single component,
+// reading exclusively from the FROZEN status.resolvedSpec + status.components
+// (never the live Pipeline). The resolved image + pull policy come from the
+// snapshot recorded at admission.
+func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datupletv1.PipelineRun, comp *datupletv1.ComponentSpec) (*batchv1.Job, *corev1.ConfigMap, error) {
+	// The frozen spec drives gateway settings, stage lookup, and secret-ref
+	// detection. Wrap it as a Pipeline so the existing helpers keep working.
+	frozen := &datupletv1.Pipeline{Spec: *pr.Status.ResolvedSpec}
+
 	stageIdx := -1
-	for i, stage := range pipeline.Spec.Stages {
+	for i, stage := range frozen.Spec.Stages {
 		for _, c := range stage.Components {
 			if c.Name == comp.Name {
 				stageIdx = i
@@ -53,16 +60,31 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		}
 	}
 	if stageIdx == -1 {
-		return nil, nil, fmt.Errorf("component not found in pipeline")
+		return nil, nil, fmt.Errorf("component not found in resolved spec")
 	}
 
-	stage := &pipeline.Spec.Stages[stageIdx]
+	// Resolved image + version were frozen at admission.
+	var componentImage, componentVersion string
+	found := false
+	for _, rc := range pr.Status.Components {
+		if rc.Name == comp.Name {
+			componentImage = rc.Image
+			componentVersion = rc.Version
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, nil, fmt.Errorf("component %q not found in resolved components", comp.Name)
+	}
+
+	stage := &frozen.Spec.Stages[stageIdx]
 
 	jobName := componentJobName(pr, stage.Name, comp.Name)
 	configMapName := fmt.Sprintf("gateway-config-%s", jobName)
 
 	// Generate gateway config
-	gatewayConfig, err := r.generateGatewayConfig(pr, pipeline, comp)
+	gatewayConfig, err := r.generateGatewayConfig(pr, frozen, comp)
 	if err != nil {
 		return nil, nil, fmt.Errorf("component %q: %w", comp.Name, err)
 	}
@@ -205,11 +227,12 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 					Containers: []corev1.Container{
 						{
 							Name:  "component",
-							Image: comp.Image,
-							// PullAlways: same RFC 020 iteration-loop reasoning as the gateway
-							// sidecar — every iteration pushes a fresh image to ttl.sh, so we
-							// must pull.
-							ImagePullPolicy: r.runtimePullPolicy(),
+							Image: componentImage,
+							// Registry-driven: a prerelease-resolved version uses a
+							// mutable tag → Always; a stable semver version is
+							// immutable → IfNotPresent. (The gateway sidecar keeps
+							// runtimePullPolicy.)
+							ImagePullPolicy: componentPullPolicy(componentVersion),
 							Env:             env,
 							// Component container hardening: makes the
 							// sidecar-only run-token mount a real defense.
@@ -253,7 +276,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		&job.Spec.Template.Spec,
 		&job.Spec.Template.Spec.InitContainers[0],
 		pr,
-		pipeline,
+		frozen,
 	)
 
 	// Mount the referenced Secret on the gateway sidecar (only) when runTokenRef is set.

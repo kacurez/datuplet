@@ -24,7 +24,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           config:
             nested:
               token: "$[a]"
@@ -34,7 +34,7 @@ spec:
     - name: load
       components:
         - name: loader
-          image: loader:latest
+          component: loader
           config:
             again: "$[a]"
           inputs:
@@ -53,7 +53,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           config:
             url: "https://example.com"
           outputs:
@@ -72,7 +72,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           config:
             url: "$$[x]"
           outputs:
@@ -91,7 +91,7 @@ spec:
     - name: extract
       components:
         - name: extractor
-          image: extractor:latest
+          component: extractor
           config:
             nested:
               url: "x-$[a]-y"

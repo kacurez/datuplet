@@ -82,7 +82,8 @@ func componentFromCRD(c *datupletv1.ComponentSpec) (Component, error) {
 	}
 	return Component{
 		Name:      c.Name,
-		Image:     c.Image,
+		Component: c.Component,
+		Version:   c.Version,
 		Config:    cfg,
 		Inputs:    inputsFromCRD(c.Inputs),
 		Outputs:   outputsFromCRD(c.Outputs),

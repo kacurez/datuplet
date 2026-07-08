@@ -191,9 +191,9 @@ func TestStaticRegistry_Resolve_HappyPath(t *testing.T) {
 // sole component carries the given name and (optional) raw config.
 func pipelineWithComponent(name string, rawConfig []byte) *datupletv1.Pipeline {
 	c := datupletv1.ComponentSpec{
-		Name:    name,
-		Image:   "img:v1",
-		Outputs: &datupletv1.OutputSpec{DefaultBucket: "raw"},
+		Name:      name,
+		Component: name,
+		Outputs:   &datupletv1.OutputSpec{DefaultBucket: "raw"},
 	}
 	if rawConfig != nil {
 		c.Config = apiextensionsv1.JSON{Raw: rawConfig}

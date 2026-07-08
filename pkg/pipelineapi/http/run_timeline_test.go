@@ -13,7 +13,7 @@ spec:
     - name: extract
       components:
         - name: api
-          image: x
+          component: x
           inputs:
             buckets: [api]
           outputs:
@@ -24,7 +24,7 @@ spec:
     - name: transform
       components:
         - name: sql
-          image: y
+          component: y
           inputs:
             tables:
               - {bucket: raw, table: orders}

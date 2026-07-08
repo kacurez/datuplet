@@ -26,7 +26,7 @@ spec:
     - name: extract
       components:
         - name: data-generator
-          image: ghcr.io/kacurez/data-generator:latest
+          component: data-generator
           config:
             tables:
               - name: products
@@ -54,7 +54,7 @@ spec:
     - name: load
       components:
         - name: stdout-writer
-          image: ghcr.io/kacurez/stdout-writer:latest
+          component: stdout-writer
           inputs:
             buckets:
               - raw
