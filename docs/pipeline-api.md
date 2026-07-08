@@ -162,14 +162,14 @@ PID=<project-uuid>
 curl -sS -b /tmp/cookies -X PUT \
   --data-binary @examples/pipelines/simple-http-extract.yaml \
   -H 'Content-Type: application/yaml' \
-  http://127.0.0.1:8081/api/v1/projects/$PID/pipelines/simple -i
+  http://127.0.0.1:8081/api/v1/projects/$PID/pipelines/simple-pipeline -i
 ```
 
 ### Trigger a run
 
 ```bash
 curl -sS -b /tmp/cookies -X POST \
-  http://127.0.0.1:8081/api/v1/projects/$PID/pipelines/simple/runs \
+  http://127.0.0.1:8081/api/v1/projects/$PID/pipelines/simple-pipeline/runs \
   -H 'Content-Type: application/json' -d '{}'
 # → 202 {"id":"…","status":"Pending"}
 ```
