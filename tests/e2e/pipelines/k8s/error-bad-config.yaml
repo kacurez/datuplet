@@ -10,22 +10,13 @@ spec:
       components:
         - name: data-generator
           image: datuplet/data-generator:latest
-          # K8s CRD's `config` field is map[string]string; data-generator's
-          # nested tables[] config must go through `configJSON` (a single
-          # JSON string the operator forwards verbatim to the gateway).
-          configJSON: |
-            {
-              "tables": [
-                {
-                  "name": "bad",
-                  "random": {
-                    "schema": {"id": "int"},
-                    "limit": {"rowsCount": 10},
-                    "userErrorMessage": "simulated user error: bad config"
-                  }
-                }
-              ]
-            }
+          config:
+            tables:
+              - name: bad
+                random:
+                  schema: {id: int}
+                  limit: {rowsCount: 10}
+                  userErrorMessage: "simulated user error: bad config"
           outputs:
             defaultBucket: "{{.RunPrefix}}-err"
             defaultWriteMode: APPEND
@@ -38,4 +29,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-error-bad-config"
-  parameters: {}

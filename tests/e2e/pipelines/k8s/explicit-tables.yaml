@@ -27,4 +27,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-explicit-tables"
-  parameters: {}

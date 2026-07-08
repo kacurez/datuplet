@@ -35,4 +35,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-read-back"
-  parameters: {}

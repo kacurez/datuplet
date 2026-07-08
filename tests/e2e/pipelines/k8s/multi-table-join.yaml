@@ -66,4 +66,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-multi-table-join"
-  parameters: {}

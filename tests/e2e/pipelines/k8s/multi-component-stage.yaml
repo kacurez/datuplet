@@ -37,4 +37,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-multi-component-stage"
-  parameters: {}

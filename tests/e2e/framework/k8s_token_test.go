@@ -39,7 +39,6 @@ metadata:
 spec:
   pipelineRef:
     name: myrun-http-json-extract
-  parameters: {}
 `
 
 func TestRewriteYAMLWithRunToken_InjectsRunIDAndSecretRef(t *testing.T) {

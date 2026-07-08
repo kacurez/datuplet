@@ -49,4 +49,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-duckdb-etl"
-  parameters: {}

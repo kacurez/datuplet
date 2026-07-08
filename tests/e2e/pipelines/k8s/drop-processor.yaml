@@ -29,4 +29,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-drop-processor"
-  parameters: {}

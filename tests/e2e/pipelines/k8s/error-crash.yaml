@@ -30,4 +30,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-error-crash"
-  parameters: {}

@@ -53,7 +53,10 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 	configMapName := fmt.Sprintf("gateway-config-%s", jobName)
 
 	// Generate gateway config
-	gatewayConfig := r.generateGatewayConfig(pr, pipeline, comp)
+	gatewayConfig, err := r.generateGatewayConfig(pr, pipeline, comp)
+	if err != nil {
+		return nil, nil, fmt.Errorf("component %q: %w", comp.Name, err)
+	}
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -441,14 +444,13 @@ func applyCancelAnnotationMount(podSpec *corev1.PodSpec, gatewayContainer *corev
 }
 
 // generateGatewayConfig creates the gateway configuration YAML.
-func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, comp *datupletv1.ComponentSpec) string {
-	// Decode the structured Config. Mirrors the old ConfigJSON-unmarshal-error
-	// handling: malformed config is logged and treated as empty rather than
-	// failing the build (B6 replaces this with a hard failure + tests).
+func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, comp *datupletv1.ComponentSpec) (string, error) {
 	config, err := comp.ConfigMap()
 	if err != nil {
-		fmt.Printf("WARNING: component %s: %v (ignoring config)\n", comp.Name, err)
-		config = nil
+		return "", err
+	}
+	if config == nil {
+		config = map[string]any{}
 	}
 
 	// Build gateway settings
@@ -692,10 +694,10 @@ gateway:
 			chunkSize,
 			bufferSize,
 			rowGroupSize,
-			targetFileSize)
+			targetFileSize), nil
 	}
 
-	return string(yamlBytes)
+	return string(yamlBytes), nil
 }
 
 // buildGatewaySidecarEnv returns the env-var slice attached to every

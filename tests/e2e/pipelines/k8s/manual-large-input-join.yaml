@@ -19,43 +19,29 @@ spec:
       components:
         - name: data-generator
           image: datuplet/data-generator:latest
-          # K8s CRD's `config` is map[string]string; nested tables[]
-          # config goes through `configJSON` (string the operator
-          # forwards verbatim to the gateway).
-          configJSON: |
-            {
-              "tables": [
-                {
-                  "name": "facts",
-                  "random": {
-                    "schema": {
-                      "id": "long",
-                      "value": "double",
-                      "payload": "string"
-                    },
-                    "limit": {"rowsCount": 5000000}
-                  }
-                },
-                {
-                  "name": "dimensions",
-                  "literal": {
-                    "columns": ["bucket_id", "category"],
-                    "rows": [
-                      [0, "small"],
-                      [1, "small"],
-                      [2, "small"],
-                      [3, "medium"],
-                      [4, "medium"],
-                      [5, "medium"],
-                      [6, "large"],
-                      [7, "large"],
-                      [8, "xl"],
-                      [9, "xl"]
-                    ]
-                  }
-                }
-              ]
-            }
+          config:
+            tables:
+              - name: facts
+                random:
+                  schema:
+                    id: long
+                    value: double
+                    payload: string
+                  limit: {rowsCount: 5000000}
+              - name: dimensions
+                literal:
+                  columns: [bucket_id, category]
+                  rows:
+                    - [0, small]
+                    - [1, small]
+                    - [2, small]
+                    - [3, medium]
+                    - [4, medium]
+                    - [5, medium]
+                    - [6, large]
+                    - [7, large]
+                    - [8, xl]
+                    - [9, xl]
           outputs:
             defaultBucket: "{{.RunPrefix}}-raw"
             defaultWriteMode: FULL_LOAD
@@ -105,4 +91,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-manual-large-input-join"
-  parameters: {}

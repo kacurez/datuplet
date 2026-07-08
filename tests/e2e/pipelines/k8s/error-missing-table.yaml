@@ -25,4 +25,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-error-missing-table"
-  parameters: {}

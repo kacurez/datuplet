@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
 // minimalPipeline returns a Pipeline with one stage and one component,
@@ -287,7 +289,10 @@ func TestGenerateGatewayConfig_LakekeeperURL(t *testing.T) {
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if !strings.Contains(y, "lakekeeper_url: http://lakekeeper.lakekeeper.svc.cluster.local:8181/catalog") {
 		t.Errorf("generated YAML did not carry lakekeeper URL; got:\n%s", y)
 	}
@@ -302,9 +307,70 @@ func TestGenerateGatewayConfig_LakekeeperURL_OmittedWhenUnset(t *testing.T) {
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if strings.Contains(y, "lakekeeper_url") {
 		t.Errorf("generated YAML should omit lakekeeper_url when unset; got:\n%s", y)
+	}
+}
+
+// TestGenerateGatewayConfig_NestedConfig verifies that a component's
+// structured Config (a nested tables list) survives into gateway.yaml as
+// native YAML nesting — not as an escaped JSON string embedded in the
+// output (RFC 026 P1, B6).
+func TestGenerateGatewayConfig_NestedConfig(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	comp := &datupletv1.ComponentSpec{
+		Name:  "c1",
+		Image: "datuplet/test:latest",
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"tables":[{"name":"facts","random":{"schema":{"id":"int"}}}]}`),
+		},
+	}
+
+	y, err := r.generateGatewayConfig(pr, pipeline, comp)
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
+	if strings.Contains(y, `"tables"`) {
+		t.Errorf("config appears to be escaped/embedded JSON, not native YAML nesting; got:\n%s", y)
+	}
+
+	// Decode the generated YAML and walk the structure to prove "tables"
+	// is a real nested sequence under component.config — not merely a
+	// substring that happens to appear somewhere in the document (e.g.
+	// flat, or under an unrelated key).
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(y), &doc); err != nil {
+		t.Fatalf("generated YAML did not parse: %v\ngot:\n%s", err, y)
+	}
+
+	component, ok := doc["component"].(map[string]any)
+	if !ok {
+		t.Fatalf("doc[\"component\"] is not a map[string]any; got %T (%v)\ndoc:\n%s", doc["component"], doc["component"], y)
+	}
+	configSection, ok := component["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("component[\"config\"] is not a map[string]any; got %T (%v)\ndoc:\n%s", component["config"], component["config"], y)
+	}
+	tables, ok := configSection["tables"].([]any)
+	if !ok {
+		t.Fatalf("component.config[\"tables\"] is not a []any (not a nested sequence); got %T (%v)\ndoc:\n%s", configSection["tables"], configSection["tables"], y)
+	}
+	if len(tables) != 1 {
+		t.Fatalf("expected 1 entry under component.config.tables, got %d\ndoc:\n%s", len(tables), y)
+	}
+	firstTable, ok := tables[0].(map[string]any)
+	if !ok {
+		t.Fatalf("component.config.tables[0] is not a map[string]any; got %T (%v)\ndoc:\n%s", tables[0], tables[0], y)
+	}
+	if name, _ := firstTable["name"].(string); name != "facts" {
+		t.Errorf("expected component.config.tables[0].name == \"facts\", got %v\ndoc:\n%s", firstTable["name"], y)
 	}
 }
 
@@ -321,7 +387,10 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL(t *testing.T) {
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	want := "pipeline_api_jwks_url: http://pipeline-api.datuplet.svc.cluster.local:8081/api/v1/auth/jwks.json"
 	if !strings.Contains(y, want) {
 		t.Errorf("generated YAML should contain %q; got:\n%s", want, y)
@@ -340,7 +409,10 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL_TrimsTrailingSlash(t *testing.
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if strings.Contains(y, "8081//api") {
 		t.Errorf("trailing-slash hygiene broken — double slash in JWKS URL; got:\n%s", y)
 	}
@@ -396,7 +468,10 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL_OmittedWhenUnset(t *testing.T)
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if strings.Contains(y, "pipeline_api_jwks_url") {
 		t.Errorf("generated YAML should omit pipeline_api_jwks_url when PipelineAPIURL is unset; got:\n%s", y)
 	}
