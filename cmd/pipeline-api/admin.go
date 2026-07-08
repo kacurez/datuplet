@@ -27,26 +27,29 @@ import (
 
 func runAdmin(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("admin requires a subcommand (attach-warehouse | create-user | create-project | delete-project | ensure-project-authz | grant | keygen | lakekeeper-bootstrap | migrate)")
+		return fmt.Errorf("admin requires a subcommand (attach-warehouse | component | create-user | create-project | delete-project | ensure-project-authz | grant | keygen | lakekeeper-bootstrap | migrate)")
 	}
 
 	// Validate the subcommand BEFORE opening the DB or running migrations —
 	// a typo shouldn't cause schema changes or a misleading config error.
 	switch args[0] {
-	case "attach-warehouse", "create-user", "create-project", "delete-project", "ensure-project-authz",
+	case "attach-warehouse", "component", "create-user", "create-project", "delete-project", "ensure-project-authz",
 		"grant", "keygen", "lakekeeper-bootstrap", "migrate":
 		// ok
 	default:
-		return fmt.Errorf("unknown admin subcommand: %q (valid: attach-warehouse | create-user | create-project | delete-project | ensure-project-authz | grant | keygen | lakekeeper-bootstrap | migrate)", args[0])
+		return fmt.Errorf("unknown admin subcommand: %q (valid: attach-warehouse | component | create-user | create-project | delete-project | ensure-project-authz | grant | keygen | lakekeeper-bootstrap | migrate)", args[0])
 	}
 
-	// keygen + lakekeeper-bootstrap are DB-free —
+	// keygen + lakekeeper-bootstrap + component are DB-free —
 	// skip DB open+migrate entirely.
 	if args[0] == "keygen" {
 		return adminKeygen(args[1:])
 	}
 	if args[0] == "lakekeeper-bootstrap" {
 		return adminLakekeeperBootstrap(args[1:])
+	}
+	if args[0] == "component" {
+		return runAdminComponent(args[1:])
 	}
 	// migrate manages its own DB connection — it IS the migration step.
 	if args[0] == "migrate" {

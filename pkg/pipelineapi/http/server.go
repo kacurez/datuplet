@@ -58,6 +58,14 @@ type Server struct {
 	// annotation. Injected (not read inside the patch helper) so tests get
 	// deterministic timestamps.
 	secretsClock func() time.Time
+	// registry is pipeline-api's view of the component registry: Resolve is
+	// threaded into ValidatePipeline on the pipeline save path (replacing
+	// R5's temporary nil), and List backs the /api/v1/components catalog
+	// handlers. When nil, both the catalog routes stay unregistered AND
+	// handlePutPipeline validates with a nil RegistryView (registry
+	// resolution + config-schema checks skipped) — same soft-degrade shape
+	// as the other With* seams.
+	registry ComponentRegistry
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -220,6 +228,18 @@ func (s *Server) WithSecrets(k8sClient client.Client, clock func() time.Time) *S
 	return s
 }
 
+// WithRegistry wires pipeline-api's view of the component registry. Resolve
+// is threaded into ValidatePipeline on the pipeline save path (PUT
+// /api/v1/projects/{pid}/pipelines/{name}); List backs the
+// GET /api/v1/components catalog routes, which register only when both this
+// and WithUserResolver are wired. When nil (the default), the catalog
+// routes stay unregistered and pipeline saves validate with a nil
+// RegistryView, matching R5's pre-registry behavior.
+func (s *Server) WithRegistry(r ComponentRegistry) *Server {
+	s.registry = r
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -302,6 +322,13 @@ func (s *Server) Handler() http.Handler {
 	if s.resolver != nil && s.authzr != nil && s.backend != nil && s.pipelines != nil {
 		mux.Handle("POST /api/v1/projects/{pid}/pipelines/{name}/runs",
 			auth.WithUser(s.resolver, http.HandlerFunc(s.handleTriggerRun)))
+	}
+
+	// Component catalog routes: any authenticated user (WithUser only — no
+	// project-scoped authz check, spec §4.7's shared picker).
+	if s.resolver != nil && s.registry != nil {
+		mux.Handle("GET /api/v1/components", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListComponents)))
+		mux.Handle("GET /api/v1/components/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleGetComponent)))
 	}
 
 	// Query service route. When a pre-built queryHandler + resolver are wired,

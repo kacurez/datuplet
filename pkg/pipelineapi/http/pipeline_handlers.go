@@ -150,7 +150,10 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "body exceeds 1 MiB: "+err.Error())
 		return
 	}
-	pl, findings, err := validate.ValidatePipeline(body, nil)
+	// s.registry is nil when WithRegistry hasn't been wired; ValidatePipeline
+	// treats a nil RegistryView as "skip resolution" (see R5), so this stays
+	// a soft-degrade rather than a nil-deref.
+	pl, findings, err := validate.ValidatePipeline(body, s.registry)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid pipeline: "+err.Error())
 		return

@@ -24,6 +24,7 @@ import (
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/registry"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -363,6 +364,14 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		// PIPELINE_API_PUBLIC_URL). Warehouse name is not a server-side env
 		// var; it is resolved per-request via lakekeeper.
 		WithCLIClusterInfo(cfg.LakekeeperPublicURL, "")
+	// Component registry: GET /api/v1/components catalog routes + real
+	// registry-aware validation on the pipeline save path (replaces R5's
+	// temporary nil RegistryView). Same soft-degrade gate as WithK8sClient —
+	// no K8s client means no ComponentDefinition access, so the catalog
+	// routes stay unregistered and saves validate without registry checks.
+	if k8sClient != nil {
+		srv = srv.WithRegistry(registry.NewView(k8sClient, 0))
+	}
 	// Query service: POST /api/v1/query ad-hoc SQL. Wired only when
 	// DATUPLET_QUERY_WORKER_URL is set and handler construction succeeded above.
 	// nil → route stays unregistered → 404.

@@ -54,6 +54,44 @@ func freshServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *authztest.Fake
 	return ts, pool, authzr, cleanup
 }
 
+// freshServerWithRegistry is freshServer plus a wired ComponentRegistry —
+// used by tests that need the pipeline save path to actually resolve
+// components (R9: handlePutPipeline threads s.registry into ValidatePipeline
+// instead of R5's temporary nil).
+func freshServerWithRegistry(t *testing.T, reg apihttp.ComponentRegistry) (*httptest.Server, *pgxpool.Pool, *authztest.Fake, func()) {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"); err != nil {
+		pool.Close()
+		t.Fatalf("reset: %v", err)
+	}
+	if err := pipelineapidb.Migrate(context.Background(), pool); err != nil {
+		pool.Close()
+		t.Fatalf("migrate: %v", err)
+	}
+	authzr := authztest.New()
+	srv := apihttp.NewServer(pool).
+		WithUserResolver(auth.NewPostgresResolver(pool, false)).
+		WithAuthorizer(authzr).
+		WithProjectReader(apihttp.NewPgxProjectReader(pool, authzr)).
+		WithPipelineStore(apihttp.NewPgxPipelineStore(pool)).
+		WithRunReader(apihttp.NewPgxRunReader(pool)).
+		WithRegistry(reg)
+	ts := httptest.NewServer(srv.Handler())
+	cleanup := func() {
+		ts.Close()
+		pool.Close()
+	}
+	return ts, pool, authzr, cleanup
+}
+
 func seedUser(t *testing.T, pool *pgxpool.Pool, email, password string) {
 	t.Helper()
 	hash, err := auth.HashPassword(password)

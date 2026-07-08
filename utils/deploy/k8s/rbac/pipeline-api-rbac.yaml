@@ -45,6 +45,16 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
     verbs: ["get", "create"]
+  # Component registry (RFC 026 P2) — mirrors
+  # charts/datuplet-app/templates/pipeline-api/rbac.yaml. GET
+  # /api/v1/components catalog handlers + registry-aware pipeline-save
+  # validation both List ComponentDefinition CRs via pipeline-api's
+  # registry.View. No write verbs — registration/deprecation is CLI-only
+  # (`pipeline-api admin component ...`), run with the operator's own
+  # kubeconfig, not this ServiceAccount.
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

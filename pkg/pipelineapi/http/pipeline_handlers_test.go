@@ -129,6 +129,48 @@ func TestPutPipeline_InvalidYAML(t *testing.T) {
 	}
 }
 
+// TestPutPipeline_UnknownComponent_ReturnsRegistryFinding is R9's headline
+// regression test: once a real ComponentRegistry is wired via WithRegistry,
+// saving a pipeline that references a component absent from the registry
+// must surface R5's "unknown component" finding — R5 landed this check but
+// it stayed dark because handlePutPipeline called ValidatePipeline with a
+// hard-coded nil registry.
+func TestPutPipeline_UnknownComponent_ReturnsRegistryFinding(t *testing.T) {
+	// Empty registry: no ComponentDefinitions registered at all, so
+	// "datuplet/test:latest" (used by every other fixture in this file)
+	// resolves to "unknown component".
+	ts, pool, fakeAuthz, cleanup := freshServerWithRegistry(t, newFakeComponentRegistry())
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-unknown-component"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var body findingsBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var found bool
+	for _, f := range body.Findings {
+		if strings.Contains(f.Message, `unknown component "datuplet/test:latest"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an 'unknown component' finding, got %+v", body.Findings)
+	}
+}
+
 func TestListPipelines(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()

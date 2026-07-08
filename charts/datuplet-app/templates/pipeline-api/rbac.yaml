@@ -71,6 +71,14 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list", "patch"]
+  # Component registry (RFC 026 P2): GET /api/v1/components catalog
+  # handlers + registry-aware pipeline-save validation both List
+  # ComponentDefinition CRs via pipeline-api's registry.View. No write
+  # verbs — registration/deprecation is CLI-only (`pipeline-api admin
+  # component ...`), run out-of-Pod against the operator's own RBAC.
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
