@@ -13,7 +13,7 @@
 // PUT is idempotent — the same endpoint both creates and replaces.
 // Delete is a separate button with a confirm prompt.
 
-import { api, putPipelineYAML, esc, getComponents, getComponent, listSecrets } from '/ui/api.js';
+import { api, putPipelineYAML, esc, getComponents, getComponent, listSecrets, getStorageCatalog } from '/ui/api.js';
 import { timeTag, phaseToPillClass, formatDuration, durationFrom } from '/ui/format.js';
 import { renderFindings } from '/ui/lib/findings.js';
 import { buildSchemaForm } from '/ui/lib/schema-form.js';
@@ -216,6 +216,23 @@ export async function renderPipelineDetail(ctx) {
   } catch { /* secrets optional */ }
   const isSuperadmin = !!(me && me.is_superadmin); // T1-verified key name
 
+  // Storage catalog (RFC 005) for the inputs picker — existing tables the
+  // component can read. Optional: on any failure we degrade to an empty
+  // catalog (the inputs picker then shows a usable empty state, no crash).
+  // Grouped by namespace up front (namespace == bucket in Datuplet's model),
+  // mirroring query.js's buildSchemaPane idiom.
+  let storageTables = [];
+  try {
+    const sc = await getStorageCatalog(pid);
+    if (aborted()) return;
+    storageTables = (sc && sc.tables) || [];
+  } catch { /* catalog optional */ }
+  const storageByNs = new Map();
+  for (const t of storageTables) {
+    if (!storageByNs.has(t.namespace)) storageByNs.set(t.namespace, []);
+    storageByNs.get(t.namespace).push(t);
+  }
+
   let comps = [];
   try {
     comps = await getComponents();
@@ -258,6 +275,18 @@ export async function renderPipelineDetail(ctx) {
             <button type="button" class="btn btn--ghost" id="edit-as-yaml">Edit as YAML…</button>
           </div>
           <div id="builder-form"></div>
+          <details class="builder-io"><summary>Inputs (read existing tables)</summary>
+            <div id="io-inputs"></div>
+            <button type="button" class="btn btn--ghost" id="add-input">+ add input table</button>
+          </details>
+          <details class="builder-io"><summary>Outputs (tables this component writes)</summary>
+            <label class="field">Default bucket <input class="input" id="out-bucket" type="text" placeholder="raw"></label>
+            <label class="field">Table name (optional) <input class="input" id="out-table" type="text"></label>
+            <label class="field">Write mode
+              <select class="input" id="out-writemode"><option value="">— default —</option><option>APPEND</option><option>FULL_LOAD</option></select>
+            </label>
+            <span class="builder-io-chips" id="out-preview"></span>
+          </details>
           <button type="button" class="btn btn--primary" id="insert-form" disabled>Insert as YAML</button>
         </div>
         <div id="builder-schema-docs" style="display:none;">${v && v.configSchema ? schemaDocs(v.configSchema) : `<p style="color:var(--fg-2);">No schema.</p>`}</div>`;
@@ -270,27 +299,139 @@ export async function renderPipelineDetail(ctx) {
       );
       document.getElementById('insert-form').disabled = false;
 
-      // "Insert as YAML": client-side pre-check via getErrors(), then splice a
-      // serialized component block at the caret. The server re-parses and
-      // validates authoritatively; this is only a fast local guard.
+      // ---- Inputs/outputs pickers (RFC 026 T7) ---------------------------
+      // Inputs reference EXISTING tables (picked from the storage catalog);
+      // outputs are NEW tables the run creates (free-text bucket/name +
+      // writeMode). Rows live in this per-pick closure array, read at emit
+      // time. All emitted bucket/table/writeMode strings route through the
+      // T6 scalar quoter in componentBlockYAML (no raw interpolation); every
+      // value shown in the DOM is esc()'d.
+      const inputRows = [];
+      const nsNames = [...storageByNs.keys()];
+
+      // tableChips renders bucket/table labels with the shared chip classes
+      // (runs-UX PR #23). Both operands are esc()'d before interpolation.
+      const tableChips = (bucket, table) =>
+        (bucket ? `<span class="chip chip--bucket"><span class="mono">${esc(bucket)}</span></span>` : '') +
+        (table ? `<span class="chip chip--table"><span class="mono">${esc(table)}</span></span>` : '');
+
+      const ioInputs = document.getElementById('io-inputs');
+      const addInputBtn = document.getElementById('add-input');
+
+      function addInputRow() {
+        const row = document.createElement('div');
+        row.className = 'builder-io-row';
+        const nsOpts = `<option value="">— bucket —</option>` +
+          nsNames.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+        row.innerHTML = `
+          <label class="field">Bucket <select class="input io-ns">${nsOpts}</select></label>
+          <label class="field">Table <select class="input io-tbl"><option value="">— table —</option></select></label>
+          <span class="builder-io-chips io-chips"></span>
+          <button type="button" class="btn btn--ghost io-remove">Remove</button>`;
+        const nsSel = row.querySelector('.io-ns');
+        const tblSel = row.querySelector('.io-tbl');
+        const chips = row.querySelector('.io-chips');
+        nsSel.addEventListener('change', () => {
+          const tbls = nsSel.value ? (storageByNs.get(nsSel.value) || []) : [];
+          tblSel.innerHTML = `<option value="">— table —</option>` +
+            tbls.map((t) => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
+          chips.innerHTML = tableChips(nsSel.value, '');
+        });
+        tblSel.addEventListener('change', () => { chips.innerHTML = tableChips(nsSel.value, tblSel.value); });
+        const entry = { nsSel, tblSel };
+        row.querySelector('.io-remove').addEventListener('click', () => {
+          const i = inputRows.indexOf(entry);
+          if (i !== -1) inputRows.splice(i, 1);
+          row.remove();
+        });
+        inputRows.push(entry);
+        ioInputs.appendChild(row);
+      }
+
+      if (nsNames.length === 0) {
+        // Empty-but-usable state: nothing to read, so disable add + explain.
+        addInputBtn.disabled = true;
+        ioInputs.innerHTML = `<p style="color:var(--fg-2);font-size:var(--text-sm);">No existing tables in this project yet.</p>`;
+      } else {
+        addInputBtn.addEventListener('click', addInputRow);
+      }
+
+      // Outputs live preview chips (user-entered → esc()'d in tableChips).
+      const outPreview = document.getElementById('out-preview');
+      const refreshOutPreview = () => {
+        const b = (document.getElementById('out-bucket').value || '').trim();
+        const t = (document.getElementById('out-table').value || '').trim();
+        outPreview.innerHTML = tableChips(b, t);
+      };
+      document.getElementById('out-bucket').addEventListener('input', refreshOutPreview);
+      document.getElementById('out-table').addEventListener('input', refreshOutPreview);
+
+      // collectInputs → { tables:[{bucket, table}] } | null. The catalog's
+      // namespace maps to the CRD `bucket`, its name to `table`. Rows missing
+      // either field are skipped.
+      function collectInputs() {
+        const tables = [];
+        for (const r of inputRows) {
+          const bucket = r.nsSel.value;
+          const table = r.tblSel.value;
+          if (bucket && table) tables.push({ bucket, table });
+        }
+        return tables.length ? { tables } : null;
+      }
+
+      // collectOutputs → { outputs, ioErrs }. A table name selects the
+      // OutputTableSpec shape (bucket REQUIRED — never emit an entry without
+      // it); otherwise the bucket/writeMode become defaultBucket/
+      // defaultWriteMode. Only fields the user filled are emitted.
+      function collectOutputs() {
+        const bucket = (document.getElementById('out-bucket').value || '').trim();
+        const table = (document.getElementById('out-table').value || '').trim();
+        const writeMode = document.getElementById('out-writemode').value || '';
+        const ioErrs = [];
+        let outputs = null;
+        if (table) {
+          if (!bucket) {
+            ioErrs.push({ path: 'outputs.tables[0].bucket', message: 'Bucket is required when an output table name is given.', severity: 'error' });
+          } else {
+            const entry = { name: table, bucket };
+            if (writeMode) entry.writeMode = writeMode;
+            outputs = { tables: [entry] };
+          }
+        } else if (bucket || writeMode) {
+          outputs = {};
+          if (bucket) outputs.defaultBucket = bucket;
+          if (writeMode) outputs.defaultWriteMode = writeMode;
+        }
+        return { outputs, ioErrs };
+      }
+
+      // "Insert as YAML": client-side pre-check via getErrors() + the outputs
+      // bucket guard, then splice a serialized component block at the caret.
+      // The server re-parses and validates authoritatively; this is only a
+      // fast local guard.
       document.getElementById('insert-form').addEventListener('click', () => {
-        const errs = formHandle.getErrors();
-        if (errs.length) {
-          document.getElementById('pipeline-msg').innerHTML = renderFindings(
-            errs.map((e) => ({ path: `config.${e.path}`, message: e.message, severity: 'error' })));
+        const errs = formHandle.getErrors()
+          .map((e) => ({ path: `config.${e.path}`, message: e.message, severity: 'error' }));
+        const { outputs, ioErrs } = collectOutputs();
+        const all = errs.concat(ioErrs);
+        if (all.length) {
+          document.getElementById('pipeline-msg').innerHTML = renderFindings(all);
           return;
         }
-        const block = componentBlockYAML(sel.value, sel.dataset.version, formHandle.getValue());
+        const block = componentBlockYAML(sel.value, sel.dataset.version, formHandle.getValue(), collectInputs(), outputs);
         insertAtCursor(document.querySelector('textarea[name=yaml]'), block);
       });
 
       // "Edit as YAML" — the one-way toggle (confirm guards the irreversible
-      // direction). On OK, preserve the current form entries by inserting them
-      // into the textarea, then collapse the form; the textarea is now the
-      // surface. There is no reverse sync back into the form.
+      // direction). On OK, preserve the current form entries (incl. the
+      // collected inputs/outputs) by inserting them into the textarea, then
+      // collapse the form; the textarea is now the surface. There is no
+      // reverse sync back into the form. collectOutputs never yields a
+      // bucket-less table entry, so the emitted block stays valid here too.
       document.getElementById('edit-as-yaml').addEventListener('click', () => {
         if (!confirm('Switch to YAML editing? Your current form entries for this component will be inserted into the YAML and the form cleared. You can’t convert a hand-edited block back into the form.')) return;
-        const block = componentBlockYAML(sel.value, sel.dataset.version, formHandle.getValue());
+        const { outputs } = collectOutputs();
+        const block = componentBlockYAML(sel.value, sel.dataset.version, formHandle.getValue(), collectInputs(), outputs);
         insertAtCursor(document.querySelector('textarea[name=yaml]'), block);
         document.querySelector('.builder-form-wrap')?.remove();
         document.querySelector('textarea[name=yaml]')?.focus();
@@ -307,6 +448,9 @@ export async function renderPipelineDetail(ctx) {
         if (formEl) formEl.style.display = showForm ? '' : 'none';
         if (insertEl) insertEl.style.display = showForm ? '' : 'none';
         if (docsEl) docsEl.style.display = showForm ? 'none' : '';
+        // The inputs/outputs pickers belong to the form surface, not the
+        // read-only schema reference — hide them alongside the form.
+        document.querySelectorAll('.builder-io').forEach((el) => { el.style.display = showForm ? '' : 'none'; });
       });
     } catch (e) {
       if (!aborted()) docs.innerHTML = `<p style="color:var(--status-fail-fg);">${esc(e.message)}</p>`;
@@ -351,7 +495,7 @@ function pickDocVersion(c) {
 // constrained shapes the schema form produces (scalars, arrays of scalars, and
 // JSON-object subvalues) and only needs to emit VALID, correctly-shaped YAML —
 // the server re-parses and validates authoritatively (§4.3).
-function componentBlockYAML(name, version, cfg) {
+function componentBlockYAML(name, version, cfg, inputs, outputs) {
   // Identifier fields (name / component / version) may carry registry-supplied
   // strings, so they route through yamlIdentScalar — a value with YAML-special
   // chars or a newline becomes a single double-quoted scalar and can never
@@ -368,7 +512,53 @@ function componentBlockYAML(name, version, cfg) {
     lines.push(`          config:`);
     for (const k of keys) yamlKeyValue(lines, k, cfg[k], 12);
   }
+  emitInputs(lines, inputs);
+  emitOutputs(lines, outputs);
   return lines.join('\n') + '\n';
+}
+
+// emitInputs appends an `inputs:` sub-block (sibling of `config:`, 10-space
+// indent) when there are input tables. Each table maps the storage catalog's
+// (namespace, name) onto the CRD `InputTableSpec` fields (bucket, table). All
+// bucket/table strings route through yamlScalar so user/catalog values can't
+// inject sibling keys.
+function emitInputs(lines, inputs) {
+  const tables = inputs && Array.isArray(inputs.tables) ? inputs.tables : [];
+  if (tables.length === 0) return;
+  lines.push(`          inputs:`);
+  lines.push(`            tables:`);
+  for (const t of tables) {
+    lines.push(`              - bucket: ${yamlScalar(t.bucket)}`);
+    lines.push(`                table: ${yamlScalar(t.table)}`);
+  }
+}
+
+// emitOutputs appends an `outputs:` sub-block when the user filled anything.
+// A table name selects the `OutputTableSpec` shape — `bucket` is REQUIRED, so
+// entries without one are dropped (never emitted). Otherwise the bucket /
+// writeMode become defaultBucket / defaultWriteMode. Values route through
+// yamlScalar.
+function emitOutputs(lines, outputs) {
+  if (!outputs) return;
+  const tables = Array.isArray(outputs.tables)
+    ? outputs.tables.filter((t) => t && t.bucket)
+    : [];
+  if (tables.length > 0) {
+    lines.push(`          outputs:`);
+    lines.push(`            tables:`);
+    for (const t of tables) {
+      lines.push(`              - name: ${yamlScalar(t.name)}`);
+      lines.push(`                bucket: ${yamlScalar(t.bucket)}`);
+      if (t.writeMode) lines.push(`                writeMode: ${yamlScalar(t.writeMode)}`);
+    }
+    return;
+  }
+  const hasBucket = outputs.defaultBucket != null && String(outputs.defaultBucket) !== '';
+  const hasWriteMode = outputs.defaultWriteMode != null && String(outputs.defaultWriteMode) !== '';
+  if (!hasBucket && !hasWriteMode) return;
+  lines.push(`          outputs:`);
+  if (hasBucket) lines.push(`            defaultBucket: ${yamlScalar(outputs.defaultBucket)}`);
+  if (hasWriteMode) lines.push(`            defaultWriteMode: ${yamlScalar(outputs.defaultWriteMode)}`);
 }
 
 // yamlKeyValue appends one config entry (`<pad><key>: <value>`, or a block

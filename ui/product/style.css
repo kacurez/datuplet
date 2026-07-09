@@ -887,6 +887,10 @@ code.inline {
 @media (max-width: 860px) { .builder-layout { grid-template-columns: 1fr; } .builder-docs { position: static; } }
 .builder-form-wrap { display: flex; flex-direction: column; gap: var(--s-2); margin-bottom: var(--s-3); }
 .builder-mode { display: flex; gap: var(--s-2); }
+.builder-io { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s-2) var(--s-3); background: var(--bg-1); }
+.builder-io > summary { cursor: pointer; color: var(--fg-1); font-size: var(--text-sm); }
+.builder-io-row { display: flex; align-items: flex-end; gap: var(--s-2); margin-top: var(--s-2); flex-wrap: wrap; }
+.builder-io-chips { display: inline-flex; align-items: center; gap: var(--s-1); }
 
 /* ---------- Schema form (RFC 026 Phase 4) ---------- */
 .sform { display: flex; flex-direction: column; gap: var(--s-2); }
