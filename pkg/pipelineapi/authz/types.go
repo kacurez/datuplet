@@ -23,6 +23,7 @@ const (
 	TypeTable     ObjectType = "table"
 	TypeView      ObjectType = "view"
 	TypeUser      ObjectType = "user"
+	TypeServer    ObjectType = "server"
 )
 
 // Object is an immutable FGA object reference (type:id). Use the typed
@@ -68,6 +69,13 @@ func ProjectObject(uuid string) Object { return Object{kind: string(TypeProject)
 //   - NamespaceObject("raw").String()             == "namespace:raw"
 //   - NamespaceObject("joined.staging").String()  == "namespace:joined.staging"
 func NamespaceObject(name string) Object { return Object{kind: string(TypeNamespace), id: name} }
+
+// ServerObject returns the FGA object for the lakekeeper server singleton.
+// The uuid parameter is the server object UUID lakekeeper writes on first
+// bootstrap (discovered via DiscoverServerObject / the /changes feed). No
+// normalization is applied — unlike UserObject, the server id carries no
+// "oidc~" prefix. Wire form: "server:<uuid>".
+func ServerObject(uuid string) Object { return Object{kind: string(TypeServer), id: uuid} }
 
 // UserObject returns the FGA object for a user, applying the oidc~ prefix
 // that lakekeeper hard-codes when normalizing OIDC subjects.

@@ -10,10 +10,10 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 
+	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
 
@@ -531,7 +531,7 @@ func lakekeeperWarehouseExists(c *http.Client, base, jwt, projectID, name string
 func writeServerAdminTuple(ctx context.Context, fgaURL, apiKey, storeID string) error {
 	c := &http.Client{Timeout: 30 * time.Second}
 
-	serverObj, err := discoverServerObject(ctx, c, fgaURL, apiKey, storeID)
+	serverObj, err := authz.DiscoverServerObject(ctx, fgaURL, apiKey, storeID)
 	if err != nil {
 		return fmt.Errorf("discover server object: %w", err)
 	}
@@ -675,46 +675,6 @@ func writeProjectAdminTuple(ctx context.Context, fgaURL, apiKey, storeID, userSu
 		return nil
 	}
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, b)
-}
-
-func discoverServerObject(ctx context.Context, c *http.Client, fgaURL, apiKey, storeID string) (string, error) {
-	token := ""
-	pattern := regexp.MustCompile(`^server:[0-9a-f-]+$`)
-	for i := 0; i < 100; i++ {
-		u := fmt.Sprintf("%s/stores/%s/changes?page_size=100", strings.TrimRight(fgaURL, "/"), storeID)
-		if token != "" {
-			u += "&continuation_token=" + token
-		}
-		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
-		if apiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-		}
-		resp, err := c.Do(req)
-		if err != nil {
-			return "", err
-		}
-		var page struct {
-			Changes []struct {
-				TupleKey struct{ Object string } `json:"tuple_key"`
-			} `json:"changes"`
-			ContinuationToken string `json:"continuation_token"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
-			resp.Body.Close()
-			return "", err
-		}
-		resp.Body.Close()
-		for _, ch := range page.Changes {
-			if pattern.MatchString(ch.TupleKey.Object) {
-				return ch.TupleKey.Object, nil
-			}
-		}
-		if page.ContinuationToken == "" {
-			break
-		}
-		token = page.ContinuationToken
-	}
-	return "", fmt.Errorf("no server:<uuid> tuple found")
 }
 
 func resolveStoreIDByName(ctx context.Context, fgaURL, apiKey, storeName string) (string, error) {
