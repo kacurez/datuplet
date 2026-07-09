@@ -1,0 +1,38 @@
+---
+# RFC 026 P3 Task T10: registry-default resource application. The
+# data-generator@v0.0.1 component sets NO resources block, so the controller
+# applies the registry resources.default at run admission, freezes it into
+# status.resolvedSpec, and the built component Job container carries it
+# verbatim (framework/components_bootstrap.go registers the Default/Max on
+# v0.0.1). Pinned to v0.0.1 because the mutable "dev" version carries no
+# resources.
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: "{{.RunPrefix}}-resource-default"
+  namespace: datuplet
+spec:
+  stages:
+    - name: generate
+      components:
+        - name: gen
+          component: data-generator
+          version: v0.0.1
+          config:
+            tables:
+              - name: rd
+                random:
+                  schema: {id: int}
+                  limit: {rowsCount: 10}
+          outputs:
+            defaultBucket: "{{.RunPrefix}}-resource-default"
+            defaultWriteMode: APPEND
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: "{{.RunPrefix}}-resource-default-run"
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: "{{.RunPrefix}}-resource-default"

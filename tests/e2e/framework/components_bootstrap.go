@@ -102,6 +102,49 @@ const (
 	DataGeneratorStableImage   = "datuplet/data-generator:" + DataGeneratorStableVersion
 )
 
+// Registry resource bounds carried by data-generator's stable "v0.0.1" e2e
+// version (RFC 026 P3 Task T10). The Max is deliberately LOW so the resource
+// scenarios can drive both the clamp path (a spec above Max) and the
+// default-application path (no spec) against a real ceiling. Exposed as
+// string constants so the Go assertions in scenarios_resources_test.go
+// compare against a single source of truth. The mutable "dev" prerelease
+// version deliberately carries NO resources, so the resource scenarios pin
+// v0.0.1 explicitly.
+const (
+	DataGeneratorMaxCPU           = "2"
+	DataGeneratorMaxMemory        = "512Mi"
+	DataGeneratorDefaultReqCPU    = "100m"
+	DataGeneratorDefaultReqMemory = "128Mi"
+	DataGeneratorDefaultLimCPU    = "500m"
+	DataGeneratorDefaultLimMemory = "256Mi"
+)
+
+// dataGeneratorStableResourcesYAML is decoded into a
+// datupletv1.ComponentResources at registration time. It is built from the
+// exported constants above via a YAML literal (rather than the typed corev1
+// structs) so the e2e module needs no direct k8s.io/api import —
+// sigs.k8s.io/yaml decodes the corev1 quantity types through their JSON tags.
+var dataGeneratorStableResourcesYAML = fmt.Sprintf(`default:
+  requests: {cpu: %q, memory: %q}
+  limits: {cpu: %q, memory: %q}
+max: {cpu: %q, memory: %q}
+`,
+	DataGeneratorDefaultReqCPU, DataGeneratorDefaultReqMemory,
+	DataGeneratorDefaultLimCPU, DataGeneratorDefaultLimMemory,
+	DataGeneratorMaxCPU, DataGeneratorMaxMemory)
+
+// dataGeneratorStableResources decodes the resource bounds for the stable
+// v0.0.1 version. Panics on a malformed literal — the input is a
+// compile-time constant, so a decode failure is a programming error caught
+// by the first test run, not a runtime condition.
+func dataGeneratorStableResources() *datupletv1.ComponentResources {
+	var r datupletv1.ComponentResources
+	if err := yaml.Unmarshal([]byte(dataGeneratorStableResourcesYAML), &r); err != nil {
+		panic("e2e: malformed dataGeneratorStableResourcesYAML: " + err.Error())
+	}
+	return &r
+}
+
 // builtinE2EComponents lists every component instantiated by
 // tests/e2e/pipelines/k8s/*.yaml, i.e. every image `make build-components-e2e`
 // (+ build-component-sql-transform) builds locally as `datuplet/<name>:latest`.
@@ -163,6 +206,7 @@ func devComponentDefinition(name string) *datupletv1.ComponentDefinition {
 			Version:      DataGeneratorStableVersion,
 			Image:        DataGeneratorStableImage,
 			ConfigSchema: dataGeneratorStableConfigSchema,
+			Resources:    dataGeneratorStableResources(),
 		})
 	}
 	return &datupletv1.ComponentDefinition{
