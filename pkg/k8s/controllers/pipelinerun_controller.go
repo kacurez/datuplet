@@ -220,6 +220,22 @@ func (r *PipelineRunReconciler) componentImagePullPolicy(version string) corev1.
 	return componentPullPolicy(version)
 }
 
+// nonResourceFindings drops the resource-Max policy findings (over-Max quantity
+// or a name absent from the registry Max) from a finding slice. Those carry a
+// component ".resources" path and are the one class of error finding the run
+// admission does NOT fail on: the resolve loop clamps resources to the registry
+// ceiling instead (RFC 026 §4.4). Config findings (".config") are never dropped.
+func nonResourceFindings(findings []validate.Finding) []validate.Finding {
+	var out []validate.Finding
+	for _, f := range findings {
+		if strings.Contains(f.Path, ".resources") && !strings.Contains(f.Path, ".config") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 // firstErrorFinding returns the first error-severity finding, if any. Warning
 // findings (e.g. deprecation) do not fail admission.
 func firstErrorFinding(findings []validate.Finding) (validate.Finding, bool) {
@@ -404,7 +420,12 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	if tf, ok := firstTransientFinding(admissionFindings); ok {
 		return r.requeueOnTransientAdmissionError(ctx, pr, tf.Message)
 	}
-	if f, ok := firstErrorFinding(admissionFindings); ok {
+	// Resource-policy findings (over-Max / unlisted names) do NOT fail the run
+	// here: the controller CLAMPS resources to the registry ceiling in the
+	// resolve loop below (RFC 026 §4.4 Layer 2 — defense-in-depth for the
+	// direct-kubectl path, where the API's reject never ran). Every other error
+	// finding still fails the run FailedUser.
+	if f, ok := firstErrorFinding(nonResourceFindings(admissionFindings)); ok {
 		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
 		pr.Status.Message = f.Message
 		if err := r.Status().Update(ctx, pr); err != nil {
@@ -421,6 +442,7 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	// records the resolved component/version/image per instance.
 	resolvedSpec := pipeline.Spec.DeepCopy()
 	var resolvedComponents []datupletv1.ResolvedComponentStatus
+	var clampNotes []string
 	for i := range resolvedSpec.Stages {
 		stage := &resolvedSpec.Stages[i]
 		for j := range stage.Components {
@@ -445,6 +467,16 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 				Version:   rc.Version,
 				Image:     rc.Image,
 			})
+			// Compute EFFECTIVE resources once, here at admission: registry
+			// Default when the spec is nil, else clamp every entry to Max and
+			// strip unlisted names (RFC 026 §4.4). The clamped value is frozen
+			// into resolvedSpec so buildComponentJob consumes it verbatim and a
+			// mid-run registry edit can never change any stage's resources.
+			res := applyDefaultsThenClamp(comp.Resources, rc.Resources.Default, rc.Resources.Max)
+			comp.Resources = &res.Resources
+			if res.Note != "" {
+				clampNotes = append(clampNotes, fmt.Sprintf("resources clamped for component %s: %s", comp.Name, res.Note))
+			}
 		}
 	}
 	pr.Status.ResolvedSpec = resolvedSpec
@@ -461,6 +493,13 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	pr.Status.Phase = datupletv1.PipelineRunPhaseRunning
 	now := metav1.Now()
 	pr.Status.StartTime = &now
+
+	// Surface any resource clamps/strips on the run message; the run still
+	// proceeds (RFC 026 §4.4: "clamped run proceeds, with the clamp noted").
+	// Pure default application (nil spec → registry Default) records no note.
+	if len(clampNotes) > 0 {
+		pr.Status.Message = strings.Join(clampNotes, "; ")
+	}
 
 	// Initialize stage statuses from the FROZEN spec (not the live Pipeline).
 	pr.Status.StageStatuses = make([]datupletv1.StageStatus, len(resolvedSpec.Stages))
