@@ -28,7 +28,7 @@ func ParseFile(path string) (*Pipeline, error) {
 // error (preserving the historical Parse error contract); there is no second
 // dialect and no duplicated checks here.
 func Parse(data []byte) (*Pipeline, error) {
-	p, findings, err := validate.ValidatePipeline(data, nil)
+	p, findings, err := validate.ValidatePipeline(data, nil, nil)
 	if err != nil {
 		return nil, err
 	}

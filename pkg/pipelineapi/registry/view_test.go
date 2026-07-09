@@ -90,7 +90,7 @@ spec:
             defaultBucket: raw
             defaultWriteMode: APPEND
 `)
-	_, findings, err := validate.ValidatePipeline(pipelineYAML, v)
+	_, findings, err := validate.ValidatePipeline(pipelineYAML, v, nil)
 	if err != nil {
 		t.Fatalf("ValidatePipeline: %v", err)
 	}

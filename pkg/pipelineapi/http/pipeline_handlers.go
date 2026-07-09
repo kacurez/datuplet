@@ -153,7 +153,7 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 	// s.registry is nil when WithRegistry hasn't been wired; ValidatePipeline
 	// treats a nil RegistryView as "skip resolution" (see R5), so this stays
 	// a soft-degrade rather than a nil-deref.
-	pl, findings, err := validate.ValidatePipeline(body, s.registry)
+	pl, findings, err := validate.ValidatePipeline(body, s.registry, nil)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid pipeline: "+err.Error())
 		return

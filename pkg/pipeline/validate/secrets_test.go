@@ -104,7 +104,7 @@ spec:
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			p, _, err := ValidatePipeline([]byte(c.yaml), nil)
+			p, _, err := ValidatePipeline([]byte(c.yaml), nil, nil)
 			if err != nil {
 				t.Fatalf("ValidatePipeline returned unexpected error: %v", err)
 			}

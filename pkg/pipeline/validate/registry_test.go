@@ -209,7 +209,7 @@ func pipelineWithComponent(name string, rawConfig []byte) *datupletv1.Pipeline {
 
 func TestValidateTyped_UnknownComponent_PathPrefixed(t *testing.T) {
 	p := pipelineWithComponent("ghost", nil)
-	findings := ValidateTyped(p, StaticRegistry{})
+	findings := ValidateTyped(p, StaticRegistry{}, nil)
 	f, ok := findingAt(findings, "stages[0].components[0].component")
 	if !ok {
 		t.Fatalf("want a finding at the component's full path, got %+v", findings)
@@ -229,7 +229,7 @@ func TestValidateTyped_ConfigSchemaViolation_FullPath(t *testing.T) {
 	// url is a number, violating the string type constraint.
 	p := pipelineWithComponent("extractor", []byte(`{"url":123}`))
 
-	findings := ValidateTyped(p, reg)
+	findings := ValidateTyped(p, reg, nil)
 	if _, ok := findingAt(findings, "stages[0].components[0].config.url"); !ok {
 		t.Fatalf("want a config-schema finding at stages[0].components[0].config.url, got %+v", findings)
 	}
@@ -239,7 +239,7 @@ func TestValidateTyped_NilRegistry_SkipsResolution(t *testing.T) {
 	// "ghost" is in no registry, but a nil registry must skip resolution
 	// entirely, so no "unknown component" finding is produced.
 	p := pipelineWithComponent("ghost", nil)
-	findings := ValidateTyped(p, nil)
+	findings := ValidateTyped(p, nil, nil)
 	for _, f := range findings {
 		if strings.Contains(f.Message, "unknown component") {
 			t.Fatalf("nil registry must skip resolution, got %+v", findings)

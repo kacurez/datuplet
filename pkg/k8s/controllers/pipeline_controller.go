@@ -88,7 +88,7 @@ func (r *PipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // path never diverges into a second validation dialect. The first Finding
 // (if any) becomes the returned error.
 func (r *PipelineReconciler) validatePipeline(_ context.Context, pipeline *datupletv1.Pipeline) error {
-	findings := validate.ValidateTyped(pipeline, nil)
+	findings := validate.ValidateTyped(pipeline, nil, nil)
 	if len(findings) == 0 {
 		return nil
 	}

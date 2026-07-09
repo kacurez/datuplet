@@ -400,7 +400,7 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	// unresolvable version) surfaces as a finding here, before any Job. A
 	// TRANSIENT registry error (checked first) never fails the run — see the
 	// taxonomy comment on ComponentRegistry.Resolve.
-	admissionFindings := validate.ValidateTyped(pipeline, r.Registry)
+	admissionFindings := validate.ValidateTyped(pipeline, r.Registry, nil)
 	if tf, ok := firstTransientFinding(admissionFindings); ok {
 		return r.requeueOnTransientAdmissionError(ctx, pr, tf.Message)
 	}

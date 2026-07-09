@@ -66,18 +66,23 @@ var validPartitionTransforms = map[string]bool{
 // config against the resolved version's JSON Schema; a nil reg skips all
 // registry resolution and schema checks (the non-registry semantic checks still
 // run). Phase 3 extends this signature with a pol *Policy argument.
-func ValidatePipeline(data []byte, reg RegistryView) (*datupletv1.Pipeline, []Finding, error) {
+func ValidatePipeline(data []byte, reg RegistryView, pol *Policy) (*datupletv1.Pipeline, []Finding, error) {
 	var p datupletv1.Pipeline
 	if err := yaml.UnmarshalStrict(data, &p); err != nil {
 		return nil, []Finding{{Path: "", Message: err.Error(), Severity: severityError}}, nil
 	}
-	return &p, ValidateTyped(&p, reg), nil
+	return &p, ValidateTyped(&p, reg, pol), nil
 }
 
 // ValidateTyped runs the semantic checks on an already-decoded Pipeline.
 // Controllers that hold typed CRs (not YAML) call this directly. A nil reg
 // skips registry resolution and config-schema validation (see ValidatePipeline).
-func ValidateTyped(p *datupletv1.Pipeline, reg RegistryView) []Finding {
+//
+// pol is the Phase-3 extension of the Phase-2 signature: a non-nil *Policy adds
+// gateway-bounds findings (a nil *Policy disables all bound checks). Resource
+// reject rules (over-max / unlisted names) run whenever reg resolves a
+// component, independent of pol (RFC 026 §4.4, §4.6).
+func ValidateTyped(p *datupletv1.Pipeline, reg RegistryView, pol *Policy) []Finding {
 	if p == nil {
 		return []Finding{{Path: "", Message: "pipeline is nil", Severity: severityError}}
 	}
@@ -141,6 +146,11 @@ func ValidateTyped(p *datupletv1.Pipeline, reg RegistryView) []Finding {
 		for j := range stage.Components {
 			findings = append(findings, validateSecretRefs(&stage.Components[j], i, j)...)
 		}
+	}
+
+	// Phase 3: gateway-knob bounds are enforced only when a policy is supplied.
+	if pol != nil {
+		findings = append(findings, checkGatewayBounds(p, pol)...)
 	}
 
 	return findings
@@ -543,7 +553,17 @@ func validateRegistry(c *datupletv1.ComponentSpec, stageIdx, compIdx int, reg Re
 		})
 	}
 
-	if rc == nil || rc.ConfigSchema == nil {
+	if rc == nil {
+		return findings
+	}
+
+	// Phase 3: reject resource requests/limits that exceed the resolved
+	// version's registry Max, or name a resource not listed in Max. Checked
+	// whenever the component resolves, independent of any config schema
+	// (RFC 026 §4.4).
+	findings = append(findings, checkResourcesAgainstMax(c.Resources, rc.Resources.Max, base, c.Component)...)
+
+	if rc.ConfigSchema == nil {
 		return findings
 	}
 

@@ -97,7 +97,7 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 	// decodes and validates cleanly, so the re-decode here (needed for the
 	// typed CRD ReferencedSecrets walks) cannot fail in practice; a failure
 	// would mean the store returned different bytes than were just parsed.
-	crd, _, err := validate.ValidatePipeline([]byte(pipe.YAML), nil)
+	crd, _, err := validate.ValidatePipeline([]byte(pipe.YAML), nil, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "re-validate pipeline")
 		return
