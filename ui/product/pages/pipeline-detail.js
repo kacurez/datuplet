@@ -467,13 +467,15 @@ export async function renderPipelineDetail(ctx) {
 // componentSnippet returns a stand-alone, correctly-indented `components:`
 // list entry for the given component name (plus the resolved default version,
 // if any). Indentation is fixed at the stage.components level; users paste it
-// under a `components:` block. Name is sanitized to a DNS-1123-ish token.
+// under a `components:` block. It delegates to componentBlockYAML so the v1
+// "Insert snippet" path and the v2 schema-form path share ONE serializer and
+// quote name / component / version identically: a registry-supplied string with
+// a YAML-special or control char is double-quoted and can never inject a sibling
+// key (e.g. `resources:`). For clean names/versions the output is byte-identical
+// to the previous raw interpolation.
 function componentSnippet(name) {
   const ver = document.getElementById('add-component').dataset.version || '';
-  return `        - name: ${name.replace(/[^a-z0-9-]/g, '-')}
-          component: ${name}${ver ? `\n          version: ${ver}` : ''}
-          config: {}
-`;
+  return componentBlockYAML(name, ver, {});
 }
 
 // pickDocVersion selects the version to document / build a form for: the
@@ -519,25 +521,28 @@ function componentBlockYAML(name, version, cfg, inputs, outputs) {
 
 // emitInputs appends an `inputs:` sub-block (sibling of `config:`, 10-space
 // indent) when there are input tables. Each table maps the storage catalog's
-// (namespace, name) onto the CRD `InputTableSpec` fields (bucket, table). All
-// bucket/table strings route through yamlScalar so user/catalog values can't
-// inject sibling keys.
+// (namespace, name) onto the CRD `InputTableSpec` fields (bucket, table). These
+// are single-line identifiers, so they route through yamlIdentScalar: a value
+// carrying a newline / control char / YAML-special char becomes a single
+// double-quoted scalar and can never inject a sibling key.
 function emitInputs(lines, inputs) {
   const tables = inputs && Array.isArray(inputs.tables) ? inputs.tables : [];
   if (tables.length === 0) return;
   lines.push(`          inputs:`);
   lines.push(`            tables:`);
   for (const t of tables) {
-    lines.push(`              - bucket: ${yamlScalar(t.bucket)}`);
-    lines.push(`                table: ${yamlScalar(t.table)}`);
+    lines.push(`              - bucket: ${yamlIdentScalar(t.bucket)}`);
+    lines.push(`                table: ${yamlIdentScalar(t.table)}`);
   }
 }
 
 // emitOutputs appends an `outputs:` sub-block when the user filled anything.
 // A table name selects the `OutputTableSpec` shape — `bucket` is REQUIRED, so
 // entries without one are dropped (never emitted). Otherwise the bucket /
-// writeMode become defaultBucket / defaultWriteMode. Values route through
-// yamlScalar.
+// writeMode become defaultBucket / defaultWriteMode. These are all single-line
+// identifiers, so they route through yamlIdentScalar (never yamlScalar): a value
+// carrying a newline / control char / YAML-special char becomes a single
+// double-quoted scalar and can never inject a sibling key.
 function emitOutputs(lines, outputs) {
   if (!outputs) return;
   const tables = Array.isArray(outputs.tables)
@@ -547,9 +552,9 @@ function emitOutputs(lines, outputs) {
     lines.push(`          outputs:`);
     lines.push(`            tables:`);
     for (const t of tables) {
-      lines.push(`              - name: ${yamlScalar(t.name)}`);
-      lines.push(`                bucket: ${yamlScalar(t.bucket)}`);
-      if (t.writeMode) lines.push(`                writeMode: ${yamlScalar(t.writeMode)}`);
+      lines.push(`              - name: ${yamlIdentScalar(t.name)}`);
+      lines.push(`                bucket: ${yamlIdentScalar(t.bucket)}`);
+      if (t.writeMode) lines.push(`                writeMode: ${yamlIdentScalar(t.writeMode)}`);
     }
     return;
   }
@@ -557,20 +562,37 @@ function emitOutputs(lines, outputs) {
   const hasWriteMode = outputs.defaultWriteMode != null && String(outputs.defaultWriteMode) !== '';
   if (!hasBucket && !hasWriteMode) return;
   lines.push(`          outputs:`);
-  if (hasBucket) lines.push(`            defaultBucket: ${yamlScalar(outputs.defaultBucket)}`);
-  if (hasWriteMode) lines.push(`            defaultWriteMode: ${yamlScalar(outputs.defaultWriteMode)}`);
+  if (hasBucket) lines.push(`            defaultBucket: ${yamlIdentScalar(outputs.defaultBucket)}`);
+  if (hasWriteMode) lines.push(`            defaultWriteMode: ${yamlIdentScalar(outputs.defaultWriteMode)}`);
 }
 
 // yamlKeyValue appends one config entry (`<pad><key>: <value>`, or a block
-// scalar / block list) to `lines`. `indent` is the column of the key.
+// scalar / block list) to `lines`. `indent` is the column of the key. The key
+// (an author-controlled JSON-Schema property name) routes through
+// yamlIdentScalar so a key containing a newline / `:` / YAML-special char is
+// double-quoted and can never break onto a new line as a sibling key.
 function yamlKeyValue(lines, key, value, indent) {
   const pad = ' '.repeat(indent);
-  const yk = yamlScalar(key);
-  if (typeof value === 'string' && value.indexOf('\n') !== -1) {
-    // multi-line string → literal block scalar `|` (content indented +2).
-    lines.push(`${pad}${yk}: |`);
-    const cpad = ' '.repeat(indent + 2);
-    for (const ln of value.split('\n')) lines.push(`${cpad}${ln}`);
+  const yk = yamlIdentScalar(key);
+  if (typeof value === 'string' && value.includes('\n')) {
+    // A literal block scalar `|` is only SAFE when the value's SOLE line break
+    // is `\n`. Any other char that PyYAML (YAML 1.1) treats as a line break can
+    // terminate an indented block line so the trailing attacker text parses as a
+    // SIBLING YAML key (e.g. `resources:`) instead of block content. Beyond the
+    // C0 controls (`\r` etc.) that also means NEL (`\x85`), LINE SEPARATOR
+    // (`\u2028`) and PARAGRAPH SEPARATOR (`\u2029`); DEL (`\x7f`) is rejected too
+    // for conservatism. So emit a block scalar iff the value's only line-break /
+    // special char is `\n`; OTHERWISE emit it as a single double-quoted escaped
+    // scalar via yamlIdentScalar, whose quotes delimit the scalar so no folded
+    // break can terminate it and inject a sibling. Clean multi-line SQL (only
+    // `\n`) still block-scalars, byte-identically.
+    if (!/[\x00-\x09\x0b-\x1f\x7f\x85\u2028\u2029]/.test(value)) {
+      lines.push(`${pad}${yk}: |`);
+      const cpad = ' '.repeat(indent + 2);
+      for (const ln of value.split('\n')) lines.push(`${cpad}${ln}`);
+    } else {
+      lines.push(`${pad}${yk}: ${yamlIdentScalar(value)}`);
+    }
     return;
   }
   if (Array.isArray(value) && value.length > 0 && value.every(isYamlScalar)) {
@@ -594,14 +616,18 @@ function isYamlScalar(v) {
   return v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
 }
 
-// yamlScalar renders a single scalar (also used for keys): numbers/booleans →
+// yamlScalar renders a single INLINE scalar value: numbers/booleans →
 // literal; null → `null`; strings → plain unless they need quoting, in which
-// case JSON.stringify yields a valid YAML double-quoted scalar.
+// case JSON.stringify yields a valid YAML double-quoted scalar. A string with a
+// newline / control char is ALSO double-quoted (escaped as `\n` etc.) so an
+// inline use (a config array item, `yamlInline`) can never break onto a new line
+// and inject a sibling. This does NOT touch multi-line config VALUES: those are
+// intercepted upstream by yamlKeyValue and emitted as a `|` block scalar.
 function yamlScalar(v) {
   if (v === null) return 'null';
   if (typeof v === 'number' || typeof v === 'boolean') return String(v);
   const s = String(v);
-  return needsYamlQuote(s) ? JSON.stringify(s) : s;
+  return needsYamlQuote(s) || /[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(s) ? JSON.stringify(s) : s;
 }
 
 // needsYamlQuote is conservative — it quotes any string that could be misread
@@ -616,16 +642,17 @@ function needsYamlQuote(s) {
   return false;
 }
 
-// yamlIdentScalar renders an identifier field (name / component / version) as a
-// SINGLE inline `key: value` scalar. Unlike the config path (yamlKeyValue) it
-// NEVER emits a block scalar: a value with any YAML-special char OR a newline /
-// control char is double-quoted via JSON.stringify (which escapes `\` `"` and
-// newline as `\n`), so it can never break onto a new line as a sibling key.
-// Clean DNS-1123 / semver values pass needsYamlQuote and stay unquoted, so
-// well-formed output is byte-identical to the previous raw interpolation.
+// yamlIdentScalar renders an identifier field (name / component / version) or a
+// config KEY as a SINGLE inline scalar. Unlike the config VALUE path (which can
+// emit a block scalar for multi-line strings) it NEVER breaks onto a new line: a
+// value with any YAML-special char OR a newline / control char is double-quoted
+// via JSON.stringify (which escapes `\` `"` and newline as `\n`), so it can
+// never inject a sibling key. Clean DNS-1123 / semver identifiers and normal
+// property names pass needsYamlQuote and stay unquoted, so well-formed output is
+// byte-identical to the previous raw interpolation.
 function yamlIdentScalar(v) {
   const s = String(v);
-  if (needsYamlQuote(s) || /[\u0000-\u001f]/.test(s)) return JSON.stringify(s);
+  if (needsYamlQuote(s) || /[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(s)) return JSON.stringify(s);
   return s;
 }
 
