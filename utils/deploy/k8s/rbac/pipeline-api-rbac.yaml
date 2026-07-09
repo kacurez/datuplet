@@ -20,6 +20,10 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "create", "watch"]
+  # Belt-and-braces LimitRange in each project namespace (RFC 026 P3 §4.4).
+  - apiGroups: [""]
+    resources: ["limitranges"]
+    verbs: ["get", "create"]
   # Pipeline CRD materialization on trigger + GC on pipeline delete.
   - apiGroups: ["datuplet.io"]
     resources: ["pipelines"]

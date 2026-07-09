@@ -27,7 +27,8 @@ func NamespaceForProject(projectID uuid.UUID) string {
 
 // EnsureProjectNamespace creates the Namespace for projectID if it does not
 // exist, plus the per-project-namespace secret Roles + RoleBindings (RFC 026
-// P1.5). Idempotent: treats AlreadyExists as success. Does NOT update labels
+// P1.5) and a belt-and-braces LimitRange (RFC 026 P3 §4.4). Idempotent: treats
+// AlreadyExists as success. Does NOT update labels
 // on an existing Namespace (the operator will reject runs whose token
 // disagrees with the existing label, which is the right fail-safe).
 //
@@ -42,7 +43,14 @@ func EnsureProjectNamespace(ctx context.Context, c client.Client, projectID uuid
 	if err := ensureNamespace(ctx, c, name, projectID); err != nil {
 		return err
 	}
-	return ensureSecretsRBAC(ctx, c, name)
+	if err := ensureSecretsRBAC(ctx, c, name); err != nil {
+		return err
+	}
+	// Belt-and-braces LimitRange (RFC 026 §4.4). Unconditional, like the RBAC
+	// step above, so a pre-provisioned namespace is backfilled on the next
+	// ensure. The real resource ceiling is the registry Max + controller clamp;
+	// this is only a default for pods created outside Datuplet's own path.
+	return EnsureProjectLimitRange(ctx, c, projectID)
 }
 
 // ensureNamespace creates the project Namespace if absent.

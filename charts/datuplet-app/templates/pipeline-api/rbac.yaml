@@ -45,6 +45,13 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "create", "list"]
+  # Belt-and-braces LimitRange in each project namespace (RFC 026 P3 §4.4).
+  # Get-before-Create, so `get` + `create` only. Unlike Secrets, a LimitRange
+  # is not sensitive, so a cluster-wide create verb is acceptable here (same
+  # posture as `namespaces` above), rather than a per-namespace Role.
+  - apiGroups: [""]
+    resources: ["limitranges"]
+    verbs: ["get", "create"]
   # Pipeline CRD materialization on trigger (Get + Create, Update on race).
   - apiGroups: ["datuplet.io"]
     resources: ["pipelines"]
