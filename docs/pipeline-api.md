@@ -268,13 +268,49 @@ Cancel order: FGA tuple deleted first → pod annotated `datuplet.io/cancel=true
 |------|---------|
 | `/ui/login` | Email + password → `POST /api/v1/auth/login` (session cookie) |
 | `/ui/pipelines` | List the active project's pipelines |
-| `/ui/pipelines/new` | Create a new pipeline (name + YAML textarea) |
-| `/ui/pipelines/:name` | View / edit / delete the stored YAML |
+| `/ui/pipelines/_new` | Create a new pipeline (registry-driven builder or raw YAML) |
+| `/ui/pipelines/:name` | View / edit / delete a pipeline; registry-driven builder (schema form or raw YAML) |
 | `/ui/pipelines/:name/trigger` | `POST .../runs` and jump to run detail |
 | `/ui/runs` | 100 most-recent runs; refreshes every 5s |
 | `/ui/runs/:id` | Live run detail; polls every 2s until terminal; Cancel |
 | `/ui/storage` | Browse Iceberg tables in the data lake |
-| `/ui/settings/secrets` | Kubectl recipe placeholder until the secrets API ships |
+| `/ui/components` | Component catalog: registered components, versions table, and config-schema docs |
+| `/ui/settings/secrets` | Write-only project secret management (key names + timestamps; values never shown) |
+
+### Registry-driven UI
+
+The catalog and the pipeline builder are driven by the component registry
+(the `GET /api/v1/components` endpoints below).
+
+- **Component catalog** (`/ui/components`) lists every registered component,
+  with a deprecated badge where applicable. Opening one
+  (`/ui/components?name=<n>`) shows a versions table (version, image,
+  prerelease flag) and the rendered config-schema documentation for one
+  version — the `defaultVersion` if set, else the first non-prerelease version,
+  else the first listed.
+- **Pipeline builder** (`/ui/pipelines/:name`): pick a component and either
+  fill a **schema-generated form** — one control per config field, derived
+  from that version's `configSchema` — or **edit the YAML** directly. The form
+  is a one-way emitter: **Insert as YAML** splices the generated block into the
+  editor. **Two-way form↔YAML sync is intentionally not provided** — the
+  **Edit as YAML…** toggle is one-way and confirm-guarded; a hand-edited block
+  cannot be pulled back into the form.
+- **Secret fields** — config properties flagged `x-datuplet-secret` — render as
+  a picker of `$[<key>]` references. The key names come from the project's
+  write-only secrets API (`GET /api/v1/projects/{pid}/secrets`); a **manage
+  secrets** link points to `/ui/settings/secrets`. A plaintext secret cannot be
+  entered.
+- **Inputs / outputs pickers** — **input** tables are chosen from the storage
+  catalog (existing lake tables); **outputs** are new tables the run creates, so
+  they are entered as a bucket / optional table name / write-mode select (not
+  picked from existing tables). Both fold into the emitted component block.
+- The **`resources` field is YAML-only** — the builder never renders a control
+  for it and never emits it. Changing any component's `resources` requires
+  superadmin: on save, the diff-gate rejects (403) a non-superadmin whose save
+  *adds or modifies* a `resources` block (an unchanged resubmission passes), and
+  any value over the registry `resources.max` is rejected (400). (On the direct
+  `kubectl apply` path the controller instead clamps over-max values to that
+  ceiling — the two enforcement layers of RFC 026 §4.4.)
 
 ### Architecture notes
 
@@ -330,6 +366,61 @@ Open `http://localhost:30081/ui/` and log in.
 `make undeploy-local` wipes the K8s objects but **leaves** the Postgres PVC, the signing-key Secret, the `datuplet` namespace, and the MinIO host-path directory. Re-running `make deploy-local` with the same `DATUPLET_DATA_HOST_PATH` brings everything back with the previous data lake and user history intact.
 
 `./undeploy-local.sh --delete-namespace` additionally drops namespace + CRDs + PVC but never touches the host data directory. `rm -rf $DATUPLET_DATA_HOST_PATH` is the only way to wipe the data lake.
+
+## Components endpoints
+
+The component registry (RFC 026) backs the catalog page and the pipeline
+builder. Both routes are behind `auth.WithUser` only — any authenticated user
+can read the catalog (it *is* the shared component picker); there is no
+project-scoped authz check. They register when the registry is wired. Handlers:
+`pkg/pipelineapi/http/component_handlers.go`.
+
+### List components
+
+`GET /api/v1/components`
+
+Returns the registered components (deprecated ones stay listed, flagged):
+
+```json
+[
+  {
+    "name": "sql-transform",
+    "displayName": "SQL Transform",
+    "description": "Run user SQL in an embedded DuckDB engine.",
+    "deprecated": false,
+    "defaultVersion": "1.2.0",
+    "versions": [
+      { "version": "1.2.0", "prerelease": false, "image": "ghcr.io/datuplet/sql-transform:1.2.0" }
+    ]
+  }
+]
+```
+
+### Get one component
+
+`GET /api/v1/components/{name}`
+
+Same shape as a list entry, plus `configSchema` on each version — a JSON-Schema
+(draft 2020-12) string the UI renders as config docs and as the
+schema-generated builder form:
+
+```json
+{
+  "name": "sql-transform",
+  "displayName": "SQL Transform",
+  "description": "Run user SQL in an embedded DuckDB engine.",
+  "deprecated": false,
+  "defaultVersion": "1.2.0",
+  "versions": [
+    {
+      "version": "1.2.0",
+      "prerelease": false,
+      "image": "ghcr.io/datuplet/sql-transform:1.2.0",
+      "configSchema": "{\"type\":\"object\",\"properties\":{ ... }}"
+    }
+  ]
+}
+```
 
 ## Storage endpoints
 

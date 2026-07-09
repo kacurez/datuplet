@@ -74,7 +74,7 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
   thin Go and Python SDKs.
 - Apache Iceberg table format on top of S3 / GCS / bundled MinIO.
 - `pipeline-api` HTTP control plane and browser UI for pipelines, runs, secrets,
-  and storage browse.
+  storage browse, and the registry-driven component catalog.
 - `pipeline-observer` K8s informer that mirrors PipelineRun status into Postgres.
 - `pipeline-operator` controller that reconciles PipelineRun CRDs into component
   Pods and per-table iceberg commit Jobs.

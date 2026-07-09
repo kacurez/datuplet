@@ -127,7 +127,9 @@ These are conventions a new contributor wouldn't infer from the code:
 - **Browser UI** lives at `ui/product/` (vanilla ES modules, no build step).
   Pipeline-api serves it at `/ui/*` when `PIPELINE_API_UI_DIR` is set; the
   K8s Deployment sets this to `/app/ui/product`. On 401 the fetch wrapper
-  redirects to `/ui/login`.
+  redirects to `/ui/login`. Includes a registry-driven component catalog
+  (`/ui/components`) and a schema-form pipeline builder (`/ui/pipelines/:name`,
+  one-way "Edit as YAML"; `$[key]` secret + storage-catalog pickers).
 - **`pipeline-observer` runs in its own Deployment** (single replica,
   single-writer to the `runs` table). Pipeline-api defaults to 2 replicas
   (HTTP-only). The 24h reaper lives in a separate CronJob with a narrower
