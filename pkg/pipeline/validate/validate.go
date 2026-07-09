@@ -138,6 +138,12 @@ func ValidateTyped(p *datupletv1.Pipeline, reg RegistryView, pol *Policy) []Find
 		}
 	}
 
+	// Component instance names must be unique across the whole pipeline: the
+	// controller matches Jobs to components by the datuplet.io/component=<name>
+	// label, so duplicate names (same stage or across stages) are ambiguous.
+	// Structural check — runs independent of registry wiring.
+	findings = append(findings, checkUniqueComponentNames(p)...)
+
 	// Secret-reference syntax validation (pkg/lib/secrets). $[name] markers are
 	// restricted to component.config — we walk only that subtree per component
 	// and surface whole-scalar violations with the offending path.
@@ -153,6 +159,35 @@ func ValidateTyped(p *datupletv1.Pipeline, reg RegistryView, pol *Policy) []Find
 		findings = append(findings, checkGatewayBounds(p, pol)...)
 	}
 
+	return findings
+}
+
+// checkUniqueComponentNames flags every component instance whose name has
+// already appeared earlier in the pipeline. Iteration is stage-then-component
+// order so the findings are deterministic; the first occurrence of a name is
+// accepted and each later occurrence is reported. Empty names are skipped —
+// validateComponent already flags those as "name is required".
+func checkUniqueComponentNames(p *datupletv1.Pipeline) []Finding {
+	var findings []Finding
+	seen := make(map[string]bool)
+	for i := range p.Spec.Stages {
+		stage := &p.Spec.Stages[i]
+		for j := range stage.Components {
+			name := stage.Components[j].Name
+			if name == "" {
+				continue
+			}
+			if seen[name] {
+				findings = append(findings, Finding{
+					Path:     fmt.Sprintf("stages[%d].components[%d].name", i, j),
+					Message:  fmt.Sprintf("component name %q is not unique — component instance names must be unique across the whole pipeline", name),
+					Severity: severityError,
+				})
+				continue
+			}
+			seen[name] = true
+		}
+	}
 	return findings
 }
 

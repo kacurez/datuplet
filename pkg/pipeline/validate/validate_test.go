@@ -337,6 +337,81 @@ spec:
 `,
 			wantZero: true,
 		},
+		{
+			name: "duplicate component name in same stage",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: c1
+          component: extractor
+          outputs:
+            defaultBucket: raw
+        - name: c1
+          component: extractor
+          outputs:
+            defaultBucket: raw2
+`,
+			msgContains: "not unique",
+		},
+		{
+			name: "duplicate component name across stages",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: c1
+          component: extractor
+          outputs:
+            defaultBucket: raw
+    - name: transform
+      components:
+        - name: c1
+          component: transformer
+          inputs:
+            buckets: [raw]
+          outputs:
+            defaultBucket: curated
+`,
+			msgContains: "not unique",
+		},
+		{
+			name: "all component names unique",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: c1
+          component: extractor
+          outputs:
+            defaultBucket: raw
+        - name: c2
+          component: extractor
+          outputs:
+            defaultBucket: raw2
+    - name: transform
+      components:
+        - name: c3
+          component: transformer
+          inputs:
+            buckets: [raw]
+          outputs:
+            defaultBucket: curated
+`,
+			wantZero: true,
+		},
 	}
 
 	for _, c := range cases {
