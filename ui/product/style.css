@@ -864,3 +864,17 @@ code.inline {
 .finding { display: flex; flex-direction: column; gap: var(--s-1); font-size: var(--text-sm); }
 .finding-path { font-family: var(--font-mono); font-size: var(--text-xs); }
 .finding-msg { color: var(--fg-0); }
+
+/* ---------- Components catalog (RFC 026 Phase 4) ---------- */
+.section-h { margin: var(--s-5) 0 var(--s-2); font-size: var(--text-lg); }
+.badge--deprecated { color: var(--status-fail-fg); }
+.badge--pre { color: var(--status-running-fg); }
+.badge--req { color: var(--status-running-fg); }
+.badge--secret { color: var(--accent); }
+.schema-docs { display: flex; flex-direction: column; gap: var(--s-3); }
+.schema-prop { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s-3); background: var(--bg-1); }
+.schema-prop-head { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; }
+.schema-type { color: var(--fg-2); font-size: var(--text-xs); font-family: var(--font-mono); }
+.schema-desc { color: var(--fg-1); font-size: var(--text-sm); margin-top: var(--s-1); }
+.schema-enum { color: var(--fg-2); font-size: var(--text-xs); display: block; margin-top: var(--s-1); }
+.schema-note { color: var(--fg-2); font-size: var(--text-xs); }
