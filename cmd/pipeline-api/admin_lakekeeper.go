@@ -528,6 +528,13 @@ func lakekeeperWarehouseExists(c *http.Client, base, jwt, projectID, name string
 // pagination (lakekeeper writes a single server:<uuid> tuple on first bootstrap).
 // Idempotent: re-write of an existing tuple returns 400 "already exists" and is
 // treated as success.
+//
+// Option A (RFC 026 §4.5): this writes ONLY the legacy literal
+// `user:oidc~admin` subject (for lakekeeper's own console). The UUID-subject
+// platform-superadmin seed tuple (user:oidc~<uuid>, admin, server:<uuid>) is
+// granted post-install via `pipeline-api admin grant --user <email>
+// --superadmin`, since resolving email→UUID needs the DB and bootstrap is
+// DB-free by design. The chart hook (T8) / e2e (T10) invoke that grant.
 func writeServerAdminTuple(ctx context.Context, fgaURL, apiKey, storeID string) error {
 	c := &http.Client{Timeout: 30 * time.Second}
 

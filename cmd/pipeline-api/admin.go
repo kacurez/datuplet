@@ -126,6 +126,12 @@ type projectProvisioningEnv struct {
 	creatorUserID string // OIDC sub for the project_admin tuple
 	lkManager     *lakekeeper.Manager
 	authorizer    authz.Authorizer
+	// FGA connection coordinates, resolved from flags/env. Threaded out so
+	// callers (e.g. `admin grant --superadmin`) can call DiscoverServerObject
+	// with the same values the authorizer was dialed from.
+	fgaURL  string
+	apiKey  string
+	storeID string
 }
 
 // dialProjectProvisioning resolves CLI flags + env into a live
@@ -226,7 +232,7 @@ func dialProjectProvisioning(ctx context.Context, pool *pgxpool.Pool, fs *flag.F
 	if err != nil {
 		return nil, fmt.Errorf("lakekeeper manager: %w", err)
 	}
-	authorizer, err := authz.NewOpenFGAAuthorizer(*openfgaURL, *storeID, *modelID, os.Getenv("OPENFGA_API_KEY"), 5*time.Second)
+	authorizer, err := authz.NewOpenFGAAuthorizer(*openfgaURL, *storeID, *modelID, *apiKey, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("openfga authorizer: %w", err)
 	}
@@ -234,6 +240,9 @@ func dialProjectProvisioning(ctx context.Context, pool *pgxpool.Pool, fs *flag.F
 		creatorUserID: *creatorUserID,
 		lkManager:     mgr,
 		authorizer:    authorizer,
+		fgaURL:        *openfgaURL,
+		apiKey:        *apiKey,
+		storeID:       *storeID,
 	}, nil
 }
 
@@ -546,20 +555,34 @@ func adminEnsureProjectAuthz(ctx context.Context, pool *pgxpool.Pool, args []str
 func adminGrant(ctx context.Context, pool *pgxpool.Pool, args []string) error {
 	fs := flag.NewFlagSet("grant", flag.ExitOnError)
 	email := fs.String("user", "", "User email (required)")
-	projectName := fs.String("project", "", "Project name (required)")
+	projectName := fs.String("project", "", "Project name (required unless --superadmin)")
 	role := fs.String("role", "editor", "Role: 'admin', 'editor' (or 'user' alias), or 'viewer'")
+	superadmin := fs.Bool("superadmin", false, "Grant platform superadmin (FGA server.admin) to --user instead of a project role")
 	env, err := dialProjectProvisioning(ctx, pool, fs, args)
 	if err != nil {
 		return err
 	}
-	if *email == "" || *projectName == "" {
-		return fmt.Errorf("--user and --project are required")
+	if err := validateGrantFlags(*email, *projectName, *role, *superadmin); err != nil {
+		return err
 	}
 
 	// Resolve the user row from Postgres.
 	u, err := store.GetUserByEmail(ctx, pool, *email)
 	if err != nil {
 		return fmt.Errorf("user: %w", err)
+	}
+
+	// --superadmin grants FGA server.admin (the platform superadmin relation)
+	// to the user's UUID subject, targeting the discovered server:<uuid>
+	// singleton rather than a project.
+	if *superadmin {
+		tuple, err := writeSuperadminTuple(ctx, env.authorizer, env.fgaURL, env.apiKey, env.storeID, u.ID.String())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Granted superadmin (server.admin) to %s\n", u.Email)
+		fmt.Printf("  FGA tuple: %s %s %s\n", tuple.User, tuple.Relation, tuple.Object.String())
+		return nil
 	}
 
 	// Resolve the project row and its lakekeeper Project ID.
@@ -595,6 +618,56 @@ func adminGrant(ctx context.Context, pool *pgxpool.Pool, args []string) error {
 	fmt.Printf("Granted role %q on %q to %s\n", relation, *projectName, u.Email)
 	fmt.Printf("  FGA tuple: %s %s %s\n", tuple.User, tuple.Relation, tuple.Object.String())
 	return nil
+}
+
+// validateGrantFlags checks the --user / --project / --role / --superadmin
+// combination. --superadmin targets the server:<uuid> singleton, not a
+// project, so it is mutually exclusive with a project role: passing a
+// non-default --role or any --project alongside --superadmin is rejected.
+func validateGrantFlags(email, projectName, role string, superadmin bool) error {
+	if superadmin {
+		if email == "" {
+			return fmt.Errorf("--user is required")
+		}
+		if role != "editor" || projectName != "" {
+			return fmt.Errorf("--superadmin cannot be combined with --role/--project")
+		}
+		return nil
+	}
+	if email == "" || projectName == "" {
+		return fmt.Errorf("--user and --project are required")
+	}
+	return nil
+}
+
+// discoverServerObjectFn is the seam for `admin grant --superadmin`'s
+// server:<uuid> discovery. Overridden in tests to avoid a live FGA /changes
+// call.
+var discoverServerObjectFn = authz.DiscoverServerObject
+
+// writeSuperadminTuple discovers the server:<uuid> singleton and writes the
+// UUID-subject platform-superadmin tuple (user:oidc~<uuid>, admin,
+// server:<uuid>) for the given user. Split out of adminGrant so it is
+// unit-testable through the discoverServerObjectFn seam without a DB or a
+// live FGA dial. Returns the written tuple for confirmation output.
+func writeSuperadminTuple(ctx context.Context, authorizer authz.Authorizer, fgaURL, apiKey, storeID, userUUID string) (authz.Tuple, error) {
+	serverWire, err := discoverServerObjectFn(ctx, fgaURL, apiKey, storeID)
+	if err != nil {
+		return authz.Tuple{}, fmt.Errorf("discover server object: %w", err)
+	}
+	serverObj, err := authz.ParseObject(serverWire)
+	if err != nil {
+		return authz.Tuple{}, err
+	}
+	tuple := authz.Tuple{
+		User:     authz.UserObject(userUUID).String(),
+		Relation: "admin",
+		Object:   serverObj,
+	}
+	if err := authorizer.WriteTuples(ctx, []authz.Tuple{tuple}); err != nil {
+		return authz.Tuple{}, fmt.Errorf("write superadmin tuple: %w", err)
+	}
+	return tuple, nil
 }
 
 func adminKeygen(args []string) error {
