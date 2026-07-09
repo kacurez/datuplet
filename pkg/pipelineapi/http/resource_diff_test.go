@@ -26,6 +26,38 @@ func pipelineWithResources(comp string, rr *corev1.ResourceRequirements) *datupl
 	}
 }
 
+// stageComp names a single component instance placed in a named stage.
+type stageComp struct {
+	stage string
+	name  string
+	rr    *corev1.ResourceRequirements
+}
+
+// pipelineFromStages builds a pipeline with one component instance per entry,
+// each in its own StageSpec (entries sharing a stage name land in the same
+// stage in order).
+func pipelineFromStages(entries ...stageComp) *datupletv1.Pipeline {
+	byStage := map[string]int{}
+	var stages []datupletv1.StageSpec
+	for _, e := range entries {
+		comp := datupletv1.ComponentSpec{
+			Name:      e.name,
+			Component: "datuplet/test:latest",
+			Resources: e.rr,
+		}
+		if idx, ok := byStage[e.stage]; ok {
+			stages[idx].Components = append(stages[idx].Components, comp)
+			continue
+		}
+		byStage[e.stage] = len(stages)
+		stages = append(stages, datupletv1.StageSpec{
+			Name:       e.stage,
+			Components: []datupletv1.ComponentSpec{comp},
+		})
+	}
+	return &datupletv1.Pipeline{Spec: datupletv1.PipelineSpec{Stages: stages}}
+}
+
 func cpuLimit(v string) *corev1.ResourceRequirements {
 	return &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(v)},
@@ -77,5 +109,24 @@ func TestResourcesModified_BothNilUnchanged(t *testing.T) {
 	newP := pipelineWithResources("c1", nil)
 	if resourcesModified(oldP, newP) {
 		t.Error("no resources on either side must NOT count as modified")
+	}
+}
+
+// TestResourcesModified_CrossStageSameNameNoBypass guards the bypass a bare-name
+// key allowed: old has stage1/c1 with NO block and stage2/c1 WITH block R; a
+// non-superadmin PUT copies R onto stage1/c1. Keying by (stage, name) must see
+// stage1/c1 gaining a block and report modified — a bare-name key would collapse
+// both c1 instances and miss it.
+func TestResourcesModified_CrossStageSameNameNoBypass(t *testing.T) {
+	oldP := pipelineFromStages(
+		stageComp{stage: "stage1", name: "c1", rr: nil},
+		stageComp{stage: "stage2", name: "c1", rr: cpuLimit("2")},
+	)
+	newP := pipelineFromStages(
+		stageComp{stage: "stage1", name: "c1", rr: cpuLimit("2")},
+		stageComp{stage: "stage2", name: "c1", rr: cpuLimit("2")},
+	)
+	if !resourcesModified(oldP, newP) {
+		t.Error("adding a resources block to stage1/c1 must count as modified even though stage2/c1 already carries the same block")
 	}
 }
