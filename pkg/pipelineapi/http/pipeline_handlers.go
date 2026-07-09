@@ -1,15 +1,18 @@
 package http
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
@@ -123,7 +126,7 @@ func pipelineRefToJSON(p PipelineRef) pipelineRefJSON {
 }
 
 func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
-	_, projectID, ok := s.mustHaveRelation(w, r, "data_admin")
+	userID, projectID, ok := s.mustHaveRelation(w, r, "data_admin")
 	if !ok {
 		return
 	}
@@ -152,13 +155,16 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 	}
 	// s.registry is nil when WithRegistry hasn't been wired; ValidatePipeline
 	// treats a nil RegistryView as "skip resolution" (see R5), so this stays
-	// a soft-degrade rather than a nil-deref.
+	// a soft-degrade rather than a nil-deref. Parse with pol=nil here — the
+	// identity-correct policy is applied in the diff-gate below.
 	pl, findings, err := validate.ValidatePipeline(body, s.registry, nil)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid pipeline: "+err.Error())
 		return
 	}
-	if len(findings) > 0 {
+	// A strict-decode failure yields pl==nil with a single error finding;
+	// surface it with the findings contract before touching the diff-gate.
+	if pl == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "validation failed", "findings": findings,
 		})
@@ -167,10 +173,71 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 	// metadata.name must match the URL name: otherwise ApplyPipelineCRD at
 	// run-trigger time would create a CRD under the YAML's name while the
 	// PipelineRun would reference the URL name, and the operator would fail
-	// to find the Pipeline.
+	// to find the Pipeline. Structural check, before the identity-scoped gate.
 	if pl.Name != "" && pl.Name != name {
 		writeError(w, http.StatusBadRequest,
 			fmt.Sprintf("YAML metadata.name %q does not match URL name %q", pl.Name, name))
+		return
+	}
+
+	// RFC 026 §4.4 resources/gateway diff-gate. A non-superadmin may not
+	// add/alter/remove any component `resources` block, nor exceed a gateway
+	// bound; either is a 403 pointing at superadmin. A superadmin bypasses both
+	// the modification gate and the gateway bounds (validating with pol=nil),
+	// but the registry `Max` ceiling still applies to everyone — over-max
+	// findings come from the registry via ValidateTyped, not the policy.
+	// Precedence: the 403 gates run BEFORE surfacing over-max/other findings as
+	// 400, so an unprivileged resources edit gets the clear "superadmin
+	// required" 403 rather than a confusing over-max 400.
+	isSuperadmin, ok := s.isRequestSuperadmin(w, r, userID)
+	if !ok {
+		return // 503/500 already written
+	}
+	if !isSuperadmin {
+		oldP, err := s.storedPipelineSpec(r.Context(), projectID, name)
+		if err != nil {
+			// Fail closed: without the stored spec we cannot verify the
+			// diff-gate. Defaulting to "no old resources" on a transient read
+			// error would let a non-superadmin strip (or edit) an admin-set
+			// resources block through. 503 is retryable.
+			writeError(w, http.StatusServiceUnavailable,
+				"could not read current pipeline to verify the resources gate")
+			return
+		}
+		if resourcesModified(oldP, pl) {
+			writeError(w, http.StatusForbidden,
+				"modifying component resources requires superadmin privileges")
+			return
+		}
+		// Re-validate against the policy so gateway-bound violations surface;
+		// reject any as 403 for a non-superadmin (before the 400 findings path).
+		findings = validate.ValidateTyped(pl, s.registry, s.policy)
+		for _, f := range findings {
+			if f.Severity == "error" && strings.HasPrefix(f.Path, "gateway.") {
+				writeError(w, http.StatusForbidden,
+					"modifying gateway settings beyond policy bounds requires superadmin privileges")
+				return
+			}
+		}
+	}
+	// Split findings by severity: only ERROR-severity findings (resource-over-max,
+	// other validation) block the save with a 400 — checked AFTER the 403 gates
+	// per the precedence above. WARNING findings (e.g. a deprecated-but-resolvable
+	// component) never block a save; they ride along in the final 200 next to the
+	// missing-secret warnings. findings holds the pol=nil parse result for a
+	// superadmin and the policy-applied result for a non-superadmin.
+	var warnFindings, errFindings []validate.Finding
+	for _, f := range findings {
+		if f.Severity == "error" {
+			errFindings = append(errFindings, f)
+		} else {
+			warnFindings = append(warnFindings, f)
+		}
+	}
+	if len(errFindings) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "validation failed", "findings": findings,
+		})
 		return
 	}
 
@@ -190,19 +257,70 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "check secrets")
 		return
 	}
-	if len(missing) > 0 {
-		findings := make([]validate.Finding, 0, len(missing))
-		for _, key := range missing {
-			findings = append(findings, validate.Finding{
-				Path:     "secrets." + key,
-				Message:  fmt.Sprintf("secret %q is referenced but not yet set in this project's secret store", key),
-				Severity: "warning",
-			})
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"findings": findings})
+	// Merge the validation warnings kept from the split above with the
+	// missing-secret warnings; neither source blocks the save. A non-empty
+	// combined set is a 200-with-findings, otherwise a clean 204.
+	warnings := warnFindings
+	for _, key := range missing {
+		warnings = append(warnings, validate.Finding{
+			Path:     "secrets." + key,
+			Message:  fmt.Sprintf("secret %q is referenced but not yet set in this project's secret store", key),
+			Severity: "warning",
+		})
+	}
+	if len(warnings) > 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"findings": warnings})
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// isRequestSuperadmin reports whether the request's user is a platform
+// superadmin for the diff-gate. A nil checker (authz disabled) is treated as
+// "not superadmin". On an authz-backend outage it writes 503; on an unexpected
+// error it writes 500 — both return ok=false so the caller returns immediately.
+// (RFC 026 §4.4.)
+func (s *Server) isRequestSuperadmin(w http.ResponseWriter, r *http.Request, userID uuid.UUID) (isAdmin, ok bool) {
+	if s.serverAdmin == nil {
+		return false, true
+	}
+	admin, err := s.serverAdmin.IsServerAdmin(r.Context(), userID.String())
+	if errors.Is(err, authz.ErrAuthzUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "authz backend unavailable")
+		return false, false
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check superadmin")
+		return false, false
+	}
+	return admin, true
+}
+
+// storedPipelineSpec loads the currently-stored pipeline and parses it into a
+// typed spec for the diff-gate.
+//
+//   - Missing pipeline (first create): empty spec, nil error — a legitimate
+//     "no old resources".
+//   - Any other read error: propagated so the caller can FAIL CLOSED. A
+//     transient read must not default to "no resources" — that would let a
+//     non-superadmin strip an admin-set block through on a flake (RFC 026 §4.4).
+//   - Unparseable stored YAML: empty spec, nil error (logged). Stored YAML
+//     always passed validation on its way in, so this is near-impossible;
+//     treat-as-none rather than blocking a save on it.
+func (s *Server) storedPipelineSpec(ctx context.Context, projectID uuid.UUID, name string) (*datupletv1.Pipeline, error) {
+	stored, err := s.pipelines.GetByName(ctx, projectID, name)
+	switch {
+	case errors.Is(err, errStoreNotFound):
+		return &datupletv1.Pipeline{}, nil
+	case err != nil:
+		return nil, err
+	}
+	p, _, _ := validate.ValidatePipeline([]byte(stored.YAML), s.registry, nil)
+	if p == nil {
+		log.Printf("put-pipeline: stored YAML for %s/%s failed to parse; treating old resources as none", projectID, name)
+		return &datupletv1.Pipeline{}, nil
+	}
+	return p, nil
 }
 
 func (s *Server) handleListPipelines(w http.ResponseWriter, r *http.Request) {

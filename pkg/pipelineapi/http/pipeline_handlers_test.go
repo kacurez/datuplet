@@ -4,11 +4,26 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	stdhttp "net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
+	pipelineapidb "github.com/datuplet/datuplet/pkg/pipelineapi/db"
+	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
 
@@ -525,5 +540,391 @@ func TestPutPipeline_FreshProjectForbiddenSecretRead_ReturnsWarning(t *testing.T
 	}
 	if len(body.Findings) != 1 || body.Findings[0].Severity != "warning" || !strings.Contains(body.Findings[0].Message, "api_token") {
 		t.Fatalf("findings = %+v, want exactly one warning naming api_token", body.Findings)
+	}
+}
+
+// --- RFC 026 P3 (T6): resources/gateway diff-gate on PUT ---
+
+// stubServerAdminT6 is a test double for authz.ServerAdminChecker used by the
+// diff-gate handler tests (the internal-package stubServerAdmin isn't reachable
+// from this external http_test package).
+type stubServerAdminT6 struct {
+	result bool
+	err    error
+}
+
+func (s stubServerAdminT6) ServerObject(context.Context) (string, error) { return "server:x", s.err }
+func (s stubServerAdminT6) IsServerAdmin(context.Context, string) (bool, error) {
+	return s.result, s.err
+}
+
+// freshServerT6 is freshServerWithRegistry plus the Phase-3 diff-gate wiring: a
+// superadmin checker and an (optional) pipeline policy.
+func freshServerT6(t *testing.T, reg apihttp.ComponentRegistry, pol *validate.Policy, admin authz.ServerAdminChecker) (*httptest.Server, *pgxpool.Pool, *authztest.Fake, func()) {
+	t.Helper()
+	return freshServerT6WithStore(t, reg, pol, admin, nil)
+}
+
+// freshServerT6WithStore is freshServerT6 with an optional pipeline-store
+// override. A nil override uses the default pgx-backed store; tests pass a fake
+// to exercise store-error paths (e.g. a transient GetByName failure feeding the
+// diff-gate's fail-closed 503).
+func freshServerT6WithStore(t *testing.T, reg apihttp.ComponentRegistry, pol *validate.Policy, admin authz.ServerAdminChecker, storeOverride apihttp.PipelineStore) (*httptest.Server, *pgxpool.Pool, *authztest.Fake, func()) {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"); err != nil {
+		pool.Close()
+		t.Fatalf("reset: %v", err)
+	}
+	if err := pipelineapidb.Migrate(context.Background(), pool); err != nil {
+		pool.Close()
+		t.Fatalf("migrate: %v", err)
+	}
+	var pstore apihttp.PipelineStore = apihttp.NewPgxPipelineStore(pool)
+	if storeOverride != nil {
+		pstore = storeOverride
+	}
+	authzr := authztest.New()
+	srv := apihttp.NewServer(pool).
+		WithUserResolver(auth.NewPostgresResolver(pool, false)).
+		WithAuthorizer(authzr).
+		WithProjectReader(apihttp.NewPgxProjectReader(pool, authzr)).
+		WithPipelineStore(pstore).
+		WithRunReader(apihttp.NewPgxRunReader(pool)).
+		WithRegistry(reg).
+		WithServerAdmin(admin).
+		WithPipelinePolicy(pol)
+	ts := httptest.NewServer(srv.Handler())
+	cleanup := func() {
+		ts.Close()
+		pool.Close()
+	}
+	return ts, pool, authzr, cleanup
+}
+
+// errGetByNamePipelineStore is a PipelineStore whose GetByName always fails with
+// a non-NotFound error, to exercise the diff-gate's fail-closed 503 path. The
+// handler returns before touching any other method.
+type errGetByNamePipelineStore struct{}
+
+func (errGetByNamePipelineStore) List(context.Context, uuid.UUID) ([]apihttp.PipelineRef, error) {
+	return nil, nil
+}
+
+func (errGetByNamePipelineStore) GetByName(context.Context, uuid.UUID, string) (*apihttp.PipelineDetail, error) {
+	return nil, errors.New("transient store read failure")
+}
+
+func (errGetByNamePipelineStore) GetYAMLByID(context.Context, uuid.UUID) (string, error) {
+	return "", nil
+}
+
+func (errGetByNamePipelineStore) Put(context.Context, uuid.UUID, string, []byte) error { return nil }
+
+func (errGetByNamePipelineStore) Delete(context.Context, uuid.UUID, string) error { return nil }
+
+// componentDefWithMaxCPU builds a ComponentDefinition whose single version
+// bounds cpu at maxCPU (the registry Max ceiling).
+func componentDefWithMaxCPU(name, maxCPU string) datupletv1.ComponentDefinition {
+	return datupletv1.ComponentDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: datupletv1.ComponentDefinitionSpec{
+			DisplayName:    "Display " + name,
+			DefaultVersion: "v1.0.0",
+			Versions: []datupletv1.VersionSpec{{
+				Version: "v1.0.0",
+				Image:   "datuplet/test:v1.0.0",
+				Resources: &datupletv1.ComponentResources{
+					Max: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(maxCPU)},
+				},
+			}},
+		},
+	}
+}
+
+// t6Registry resolves "datuplet/test:latest" (the ref every fixture uses) with
+// the given cpu ceiling.
+func t6Registry(maxCPU string) *fakeComponentRegistry {
+	return newFakeComponentRegistry(componentDefWithMaxCPU("datuplet/test:latest", maxCPU))
+}
+
+// componentDefDeprecated builds a ComponentDefinition marked deprecated so
+// validate.Resolve returns the deprecation *warning* finding (not an error) for
+// a still-resolvable component.
+func componentDefDeprecated(name string) datupletv1.ComponentDefinition {
+	return datupletv1.ComponentDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: datupletv1.ComponentDefinitionSpec{
+			DisplayName:    "Display " + name,
+			DefaultVersion: "v1.0.0",
+			Deprecated:     true,
+			Versions: []datupletv1.VersionSpec{{
+				Version: "v1.0.0",
+				Image:   "datuplet/test:v1.0.0",
+			}},
+		},
+	}
+}
+
+// t6Seed creates a user+session, a project with a lakekeeper id, and the
+// data_admin FGA tuple that mustHaveRelation checks. Returns the session cookie
+// and the datuplet project id.
+func t6Seed(t *testing.T, ts *httptest.Server, pool *pgxpool.Pool, fakeAuthz *authztest.Fake, lkID string) (*stdhttp.Cookie, uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	return cookie, proj.ID
+}
+
+func pipelineYAMLWithCPU(cpu string) []byte {
+	return []byte(`apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: etl
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: c1
+          component: datuplet/test:latest
+          resources:
+            limits:
+              cpu: "` + cpu + `"
+          outputs:
+            defaultBucket: raw
+            defaultWriteMode: APPEND
+`)
+}
+
+// pipelineYAMLBigBuffer sets gateway.bufferSize (no resources block) so the
+// gateway-bound gate is what trips, not the resources modification gate.
+const pipelineYAMLBigBuffer = `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: etl
+spec:
+  gateway:
+    bufferSize: 200
+  stages:
+    - name: extract
+      components:
+        - name: c1
+          component: datuplet/test:latest
+          outputs:
+            defaultBucket: raw
+            defaultWriteMode: APPEND
+`
+
+// Case 1: a non-superadmin adding a resources block where the stored pipeline
+// had none is rejected with 403 pointing at superadmin.
+func TestPutPipeline_NonSuperadmin_AddResources_Forbidden(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-add-res")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", validPipelineYAML); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("2"), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "superadmin") {
+		t.Errorf("403 body = %q, want it to mention superadmin", body)
+	}
+}
+
+// Case 2: a non-superadmin resubmitting the identical stored resources block
+// passes (unchanged is not a modification).
+func TestPutPipeline_NonSuperadmin_ResubmitSameResources_OK(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-resubmit")
+	yaml := pipelineYAMLWithCPU("2")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", string(yaml)); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", yaml, cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 204 {
+		t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, body)
+	}
+}
+
+// Case 3: a non-superadmin changing limits.cpu from the stored value is 403.
+func TestPutPipeline_NonSuperadmin_ChangeCPU_Forbidden(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-change-cpu")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", string(pipelineYAMLWithCPU("1"))); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("2"), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, body)
+	}
+}
+
+// Case 4: "1000m" against a stored "1" is semantically equal, so a
+// non-superadmin resubmit passes (204).
+func TestPutPipeline_NonSuperadmin_SemanticEqualResources_OK(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-semeq")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", string(pipelineYAMLWithCPU("1"))); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("1000m"), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 204 {
+		t.Fatalf("status = %d, want 204 (1000m == 1); body=%s", resp.StatusCode, body)
+	}
+}
+
+// Case 5: a superadmin setting a fresh resources block within Max bypasses the
+// modification gate (204).
+func TestPutPipeline_Superadmin_FreshResourcesWithinMax_OK(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: true})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-super-fresh")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", validPipelineYAML); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("2"), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 204 {
+		t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, body)
+	}
+}
+
+// Case 6: the registry Max ceiling applies to superadmins too — an over-Max
+// block is 400 with a reject finding, not a diff-gate bypass.
+func TestPutPipeline_Superadmin_ResourcesOverMax_BadRequest(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("2"), nil, stubServerAdminT6{result: true})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-super-overmax")
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("4"), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		body, _ := readAll(resp)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	var fb findingsBody
+	if err := json.NewDecoder(resp.Body).Decode(&fb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range fb.Findings {
+		if strings.Contains(f.Message, "exceeds registry max") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want an 'exceeds registry max' finding, got %+v", fb.Findings)
+	}
+}
+
+// Case 7: a non-superadmin exceeding a gateway bound is 403 (the handler maps a
+// gateway-bound finding to 403, not the 400 the finding would otherwise be).
+func TestPutPipeline_NonSuperadmin_OverGatewayBound_Forbidden(t *testing.T) {
+	pol := &validate.Policy{Gateway: validate.GatewayBounds{MaxBufferSize: 100}}
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), pol, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-gw-bound")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", validPipelineYAML); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", []byte(pipelineYAMLBigBuffer), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, body)
+	}
+}
+
+// Case 8: an unavailable superadmin checker fails the PUT with 503, not a
+// silent pass.
+func TestPutPipeline_SuperadminCheckerUnavailable_ServiceUnavailable(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{err: authz.ErrAuthzUnavailable})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-checker-503")
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 503 {
+		t.Fatalf("status = %d, want 503; body=%s", resp.StatusCode, body)
+	}
+}
+
+// Case 9 (MAJOR 1): a non-superadmin PUT of an otherwise-valid pipeline whose
+// component is DEPRECATED is SAVED with 200 + the deprecation warning — never a
+// 400. Warnings never block a save (Phase-1.5 ladder convention); only
+// error-severity findings do.
+func TestPutPipeline_NonSuperadmin_DeprecatedComponent_Warns200(t *testing.T) {
+	reg := newFakeComponentRegistry(componentDefDeprecated("datuplet/test:latest"))
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, reg, nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-deprecated")
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (deprecation is a warning, not a 400); body=%s", resp.StatusCode, body)
+	}
+	var fb secretsFindingsBody
+	if err := json.Unmarshal([]byte(body), &fb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range fb.Findings {
+		if f.Severity == "warning" && strings.Contains(f.Message, "deprecated") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a deprecation warning finding, got %+v", fb.Findings)
+	}
+}
+
+// Case 10 (MAJOR 2): a transient (non-NotFound) stored-pipeline read error makes
+// the diff-gate fail CLOSED with 503, rather than defaulting to "no old
+// resources" and letting a non-superadmin slip a resources edit through.
+func TestPutPipeline_NonSuperadmin_StoreReadError_ServiceUnavailable(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6WithStore(t, t6Registry("4"), nil, stubServerAdminT6{result: false}, errGetByNamePipelineStore{})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-store-read-err")
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 503 {
+		t.Fatalf("status = %d, want 503 (fail closed on read error); body=%s", resp.StatusCode, body)
 	}
 }
