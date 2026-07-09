@@ -505,8 +505,10 @@ func TestGatewaySidecarUsesRuntimePullPolicy(t *testing.T) {
 // TestGatewayHonoursRuntimePullPolicyOverride: e2e/kind sets
 // DATUPLET_RUNTIME_PULL_POLICY=IfNotPresent so K8s uses the pre-loaded
 // images instead of trying to pull non-existent datuplet/* repos from
-// Docker Hub. This governs the GATEWAY sidecar only; the component container
-// is registry-driven (a stable version → IfNotPresent here).
+// Docker Hub. The override applies to the gateway sidecar (asserted here);
+// its effect on the component container is proven independently by
+// TestComponentContainerHonoursRuntimePullPolicyOverride (this run's stable
+// version would resolve to IfNotPresent either way).
 func TestGatewayHonoursRuntimePullPolicyOverride(t *testing.T) {
 	r := &PipelineRunReconciler{
 		GatewayImage:      "datuplet/gateway:latest",
@@ -525,7 +527,34 @@ func TestGatewayHonoursRuntimePullPolicyOverride(t *testing.T) {
 	}
 	comp := job.Spec.Template.Spec.Containers[0]
 	if comp.ImagePullPolicy != corev1.PullIfNotPresent {
-		t.Errorf("component ImagePullPolicy = %q, want IfNotPresent (stable version)", comp.ImagePullPolicy)
+		t.Errorf("component ImagePullPolicy = %q, want IfNotPresent (override; version also stable)", comp.ImagePullPolicy)
+	}
+}
+
+// TestComponentContainerHonoursRuntimePullPolicyOverride: the operator-wide
+// RuntimePullPolicy override (DATUPLET_RUNTIME_PULL_POLICY) is documented to
+// apply to every container the operator builds — INCLUDING the component
+// container. The K8s e2e sets it to IfNotPresent and registers every built-in
+// as a "dev" prerelease version pointing at a pre-loaded local :latest image.
+// If the override does not reach the component container, the registry-driven
+// policy (prerelease → Always) makes K8s try to pull a non-existent datuplet/*
+// repo from Docker Hub → ImagePullBackOff. The override must win.
+func TestComponentContainerHonoursRuntimePullPolicyOverride(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage:      "datuplet/gateway:latest",
+		RuntimePullPolicy: corev1.PullIfNotPresent,
+	}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+	pr.Status.Components[0].Version = "dev" // prerelease → registry policy would be Always
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	comp := job.Spec.Template.Spec.Containers[0]
+	if comp.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("component container ImagePullPolicy = %q, want IfNotPresent (operator override must win over prerelease Always)", comp.ImagePullPolicy)
 	}
 }
 

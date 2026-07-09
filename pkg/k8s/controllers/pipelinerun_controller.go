@@ -207,6 +207,19 @@ func componentPullPolicy(version string) corev1.PullPolicy {
 	return corev1.PullAlways
 }
 
+// componentImagePullPolicy resolves the COMPONENT container's pull policy. The
+// operator-wide RuntimePullPolicy override wins when set: it is documented to
+// apply to every container the operator builds (gateway sidecar AND component
+// container), and e2e/kind rely on it so pre-loaded local images are not
+// re-pulled from a registry that does not have them. Otherwise the policy is
+// registry-driven by the frozen version (componentPullPolicy).
+func (r *PipelineRunReconciler) componentImagePullPolicy(version string) corev1.PullPolicy {
+	if r.RuntimePullPolicy != "" {
+		return r.RuntimePullPolicy
+	}
+	return componentPullPolicy(version)
+}
+
 // firstErrorFinding returns the first error-severity finding, if any. Warning
 // findings (e.g. deprecation) do not fail admission.
 func firstErrorFinding(findings []validate.Finding) (validate.Finding, bool) {

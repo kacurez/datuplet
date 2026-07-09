@@ -228,11 +228,13 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 						{
 							Name:  "component",
 							Image: componentImage,
-							// Registry-driven: a prerelease-resolved version uses a
-							// mutable tag → Always; a stable semver version is
-							// immutable → IfNotPresent. (The gateway sidecar keeps
-							// runtimePullPolicy.)
-							ImagePullPolicy: componentPullPolicy(componentVersion),
+							// Registry-driven when no operator override is set: a
+							// prerelease-resolved version uses a mutable tag →
+							// Always; a stable semver version is immutable →
+							// IfNotPresent. The operator-wide RuntimePullPolicy
+							// override (e2e/kind) wins when set, for both the
+							// gateway sidecar and this component container.
+							ImagePullPolicy: r.componentImagePullPolicy(componentVersion),
 							Env:             env,
 							// Component container hardening: makes the
 							// sidecar-only run-token mount a real defense.
