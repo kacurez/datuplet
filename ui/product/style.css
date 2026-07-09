@@ -878,3 +878,10 @@ code.inline {
 .schema-desc { color: var(--fg-1); font-size: var(--text-sm); margin-top: var(--s-1); }
 .schema-enum { color: var(--fg-2); font-size: var(--text-xs); display: block; margin-top: var(--s-1); }
 .schema-note { color: var(--fg-2); font-size: var(--text-xs); }
+
+/* ---------- Pipeline builder (RFC 026 Phase 4) ---------- */
+.builder-layout { display: grid; grid-template-columns: minmax(0,1fr) 320px; gap: var(--s-4); align-items: start; }
+.builder-toolbar { display: flex; align-items: flex-end; gap: var(--s-2); margin-bottom: var(--s-3); }
+.builder-add { margin-bottom: 0; flex: 1; }
+.builder-docs { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s-3); background: var(--bg-1); position: sticky; top: var(--s-4); max-height: 80vh; overflow-y: auto; }
+@media (max-width: 860px) { .builder-layout { grid-template-columns: 1fr; } .builder-docs { position: static; } }

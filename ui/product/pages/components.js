@@ -123,7 +123,11 @@ async function renderDetail(head, app, name, aborted) {
 // schemaDocs renders a JSON Schema (draft 2020-12) string as a read-only
 // definition list of its top-level properties. Best-effort: unparseable or
 // non-object schemas degrade to a note. Never throws.
-function schemaDocs(schemaStr) {
+//
+// Exported so the pipeline builder's docs panel renders the same schema view
+// as the catalog (RFC 026 Phase 4). typeSummary stays module-private — it's
+// only reached through schemaDocs.
+export function schemaDocs(schemaStr) {
   let schema;
   try {
     schema = JSON.parse(schemaStr);

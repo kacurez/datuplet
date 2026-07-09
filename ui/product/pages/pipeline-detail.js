@@ -13,8 +13,10 @@
 // PUT is idempotent — the same endpoint both creates and replaces.
 // Delete is a separate button with a confirm prompt.
 
-import { api, putYAML, esc } from '/ui/api.js';
+import { api, putPipelineYAML, esc, getComponents, getComponent } from '/ui/api.js';
 import { timeTag, phaseToPillClass, formatDuration, durationFrom } from '/ui/format.js';
+import { renderFindings } from '/ui/lib/findings.js';
+import { schemaDocs } from '/ui/pages/components.js';
 
 const STARTER_YAML = `apiVersion: datuplet.io/v1
 kind: Pipeline
@@ -27,10 +29,10 @@ spec:
         - name: c1
           component: http-json-extractor
           config:
-            url: "https://jsonplaceholder.typicode.com/posts"
+            url: "https://api.example.com/items"
           outputs:
             defaultBucket: raw
-            defaultWriteMode: APPEND
+            defaultWriteMode: FULL_LOAD
 `;
 
 export async function renderPipelineDetail(ctx) {
@@ -45,11 +47,17 @@ export async function renderPipelineDetail(ctx) {
   const name = ctx.params[0];
   const isNew = name === '_new';
 
+  // Abort-on-navigation: bail out of any post-await DOM write if the user
+  // has navigated elsewhere while a fetch was in flight.
+  const path = window.location.pathname;
+  const aborted = () => window.location.pathname !== path;
+
   let yaml = STARTER_YAML;
   let updatedAt = '';
   let pipelineID = '';
   if (!isNew) {
     const pipe = await api(`/api/v1/projects/${encodeURIComponent(pid)}/pipelines/${encodeURIComponent(name)}`);
+    if (aborted()) return;
     yaml = pipe.yaml;
     updatedAt = pipe.updated_at;
     pipelineID = pipe.id;
@@ -73,21 +81,34 @@ export async function renderPipelineDetail(ctx) {
 
   app.innerHTML = `
     ${updatedAt ? `<p style="color:var(--fg-2);"><small>Updated ${timeTag(updatedAt)}</small></p>` : ''}
-    <form id="pipeline-form">
-      ${isNew ? `
-        <label class="field">Name
-          <input class="input" type="text" name="name" placeholder="my-pipeline" required
-            pattern="[a-z0-9]([-a-z0-9.]*[a-z0-9])?"
-            title="Lowercase DNS-1123 subdomain; must match metadata.name in the YAML.">
-        </label>` : ''}
-      <label class="field">YAML
-        <textarea class="textarea input--mono" name="yaml" spellcheck="false" required>${esc(yaml)}</textarea>
-      </label>
-      <div id="pipeline-msg"></div>
-      <div class="actions" style="margin-top:var(--s-3);">
-        <button type="submit" class="btn btn--primary">${isNew ? 'Create' : 'Save'}</button>
+    <div class="builder-layout">
+      <div>
+        <div class="builder-toolbar">
+          <label class="field builder-add">Add component
+            <select class="input" id="add-component"><option value="">Loading…</option></select>
+          </label>
+          <button type="button" class="btn btn--secondary" id="insert-component" disabled>Insert snippet</button>
+        </div>
+        <form id="pipeline-form">
+          ${isNew ? `
+            <label class="field">Name
+              <input class="input" type="text" name="name" placeholder="my-pipeline" required
+                pattern="[a-z0-9]([-a-z0-9.]*[a-z0-9])?"
+                title="Lowercase DNS-1123 subdomain; must match metadata.name in the YAML.">
+            </label>` : ''}
+          <label class="field">YAML
+            <textarea class="textarea input--mono" name="yaml" spellcheck="false" required>${esc(yaml)}</textarea>
+          </label>
+          <div id="pipeline-msg"></div>
+          <div class="actions" style="margin-top:var(--s-3);">
+            <button type="submit" class="btn btn--primary">${isNew ? 'Create' : 'Save'}</button>
+          </div>
+        </form>
       </div>
-    </form>
+      <aside class="builder-docs" id="builder-docs">
+        <p style="color:var(--fg-2);">Pick a component to see its config schema.</p>
+      </aside>
+    </div>
     ${isNew ? '' : `
     <section style="margin-top:var(--s-4);">
       <h2>Recent runs</h2>
@@ -112,19 +133,25 @@ export async function renderPipelineDetail(ctx) {
       const targetName = isNew ? String(fd.get('name') || '').trim() : name;
       if (!targetName) throw new Error('Name is required');
       const yamlText = String(fd.get('yaml') || '');
-      await putYAML(
-        `/api/v1/projects/${encodeURIComponent(pid)}/pipelines/${encodeURIComponent(targetName)}`,
-        yamlText,
-      );
-      msg.innerHTML = `<div class="banner success">Saved.</div>`;
-      if (isNew) {
+      const res = await putPipelineYAML(pid, targetName, yamlText);
+      if (res.ok && (!res.findings || res.findings.length === 0)) {
+        // 204 — clean save.
+        msg.innerHTML = `<div class="callout">Saved.</div>`;
+      } else if (res.ok) {
+        // 200 — saved with warnings.
+        msg.innerHTML = `<div class="callout">Saved with warnings.</div>` + renderFindings(res.findings);
+      } else {
+        // 400 — rejected; findings inline, nothing saved.
+        msg.innerHTML = renderFindings(res.findings);
+      }
+      if (res.ok && isNew) {
         // For a fresh create, jump to the detail view for that name.
         window.history.replaceState({}, '', `/ui/pipelines/${encodeURIComponent(targetName)}`);
         if (typeof window.renderRoute === 'function') window.renderRoute();
       }
     } catch (err) {
       if (String(err.message) !== 'not authenticated') {
-        msg.innerHTML = `<div class="banner error">${esc(err.message)}</div>`;
+        msg.innerHTML = `<div class="callout callout--warn">${esc(err.message)}</div>`;
       }
     } finally {
       btn.disabled = false;
@@ -142,7 +169,7 @@ export async function renderPipelineDetail(ctx) {
           if (typeof window.renderRoute === 'function') window.renderRoute();
         } catch (err) {
           if (String(err.message) !== 'not authenticated') {
-            document.getElementById('pipeline-msg').innerHTML = `<div class="banner error">${esc(err.message)}</div>`;
+            document.getElementById('pipeline-msg').innerHTML = `<div class="callout callout--warn">${esc(err.message)}</div>`;
           }
         }
       });
@@ -158,6 +185,79 @@ export async function renderPipelineDetail(ctx) {
       if (container) container.innerHTML = `<p><small>Couldn't load recent runs: ${esc(err.message)}</small></p>`;
     });
   }
+
+  // ---- Builder: catalog picker + docs panel (RFC 026 Phase 4) -------------
+  // Fetch the component catalog once, populate the "Add component" select,
+  // and wire selection → schema docs / insert → snippet at the cursor. The
+  // textarea remains the source of truth — this is an accelerator, not a
+  // replacement for editing the YAML directly.
+  const sel = document.getElementById('add-component');
+  const insertBtn = document.getElementById('insert-component');
+  const docs = document.getElementById('builder-docs');
+  let comps = [];
+  try {
+    comps = await getComponents();
+  } catch (e) {
+    // Swallow the centralized 'not authenticated' redirect; on any other
+    // fetch error just leave the dropdown empty (builder stays inert).
+  }
+  if (aborted()) return;
+  sel.innerHTML = `<option value="">— choose a component —</option>` +
+    comps.map((c) => `<option value="${esc(c.name)}">${esc(c.displayName || c.name)}${c.deprecated ? ' (deprecated)' : ''}</option>`).join('');
+
+  sel.addEventListener('change', async () => {
+    const cname = sel.value;
+    insertBtn.disabled = !cname;
+    if (!cname) {
+      docs.innerHTML = `<p style="color:var(--fg-2);">Pick a component to see its config schema.</p>`;
+      return;
+    }
+    docs.innerHTML = `<p aria-busy="true">Loading…</p>`;
+    try {
+      const c = await getComponent(cname);
+      if (aborted()) return;
+      const v = (c.versions || []).find((x) => x.version === c.defaultVersion)
+        || (c.versions || []).find((x) => !x.prerelease) || (c.versions || [])[0];
+      docs.innerHTML = `<h3 class="section-h" style="margin-top:0;"><code class="inline">${esc(cname)}</code></h3>` +
+        (v && v.configSchema ? schemaDocs(v.configSchema) : `<p style="color:var(--fg-2);">No schema.</p>`);
+      // Stash the resolved default version for the inserted snippet.
+      sel.dataset.version = v ? v.version : '';
+    } catch (e) {
+      if (!aborted()) docs.innerHTML = `<p style="color:var(--status-fail-fg);">${esc(e.message)}</p>`;
+    }
+  });
+
+  insertBtn.addEventListener('click', () => {
+    const cname = sel.value;
+    if (!cname) return;
+    insertAtCursor(document.querySelector('textarea[name=yaml]'), componentSnippet(cname));
+  });
+}
+
+// componentSnippet returns a stand-alone, correctly-indented `components:`
+// list entry for the given component name (plus the resolved default version,
+// if any). Indentation is fixed at the stage.components level; users paste it
+// under a `components:` block. Name is sanitized to a DNS-1123-ish token.
+function componentSnippet(name) {
+  const ver = document.getElementById('add-component').dataset.version || '';
+  return `        - name: ${name.replace(/[^a-z0-9-]/g, '-')}
+          component: ${name}${ver ? `\n          version: ${ver}` : ''}
+          config: {}
+`;
+}
+
+// insertAtCursor splices text into a textarea at the caret (or over the
+// current selection), then restores focus with the caret after the insert.
+// Mirrors the proven idiom in query.js.
+function insertAtCursor(textarea, text) {
+  if (!textarea) return;
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const before = textarea.value.slice(0, start);
+  const after = textarea.value.slice(end);
+  textarea.value = before + text + after;
+  textarea.selectionStart = textarea.selectionEnd = start + text.length;
+  textarea.focus();
 }
 
 // loadRecentRuns fetches the pipeline's most recent runs via the paged
