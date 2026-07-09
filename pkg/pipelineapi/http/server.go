@@ -66,6 +66,16 @@ type Server struct {
 	// resolution + config-schema checks skipped) — same soft-degrade shape
 	// as the other With* seams.
 	registry ComponentRegistry
+	// serverAdmin answers "is this user a platform superadmin?" for the
+	// mustBeSuperadmin guard and the is_superadmin flag on GET
+	// /api/v1/auth/me. Wired via WithServerAdmin; nil (authz disabled) →
+	// the guard returns 503 and is_superadmin degrades to false.
+	serverAdmin authz.ServerAdminChecker
+	// componentAdmin is the write seam behind the superadmin-gated
+	// PUT/DELETE /api/v1/admin/components/{name} routes. Wired via
+	// WithComponentAdmin over the ComponentDefinition K8s client; nil leaves
+	// those routes unregistered.
+	componentAdmin ComponentRegistryWriter
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -240,6 +250,24 @@ func (s *Server) WithRegistry(r ComponentRegistry) *Server {
 	return s
 }
 
+// WithServerAdmin wires the platform-superadmin checker used by the
+// mustBeSuperadmin guard and the is_superadmin flag on GET /api/v1/auth/me.
+// When nil (authz disabled), the guard returns 503, is_superadmin degrades to
+// false, and the superadmin-gated admin routes stay unregistered.
+func (s *Server) WithServerAdmin(c authz.ServerAdminChecker) *Server {
+	s.serverAdmin = c
+	return s
+}
+
+// WithComponentAdmin wires the write seam behind the superadmin-gated
+// PUT/DELETE /api/v1/admin/components/{name} routes. Production passes a
+// *registry.Writer over the ComponentDefinition K8s client. When nil, those
+// routes stay unregistered — same soft-degrade gate as WithK8sClient.
+func (s *Server) WithComponentAdmin(w ComponentRegistryWriter) *Server {
+	s.componentAdmin = w
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -329,6 +357,16 @@ func (s *Server) Handler() http.Handler {
 	if s.resolver != nil && s.registry != nil {
 		mux.Handle("GET /api/v1/components", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListComponents)))
 		mux.Handle("GET /api/v1/components/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleGetComponent)))
+	}
+
+	// Superadmin-gated component registry mutation routes (RFC 026 P3).
+	// Registered only when the resolver, superadmin checker, and registry
+	// writer are all wired; the handlers themselves run mustBeSuperadmin so
+	// a request that reaches them is still gated on the FGA server.admin
+	// relation.
+	if s.resolver != nil && s.serverAdmin != nil && s.componentAdmin != nil {
+		mux.Handle("PUT /api/v1/admin/components/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handlePutComponentDefinition)))
+		mux.Handle("DELETE /api/v1/admin/components/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeleteComponentDefinition)))
 	}
 
 	// Query service route. When a pre-built queryHandler + resolver are wired,

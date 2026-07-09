@@ -143,6 +143,12 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// authz-bootstrap pre-install hook guarantees the store + pin tuple
 	// exist before this binary starts.
 	var authzr authz.Authorizer
+	// serverAdmin memoizes the FGA server:<uuid> object and answers the
+	// superadmin (server.admin) check for the REST admin endpoints + the
+	// is_superadmin flag on /api/v1/auth/me. Constructed alongside the
+	// authorizer so it shares the same FGA endpoint/store; nil when authz is
+	// disabled, which leaves the superadmin routes unregistered.
+	var serverAdmin authz.ServerAdminChecker
 	{
 		openfgaURL := os.Getenv("OPENFGA_URL")
 		if openfgaURL == "" {
@@ -168,6 +174,7 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 				return fmt.Errorf("create OpenFGA authorizer: %w", err)
 			}
 			authzr = a
+			serverAdmin = authz.NewServerAdmin(a, openfgaURL, openfgaAPIKey, storeID)
 			fmt.Printf("  Authz: openfga (%s, store=%s name=%s, model=%s version=%s)\n", openfgaURL, storeID, storeName, modelID, modelVersion)
 		} else {
 			log.Printf("authz disabled: OPENFGA_MODEL_VERSION not set (project/pipeline/run handlers stay unregistered)")
@@ -353,6 +360,10 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		WithRunBackend(backend).
 		WithStorage(storageSvc).
 		WithAuthorizer(authzr).
+		// Superadmin checker for the REST admin endpoints + the is_superadmin
+		// flag on /api/v1/auth/me. nil (authz disabled) leaves the guard at
+		// 503 and is_superadmin at false.
+		WithServerAdmin(serverAdmin).
 		// Project-secrets endpoints reuse the same k8sClient as run-trigger
 		// (WithK8sClient above) — one client, one credential set. nil
 		// k8sClient (no KUBECONFIG / in-cluster hint) leaves the secrets
@@ -371,6 +382,12 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// routes stay unregistered and saves validate without registry checks.
 	if k8sClient != nil {
 		srv = srv.WithRegistry(registry.NewView(k8sClient, 0))
+		// Superadmin-gated component registry writer (RFC 026 P3). Shares the
+		// ComponentDefinition write path with the CLI `admin component
+		// register` via registry.Upsert. Routes still gate on WithServerAdmin
+		// + WithUserResolver, so no k8sClient means no writer means the admin
+		// routes stay unregistered.
+		srv = srv.WithComponentAdmin(registry.NewWriter(k8sClient))
 	}
 	// Query service: POST /api/v1/query ad-hoc SQL. Wired only when
 	// DATUPLET_QUERY_WORKER_URL is set and handler construction succeeded above.

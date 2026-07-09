@@ -9,13 +9,13 @@ import (
 	"os"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/registry"
 )
 
 // runAdminComponent dispatches the `admin component` subcommands: register
@@ -78,11 +78,8 @@ func adminComponentRegister(args []string) error {
 }
 
 // applyComponentDefinition unmarshals defYAML into a ComponentDefinition and
-// Creates or Updates it in K8s. Uses Get-then-Create/Update rather than
-// true server-side apply, mirroring pkg/pipelineapi/k8s.ApplyPipelineCRD's
-// documented rationale: SSA needs a FieldManager and behaves awkwardly
-// against the fake client used in tests, so Get+Create/Update is the
-// established equivalent for this codebase.
+// upserts it via registry.Upsert — the single write path shared with the
+// superadmin-gated REST endpoint (RFC 026 P3), so the two never diverge.
 func applyComponentDefinition(ctx context.Context, c client.Client, defYAML []byte) (*datupletv1.ComponentDefinition, error) {
 	def := &datupletv1.ComponentDefinition{}
 	if err := yaml.Unmarshal(defYAML, def); err != nil {
@@ -91,24 +88,8 @@ func applyComponentDefinition(ctx context.Context, c client.Client, defYAML []by
 	if def.Name == "" {
 		return nil, errors.New("ComponentDefinition YAML has no metadata.name")
 	}
-	def.TypeMeta = metav1.TypeMeta{APIVersion: "datuplet.io/v1", Kind: "ComponentDefinition"}
-	def.ResourceVersion = "" // Client.Create rejects a set RV.
-
-	existing := &datupletv1.ComponentDefinition{}
-	err := c.Get(ctx, types.NamespacedName{Name: def.Name}, existing)
-	if apierrors.IsNotFound(err) {
-		if createErr := c.Create(ctx, def); createErr != nil {
-			return nil, fmt.Errorf("create ComponentDefinition: %w", createErr)
-		}
-		return def, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get ComponentDefinition: %w", err)
-	}
-	// Replace spec, preserve resourceVersion so the update succeeds.
-	def.ResourceVersion = existing.ResourceVersion
-	if err := c.Update(ctx, def); err != nil {
-		return nil, fmt.Errorf("update ComponentDefinition: %w", err)
+	if err := registry.Upsert(ctx, c, def); err != nil {
+		return nil, err
 	}
 	return def, nil
 }
