@@ -857,3 +857,10 @@ code.inline {
   font-family: var(--font-mono);
   color: var(--fg-0);
 }
+
+/* ---------- Validation findings (RFC 026 Phase 4) ---------- */
+.findings-block { margin-top: var(--s-3); }
+.findings-list { list-style: none; margin: var(--s-2) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--s-2); }
+.finding { display: flex; flex-direction: column; gap: var(--s-1); font-size: var(--text-sm); }
+.finding-path { font-family: var(--font-mono); font-size: var(--text-xs); }
+.finding-msg { color: var(--fg-0); }

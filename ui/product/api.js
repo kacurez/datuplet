@@ -51,6 +51,41 @@ export async function putYAML(path, yamlText) {
   return null;
 }
 
+// putPipelineYAML wraps the pipeline-save PUT so callers get the RFC 026 §7
+// findings contract as data, not a thrown string. Resolves:
+//   { ok:true }                          — 204 (clean save)
+//   { ok:true,  findings:[...] }         — 200 (saved with warnings)
+//   { ok:false, findings:[...] }         — 400 { error, findings } (rejected)
+// Throws (like api()) on 401 → login redirect, and on any other non-2xx
+// with no findings body (so genuine server/transport errors still surface).
+export async function putPipelineYAML(projectId, name, yamlText) {
+  const r = await fetch(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/pipelines/${encodeURIComponent(name)}`,
+    {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/yaml' },
+      body: yamlText,
+    },
+  );
+  if (r.status === 401) {
+    if (typeof window.__datupletGoToLogin === 'function') window.__datupletGoToLogin();
+    throw new Error('not authenticated');
+  }
+  if (r.status === 204) return { ok: true };
+  const ct = r.headers.get('content-type') || '';
+  const raw = await r.text();                 // read the stream ONCE
+  let body = null;
+  if (ct.includes('application/json') && raw) {
+    try { body = JSON.parse(raw); } catch { /* non-JSON or malformed → leave null */ }
+  }
+  const findings = body && Array.isArray(body.findings) ? body.findings : null;
+  if (r.status === 200) return { ok: true, findings: findings || [] };
+  if (r.status === 400 && findings) return { ok: false, findings };
+  // Non-findings error (413, 500, name mismatch returned as plain text, …).
+  throw new Error(`${r.status}: ${(body && body.error) || raw || r.statusText}`);
+}
+
 // Small HTML-escape helper for innerHTML use. Not a substitute for
 // content-aware templating, but safer than string concatenation.
 export function esc(s) {
@@ -110,6 +145,30 @@ export async function getTablePreview(projectId, namespace, name) {
  */
 export async function getTableSnapshots(projectId, namespace, name) {
   return api(`/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/snapshots`);
+}
+
+// ----- Component registry (RFC 026 §4.1, §4.7) -----
+//
+// Read-only catalog of ComponentDefinitions. Readable by any authenticated
+// project member (the catalog is the shared component picker). Both return
+// the parsed body or throw via api() on non-2xx / 401.
+
+/**
+ * List registered components.
+ * Returns [{ name, displayName, description, deprecated, defaultVersion,
+ *            versions: [{ version, prerelease, image }] }, ...].
+ */
+export async function getComponents() {
+  return api('/api/v1/components');
+}
+
+/**
+ * One component with per-version configSchema (JSON Schema draft 2020-12,
+ * as a string). Same top-level shape as a list item plus
+ * versions[].configSchema.
+ */
+export async function getComponent(name) {
+  return api(`/api/v1/components/${encodeURIComponent(name)}`);
 }
 
 // ----- Secrets endpoints (RFC 026 P1.5) -----
