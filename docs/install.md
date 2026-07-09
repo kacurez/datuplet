@@ -99,6 +99,26 @@ After `register.sh` completes, open `http://localhost:30081/ui/` (OrbStack NodeP
 in with the admin credentials printed by the script (or stored in the `datuplet-app-admin-creds`
 Secret).
 
+## Grant platform superadmin
+
+Platform superadmins are the only users who may register/modify component
+definitions and set pipeline `resources`/gateway knobs beyond the chart's
+`pipelinePolicy` bounds. There is **no automated seed hook** in the chart (a
+deliberate POC gap) — grant it once as a post-install step by `kubectl exec`ing
+the same `admin grant` subcommand `register.sh` uses, this time with
+`--superadmin`:
+
+```bash
+POD=$(kubectl get pod -n datuplet -l app.kubernetes.io/name=pipeline-api \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n datuplet "$POD" -- \
+  pipeline-api admin grant --user admin@datuplet.local --superadmin
+```
+
+Use the email of your initial admin user (`pipelineApi.initAdmin.email`,
+default `admin@datuplet.local`). The grant writes an FGA `server.admin` tuple;
+it is idempotent and safe to re-run.
+
 ## Upgrade
 
 Upgrade phases independently based on what changed:

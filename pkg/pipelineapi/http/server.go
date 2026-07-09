@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
@@ -76,6 +77,11 @@ type Server struct {
 	// WithComponentAdmin over the ComponentDefinition K8s client; nil leaves
 	// those routes unregistered.
 	componentAdmin ComponentRegistryWriter
+	// policy carries the chart-configured pipeline-policy bounds (RFC 026
+	// §4.6) enforced on the PUT diff-gate for non-superadmins. Wired via
+	// WithPipelinePolicy from PIPELINE_POLICY_* env in main.go; nil disables
+	// all bound checks (ValidateTyped treats a nil *Policy as "no policy").
+	policy *validate.Policy
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -265,6 +271,17 @@ func (s *Server) WithServerAdmin(c authz.ServerAdminChecker) *Server {
 // routes stay unregistered — same soft-degrade gate as WithK8sClient.
 func (s *Server) WithComponentAdmin(w ComponentRegistryWriter) *Server {
 	s.componentAdmin = w
+	return s
+}
+
+// WithPipelinePolicy wires the chart-configured pipeline-policy bounds (RFC 026
+// §4.6) consumed by the PUT /api/v1/projects/{pid}/pipelines/{name} diff-gate:
+// a non-superadmin whose gateway knobs exceed a bound gets a 403. main.go builds
+// the *Policy from the PIPELINE_POLICY_* env vars. When nil (no env / all
+// bounds zero), bound checks are disabled — ValidateTyped treats a nil *Policy
+// as "no policy".
+func (s *Server) WithPipelinePolicy(p *validate.Policy) *Server {
+	s.policy = p
 	return s
 }
 

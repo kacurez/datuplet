@@ -114,6 +114,17 @@ warehouse:
     # existingSecret is NOT here — GCS credentials flow via lakekeeper-bootstrap
     # flags, not a pipeline-api volume mount.
 
+# Pipeline-policy bounds (RFC 026 §4.6). pipeline-api enforces these on the
+# PUT /api/v1/projects/{pid}/pipelines/{name} diff-gate (§4.4): a non-superadmin
+# whose gateway knobs exceed a bound gets a 403. A zero/unset value means "no
+# bound on that knob". Resource ceilings are NOT here — they are registry-driven
+# (per-ComponentDefinition Max, clamped by the controller).
+pipelinePolicy:
+  gateway:                    # non-superadmins must stay within these
+    maxChunkSize: 268435456       # 256Mi
+    maxBufferSize: 536870912      # 512Mi
+    maxTargetFileSize: 1073741824 # 1Gi
+
 pipelineOperator:
   replicas: 1
   resources:
