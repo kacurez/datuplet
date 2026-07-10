@@ -178,19 +178,12 @@ func decodeTruncated(body []byte) bool {
 // counter deltas without racing against the package-level promauto singleton.
 // Production callers should use Handler, which wires the package-level counter.
 func HandlerWithAudit(cfg Config, signer *tokens.Signer, counter *prometheus.CounterVec) (http.Handler, error) {
-	cfg = cfg.withDefaults()
-	if signer == nil {
-		return nil, errors.New("queryproxy: signer is required")
-	}
-	if cfg.Gate == nil {
-		return nil, errors.New("queryproxy: Gate is required")
-	}
-	client, err := newWorkerClient(cfg.WorkerURL, cfg.MaxTimeoutS, cfg.CatalogTTLSlack, cfg.MaxMaxBytes)
+	c, err := NewCore(cfg, signer)
 	if err != nil {
 		return nil, err
 	}
-	g := newGate(cfg.PerPrincipalInflight)
-	return &handler{cfg: cfg, signer: signer, client: client, gate: g, auditCounter: counter}, nil
+	c.h.auditCounter = counter
+	return c.HTTPHandler(), nil
 }
 
 // auditedHandler wraps ServeHTTP with the deferred audit emit. It is called
@@ -260,45 +253,23 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	}
 	defer h.gate.Release(sub)
 
-	// 6. Mint the two short-lived JWTs.
-	ttl := time.Duration(timeoutS)*time.Second + h.cfg.CatalogTTLSlack
-	catalogTok, err := tokens.MintQueryToken(r.Context(), h.signer, ttl)
-	if err != nil {
-		slog.Error("queryproxy: mint catalog token failed", "sub", sub, "err", err)
-		rec.outcome = "internal"
-		writeError(w, http.StatusInternalServerError, "internal", "failed to mint query credentials")
+	// 6-7. Mint the two short-lived JWTs, proxy to the query-worker, and
+	// translate the outcome — carved out into executeRaw so a second
+	// consumer (Task 3.1) can drive the same path without an HTTP
+	// request/response pair.
+	lim := queryLimits{timeoutS: timeoutS, maxRows: maxRows, maxBytes: maxBytes}
+	raw, qerr := h.executeRaw(r.Context(), sub, warehouse, req.SQL, lim, rec)
+	if qerr != nil {
+		rec.outcome = qerr.Kind
+		if qerr.Kind == "capacity" {
+			w.Header().Set("Retry-After", "2")
+		}
+		writeError(w, qerr.Status, qerr.Kind, qerr.Msg)
 		return
 	}
-	// Extract jti from the minted catalog token for cross-system correlation.
-	// Unverified decode is intentional — we minted this token ourselves.
-	rec.jti = extractJTIFromToken(catalogTok.Reveal())
-
-	internalTok, err := tokens.MintInternalQueryToken(r.Context(), h.signer, ttl)
-	if err != nil {
-		slog.Error("queryproxy: mint internal token failed", "sub", sub, "err", err)
-		rec.outcome = "internal"
-		writeError(w, http.StatusInternalServerError, "internal", "failed to mint query credentials")
-		return
-	}
-
-	// 7. Proxy to the query-worker.
-	body := workerRequest{
-		SQL:        req.SQL,
-		CatalogJWT: catalogTok.Reveal(),
-		Warehouse:  warehouse,
-		TimeoutS:   timeoutS,
-		MaxRows:    maxRows,
-		MaxBytes:   maxBytes,
-	}
-	resp, err := h.client.Do(r.Context(), internalTok, body)
-	if err != nil {
-		slog.Error("queryproxy: query-worker transport error", "sub", sub, "err", err)
-		rec.outcome = "internal"
-		writeError(w, http.StatusBadGateway, "internal", "query service unavailable")
-		return
-	}
-
-	h.translateWithAudit(w, sub, resp, rec)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
 }
 
 // allowedWorkerKinds is the closed set of worker-supplied kinds accepted as
@@ -321,48 +292,46 @@ func sanitizeKind(k, fallback string) string {
 	return fallback
 }
 
-// translateWithAudit is like translate but also fills rec.outcome and
-// rec.truncated from the worker response before writing to w.
-func (h *handler) translateWithAudit(w http.ResponseWriter, sub string, resp workerResponse, rec *auditRecord) {
+// translateRaw is translateWithAudit reshaped to RETURN instead of write:
+// it has exactly one caller (executeRaw — graph-verified before this
+// refactor when it was translateWithAudit's sole caller, serveWithAudit),
+// so returning a result instead of writing to an http.ResponseWriter is
+// safe. On 200 it fills rec.outcome/rec.truncated and returns the raw
+// Result JSON verbatim (zero re-encode). On any other worker outcome it
+// returns a *QueryError carrying the same status/kind/msg mapping
+// translateWithAudit used to write directly; rec.outcome for the error
+// path is set by the caller from qerr.Kind (see executeRaw/serveWithAudit)
+// so this function's only rec mutation is the success case.
+//
+// The worker-429→client-503 "capacity" translation and the sanitizeKind
+// allowlist are preserved exactly — moved, not rewritten. The Retry-After
+// header for the capacity case can no longer be set here (translateRaw no
+// longer holds the http.ResponseWriter); serveWithAudit sets it when
+// qerr.Kind == "capacity", preserving the observable header behaviour.
+func (h *handler) translateRaw(sub string, resp workerResponse, rec *auditRecord) ([]byte, *QueryError) {
 	kind := decodeKind(resp.body)
 
 	switch resp.status {
 	case http.StatusOK:
 		rec.outcome = "ok"
 		rec.truncated = decodeTruncated(resp.body)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(resp.body)
-		return
+		return resp.body, nil
 	case http.StatusRequestTimeout:
-		rec.outcome = "timeout"
-		writeError(w, http.StatusRequestTimeout, "timeout", workerMsg(resp.body, "query timed out"))
-		return
+		return nil, &QueryError{http.StatusRequestTimeout, "timeout", workerMsg(resp.body, "query timed out")}
 	case http.StatusRequestEntityTooLarge:
 		k := sanitizeKind(kind, "result_too_large")
-		rec.outcome = k
-		writeError(w, http.StatusRequestEntityTooLarge, k, workerMsg(resp.body, "result too large"))
-		return
+		return nil, &QueryError{http.StatusRequestEntityTooLarge, k, workerMsg(resp.body, "result too large")}
 	case http.StatusTooManyRequests:
-		rec.outcome = "capacity"
-		w.Header().Set("Retry-After", "2")
-		writeError(w, http.StatusServiceUnavailable, "capacity", "query service is busy, retry shortly")
-		return
+		return nil, &QueryError{http.StatusServiceUnavailable, "capacity", "query service is busy, retry shortly"}
 	case http.StatusBadRequest:
 		k := sanitizeKind(kind, "sql_error")
-		rec.outcome = k
-		writeError(w, http.StatusBadRequest, k, workerMsg(resp.body, "query failed"))
-		return
+		return nil, &QueryError{http.StatusBadRequest, k, workerMsg(resp.body, "query failed")}
 	case http.StatusUnauthorized:
 		slog.Error("queryproxy: query-worker rejected internal token (config/clock/key bug)", "sub", sub)
-		rec.outcome = "internal"
-		writeError(w, http.StatusBadGateway, "internal", "query service unavailable")
-		return
+		return nil, &QueryError{http.StatusBadGateway, "internal", "query service unavailable"}
 	default:
 		slog.Error("queryproxy: unexpected query-worker status", "sub", sub, "status", resp.status)
-		rec.outcome = "internal"
-		writeError(w, http.StatusBadGateway, "internal", "query service unavailable")
-		return
+		return nil, &QueryError{http.StatusBadGateway, "internal", "query service unavailable"}
 	}
 }
 
