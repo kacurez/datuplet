@@ -197,10 +197,10 @@ Pods are Ready before installing Phase 3.
 
 ## Optional: ad-hoc SQL query service
 
-The ad-hoc SQL query service (browser console + `POST /api/v1/query` + the
-laptop `datuplet-query` CLI) is **experimental and disabled by default** — the
-install above does not deploy it. To turn it on as a post-install step (build
-the query-worker image, set the project-qualified warehouse, helm-upgrade with
+The ad-hoc SQL query service (browser console + `POST /api/v1/projects/{pid}/query`
++ the laptop `datuplet-query` CLI) is **experimental and disabled by
+default** — the install above does not deploy it. To turn it on as a
+post-install step (build the query-worker image, helm-upgrade with
 `queryWorker.enabled=true`), see [docs/ad-hoc-query.md](ad-hoc-query.md).
 
 ## Further reading

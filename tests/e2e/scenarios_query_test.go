@@ -1,19 +1,21 @@
 // Package e2e — RFC 022 Task 2.7: ad-hoc SQL query e2e scenarios.
 //
-// This file covers POST /api/v1/query via the queryproxy → query-worker path.
-// All tests require:
+// This file covers POST /api/v1/projects/{pid}/query via the queryproxy →
+// query-worker path. All tests require:
 //   - E2E_K8S=1
 //   - SetupFGABootstrap ran in TestMain (SharedHarness != nil)
 //   - The query-worker Deployment is Running (queryWorker.enabled=true in the
 //     e2e helm install — wired in tests/e2e/values-app.yaml)
-//   - DATUPLET_QUERY_WAREHOUSE env set on the pipeline-api Deployment
-//     (project-qualified "projectID/warehouse_name") — the e2e helper
-//     EnsureQueryWarehouseEnv sets this post-bootstrap, because the project-id
-//     is only known AFTER SetupFGABootstrap returns.
+//
+// The warehouse is resolved per request from the {pid} path segment (RFC
+// 025) — there is no post-bootstrap env patch step. {pid} is the Datuplet
+// project UUID, resolved once via getQueryProjectID (reuses
+// remoteCLIFindProject against the admin session, since some test principals
+// below intentionally carry no FGA grants on the project).
 //
 // # Authentication
 //
-// POST /api/v1/query is protected by auth.WithUser (ChainResolver) which
+// POST /api/v1/projects/{pid}/query is protected by auth.WithUser (ChainResolver) which
 // accepts either a session cookie (PostgresResolver) or a cli-api JWT
 // (BearerJWTResolver).  The FGA test identities (Alice/Bob/Charlie/Dora)
 // are FGA-only UUIDs with no DB user records, so their impersonation tokens
@@ -32,18 +34,10 @@
 // so their catalog JWT (minted by pipeline-api from the DB user UUID as sub)
 // carries no grants.  Lakekeeper denies the LoadTable / STS vend → the
 // query-worker surfaces this as a DuckDB-level error (status 400, kind
-// sql_error).
-//
-// # Why DATUPLET_QUERY_WAREHOUSE is set post-bootstrap
-//
-// The warehouse value is "<lakekeeper-project-id>/datuplet". The lakekeeper
-// project is created by SetupFGABootstrap (idempotent). The project-id is
-// therefore only known at Go-test runtime, after bootstrap completes. We
-// cannot bake it into the helm chart values file at deploy time. Instead,
-// TestQueryBootstrap (called once before the query scenarios) patches the
-// pipeline-api Deployment env var via `kubectl set env` + waits for rollout.
-// The patch is idempotent: if the env already carries the right value, the
-// kubectl command is a no-op and no rollout is triggered.
+// sql_error). Note that the deny-test user's lack of FGA grants also means
+// it cannot resolve {pid} via its own session (GET /api/v1/projects returns
+// only projects the caller has a relation on) — {pid} is resolved once via
+// the admin session and reused across all test principals.
 package e2e
 
 import (
@@ -90,13 +84,10 @@ var queryAdminSessionErr error
 func getAdminSession(t *testing.T) string {
 	t.Helper()
 	queryAdminSessionOnce.Do(func() {
-		// Retry across a ~90s window. getAdminSession is first called right after
-		// EnsureQueryWarehouseEnv rolls pipeline-api, and on OrbStack the NodePort
-		// the framework reaches (:30081) can briefly stop serving while
-		// kube-proxy re-points it at the new pods. Tolerating that settling
-		// window beats skipping the entire query suite on one transient timeout
-		// (the pods are Ready — kubectl rollout status already returned — it's
-		// purely NodePort routing catching up).
+		// Retry across a ~90s window. On OrbStack the NodePort the framework
+		// reaches (:30081) can briefly stop serving while pipeline-api settles
+		// after the shared bootstrap. Tolerating that settling window beats
+		// skipping the entire query suite on one transient timeout.
 		var lastErr error
 		deadline := time.Now().Add(90 * time.Second)
 		for attempt := 1; ; attempt++ {
@@ -202,80 +193,65 @@ func ensureQueryTable(t *testing.T) (ns, table string) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Wiring helper — post-bootstrap env patch
+// Wiring helper — project UUID resolution (RFC 025 project-scoped route)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// EnsureQueryWarehouseEnv patches DATUPLET_QUERY_WAREHOUSE on the pipeline-api
-// Deployment if it is not already set to the correct project-qualified value.
-// Waits up to 90 s for the rollout to complete when a patch is needed.
+// queryProjectIDOnce / queryProjectIDCached / queryProjectIDErr cache the
+// Datuplet project UUID for the test process (mirrors the queryAdminSession*
+// caching pattern above).
+var queryProjectIDOnce sync.Once
+var queryProjectIDCached string
+var queryProjectIDErr error
+
+// getQueryProjectID resolves the Datuplet project UUID that all query
+// scenarios target (POST /api/v1/projects/{pid}/query), caching it for the
+// test process.
 //
-// WHY: queryWorker.enabled=true is set in the helm values file so the
-// Deployment + Service + NetworkPolicy are created at install time.  However,
-// queryWorker.query.warehouse is left empty in the chart values file because
-// the lakekeeper project-id is only known post-bootstrap. This function fills
-// the gap at Go-test runtime, once, idempotently.
-func EnsureQueryWarehouseEnv(t *testing.T, h *framework.FGAHarness) {
+// WHY resolve via the admin session and reuse across every test principal:
+// TestQuery_AuthzDenied and TestQuery_WriteProbe deliberately use principals
+// with NO FGA grants (or read-only grants) on the project — GET
+// /api/v1/projects only returns projects the CALLING user has a relation on
+// (pkg/pipelineapi/http/stores_pgx.go ListForUser), so those principals could
+// not resolve {pid} via their own session. {pid} identifies the project being
+// queried, not "projects visible to me" — the e2e suite provisions exactly
+// one Datuplet project, so resolving it once via the admin session (which
+// does have project_admin) and reusing it is correct for every principal.
+//
+// Reuses remoteCLIFindProject (tests/e2e/scenarios_remote_cli_test.go), the
+// ground-truth helper for this exact GET /api/v1/projects call — it already
+// decodes the bare JSON array the endpoint returns and falls back to the
+// single project when name matching finds nothing (empty projectName never
+// matches, so this always exercises the single-project fallback).
+func getQueryProjectID(t *testing.T) string {
 	t.Helper()
-	if h == nil {
-		return
+	// getAdminSession is called OUTSIDE queryProjectIDOnce.Do: it may itself
+	// t.Skip on failure, and doing that from inside another sync.Once's
+	// closure would mark this Once "done" via Goexit-triggered defers without
+	// ever setting queryProjectIDCached — silently handing later tests an
+	// empty pid. getAdminSession is already cheap to call repeatedly (cached
+	// by its own sync.Once).
+	session := getAdminSession(t)
+	queryProjectIDOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		pid, err := remoteCLIFindProject(ctx, framework.PipelineAPIBaseURL(), session, "")
+		if err != nil {
+			queryProjectIDErr = fmt.Errorf("resolve query project id: %w", err)
+			return
+		}
+		queryProjectIDCached = pid
+	})
+	if queryProjectIDErr != nil {
+		t.Skipf("%v", queryProjectIDErr)
 	}
-	want := h.LakekeeperProjectID + "/" + h.WarehouseName
-
-	// Read current env value on the Deployment (best-effort — if kubectl
-	// fails we proceed anyway and let the query calls surface the error).
-	cur := queryWarehouseEnvValue(t)
-	if cur == want {
-		t.Logf("query: DATUPLET_QUERY_WAREHOUSE already correct (%s) — no rollout needed", want)
-		return
-	}
-
-	t.Logf("query: patching DATUPLET_QUERY_WAREHOUSE=%s on pipeline-api (current: %q)", want, cur)
-	out, err := exec.Command("kubectl", "set", "env",
-		"deployment/pipeline-api",
-		"-n", queryE2ENamespace,
-		"DATUPLET_QUERY_WAREHOUSE="+want).CombinedOutput()
-	if err != nil {
-		t.Logf("query: WARN — kubectl set env failed: %v\n%s", err, string(out))
-		return
-	}
-
-	t.Logf("query: waiting for pipeline-api rollout after env patch…")
-	rollout, rerr := exec.Command("kubectl", "rollout", "status",
-		"deployment/pipeline-api",
-		"-n", queryE2ENamespace,
-		"--timeout=90s").CombinedOutput()
-	if rerr != nil {
-		t.Logf("query: WARN — rollout status failed: %v\n%s", rerr, string(rollout))
-	} else {
-		t.Logf("query: pipeline-api rollout complete")
-	}
-
-	// Reset the cached admin session — the rollout created a new pipeline-api
-	// pod so the old session cookie is invalid. Force a fresh login on next
-	// getAdminSession() call.
-	queryAdminSessionOnce = sync.Once{}
-	queryAdminSession = ""
-	queryAdminSessionErr = nil
-}
-
-// queryWarehouseEnvValue returns the current value of DATUPLET_QUERY_WAREHOUSE
-// from the pipeline-api Deployment's env, or "" on any error.
-func queryWarehouseEnvValue(t *testing.T) string {
-	t.Helper()
-	out, err := exec.Command("kubectl", "get", "deployment", "pipeline-api",
-		"-n", queryE2ENamespace,
-		"-o", `jsonpath={.spec.template.spec.containers[0].env[?(@.name=="DATUPLET_QUERY_WAREHOUSE")].value}`).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	return queryProjectIDCached
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HTTP helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-// queryRequest is the JSON body for POST /api/v1/query.
+// queryRequest is the JSON body for POST /api/v1/projects/{pid}/query.
 type queryRequest struct {
 	SQL      string `json:"sql"`
 	TimeoutS *int   `json:"timeout_s,omitempty"`
@@ -296,14 +272,14 @@ type queryError struct {
 	Kind  string `json:"kind"`
 }
 
-// postQuery sends POST /api/v1/query authenticated with a session cookie.
-// Returns (statusCode, body).
-func postQuery(ctx context.Context, sessionCookie string, req queryRequest) (int, []byte, error) {
+// postQuery sends POST /api/v1/projects/{pid}/query authenticated with a
+// session cookie. Returns (statusCode, body).
+func postQuery(ctx context.Context, sessionCookie, pid string, req queryRequest) (int, []byte, error) {
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshal query request: %w", err)
 	}
-	u := framework.PipelineAPIBaseURL() + "/api/v1/query"
+	u := framework.PipelineAPIBaseURL() + "/api/v1/projects/" + pid + "/query"
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request: %w", err)
@@ -315,7 +291,7 @@ func postQuery(ctx context.Context, sessionCookie string, req queryRequest) (int
 	cli := &http.Client{Timeout: 30 * time.Second}
 	resp, err := cli.Do(r)
 	if err != nil {
-		return 0, nil, fmt.Errorf("POST /api/v1/query: %w", err)
+		return 0, nil, fmt.Errorf("POST /api/v1/projects/%s/query: %w", pid, err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -485,9 +461,10 @@ func ensureAdminFGAGrant(t *testing.T, h *framework.FGAHarness, session string) 
 	t.Logf("query: admin FGA grant ensured for user %s on project %s", me.ID, h.LakekeeperProjectID)
 }
 
-// TestQueryBootstrap patches DATUPLET_QUERY_WAREHOUSE on pipeline-api once.
-// All other TestQuery* subtests depend on this having run first.  Go's test
-// execution is top-down within a file so naming it Bootstrap keeps it first.
+// TestQueryBootstrap verifies the query-worker is ready and the admin
+// session + project UUID resolve cleanly. All other TestQuery* subtests
+// depend on this having run first.  Go's test execution is top-down within
+// a file so naming it Bootstrap keeps it first.
 func TestQueryBootstrap(t *testing.T) {
 	if os.Getenv("E2E_K8S") != "1" {
 		t.Skip("E2E_K8S=1 required")
@@ -503,11 +480,6 @@ func TestQueryBootstrap(t *testing.T) {
 		t.Skip("pipeline-api not reachable on NodePort 30081 — start port-forward")
 	}
 
-	// Patch warehouse env on pipeline-api (idempotent). This may trigger a
-	// rollout; EnsureQueryWarehouseEnv also resets the admin session cache
-	// so the next getAdminSession() call gets a fresh cookie.
-	EnsureQueryWarehouseEnv(t, h)
-
 	// Verify query-worker Deployment exists and has at least 1 ready replica.
 	out, err := exec.Command("kubectl", "get", "deployment", "query-worker",
 		"-n", queryE2ENamespace,
@@ -521,7 +493,7 @@ func TestQueryBootstrap(t *testing.T) {
 	}
 	t.Logf("query-worker ready replicas: %s", ready)
 
-	// Verify admin login works now (fresh session after any rollout).
+	// Verify admin login works.
 	session := getAdminSession(t)
 	if session == "" {
 		t.Fatal("admin session login returned empty cookie")
@@ -533,6 +505,16 @@ func TestQueryBootstrap(t *testing.T) {
 	// e2e harness project. Without this grant, the query-worker's catalog JWT
 	// (sub=admin-uuid) gets 403 from lakekeeper on ATTACH.
 	ensureAdminFGAGrant(t, h, session)
+
+	// Resolve + cache the project UUID the query scenarios target (RFC 025
+	// project-scoped route). Failing fast here gives a clearer error than
+	// letting every downstream TestQuery* subtest hit the same resolution
+	// failure independently.
+	pid := getQueryProjectID(t)
+	if pid == "" {
+		t.Fatal("query project id resolved to empty string")
+	}
+	t.Logf("query project id resolved: %s", pid)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -554,6 +536,7 @@ func TestQuery_HappyPath(t *testing.T) {
 	ns, table := ensureQueryTable(t)
 	ctx := context.Background()
 	session := getAdminSession(t)
+	pid := getQueryProjectID(t)
 
 	// The Iceberg namespace is the lakekeeper namespace = "<runPrefix>-api".
 	// DuckDB's iceberg extension references it as: iceberg_scan('<catalog>.<ns>.<table>').
@@ -561,9 +544,9 @@ func TestQuery_HappyPath(t *testing.T) {
 	// the lakekeeper warehouse we seeded, the namespace and table match what
 	// the pipeline wrote.
 	sql := fmt.Sprintf(`SELECT count(*) AS cnt FROM "%s"."%s"`, ns, table)
-	status, body, err := postQuery(ctx, session, queryRequest{SQL: sql})
+	status, body, err := postQuery(ctx, session, pid, queryRequest{SQL: sql})
 	if err != nil {
-		t.Fatalf("POST /api/v1/query: %v", err)
+		t.Fatalf("POST /api/v1/projects/{pid}/query: %v", err)
 	}
 	t.Logf("happy-path status=%d body=%s", status, truncateLog(body, 512))
 	if status != http.StatusOK {
@@ -608,19 +591,23 @@ func TestQuery_HappyPath(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // TestQuery_AuthzDenied proves that a user with NO FGA grants on the
-// lakekeeper project cannot retrieve data.
+// project cannot retrieve data.
 //
 // Approach: create a fresh DB user (no FGA grants) via pipeline-api admin
-// create-user (kubectl exec), login as that user to get a session cookie.
-// The catalog JWT pipeline-api mints for that user has sub=<user-uuid> with
-// no FGA tuples on the lakekeeper project.  Lakekeeper denies the catalog
-// handshake (LoadTable or STS credential vending).  The query-worker surfaces
-// this as a DuckDB-level error (400 sql_error) — NOT as a 403 from the proxy.
-// See pkg/pipelineapi/queryproxy/audit.go note on "lakekeeper FGA denials".
+// create-user (kubectl exec), login as that user to get a session cookie,
+// then POST to the project-scoped query route.
 //
-// We assert: status is NOT 200 AND body carries a non-empty "error" field.
-// This is the strongest assertion provable without string-matching lakekeeper
-// error messages.
+// RFC 025 §4.6: the project gate (projectgate.Gate.Authorize) enforces FGA
+// datuplet_member at the pipeline-api layer, BEFORE the query reaches the
+// worker/lakekeeper. A zero-grant caller is denied fail-fast with HTTP 403
+// kind="forbidden" (Authorize → Check returns (false,nil) → 403 forbidden;
+// see pkg/pipelineapi/queryproxy/audit.go serveWithAudit → QualifiedWarehouse).
+// This is a stronger, earlier denial than the pre-RFC-025 behaviour, where
+// the query reached lakekeeper and was rejected at ATTACH time as a DuckDB
+// 400 sql_error.
+//
+// We assert: status == 403 AND kind == "forbidden" AND a non-empty "error"
+// field.
 func TestQuery_AuthzDenied(t *testing.T) {
 	if os.Getenv("E2E_K8S") != "1" {
 		t.Skip("E2E_K8S=1 required")
@@ -665,18 +652,27 @@ func TestQuery_AuthzDenied(t *testing.T) {
 		t.Skipf("deny-test user login failed: %v", err)
 	}
 
-	// Query the seeded table. The catalog JWT sub=<deny-user-uuid> has no FGA
-	// tuple on the project → lakekeeper MUST deny the LoadTable or STS vend.
+	// Resolve {pid} via the admin session, NOT the deny-test session: the
+	// deny-test user has no FGA grants on the project, so GET /api/v1/projects
+	// under its own session would return an empty list.
+	pid := getQueryProjectID(t)
+
+	// Query the seeded table. The deny-test user has no FGA tuple on the
+	// project → the project gate denies the request at the pipeline-api layer,
+	// before the query ever reaches the worker/lakekeeper.
 	sql := fmt.Sprintf(`SELECT count(*) AS cnt FROM "%s"."%s"`, ns, table)
-	status, body, err := postQuery(ctx, denyCookie, queryRequest{SQL: sql})
+	status, body, err := postQuery(ctx, denyCookie, pid, queryRequest{SQL: sql})
 	if err != nil {
-		t.Fatalf("POST /api/v1/query: %v", err)
+		t.Fatalf("POST /api/v1/projects/{pid}/query: %v", err)
 	}
 	t.Logf("authz-denied status=%d body=%s", status, truncateLog(body, 512))
 
-	// Must NOT be 200 OK — the query must have been denied.
-	if status == http.StatusOK {
-		t.Fatalf("expected non-200 for deny-test user (no FGA grants), got 200 OK — table access was NOT denied")
+	// The project gate denies a zero-grant caller fail-fast with HTTP 403
+	// (RFC 025 §4.6). This also implicitly proves the query was NOT served
+	// (a 200 would mean the gate let it through).
+	if status != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for deny-test user (no FGA grants), got %d: %s",
+			status, truncateLog(body, 512))
 	}
 
 	// Body must carry a non-empty "error" field.
@@ -687,13 +683,11 @@ func TestQuery_AuthzDenied(t *testing.T) {
 	if errBody.Error == "" {
 		t.Errorf("error body has empty 'error' field — expected a denial message")
 	}
-	// The denial must surface as a query-execution error (lakekeeper rejects the
-	// ATTACH for a principal with no tuples → DuckDB sql_error), NOT an infra
-	// failure (404 route / 401 auth) that would satisfy status!=200 vacuously.
-	// `kind` is the proxy's own stable taxonomy, so this isn't string-matching
-	// lakekeeper internals.
-	if errBody.Kind != "sql_error" {
-		t.Errorf("expected kind=sql_error for lakekeeper FGA denial at ATTACH, got kind=%q error=%q",
+	// The denial must carry the project gate's stable "forbidden" kind (the
+	// FGA datuplet_member check at the pipeline-api layer), NOT a downstream
+	// worker/lakekeeper kind — the gate rejects before the query is dispatched.
+	if errBody.Kind != "forbidden" {
+		t.Errorf("expected kind=forbidden for project-gate FGA denial, got kind=%q error=%q",
 			errBody.Kind, errBody.Error)
 	}
 	t.Logf("authz denied correctly: status=%d kind=%q error=%q", status, errBody.Kind, errBody.Error)
@@ -720,15 +714,16 @@ func TestQuery_Truncation(t *testing.T) {
 
 	ctx := context.Background()
 	session := getAdminSession(t)
+	pid := getQueryProjectID(t)
 
 	// range(100000) produces 100k rows; cap to 10000 (chart max_rows default).
 	// This query needs no catalog attachment — DuckDB's built-in range()
 	// function works without an Iceberg table.
 	sql := "SELECT * FROM range(100000)"
 	cap := 10000
-	status, body, err := postQuery(ctx, session, queryRequest{SQL: sql, MaxRows: intPtr(cap)})
+	status, body, err := postQuery(ctx, session, pid, queryRequest{SQL: sql, MaxRows: intPtr(cap)})
 	if err != nil {
-		t.Fatalf("POST /api/v1/query: %v", err)
+		t.Fatalf("POST /api/v1/projects/{pid}/query: %v", err)
 	}
 	t.Logf("truncation status=%d body_len=%d", status, len(body))
 	if status != http.StatusOK {
@@ -769,6 +764,7 @@ func TestQuery_Timeout(t *testing.T) {
 
 	ctx := context.Background()
 	session := getAdminSession(t)
+	pid := getQueryProjectID(t)
 
 	// Aggregation over range(30000)×range(30000) = 900M combinations.
 	// Produces exactly 1 output row (a SUM), so the max_rows cap cannot
@@ -785,7 +781,7 @@ func TestQuery_Timeout(t *testing.T) {
 	// Use a raw HTTP client with a longer timeout so the 408 from the worker
 	// can reach us (we don't want our client-side timeout to fire first).
 	raw, _ := json.Marshal(queryRequest{SQL: sql, TimeoutS: intPtr(timeoutS)})
-	u := framework.PipelineAPIBaseURL() + "/api/v1/query"
+	u := framework.PipelineAPIBaseURL() + "/api/v1/projects/" + pid + "/query"
 	req, _ := http.NewRequestWithContext(ctx2, http.MethodPost, u, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(&http.Cookie{Name: "pipeline_api_session", Value: session})
@@ -794,7 +790,7 @@ func TestQuery_Timeout(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if err != nil {
-		t.Fatalf("POST /api/v1/query: %v (elapsed %s)", err, elapsed)
+		t.Fatalf("POST /api/v1/projects/{pid}/query: %v (elapsed %s)", err, elapsed)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -845,6 +841,7 @@ func TestQuery_Concurrency(t *testing.T) {
 	// principal in the per-principal gate). The gate cap is 2, so the 3rd
 	// request must get 429 rate_limited.
 	session := getAdminSession(t)
+	pid := getQueryProjectID(t)
 
 	// 3 concurrent slow queries from the SAME user (admin).
 	// Per-principal cap = 2 (queryproxy default).
@@ -872,7 +869,7 @@ func TestQuery_Concurrency(t *testing.T) {
 			ctx2, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			raw, _ := json.Marshal(queryRequest{SQL: sql, TimeoutS: intPtr(timeoutS)})
-			u := framework.PipelineAPIBaseURL() + "/api/v1/query"
+			u := framework.PipelineAPIBaseURL() + "/api/v1/projects/" + pid + "/query"
 			req, _ := http.NewRequestWithContext(ctx2, http.MethodPost, u, bytes.NewReader(raw))
 			req.Header.Set("Content-Type", "application/json")
 			req.AddCookie(&http.Cookie{Name: "pipeline_api_session", Value: session})
@@ -959,6 +956,7 @@ func TestQuery_WriteProbe(t *testing.T) {
 
 	ns, table := ensureQueryTable(t)
 	ctx := context.Background()
+	pid := getQueryProjectID(t)
 
 	// Provision a fresh READ-ONLY (viewer) DB user, unique per run-prefix.
 	viewerEmail := "viewer-" + runPrefix + "@datuplet.test"
@@ -999,9 +997,9 @@ func TestQuery_WriteProbe(t *testing.T) {
 	// (lakekeeper vends working read STS) so the write denial below is
 	// attributable to write-permission, not a broken read path.
 	selectSQL := fmt.Sprintf(`SELECT count(*) AS cnt FROM "%s"."%s"`, ns, table)
-	status, body, err := postQuery(ctx, viewerCookie, queryRequest{SQL: selectSQL})
+	status, body, err := postQuery(ctx, viewerCookie, pid, queryRequest{SQL: selectSQL})
 	if err != nil {
-		t.Fatalf("POST /api/v1/query (viewer SELECT): %v", err)
+		t.Fatalf("POST /api/v1/projects/{pid}/query (viewer SELECT): %v", err)
 	}
 	if status != http.StatusOK {
 		t.Fatalf("viewer SELECT must succeed (read-only grant) — got %d body=%s",
@@ -1016,9 +1014,9 @@ func TestQuery_WriteProbe(t *testing.T) {
 		`INSERT INTO "%s"."%s" SELECT * FROM "%s"."%s" LIMIT 1`,
 		ns, table, ns, table,
 	)
-	status, body, err = postQuery(ctx, viewerCookie, queryRequest{SQL: insertSQL})
+	status, body, err = postQuery(ctx, viewerCookie, pid, queryRequest{SQL: insertSQL})
 	if err != nil {
-		t.Fatalf("POST /api/v1/query (viewer INSERT): %v", err)
+		t.Fatalf("POST /api/v1/projects/{pid}/query (viewer INSERT): %v", err)
 	}
 	t.Logf("viewer write-probe status=%d body=%s", status, truncateLog(body, 512))
 
@@ -1165,13 +1163,14 @@ spec:
 	// allowlist) must fail with a connection-class error.
 	t.Logf("NetworkPolicy is enforced — running egress assertion")
 	session := getAdminSession(t)
+	pid := getQueryProjectID(t)
 
 	// Attempt to reach openfga (not in query-worker allowlist).
 	// read_parquet over HTTP to openfga's port — the connection must be
 	// blocked at the network layer → DuckDB returns a sql_error or connection error.
 	openFGATarget := fmt.Sprintf("http://openfga.%s.svc.cluster.local:8080/x.parquet", canaryNS)
 	blockedSQL := fmt.Sprintf(`SELECT * FROM read_parquet('%s') LIMIT 1`, openFGATarget)
-	blockedStatus, blockedBody, err := postQuery(ctx, session, queryRequest{SQL: blockedSQL})
+	blockedStatus, blockedBody, err := postQuery(ctx, session, pid, queryRequest{SQL: blockedSQL})
 	if err != nil {
 		t.Logf("blocked query transport error (acceptable): %v", err)
 	} else {
@@ -1187,7 +1186,7 @@ spec:
 	// Seeded-table query must still succeed (lakekeeper + minio are in the allowlist).
 	ns, table := ensureQueryTable(t)
 	goodSQL := fmt.Sprintf(`SELECT count(*) AS cnt FROM "%s"."%s"`, ns, table)
-	goodStatus, goodBody, err := postQuery(ctx, session, queryRequest{SQL: goodSQL})
+	goodStatus, goodBody, err := postQuery(ctx, session, pid, queryRequest{SQL: goodSQL})
 	if err != nil {
 		t.Errorf("seeded-table query after egress check failed: %v", err)
 	} else if goodStatus != http.StatusOK {
@@ -1222,10 +1221,11 @@ func TestQuery_AuditSmoke(t *testing.T) {
 	ns, table := ensureQueryTable(t)
 	ctx := context.Background()
 	session := getAdminSession(t)
+	pid := getQueryProjectID(t)
 
 	// Fire a fresh happy-path query to ensure a recent audit line exists.
 	sql := fmt.Sprintf(`SELECT count(*) AS cnt FROM "%s"."%s"`, ns, table)
-	status, body, err := postQuery(ctx, session, queryRequest{SQL: sql})
+	status, body, err := postQuery(ctx, session, pid, queryRequest{SQL: sql})
 	if err != nil || status != http.StatusOK {
 		t.Skipf("audit-smoke pre-query failed (status=%d err=%v) — skipping audit check", status, err)
 	}

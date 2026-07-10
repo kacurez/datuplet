@@ -19,14 +19,10 @@ image:
 
 # RFC 022 Task 2.7: enable the query-worker for e2e query scenarios.
 #
-# Bootstrap-ordering note: queryWorker.query.warehouse cannot be set here
-# because the lakekeeper project-id is only known after SetupFGABootstrap runs
-# (Go-test runtime). The e2e framework helper EnsureQueryWarehouseEnv (in
-# scenarios_query_test.go) patches DATUPLET_QUERY_WAREHOUSE on the pipeline-api
-# Deployment via `kubectl set env` once per test run, after bootstrap completes.
-# Leaving warehouse empty here is intentional: pipeline-api soft-degrades
-# (route unregistered → 404) until the patch lands. TestQueryBootstrap verifies
-# the patch and skips the query suite if the worker is not ready.
+# RFC 025: the warehouse is resolved per request from the project-scoped
+# route (POST /api/v1/projects/{pid}/query) — no bootstrap-ordering env patch
+# is needed. TestQueryBootstrap verifies the worker is ready and skips the
+# query suite if it is not.
 queryWorker:
   enabled: true
   image:
@@ -48,8 +44,6 @@ queryWorker:
   scratch:
     sizeLimit: 1Gi
   query:
-    # Leave warehouse empty — patched post-bootstrap by EnsureQueryWarehouseEnv.
-    warehouse: ""
     defaultTimeoutS: 60
     maxTimeoutS: 300
     defaultMaxRows: 1000

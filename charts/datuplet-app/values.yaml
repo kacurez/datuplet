@@ -165,18 +165,9 @@ pipelineObserver:
 # the lakekeeper Iceberg catalog. The query-worker is an EXPERIMENTAL feature
 # and is disabled by default. Set queryWorker.enabled=true to opt in.
 #
-# Bootstrap-ordering note: queryWorker.query.warehouse must be the
-# lakekeeper project-qualified warehouse name ("projectID/warehouse_name"),
-# e.g. "019eb2b6-659b-72c0-b8e1-2a193ca238fe/datuplet". This value is only
-# known AFTER `pipeline-api admin lakekeeper-bootstrap` has been run (the
-# project ID comes from the lakekeeper-bootstrap output). Set it post-install:
-#
-#   helm upgrade datuplet-app charts/datuplet-app --reuse-values \
-#     --set queryWorker.query.warehouse="<projectID>/datuplet"
-#
-# pipeline-api soft-degrades (route unregistered → 404) when warehouse is
-# empty; this is the intentional v1 behaviour. Multi-warehouse support is
-# deferred.
+# The warehouse is resolved per request from the project-scoped route
+# (POST /api/v1/projects/{pid}/query, RFC 025) — no post-install warehouse
+# step is needed. Multi-warehouse support is deferred.
 #
 # No autoscaling block: DuckDB's in-process concurrency knob (queryWorker.concurrency)
 # is the primary throughput lever for v1. HPA / KEDA integration is deferred.
@@ -254,11 +245,6 @@ queryWorker:
     # principal (pipeline-api proxy layer). Prevents a single user from
     # exhausting the worker's semaphore.
     perPrincipalInflight: 2
-    # warehouse: lakekeeper project-qualified warehouse name. REQUIRED for the
-    # query route to be active. Format: "<lakekeeperProjectID>/<warehouseName>".
-    # Leave "" until after `pipeline-api admin lakekeeper-bootstrap` runs.
-    # Example: "019eb2b6-659b-72c0-b8e1-2a193ca238fe/datuplet"
-    warehouse: ""
 
 # allowClientSideQuery gates the POST /api/v1/query/token mint endpoint (RFC 022
 # §5.3): the per-invocation query-JWT mint the laptop-side `datuplet-query` CLI
@@ -268,7 +254,7 @@ queryWorker:
 # it. Setting true mints short-lived catalog JWTs to laptops, which then read
 # warehouse data directly via lakekeeper-vended STS creds — enable only when
 # that egress posture is acceptable. Independent of queryWorker.enabled (which
-# controls the server-side POST /api/v1/query path).
+# controls the server-side POST /api/v1/projects/{pid}/query path).
 allowClientSideQuery: false
 
 # Built-in ComponentDefinition catalog (RFC 026 Task R10). Each component's

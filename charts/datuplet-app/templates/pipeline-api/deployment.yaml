@@ -135,23 +135,13 @@ spec:
               value: {{ .Values.allowClientSideQuery | default false | quote }}
             {{- if .Values.queryWorker.enabled }}
             # ── Query Worker (RFC 022) ──────────────────────────────────────
-            # Route POST /api/v1/query to the in-cluster query-worker Service.
-            # Soft-degrade: both vars are required for the route to register;
-            # pipeline-api logs a warning and leaves the route unregistered
-            # (404) when either is absent.
-            #
-            # DATUPLET_QUERY_WAREHOUSE bootstrap-ordering note:
-            #   The project-qualified warehouse ID ("projectID/warehouse_name")
-            #   is only known after `pipeline-api admin lakekeeper-bootstrap`
-            #   runs. Leave queryWorker.query.warehouse="" until bootstrap is
-            #   done, then:
-            #     helm upgrade <release> charts/datuplet-app --reuse-values \
-            #       --set queryWorker.query.warehouse="<projectID>/datuplet"
-            #   pipeline-api soft-degrades to 404 until the value is set.
+            # Route POST /api/v1/projects/{pid}/query to the in-cluster
+            # query-worker Service. The warehouse is resolved per request from
+            # the pid path segment (RFC 025) — no static warehouse env needed.
+            # Soft-degrade: pipeline-api logs a warning and leaves the route
+            # unregistered (404) when DATUPLET_QUERY_WORKER_URL is absent.
             - name: DATUPLET_QUERY_WORKER_URL
               value: "http://{{ include "datuplet-app.prefix" . }}query-worker.{{ .Release.Namespace }}.svc.cluster.local:8090"
-            - name: DATUPLET_QUERY_WAREHOUSE
-              value: {{ .Values.queryWorker.query.warehouse | quote }}
             # Optional proxy-layer overrides (0 = use package default).
             - name: DATUPLET_QUERY_DEFAULT_TIMEOUT_S
               value: {{ .Values.queryWorker.query.defaultTimeoutS | default 60 | quote }}
