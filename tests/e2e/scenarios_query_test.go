@@ -333,6 +333,33 @@ func postQuery(ctx context.Context, sessionCookie, pid string, req queryRequest)
 	return resp.StatusCode, body, nil
 }
 
+// storageGETPreview fetches the storage preview for (ns, table) via
+// GET /api/v1/storage/projects/{pid}/tables/{ns}/{table}/preview, authenticated
+// with a session cookie (mirrors postQuery's cookie attachment above). Returns
+// (statusCode, body, err).
+func storageGETPreview(ctx context.Context, sessionCookie, pid, ns, table string) (int, []byte, error) {
+	u := framework.PipelineAPIBaseURL() + "/api/v1/storage/projects/" + pid +
+		"/tables/" + ns + "/" + table + "/preview"
+	r, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("build request: %w", err)
+	}
+	if sessionCookie != "" {
+		r.AddCookie(&http.Cookie{Name: "pipeline_api_session", Value: sessionCookie})
+	}
+	cli := &http.Client{Timeout: 30 * time.Second}
+	resp, err := cli.Do(r)
+	if err != nil {
+		return 0, nil, fmt.Errorf("GET %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return 0, nil, fmt.Errorf("read response body: %w", err)
+	}
+	return resp.StatusCode, body, nil
+}
+
 // querySessionLogin POSTs to /api/v1/auth/login and returns the session
 // cookie value + user_id. pipeline-api returns 204 No Content on success
 // (cookie in Set-Cookie header; no JSON body). This mirrors the cookie-login
@@ -1297,6 +1324,66 @@ func TestQuery_AuditSmoke(t *testing.T) {
 		t.Skip("audit smoke: query_audit found but outcome=ok not present — best-effort only")
 	}
 	t.Logf("audit smoke PASS: found query_audit line with outcome=ok")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 9 — Storage preview: served by the query-worker, <5s latency gate
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestQuery_StoragePreview proves that GET
+// /api/v1/storage/projects/{pid}/tables/{ns}/{table}/preview is served by the
+// query-worker (RFC 025 §4.1 — pipeline-api never touches parquet bytes) and
+// meets the Phase 3 latency gate (§7): the response must arrive within 5s.
+//
+// The disabled path (501 query_disabled, h.Query == nil in
+// pkg/pipelineapi/storage/handlers.go Preview) is NOT exercised here: the e2e
+// cluster always installs with queryWorker.enabled=true (tests/e2e/values-app.yaml
+// plus the chart's own default), so there is no disabled lane in this suite
+// to assert against.
+func TestQuery_StoragePreview(t *testing.T) {
+	if os.Getenv("E2E_K8S") != "1" {
+		t.Skip("E2E_K8S=1 required")
+	}
+	h := framework.SharedHarness()
+	if h == nil {
+		t.Skip("SharedHarness nil")
+	}
+	if err := framework.PreCheck(); err != nil {
+		t.Skipf("precheck failed: %v", err)
+	}
+	if !framework.PipelineAPIReachable() {
+		t.Skip("pipeline-api not reachable")
+	}
+
+	ctx := context.Background()
+	session := getAdminSession(t)
+	pid := getQueryProjectID(t)
+	ns, table := ensureQueryTable(t)
+
+	start := time.Now()
+	status, body, err := storageGETPreview(ctx, session, pid, ns, table)
+	if err != nil {
+		t.Fatalf("GET storage preview: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", status, truncateLog(body, 512))
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("preview took %s, want < 5s (RFC 025 §7 Phase 3 latency gate)", elapsed)
+	}
+	t.Logf("preview latency: %s", time.Since(start)) // recorded in the PR description
+
+	var resp struct {
+		Columns []struct {
+			Name, Type string
+		} `json:"columns"`
+		Rows      [][]any `json:"rows"`
+		Truncated bool    `json:"truncated"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || len(resp.Columns) == 0 {
+		t.Fatalf("preview shape: err=%v body=%s", err, truncateLog(body, 512))
+	}
+	t.Logf("preview OK: columns=%d rows=%d truncated=%v", len(resp.Columns), len(resp.Rows), resp.Truncated)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
