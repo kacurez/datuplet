@@ -195,13 +195,15 @@ Re-run — all subcommands are idempotent.
 Phase 2 is not fully installed. Run `kubectl get pods -n datuplet` and ensure all Phase 2
 Pods are Ready before installing Phase 3.
 
-## Optional: ad-hoc SQL query service
+## Ad-hoc SQL query service
 
-The ad-hoc SQL query service (browser console + `POST /api/v1/projects/{pid}/query`
-+ the laptop `datuplet-query` CLI) is **experimental and disabled by
-default** — the install above does not deploy it. To turn it on as a
-post-install step (build the query-worker image, helm-upgrade with
-`queryWorker.enabled=true`), see [docs/ad-hoc-query.md](ad-hoc-query.md).
+The ad-hoc SQL query service (browser console + `POST /api/v1/projects/{pid}/query`)
+is **experimental but on by default** — the query-worker Pod is part of the
+stock install's footprint, and `make deploy-local` / `docker-build-k8s` build
+its image automatically. No post-install step is needed. To disable it,
+helm-upgrade with `queryWorker.enabled=false`. The laptop `datuplet-query` CLI
+remains a separate opt-in (`allowClientSideQuery=true`). See
+[docs/ad-hoc-query.md](ad-hoc-query.md) for details.
 
 ## Further reading
 

@@ -162,8 +162,8 @@ pipelineObserver:
 # ─── Query Worker (RFC 022) ───────────────────────────────────────────────────
 #
 # Ad-hoc SQL query service backed by an embedded DuckDB engine that attaches to
-# the lakekeeper Iceberg catalog. The query-worker is an EXPERIMENTAL feature
-# and is disabled by default. Set queryWorker.enabled=true to opt in.
+# the lakekeeper Iceberg catalog. The query-worker is EXPERIMENTAL but ON by
+# default (RFC 025 Q1). Disable with --set queryWorker.enabled=false.
 #
 # The warehouse is resolved per request from the project-scoped route
 # (POST /api/v1/projects/{pid}/query, RFC 025) — no post-install warehouse
@@ -174,7 +174,7 @@ pipelineObserver:
 queryWorker:
   # enabled: false → no Deployment, Service, or NetworkPolicy resources are
   # rendered; pipeline-api also skips the DATUPLET_QUERY_WORKER_URL env var.
-  enabled: false
+  enabled: true
 
   # replicas: number of query-worker Deployment replicas. Each replica runs
   # its own embedded DuckDB at full concurrency. Keep at 1 for v1 (single

@@ -93,8 +93,11 @@ docker-build-pipeline-api: ## Build pipeline-api Docker image
 docker-build-pipeline-observer: ## Build pipeline-observer Docker image (RFC 015)
 	DOCKER_BUILDKIT=1 docker build -f utils/docker/Dockerfile.pipeline-observer -t datuplet/pipeline-observer:latest .
 
-# Build all K8s images (operators + services)
-docker-build-k8s: docker-build-operators build-gateway build-iceberg-job docker-build-pipeline-api docker-build-pipeline-observer ## Build all K8s images (operators + gateway + iceberg-job + pipeline-api + pipeline-observer)
+# Build all K8s images (operators + services). RFC 025 Task 3.3: query-worker
+# is included here now that queryWorker.enabled defaults to true in the chart
+# — a stock deploy-local must have the image available.
+docker-build-k8s: docker-build-operators build-gateway build-iceberg-job docker-build-pipeline-api docker-build-pipeline-observer ## Build all K8s images (operators + gateway + iceberg-job + pipeline-api + pipeline-observer + query-worker)
+	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
 # =============================================================================
 # K8s UX umbrellas
