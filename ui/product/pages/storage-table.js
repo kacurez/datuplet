@@ -109,8 +109,8 @@ async function renderInfo(gen, app, projectId, ns, name) {
       <dt>Metadata location</dt><dd>${esc(info.metadata_location || '')}</dd>
       <dt>Current snapshot</dt><dd>${esc(String(info.current_snapshot_id ?? ''))}</dd>
       <dt>Snapshot count</dt><dd>${(info.snapshots || []).length}</dd>
-      <dt>Data files</dt><dd>${(info.data_files || []).length}</dd>
-      <dt>Row count</dt><dd>${esc(String(info.row_count ?? 0))}</dd>
+      <dt>Data files</dt><dd>${info.data_file_count == null ? '—' : esc(String(info.data_file_count))}</dd>
+      <dt>Row count</dt><dd>${info.row_count == null ? '—' : esc(String(info.row_count))}</dd>
     </dl>
   `;
 
