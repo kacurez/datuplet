@@ -640,6 +640,78 @@ func TestAdmission_BoundedWaitExpires429(t *testing.T) {
 	<-firstDone
 }
 
+// TestSanitizeEngineError: DuckDB's native error message appends a
+// "\nLINE N: <SQL>\n   ^" echo of the offending statement, which may carry
+// sensitive literals (RFC 025 Codex review F1). sanitizeEngineError must
+// keep the leading diagnostic (used by callers to distinguish error kinds)
+// and drop everything from the LINE echo onward.
+func TestSanitizeEngineError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "line_echo_stripped",
+			err: errors.New("Catalog Error: Table with name secret_table does not exist.\n" +
+				"\nLINE 1: SELECT secret_column FROM \"ns\".\"secret_table\"\n" +
+				"                                     ^"),
+			want: "Catalog Error: Table with name secret_table does not exist.",
+		},
+		{
+			name: "no_line_echo_passthrough",
+			err:  errors.New("connection refused"),
+			want: "connection refused",
+		},
+		{
+			name: "wrapped_timeout_no_line_echo",
+			err:  fmt.Errorf("timeout: %w", queryengine.ErrTimeout),
+			want: "timeout: query timed out",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeEngineError(tc.err); got != tc.want {
+				t.Errorf("sanitizeEngineError(%q) = %q, want %q", tc.err.Error(), got, tc.want)
+			}
+			if strings.Contains(sanitizeEngineError(tc.err), "secret_column") {
+				t.Errorf("sanitized error must not contain the SQL echo: %q", sanitizeEngineError(tc.err))
+			}
+		})
+	}
+}
+
+// TestServer_RunnerError_LogAndBodyStripSQLEcho: a DuckDB-shaped error
+// containing a LINE echo of the SQL text must not leak that echo into the
+// HTTP error body (the worker log isn't observable from this test, but
+// sanitizeEngineError is the single choke point both use).
+func TestServer_RunnerError_LogAndBodyStripSQLEcho(t *testing.T) {
+	priv := genTestKey(t)
+	duckdbErr := errors.New("Catalog Error: Table with name nonexistent_t does not exist.\n" +
+		"\nLINE 1: SELECT * FROM \"ns\".\"nonexistent_t\" WHERE ssn = '123-45-6789'\n" +
+		"                       ^")
+	runner := &fakeRunner{err: duckdbErr}
+	srv := newTestServer(t, priv, runner, testWorkerCfg())
+
+	token := mintTestToken(t, priv)
+	body := map[string]any{"sql": "SELECT * FROM \"ns\".\"nonexistent_t\" WHERE ssn = '123-45-6789'", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
+	resp := doPost(t, srv, body, token)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", resp.Code, resp.Body.String())
+	}
+	errMsg, kind := decodeError(t, resp.Body.String())
+	if kind != "sql_error" {
+		t.Errorf("kind = %q, want sql_error", kind)
+	}
+	if !strings.Contains(errMsg, "nonexistent_t") {
+		t.Errorf("error body should still name the offending table, got: %q", errMsg)
+	}
+	if strings.Contains(errMsg, "LINE ") || strings.Contains(errMsg, "123-45-6789") {
+		t.Errorf("error body must not echo the SQL statement, got: %q", errMsg)
+	}
+}
+
 // Test 10: timeout_s=0 in body → runner receives cfg.MaxTimeoutS (default applies).
 func TestServer_ZeroTimeoutUsesDefault(t *testing.T) {
 	priv := genTestKey(t)

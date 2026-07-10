@@ -272,8 +272,13 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadRequest
 			kind = "sql_error"
 		}
-		log.Printf("query-worker: sub=%s jti=%s kind=%s duration=%s err=%v", sub, jti, kind, duration, runErr)
-		writeError(w, status, kind, runErr.Error())
+		// SECURITY: queryengine.Run's error is DuckDB's native message, which
+		// echoes the offending statement text ("\nLINE N: <SQL>\n   ^") after
+		// the leading diagnostic. Strip that echo before it reaches the log
+		// or the client — the SQL may carry sensitive literals.
+		safeMsg := sanitizeEngineError(runErr)
+		log.Printf("query-worker: sub=%s jti=%s kind=%s duration=%s err=%s", sub, jti, kind, duration, safeMsg)
+		writeError(w, status, kind, safeMsg)
 		return
 	}
 
@@ -299,4 +304,25 @@ func (s *queryServer) extractAndVerify(r *http.Request) (sub, jti string, err er
 		return "", "", errors.New("empty bearer token")
 	}
 	return s.verifier.Verify(r.Context(), tokenStr)
+}
+
+// sqlLineEcho marks the start of DuckDB's statement echo in a native error
+// message, e.g. "Catalog Error: Table with name X does not exist.\n\nLINE 1:
+// SELECT * FROM \"ns\".\"X\"\n                       ^". Everything from
+// this marker onward reproduces (part of) the query text, which may carry
+// sensitive literals — see sanitizeEngineError.
+const sqlLineEcho = "\nLINE "
+
+// sanitizeEngineError strips DuckDB's SQL statement echo from a
+// queryengine.Run error before it is logged or returned to the client. It
+// keeps the leading diagnostic (e.g. "Catalog Error: Table with name X does
+// not exist.") — which callers rely on to distinguish error kinds — and
+// drops everything from the first "\nLINE " marker onward. Errors without a
+// LINE echo pass through unchanged (aside from TrimSpace, a no-op for them).
+func sanitizeEngineError(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, sqlLineEcho); i >= 0 {
+		msg = msg[:i]
+	}
+	return strings.TrimSpace(msg)
 }
