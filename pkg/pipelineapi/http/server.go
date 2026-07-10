@@ -453,10 +453,9 @@ func (s *Server) Handler() http.Handler {
 	switch {
 	case s.storage != nil && s.resolver != nil && s.authzr != nil:
 		h := &storage.HTTPHandlers{
-			Svc:        s.storage,
-			Authorizer: s.authzr,
-			Emails:     pgxEmailLookup{pool: s.db},
-			Gate:       s.projectGate,
+			Svc:    s.storage,
+			Emails: pgxEmailLookup{pool: s.db},
+			Gate:   s.projectGate,
 		}
 		if s.queryCore != nil {
 			h.Query = s.queryCore

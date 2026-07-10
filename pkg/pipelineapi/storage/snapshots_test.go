@@ -33,8 +33,7 @@ func newSnapshotsTestServerFull(t *testing.T, svc *Service) *httptest.Server {
 	// these fixtures use the fixture-walker path (LakekeeperURL == ""), so
 	// resolveWarehouse is never invoked.
 	h := &HTTPHandlers{
-		Svc:        svc,
-		Authorizer: authzr,
+		Svc: svc,
 		Gate: &projectgate.Gate{
 			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
 			Authorizer:             authzr,

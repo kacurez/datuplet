@@ -90,14 +90,13 @@ func makeFixtureServiceWithLK(t *testing.T) *Service {
 func newTestServer(t *testing.T, svc *Service, resolver auth.UserResolver, authzr *authztest.Fake) *httptest.Server {
 	t.Helper()
 	// Gate is built from the SAME stubs the fixture Service already carries
-	// (svc.LakekeeperProjectIDFor) plus the same authzr passed to
-	// HTTPHandlers.Authorizer — resolveProject now delegates to it instead
-	// of calling h.Svc.LakekeeperProjectIDFor + h.Authorizer directly.
-	// WarehouseFor is left nil: every test here uses the fixture-walker
-	// path (LakekeeperURL == ""), so resolveWarehouse is never invoked.
+	// (svc.LakekeeperProjectIDFor) plus authzr — resolveProject delegates
+	// to it instead of calling h.Svc.LakekeeperProjectIDFor + an authorizer
+	// directly. WarehouseFor is left nil: every test here uses the
+	// fixture-walker path (LakekeeperURL == ""), so resolveWarehouse is
+	// never invoked.
 	h := &HTTPHandlers{
-		Svc:        svc,
-		Authorizer: authzr,
+		Svc: svc,
 		Gate: &projectgate.Gate{
 			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
 			Authorizer:             authzr,

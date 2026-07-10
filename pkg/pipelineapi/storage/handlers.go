@@ -16,7 +16,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
-	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 )
@@ -33,18 +32,17 @@ type EmailLookup interface {
 }
 
 // HTTPHandlers wires the four /api/v1/storage handlers against a
-// Service + the pipeline-api authz seam (Authorizer). The UserResolver
-// is applied by the caller via auth.WithUser middleware before each
-// request reaches these handlers — so we only need an Authorizer here
-// to decide whether the already-authenticated user may access a project.
+// Service + the pipeline-api authz seam. The UserResolver is applied by
+// the caller via auth.WithUser middleware before each request reaches
+// these handlers — authorization of the already-authenticated user's
+// project access flows through Gate.
 // Emails (optional — nil means "don't enrich actor_email") resolves the
 // snapshot-history actor UUID → email for display.
 // Constructed once at server startup; handlers are safe for concurrent
 // use.
 type HTTPHandlers struct {
-	Svc        *Service
-	Authorizer authz.Authorizer
-	Emails     EmailLookup
+	Svc    *Service
+	Emails EmailLookup
 	// Gate is the shared project-authz + warehouse prologue (RFC 025 §4.6
 	// amendment) — the same instance the query proxy uses.
 	Gate *projectgate.Gate
