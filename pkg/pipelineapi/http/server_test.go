@@ -148,16 +148,18 @@ func TestServer_StorageRoute_WithServiceWired(t *testing.T) {
 	}
 }
 
-// TestServer_QueryRoute_NotConfigured asserts that POST /api/v1/query
-// returns 404 when the query service is not wired.
+// TestServer_QueryRoute_NotConfigured asserts that
+// POST /api/v1/projects/{pid}/query returns 404 when the query service is
+// not wired.
 func TestServer_QueryRoute_NotConfigured(t *testing.T) {
 	srv := apihttp.NewServer(nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := stdhttp.Post(ts.URL+"/api/v1/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
+	pid := uuid.NewString()
+	resp, err := stdhttp.Post(ts.URL+"/api/v1/projects/"+pid+"/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
 	if err != nil {
-		t.Fatalf("POST /api/v1/query: %v", err)
+		t.Fatalf("POST /api/v1/projects/%s/query: %v", pid, err)
 	}
 	defer resp.Body.Close()
 
@@ -166,10 +168,10 @@ func TestServer_QueryRoute_NotConfigured(t *testing.T) {
 	}
 }
 
-// TestServer_QueryRoute_WithServiceWired asserts that POST /api/v1/query is
-// registered behind auth.WithUser when a pre-built query handler + resolver
-// are wired. It exercises the full chain: route → auth.WithUser → queryproxy
-// → fake worker.
+// TestServer_QueryRoute_WithServiceWired asserts that
+// POST /api/v1/projects/{pid}/query is registered behind auth.WithUser when
+// a pre-built query handler + resolver are wired. It exercises the full
+// chain: route → auth.WithUser → queryproxy → fake worker.
 func TestServer_QueryRoute_WithServiceWired(t *testing.T) {
 	// Fixed result JSON the fake worker returns verbatim.
 	const resultJSON = `{"schema":[{"name":"a","type":"INTEGER"}],"rows":[[1]],"truncated":false,"stats":{"duration_ms":3}}`
@@ -198,38 +200,41 @@ func TestServer_QueryRoute_WithServiceWired(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
+	pid := uuid.NewString()
+	queryURL := ts.URL + "/api/v1/projects/" + pid + "/query"
+
 	// Test 1: Unauthenticated request.
 	// auth.WithUser (middleware.go) always returns exactly 401 when the resolver
 	// returns (nil, false, nil) — it writes writeJSONError(w, 401, "not authenticated")
 	// regardless of resolver Mode. The selectiveResolver.Mode() returns "test" which
 	// does not trigger any redirect path.
-	resp, err := stdhttp.Post(ts.URL+"/api/v1/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
+	resp, err := stdhttp.Post(queryURL, "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
 	if err != nil {
-		t.Fatalf("POST /api/v1/query (unauthenticated): %v", err)
+		t.Fatalf("POST %s (unauthenticated): %v", queryURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != stdhttp.StatusUnauthorized {
 		t.Errorf("unauthenticated: status = %d, want 401 (auth.WithUser always returns 401 on (nil,false,nil))", resp.StatusCode)
 	}
 
-	// Test 2: Authenticated request — full chain: route → auth → queryproxy → fake worker.
-	//
-	// TRANSITIONAL (RFC 025 Task 0.3, pending Task 0.4): the route is still
-	// registered at the pid-less "/api/v1/query" pattern (server.go), so
-	// r.PathValue("pid") is empty and the queryproxy gate step 400s before
-	// ever reaching the worker — the worker is never called. Task 0.4
-	// re-registers the route as "/api/v1/projects/{pid}/query" and must
-	// restore this test to its full 200/resultJSON assertion using a real
-	// pid in the request path.
+	// Test 2: Authenticated request — full chain: route → auth → queryproxy
+	// (Gate authorizes {pid} via projectgatetest.AllowAll) → fake worker.
 	resolver.allow = true
-	resp2, err := stdhttp.Post(ts.URL+"/api/v1/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
+	resp2, err := stdhttp.Post(queryURL, "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
 	if err != nil {
-		t.Fatalf("POST /api/v1/query (authenticated): %v", err)
+		t.Fatalf("POST %s (authenticated): %v", queryURL, err)
 	}
 	defer resp2.Body.Close()
-	if resp2.StatusCode != stdhttp.StatusBadRequest {
+	if resp2.StatusCode != stdhttp.StatusOK {
 		body, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("authenticated: status = %d, want 400 (no {pid} segment until Task 0.4 rewires the route); body=%s", resp2.StatusCode, body)
+		t.Fatalf("authenticated: status = %d, want 200; body=%s", resp2.StatusCode, body)
+	}
+	body2, err := io.ReadAll(resp2.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body2) != resultJSON {
+		t.Errorf("body = %q, want %q", string(body2), resultJSON)
 	}
 }
 

@@ -242,18 +242,17 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		return fmt.Errorf("storage service: %w", err)
 	}
 
-	// warehouseResolver is used by the storage service only (per-request warehouse
-	// resolution for the storage UI). The query service uses the static
-	// DATUPLET_QUERY_WAREHOUSE env var set at boot — not this resolver.
+	// warehouseResolver does per-request warehouse resolution and is shared by
+	// the storage handlers and the query proxy — both consume it via projGate
+	// (below), which wraps it as projGate.WarehouseFor.
 	var warehouseResolver func(ctx context.Context, lakekeeperProjectID string) (string, error)
 	// pgxProjectIDFor maps a Datuplet project UUID to its lakekeeper project
 	// UUID. Hoisted to this outer scope (not just inside the `if storageSvc
 	// != nil` block below) because it also feeds projGate.
 	var pgxProjectIDFor func(context.Context, uuid.UUID) (string, error)
 	// projGate is the shared project-authz + warehouse prologue (RFC 025
-	// §4.6 amendment) consumed by the storage handlers (this task) and,
-	// later, the query proxy (Task 0.4) — built once below, only when
-	// lakekeeper wiring succeeds.
+	// §4.6 amendment) consumed by both the storage handlers and the query
+	// proxy — built once below, only when lakekeeper wiring succeeds.
 	var projGate *projectgate.Gate
 
 	if storageSvc != nil {
@@ -306,19 +305,16 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 			lakekeeperURL)
 	}
 
-	// Query service: POST /api/v1/query ad-hoc SQL queries on lakekeeper tables.
-	// Routes to the query-worker Service with JWT credentials. Soft-degrade when
-	// DATUPLET_QUERY_WORKER_URL is absent — the endpoint stays unregistered
-	// (clients get 404).
+	// Query service: POST /api/v1/projects/{pid}/query ad-hoc SQL queries on
+	// lakekeeper tables. Routes to the query-worker Service with JWT
+	// credentials. Soft-degrade when DATUPLET_QUERY_WORKER_URL is absent —
+	// the endpoint stays unregistered (clients get 404).
 	//
 	// Warehouse: the query-worker must attach to a specific lakekeeper warehouse
-	// to resolve table metadata. The warehouse must be project-qualified
-	// (format: "lakekeeper_project_id/warehouse_name") as lakekeeper requires for
-	// attach (RFC 022 §6.1). Unlike storage handlers which resolve the warehouse
-	// per-request, the query service uses a single static warehouse configured at
-	// boot via DATUPLET_QUERY_WAREHOUSE. This design supports single-warehouse
-	// deployments; multi-warehouse support is deferred (would require per-request
-	// warehouse selection based on run context).
+	// to resolve table metadata. The warehouse now resolves per request via
+	// projGate — the same project-authz + warehouse prologue the storage
+	// handlers use (RFC 025 §4.6 amendment) — instead of a single static
+	// warehouse configured at boot.
 	//
 	// The handler is built here at config time (same pattern as
 	// storage.NewForLakekeeper) so that a present-but-invalid WorkerURL
@@ -327,17 +323,22 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	var queryHandler http.Handler
 	queryWorkerURL := os.Getenv("DATUPLET_QUERY_WORKER_URL")
 	if queryWorkerURL != "" {
-		queryWarehouse := os.Getenv("DATUPLET_QUERY_WAREHOUSE")
-		if queryWarehouse == "" {
-			log.Printf("query service: DATUPLET_QUERY_WAREHOUSE not set (POST /api/v1/query unavailable); set to enable (format: projectID/warehouse)")
-		} else if lakekeeperURL == "" {
-			log.Printf("query service: DATUPLET_LAKEKEEPER_URL not set (POST /api/v1/query unavailable); required for table catalog access")
-		} else {
+		switch {
+		case lakekeeperURL == "":
+			log.Printf("query service: DATUPLET_LAKEKEEPER_URL not set (query route unavailable); required for table catalog access")
+		case authzr == nil:
+			// authz stays nil when OPENFGA_MODEL_VERSION is unset (authz
+			// disabled — main.go:172). The query route now enforces FGA
+			// membership, so it soft-degrades with authz off.
+			log.Printf("query service: authz disabled (OPENFGA_MODEL_VERSION unset) — query route unavailable")
+		case projGate == nil:
+			log.Printf("query service: project gate not wired (query route unavailable)")
+		default:
 			queryProxyCfg := queryproxy.Config{
 				WorkerURL: queryWorkerURL,
-				// Gate: wiring deferred to Task 0.4 (route registration +
-				// main.go); queryproxy.Handler now requires cfg.Gate and will
-				// error here until it is set. See RFC 025 Task 0.3.
+				// The SAME gate instance the storage handlers use (Task
+				// 0.2) — one seam, two consumers, drift impossible.
+				Gate:                 projGate,
 				DefaultTimeoutS:      envIntOr("DATUPLET_QUERY_DEFAULT_TIMEOUT_S", 0),      // 0 → use package default (60s)
 				MaxTimeoutS:          envIntOr("DATUPLET_QUERY_MAX_TIMEOUT_S", 0),          // 0 → use package default (300s)
 				DefaultMaxRows:       envIntOr("DATUPLET_QUERY_DEFAULT_MAX_ROWS", 0),       // 0 → use package default (1000)
@@ -353,10 +354,10 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 				return fmt.Errorf("query service: %w", err)
 			}
 			queryHandler = h
-			fmt.Printf("  Query service: %s (warehouse: %s)\n", queryWorkerURL, queryWarehouse)
+			fmt.Printf("  Query service: %s (warehouse: per-request)\n", queryWorkerURL)
 		}
 	} else {
-		log.Printf("query service not wired: DATUPLET_QUERY_WORKER_URL not set (POST /api/v1/query returns 404)")
+		log.Printf("query service not wired: DATUPLET_QUERY_WORKER_URL not set (query route returns 404)")
 	}
 
 	// Local query-JWT mint endpoint: POST /api/v1/query/token (RFC 022 §5.3).
@@ -435,9 +436,9 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		// routes stay unregistered.
 		srv = srv.WithComponentAdmin(registry.NewWriter(k8sClient))
 	}
-	// Query service: POST /api/v1/query ad-hoc SQL. Wired only when
-	// DATUPLET_QUERY_WORKER_URL is set and handler construction succeeded above.
-	// nil → route stays unregistered → 404.
+	// Query service: POST /api/v1/projects/{pid}/query ad-hoc SQL. Wired only
+	// when DATUPLET_QUERY_WORKER_URL is set and handler construction succeeded
+	// above. nil → route stays unregistered → 404.
 	if queryHandler != nil {
 		srv = srv.WithQueryService(queryHandler)
 	}

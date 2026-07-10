@@ -78,7 +78,7 @@ type Config struct {
 	// Gate resolves + authorizes the {pid} route segment and returns the
 	// project-qualified warehouse per request (RFC 025 §4.6). The SAME
 	// instance the storage handlers use (wired in main.go) — one seam, two
-	// consumers. Replaces the static Warehouse / DATUPLET_QUERY_WAREHOUSE.
+	// consumers. Replaces the old static per-boot Warehouse config field.
 	// Required.
 	Gate *projectgate.Gate
 

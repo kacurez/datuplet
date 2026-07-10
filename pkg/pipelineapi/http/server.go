@@ -48,8 +48,9 @@ type Server struct {
 	// cliTokenLimiter rate-limits POST /api/v1/auth/token by client IP.
 	// Initialised in NewServer; never nil.
 	cliTokenLimiter *auth.Limiter
-	// queryHandler is a pre-built http.Handler for POST /api/v1/query,
-	// constructed in main.go at config time (same pattern as storage.NewForLakekeeper).
+	// queryHandler is a pre-built http.Handler for
+	// POST /api/v1/projects/{pid}/query, constructed in main.go at config
+	// time (same pattern as storage.NewForLakekeeper).
 	// Nil when the query service is not configured; the route stays unregistered.
 	queryHandler http.Handler
 	// localQueryMintHandler is the pre-built http.Handler for
@@ -222,7 +223,8 @@ func (s *Server) WithProjectGate(g *projectgate.Gate) *Server {
 	return s
 }
 
-// WithQueryService wires the pre-built http.Handler for POST /api/v1/query.
+// WithQueryService wires the pre-built http.Handler for
+// POST /api/v1/projects/{pid}/query.
 // The handler must have been constructed by the caller (e.g. via
 // queryproxy.Handler in main.go) so that construction errors surface as a
 // normal return error at config time rather than a panic at request time.
@@ -404,12 +406,15 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	// Query service route. When a pre-built queryHandler + resolver are wired,
-	// register POST /api/v1/query behind auth.WithUser middleware.
+	// register POST /api/v1/projects/{pid}/query behind auth.WithUser
+	// middleware. {pid} is resolved + authorized by the query proxy's
+	// projectgate.Gate (RFC 025 §4.6 amendment) — the same gate the storage
+	// handlers use.
 	// The handler is constructed in main.go at config time (same pattern as
 	// storage.NewForLakekeeper), so no construction can fail here.
 	// Absent env → queryHandler is nil → route stays unregistered (404).
 	if s.queryHandler != nil && s.resolver != nil {
-		mux.Handle("POST /api/v1/query", auth.WithUser(s.resolver, s.queryHandler))
+		mux.Handle("POST /api/v1/projects/{pid}/query", auth.WithUser(s.resolver, s.queryHandler))
 	}
 
 	// Local query-JWT mint route (RFC 022 §5.3). Registered whenever the
