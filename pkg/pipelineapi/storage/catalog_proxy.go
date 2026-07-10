@@ -6,6 +6,7 @@ import (
 
 	"github.com/apache/iceberg-go/catalog"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
@@ -96,7 +97,10 @@ func newCatalogProxy(ctx context.Context, svc *Service, projectID, warehouse str
 // paths don't carry project identity, so any prefix check would be either
 // useless or wrong.
 func (p *catalogProxy) listAllTables(ctx context.Context) ([]TableRef, error) {
-	var out []TableRef
+	// Listing is cheap; LoadTable dominates wall-clock (one REST call +
+	// credential vend per table). Collect identifiers first, then load
+	// with bounded parallelism (RFC 025 §4.3).
+	var idents []icebergtable.Identifier
 	namespaces, err := p.cli.Catalog.ListNamespaces(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -106,23 +110,40 @@ func (p *catalogProxy) listAllTables(ctx context.Context) ([]TableRef, error) {
 			if tErr != nil {
 				return nil, fmt.Errorf("list tables in %v: %w", ns, tErr)
 			}
-			tbl, lErr := p.cli.Catalog.LoadTable(ctx, ident)
+			idents = append(idents, ident)
+		}
+	}
+
+	loaded := make([]*TableRef, len(idents))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
+	for i, ident := range idents {
+		g.Go(func() error {
+			tbl, lErr := p.cli.Catalog.LoadTable(gctx, ident)
 			if lErr != nil {
 				// A table that fails to load (orphan, mid-creation,
 				// permission denied) is skipped rather than failing the
-				// whole list — same behaviour as the fixture walker.
-				continue
+				// whole list — same behaviour as the sequential version.
+				return nil
 			}
 			var snapID int64
 			if cur := tbl.CurrentSnapshot(); cur != nil {
 				snapID = cur.SnapshotID
 			}
-			out = append(out, TableRef{
+			loaded[i] = &TableRef{
 				Namespace:         joinNS(ident),
 				Name:              shortName(ident),
 				MetadataLocation:  tbl.MetadataLocation(),
 				CurrentSnapshotID: snapID,
-			})
+			}
+			return nil
+		})
+	}
+	_ = g.Wait() // goroutines only ever return nil; ctx cancellation surfaces via LoadTable skips
+	out := make([]TableRef, 0, len(loaded))
+	for _, ref := range loaded {
+		if ref != nil {
+			out = append(out, *ref)
 		}
 	}
 	return out, nil

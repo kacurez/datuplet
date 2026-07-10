@@ -2,10 +2,14 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	icebergtable "github.com/apache/iceberg-go/table"
 
@@ -273,5 +277,212 @@ func TestListAllTables_RealLakekeeperLayout(t *testing.T) {
 	}
 	if strings.Contains(got, "/orgs/") || strings.Contains(got, "/projects/") {
 		t.Errorf("MetadataLocation = %q; should NOT carry legacy /orgs/.../projects/... prefix", got)
+	}
+}
+
+// fakeTableMetadataJSON builds a minimal v1 table metadata document (the
+// same shape as TestListAllTables_RealLakekeeperLayout's inline fixture),
+// parameterized by metadata-location and table UUID so each faked
+// identifier in the tests below gets a distinguishable LoadTable response.
+// table-uuid must be a real UUID (iceberg-go decodes it via uuid.UUID),
+// so tests pass a zero-padded index rather than the bare table name.
+func fakeTableMetadataJSON(metadataLoc, tableUUID string) string {
+	return `{
+		"metadata-location": "` + metadataLoc + `",
+		"metadata": {
+			"format-version": 1,
+			"table-uuid": "` + tableUUID + `",
+			"location": "s3://datuplet/` + tableUUID + `",
+			"last-updated-ms": 1700000000000,
+			"last-column-id": 1,
+			"schema": {"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","required":false,"type":"long"}]},
+			"current-schema-id": 0,
+			"schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","required":false,"type":"long"}]}],
+			"partition-spec": [],
+			"default-spec-id": 0,
+			"partition-specs": [{"spec-id":0,"fields":[]}],
+			"default-sort-order-id": 0,
+			"sort-orders": [{"order-id":0,"fields":[]}],
+			"properties": {},
+			"current-snapshot-id": -1,
+			"snapshots": [],
+			"refs": {}
+		},
+		"config": {}
+	}`
+}
+
+// fakeUUID turns a small integer into a syntactically valid UUID so the
+// fixture metadata below satisfies iceberg-go's uuid.UUID decode.
+func fakeUUID(i int) string {
+	return fmt.Sprintf("00000000-0000-0000-0000-%012d", i)
+}
+
+// fakeUUIDForTableName derives a distinguishable-but-valid UUID from a
+// "t<N>" fixture table name, so each faked identifier's LoadTable
+// response is unique rather than every table sharing index 0.
+func fakeUUIDForTableName(name string) string {
+	n, err := strconv.Atoi(strings.TrimPrefix(name, "t"))
+	if err != nil {
+		n = 0
+	}
+	return fakeUUID(n)
+}
+
+// newFakeCatalogMux builds an httptest mux that speaks just enough of the
+// iceberg-go REST catalog protocol to drive listAllTables: one namespace
+// "raw" containing `total` tables named t0..t(total-1), with LoadTable
+// requests routed through loadHandler so tests can instrument/fail
+// individual loads. Mirrors the wiring already proven out in
+// TestListAllTables_RealLakekeeperLayout.
+func newFakeCatalogMux(total int, loadHandler func(w http.ResponseWriter, name string)) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"defaults":{},"overrides":{}}`))
+	})
+	mux.HandleFunc("/v1/namespaces", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"namespaces":[["raw"]]}`))
+	})
+	mux.HandleFunc("/v1/namespaces/raw/tables", func(w http.ResponseWriter, _ *http.Request) {
+		idents := make([]string, total)
+		for i := 0; i < total; i++ {
+			idents[i] = fmt.Sprintf(`{"namespace":["raw"],"name":"t%d"}`, i)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"identifiers":[%s]}`, strings.Join(idents, ","))
+	})
+	// Trailing-slash subtree route: matches every "/v1/namespaces/raw/tables/<name>"
+	// LoadTable request without needing one handler per identifier.
+	mux.HandleFunc("/v1/namespaces/raw/tables/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/v1/namespaces/raw/tables/")
+		loadHandler(w, name)
+	})
+	return mux
+}
+
+func newFakeCatalogProxy(t *testing.T, mux *http.ServeMux) *catalogProxy {
+	t.Helper()
+	stub := httptest.NewServer(mux)
+	t.Cleanup(stub.Close)
+
+	svc := &Service{
+		LakekeeperURL: stub.URL,
+		WarehouseName: "datuplet",
+		Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
+			return "tok", nil
+		},
+	}
+	p, err := newCatalogProxy(context.Background(), svc, "", "datuplet")
+	if err != nil {
+		t.Fatalf("newCatalogProxy: %v", err)
+	}
+	return p
+}
+
+// TestListAllTables_BoundedParallelLoad proves the errgroup.SetLimit(8)
+// width deterministically: it blocks every LoadTable call inside the fake
+// until `release` closes, tracking the peak number simultaneously blocked.
+// With 16 identifiers and a limit of 8, the peak must reach exactly 8 —
+// never more (the limiter caps it) and, since 16 > 8, never less either.
+// No wall-clock assertions: the test polls until the peak is observed,
+// then unblocks everything and asserts on the final state.
+func TestListAllTables_BoundedParallelLoad(t *testing.T) {
+	const total = 16
+	var inflight, peak int32
+	release := make(chan struct{})
+
+	loadEnter := func() {
+		cur := atomic.AddInt32(&inflight, 1)
+		for {
+			p := atomic.LoadInt32(&peak)
+			if cur <= p || atomic.CompareAndSwapInt32(&peak, p, cur) {
+				break
+			}
+		}
+		<-release
+		atomic.AddInt32(&inflight, -1)
+	}
+
+	mux := newFakeCatalogMux(total, func(w http.ResponseWriter, name string) {
+		loadEnter()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fakeTableMetadataJSON(
+			fmt.Sprintf("s3://datuplet/%s/metadata/00000.metadata.json", name),
+			fakeUUIDForTableName(name),
+		)))
+	})
+	p := newFakeCatalogProxy(t, mux)
+
+	type res struct {
+		out []TableRef
+		err error
+	}
+	resCh := make(chan res, 1)
+	go func() {
+		out, err := p.listAllTables(context.Background())
+		resCh <- res{out, err} // assertions happen on the test goroutine below
+	}()
+
+	// Deterministic release: wait until the limiter's full width (8) is
+	// simultaneously blocked inside LoadTable, then let everything finish.
+	deadline := time.After(10 * time.Second)
+	for atomic.LoadInt32(&peak) < 8 {
+		select {
+		case <-deadline:
+			close(release) // unblock leaked goroutines before failing
+			t.Fatalf("never reached 8 concurrent LoadTable calls (peak=%d)", atomic.LoadInt32(&peak))
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	close(release)
+
+	r := <-resCh
+	if r.err != nil {
+		t.Fatalf("listAllTables: %v", r.err)
+	}
+	if got := atomic.LoadInt32(&peak); got != 8 {
+		t.Fatalf("peak concurrency = %d, want exactly the SetLimit width 8", got)
+	}
+	if len(r.out) != total {
+		t.Fatalf("len(out) = %d, want %d", len(r.out), total)
+	}
+}
+
+// TestListAllTables_SkipsFailedLoadPreservesOrder: a LoadTable failure on
+// one identifier must be skipped (not fail the whole list, and not
+// reorder the survivors) — identifiers are collected in
+// ListNamespaces/ListTables order, loaded into an index-aligned slice, and
+// the final compaction preserves that index order.
+func TestListAllTables_SkipsFailedLoadPreservesOrder(t *testing.T) {
+	const total = 3 // t0, t1 (fails), t2
+	mux := newFakeCatalogMux(total, func(w http.ResponseWriter, name string) {
+		if name == "t1" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fakeTableMetadataJSON(
+			fmt.Sprintf("s3://datuplet/%s/metadata/00000.metadata.json", name),
+			fakeUUIDForTableName(name),
+		)))
+	})
+	p := newFakeCatalogProxy(t, mux)
+
+	out, err := p.listAllTables(context.Background())
+	if err != nil {
+		t.Fatalf("listAllTables: %v", err)
+	}
+	if len(out) != total-1 {
+		t.Fatalf("len(out) = %d, want %d (t1 failed to load and should be skipped)", len(out), total-1)
+	}
+	if out[0].Name != "t0" || out[1].Name != "t2" {
+		t.Fatalf("order not preserved: got [%s, %s], want [t0, t2]", out[0].Name, out[1].Name)
+	}
+	for _, ref := range out {
+		if ref.Name == "t1" {
+			t.Fatalf("t1 failed LoadTable and must be absent from the result, got %+v", ref)
+		}
 	}
 }
