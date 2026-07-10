@@ -499,13 +499,16 @@ prior in-process Arrow scan.
 
 Preview requires the query service (`queryWorker.enabled=true`); when it
 isn't configured, the endpoint returns 501 with `{"error": "...", "kind":
-"query_disabled"}`. All non-2xx preview responses carry this
+"query_disabled"}`. Query-service preview errors carry this
 `{error, kind}` envelope, with `kind` one of: `query_disabled` (query
 service not wired), `rate_limited` (a preview is already running for this
 user — the per-principal preview gate caps at 1 concurrent preview),
 `capacity` (query-worker is busy), `result_too_large` (schema/rows exceed
 the preview byte cap), `sql_error` (lakekeeper/DuckDB rejected the
-generated statement), `timeout` (query exceeded its time budget).
+generated statement), `timeout` (query exceeded its time budget). The
+shared request prologue's own errors — invalid project id (400),
+unauthenticated (401), forbidden (403), and backend-not-configured (503) —
+return a bare `{"error": "..."}` without a `kind`.
 
 ### Errors
 
