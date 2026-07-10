@@ -909,12 +909,24 @@ func TestQuery_Concurrency(t *testing.T) {
 	// Per-principal cap = 2 (queryproxy default).
 	// At least one of the three MUST get 429 rate_limited.
 	//
-	// Query: cross-join large enough to run for >2s (so all three land
-	// before any finishes), but not so large it OOMs: range(1000)×range(1000)
-	// = 1M rows with a 5s timeout — DuckDB scans for ~3s on a small cluster
-	// before we get the 429 and cancel the others.
-	sql := "SELECT t1.range + t2.range AS val FROM range(1000) t1, range(1000) t2"
-	timeoutS := 5
+	// The query must reliably HOLD each request's gate slot for longer than
+	// the pre-gate stagger, so that requests 1 and 2 are both still in flight
+	// when request 3 hits the per-principal gate and gets an instant 429.
+	// Two pitfalls to avoid:
+	//   - a row-returning scan hits the max_rows cap (default 1000) and
+	//     returns near-instantly;
+	//   - a plain count(*)/sum() over range()×range() is computed
+	//     ANALYTICALLY by DuckDB (cardinality known without scanning), so it
+	//     also returns in ~milliseconds.
+	// An aggregate over an OPAQUE per-row predicate (hash) forces DuckDB to
+	// actually evaluate every row of the product — a genuine multi-second
+	// scan the optimizer cannot short-circuit. 30000×30000 = 9e8 rows.
+	//
+	// (RFC 025's per-request warehouse resolution widened the pre-gate
+	// stagger, which made the old fast query deterministically fail this test
+	// on fast machines — the gate itself is unchanged and correct.)
+	sql := "SELECT count(*) AS c FROM range(30000) t1, range(30000) t2 WHERE hash(t1.range * 1000003 + t2.range) % 5 = 0"
+	timeoutS := 20
 
 	type result struct {
 		status int
