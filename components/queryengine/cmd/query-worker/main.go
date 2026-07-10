@@ -15,10 +15,9 @@
 // Signal handling mirrors cmd/pipeline-observer: SIGTERM or SIGINT triggers
 // graceful HTTP shutdown with a 15s drain, then the process exits.
 //
-// Metrics: pipeline-observer exposes Prometheus /metrics; this binary is a
-// single-purpose sidecar service (not a long-lived informer) so we do not wire
-// a Prometheus registry here — only /healthz is exposed alongside the query
-// endpoint.  A future hardening pass can add /metrics if desired.
+// Metrics: GET /metrics (default Prometheus registry via promhttp) exposes
+// query_worker_inflight, query_worker_capacity_slots, and
+// query_worker_admission_total{outcome} alongside /healthz (RFC 025 §5.3).
 package main
 
 import (
@@ -78,6 +77,7 @@ func run() error {
 	fmt.Printf("  MaxTimeoutS:  %d\n", cfg.MaxTimeoutS)
 	fmt.Printf("  MaxRows:      %d\n", cfg.MaxRows)
 	fmt.Printf("  MaxBytes:     %d\n", cfg.MaxBytes)
+	fmt.Printf("  Metrics:      /metrics\n")
 
 	// ---- wire JWKS client + token verifier --------------------------------
 	// jwks.Client.KeyFor holds a mutex across HTTP re-fetches, which makes it
@@ -107,7 +107,7 @@ func run() error {
 
 	httpErrCh := make(chan error, 1)
 	go func() {
-		fmt.Printf("  HTTP: listening on %s (/healthz, /internal/query)\n", cfg.ListenAddr)
+		fmt.Printf("  HTTP: listening on %s (/healthz, /metrics, /internal/query)\n", cfg.ListenAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			httpErrCh <- fmt.Errorf("http listen: %w", err)
 			return

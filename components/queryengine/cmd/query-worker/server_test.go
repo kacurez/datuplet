@@ -559,6 +559,27 @@ func TestServer_MalformedJSON_Returns400(t *testing.T) {
 	}
 }
 
+// Test 11: GET /metrics → 200, body exposes inflight + capacity gauges.
+func TestMetricsEndpoint(t *testing.T) {
+	priv := genTestKey(t)
+	ok := RunnerFunc(func(_ context.Context, _ queryengine.Request) (*queryengine.Result, error) {
+		return &queryengine.Result{Rows: [][]any{}}, nil
+	})
+	srv := newTestServer(t, priv, ok, workerConfig{MaxConcurrency: 3})
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "query_worker_capacity_slots 3") {
+		t.Fatalf("metrics missing capacity gauge:\n%s", body)
+	}
+	if !strings.Contains(body, "query_worker_inflight 0") {
+		t.Fatalf("metrics missing inflight gauge:\n%s", body)
+	}
+}
+
 // Test 10: timeout_s=0 in body → runner receives cfg.MaxTimeoutS (default applies).
 func TestServer_ZeroTimeoutUsesDefault(t *testing.T) {
 	priv := genTestKey(t)

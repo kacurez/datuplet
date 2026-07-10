@@ -15,7 +15,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/datuplet/datuplet/components/queryengine"
+)
+
+// Prometheus surface (RFC 025 §5.3): capacity is legible so a future
+// autoscaler is a bolt-on. Default registry + promauto, exposed on the
+// same mux as /healthz — cluster-internal only (NetworkPolicy).
+var (
+	inflightGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "query_worker_inflight", Help: "Queries currently holding an admission slot."})
+	capacitySlots = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "query_worker_capacity_slots", Help: "Total admission slots (DATUPLET_QUERY_WORKER_CONCURRENCY)."})
+	admissionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "query_worker_admission_total", Help: "Admission decisions by outcome."}, []string{"outcome"})
 )
 
 // Runner is the engine seam: lets server.go be tested with a fake without
@@ -83,9 +99,11 @@ func newQueryServer(verifier *tokenVerifier, runner Runner, cfg workerConfig) *q
 		cfg:      cfg,
 		sem:      make(chan struct{}, cfg.MaxConcurrency),
 	}
+	capacitySlots.Set(float64(cfg.MaxConcurrency))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
+	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.HandleFunc("POST /internal/query", srv.handleQuery)
 	srv.mux = mux
 
@@ -142,8 +160,11 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 2. Admission: acquire semaphore non-blocking.
 	select {
 	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
+		inflightGauge.Inc()
+		admissionTotal.WithLabelValues("admitted").Inc()
+		defer func() { <-s.sem; inflightGauge.Dec() }()
 	default:
+		admissionTotal.WithLabelValues("rejected").Inc()
 		log.Printf("query-worker: capacity exhausted sub=%s jti=%s", sub, jti)
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "capacity", "server at capacity, try again shortly")
