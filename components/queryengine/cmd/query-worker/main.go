@@ -13,7 +13,8 @@
 // variables are absent — matching the Data Gateway sidecar's fail-closed posture.
 //
 // Signal handling mirrors cmd/pipeline-observer: SIGTERM or SIGINT triggers
-// graceful HTTP shutdown with a 15s drain, then the process exits.
+// graceful HTTP shutdown with a drain window of MaxTimeoutS+30s (so a
+// legitimate in-flight query can finish), then the process exits.
 //
 // Metrics: GET /metrics (default Prometheus registry via promhttp) exposes
 // query_worker_inflight, query_worker_capacity_slots, and
@@ -101,6 +102,13 @@ func run() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           srv,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Request bodies are ≤1 MiB JSON (maxBodyBytes) — 30s is generous.
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout spans the whole handler; it must comfortably exceed
+		// the longest admitted query (MaxTimeoutS) + admission wait +
+		// response serialisation, or it would kill legitimate results.
+		WriteTimeout: time.Duration(cfg.MaxTimeoutS)*time.Second + 60*time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// ---- signal handling (mirrors pipeline-observer) ---------------------
@@ -123,7 +131,10 @@ func run() error {
 		// Graceful shutdown: drain in-flight requests, then exit.
 		// After Shutdown returns, ListenAndServe exits with http.ErrServerClosed,
 		// which the goroutine filters to nil and sends on httpErrCh — drain it.
-		const drainTimeout = 15 * time.Second
+		// Drain window: a legitimate query may run the full MaxTimeoutS; cutting
+		// it off at SIGTERM turns every rollout/scale-in into a failed query.
+		// +30s covers response serialisation (RFC 025 §5.2).
+		drainTimeout := time.Duration(cfg.MaxTimeoutS)*time.Second + 30*time.Second
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), drainTimeout)
 		defer shutdownCancel()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
