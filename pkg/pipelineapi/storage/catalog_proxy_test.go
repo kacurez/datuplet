@@ -114,7 +114,6 @@ func TestNewCatalogProxy_OK(t *testing.T) {
 
 	svc := &Service{
 		LakekeeperURL: stub.URL,
-		WarehouseName: "datuplet",
 		Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
 			return "impersonation-jwt-here", nil
 		},
@@ -152,7 +151,6 @@ func TestNewCatalogProxy_ProjectIDHeader(t *testing.T) {
 	wantPID := "lk-project-uuid-1234"
 	svc := &Service{
 		LakekeeperURL: stub.URL,
-		WarehouseName: "datuplet",
 		Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
 			return "tok", nil
 		},
@@ -244,7 +242,6 @@ func TestListAllTables_RealLakekeeperLayout(t *testing.T) {
 
 	svc := &Service{
 		LakekeeperURL: stub.URL,
-		WarehouseName: "datuplet",
 		Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
 			return "tok", nil
 		},
@@ -369,7 +366,6 @@ func newFakeCatalogProxy(t *testing.T, mux *http.ServeMux) *catalogProxy {
 
 	svc := &Service{
 		LakekeeperURL: stub.URL,
-		WarehouseName: "datuplet",
 		Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
 			return "tok", nil
 		},
