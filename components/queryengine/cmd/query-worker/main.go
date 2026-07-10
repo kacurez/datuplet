@@ -54,6 +54,7 @@ func run() error {
 		TempDir:        envOr("DATUPLET_QUERY_WORKER_TEMP_DIR", "/scratch"),
 		MaxTempSize:    os.Getenv("DATUPLET_QUERY_WORKER_MAX_TEMP_SIZE"),
 		MaxConcurrency: envInt("DATUPLET_QUERY_WORKER_CONCURRENCY", 2),
+		AdmissionWait:  time.Duration(envInt("DATUPLET_QUERY_WORKER_ADMISSION_WAIT_MS", 2000)) * time.Millisecond,
 		Threads:        envInt("DATUPLET_QUERY_WORKER_THREADS", 0), // 0 = engine default (2)
 		MaxTimeoutS:    envInt("DATUPLET_QUERY_WORKER_MAX_TIMEOUT_S", 300),
 		MaxRows:        envInt("DATUPLET_QUERY_WORKER_MAX_ROWS", 10000),
@@ -74,6 +75,7 @@ func run() error {
 	fmt.Printf("  JWKS URL:     %s\n", cfg.JWKSUrl)
 	fmt.Printf("  Lakekeeper:   %s\n", cfg.LakekeeperURL)
 	fmt.Printf("  Concurrency:  %d\n", cfg.MaxConcurrency)
+	fmt.Printf("  AdmissionWait: %s\n", cfg.AdmissionWait)
 	fmt.Printf("  MaxTimeoutS:  %d\n", cfg.MaxTimeoutS)
 	fmt.Printf("  MaxRows:      %d\n", cfg.MaxRows)
 	fmt.Printf("  MaxBytes:     %d\n", cfg.MaxBytes)

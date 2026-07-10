@@ -54,7 +54,8 @@ type workerConfig struct {
 	ListenAddr     string
 	JWKSUrl        string
 	LakekeeperURL  string
-	MaxConcurrency int // default 2
+	MaxConcurrency int           // default 2
+	AdmissionWait  time.Duration // default 2s
 	MemoryLimit    string
 	TempDir        string // default /scratch
 	MaxTempSize    string
@@ -79,6 +80,9 @@ type queryServer struct {
 func newQueryServer(verifier *tokenVerifier, runner Runner, cfg workerConfig) *queryServer {
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 2
+	}
+	if cfg.AdmissionWait <= 0 {
+		cfg.AdmissionWait = 2 * time.Second
 	}
 	if cfg.MaxTimeoutS <= 0 {
 		cfg.MaxTimeoutS = 300
@@ -157,19 +161,35 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Admission: acquire semaphore non-blocking.
+	// 2. Admission: try immediately, then wait up to AdmissionWait for a
+	//    slot. The bounded wait smooths transient collisions when the
+	//    Service LB lands two requests on the same pod (RFC 025 §5.2); the
+	//    proxy's retry-on-429 covers the genuinely-full case.
+	admitted := false
 	select {
 	case s.sem <- struct{}{}:
-		inflightGauge.Inc()
-		admissionTotal.WithLabelValues("admitted").Inc()
-		defer func() { <-s.sem; inflightGauge.Dec() }()
+		admitted = true
 	default:
+		waitT := time.NewTimer(s.cfg.AdmissionWait)
+		select {
+		case s.sem <- struct{}{}:
+			admitted = true
+		case <-r.Context().Done():
+			// Client gone while queued — nothing to answer.
+		case <-waitT.C:
+		}
+		waitT.Stop()
+	}
+	if !admitted {
 		admissionTotal.WithLabelValues("rejected").Inc()
 		log.Printf("query-worker: capacity exhausted sub=%s jti=%s", sub, jti)
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "capacity", "server at capacity, try again shortly")
 		return
 	}
+	inflightGauge.Inc()
+	admissionTotal.WithLabelValues("admitted").Inc()
+	defer func() { <-s.sem; inflightGauge.Dec() }()
 
 	// 3. Parse and validate the request body.
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
