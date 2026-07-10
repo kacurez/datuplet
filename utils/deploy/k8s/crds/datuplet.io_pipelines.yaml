@@ -5,6 +5,9 @@ metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.0
   name: pipelines.datuplet.io
+  labels:
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/name: pipeline
 spec:
   group: datuplet.io
   names:
@@ -126,7 +129,7 @@ spec:
                                       description: |-
                                         LogicalName is an optional override for the SQL identifier used to
                                         reference this input table in SQL transform components. Defaults
-                                        to Table when not specified. Used by the workspace pattern (RFC 010).
+                                        to Table when not specified.
                                       pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
                                       type: string
                                     since:
@@ -244,7 +247,7 @@ spec:
                                       description: |-
                                         LogicalName is an optional override for the SQL identifier used to
                                         reference this output table in SQL transform components. Defaults
-                                        to Name when not specified. Used by the workspace pattern (RFC 010).
+                                        to Name when not specified.
                                       pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
                                       type: string
                                     name:

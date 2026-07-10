@@ -5,6 +5,9 @@ metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.0
   name: pipelineruns.datuplet.io
+  labels:
+    app.kubernetes.io/part-of: datuplet
+    app.kubernetes.io/name: pipelinerun
 spec:
   group: datuplet.io
   names:
