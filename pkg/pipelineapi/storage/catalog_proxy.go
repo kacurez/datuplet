@@ -139,13 +139,34 @@ func (p *catalogProxy) listAllTables(ctx context.Context) ([]TableRef, error) {
 			return nil
 		})
 	}
-	_ = g.Wait() // goroutines only ever return nil; ctx cancellation surfaces via LoadTable skips
+	// goroutines only ever return nil (per-table load failures are
+	// intentionally swallowed above), so g.Wait()'s error is always nil —
+	// ctx cancellation no longer surfaces here; it's checked explicitly
+	// below via ctx.Err().
+	_ = g.Wait()
+
+	// A cancelled/deadline-exceeded request context must surface as an
+	// error, not a silently-empty (or silently-partial) table list.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
+
 	out := make([]TableRef, 0, len(loaded))
 	for _, ref := range loaded {
 		if ref != nil {
 			out = append(out, *ref)
 		}
 	}
+
+	// Distinguish "every LoadTable call failed" (likely a lakekeeper/STS
+	// outage) from a genuinely empty catalog. A partial result (some
+	// loaded, some skipped) is left as success — that's the intended
+	// orphan/mid-creation/permission-denied skip behavior above, and
+	// can't be distinguished from a partial outage without more signal.
+	if len(idents) > 0 && len(out) == 0 {
+		return nil, fmt.Errorf("failed to load any of %d catalog tables (lakekeeper/STS outage?)", len(idents))
+	}
+
 	return out, nil
 }
 

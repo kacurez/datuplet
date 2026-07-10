@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -480,5 +481,68 @@ func TestListAllTables_SkipsFailedLoadPreservesOrder(t *testing.T) {
 		if ref.Name == "t1" {
 			t.Fatalf("t1 failed LoadTable and must be absent from the result, got %+v", ref)
 		}
+	}
+}
+
+// TestListAllTables_AllLoadsFailReturnsError: when every identifier fails to
+// load (simulating a lakekeeper/STS outage), listAllTables must return an
+// error rather than a silently-empty catalog — otherwise the outage is
+// indistinguishable from "this project genuinely has no tables" on the wire.
+func TestListAllTables_AllLoadsFailReturnsError(t *testing.T) {
+	const total = 3
+	mux := newFakeCatalogMux(total, func(w http.ResponseWriter, _ string) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	p := newFakeCatalogProxy(t, mux)
+
+	out, err := p.listAllTables(context.Background())
+	if err == nil {
+		t.Fatalf("listAllTables should error when every LoadTable call fails, got out=%v", out)
+	}
+	if out != nil {
+		t.Errorf("out = %v, want nil alongside the total-failure error", out)
+	}
+}
+
+// TestListAllTables_EmptyCatalogReturnsEmptySuccess: a namespace with zero
+// tables is a genuinely empty catalog, not an outage — it must still
+// return ([], nil), not an error. This is the case the total-failure guard
+// (len(idents) > 0 && len(out) == 0) must NOT catch.
+func TestListAllTables_EmptyCatalogReturnsEmptySuccess(t *testing.T) {
+	mux := newFakeCatalogMux(0, func(w http.ResponseWriter, _ string) {})
+	p := newFakeCatalogProxy(t, mux)
+
+	out, err := p.listAllTables(context.Background())
+	if err != nil {
+		t.Fatalf("listAllTables on a genuinely empty catalog should succeed, got err: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("out = %v, want empty", out)
+	}
+}
+
+// TestListAllTables_CancelledContextReturnsError: a request context that's
+// cancelled mid-fan-out (client disconnect, upstream deadline) must surface
+// as an error. Pre-fix, cancellation only showed up as per-table LoadTable
+// skips, which — combined with the total-failure guard being absent —
+// meant a fully-cancelled request silently returned 200 {"tables":[]}.
+func TestListAllTables_CancelledContextReturnsError(t *testing.T) {
+	const total = 4
+	ctx, cancel := context.WithCancel(context.Background())
+	mux := newFakeCatalogMux(total, func(w http.ResponseWriter, _ string) {
+		// Cancel the very context listAllTables was called with. By the
+		// time g.Wait() returns (which requires this handler's goroutine to
+		// finish), ctx.Err() is guaranteed non-nil.
+		cancel()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	p := newFakeCatalogProxy(t, mux)
+
+	_, err := p.listAllTables(ctx)
+	if err == nil {
+		t.Fatal("listAllTables with a cancelled request ctx must return an error, not an empty success")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the error to wrap context.Canceled, got: %v", err)
 	}
 }
