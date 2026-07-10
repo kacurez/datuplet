@@ -40,6 +40,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate/projectgatetest"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
 
@@ -135,10 +136,14 @@ func workerThatReturns(status int, body string) *httptest.Server {
 	}))
 }
 
-// authedReq is authedRequest from handler_test.go (same package).
+// authedReq is authedRequest from handler_test.go (same package). It sets
+// the {pid} path value the same way authedRequest does (Task 0.3) since the
+// gate step reads r.PathValue("pid") before the body decode.
 func authedReq(t *testing.T, sub uuid.UUID, body string) *http.Request {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(body))
+	pid := uuid.NewString()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/projects/"+pid+"/query", strings.NewReader(body))
+	r.SetPathValue("pid", pid)
 	u := &store.User{ID: sub, Email: "test@example.com"}
 	return r.WithContext(auth.WithCtxUser(r.Context(), u))
 }
@@ -290,7 +295,7 @@ func TestAudit_ExactlyOneLinePerRequest(t *testing.T) {
 			worker := workerThatReturns(tc.workerStatus, tc.workerBody)
 			defer worker.Close()
 
-			h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"}, counter)
+			h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}, counter)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, authedReq(t, uuid.New(), tc.reqBody))
 
@@ -369,7 +374,7 @@ func TestAudit_BadRequest_BeforeMint(t *testing.T) {
 	}))
 	defer worker.Close()
 
-	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"}, counter)
+	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}, counter)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, authedReq(t, uuid.New(), `{"sql":""}`)) // empty SQL → bad_request
 
@@ -412,7 +417,7 @@ func TestAudit_RateLimited_EmptyJTI(t *testing.T) {
 	defer worker.Close()
 
 	counter := freshCounter()
-	cfg := Config{WorkerURL: worker.URL, Warehouse: "p/w", PerPrincipalInflight: 1}
+	cfg := Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w"), PerPrincipalInflight: 1}
 	h := newHandlerWithCounter(t, cfg, counter)
 	sub := uuid.New()
 
@@ -467,7 +472,7 @@ func TestAudit_TransportError_InternalOutcome(t *testing.T) {
 	buf := captureLogger(t)
 	counter := freshCounter()
 
-	h := newHandlerWithCounter(t, Config{WorkerURL: "http://127.0.0.1:1/", Warehouse: "p/w"}, counter)
+	h := newHandlerWithCounter(t, Config{WorkerURL: "http://127.0.0.1:1/", Gate: projectgatetest.AllowAll("p", "w")}, counter)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, authedReq(t, uuid.New(), `{"sql":"SELECT 1"}`))
 
@@ -506,7 +511,7 @@ func TestAudit_Unauthenticated_NoLine(t *testing.T) {
 	}))
 	defer worker.Close()
 
-	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"}, counter)
+	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}, counter)
 	// No auth.WithCtxUser → no user in ctx.
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
 	rec := httptest.NewRecorder()
@@ -539,7 +544,7 @@ func TestAudit_JTIMatchesMintedToken(t *testing.T) {
 	}))
 	defer worker.Close()
 
-	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"}, counter)
+	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}, counter)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, authedReq(t, uuid.New(), `{"sql":"SELECT 1"}`))
 
@@ -574,7 +579,7 @@ func TestAudit_StatementHashMatchesSHA256(t *testing.T) {
 		`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`)
 	defer worker.Close()
 
-	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"}, counter)
+	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}, counter)
 	rec := httptest.NewRecorder()
 	body, _ := json.Marshal(map[string]string{"sql": sql})
 	h.ServeHTTP(rec, authedReq(t, uuid.New(), string(body)))

@@ -182,6 +182,9 @@ func HandlerWithAudit(cfg Config, signer *tokens.Signer, counter *prometheus.Cou
 	if signer == nil {
 		return nil, errors.New("queryproxy: signer is required")
 	}
+	if cfg.Gate == nil {
+		return nil, errors.New("queryproxy: Gate is required")
+	}
 	client, err := newWorkerClient(cfg.WorkerURL, cfg.MaxTimeoutS, cfg.CatalogTTLSlack, cfg.MaxMaxBytes)
 	if err != nil {
 		return nil, err
@@ -216,7 +219,17 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 		emitAudit(logger, counter, rec)
 	}()
 
-	// 2. Decode + validate the body (≤64 KiB SQL-text cap).
+	// 2. Project gate: {pid} → FGA datuplet_member → project-qualified
+	//    warehouse. Runs before the body decode — an unauthorized caller
+	//    learns nothing about the body-validation surface.
+	warehouse, gerr := h.cfg.Gate.QualifiedWarehouse(r.Context(), sub, r.PathValue("pid"))
+	if gerr != nil {
+		rec.outcome = gerr.Kind
+		writeError(w, gerr.Status, gerr.Kind, gerr.Msg)
+		return
+	}
+
+	// 3. Decode + validate the body (≤64 KiB SQL-text cap).
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req queryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -231,12 +244,12 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	}
 	rec.statementHash = statementHash(req.SQL)
 
-	// 3. Clamp limits.
+	// 4. Clamp limits.
 	timeoutS := clamp(req.TimeoutS, h.cfg.DefaultTimeoutS, h.cfg.MaxTimeoutS)
 	maxRows := clamp(req.MaxRows, h.cfg.DefaultMaxRows, h.cfg.MaxMaxRows)
 	maxBytes := clamp(req.MaxBytes, h.cfg.DefaultMaxBytes, h.cfg.MaxMaxBytes)
 
-	// 4. Per-principal in-flight gate.
+	// 5. Per-principal in-flight gate.
 	if !h.gate.Acquire(sub) {
 		rec.outcome = "rate_limited"
 		// jti remains "" — no catalog token minted yet.
@@ -247,7 +260,7 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	}
 	defer h.gate.Release(sub)
 
-	// 5. Mint the two short-lived JWTs.
+	// 6. Mint the two short-lived JWTs.
 	ttl := time.Duration(timeoutS)*time.Second + h.cfg.CatalogTTLSlack
 	catalogTok, err := tokens.MintQueryToken(r.Context(), h.signer, ttl)
 	if err != nil {
@@ -268,11 +281,11 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 		return
 	}
 
-	// 6. Proxy to the query-worker.
+	// 7. Proxy to the query-worker.
 	body := workerRequest{
 		SQL:        req.SQL,
 		CatalogJWT: catalogTok.Reveal(),
-		Warehouse:  h.cfg.Warehouse,
+		Warehouse:  warehouse,
 		TimeoutS:   timeoutS,
 		MaxRows:    maxRows,
 		MaxBytes:   maxBytes,

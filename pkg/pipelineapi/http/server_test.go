@@ -20,6 +20,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate/projectgatetest"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -32,7 +33,7 @@ func stubQueryHandler(t *testing.T, workerURL string, signer *tokens.Signer) std
 	t.Helper()
 	h, err := queryproxy.Handler(queryproxy.Config{
 		WorkerURL: workerURL,
-		Warehouse: "test-project/test-warehouse",
+		Gate:      projectgatetest.AllowAll("test-project", "test-warehouse"),
 	}, signer)
 	if err != nil {
 		t.Fatalf("queryproxy.Handler: %v", err)
@@ -212,19 +213,23 @@ func TestServer_QueryRoute_WithServiceWired(t *testing.T) {
 	}
 
 	// Test 2: Authenticated request — full chain: route → auth → queryproxy → fake worker.
+	//
+	// TRANSITIONAL (RFC 025 Task 0.3, pending Task 0.4): the route is still
+	// registered at the pid-less "/api/v1/query" pattern (server.go), so
+	// r.PathValue("pid") is empty and the queryproxy gate step 400s before
+	// ever reaching the worker — the worker is never called. Task 0.4
+	// re-registers the route as "/api/v1/projects/{pid}/query" and must
+	// restore this test to its full 200/resultJSON assertion using a real
+	// pid in the request path.
 	resolver.allow = true
 	resp2, err := stdhttp.Post(ts.URL+"/api/v1/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
 	if err != nil {
 		t.Fatalf("POST /api/v1/query (authenticated): %v", err)
 	}
 	defer resp2.Body.Close()
-	if resp2.StatusCode != stdhttp.StatusOK {
+	if resp2.StatusCode != stdhttp.StatusBadRequest {
 		body, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("authenticated: status = %d, want 200; body=%s", resp2.StatusCode, body)
-	}
-	got, _ := io.ReadAll(resp2.Body)
-	if strings.TrimRight(string(got), "\n") != resultJSON {
-		t.Errorf("authenticated body = %q, want %q", strings.TrimRight(string(got), "\n"), resultJSON)
+		t.Fatalf("authenticated: status = %d, want 400 (no {pid} segment until Task 0.4 rewires the route); body=%s", resp2.StatusCode, body)
 	}
 }
 

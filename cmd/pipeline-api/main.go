@@ -334,8 +334,10 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 			log.Printf("query service: DATUPLET_LAKEKEEPER_URL not set (POST /api/v1/query unavailable); required for table catalog access")
 		} else {
 			queryProxyCfg := queryproxy.Config{
-				WorkerURL:            queryWorkerURL,
-				Warehouse:            queryWarehouse,
+				WorkerURL: queryWorkerURL,
+				// Gate: wiring deferred to Task 0.4 (route registration +
+				// main.go); queryproxy.Handler now requires cfg.Gate and will
+				// error here until it is set. See RFC 025 Task 0.3.
 				DefaultTimeoutS:      envIntOr("DATUPLET_QUERY_DEFAULT_TIMEOUT_S", 0),      // 0 → use package default (60s)
 				MaxTimeoutS:          envIntOr("DATUPLET_QUERY_MAX_TIMEOUT_S", 0),          // 0 → use package default (300s)
 				DefaultMaxRows:       envIntOr("DATUPLET_QUERY_DEFAULT_MAX_ROWS", 0),       // 0 → use package default (1000)
