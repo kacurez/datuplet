@@ -27,16 +27,13 @@ type PreviewLimits struct {
 // hold their own per-principal gate (cap 1) so they never starve, or get
 // starved by, console queries. One query_audit record is emitted.
 func (c *Core) Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table string, lim PreviewLimits) (*Result, *QueryError) {
-	if !c.h.previewGate.Acquire(sub) {
-		return nil, &QueryError{http.StatusTooManyRequests, "rate_limited", "a preview is already running for this user"}
-	}
-	defer c.h.previewGate.Release(sub)
-
 	sql := fmt.Sprintf("SELECT * FROM lk.%s.%s LIMIT %d", QuoteIdent(ns), QuoteIdent(table), lim.MaxRows)
 
 	start := time.Now()
 	rec := &auditRecord{principal: sub, outcome: "internal", statementHash: statementHash(sql)}
 	logger := slog.Default()
+	// Armed before the gate check so a rate-limited preview still emits a
+	// query_audit line, matching the console path (serveWithAudit).
 	defer func() {
 		rec.durationMS = time.Since(start).Milliseconds()
 		counter := c.h.auditCounter
@@ -45,6 +42,12 @@ func (c *Core) Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table s
 		}
 		emitAudit(logger, counter, rec)
 	}()
+
+	if !c.h.previewGate.Acquire(sub) {
+		rec.outcome = "rate_limited"
+		return nil, &QueryError{http.StatusTooManyRequests, "rate_limited", "a preview is already running for this user"}
+	}
+	defer c.h.previewGate.Release(sub)
 
 	raw, qerr := c.h.executeRaw(ctx, sub, qualifiedWarehouse, sql,
 		queryLimits{timeoutS: lim.TimeoutS, maxRows: lim.MaxRows, maxBytes: lim.MaxBytes}, rec)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -71,5 +72,49 @@ func TestCorePreview_SQLShapeAndGate(t *testing.T) {
 	}
 	if want := `SELECT * FROM lk."my-ns"."users" LIMIT 100`; gotSQL != want {
 		t.Fatalf("sql = %q, want %q", gotSQL, want)
+	}
+}
+
+// TestCorePreview_RateLimitEmitsAudit asserts that a rate-limited preview
+// (previewGate already held for the principal) still emits exactly one
+// query_audit line with outcome=rate_limited, matching the console path
+// (serveWithAudit) — the fix for the RFC 025 follow-up review finding that
+// Preview used to return 429 before the audit record was armed.
+func TestCorePreview_RateLimitEmitsAudit(t *testing.T) {
+	buf := captureLogger(t)
+	counter := freshCounter()
+
+	core, err := NewCore(Config{WorkerURL: "http://127.0.0.1:1/", Gate: projectgatetest.AllowAll("p", "w")}, testSigner(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.h.auditCounter = counter
+
+	subID := uuid.New()
+	sub := subID.String()
+	ctxUser := auth.WithCtxUser(context.Background(), &store.User{ID: subID, Email: "t@e.c"})
+	lim := PreviewLimits{TimeoutS: 30, MaxRows: 100, MaxBytes: 1 << 20}
+
+	// Hold the previewGate slot for sub before calling Preview, forcing the
+	// rate-limited branch without needing a second goroutine.
+	if !core.h.previewGate.Acquire(sub) {
+		t.Fatal("test bug: failed to pre-acquire previewGate")
+	}
+	defer core.h.previewGate.Release(sub)
+
+	_, qerr := core.Preview(ctxUser, sub, "p/w", "my-ns", "users", lim)
+	if qerr == nil || qerr.Status != http.StatusTooManyRequests || qerr.Kind != "rate_limited" {
+		t.Fatalf("Preview = %+v, want 429 rate_limited", qerr)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], "query_audit") {
+		t.Fatalf("want exactly one query_audit line, got: %q", buf.String())
+	}
+	if got := extractField(lines[0], "outcome"); got != "rate_limited" {
+		t.Errorf("outcome = %q, want rate_limited", got)
+	}
+	if delta := counterDelta(counter, "rate_limited", 0); delta != 1 {
+		t.Errorf("counter[rate_limited] delta = %v, want 1", delta)
 	}
 }
