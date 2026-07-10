@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	iceio "github.com/apache/iceberg-go/io"
@@ -376,8 +377,24 @@ type infoResp struct {
 	MetadataLocation  string          `json:"metadata_location"`
 	CurrentSnapshotID int64           `json:"current_snapshot_id"`
 	Snapshots         []snapshotBrief `json:"snapshots"`
-	DataFiles         []string        `json:"data_files"`
-	RowCount          int64           `json:"row_count"`
+	// RowCount/DataFileCount come from the current snapshot's summary
+	// (total-records / total-data-files). nil = summary absent (foreign
+	// writer); the UI renders "—". RFC 025 §4.2 replaced the manifest
+	// walk this used to do.
+	RowCount      *int64 `json:"row_count"`
+	DataFileCount *int64 `json:"data_file_count"`
+}
+
+// parseSummaryInt parses an Iceberg summary property value ("" = absent).
+func parseSummaryInt(v string) (int64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // TableInfo handles GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/info.
@@ -390,7 +407,6 @@ func (h *HTTPHandlers) TableInfo(w http.ResponseWriter, r *http.Request) {
 	resp := infoResp{
 		MetadataLocation: metaURI,
 		Snapshots:        []snapshotBrief{},
-		DataFiles:        []string{},
 	}
 	if cur := tbl.CurrentSnapshot(); cur != nil {
 		resp.CurrentSnapshotID = cur.SnapshotID
@@ -408,36 +424,15 @@ func (h *HTTPHandlers) TableInfo(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Collect data-file paths + row count from the current snapshot's
-	// manifests. Failure to fetch entries is non-fatal for the response
-	// — we still return metadata; we just log via the error shape and
-	// leave the data_files empty.
-	if cur := tbl.CurrentSnapshot(); cur != nil {
-		fs, err := tbl.FS(r.Context())
-		if err == nil {
-			manifests, mErr := cur.Manifests(fs)
-			if mErr == nil {
-				for _, m := range manifests {
-					// discardDeleted=true drops entries whose Iceberg
-					// status is DELETED — rows that were overwritten /
-					// removed and are no longer part of the current
-					// snapshot's logical state. Without this, row_count
-					// and data_files over-count for tables with delete
-					// manifests or overwrite snapshots.
-					entries, eErr := m.FetchEntries(fs, true)
-					if eErr != nil {
-						continue
-					}
-					for _, e := range entries {
-						df := e.DataFile()
-						if df == nil {
-							continue
-						}
-						resp.DataFiles = append(resp.DataFiles, df.FilePath())
-						resp.RowCount += df.Count()
-					}
-				}
-			}
+	// Row/file counts come straight from the current snapshot's summary
+	// totals — no manifest walk. Absent or unparseable totals (foreign
+	// writer that didn't populate them) leave the pointers nil.
+	if cur := tbl.CurrentSnapshot(); cur != nil && cur.Summary != nil && cur.Summary.Properties != nil {
+		if n, ok := parseSummaryInt(cur.Summary.Properties["total-records"]); ok {
+			resp.RowCount = &n
+		}
+		if n, ok := parseSummaryInt(cur.Summary.Properties["total-data-files"]); ok {
+			resp.DataFileCount = &n
 		}
 	}
 

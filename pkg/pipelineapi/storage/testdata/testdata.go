@@ -105,6 +105,23 @@ func GenerateEmptyErr(warehouse string) error {
 	return writeEmpty(filepath.Join(warehouse, ProjectRoot(), fixtureSchema, "empty"))
 }
 
+// GenerateNoSummaryErr writes a "nosummary" table fixture whose current
+// snapshot's Summary has properties but lacks total-records /
+// total-data-files — simulating a writer that didn't populate the
+// standard Iceberg summary totals (RFC 025 Task 4.2). Not included in
+// GenerateAllErr: it's opt-in for the TableInfo no-summary test so it
+// doesn't perturb the "exactly one resolvable table" assertions the
+// existing ListTables tests make against the simple/orphan/empty set.
+func GenerateNoSummaryErr(warehouse string) error {
+	if err := checkAbsWarehouse(warehouse); err != nil {
+		return err
+	}
+	return writeTableFixture(
+		filepath.Join(warehouse, ProjectRoot(), fixtureSchema, "nosummary"),
+		false, // no total-records / total-data-files
+	)
+}
+
 // checkAbsWarehouse guards every public entrypoint against a relative
 // warehouse path. Iceberg bakes absolute file:// URIs into metadata.json
 // (location, metadata-log, snapshot manifest-list, per-file data paths),
@@ -122,6 +139,17 @@ func checkAbsWarehouse(warehouse string) error {
 // report failures cleanly.
 
 func writeSimple(tableDir string) error {
+	return writeTableFixture(tableDir, true)
+}
+
+// writeTableFixture writes a single-snapshot Iceberg table fixture at
+// tableDir. When includeTotals is true, the snapshot Summary carries
+// the standard Iceberg total-records/total-data-files properties
+// (the happy path for RFC 025 Task 4.2's TableInfo handler). When
+// false, the Summary carries only the added-* properties — simulating
+// a writer that didn't populate the totals — so TableInfo's
+// row_count/data_file_count come back nil.
+func writeTableFixture(tableDir string, includeTotals bool) error {
 	metadataDir := filepath.Join(tableDir, "metadata")
 	dataDir := filepath.Join(tableDir, "data")
 	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
@@ -229,21 +257,24 @@ func writeSimple(tableDir string) error {
 		return fmt.Errorf("new metadata: %w", err)
 	}
 
+	summaryProps := map[string]string{
+		"added-data-files": "1",
+		"added-records":    fmt.Sprintf("%d", rowCount),
+		"added-files-size": fmt.Sprintf("%d", sizeBytes),
+	}
+	if includeTotals {
+		summaryProps["total-data-files"] = "1"
+		summaryProps["total-records"] = fmt.Sprintf("%d", rowCount)
+		summaryProps["total-files-size"] = fmt.Sprintf("%d", sizeBytes)
+	}
 	snapshot := table.Snapshot{
 		SnapshotID:     snapshotID,
 		SequenceNumber: seqNum,
 		TimestampMs:    now.UnixMilli(),
 		ManifestList:   manifestListURI,
 		Summary: &table.Summary{
-			Operation: table.OpAppend,
-			Properties: map[string]string{
-				"added-data-files": "1",
-				"added-records":    fmt.Sprintf("%d", rowCount),
-				"added-files-size": fmt.Sprintf("%d", sizeBytes),
-				"total-data-files": "1",
-				"total-records":    fmt.Sprintf("%d", rowCount),
-				"total-files-size": fmt.Sprintf("%d", sizeBytes),
-			},
+			Operation:  table.OpAppend,
+			Properties: summaryProps,
 		},
 		SchemaID: intPtr(base.CurrentSchema().ID),
 	}

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -463,8 +464,19 @@ func TestTableInfo_Success(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	var body infoResp
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	var body struct {
+		MetadataLocation  string          `json:"metadata_location"`
+		CurrentSnapshotID int64           `json:"current_snapshot_id"`
+		Snapshots         []snapshotBrief `json:"snapshots"`
+		RowCount          *int64          `json:"row_count"`
+		DataFileCount     *int64          `json:"data_file_count"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if body.MetadataLocation == "" {
@@ -476,11 +488,62 @@ func TestTableInfo_Success(t *testing.T) {
 	if len(body.Snapshots) != 1 {
 		t.Errorf("snapshots = %d, want 1 (fixture commits only one real snapshot)", len(body.Snapshots))
 	}
-	if body.RowCount != 3 {
-		t.Errorf("row_count = %d, want 3", body.RowCount)
+	if body.RowCount == nil || *body.RowCount != 3 {
+		t.Errorf("row_count = %v, want 3 (from total-records summary)", body.RowCount)
 	}
-	if len(body.DataFiles) != 1 {
-		t.Errorf("data_files = %d, want 1", len(body.DataFiles))
+	if body.DataFileCount == nil || *body.DataFileCount != 1 {
+		t.Errorf("data_file_count = %v, want 1 (from total-data-files summary)", body.DataFileCount)
+	}
+
+	// data_files must be gone from the wire shape entirely (not just
+	// empty) — decode into a permissive map to check for its absence.
+	var raw2 map[string]any
+	if err := json.Unmarshal(raw, &raw2); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if _, present := raw2["data_files"]; present {
+		t.Error("data_files must be gone from the wire shape")
+	}
+}
+
+// TestTableInfo_NoSummary exercises a table whose current snapshot's
+// Summary lacks total-records/total-data-files (e.g. a writer that
+// didn't populate the standard Iceberg totals). RowCount and
+// DataFileCount must come back nil rather than 0 or a manifest-derived
+// approximation — the UI renders "—" for nil.
+func TestTableInfo_NoSummary(t *testing.T) {
+	warehouse := filepath.Join(t.TempDir(), "warehouse")
+	if err := testdata.GenerateNoSummaryErr(warehouse); err != nil {
+		t.Fatalf("generate no-summary fixture: %v", err)
+	}
+	svc := &Service{
+		WarehouseURI: "file://" + warehouse,
+		OrgName:      "myorg",
+		AllowLocal:   true,
+		LakekeeperProjectIDFor: func(_ context.Context, _ uuid.UUID) (string, error) {
+			return fixtureLakekeeperProjectID, nil
+		},
+	}
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/nosummary/info"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET info: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body infoResp
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.RowCount != nil {
+		t.Errorf("row_count = %v, want nil (no total-records in summary)", *body.RowCount)
+	}
+	if body.DataFileCount != nil {
+		t.Errorf("data_file_count = %v, want nil (no total-data-files in summary)", *body.DataFileCount)
 	}
 }
 

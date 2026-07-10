@@ -455,10 +455,15 @@ Returns every directory under the project's `tables/` prefix that contains a val
   "snapshots": [
     { "id": 1777057648904, "timestamp_ms": 1777057648904, "operation": "append" }
   ],
-  "data_files": ["s3://datuplet/…/data/part-….parquet"],
-  "row_count": 10
+  "row_count": 10,
+  "data_file_count": 1
 }
 ```
+
+`row_count` and `data_file_count` come from the current snapshot's summary
+totals (`total-records` / `total-data-files`) — no manifest walk. Both are
+`null` when the snapshot summary lacks these properties (e.g. a foreign
+writer that didn't populate them).
 
 ### Table schema
 
