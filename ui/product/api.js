@@ -208,11 +208,10 @@ export async function deleteSecret(projectId, key) {
 // and returns the queryengine Result JSON: { schema:[{name,type}], rows:[[...]],
 // truncated:bool, stats:{duration_ms,...} }.
 //
-// The warehouse is server-configured (one per deploy via DATUPLET_QUERY_WAREHOUSE),
-// so `projectId` is NOT sent in the body — it is accepted for parity with the
-// storage API and so the console can pass its active project for future
-// per-project routing. `opts` may carry { timeoutS, maxRows, maxBytes } (clamped
-// server-side).
+// The route is project-scoped (RFC 025 §4.6): pipeline-api enforces FGA
+// datuplet_member on `projectId` and resolves the lakekeeper warehouse for
+// that project per request. `opts` may carry { timeoutS, maxRows, maxBytes }
+// (clamped server-side).
 //
 // This does NOT use the api() wrapper: query errors (400 sql_error, 403,
 // 408 timeout, 429 rate_limited) are EXPECTED outcomes the console renders
@@ -226,7 +225,7 @@ export async function runQuery(projectId, sql, opts = {}) {
   if (opts.maxRows != null) body.max_rows = opts.maxRows;
   if (opts.maxBytes != null) body.max_bytes = opts.maxBytes;
 
-  const r = await fetch('/api/v1/query', {
+  const r = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/query`, {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
