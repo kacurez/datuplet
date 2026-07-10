@@ -11,6 +11,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
@@ -31,6 +32,12 @@ type Server struct {
 	pipelines    PipelineStore
 	runs         RunReader
 	storage      *storage.Service
+	// projectGate is the shared project-authz + warehouse prologue (RFC 025
+	// §4.6 amendment) consumed by the storage handlers' resolveProject /
+	// resolveWarehouse — the same instance the query proxy uses. Wired via
+	// WithProjectGate from the lakekeeper wiring block in main.go. nil is
+	// safe: resolveProject soft-degrades to 503 instead of nil-derefing.
+	projectGate *projectgate.Gate
 	// cliToken: deploy-time public URL + warehouse name returned in the
 	// `POST /api/v1/auth/token` response body so the CLI can talk to
 	// lakekeeper directly. Empty = endpoint stays
@@ -202,6 +209,16 @@ func (s *Server) WithStorage(svc *storage.Service) *Server {
 func (s *Server) WithCLIClusterInfo(lakekeeperPublicURL, warehouseName string) *Server {
 	s.cliLakekeeperURL = lakekeeperPublicURL
 	s.cliWarehouseName = warehouseName
+	return s
+}
+
+// WithProjectGate wires the shared project-authz + warehouse prologue
+// (RFC 025 §4.6 amendment) used by the storage handlers' resolveProject /
+// resolveWarehouse. main.go builds ONE Gate instance in the lakekeeper
+// wiring block; Task 0.4 (the query proxy) reuses the same instance. When
+// nil, resolveProject soft-degrades to 503 instead of nil-derefing.
+func (s *Server) WithProjectGate(g *projectgate.Gate) *Server {
+	s.projectGate = g
 	return s
 }
 
@@ -416,6 +433,7 @@ func (s *Server) Handler() http.Handler {
 			Svc:        s.storage,
 			Authorizer: s.authzr,
 			Emails:     pgxEmailLookup{pool: s.db},
+			Gate:       s.projectGate,
 		}
 		mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
 			auth.WithUser(s.resolver, http.HandlerFunc(h.ListTables)))

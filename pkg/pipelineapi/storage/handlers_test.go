@@ -14,6 +14,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage/testdata"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
@@ -84,7 +85,20 @@ func makeFixtureServiceWithLK(t *testing.T) *Service {
 // though we don't use it here.
 func newTestServer(t *testing.T, svc *Service, resolver auth.UserResolver, authzr *authztest.Fake) *httptest.Server {
 	t.Helper()
-	h := &HTTPHandlers{Svc: svc, Authorizer: authzr}
+	// Gate is built from the SAME stubs the fixture Service already carries
+	// (svc.LakekeeperProjectIDFor) plus the same authzr passed to
+	// HTTPHandlers.Authorizer — resolveProject now delegates to it instead
+	// of calling h.Svc.LakekeeperProjectIDFor + h.Authorizer directly.
+	// WarehouseFor is left nil: every test here uses the fixture-walker
+	// path (LakekeeperURL == ""), so resolveWarehouse is never invoked.
+	h := &HTTPHandlers{
+		Svc:        svc,
+		Authorizer: authzr,
+		Gate: &projectgate.Gate{
+			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+			Authorizer:             authzr,
+		},
+	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
 		auth.WithUser(resolver, http.HandlerFunc(h.ListTables)))

@@ -24,6 +24,7 @@ import (
 	pipelineapidb "github.com/datuplet/datuplet/pkg/pipelineapi/db"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/registry"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
@@ -186,6 +187,12 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// storage service. Resolve it once here so both blocks share the same value.
 	lakekeeperURL := os.Getenv("DATUPLET_LAKEKEEPER_URL")
 
+	// Warehouse resolution is on the hot path of every storage + query
+	// request; a hung lakekeeper management API must not pin handler
+	// goroutines. Declared before BOTH resolver constructions (trigger +
+	// storage) below so both share the same bounded client.
+	warehouseHTTPClient := &http.Client{Timeout: 5 * time.Second}
+
 	// K8s run lifecycle backend: the HTTP handler becomes a thin adapter
 	// that calls this for trigger + cancel. Only constructed when we
 	// have a k8s client, signer, and DB pool.
@@ -204,6 +211,7 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 				Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
 					return tokens.MintImpersonation(ctx, signer)
 				},
+				HTTPClient: warehouseHTTPClient,
 			})
 		}
 		backend = runbackend.NewK8sBackend(runbackend.K8sOpts{
@@ -238,6 +246,15 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// resolution for the storage UI). The query service uses the static
 	// DATUPLET_QUERY_WAREHOUSE env var set at boot — not this resolver.
 	var warehouseResolver func(ctx context.Context, lakekeeperProjectID string) (string, error)
+	// pgxProjectIDFor maps a Datuplet project UUID to its lakekeeper project
+	// UUID. Hoisted to this outer scope (not just inside the `if storageSvc
+	// != nil` block below) because it also feeds projGate.
+	var pgxProjectIDFor func(context.Context, uuid.UUID) (string, error)
+	// projGate is the shared project-authz + warehouse prologue (RFC 025
+	// §4.6 amendment) consumed by the storage handlers (this task) and,
+	// later, the query proxy (Task 0.4) — built once below, only when
+	// lakekeeper wiring succeeds.
+	var projGate *projectgate.Gate
 
 	if storageSvc != nil {
 		if signer == nil {
@@ -261,7 +278,7 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 			if pool == nil {
 				return fmt.Errorf("storage proxy: cluster mode requires a Postgres pool to resolve lakekeeper_project_id; pool is nil — check DATABASE_URL")
 			}
-			pgxProjectIDFor := func(ctx context.Context, datupletProjectID uuid.UUID) (string, error) {
+			pgxProjectIDFor = func(ctx context.Context, datupletProjectID uuid.UUID) (string, error) {
 				p, err := store.GetProjectByID(ctx, pool, datupletProjectID)
 				if err != nil {
 					return "", err
@@ -274,8 +291,14 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 			warehouseResolver = storage.NewLakekeeperWarehouseResolver(storage.WarehouseResolverConfig{
 				LakekeeperURL: lakekeeperURL,
 				Minter:        impersonationMinter,
+				HTTPClient:    warehouseHTTPClient,
 			})
 			storageSvc.WithLakekeeper(lakekeeperURL, impersonationMinter, pgxProjectIDFor, warehouseResolver)
+			projGate = &projectgate.Gate{
+				LakekeeperProjectIDFor: pgxProjectIDFor,
+				Authorizer:             authzr,
+				WarehouseFor:           warehouseResolver,
+			}
 		}
 		fmt.Printf("  Storage catalog: %s (warehouse: per-request)\n", lakekeeperURL)
 	} else {
@@ -374,6 +397,9 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		WithStaticDir(cfg.UIDir).
 		WithRunBackend(backend).
 		WithStorage(storageSvc).
+		// projGate is nil when lakekeeper wiring didn't complete (e.g. no
+		// signer) — resolveProject soft-degrades to 503 in that case.
+		WithProjectGate(projGate).
 		WithAuthorizer(authzr).
 		// Superadmin checker for the REST admin endpoints + the is_superadmin
 		// flag on /api/v1/auth/me. nil (authz disabled) leaves the guard at

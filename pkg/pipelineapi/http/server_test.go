@@ -19,6 +19,7 @@ import (
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -113,8 +114,17 @@ func TestServer_StorageRoute_WithServiceWired(t *testing.T) {
 	}
 	// Empty fake — Check returns (false, nil) → 403 from the handler.
 	fakeAuthz := authztest.New()
+	// The gate is built from the same stubs the Service already carries
+	// (LakekeeperProjectIDFor) plus the same authzr wired via WithAuthorizer
+	// — resolveProject now delegates to h.Gate instead of calling
+	// h.Svc.LakekeeperProjectIDFor / h.Authorizer directly.
+	gate := &projectgate.Gate{
+		LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+		Authorizer:             fakeAuthz,
+	}
 	srv := apihttp.NewServer(nil).
 		WithStorage(svc).
+		WithProjectGate(gate).
 		WithUserResolver(stubResolver{}).
 		WithAuthorizer(fakeAuthz)
 

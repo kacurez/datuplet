@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"iter"
 	"log"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 )
 
 // EmailLookup resolves a user UUID (as it appears in JWT actor claims
@@ -45,6 +45,9 @@ type HTTPHandlers struct {
 	Svc        *Service
 	Authorizer authz.Authorizer
 	Emails     EmailLookup
+	// Gate is the shared project-authz + warehouse prologue (RFC 025 §4.6
+	// amendment) — the same instance the query proxy uses.
+	Gate *projectgate.Gate
 }
 
 // Preview caps. Kept as package-level variables (not const) so tests
@@ -69,50 +72,34 @@ func writeErrResp(w http.ResponseWriter, status int, msg string) {
 }
 
 // resolveProject pulls pid from the URL, validates it, enforces
-// FGA datuplet_member authorization, and returns the parsed project UUID.
-// On any failure it writes the appropriate HTTP error and returns ok=false;
-// callers must return immediately.
+// FGA datuplet_member authorization via the shared projectgate.Gate, and
+// returns the parsed project UUID plus the lakekeeper project UUID (so
+// callers don't have to re-resolve it). On any failure it writes the
+// appropriate HTTP error and returns ok=false; callers must return
+// immediately.
 //
 // Shared by all four handlers — inlining the same checks in every
 // caller would be busier and easier to get wrong than a single helper.
-func (h *HTTPHandlers) resolveProject(w http.ResponseWriter, r *http.Request) (projectID uuid.UUID, ok bool) {
-	pid := r.PathValue("pid")
-	// Project IDs are UUIDs. uuid.Parse fails closed on any malformed
-	// input (including path-separators and traversal sequences), so it
-	// subsumes the ValidIdentifier check for this particular segment.
-	parsed, err := uuid.Parse(pid)
-	if err != nil {
-		writeErrResp(w, http.StatusBadRequest, "invalid project id")
-		return uuid.Nil, false
-	}
+func (h *HTTPHandlers) resolveProject(w http.ResponseWriter, r *http.Request) (projectID uuid.UUID, lkPID string, ok bool) {
 	u, authed := auth.UserFromContext(r.Context())
 	if !authed {
 		writeErrResp(w, http.StatusUnauthorized, "not authenticated")
-		return uuid.Nil, false
+		return uuid.Nil, "", false
 	}
-	// Resolve the lakekeeper project ID for the FGA check. If none is
-	// provisioned yet (e.g. ensureLocalProjectAuthz hasn't completed),
-	// return 503 so the caller can retry rather than getting a spurious 403.
-	lkPID := h.resolveLakekeeperProjectID(r.Context(), parsed)
-	if lkPID == "" {
-		writeErrResp(w, http.StatusServiceUnavailable, "project authz not yet provisioned")
-		return uuid.Nil, false
+	// Nil-safe: storage routes register on (storage+resolver+authzr) non-nil
+	// (server.go), but the gate is built in the lakekeeper/signer wiring
+	// block — a signer-less deployment could register these routes with a
+	// nil gate. Soft-degrade with 503 instead of panicking.
+	if h.Gate == nil {
+		writeErrResp(w, http.StatusServiceUnavailable, "storage backend not fully configured")
+		return uuid.Nil, "", false
 	}
-	userStr := authz.UserObject(u.ID.String()).String()
-	allowed, err := h.Authorizer.Check(r.Context(), userStr, "datuplet_member", authz.ProjectObject(lkPID))
-	if err != nil {
-		if errors.Is(err, authz.ErrAuthzUnavailable) {
-			writeErrResp(w, http.StatusServiceUnavailable, "authz backend unavailable")
-			return uuid.Nil, false
-		}
-		writeErrResp(w, http.StatusInternalServerError, "check authz")
-		return uuid.Nil, false
+	pid, lk, gerr := h.Gate.Authorize(r.Context(), u.ID.String(), r.PathValue("pid"))
+	if gerr != nil {
+		writeErrResp(w, gerr.Status, gerr.Msg)
+		return uuid.Nil, "", false
 	}
-	if !allowed {
-		writeErrResp(w, http.StatusForbidden, "forbidden")
-		return uuid.Nil, false
-	}
-	return parsed, true
+	return pid, lk, true
 }
 
 // projectURI builds the absolute URI rooted at the project's
@@ -173,42 +160,11 @@ func (h *HTTPHandlers) guardTablePath(w http.ResponseWriter, tableURI string) bo
 	return true
 }
 
-// resolveLakekeeperProjectID maps a Datuplet project UUID to the lakekeeper
-// Project UUID needed for x-project-id routing. Returns "" when the resolver
-// is nil or returns an error — callers omit the header in that case and
-// lakekeeper falls back to its default project (LAKEKEEPER__ENABLE_DEFAULT_PROJECT).
-func (h *HTTPHandlers) resolveLakekeeperProjectID(ctx context.Context, datupletPID uuid.UUID) string {
-	if h.Svc.LakekeeperProjectIDFor == nil {
-		return ""
-	}
-	lkPID, err := h.Svc.LakekeeperProjectIDFor(ctx, datupletPID)
-	if err != nil {
-		log.Printf("storage: resolveLakekeeperProjectID(%s): %v (omitting x-project-id)", datupletPID, err)
-		return ""
-	}
-	return lkPID
-}
-
-// resolveWarehouse returns the lakekeeper warehouse name to use for a
-// per-request catalog call against project `lakekeeperProjectID`.
-// Pipeline-api asks lakekeeper for warehouses attached to the project
-// and picks the first. An explicit per-project selector is not yet
-// implemented.
-//
-// Resolution priority:
-//
-//  1. WarehouseResolver (production): per-request lakekeeper API call.
-//  2. WarehouseName (legacy / tests): fall back to the deployment-time default.
-//
-// Returns ("", err) when neither is wired — callers surface 500.
-func (h *HTTPHandlers) resolveWarehouse(ctx context.Context, lakekeeperProjectID string) (string, error) {
-	if h.Svc.WarehouseResolver != nil {
-		return h.Svc.WarehouseResolver(ctx, lakekeeperProjectID)
-	}
-	if h.Svc.WarehouseName != "" {
-		return h.Svc.WarehouseName, nil
-	}
-	return "", fmt.Errorf("no warehouse configured: neither WarehouseResolver nor WarehouseName is set")
+// resolveWarehouse resolves the bare warehouse name for an authorized
+// lakekeeper project. Returns a *projectgate.Error (nil on success) so the
+// caller can map status/kind directly.
+func (h *HTTPHandlers) resolveWarehouse(ctx context.Context, lkPID string) (string, *projectgate.Error) {
+	return h.Gate.Warehouse(ctx, lkPID)
 }
 
 // loadRequestedTable runs the full per-table prologue shared by
@@ -222,7 +178,7 @@ func (h *HTTPHandlers) resolveWarehouse(ctx context.Context, lakekeeperProjectID
 //   - LakekeeperURL empty → fall back to ResolveCurrentMetadata against
 //     the directory walker (tests + legacy).
 func (h *HTTPHandlers) loadRequestedTable(w http.ResponseWriter, r *http.Request) (tbl *table.Table, metaURI string, ok bool) {
-	pid, ok := h.resolveProject(w, r)
+	pid, lkPID, ok := h.resolveProject(w, r)
 	if !ok {
 		return nil, "", false
 	}
@@ -233,10 +189,9 @@ func (h *HTTPHandlers) loadRequestedTable(w http.ResponseWriter, r *http.Request
 	}
 
 	if h.Svc.LakekeeperURL != "" {
-		lkPID := h.resolveLakekeeperProjectID(r.Context(), pid)
-		warehouse, werr := h.resolveWarehouse(r.Context(), lkPID)
-		if werr != nil {
-			writeErrResp(w, http.StatusInternalServerError, "resolve warehouse")
+		warehouse, gerr := h.resolveWarehouse(r.Context(), lkPID)
+		if gerr != nil {
+			writeErrResp(w, gerr.Status, gerr.Msg)
 			return nil, "", false
 		}
 		proxy, err := newCatalogProxy(r.Context(), h.Svc, lkPID, warehouse)
@@ -325,17 +280,16 @@ type tableListEntry struct {
 //   - When LakekeeperURL is empty (tests + legacy fixture warehouses),
 //     it falls back to the directory walker.
 func (h *HTTPHandlers) ListTables(w http.ResponseWriter, r *http.Request) {
-	pid, ok := h.resolveProject(w, r)
+	pid, lkPID, ok := h.resolveProject(w, r)
 	if !ok {
 		return
 	}
 
 	if h.Svc.LakekeeperURL != "" {
-		lkPID := h.resolveLakekeeperProjectID(r.Context(), pid)
-		warehouse, werr := h.resolveWarehouse(r.Context(), lkPID)
-		if werr != nil {
-			log.Printf("storage: resolve warehouse (lakekeeper=%s lkPID=%s): %v", h.Svc.LakekeeperURL, lkPID, werr)
-			writeErrResp(w, http.StatusInternalServerError, "resolve warehouse: "+werr.Error())
+		warehouse, gerr := h.resolveWarehouse(r.Context(), lkPID)
+		if gerr != nil {
+			log.Printf("storage: resolve warehouse (lakekeeper=%s lkPID=%s): %s", h.Svc.LakekeeperURL, lkPID, gerr.Msg)
+			writeErrResp(w, gerr.Status, gerr.Msg)
 			return
 		}
 		proxy, err := newCatalogProxy(r.Context(), h.Svc, lkPID, warehouse)
