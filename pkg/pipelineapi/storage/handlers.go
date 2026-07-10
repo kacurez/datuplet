@@ -4,14 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"iter"
 	"log"
 	"net/http"
 	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
@@ -19,6 +17,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 )
 
 // EmailLookup resolves a user UUID (as it appears in JWT actor claims
@@ -48,6 +47,34 @@ type HTTPHandlers struct {
 	// Gate is the shared project-authz + warehouse prologue (RFC 025 §4.6
 	// amendment) — the same instance the query proxy uses.
 	Gate *projectgate.Gate
+	// Query runs storage previews through the shared query-service core.
+	// nil (query service not configured) → preview returns 501 query_disabled.
+	Query PreviewRunner
+}
+
+// PreviewRunner is the seam Preview uses to run the server-generated
+// SELECT ... LIMIT statement through the query-worker (RFC 025 §4.1).
+// queryproxy.Core satisfies it; tests use a fake.
+type PreviewRunner interface {
+	Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table string, lim queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError)
+}
+
+// PreviewResponse is the JSON body returned by the preview handler.
+// One entry per column in Columns; one slice per row in Rows.
+type PreviewResponse struct {
+	Columns   []ColumnInfo `json:"columns"`
+	Rows      [][]any      `json:"rows"`
+	Truncated bool         `json:"truncated"`
+}
+
+// ColumnInfo describes one column in a PreviewResponse. Type is the
+// DuckDB type name (e.g. "INTEGER", "VARCHAR") as reported by the
+// query-worker — not the Iceberg/Arrow type string. This is a
+// documented v3 change (RFC 025 Task 3.1): previously Type carried the
+// Arrow type string (e.g. "int64", "utf8").
+type ColumnInfo struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 // Preview caps. Kept as package-level variables (not const) so tests
@@ -452,48 +479,44 @@ func (h *HTTPHandlers) TableSchema(w http.ResponseWriter, r *http.Request) {
 // ----- Preview -------------------------------------------------------
 
 // Preview handles GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/preview.
+// The data read runs inside the query-worker sandbox (RFC 025 §4.1);
+// pipeline-api never touches parquet bytes. Column types are DuckDB type
+// names (e.g. VARCHAR), not Iceberg ones — a documented v3 change.
 func (h *HTTPHandlers) Preview(w http.ResponseWriter, r *http.Request) {
-	tbl, _, ok := h.loadRequestedTable(w, r)
+	_, lkPID, ok := h.resolveProject(w, r) // shared projectgate prologue (Task 0.2)
 	if !ok {
 		return
 	}
-	// Ask iceberg-go for previewRowCap+1 rows so EncodeRecords can see
-	// the "one more row would fit" signal via its end-of-stream peek
-	// and correctly set Truncated=true. Capping at previewRowCap at the
-	// scan level hides that signal and makes Truncated stuck at false.
-	schema, iter2, err := tbl.Scan(table.WithLimit(int64(previewRowCap) + 1)).ToArrowRecords(r.Context())
-	if err != nil {
-		writeErrResp(w, http.StatusInternalServerError, "scan table")
+	ns, name := r.PathValue("ns"), r.PathValue("t")
+	if !validateTableIdentifiers(w, ns, name) {
 		return
 	}
-
-	// EncodeRecords takes a pull-shaped next() closure and Release()s
-	// each batch after consuming. The iter.Seq2 from iceberg-go yields
-	// batches the consumer is expected to release; wrapping with
-	// iter.Pull2 preserves that contract.
-	pull, stop := iter.Pull2(iter2)
-	defer stop()
-	next := func() (arrow.RecordBatch, error) {
-		batch, yieldErr, more := pull()
-		if !more {
-			return nil, nil
-		}
-		if yieldErr != nil {
-			// Release any batch the iterator emitted alongside an error
-			// before surfacing it — EncodeRecords would otherwise leak
-			// it since it returns early on a non-nil error.
-			if batch != nil {
-				batch.Release()
-			}
-			return nil, yieldErr
-		}
-		return batch, nil
-	}
-
-	resp, err := EncodeRecords(schema, next, previewRowCap, previewByteCap)
-	if err != nil {
-		writeErrResp(w, http.StatusInternalServerError, "encode records: "+err.Error())
+	if h.Query == nil {
+		writeJSONResp(w, http.StatusNotImplemented, map[string]string{
+			"error": "preview requires the query service (queryWorker.enabled=true)",
+			"kind":  "query_disabled",
+		})
 		return
+	}
+	u, _ := auth.UserFromContext(r.Context()) // resolveProject already 401'd if absent
+	warehouse, gerr := h.Gate.Warehouse(r.Context(), lkPID)
+	if gerr != nil {
+		writeJSONResp(w, gerr.Status, map[string]string{"error": gerr.Msg, "kind": gerr.Kind})
+		return
+	}
+	res, qerr := h.Query.Preview(r.Context(), u.ID.String(), lkPID+"/"+warehouse, ns, name,
+		queryproxy.PreviewLimits{TimeoutS: 30, MaxRows: previewRowCap, MaxBytes: previewByteCap})
+	if qerr != nil {
+		msg := qerr.Msg
+		if qerr.Kind == "result_too_large" {
+			msg = "table too wide to preview (schema exceeds the preview byte cap)"
+		}
+		writeJSONResp(w, qerr.Status, map[string]string{"error": msg, "kind": qerr.Kind})
+		return
+	}
+	resp := PreviewResponse{Columns: make([]ColumnInfo, len(res.Schema)), Rows: res.Rows, Truncated: res.Truncated}
+	for i, c := range res.Schema {
+		resp.Columns[i] = ColumnInfo{Name: c.Name, Type: c.Type}
 	}
 	writeJSONResp(w, http.StatusOK, resp)
 }

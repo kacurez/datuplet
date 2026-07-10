@@ -321,6 +321,11 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// hard-fails runServeCluster with a normal error rather than panicking at
 	// request time. Absent env → soft-degrade → route unregistered → 404.
 	var queryHandler http.Handler
+	// queryCore is the same *queryproxy.Core queryHandler wraps (Task 3.1).
+	// Shared with the storage-preview handler via WithQueryCore so previews
+	// run through the query-worker instead of pipeline-api's own iceberg-go
+	// scan path. Stays nil when the query block soft-degrades above.
+	var queryCore *queryproxy.Core
 	queryWorkerURL := os.Getenv("DATUPLET_QUERY_WORKER_URL")
 	if queryWorkerURL != "" {
 		switch {
@@ -347,13 +352,16 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 				MaxMaxBytes:          envIntOr("DATUPLET_QUERY_MAX_MAX_BYTES", 0),          // 0 → use package default (10 MiB)
 				PerPrincipalInflight: envIntOr("DATUPLET_QUERY_PER_PRINCIPAL_INFLIGHT", 0), // 0 → use package default (2)
 			}
-			// Build the handler now so an invalid WorkerURL (e.g. unparseable URL)
-			// surfaces as a runServeCluster error rather than a panic on first request.
-			h, err := queryproxy.Handler(queryProxyCfg, signer)
+			// Build the core now so an invalid WorkerURL (e.g. unparseable URL)
+			// surfaces as a runServeCluster error rather than a panic on first
+			// request. Shared between the console query route (HTTPHandler())
+			// and the storage-preview handler (Core.Preview directly).
+			core, err := queryproxy.NewCore(queryProxyCfg, signer)
 			if err != nil {
 				return fmt.Errorf("query service: %w", err)
 			}
-			queryHandler = h
+			queryHandler = core.HTTPHandler()
+			queryCore = core
 			fmt.Printf("  Query service: %s (warehouse: per-request)\n", queryWorkerURL)
 		}
 	} else {
@@ -441,6 +449,13 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// above. nil → route stays unregistered → 404.
 	if queryHandler != nil {
 		srv = srv.WithQueryService(queryHandler)
+	}
+	// Storage preview reads via the query-worker (RFC 025 Task 3.1). Shares
+	// the same *queryproxy.Core the console query route uses. nil → the
+	// storage handler leaves Query as the nil interface (server.go guards
+	// on s.queryCore != nil), so preview soft-degrades to 501 query_disabled.
+	if queryCore != nil {
+		srv = srv.WithQueryCore(queryCore)
 	}
 	// Local query-JWT mint route. Wired whenever the signer exists; the
 	// handler returns 403 when the allowClientSideQuery policy is off.

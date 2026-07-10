@@ -80,7 +80,7 @@ func NewCore(cfg Config, signer *tokens.Signer) (*Core, error) {
 		return nil, err
 	}
 	g := newGate(cfg.PerPrincipalInflight)
-	return &Core{h: &handler{cfg: cfg, signer: signer, client: client, gate: g}}, nil
+	return &Core{h: &handler{cfg: cfg, signer: signer, client: client, gate: g, previewGate: newGate(1)}}, nil
 }
 
 // HTTPHandler returns the POST /api/v1/projects/{pid}/query http.Handler.

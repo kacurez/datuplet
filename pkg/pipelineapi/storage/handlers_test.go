@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -15,6 +16,8 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate/projectgatetest"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage/testdata"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
@@ -284,9 +287,53 @@ func TestTableSchema_InvalidIdentifier(t *testing.T) {
 	}
 }
 
-func TestTablePreview_Success(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+// fakePreviewRunner implements PreviewRunner for the storage preview tests
+// (RFC 025 Task 3.1). Preview no longer scans the table itself — it
+// delegates the actual data read to the query-worker via this seam, so the
+// walker-backed EncodeRecords tests this replaces no longer apply.
+type fakePreviewRunner struct {
+	res  *queryproxy.Result
+	qerr *queryproxy.QueryError
+	got  struct{ warehouse, ns, table string }
+}
+
+func (f *fakePreviewRunner) Preview(_ context.Context, _, warehouse, ns, table string, _ queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError) {
+	f.got.warehouse, f.got.ns, f.got.table = warehouse, ns, table
+	return f.res, f.qerr
+}
+
+// previewWarehouseName is the bare warehouse name projectgatetest.AllowAll
+// resolves for the preview tests below.
+const previewWarehouseName = "mywarehouse"
+
+// newPreviewTestServer wires just the Preview route against h. Preview no
+// longer touches h.Svc (the query-worker owns the data read), so these
+// tests build a minimal HTTPHandlers instead of reusing the fixture-walker
+// newTestServer harness.
+func newPreviewTestServer(t *testing.T, h *HTTPHandlers, resolver auth.UserResolver) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/preview",
+		auth.WithUser(resolver, http.HandlerFunc(h.Preview)))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPreview_Success covers the happy path: the fake runner's
+// queryproxy.Result maps onto PreviewResponse verbatim, and Preview passes
+// through the resolved ns/table/qualified-warehouse to the runner.
+func TestPreview_Success(t *testing.T) {
+	runner := &fakePreviewRunner{res: &queryproxy.Result{
+		Schema:    []queryproxy.ResultColumn{{Name: "id", Type: "INTEGER"}},
+		Rows:      [][]any{{1}},
+		Truncated: true,
+	}}
+	h := &HTTPHandlers{
+		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		Query: runner,
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
 
 	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
 	resp, err := http.Get(url)
@@ -301,27 +348,34 @@ func TestTablePreview_Success(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.Rows) != 3 {
-		t.Errorf("rows = %d, want 3 (%v)", len(body.Rows), body.Rows)
+	if len(body.Columns) != 1 || body.Columns[0].Name != "id" || body.Columns[0].Type != "INTEGER" {
+		t.Errorf("columns = %+v, want [{id INTEGER}]", body.Columns)
 	}
-	if body.Truncated {
-		t.Errorf("preview should not be truncated for 3-row fixture")
+	if len(body.Rows) != 1 {
+		t.Errorf("rows = %d, want 1 (%v)", len(body.Rows), body.Rows)
+	}
+	if !body.Truncated {
+		t.Errorf("truncated = false, want true")
+	}
+	if runner.got.ns != "public" || runner.got.table != "simple" {
+		t.Errorf("runner got ns/table = %q/%q, want public/simple", runner.got.ns, runner.got.table)
+	}
+	if want := fixtureLakekeeperProjectID + "/" + previewWarehouseName; runner.got.warehouse != want {
+		t.Errorf("runner got warehouse = %q, want %q", runner.got.warehouse, want)
 	}
 }
 
-// TestTablePreview_TruncationFlag exercises the P1 regression path:
-// EncodeRecords sets Truncated=true only when the underlying scan yields
-// one more row past the cap. Lowering previewRowCap below the fixture's
-// row count means iceberg-go must still hand at least one extra row to
-// the post-loop peek; if Preview caps at the scan layer itself, this
-// test fails.
-func TestTablePreview_TruncationFlag(t *testing.T) {
-	orig := previewRowCap
-	previewRowCap = 2
-	t.Cleanup(func() { previewRowCap = orig })
-
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+// TestPreview_QueryDisabled asserts the 501 query_disabled soft-degrade
+// when no query-service core is wired (h.Query left as the nil interface).
+func TestPreview_QueryDisabled(t *testing.T) {
+	h := &HTTPHandlers{
+		Gate: projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		// Query intentionally left nil.
+	}
+	if h.Query != nil {
+		t.Fatal("precondition: h.Query must be the nil interface")
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
 
 	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
 	resp, err := http.Get(url)
@@ -329,18 +383,70 @@ func TestTablePreview_TruncationFlag(t *testing.T) {
 		t.Fatalf("GET preview: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", resp.StatusCode)
 	}
-	var body PreviewResponse
+	var body map[string]string
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.Rows) != 2 {
-		t.Errorf("rows = %d, want 2 (capped by previewRowCap)", len(body.Rows))
+	if body["kind"] != "query_disabled" {
+		t.Errorf(`kind = %q, want "query_disabled"`, body["kind"])
 	}
-	if !body.Truncated {
-		t.Errorf("truncated = false, want true (fixture has 3 rows > cap of 2)")
+}
+
+// TestPreview_ResultTooLarge asserts the query-worker's result_too_large
+// QueryError maps to a 413 whose message explains the cap in storage-UI
+// terms ("too wide") rather than the query-worker's generic wording.
+func TestPreview_ResultTooLarge(t *testing.T) {
+	runner := &fakePreviewRunner{qerr: &queryproxy.QueryError{Status: http.StatusRequestEntityTooLarge, Kind: "result_too_large", Msg: "result too large"}}
+	h := &HTTPHandlers{
+		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		Query: runner,
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET preview: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(body["error"], "too wide") {
+		t.Errorf("error = %q, want it to contain %q", body["error"], "too wide")
+	}
+}
+
+// TestPreview_InvalidIdentifier asserts identifiers are still rejected
+// BEFORE the runner is invoked. "_bad" (not "../x") is the canonical
+// invalid-identifier probe here — Go's ServeMux strips dot segments out of
+// the path before PathValue, so "../x" never reaches the handler.
+func TestPreview_InvalidIdentifier(t *testing.T) {
+	runner := &fakePreviewRunner{}
+	h := &HTTPHandlers{
+		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		Query: runner,
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/_bad/simple/preview"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET preview: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if runner.got.ns != "" || runner.got.table != "" {
+		t.Errorf("runner invoked despite invalid identifier: got=%+v", runner.got)
 	}
 }
 

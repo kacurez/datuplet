@@ -154,10 +154,14 @@ func Handler(cfg Config, signer *tokens.Signer) (http.Handler, error) {
 
 // handler is the concrete POST /api/v1/query implementation.
 type handler struct {
-	cfg          Config
-	signer       *tokens.Signer
-	client       *workerClient
-	gate         *gate
+	cfg    Config
+	signer *tokens.Signer
+	client *workerClient
+	gate   *gate
+	// previewGate is the separate per-principal in-flight cap (capacity 1)
+	// for Core.Preview (Task 3.1). Previews and console queries never share
+	// a gate slot so one path can't starve the other.
+	previewGate  *gate
 	auditCounter *prometheus.CounterVec // nil → use package-level promauto counter
 }
 
