@@ -131,10 +131,28 @@ export async function getTableSchema(projectId, namespace, name) {
 
 /**
  * First N rows (server-capped at 100) plus column types. May set
- * truncated=true when row or byte cap fires.
+ * truncated=true. Errors carry .status and .kind (query_disabled /
+ * rate_limited / capacity / result_too_large / sql_error / timeout) so the
+ * page can render actionable states instead of a generic failure.
  */
 export async function getTablePreview(projectId, namespace, name) {
-  return api(`/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/preview`);
+  const r = await fetch(
+    `/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/preview`,
+    { credentials: 'include' },
+  );
+  if (r.status === 401) {
+    if (typeof window.__datupletGoToLogin === 'function') window.__datupletGoToLogin();
+    throw new Error('not authenticated');
+  }
+  const ct = r.headers.get('content-type') || '';
+  const payload = ct.includes('application/json') ? await r.json() : await r.text();
+  if (!r.ok) {
+    const err = new Error((payload && payload.error) || `preview failed (HTTP ${r.status})`);
+    err.status = r.status;
+    err.kind = payload && payload.kind;
+    throw err;
+  }
+  return payload;
 }
 
 /**
