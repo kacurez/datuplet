@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -204,6 +205,16 @@ func TestListTables_NoMembership(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", resp.StatusCode)
 	}
+	// The gate-error body must carry "kind" alongside "error" — parity with
+	// the query proxy's {"error","kind"} shape for the same shared
+	// projectgate.Error (RFC 025 Codex review, Minor finding).
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kind"] != "forbidden" {
+		t.Errorf(`kind = %q, want "forbidden"`, body["kind"])
+	}
 }
 
 func TestListTables_NoSession(t *testing.T) {
@@ -231,6 +242,53 @@ func TestListTables_InvalidProjectID(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kind"] != "bad_request" {
+		t.Errorf(`kind = %q, want "bad_request"`, body["kind"])
+	}
+}
+
+// TestListTables_WarehouseResolutionFails: on the lakekeeper-configured
+// path, a resolveWarehouse gate failure (e.g. no warehouse registered yet
+// for the project) must carry "kind" alongside "error" — same parity as
+// resolveProject and the query proxy (Minor finding, RFC 025 Codex review).
+func TestListTables_WarehouseResolutionFails(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	svc.LakekeeperURL = "http://lakekeeper.invalid" // never dialed: warehouse resolution fails first
+	h := &HTTPHandlers{
+		Svc: svc,
+		Gate: &projectgate.Gate{
+			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+			Authorizer:             allowedFake(),
+			WarehouseFor: func(_ context.Context, _ string) (string, error) {
+				return "", errors.New("no warehouse registered")
+			},
+		},
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
+		auth.WithUser(stubResolver{}, http.HandlerFunc(h.ListTables)))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
+	if err != nil {
+		t.Fatalf("GET tables: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kind"] != "unavailable" {
+		t.Errorf(`kind = %q, want "unavailable"`, body["kind"])
 	}
 }
 

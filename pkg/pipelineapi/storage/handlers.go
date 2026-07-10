@@ -97,6 +97,15 @@ func writeErrResp(w http.ResponseWriter, status int, msg string) {
 	writeJSONResp(w, status, map[string]string{"error": msg})
 }
 
+// writeGateErrResp writes a *projectgate.Error response with the same
+// {"error","kind"} shape the query proxy uses for the same shared-gate
+// errors (pkg/pipelineapi/queryproxy/audit.go). Kept as a helper so the
+// three gate-error call sites below (resolveProject, plus the two
+// resolveWarehouse callers) don't drift from each other.
+func writeGateErrResp(w http.ResponseWriter, gerr *projectgate.Error) {
+	writeJSONResp(w, gerr.Status, map[string]string{"error": gerr.Msg, "kind": gerr.Kind})
+}
+
 // resolveProject pulls pid from the URL, validates it, enforces
 // FGA datuplet_member authorization via the shared projectgate.Gate, and
 // returns the parsed project UUID plus the lakekeeper project UUID (so
@@ -122,7 +131,7 @@ func (h *HTTPHandlers) resolveProject(w http.ResponseWriter, r *http.Request) (p
 	}
 	pid, lk, gerr := h.Gate.Authorize(r.Context(), u.ID.String(), r.PathValue("pid"))
 	if gerr != nil {
-		writeErrResp(w, gerr.Status, gerr.Msg)
+		writeGateErrResp(w, gerr)
 		return uuid.Nil, "", false
 	}
 	return pid, lk, true
@@ -217,7 +226,7 @@ func (h *HTTPHandlers) loadRequestedTable(w http.ResponseWriter, r *http.Request
 	if h.Svc.LakekeeperURL != "" {
 		warehouse, gerr := h.resolveWarehouse(r.Context(), lkPID)
 		if gerr != nil {
-			writeErrResp(w, gerr.Status, gerr.Msg)
+			writeGateErrResp(w, gerr)
 			return nil, "", false
 		}
 		proxy, err := newCatalogProxy(r.Context(), h.Svc, lkPID, warehouse)
@@ -315,7 +324,7 @@ func (h *HTTPHandlers) ListTables(w http.ResponseWriter, r *http.Request) {
 		warehouse, gerr := h.resolveWarehouse(r.Context(), lkPID)
 		if gerr != nil {
 			log.Printf("storage: resolve warehouse (lakekeeper=%s lkPID=%s): %s", h.Svc.LakekeeperURL, lkPID, gerr.Msg)
-			writeErrResp(w, gerr.Status, gerr.Msg)
+			writeGateErrResp(w, gerr)
 			return
 		}
 		proxy, err := newCatalogProxy(r.Context(), h.Svc, lkPID, warehouse)
@@ -494,7 +503,7 @@ func (h *HTTPHandlers) Preview(w http.ResponseWriter, r *http.Request) {
 	u, _ := auth.UserFromContext(r.Context()) // resolveProject already 401'd if absent
 	warehouse, gerr := h.Gate.Warehouse(r.Context(), lkPID)
 	if gerr != nil {
-		writeJSONResp(w, gerr.Status, map[string]string{"error": gerr.Msg, "kind": gerr.Kind})
+		writeGateErrResp(w, gerr)
 		return
 	}
 	res, qerr := h.Query.Preview(r.Context(), u.ID.String(), lkPID+"/"+warehouse, ns, name,
