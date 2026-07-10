@@ -213,15 +213,38 @@ var queryProjectIDErr error
 // /api/v1/projects only returns projects the CALLING user has a relation on
 // (pkg/pipelineapi/http/stores_pgx.go ListForUser), so those principals could
 // not resolve {pid} via their own session. {pid} identifies the project being
-// queried, not "projects visible to me" — the e2e suite provisions exactly
-// one Datuplet project, so resolving it once via the admin session (which
-// does have project_admin) and reusing it is correct for every principal.
+// queried, not "projects visible to me" — resolving it once via the admin
+// session (which does have project_admin on it) and reusing it is correct
+// for every principal.
+//
+// WHY resolve BY NAME rather than the single-project fallback: the e2e
+// cluster carries TWO lakekeeper projects — the shell bootstrap's "default"
+// project (register.sh's create-project + attach-warehouse) and the Go
+// harness's own project (h.LakekeeperProjectID, lakekeeper NAME
+// h.LakekeeperProjectName == "datuplet-e2e"). The query seed table
+// (ensureQueryTable) and every FGA grant this suite writes
+// (ensureAdminFGAGrant, SeedViewerFGAGrant, ...) live on the HARNESS's
+// lakekeeper project, NOT the shell bootstrap's "default" one. Before this
+// fix, the single-project fallback below (empty projectName) resolved to
+// whichever Datuplet project existed first — the "default" one — so the
+// query route attached to the wrong warehouse (table-not-found) and
+// non-admin principals (granted only on the harness project) got 403. Now
+// that two Datuplet projects can exist, that fallback is ambiguous; we must
+// resolve the ONE bound to the harness's own lakekeeper project by name.
+//
+// ensureSecretsLadderProject (scenarios_secrets_test.go) already does
+// exactly the binding we need here: `pipeline-api admin create-project
+// --name=<lakekeeper project name>` is a find-or-create BY NAME on the
+// lakekeeper side (LakekeeperManager.FindProjectIDByName), so passing
+// h.LakekeeperProjectName reuses h.LakekeeperProjectID instead of
+// allocating a new lakekeeper Project, and persists a Datuplet
+// projects-table row bound to it (lakekeeper_project_id =
+// h.LakekeeperProjectID). It's idempotent — safe to call here even if
+// TestSecretsLadder already ran it in the same process.
 //
 // Reuses remoteCLIFindProject (tests/e2e/scenarios_remote_cli_test.go), the
-// ground-truth helper for this exact GET /api/v1/projects call — it already
-// decodes the bare JSON array the endpoint returns and falls back to the
-// single project when name matching finds nothing (empty projectName never
-// matches, so this always exercises the single-project fallback).
+// ground-truth helper for this exact GET /api/v1/projects call — it decodes
+// the bare JSON array the endpoint returns and matches by exact name.
 func getQueryProjectID(t *testing.T) string {
 	t.Helper()
 	// getAdminSession is called OUTSIDE queryProjectIDOnce.Do: it may itself
@@ -231,10 +254,22 @@ func getQueryProjectID(t *testing.T) string {
 	// empty pid. getAdminSession is already cheap to call repeatedly (cached
 	// by its own sync.Once).
 	session := getAdminSession(t)
+	h := framework.SharedHarness()
 	queryProjectIDOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if h == nil {
+			queryProjectIDErr = fmt.Errorf("resolve query project id: SharedHarness nil")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		pid, err := remoteCLIFindProject(ctx, framework.PipelineAPIBaseURL(), session, "")
+		// Bind a Datuplet project row to the harness's own lakekeeper project
+		// FIRST — remoteCLIFindProject below can only find it by name once
+		// the row exists.
+		if _, err := ensureSecretsLadderProject(ctx, h); err != nil {
+			queryProjectIDErr = fmt.Errorf("bind Datuplet project to harness lakekeeper project %q: %w", h.LakekeeperProjectName, err)
+			return
+		}
+		pid, err := remoteCLIFindProject(ctx, framework.PipelineAPIBaseURL(), session, h.LakekeeperProjectName)
 		if err != nil {
 			queryProjectIDErr = fmt.Errorf("resolve query project id: %w", err)
 			return
