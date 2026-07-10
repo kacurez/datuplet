@@ -11,6 +11,8 @@ import (
 	"testing"
 )
 
+const testProjectID = "11111111-1111-1111-1111-111111111111"
+
 func TestResolveQuerySQL(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -70,12 +72,13 @@ func TestServerQueryRoute(t *testing.T) {
 	defer srv.Close()
 
 	var out bytes.Buffer
-	err := serverQuery(srv.URL, "api-token-xyz", "SELECT count(*) FROM t", "json", &out)
+	err := serverQuery(srv.URL, "api-token-xyz", testProjectID, "SELECT count(*) FROM t", "json", &out)
 	if err != nil {
 		t.Fatalf("serverQuery: %v", err)
 	}
-	if gotPath != "/api/v1/query" {
-		t.Fatalf("path = %q, want /api/v1/query", gotPath)
+	wantPath := "/api/v1/projects/" + testProjectID + "/query"
+	if gotPath != wantPath {
+		t.Fatalf("path = %q, want %q", gotPath, wantPath)
 	}
 	if gotAuth != "Bearer api-token-xyz" {
 		t.Fatalf("auth = %q, want Bearer api-token-xyz", gotAuth)
@@ -96,7 +99,7 @@ func TestServerQuery_ErrorStatus(t *testing.T) {
 	defer srv.Close()
 
 	var out bytes.Buffer
-	err := serverQuery(srv.URL, "tok", "SELECT bad", "json", &out)
+	err := serverQuery(srv.URL, "tok", testProjectID, "SELECT bad", "json", &out)
 	if err == nil {
 		t.Fatalf("expected error on HTTP 400")
 	}
