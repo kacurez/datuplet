@@ -5,7 +5,10 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
@@ -110,6 +113,75 @@ func TestReapOnce_DeletesTerminalRunsEvenWithoutStartTime(t *testing.T) {
 	_ = c.List(context.Background(), list)
 	if len(list.Items) != 0 {
 		t.Errorf("terminal run without startTime should be reaped; remaining=%v", list.Items)
+	}
+}
+
+// projectNS builds a project-labelled Namespace (the marker the reaper
+// iterates on now that Secret listing is per-namespace, not cluster-wide).
+func projectNS(name string) *corev1.Namespace {
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: map[string]string{"datuplet.io/project-id": "p"},
+		},
+	}
+}
+
+func runSecret(name, ns string, age time.Duration, owned bool) *corev1.Secret {
+	s := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: ns,
+			Labels:            map[string]string{"datuplet.io/run-id": name},
+			CreationTimestamp: metav1.Time{Time: time.Now().Add(-age)},
+		},
+	}
+	if owned {
+		s.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "datuplet.io/v1", Kind: "PipelineRun", Name: "owner", UID: "u",
+		}}
+	}
+	return s
+}
+
+// TestReapOnce_SweepsOrphanSecretsPerNamespace pins the RFC 026 P1.5 change:
+// the reaper finds run-token/snapshot Secrets by iterating project-labelled
+// namespaces and listing per-namespace (authorized by the datuplet-secrets
+// Role), NOT by a cluster-wide Secret list. The orphan/owner/cutoff logic is
+// unchanged.
+func TestReapOnce_SweepsOrphanSecretsPerNamespace(t *testing.T) {
+	oldOrphan := runSecret("old-orphan", "datuplet-proj", 25*time.Hour, false)  // reaped
+	youngOrphan := runSecret("young-orphan", "datuplet-proj", time.Hour, false) // kept (fresh)
+	ownedOld := runSecret("owned-old", "datuplet-proj", 25*time.Hour, true)     // kept (GC owns it)
+	// A Secret in a namespace WITHOUT the project-id label must never be
+	// visited — this is exactly what the cluster-wide→per-namespace switch
+	// guarantees.
+	foreignOrphan := runSecret("foreign-orphan", "unmanaged-ns", 25*time.Hour, false) // kept
+
+	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(
+		projectNS("datuplet-proj"),
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "unmanaged-ns"}},
+		oldOrphan, youngOrphan, ownedOld, foreignOrphan,
+	).Build()
+
+	if err := pkg8s.ReapOnce(context.Background(), c, 24*time.Hour, nil); err != nil {
+		t.Fatalf("ReapOnce: %v", err)
+	}
+
+	exists := func(name, ns string) bool {
+		err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, &corev1.Secret{})
+		return !apierrors.IsNotFound(err)
+	}
+	if exists("old-orphan", "datuplet-proj") {
+		t.Error("old orphan Secret in project namespace should have been reaped")
+	}
+	if !exists("young-orphan", "datuplet-proj") {
+		t.Error("young orphan Secret should be kept (under cutoff)")
+	}
+	if !exists("owned-old", "datuplet-proj") {
+		t.Error("owner-referenced Secret should be kept (GC handles it)")
+	}
+	if !exists("foreign-orphan", "unmanaged-ns") {
+		t.Error("orphan Secret in a non-project namespace must NOT be reaped")
 	}
 }
 

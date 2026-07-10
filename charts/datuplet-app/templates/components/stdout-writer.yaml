@@ -1,0 +1,53 @@
+{{- if .Values.components.builtins }}
+{{- /*
+ComponentDefinition CR for the built-in stdout-writer component (RFC 026
+Task R10). See data-generator.yaml in this directory for the cluster-scoped
+naming rationale.
+
+configSchema derived from docs/components.md ("stdout-writer" section) and
+components/stdout-writer/main.go (format defaults to "csv" when omitted).
+*/ -}}
+---
+apiVersion: datuplet.io/v1
+kind: ComponentDefinition
+metadata:
+  name: stdout-writer
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: stdout-writer
+spec:
+  displayName: Stdout Writer
+  description: Reads input tables and prints them to stdout. For debugging only — no Iceberg output.
+  maintainer: datuplet
+  defaultVersion: {{ .Values.components.tag }}
+  versions:
+    - version: {{ .Values.components.tag }}
+      image: "{{ .Values.components.registry }}/stdout-writer:{{ .Values.components.tag }}"
+      configSchema: |
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "format": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "json"
+              ]
+            }
+          }
+        }
+      resources:
+        default:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        max:
+          cpu: "2"
+          memory: 2Gi
+          ephemeral-storage: 10Gi
+{{- end }}

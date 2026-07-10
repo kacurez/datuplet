@@ -66,11 +66,6 @@ spec:
           spec:
             description: PipelineRunSpec defines the desired state of PipelineRun
             properties:
-              parameters:
-                additionalProperties:
-                  type: string
-                description: Parameters allows overriding component config values
-                type: object
               pipelineRef:
                 description: PipelineRef references the Pipeline to run
                 properties:
@@ -109,6 +104,36 @@ spec:
                 description: CompletionTime is when the run completed
                 format: date-time
                 type: string
+              components:
+                description: Components records the resolved component/version/image
+                  mapping for each component instance admitted into this run.
+                items:
+                  description: ResolvedComponentStatus records the component/version/image
+                    resolution snapshotted for one component instance at run admission.
+                  properties:
+                    component:
+                      description: Component is the registry component name (ComponentDefinition.Name).
+                      type: string
+                    image:
+                      description: Image is the resolved container image.
+                      type: string
+                    imageID:
+                      description: ImageID is the digest observed after pull (populated
+                        post-admission, R7).
+                      type: string
+                    name:
+                      description: Name is the component instance name (ComponentSpec.Name).
+                      type: string
+                    version:
+                      description: Version is the resolved version identifier.
+                      type: string
+                  required:
+                  - component
+                  - image
+                  - name
+                  - version
+                  type: object
+                type: array
               conditions:
                 description: Conditions represent the latest available observations
                   of the PipelineRun's state
@@ -182,6 +207,18 @@ spec:
               phase:
                 description: Phase is the current phase of the PipelineRun
                 type: string
+              pipelineGeneration:
+                description: PipelineGeneration is the Pipeline generation this
+                  run was admitted against.
+                format: int64
+                type: integer
+              resolvedSpec:
+                description: |-
+                  ResolvedSpec is the fully-resolved pipeline spec snapshotted at
+                  admission (RFC 026 §4.3): component/version references are frozen so
+                  later registry changes cannot affect an in-flight run.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
               stageStatuses:
                 description: StageStatuses tracks the status of each stage
                 items:

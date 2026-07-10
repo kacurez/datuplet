@@ -168,6 +168,18 @@ spec:
             - name: DATUPLET_QUERY_PER_PRINCIPAL_INFLIGHT
               value: {{ .Values.queryWorker.query.perPrincipalInflight | default 2 | quote }}
             {{- end }}
+            # Pipeline-policy gateway bounds (RFC 026 §4.4/§4.6). pipeline-api
+            # rejects (403) a non-superadmin PUT whose gateway knobs exceed
+            # these on the diff-gate. 0/unset = no bound on that knob.
+            # int64 before quote: Helm parses large YAML integers as float64,
+            # which `quote` would render in scientific notation (e.g.
+            # "2.68435456e+08"), breaking strconv.ParseInt in pipeline-api.
+            - name: PIPELINE_POLICY_GATEWAY_MAX_CHUNK_SIZE
+              value: {{ .Values.pipelinePolicy.gateway.maxChunkSize | int64 | quote }}
+            - name: PIPELINE_POLICY_GATEWAY_MAX_BUFFER_SIZE
+              value: {{ .Values.pipelinePolicy.gateway.maxBufferSize | int64 | quote }}
+            - name: PIPELINE_POLICY_GATEWAY_MAX_TARGET_FILE_SIZE
+              value: {{ .Values.pipelinePolicy.gateway.maxTargetFileSize | int64 | quote }}
             # Fine-grained authz via OpenFGA.
             - name: OPENFGA_URL
               value: {{ include "datuplet-app.openfgaHttpUrl" . | quote }}

@@ -60,8 +60,14 @@ build-components: build-gateway ## Build all component Docker images
 # Keeps gateway as a build dep (sidecar is required for every run). RFC 010
 # scenarios (duckdb-etl, multi-table-join) need datuplet/sql-transform too.
 # RFC 022 Task 2.7: query-worker is needed for the query e2e scenarios.
+# RFC 026 Task R11: data-generator is additionally tagged v0.0.1 — a second,
+# STABLE tag of the same local image — so the e2e ComponentDefinition
+# bootstrap (tests/e2e/framework/components_bootstrap.go) has a real stable
+# version to register alongside the mutable "dev" tag, giving the
+# unpinned-resolution and schema-invalid scenarios something to pin against.
 build-components-e2e: build-gateway build-component-sql-transform ## Build only the components actively used by e2e (data-generator + http-json-extractor + stdout-writer + sql-transform + query-worker)
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
+	docker tag datuplet/data-generator:latest datuplet/data-generator:v0.0.1
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
 	docker build -t datuplet/stdout-writer:latest -f components/stdout-writer/Dockerfile .
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
@@ -150,6 +156,14 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	helm dependency update charts/datuplet-infra
 	helm dependency update charts/datuplet-app
 	helm dependency update charts/datuplet-lakekeeper
+	# Refresh the Datuplet CRDs up front. Helm installs CRDs from a chart's
+	# crds/ dir only on FIRST install and never upgrades them (nor removes
+	# them on uninstall), so on a reused cluster (the OrbStack dev loop) a
+	# CRD schema change never lands via helm alone — every pipeline apply
+	# then fails strict decoding on the new fields. kubectl apply updates
+	# the schema in place; a no-op on a fresh cluster the first helm install
+	# would populate anyway.
+	kubectl apply -f charts/datuplet-app/crds/
 	# Five-phase install: operators → infra → app → lakekeeper → register.
 	# Sequential, each --wait --wait-for-jobs. Phases 2-4 are strict order:
 	#   - infra owns CNPG + OpenFGA + MinIO + keygen (no Datuplet code)
@@ -259,21 +273,21 @@ k8s-rebuild-services: build-gateway build-iceberg-job ## Rebuild gateway + icebe
 	@echo "Services rebuilt!"
 
 # Clean up pipelineruns and retry the example (with CRD reload)
-k8s-retry-simple: k8s-reload-crds ## Delete all PipelineRuns + re-apply simple-pipeline.yaml
+k8s-retry-simple: k8s-reload-crds ## Delete all PipelineRuns + re-apply simple-http-extract.yaml
 	kubectl delete pipelinerun --all -n datuplet-e2e --ignore-not-found
 	kubectl delete pipeline simple-pipeline -n datuplet-e2e --ignore-not-found
-	kubectl apply -f examples/k8s/simple-pipeline.yaml
+	kubectl apply -f examples/pipelines/simple-http-extract.yaml
 
-k8s-retry-duckdb: k8s-reload-crds ## Delete all PipelineRuns + re-apply duckdb-pipeline.yaml
+k8s-retry-duckdb: k8s-reload-crds ## Delete all PipelineRuns + re-apply etl-duckdb.yaml
 	kubectl delete pipelinerun --all -n datuplet-e2e --ignore-not-found
 	kubectl delete pipeline duckdb-transform -n datuplet-e2e --ignore-not-found
-	kubectl apply -f examples/k8s/duckdb-pipeline.yaml
+	kubectl apply -f examples/pipelines/etl-duckdb.yaml
 
 # Clean up pipelineruns and retry the example (with CRD reload)
-k8s-retry-full: k8s-reload-crds ## Delete all PipelineRuns + re-apply full-pipeline.yaml
+k8s-retry-full: k8s-reload-crds ## Delete all PipelineRuns + re-apply full-etl.yaml
 	kubectl delete pipelinerun --all -n datuplet-e2e --ignore-not-found
 	kubectl delete pipeline full-pipeline -n datuplet-e2e --ignore-not-found
-	kubectl apply -f examples/k8s/full-pipeline.yaml
+	kubectl apply -f examples/pipelines/full-etl.yaml
 
 # Rebuild operators and retry example pipeline (comprehensive)
 k8s-rebuild-retry-simple: k8s-rebuild-operators k8s-retry-simple ## Rebuild operators + retry simple-pipeline (comprehensive)

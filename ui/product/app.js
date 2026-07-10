@@ -17,6 +17,7 @@ import { renderSecrets } from '/ui/pages/settings-secrets.js';
 import { renderStorageCatalog } from '/ui/pages/storage-catalog.js';
 import { renderStorageTable } from '/ui/pages/storage-table.js';
 import { renderQuery } from '/ui/pages/query.js';
+import { renderComponents } from '/ui/pages/components.js';
 import { install as installHotkeys } from '/ui/hotkeys.js';
 import { install as installOverlay } from '/ui/overlay.js';
 import * as icons from '/ui/icons.js';
@@ -43,6 +44,7 @@ const routes = [
   { pattern: /^\/ui\/storage\/?$/, render: renderStorageCatalog },
   { pattern: /^\/ui\/storage\/t\/([^/]+)\/([^/]+)\/?$/, render: renderStorageTable },
   { pattern: /^\/ui\/query\/?$/, render: renderQuery },
+  { pattern: /^\/ui\/components\/?$/, render: renderComponents },
   { pattern: /^\/ui\/settings\/secrets\/?$/, render: renderSecrets },
 ];
 
@@ -65,8 +67,9 @@ const NAV_ITEMS = [
   { href: '/ui/pipelines',        label: 'Pipelines', icon: 'play'     },
   { href: '/ui/runs',             label: 'Runs',      icon: 'activity' },
   { href: '/ui/storage',          label: 'Storage',   icon: 'database' },
-  { href: '/ui/query',            label: 'Query',     icon: 'terminal' },
-  { href: '/ui/settings/secrets', label: 'Secrets',   icon: 'key'      },
+  { href: '/ui/query',            label: 'Query',      icon: 'terminal' },
+  { href: '/ui/components',       label: 'Components', icon: 'database' },
+  { href: '/ui/settings/secrets', label: 'Secrets',    icon: 'key'      },
 ];
 
 function navItemsHTML(pathname) {
@@ -191,7 +194,12 @@ document.addEventListener('click', (e) => {
   if (!href || !href.startsWith('/ui/')) return;
   if (a.target === '_blank' || e.metaKey || e.ctrlKey || e.shiftKey) return;
   e.preventDefault();
-  if (window.location.pathname !== href) {
+  // Compare the full current URL (path + query) against the target href so
+  // query-clearing navigations (e.g. the components detail's "Back to
+  // catalog" link, /ui/components?name=x → /ui/components) still push and
+  // drop the stale query. Query-bearing and cross-path links push as before.
+  const current = window.location.pathname + window.location.search;
+  if (current !== href) {
     window.history.pushState({}, '', href);
   }
   renderRoute();

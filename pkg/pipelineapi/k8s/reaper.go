@@ -161,35 +161,57 @@ func ReapOnce(ctx context.Context, c client.Client, maxAge time.Duration, u RunS
 	return nil
 }
 
+// reapOrphanSecrets sweeps orphan run-token / snapshot Secrets. RFC 026 P1.5
+// moved Secret verbs off pipeline-api's ClusterRole into per-project-namespace
+// Roles, so the reaper can no longer list Secrets cluster-wide. Instead it
+// iterates the project namespaces (found via the cluster-wide
+// `datuplet.io/project-id` label — the one namespace-scope verb still on the
+// ClusterRole) and lists Secrets within each, authorized by the
+// `datuplet-secrets` Role bound to the shared pipeline-api SA. The orphan
+// detection (ownerReference skip, zero/after-cutoff skip) is unchanged.
 func reapOrphanSecrets(ctx context.Context, c client.Client, cutoff time.Time) error {
-	sel, err := labels.Parse("datuplet.io/run-id")
+	nsSel, err := labels.Parse(ProjectNamespaceLabel)
+	if err != nil {
+		return fmt.Errorf("build namespace selector: %w", err)
+	}
+	namespaces := &corev1.NamespaceList{}
+	if err := c.List(ctx, namespaces, &client.ListOptions{LabelSelector: nsSel}); err != nil {
+		return fmt.Errorf("list project namespaces: %w", err)
+	}
+
+	secretSel, err := labels.Parse("datuplet.io/run-id")
 	if err != nil {
 		return fmt.Errorf("build label selector: %w", err)
 	}
-	secrets := &corev1.SecretList{}
-	if err := c.List(ctx, secrets, &client.ListOptions{LabelSelector: sel}); err != nil {
-		return fmt.Errorf("list secrets: %w", err)
-	}
-	for i := range secrets.Items {
-		sec := &secrets.Items[i]
-		// Skip if an ownerReference still ties this Secret to a PipelineRun —
-		// GC will handle cleanup when the owner is deleted.
-		if len(sec.OwnerReferences) > 0 {
+	for i := range namespaces.Items {
+		ns := namespaces.Items[i].Name
+		secrets := &corev1.SecretList{}
+		if err := c.List(ctx, secrets, &client.ListOptions{Namespace: ns, LabelSelector: secretSel}); err != nil {
+			// Log + continue so one namespace's transient error (e.g. RBAC
+			// still propagating) doesn't abort the whole sweep.
+			log.Printf("pipeline-api reaper: list secrets in ns %s: %v", ns, err)
 			continue
 		}
-		if sec.CreationTimestamp.Time.IsZero() {
-			continue
-		}
-		if !sec.CreationTimestamp.Time.Before(cutoff) {
-			continue
-		}
-		if err := c.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
-			log.Printf("pipeline-api reaper: delete Secret %s/%s: %v", sec.Namespace, sec.Name, err)
+		for j := range secrets.Items {
+			sec := &secrets.Items[j]
+			// Skip if an ownerReference still ties this Secret to a PipelineRun —
+			// GC will handle cleanup when the owner is deleted.
+			if len(sec.OwnerReferences) > 0 {
+				continue
+			}
+			if sec.CreationTimestamp.Time.IsZero() {
+				continue
+			}
+			if !sec.CreationTimestamp.Time.Before(cutoff) {
+				continue
+			}
+			if err := c.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
+				log.Printf("pipeline-api reaper: delete Secret %s/%s: %v", sec.Namespace, sec.Name, err)
+			}
 		}
 	}
 	return nil
 }
-
 
 // ReapOnceWith runs ReapOnce + the run_tuples sweep in one pass.
 // K8s-side errors are returned (the caller may want to fail

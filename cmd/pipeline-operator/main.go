@@ -166,6 +166,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Set up ComponentDefinition controller (registration-time validation).
+	if err = (&controllers.ComponentDefinitionReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ComponentDefinition")
+		os.Exit(1)
+	}
+
 	// Create Kubernetes clientset for pod log access
 	clientset, err := kubernetes.NewForConfig(ctrl.GetConfigOrDie())
 	if err != nil {
@@ -198,7 +207,10 @@ func main() {
 
 	// Set up PipelineRun controller.
 	if err = (&controllers.PipelineRunReconciler{
-		Client:       mgr.GetClient(),
+		Client: mgr.GetClient(),
+		// Uncached reader for the managed project Secret at admission — avoids
+		// a cluster-wide Secret informer; per-namespace secrets:get suffices.
+		APIReader:    mgr.GetAPIReader(),
 		Scheme:       mgr.GetScheme(),
 		GatewayImage: gatewayImage,
 		LakekeeperURL: lakekeeperURL,
@@ -211,6 +223,9 @@ func main() {
 		GatewayProfilingUsername:      gatewayProfilingUser,
 		GatewayProfilingPassword:      gatewayProfilingPass,
 		RuntimePullPolicy:             runtimePullPolicy,
+		// Registry resolves component/version references at run admission
+		// against cluster-scoped ComponentDefinitions via the manager cache.
+		Registry: controllers.ComponentRegistry{Reader: mgr.GetClient()},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PipelineRun")
 		os.Exit(1)

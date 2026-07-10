@@ -76,20 +76,6 @@ spec:
                     format: int64
                     type: integer
                 type: object
-              secretsRef:
-                description: |
-                  SecretsRef names a Kubernetes Secret in the same namespace whose keys
-                  are resolvable via $[name] references in component configs. Optional.
-                properties:
-                  name:
-                    description: Name is the Secret's name in the same namespace as the PipelineRun.
-                    maxLength: 253
-                    minLength: 1
-                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                    type: string
-                required:
-                  - name
-                type: object
               stages:
                 description: Stages defines the pipeline stages
                 items:
@@ -101,17 +87,15 @@ spec:
                         description: ComponentSpec defines a pipeline component
                         properties:
                           config:
-                            additionalProperties:
-                              type: string
-                            description: Config contains component-specific configuration
-                              (simple key-value pairs)
+                            description: Component-specific configuration as an
+                              arbitrary structured object (validated against the
+                              component's registry schema).
                             type: object
-                          configJSON:
-                            description: ConfigJSON contains component-specific configuration
-                              as JSON (for complex/nested values)
-                            type: string
-                          image:
-                            description: Image is the container image to run
+                            x-kubernetes-preserve-unknown-fields: true
+                          component:
+                            description: Component is the registry component name
+                              (ComponentDefinition.Name) this instance runs. Resolved
+                              against the component registry at run admission.
                             type: string
                           inputs:
                             description: Inputs defines input configuration
@@ -372,8 +356,13 @@ spec:
                                   More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                                 type: object
                             type: object
+                          version:
+                            description: Version pins the registry version. Empty
+                              resolves to the component's default version (its
+                              DefaultVersion, or the highest registered stable semver).
+                            type: string
                         required:
-                        - image
+                        - component
                         - name
                         type: object
                       minItems: 1

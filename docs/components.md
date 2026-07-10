@@ -1,6 +1,6 @@
 # Built-in Components
 
-Datuplet ships five component images. Each runs as an ordinary container alongside
+Datuplet ships six component images. Each runs as an ordinary container alongside
 the Data Gateway sidecar; the component communicates with the sidecar via gRPC and
 HTTP — it never touches S3 directly.
 
@@ -15,11 +15,13 @@ pipelines without an external data source.
 
 **Image:** `ghcr.io/kacurez/data-generator:v0.1.0`
 
+**Registry name:** `data-generator` · default version from the chart
+
 **Config schema (random mode):**
 
 ```yaml
 - name: gen
-  image: ghcr.io/kacurez/data-generator:v0.1.0
+  component: data-generator
   config:
     tables:
       - name: events
@@ -42,7 +44,7 @@ pipelines without an external data source.
 
 ```yaml
 - name: seed
-  image: ghcr.io/kacurez/data-generator:v0.1.0
+  component: data-generator
   config:
     tables:
       - name: lookup
@@ -76,18 +78,22 @@ single-request and paginated modes.
 
 **Image:** `ghcr.io/kacurez/http-json-extractor:v0.1.0`
 
+**Registry name:** `http-json-extractor` · default version from the chart
+
 **Config schema (single request):**
 
 ```yaml
 - name: fetch
-  image: ghcr.io/kacurez/http-json-extractor:v0.1.0
+  component: http-json-extractor
   config:
     url: "https://api.example.com/items"
     array_path: "items"     # key of the JSON array in the response object
                             # omit if the response is a top-level array
     table_name: "items"     # output table name (defaults to array_path or "data")
     headers:
-      Authorization: "Bearer $[api_token]"  # use $[name] for secrets
+      # $[name] refs must be a whole scalar, so the Secret value carries the
+      # full header, "Bearer " prefix included (see docs/secrets.md).
+      Authorization: "$[api_token]"
   outputs:
     defaultBucket: raw
     defaultWriteMode: APPEND
@@ -97,7 +103,7 @@ single-request and paginated modes.
 
 ```yaml
 - name: fetch-paged
-  image: ghcr.io/kacurez/http-json-extractor:v0.1.0
+  component: http-json-extractor
   config:
     url: "https://api.example.com/records"
     array_path: "records"
@@ -116,8 +122,8 @@ single-request and paginated modes.
     defaultWriteMode: APPEND
 ```
 
-For API keys, use `$[name]` in the `headers` map and provide the secret via
-`spec.secretsRef` on the Pipeline. See [docs/secrets.md](secrets.md).
+For API keys, use `$[name]` in the `headers` map and set the value in the
+project's managed secrets. See [docs/secrets.md](secrets.md).
 
 ---
 
@@ -128,11 +134,13 @@ Finnhub API key.
 
 **Image:** `ghcr.io/kacurez/finnhub-extractor:v0.1.0`
 
+**Registry name:** `finnhub-extractor` · default version from the chart
+
 **Config schema:**
 
 ```yaml
 - name: market
-  image: ghcr.io/kacurez/finnhub-extractor:v0.1.0
+  component: finnhub-extractor
   config:
     mode: quote             # see modes below
     symbols: [AAPL, MSFT, GOOG]
@@ -165,18 +173,13 @@ config:
   apiKey: $[finnhub_key]
 ```
 
-Store the API key as a K8s Secret and reference it:
-
-```yaml
-spec:
-  secretsRef:
-    name: finnhub-secrets
-```
+Set the key in the project's managed secrets (UI: Settings → Secrets, or the API):
 
 ```bash
-kubectl create secret generic finnhub-secrets \
-  --from-literal=finnhub_key=<your-api-key> \
-  -n datuplet
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value":"<your-api-key>"}' \
+  https://<host>/api/v1/projects/$PROJECT_ID/secrets/finnhub_key
 ```
 
 See [docs/secrets.md](secrets.md) for the full secret resolution flow.
@@ -192,11 +195,13 @@ the component.
 
 **Image:** `ghcr.io/kacurez/sql-transform:v0.1.0`
 
+**Registry name:** `sql-transform` · default version from the chart
+
 **Config schema:**
 
 ```yaml
 - name: transform
-  image: ghcr.io/kacurez/sql-transform:v0.1.0
+  component: sql-transform
   inputs:
     tables:
       - bucket: raw
@@ -246,6 +251,65 @@ the component.
 
 ---
 
+## pandas-transform
+
+Applies a sequence of pandas operations to input data. Reads the input table as
+CSV from the Data Gateway, applies the operations in order, and writes the
+result back as CSV — no S3 or Lakekeeper credentials touch the component.
+
+**Image:** `ghcr.io/kacurez/pandas-transform:v0.1.0`
+
+**Registry name:** `pandas-transform` · default version from the chart
+
+**Config schema:**
+
+```yaml
+- name: clean
+  component: pandas-transform
+  inputs:
+    tables:
+      - bucket: raw
+        table: events
+  outputs:
+    defaultBucket: curated
+    defaultWriteMode: FULL_LOAD
+  config:
+    output_table: events_clean   # optional, defaults to the input table name
+    operations:
+      - type: filter
+        column: value
+        op: ">"                  # ">", ">=", "<", "<=", "==", "!=", "in", "contains"
+        value: 0
+      - type: select
+        columns: [id, value, label]
+      - type: rename
+        columns:
+          value: amount
+      - type: sort
+        by: [id]                 # string or list
+        ascending: true
+      - type: fillna
+        column: amount           # omit to fill all columns
+        value: 0
+```
+
+**Supported operations (applied in order):**
+
+| Type | Fields | Description |
+|---|---|---|
+| `filter` | `column`, `op`, `value` | Keep rows matching the condition |
+| `select` | `columns` | Keep only the listed columns |
+| `sort` | `by`, `ascending` (default `true`) | Sort rows |
+| `rename` | `columns` (map of old name → new name) | Rename columns |
+| `drop` | `columns` (string or list) | Drop columns |
+| `fillna` | `column` (optional), `value` | Fill missing values |
+
+Only one input table is read (the first entry under `inputs.tables`). Unknown
+operation types and references to missing columns are logged as warnings and
+skipped rather than failing the run.
+
+---
+
 ## stdout-writer
 
 Reads input tables and prints them to stdout. For debugging only — no Iceberg
@@ -253,11 +317,13 @@ output.
 
 **Image:** `ghcr.io/kacurez/stdout-writer:v0.1.0`
 
+**Registry name:** `stdout-writer` · default version from the chart
+
 **Config schema:**
 
 ```yaml
 - name: print
-  image: ghcr.io/kacurez/stdout-writer:v0.1.0
+  component: stdout-writer
   inputs:
     tables:
       - bucket: raw
@@ -279,7 +345,7 @@ spec:
     - name: generate
       components:
         - name: gen
-          image: ghcr.io/kacurez/data-generator:v0.1.0
+          component: data-generator
           config:
             tables:
               - name: events
@@ -292,7 +358,7 @@ spec:
     - name: print
       components:
         - name: printer
-          image: ghcr.io/kacurez/stdout-writer:v0.1.0
+          component: stdout-writer
           inputs:
             tables:
               - bucket: raw

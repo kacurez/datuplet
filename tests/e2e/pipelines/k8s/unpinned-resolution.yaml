@@ -1,0 +1,37 @@
+---
+# RFC 026 P2 Task R11: unpinned-resolution scenario. `version` is omitted —
+# StaticRegistry.Resolve (pkg/pipeline/validate/registry.go) falls through
+# to ComponentDefinitionSpec.LatestStable(), which skips the "dev"
+# prerelease entry and resolves to the only stable version registered for
+# data-generator: v0.0.1 (framework/components_bootstrap.go). The test
+# asserts the resolution is recorded verbatim in
+# PipelineRun.status.components[].
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: "{{.RunPrefix}}-unpinned-resolution"
+  namespace: datuplet
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: data-generator
+          component: data-generator
+          config:
+            tables:
+              - name: unpinned
+                random:
+                  schema: {id: int}
+                  limit: {rowsCount: 10}
+          outputs:
+            defaultBucket: "{{.RunPrefix}}-unpinned"
+            defaultWriteMode: APPEND
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: "{{.RunPrefix}}-unpinned-resolution-run"
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: "{{.RunPrefix}}-unpinned-resolution"

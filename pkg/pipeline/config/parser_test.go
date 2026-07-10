@@ -17,7 +17,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           config:
             password: $[db_password]
             user: alice
@@ -40,7 +40,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           config:
             password: "prefix $[db_password] suffix"
           outputs:
@@ -50,8 +50,10 @@ spec:
 	if err == nil {
 		t.Fatal("expected error for mid-string ref")
 	}
-	if !strings.Contains(err.Error(), "c1") {
-		t.Errorf("error does not mention component: %v", err)
+	// The single validation source now reports structured paths; the error
+	// must locate the offending component positionally.
+	if !strings.Contains(err.Error(), "components[0]") {
+		t.Errorf("error does not locate the component: %v", err)
 	}
 }
 
@@ -66,7 +68,7 @@ spec:
     - name: s1
       components:
         - name: c1
-          image: foo:latest
+          component: foo:latest
           config:
             literal: $$[not_a_secret]
           outputs:
@@ -74,6 +76,65 @@ spec:
 `
 	if _, err := Parse([]byte(yaml)); err != nil {
 		t.Fatalf("Parse: %v", err)
+	}
+}
+
+// TestParseNestedConfig proves nested component config survives the
+// validate -> FromCRD bridge: a nested YAML list lands in the runtime
+// Config map as a []any.
+func TestParseNestedConfig(t *testing.T) {
+	yaml := `
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: nested-ok
+spec:
+  stages:
+    - name: s1
+      components:
+        - name: c1
+          component: foo:latest
+          config:
+            tables:
+              - name: t1
+                columns: [a, b]
+          outputs:
+            defaultBucket: raw
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := cfg.Spec.Stages[0].Components[0].Config["tables"]
+	if _, ok := got.([]any); !ok {
+		t.Fatalf("Config[\"tables\"] = %#v, want []any", got)
+	}
+}
+
+// TestParseRejectsConfigJSON proves the decode is strict: the deleted
+// configJSON field is now an unknown-field error, not silently dropped.
+func TestParseRejectsConfigJSON(t *testing.T) {
+	yaml := `
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: legacy
+spec:
+  stages:
+    - name: s1
+      components:
+        - name: c1
+          component: foo:latest
+          configJSON: "{}"
+          outputs:
+            defaultBucket: raw
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected unknown-field error for configJSON")
+	}
+	if !strings.Contains(err.Error(), "configJSON") {
+		t.Errorf("error does not mention the unknown field: %v", err)
 	}
 }
 
@@ -120,61 +181,5 @@ func TestParseSinceDuration(t *testing.T) {
 				t.Errorf("ParseSinceDuration(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestValidateInputs_SinceMutuallyExclusive(t *testing.T) {
-	snapshotID := int64(12345)
-	in := &InputSpec{
-		Tables: []InputTableSpec{
-			{
-				Bucket:        "raw",
-				Table:         "orders",
-				Since:         "3d",
-				SinceSnapshot: &snapshotID,
-			},
-		},
-	}
-
-	err := validateInputs("test-comp", in, 0, nil, nil)
-	if err == nil {
-		t.Fatal("expected error for mutually exclusive since and sinceSnapshot")
-	}
-	if got := err.Error(); got == "" {
-		t.Fatal("expected non-empty error message")
-	}
-}
-
-func TestValidateInputs_InvalidSince(t *testing.T) {
-	in := &InputSpec{
-		Tables: []InputTableSpec{
-			{
-				Bucket: "raw",
-				Table:  "orders",
-				Since:  "invalid",
-			},
-		},
-	}
-
-	err := validateInputs("test-comp", in, 0, nil, nil)
-	if err == nil {
-		t.Fatal("expected error for invalid since duration")
-	}
-}
-
-func TestValidateInputs_ValidSince(t *testing.T) {
-	in := &InputSpec{
-		Tables: []InputTableSpec{
-			{
-				Bucket: "raw",
-				Table:  "orders",
-				Since:  "3d",
-			},
-		},
-	}
-
-	err := validateInputs("test-comp", in, 0, nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }

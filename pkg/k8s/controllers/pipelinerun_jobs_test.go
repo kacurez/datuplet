@@ -6,31 +6,44 @@ import (
 	"testing"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
 // minimalPipeline returns a Pipeline with one stage and one component,
-// no SecretsRef, no inputs, no outputs — just enough for buildComponentJob.
+// no inputs, no outputs — just enough for buildComponentJob.
 func minimalPipeline() *datupletv1.Pipeline {
 	return &datupletv1.Pipeline{
 		Spec: datupletv1.PipelineSpec{
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:  "c1",
-					Image: "datuplet/test:latest",
+					Name:      "c1",
+					Component: "comp-a",
+					Version:   "v1.0.0",
 				}},
 			}},
 		},
 	}
 }
 
-// minimalPipelineRun returns a PipelineRun with name, namespace, and RunID set.
+// minimalPipelineRun returns an admitted PipelineRun: RunID set, and the
+// minimalPipeline frozen into Status.ResolvedSpec + Status.Components (as
+// handlePending would after resolve-&-freeze). buildComponentJob reads the
+// resolved image/version from the snapshot, so unit tests must supply it.
 func minimalPipelineRun() *datupletv1.PipelineRun {
 	pr := &datupletv1.PipelineRun{}
 	pr.Name = "pr1"
 	pr.Namespace = "default"
 	pr.Status.RunID = "run-1"
+	pr.Status.ResolvedSpec = minimalPipeline().Spec.DeepCopy()
+	pr.Status.Components = []datupletv1.ResolvedComponentStatus{{
+		Name:      "c1",
+		Component: "comp-a",
+		Version:   "v1.0.0",
+		Image:     "datuplet/test:latest",
+	}}
 	return pr
 }
 
@@ -39,7 +52,7 @@ func TestBuildComponentJob_AutomountDisabled_NoSecretsRef(t *testing.T) {
 	pipeline := minimalPipeline()
 	pr := minimalPipelineRun()
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
@@ -53,29 +66,12 @@ func TestBuildComponentJob_AutomountDisabled_NoSecretsRef(t *testing.T) {
 	}
 }
 
-func TestBuildComponentJob_AutomountDisabled_WithSecretsRef(t *testing.T) {
-	r := &PipelineRunReconciler{}
-	pipeline := minimalPipeline()
-	pipeline.Spec.SecretsRef = &datupletv1.SecretsRef{Name: "mysecrets"}
-	pr := minimalPipelineRun()
-
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
-	if err != nil {
-		t.Fatalf("buildComponentJob: %v", err)
-	}
-
-	am := job.Spec.Template.Spec.AutomountServiceAccountToken
-	if am == nil || *am != false {
-		t.Errorf("AutomountServiceAccountToken must be false even with SecretsRef set; got %v", am)
-	}
-}
-
 func TestBuildComponentJob_ComponentContainerHardened(t *testing.T) {
 	r := &PipelineRunReconciler{}
 	pipeline := minimalPipeline()
 	pr := minimalPipelineRun()
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
@@ -117,7 +113,7 @@ func TestBuildComponentJob_RunTokenMounted_OnGatewayOnly(t *testing.T) {
 	pr := minimalPipelineRun()
 	pr.Spec.RunTokenRef = &datupletv1.RunTokenRef{Name: "runtoken-pr1"}
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
@@ -209,7 +205,7 @@ func TestBuildComponentJob_RunTokenNil_NoVolume(t *testing.T) {
 	pr := minimalPipelineRun()
 	// RunTokenRef deliberately nil
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
@@ -217,39 +213,6 @@ func TestBuildComponentJob_RunTokenNil_NoVolume(t *testing.T) {
 		if v.Name == "datuplet-runtoken" {
 			t.Error("datuplet-runtoken volume must not be added when RunTokenRef is nil")
 		}
-	}
-}
-
-func TestBuildComponentJob_RunTokenAndSecretsRef_BothCoexist(t *testing.T) {
-	r := &PipelineRunReconciler{}
-	pipeline := minimalPipeline()
-	pipeline.Spec.SecretsRef = &datupletv1.SecretsRef{Name: "my-secrets"}
-	pr := minimalPipelineRun()
-	pr.Spec.RunTokenRef = &datupletv1.RunTokenRef{Name: "runtoken-pr1"}
-
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
-	if err != nil {
-		t.Fatalf("buildComponentJob: %v", err)
-	}
-
-	volumeNames := map[string]bool{}
-	for _, v := range job.Spec.Template.Spec.Volumes {
-		volumeNames[v.Name] = true
-	}
-	if !volumeNames["datuplet-secrets"] {
-		t.Error("SecretsRef volume 'datuplet-secrets' missing when both refs are set")
-	}
-	if !volumeNames["datuplet-runtoken"] {
-		t.Error("RunTokenRef volume 'datuplet-runtoken' missing when both refs are set")
-	}
-
-	gw := &job.Spec.Template.Spec.InitContainers[0]
-	gwMounts := map[string]bool{}
-	for _, m := range gw.VolumeMounts {
-		gwMounts[m.Name] = true
-	}
-	if !gwMounts["datuplet-secrets"] || !gwMounts["datuplet-runtoken"] {
-		t.Errorf("gateway missing mounts: %v", gwMounts)
 	}
 }
 
@@ -287,7 +250,10 @@ func TestGenerateGatewayConfig_LakekeeperURL(t *testing.T) {
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if !strings.Contains(y, "lakekeeper_url: http://lakekeeper.lakekeeper.svc.cluster.local:8181/catalog") {
 		t.Errorf("generated YAML did not carry lakekeeper URL; got:\n%s", y)
 	}
@@ -302,9 +268,70 @@ func TestGenerateGatewayConfig_LakekeeperURL_OmittedWhenUnset(t *testing.T) {
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if strings.Contains(y, "lakekeeper_url") {
 		t.Errorf("generated YAML should omit lakekeeper_url when unset; got:\n%s", y)
+	}
+}
+
+// TestGenerateGatewayConfig_NestedConfig verifies that a component's
+// structured Config (a nested tables list) survives into gateway.yaml as
+// native YAML nesting — not as an escaped JSON string embedded in the
+// output (RFC 026 P1, B6).
+func TestGenerateGatewayConfig_NestedConfig(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	comp := &datupletv1.ComponentSpec{
+		Name:      "c1",
+		Component: "comp-a",
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"tables":[{"name":"facts","random":{"schema":{"id":"int"}}}]}`),
+		},
+	}
+
+	y, err := r.generateGatewayConfig(pr, pipeline, comp)
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
+	if strings.Contains(y, `"tables"`) {
+		t.Errorf("config appears to be escaped/embedded JSON, not native YAML nesting; got:\n%s", y)
+	}
+
+	// Decode the generated YAML and walk the structure to prove "tables"
+	// is a real nested sequence under component.config — not merely a
+	// substring that happens to appear somewhere in the document (e.g.
+	// flat, or under an unrelated key).
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(y), &doc); err != nil {
+		t.Fatalf("generated YAML did not parse: %v\ngot:\n%s", err, y)
+	}
+
+	component, ok := doc["component"].(map[string]any)
+	if !ok {
+		t.Fatalf("doc[\"component\"] is not a map[string]any; got %T (%v)\ndoc:\n%s", doc["component"], doc["component"], y)
+	}
+	configSection, ok := component["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("component[\"config\"] is not a map[string]any; got %T (%v)\ndoc:\n%s", component["config"], component["config"], y)
+	}
+	tables, ok := configSection["tables"].([]any)
+	if !ok {
+		t.Fatalf("component.config[\"tables\"] is not a []any (not a nested sequence); got %T (%v)\ndoc:\n%s", configSection["tables"], configSection["tables"], y)
+	}
+	if len(tables) != 1 {
+		t.Fatalf("expected 1 entry under component.config.tables, got %d\ndoc:\n%s", len(tables), y)
+	}
+	firstTable, ok := tables[0].(map[string]any)
+	if !ok {
+		t.Fatalf("component.config.tables[0] is not a map[string]any; got %T (%v)\ndoc:\n%s", tables[0], tables[0], y)
+	}
+	if name, _ := firstTable["name"].(string); name != "facts" {
+		t.Errorf("expected component.config.tables[0].name == \"facts\", got %v\ndoc:\n%s", firstTable["name"], y)
 	}
 }
 
@@ -321,7 +348,10 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL(t *testing.T) {
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	want := "pipeline_api_jwks_url: http://pipeline-api.datuplet.svc.cluster.local:8081/api/v1/auth/jwks.json"
 	if !strings.Contains(y, want) {
 		t.Errorf("generated YAML should contain %q; got:\n%s", want, y)
@@ -340,7 +370,10 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL_TrimsTrailingSlash(t *testing.
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if strings.Contains(y, "8081//api") {
 		t.Errorf("trailing-slash hygiene broken — double slash in JWKS URL; got:\n%s", y)
 	}
@@ -359,7 +392,7 @@ func TestBuildComponentJobHasRuntimeTolerations(t *testing.T) {
 	pipeline := minimalPipeline()
 	pr := minimalPipelineRun()
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
@@ -378,7 +411,7 @@ func TestBuildComponentJobNilTolerationsOmitsField(t *testing.T) {
 	pipeline := minimalPipeline()
 	pr := minimalPipelineRun()
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
@@ -396,7 +429,10 @@ func TestGenerateGatewayConfig_PipelineAPIJWKSURL_OmittedWhenUnset(t *testing.T)
 	pr := minimalPipelineRun()
 	pr.Namespace = "datuplet-proj-a"
 
-	y := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
 	if strings.Contains(y, "pipeline_api_jwks_url") {
 		t.Errorf("generated YAML should omit pipeline_api_jwks_url when PipelineAPIURL is unset; got:\n%s", y)
 	}
@@ -423,19 +459,21 @@ func TestBuildGatewaySidecarEnvOmitsIterationIDWhenImageHasNoIterTag(t *testing.
 	}
 }
 
-// TestComponentJobUsesPullAlwaysOnAllContainers: RFC 020 iteration loop
-// requires that every re-run of a build cycle picks up the freshly-pushed
-// image rather than a kubelet-cached one. PullAlways must be set on:
-//   - the gateway sidecar (init container)
-//   - the component container
-func TestComponentJobUsesPullAlwaysOnAllContainers(t *testing.T) {
+// TestGatewaySidecarUsesRuntimePullPolicy: RFC 020 iteration loop requires the
+// gateway sidecar picks up the freshly-pushed image. The gateway sidecar keeps
+// the runtimePullPolicy default (PullAlways). The component container's policy
+// is registry-driven (see TestComponentContainerPullPolicyIsVersionDriven and
+// the freeze-test case c) — here the frozen version is prerelease so it too is
+// PullAlways.
+func TestGatewaySidecarUsesRuntimePullPolicy(t *testing.T) {
 	r := &PipelineRunReconciler{
 		GatewayImage: "ttl.sh/datuplet-gateway-iter-abc1234:24h",
 	}
 	pipeline := minimalPipeline()
 	pr := minimalPipelineRun()
+	pr.Status.Components[0].Version = "dev" // prerelease → component PullAlways
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
@@ -453,40 +491,70 @@ func TestComponentJobUsesPullAlwaysOnAllContainers(t *testing.T) {
 		t.Errorf("gateway sidecar ImagePullPolicy = %q, want PullAlways", gw.ImagePullPolicy)
 	}
 
-	// Component container.
+	// Component container: prerelease version → PullAlways.
 	containers := job.Spec.Template.Spec.Containers
 	if len(containers) == 0 {
 		t.Fatal("no containers on component Job")
 	}
 	comp := containers[0]
 	if comp.ImagePullPolicy != corev1.PullAlways {
-		t.Errorf("component container ImagePullPolicy = %q, want PullAlways", comp.ImagePullPolicy)
+		t.Errorf("component container ImagePullPolicy = %q, want PullAlways (prerelease version)", comp.ImagePullPolicy)
 	}
 }
 
-// TestComponentJobHonoursRuntimePullPolicyOverride: e2e/kind sets
+// TestGatewayHonoursRuntimePullPolicyOverride: e2e/kind sets
 // DATUPLET_RUNTIME_PULL_POLICY=IfNotPresent so K8s uses the pre-loaded
 // images instead of trying to pull non-existent datuplet/* repos from
-// Docker Hub.
-func TestComponentJobHonoursRuntimePullPolicyOverride(t *testing.T) {
+// Docker Hub. The override applies to the gateway sidecar (asserted here);
+// its effect on the component container is proven independently by
+// TestComponentContainerHonoursRuntimePullPolicyOverride (this run's stable
+// version would resolve to IfNotPresent either way).
+func TestGatewayHonoursRuntimePullPolicyOverride(t *testing.T) {
+	r := &PipelineRunReconciler{
+		GatewayImage:      "datuplet/gateway:latest",
+		RuntimePullPolicy: corev1.PullIfNotPresent,
+	}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun() // frozen version v1.0.0 (stable)
+
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	gw := job.Spec.Template.Spec.InitContainers[0]
+	if gw.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("gateway ImagePullPolicy = %q, want IfNotPresent (override)", gw.ImagePullPolicy)
+	}
+	comp := job.Spec.Template.Spec.Containers[0]
+	if comp.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("component ImagePullPolicy = %q, want IfNotPresent (override; version also stable)", comp.ImagePullPolicy)
+	}
+}
+
+// TestComponentContainerHonoursRuntimePullPolicyOverride: the operator-wide
+// RuntimePullPolicy override (DATUPLET_RUNTIME_PULL_POLICY) is documented to
+// apply to every container the operator builds — INCLUDING the component
+// container. The K8s e2e sets it to IfNotPresent and registers every built-in
+// as a "dev" prerelease version pointing at a pre-loaded local :latest image.
+// If the override does not reach the component container, the registry-driven
+// policy (prerelease → Always) makes K8s try to pull a non-existent datuplet/*
+// repo from Docker Hub → ImagePullBackOff. The override must win.
+func TestComponentContainerHonoursRuntimePullPolicyOverride(t *testing.T) {
 	r := &PipelineRunReconciler{
 		GatewayImage:      "datuplet/gateway:latest",
 		RuntimePullPolicy: corev1.PullIfNotPresent,
 	}
 	pipeline := minimalPipeline()
 	pr := minimalPipelineRun()
+	pr.Status.Components[0].Version = "dev" // prerelease → registry policy would be Always
 
-	job, _, err := r.buildComponentJob(context.Background(), pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
 	if err != nil {
 		t.Fatalf("buildComponentJob: %v", err)
 	}
-	gw := job.Spec.Template.Spec.InitContainers[0]
-	if gw.ImagePullPolicy != corev1.PullIfNotPresent {
-		t.Errorf("gateway ImagePullPolicy = %q, want IfNotPresent", gw.ImagePullPolicy)
-	}
 	comp := job.Spec.Template.Spec.Containers[0]
 	if comp.ImagePullPolicy != corev1.PullIfNotPresent {
-		t.Errorf("component ImagePullPolicy = %q, want IfNotPresent", comp.ImagePullPolicy)
+		t.Errorf("component container ImagePullPolicy = %q, want IfNotPresent (operator override must win over prerelease Always)", comp.ImagePullPolicy)
 	}
 }
 

@@ -1,0 +1,62 @@
+---
+# Full ETL — extract JSON from a public API, then SQL-transform into a curated table
+#
+# Components: http-json-extractor, sql-transform
+# Prerequisites: running Datuplet install (lakekeeper + pipeline-api), see docs/install.md
+#
+# Run it:
+#   UI:      Pipelines → New → paste this YAML → Save → Trigger
+#   REST:    see docs/pipeline-api.md "Upload a pipeline" + "Trigger a run"
+#   kubectl: kubectl apply -f examples/pipelines/full-etl.yaml   (applies Pipeline + PipelineRun)
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: full-pipeline
+  namespace: datuplet
+spec:
+  gateway:
+    chunkSize: 33554432       # 32MB
+    bufferSize: 67108864      # 64MB
+    rowGroupSize: 67108864    # 64MB
+    targetFileSize: 134217728 # 128MB
+
+  stages:
+    - name: extract
+      components:
+        - name: json-extractor
+          component: http-json-extractor
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
+          outputs:
+            tables:
+              - name: data
+                bucket: staging
+                writeMode: APPEND
+
+    - name: transform
+      components:
+        - name: transformer
+          component: sql-transform
+          inputs:
+            tables:
+              - bucket: staging
+                table: data
+          outputs:
+            tables:
+              - name: enriched_posts
+                bucket: curated
+                writeMode: APPEND
+          config:
+            sql: |
+              CREATE TABLE enriched_posts AS
+              SELECT id, title, body
+              FROM data;
+---
+apiVersion: datuplet.io/v1
+kind: PipelineRun
+metadata:
+  name: full-pipeline-run-1
+  namespace: datuplet
+spec:
+  pipelineRef:
+    name: full-pipeline

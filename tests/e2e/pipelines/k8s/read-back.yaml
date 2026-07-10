@@ -9,7 +9,8 @@ spec:
     - name: extract
       components:
         - name: json-extractor
-          image: datuplet/http-json-extractor:latest
+          component: http-json-extractor
+          version: dev
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
           outputs:
@@ -19,7 +20,8 @@ spec:
     - name: read
       components:
         - name: stdout-writer
-          image: datuplet/stdout-writer:latest
+          component: stdout-writer
+          version: dev
           inputs:
             tables:
               - bucket: "{{.RunPrefix}}-readback"
@@ -35,4 +37,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-read-back"
-  parameters: {}

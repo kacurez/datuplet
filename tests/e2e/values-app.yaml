@@ -64,3 +64,15 @@ queryWorker:
 # through, skipping unrelated query scenarios. The policy-off 403 refusal is
 # covered by the pkg/pipelineapi/http unit test instead.
 allowClientSideQuery: true
+
+# RFC 026 Task R13: the e2e registers its own ComponentDefinitions for every
+# built-in via tests/e2e/framework/components_bootstrap.go — one "dev"
+# prerelease version per component pointing at the locally docker-built
+# ":latest" image (plus a stable "v0.0.1" for data-generator). The chart's
+# built-in ComponentDefinition CRs would reference registry images
+# (ghcr.io/kacurez/<name>:v0.1.0) that don't exist in the e2e cluster AND
+# collide by name with the bootstrap objects (both are cluster-scoped), so a
+# kubectl-apply merge leaves a stale defaultVersion. Disable them here; the
+# bootstrap is the sole registrar in e2e.
+components:
+  builtins: false

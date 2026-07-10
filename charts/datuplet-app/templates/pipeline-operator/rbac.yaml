@@ -35,6 +35,16 @@ rules:
   - apiGroups: ["datuplet.io"]
     resources: ["pipelines/status", "pipelineruns/status"]
     verbs: ["get", "update", "patch"]
+  # ComponentDefinitions - cluster-scoped registry, watched by both the
+  # ComponentDefinition reconciler (registration-time validation, RFC 026 P2)
+  # and PipelineRun admission (ComponentRegistry.Resolve). Read-only: the
+  # operator never creates/deletes definitions.
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions/status"]
+    verbs: ["get", "update", "patch"]
   # Pods - create and monitor component pods
   - apiGroups: [""]
     resources: ["pods"]
@@ -50,10 +60,12 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Secrets - read credentials
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+  # Secrets: NO cluster-wide verbs (RFC 026 P1.5). The operator reads the
+  # managed project Secret (uncached APIReader) and creates the per-run
+  # snapshot Secret via the `datuplet-secrets-operator` Role (secrets
+  # get,create) bound to this SA in each project namespace by pipeline-api.
+  # It runs no Secret informer (SetupWithManager: For(PipelineRun)+Owns(Job)
+  # only), so it never needs cluster list/watch.
   # Services - discover lakekeeper / pipeline-api
   - apiGroups: [""]
     resources: ["services"]

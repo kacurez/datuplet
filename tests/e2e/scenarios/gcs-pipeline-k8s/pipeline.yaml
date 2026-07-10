@@ -4,7 +4,7 @@
 # registered against an in-cluster fake-gcs-server.
 #
 # This template is intentionally minimal: one extract stage, one table,
-# same shape as examples/k8s/simple-pipeline.yaml. The only GCS-specific
+# same shape as examples/pipelines/simple-http-extract.yaml. The only GCS-specific
 # aspect is the warehouse registered via `pipeline-api admin
 # lakekeeper-bootstrap --gcs-credential-type=service-account-key`
 # before the run (bootstrap wiring tracked in run.sh).
@@ -17,7 +17,8 @@ spec:
     - name: extract
       components:
         - name: json-extractor
-          image: datuplet/http-json-extractor:latest
+          component: http-json-extractor
+          version: dev
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
             table_name: "posts"

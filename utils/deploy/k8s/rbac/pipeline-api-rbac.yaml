@@ -16,27 +16,55 @@ kind: ClusterRole
 metadata:
   name: pipeline-api
 rules:
-  # Namespace provisioning (RFC 002 §B step 14).
+  # Namespace provisioning — Get-before-Create. `list` lets the reaper
+  # enumerate project namespaces (mirrors the chart; RFC 026 P1.5).
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list", "create", "watch"]
-  # Pipeline CRD materialization on trigger + GC on pipeline delete.
+    verbs: ["get", "create", "list"]
+  # Belt-and-braces LimitRange in each project namespace (RFC 026 P3 §4.4).
+  - apiGroups: [""]
+    resources: ["limitranges"]
+    verbs: ["get", "create"]
+  # Pipeline CRD materialization on trigger (Get + Create, Update on race).
+  # Mirrors the chart: observer is a separate binary, so no watch/patch/delete.
   - apiGroups: ["datuplet.io"]
     resources: ["pipelines"]
-    verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
-  # PipelineRun creation + status mirror + reaper delete.
+    verbs: ["get", "create", "update"]
+  # PipelineRun trigger (Create + Get for UID) + cancel (Get + Delete);
+  # `list` retained for the reaper. Mirrors the chart.
   - apiGroups: ["datuplet.io"]
     resources: ["pipelineruns"]
-    verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
-  - apiGroups: ["datuplet.io"]
-    resources: ["pipelineruns/status"]
-    verbs: ["get"]
-  # Run-token Secret: create + ownerReference patch + reaper delete of
-  # orphans. Namespaced resource but we allow cluster-wide because the
-  # target namespace is per-project and created lazily.
+    verbs: ["get", "list", "create", "delete"]
+  # Per-project-namespace secret RBAC (RFC 026 P1.5) — mirrors
+  # charts/datuplet-app/templates/pipeline-api/rbac.yaml. pipeline-api holds
+  # NO cluster-wide Secret verbs; it manages Secrets only within each project
+  # namespace via the `datuplet-secrets` + `datuplet-secrets-operator` Roles it
+  # creates there (EnsureProjectNamespace). Creating those Roles + their
+  # RoleBindings while lacking cluster Secret verbs would otherwise trip
+  # Kubernetes' privilege-escalation guard, so the roles rule carries
+  # `escalate` (on roles) + `bind` (on the referenced role).
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["get", "create", "escalate", "bind"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "create"]
+  # Cancel path: list pods by label selector, patch the
+  # datuplet.io/cancel=true annotation (mirrors the chart).
   - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
+    resources: ["pods"]
+    verbs: ["list", "patch"]
+  # Component registry (RFC 026 P2/P3) — mirrors
+  # charts/datuplet-app/templates/pipeline-api/rbac.yaml. GET
+  # /api/v1/components catalog handlers + registry-aware pipeline-save
+  # validation List/watch ComponentDefinition CRs via pipeline-api's
+  # registry.View. The superadmin-gated PUT/DELETE
+  # /api/v1/admin/components/{name} handlers (RFC 026 P3) additionally
+  # Get (Upsert read-before-write) + Create/Update/Delete
+  # ComponentDefinition CRs.
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

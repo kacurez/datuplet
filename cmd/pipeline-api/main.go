@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
@@ -24,6 +25,7 @@ import (
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/registry"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -142,6 +144,12 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// authz-bootstrap pre-install hook guarantees the store + pin tuple
 	// exist before this binary starts.
 	var authzr authz.Authorizer
+	// serverAdmin memoizes the FGA server:<uuid> object and answers the
+	// superadmin (server.admin) check for the REST admin endpoints + the
+	// is_superadmin flag on /api/v1/auth/me. Constructed alongside the
+	// authorizer so it shares the same FGA endpoint/store; nil when authz is
+	// disabled, which leaves the superadmin routes unregistered.
+	var serverAdmin authz.ServerAdminChecker
 	{
 		openfgaURL := os.Getenv("OPENFGA_URL")
 		if openfgaURL == "" {
@@ -167,6 +175,7 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 				return fmt.Errorf("create OpenFGA authorizer: %w", err)
 			}
 			authzr = a
+			serverAdmin = authz.NewServerAdmin(a, openfgaURL, openfgaAPIKey, storeID)
 			fmt.Printf("  Authz: openfga (%s, store=%s name=%s, model=%s version=%s)\n", openfgaURL, storeID, storeName, modelID, modelVersion)
 		} else {
 			log.Printf("authz disabled: OPENFGA_MODEL_VERSION not set (project/pipeline/run handlers stay unregistered)")
@@ -343,6 +352,20 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		}
 	}
 
+	// Pipeline-policy gateway bounds (RFC 026 §4.4/§4.6). pipeline-api enforces
+	// these on the PUT diff-gate: a non-superadmin whose gateway knobs exceed a
+	// bound gets a 403. Each var is parsed base-10; unset/empty/malformed → 0 =
+	// no bound on that knob. Consumed by the PUT handler via WithPipelinePolicy.
+	pol := &validate.Policy{
+		Gateway: validate.GatewayBounds{
+			MaxChunkSize:      envInt64Or("PIPELINE_POLICY_GATEWAY_MAX_CHUNK_SIZE", 0),
+			MaxBufferSize:     envInt64Or("PIPELINE_POLICY_GATEWAY_MAX_BUFFER_SIZE", 0),
+			MaxTargetFileSize: envInt64Or("PIPELINE_POLICY_GATEWAY_MAX_TARGET_FILE_SIZE", 0),
+		},
+	}
+	fmt.Printf("  Pipeline policy: gateway bounds chunkSize=%d bufferSize=%d targetFileSize=%d (0 = no bound)\n",
+		pol.Gateway.MaxChunkSize, pol.Gateway.MaxBufferSize, pol.Gateway.MaxTargetFileSize)
+
 	srv := apihttp.NewServer(pool).
 		WithCookieSecure(cfg.CookieSecure).
 		WithSigner(signer).
@@ -352,12 +375,38 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		WithRunBackend(backend).
 		WithStorage(storageSvc).
 		WithAuthorizer(authzr).
+		// Superadmin checker for the REST admin endpoints + the is_superadmin
+		// flag on /api/v1/auth/me. nil (authz disabled) leaves the guard at
+		// 503 and is_superadmin at false.
+		WithServerAdmin(serverAdmin).
+		// Pipeline-policy gateway bounds enforced on the PUT diff-gate for
+		// non-superadmins (RFC 026 §4.6). all-zero pol = no bounds.
+		WithPipelinePolicy(pol).
+		// Project-secrets endpoints reuse the same k8sClient as run-trigger
+		// (WithK8sClient above) — one client, one credential set. nil
+		// k8sClient (no KUBECONFIG / in-cluster hint) leaves the secrets
+		// routes unregistered, same soft-degrade shape as WithK8sClient.
+		WithSecrets(k8sClient, time.Now).
 		// Cluster info is embedded in POST /api/v1/auth/token responses so
 		// `datuplet run --remote` can reach lakekeeper. The lakekeeper URL
 		// is the deployment-time public URL (distinct from
 		// PIPELINE_API_PUBLIC_URL). Warehouse name is not a server-side env
 		// var; it is resolved per-request via lakekeeper.
 		WithCLIClusterInfo(cfg.LakekeeperPublicURL, "")
+	// Component registry: GET /api/v1/components catalog routes + real
+	// registry-aware validation on the pipeline save path (replaces R5's
+	// temporary nil RegistryView). Same soft-degrade gate as WithK8sClient —
+	// no K8s client means no ComponentDefinition access, so the catalog
+	// routes stay unregistered and saves validate without registry checks.
+	if k8sClient != nil {
+		srv = srv.WithRegistry(registry.NewView(k8sClient, 0))
+		// Superadmin-gated component registry writer (RFC 026 P3). Shares the
+		// ComponentDefinition write path with the CLI `admin component
+		// register` via registry.Upsert. Routes still gate on WithServerAdmin
+		// + WithUserResolver, so no k8sClient means no writer means the admin
+		// routes stay unregistered.
+		srv = srv.WithComponentAdmin(registry.NewWriter(k8sClient))
+	}
 	// Query service: POST /api/v1/query ad-hoc SQL. Wired only when
 	// DATUPLET_QUERY_WORKER_URL is set and handler construction succeeded above.
 	// nil → route stays unregistered → 404.
@@ -465,6 +514,17 @@ Env:
 func envIntOr(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return def
+}
+
+// envInt64Or parses the env var as a base-10 int64, returning def if absent or
+// malformed. Used for the PIPELINE_POLICY_GATEWAY_* byte bounds.
+func envInt64Or(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return i
 		}
 	}

@@ -10,9 +10,18 @@ Verb set covers the actual trigger + cancel call graph:
 - Pods: cancel path uses `list` + `patch` only.
 - Pipelines: only `get`, `create`, `update` from CRD materialization.
 - Pipelineruns: `get`, `create`, `delete` for trigger/cancel.
-  PLUS `list` (and Secrets `list`+`delete`) retained for the reaper
-  CronJob which currently shares this ServiceAccount. The cleaner fix is
-  to give the reaper its own narrower SA (see docs/known-gaps.md).
+  PLUS `list` retained for the reaper CronJob which currently shares this
+  ServiceAccount. The cleaner fix is to give the reaper its own narrower
+  SA (see docs/known-gaps.md).
+- Namespaces: `get`, `create` for project provisioning; `list` so the
+  reaper can enumerate project namespaces (RFC 026 P1.5 — Secret listing
+  is now per-namespace, not cluster-wide).
+- Secrets: NO cluster-wide verbs (RFC 026 P1.5). pipeline-api manages
+  Secrets only within each project namespace via the `datuplet-secrets`
+  Role it creates there (EnsureProjectNamespace). Creating that Role +
+  its RoleBinding while lacking cluster Secret verbs trips Kubernetes'
+  privilege-escalation guard, so the `roles`/`rolebindings` rule below
+  carries `escalate` + `bind`.
 */}}
 ---
 apiVersion: v1
@@ -31,9 +40,17 @@ metadata:
   labels:
     {{- include "datuplet-app.labels" . | nindent 4 }}
 rules:
-  # Namespace provisioning — Get-before-Create pattern.
+  # Namespace provisioning — Get-before-Create pattern. `list` lets the
+  # reaper enumerate project namespaces to sweep their run Secrets.
   - apiGroups: [""]
     resources: ["namespaces"]
+    verbs: ["get", "create", "list"]
+  # Belt-and-braces LimitRange in each project namespace (RFC 026 P3 §4.4).
+  # Get-before-Create, so `get` + `create` only. Unlike Secrets, a LimitRange
+  # is not sensitive, so a cluster-wide create verb is acceptable here (same
+  # posture as `namespaces` above), rather than a per-namespace Role.
+  - apiGroups: [""]
+    resources: ["limitranges"]
     verbs: ["get", "create"]
   # Pipeline CRD materialization on trigger (Get + Create, Update on race).
   - apiGroups: ["datuplet.io"]
@@ -44,16 +61,32 @@ rules:
   - apiGroups: ["datuplet.io"]
     resources: ["pipelineruns"]
     verbs: ["get", "list", "create", "delete"]
-  # Run-token Secret: Create + Update (ownerReference patch). `list` +
-  # `delete` kept for the reaper CronJob (shares this SA — see header).
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["create", "update", "list", "delete"]
+  # Per-project-namespace secret RBAC (RFC 026 P1.5). pipeline-api creates
+  # the `datuplet-secrets` + `datuplet-secrets-operator` Roles and their
+  # RoleBindings inside each project namespace (EnsureProjectNamespace).
+  # `escalate` (roles) + `bind` (referenced role) are REQUIRED: without
+  # cluster-wide Secret verbs, granting Secret verbs via a new Role/binding
+  # would otherwise be blocked by Kubernetes' privilege-escalation guard.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["get", "create", "escalate", "bind"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "create"]
   # Cancel path: list pods by label selector, patch the
   # datuplet.io/cancel=true annotation.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list", "patch"]
+  # Component registry (RFC 026 P2/P3): GET /api/v1/components catalog
+  # handlers + registry-aware pipeline-save validation List/watch
+  # ComponentDefinition CRs via pipeline-api's registry.View. The
+  # superadmin-gated PUT/DELETE /api/v1/admin/components/{name} handlers
+  # (RFC 026 P3) additionally Get (Upsert read-before-write) +
+  # Create/Update/Delete ComponentDefinition CRs.
+  - apiGroups: ["datuplet.io"]
+    resources: ["componentdefinitions"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

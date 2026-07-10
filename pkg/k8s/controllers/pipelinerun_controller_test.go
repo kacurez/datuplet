@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
@@ -53,14 +54,16 @@ func TestStageRunningToSucceededDirect(t *testing.T) {
 			Stages: []datupletv1.StageSpec{{
 				Name: "extract",
 				Components: []datupletv1.ComponentSpec{{
-					Name:  "c1",
-					Image: "datuplet/test:latest",
+					Name:      "c1",
+					Component: "comp-a",
+					Version:   "v1.0.0",
 				}},
 			}},
 		},
 	}
 
 	// PipelineRun already in Running/stage-Running state, component succeeded.
+	// The frozen resolvedSpec is what handleRunning reads (never the live Pipeline).
 	pr := &datupletv1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pr1",
@@ -70,8 +73,9 @@ func TestStageRunningToSucceededDirect(t *testing.T) {
 			PipelineRef: datupletv1.PipelineRef{Name: "p1"},
 		},
 		Status: datupletv1.PipelineRunStatus{
-			Phase: datupletv1.PipelineRunPhaseRunning,
-			RunID: "00000000-0000-0000-0000-000000000001",
+			Phase:        datupletv1.PipelineRunPhaseRunning,
+			RunID:        "00000000-0000-0000-0000-000000000001",
+			ResolvedSpec: pipeline.Spec.DeepCopy(),
 			StageStatuses: []datupletv1.StageStatus{{
 				Name:  "extract",
 				Phase: datupletv1.StagePhaseRunning,
@@ -143,5 +147,82 @@ func TestStageRunningToSucceededDirect(t *testing.T) {
 	}
 	if len(jobList.Items) != 0 {
 		t.Errorf("expected 0 table-commit Jobs, found %d", len(jobList.Items))
+	}
+}
+
+// TestPipelineRunReconcile_InvalidPipeline_FailsUser_NoJobs: run admission
+// runs validate.ValidateTyped on the fetched Pipeline itself — it does not
+// gate on pipeline.Status.Phase (which the fake Pipeline below deliberately
+// leaves unset). An invalid Pipeline must fail the run FailedUser with the
+// first finding in the message, before any component Job is created.
+func TestPipelineRunReconcile_InvalidPipeline_FailsUser_NoJobs(t *testing.T) {
+	scheme := newTestScheme(t)
+
+	pipeline := &datupletv1.Pipeline{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "p1",
+			Namespace: "default",
+		},
+		// Status.Phase intentionally left unset ("") — the run controller
+		// must not rely on the Pipeline controller having reconciled.
+		Spec: datupletv1.PipelineSpec{
+			Stages: []datupletv1.StageSpec{{
+				Name: "extract",
+				Components: []datupletv1.ComponentSpec{{
+					Name:      "c1",
+					Component: "comp-a",
+					Outputs: &datupletv1.OutputSpec{
+						DefaultBucket: "Bad_Bucket",
+					},
+				}},
+			}},
+		},
+	}
+
+	pr := &datupletv1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr1",
+			Namespace: "default",
+		},
+		Spec: datupletv1.PipelineRunSpec{
+			PipelineRef: datupletv1.PipelineRef{Name: "p1"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pipeline, pr).
+		WithStatusSubresource(pr).
+		Build()
+
+	r := &PipelineRunReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pr1", Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &datupletv1.PipelineRun{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "pr1", Namespace: "default"}, got); err != nil {
+		t.Fatalf("Get PipelineRun: %v", err)
+	}
+
+	if got.Status.Phase != datupletv1.PipelineRunPhaseFailedUser {
+		t.Fatalf("phase = %q, want %q", got.Status.Phase, datupletv1.PipelineRunPhaseFailedUser)
+	}
+	if !strings.Contains(got.Status.Message, "Bad_Bucket") {
+		t.Errorf("message = %q, want it to contain the first validate.Finding text about %q", got.Status.Message, "Bad_Bucket")
+	}
+
+	jobList := &batchv1.JobList{}
+	if err := fakeClient.List(context.Background(), jobList, client.InNamespace("default")); err != nil {
+		t.Fatalf("List Jobs: %v", err)
+	}
+	if len(jobList.Items) != 0 {
+		t.Errorf("expected 0 Jobs created, found %d", len(jobList.Items))
 	}
 }

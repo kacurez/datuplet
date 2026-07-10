@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/status"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -17,76 +17,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// updateSecretsResolvedCondition inspects the given job's latest pod and
-// events and, when a signal is present, sets the SecretsResolved condition
-// on pr.Status. No-op when the pipeline has no secretsRef or when the pod
-// has not produced an observable signal yet.
-func (r *PipelineRunReconciler) updateSecretsResolvedCondition(
-	ctx context.Context,
-	pr *datupletv1.PipelineRun,
-	pipeline *datupletv1.Pipeline,
-	job *batchv1.Job,
-) {
-	if pipeline.Spec.SecretsRef == nil {
+// updateSecretsResolvedCondition sets the SecretsResolved condition based on
+// whether the run references any $[name] secrets. When it does, the per-run
+// snapshot was validated + created at admission (snapshotRunSecrets), so the
+// condition is True/Resolved. When it references none, the condition is left
+// absent. The False/SnapshotMissing case is set at admission on the
+// missing-key failure path, not here.
+func (r *PipelineRunReconciler) updateSecretsResolvedCondition(pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline) {
+	if len(validate.ReferencedSecrets(pipeline)) == 0 {
 		return
 	}
-
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{"job-name": job.Name}); err != nil {
-		return
-	}
-	if len(pods.Items) == 0 {
-		return
-	}
-	pod := &pods.Items[len(pods.Items)-1]
-
-	// FailedMount on the datuplet-secrets volume -> the Secret object is missing.
-	// (We list namespace-wide and filter in memory; indexing involvedObject.name
-	// would require a manager-level FieldIndexer and isn't worth it for the event
-	// volume of a pipeline namespace.)
-	events := &corev1.EventList{}
-	if err := r.List(ctx, events, client.InNamespace(pod.Namespace)); err == nil {
-		for _, e := range events.Items {
-			if e.InvolvedObject.Name != pod.Name {
-				continue
-			}
-			if e.Reason == "FailedMount" && strings.Contains(e.Message, "datuplet-secrets") {
-				meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
-					Type:    datupletv1.PipelineRunSecretsResolved,
-					Status:  metav1.ConditionFalse,
-					Reason:  datupletv1.PipelineRunReasonSecretsRefMissing,
-					Message: e.Message,
-				})
-				return
-			}
-		}
-	}
-
-	// Gateway init container observations: terminated non-zero before Ready
-	// means a missing key file (or unmarshal error); Ready means it resolved
-	// everything and served its first GetConfig.
-	for _, c := range pod.Status.InitContainerStatuses {
-		if c.Name != "gateway" {
-			continue
-		}
-		if c.LastTerminationState.Terminated != nil && c.LastTerminationState.Terminated.ExitCode != 0 {
-			meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
-				Type:    datupletv1.PipelineRunSecretsResolved,
-				Status:  metav1.ConditionFalse,
-				Reason:  datupletv1.PipelineRunReasonSecretNotFound,
-				Message: c.LastTerminationState.Terminated.Message,
-			})
-			return
-		}
-		if c.Ready {
-			meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
-				Type:   datupletv1.PipelineRunSecretsResolved,
-				Status: metav1.ConditionTrue,
-				Reason: datupletv1.PipelineRunReasonSecretsResolved,
-			})
-			return
-		}
-	}
+	meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
+		Type:   datupletv1.PipelineRunSecretsResolved,
+		Status: metav1.ConditionTrue,
+		Reason: datupletv1.PipelineRunReasonSecretsResolved,
+	})
 }
 
 // extractExitCodeFromJob extracts the exit code from the first pod of a job.
@@ -124,6 +69,55 @@ func extractExitCodeFromPod(pod *corev1.Pod, containerName string) *int32 {
 		}
 	}
 	return nil
+}
+
+// extractImageIDFromJob returns the observed
+// containerStatuses[name=="component"].imageID from the job's most recent
+// pod, or "" if not yet reported (pod/job not found, or the image hasn't
+// been pulled yet — the kubelet only populates ImageID once the container
+// has started).
+func (r *PipelineRunReconciler) extractImageIDFromJob(ctx context.Context, job *batchv1.Job) string {
+	logger := log.FromContext(ctx)
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{"job-name": job.Name}); err != nil {
+		logger.V(1).Info("Failed to list pods for job", "job", job.Name, "error", err)
+		return ""
+	}
+	if len(pods.Items) == 0 {
+		return ""
+	}
+
+	return extractImageIDFromPod(&pods.Items[len(pods.Items)-1], "component")
+}
+
+// extractImageIDFromPod returns the imageID reported for a named container,
+// or "" if the container status isn't present yet.
+func extractImageIDFromPod(pod *corev1.Pod, containerName string) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == containerName {
+			return cs.ImageID
+		}
+	}
+	return ""
+}
+
+// recordComponentImageID copies imageID into the status.components[] entry
+// matching name — ONCE. A component instance's imageID is "first observed,
+// frozen thereafter": once set, a later reconcile observing a different
+// value (e.g. after a pod recreation) must never overwrite it (RFC 026
+// §4.3: observed runtime fields are appended, not repeatedly rewritten).
+// No-op if imageID is empty or no matching, not-yet-recorded entry exists.
+func recordComponentImageID(pr *datupletv1.PipelineRun, name, imageID string) {
+	if imageID == "" {
+		return
+	}
+	for i := range pr.Status.Components {
+		if pr.Status.Components[i].Name == name && pr.Status.Components[i].ImageID == "" {
+			pr.Status.Components[i].ImageID = imageID
+			return
+		}
+	}
 }
 
 // extractComponentStatusMessage fetches pod logs and extracts a status message.

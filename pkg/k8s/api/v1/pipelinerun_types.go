@@ -23,20 +23,19 @@ const (
 
 const (
 	// PipelineRunSecretsResolved is the condition Type reported on PipelineRun.Status
-	// to surface the result of the gateway sidecar's $[name] secret resolution.
-	// True once the gateway has resolved all references; False with a Reason below
-	// on failure. Absent until the pod has progressed far enough to observe either.
+	// to surface the result of per-run secret snapshotting at admission. True once
+	// every referenced $[name] key was copied into the per-run snapshot Secret;
+	// False with a Reason below when a referenced key was missing. Absent when the
+	// pipeline references no secrets.
 	PipelineRunSecretsResolved = "SecretsResolved"
 
-	// PipelineRunReasonSecretsRefMissing: the Secret object referenced by
-	// Pipeline.spec.secretsRef.Name does not exist (surfaced via FailedMount).
-	PipelineRunReasonSecretsRefMissing = "SecretsRefMissing"
+	// PipelineRunReasonSnapshotMissing: the run references $[name] secrets but
+	// the per-run snapshot Secret could not be built — a referenced key was
+	// absent from the managed project Secret at admission.
+	PipelineRunReasonSnapshotMissing = "SnapshotMissing"
 
-	// PipelineRunReasonSecretNotFound: the Secret mounts successfully but a
-	// $[name] reference pointed at a missing key file at gateway boot.
-	PipelineRunReasonSecretNotFound = "SecretNotFound"
-
-	// PipelineRunReasonSecretsResolved: all references resolved at gateway boot.
+	// PipelineRunReasonSecretsResolved: the per-run snapshot holds every
+	// referenced key; the gateway resolves them from the mounted snapshot.
 	PipelineRunReasonSecretsResolved = "Resolved"
 )
 
@@ -44,10 +43,6 @@ const (
 type PipelineRunSpec struct {
 	// PipelineRef references the Pipeline to run
 	PipelineRef PipelineRef `json:"pipelineRef"`
-
-	// Parameters allows overriding component config values
-	// +optional
-	Parameters map[string]string `json:"parameters,omitempty"`
 
 	// RunID optionally specifies the execution identifier. If empty, the controller generates one.
 	// Must be a valid UUID.
@@ -63,7 +58,6 @@ type PipelineRunSpec struct {
 }
 
 // RunTokenRef is a reference to a Kubernetes Secret holding the run-scoped JWT.
-// Mirrors the shape of SecretsRef in pipeline_types.go.
 type RunTokenRef struct {
 	// Name is the Secret's name in the same namespace as the PipelineRun.
 	// +kubebuilder:validation:MinLength=1
@@ -119,6 +113,41 @@ type PipelineRunStatus struct {
 	// Conditions represent the latest available observations of the PipelineRun's state
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// PipelineGeneration is the Pipeline generation this run was admitted against.
+	// +optional
+	PipelineGeneration int64 `json:"pipelineGeneration,omitempty"`
+
+	// ResolvedSpec is the fully-resolved pipeline spec snapshotted at
+	// admission (RFC 026 §4.3): component/version references are frozen so
+	// later registry changes cannot affect an in-flight run.
+	// +optional
+	ResolvedSpec *PipelineSpec `json:"resolvedSpec,omitempty"`
+
+	// Components records the resolved component/version/image mapping for
+	// each component instance admitted into this run.
+	// +optional
+	Components []ResolvedComponentStatus `json:"components,omitempty"`
+}
+
+// ResolvedComponentStatus records the component/version/image resolution
+// snapshotted for one component instance at run admission.
+type ResolvedComponentStatus struct {
+	// Name is the component instance name (ComponentSpec.Name).
+	Name string `json:"name"`
+
+	// Component is the registry component name (ComponentDefinition.Name).
+	Component string `json:"component"`
+
+	// Version is the resolved version identifier.
+	Version string `json:"version"`
+
+	// Image is the resolved container image.
+	Image string `json:"image"`
+
+	// ImageID is the digest observed after pull (populated post-admission, R7).
+	// +optional
+	ImageID string `json:"imageID,omitempty"`
 }
 
 // StageStatus tracks the status of a pipeline stage
@@ -309,13 +338,6 @@ func (in *PipelineRunList) DeepCopyObject() runtime.Object {
 func (in *PipelineRunSpec) DeepCopyInto(out *PipelineRunSpec) {
 	*out = *in
 	out.PipelineRef = in.PipelineRef
-	if in.Parameters != nil {
-		in, out := &in.Parameters, &out.Parameters
-		*out = make(map[string]string, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
-		}
-	}
 	if in.RunTokenRef != nil {
 		in, out := &in.RunTokenRef, &out.RunTokenRef
 		*out = new(RunTokenRef)
@@ -367,6 +389,16 @@ func (in *PipelineRunStatus) DeepCopyInto(out *PipelineRunStatus) {
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
+	}
+	if in.ResolvedSpec != nil {
+		in, out := &in.ResolvedSpec, &out.ResolvedSpec
+		*out = new(PipelineSpec)
+		(*in).DeepCopyInto(*out)
+	}
+	if in.Components != nil {
+		in, out := &in.Components, &out.Components
+		*out = make([]ResolvedComponentStatus, len(*in))
+		copy(*out, *in)
 	}
 }
 

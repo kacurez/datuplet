@@ -1,0 +1,102 @@
+{{- if .Values.components.builtins }}
+{{- /*
+ComponentDefinition CR for the built-in http-json-extractor component (RFC
+026 Task R10). See data-generator.yaml in this directory for the
+cluster-scoped naming rationale.
+
+configSchema derived from docs/components.md ("http-json-extractor" section)
+and components/http-json-extractor/main.go (PaginationConfig + top-level
+config struct).
+*/ -}}
+---
+apiVersion: datuplet.io/v1
+kind: ComponentDefinition
+metadata:
+  name: http-json-extractor
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: http-json-extractor
+spec:
+  displayName: HTTP JSON Extractor
+  description: Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports single-request and paginated modes.
+  maintainer: datuplet
+  defaultVersion: {{ .Values.components.tag }}
+  versions:
+    - version: {{ .Values.components.tag }}
+      image: "{{ .Values.components.registry }}/http-json-extractor:{{ .Values.components.tag }}"
+      configSchema: |
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "url"
+          ],
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "array_path": {
+              "type": "string"
+            },
+            "table_name": {
+              "type": "string"
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "pagination": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "page",
+                    "offset"
+                  ]
+                },
+                "param": {
+                  "type": "string"
+                },
+                "start": {
+                  "type": "integer"
+                },
+                "increment": {
+                  "type": "integer"
+                },
+                "page_size": {
+                  "type": "integer"
+                },
+                "size_param": {
+                  "type": "string"
+                },
+                "max_pages": {
+                  "type": "integer"
+                },
+                "max_records": {
+                  "type": "integer"
+                },
+                "stop_when_empty": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      resources:
+        default:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        max:
+          cpu: "2"
+          memory: 2Gi
+          ephemeral-storage: 10Gi
+{{- end }}

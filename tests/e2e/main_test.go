@@ -32,10 +32,30 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
 				"E2E: FGA bootstrap failed (K8s scenarios will skip): %v\n", err)
+		} else if err := framework.RegisterBuiltinComponents(ctx); err != nil {
+			// Registration failing (e.g. ComponentDefinition CRD not installed on
+			// an older cluster) must not silently let every scenario run against
+			// an empty registry and fail FailedUser with a confusing "unknown
+			// component" — skip cleanly instead, same as an FGA bootstrap failure.
+			fmt.Fprintf(os.Stderr,
+				"E2E: component registration failed (K8s scenarios will skip): %v\n", err)
 		} else {
 			framework.SetSharedHarness(h)
 			fmt.Printf("E2E: bootstrap OK — lakekeeper project=%s, FGA store=%s\n",
 				h.LakekeeperProjectID, h.OpenFGAStoreID)
+			// RFC 026 P3 Task T10: grant the e2e admin identity platform
+			// superadmin so the resource diff-gate API scenarios have a
+			// superadmin PUT identity. Runs after SetupFGABootstrap — i.e.
+			// after the cluster's install-time lakekeeper-bootstrap created the
+			// FGA server object the grant discovers via /changes. Best-effort:
+			// a failure only affects the resource API-gate scenarios (they
+			// assert the outcome), never the rest of the suite.
+			if err := grantAdminSuperadmin(); err != nil {
+				fmt.Fprintf(os.Stderr,
+					"E2E: superadmin grant failed (resource API-gate scenarios affected): %v\n", err)
+			} else {
+				fmt.Printf("E2E: granted platform superadmin to %s\n", queryAdminEmail)
+			}
 		}
 	}
 

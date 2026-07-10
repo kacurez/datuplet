@@ -3,15 +3,19 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/status"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/google/uuid"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,7 +38,37 @@ const (
 	// PipelineRunRequeueInterval is the requeue interval when execution is in progress.
 	PipelineRunRequeueInterval = 5 * time.Second
 
+	// admissionTransientRetryBudget caps CONSECUTIVE transient registry
+	// errors at run admission (see the taxonomy comment on
+	// ComponentRegistry.Resolve). Exhausting the budget escalates the run to
+	// FailedApplication — a wedged registry must not requeue forever.
+	admissionTransientRetryBudget = 5
+
+	// admissionTransientRetryInterval is the requeue backoff applied while
+	// the transient retry budget has not yet been exhausted.
+	admissionTransientRetryInterval = 2 * time.Second
 )
+
+// severityTransient marks a validate.Finding returned by
+// ComponentRegistry.Resolve as a TRANSIENT infrastructure error (K8s API
+// timeout/5xx, registry informer not yet synced) rather than a terminal,
+// user-facing verdict. It is a controller-local extension of the shared
+// Finding.Severity string — recognized only by handlePending's admission
+// path below, never by pipeline-api (which never wires a ComponentRegistry).
+//
+// Controller error taxonomy (spec §7 — explicit, because pre-R7 code
+// blanket-classified every registry/job-build error as FailedApplication):
+//
+//   - spec/schema/policy validation failure, unresolvable component or
+//     version, reference to an Invalid definition
+//     -> FailedUser (exit-code contract 1), first finding in the status
+//     message.
+//   - registry informer not synced, K8s API errors, image-pull
+//     infrastructure failures
+//     -> transient requeue with backoff, escalating to FailedApplication
+//     (exit-code contract >=20) after admissionTransientRetryBudget
+//     CONSECUTIVE occurrences — never FailedUser.
+const severityTransient = "transient"
 
 // shortID returns the first 8 chars of id, or the whole string if shorter.
 // Used to build K8s resource names; avoids panicking on unexpectedly short IDs.
@@ -48,6 +82,13 @@ func shortID(id string) string {
 // PipelineRunReconciler reconciles a PipelineRun object
 type PipelineRunReconciler struct {
 	client.Client
+
+	// APIReader is an UNCACHED reader (mgr.GetAPIReader) used to read the
+	// managed project Secret at admission. Reading via the cached client
+	// would spin up a cluster-wide Secret informer; a direct Get needs only
+	// per-namespace `secrets:get` RBAC. Never used for the run's own objects.
+	APIReader client.Reader
+
 	Scheme       *runtime.Scheme
 	GatewayImage string
 
@@ -103,6 +144,120 @@ type PipelineRunReconciler struct {
 	// try to pull non-existent `datuplet/*` repositories from Docker
 	// Hub. Empty defaults to PullAlways (chart-iteration default).
 	RuntimePullPolicy corev1.PullPolicy
+
+	// Registry resolves component/version references at run admission. In
+	// production it is a ComponentRegistry over the manager's cached client;
+	// tests inject a fake-client-backed one. Never re-read after admission —
+	// the resolution is frozen into status.resolvedSpec.
+	Registry validate.RegistryView
+
+	// transientRetries tracks CONSECUTIVE transient registry-Get failures at
+	// admission, keyed by the PipelineRun's NamespacedName (see
+	// requeueOnTransientAdmissionError). Deliberately in-memory, not CRD
+	// status: a purely operational retry budget. An operator restart resets
+	// it, which is the safe direction — it never prematurely fails a run
+	// that would otherwise have succeeded.
+	transientRetries   map[types.NamespacedName]int
+	transientRetriesMu sync.Mutex
+}
+
+// ComponentRegistry adapts a cached, cluster-scoped client.Reader into a
+// validate.RegistryView. Resolve Gets the ComponentDefinition named by the
+// component reference and delegates to a validate.StaticRegistry built from it,
+// so the resolved component retains the full config-schema (secret-ref)
+// validation semantics that only StaticRegistry populates. An Invalid-phase
+// definition is refused by StaticRegistry.Resolve.
+type ComponentRegistry struct {
+	Reader client.Reader
+}
+
+// Resolve implements validate.RegistryView.
+func (cr ComponentRegistry) Resolve(component, version string) (*validate.ResolvedComponent, []validate.Finding) {
+	def := &datupletv1.ComponentDefinition{}
+	if err := cr.Reader.Get(context.Background(), types.NamespacedName{Name: component}, def); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, []validate.Finding{{
+				Path:     "component",
+				Message:  fmt.Sprintf("unknown component %q", component),
+				Severity: "error",
+			}}
+		}
+		// Any other Get error (API server timeout/5xx, informer not yet
+		// synced) is TRANSIENT infrastructure noise, not a statement about
+		// the component reference itself. Tagged severityTransient so
+		// handlePending requeues instead of failing the run FailedUser —
+		// see the taxonomy comment above.
+		return nil, []validate.Finding{{
+			Path:     "component",
+			Message:  fmt.Sprintf("component %q: %v", component, err),
+			Severity: severityTransient,
+		}}
+	}
+	return validate.StaticRegistry{component: *def}.Resolve(component, version)
+}
+
+// componentPullPolicy governs the COMPONENT container's image pull policy from
+// the frozen resolved version: stable (semver) versions are immutable →
+// IfNotPresent; prerelease versions use mutable tags → Always so a re-pushed
+// tag is picked up. The gateway sidecar keeps runtimePullPolicy separately.
+func componentPullPolicy(version string) corev1.PullPolicy {
+	if datupletv1.IsStableVersion(version) {
+		return corev1.PullIfNotPresent
+	}
+	return corev1.PullAlways
+}
+
+// componentImagePullPolicy resolves the COMPONENT container's pull policy. The
+// operator-wide RuntimePullPolicy override wins when set: it is documented to
+// apply to every container the operator builds (gateway sidecar AND component
+// container), and e2e/kind rely on it so pre-loaded local images are not
+// re-pulled from a registry that does not have them. Otherwise the policy is
+// registry-driven by the frozen version (componentPullPolicy).
+func (r *PipelineRunReconciler) componentImagePullPolicy(version string) corev1.PullPolicy {
+	if r.RuntimePullPolicy != "" {
+		return r.RuntimePullPolicy
+	}
+	return componentPullPolicy(version)
+}
+
+// nonResourceFindings drops the resource-Max policy findings (over-Max quantity
+// or a name absent from the registry Max) from a finding slice. Those carry a
+// component ".resources" path and are the one class of error finding the run
+// admission does NOT fail on: the resolve loop clamps resources to the registry
+// ceiling instead (RFC 026 §4.4). Config findings (".config") are never dropped.
+func nonResourceFindings(findings []validate.Finding) []validate.Finding {
+	var out []validate.Finding
+	for _, f := range findings {
+		if strings.Contains(f.Path, ".resources") && !strings.Contains(f.Path, ".config") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// firstErrorFinding returns the first error-severity finding, if any. Warning
+// findings (e.g. deprecation) do not fail admission.
+func firstErrorFinding(findings []validate.Finding) (validate.Finding, bool) {
+	for _, f := range findings {
+		if f.Severity == "error" {
+			return f, true
+		}
+	}
+	return validate.Finding{}, false
+}
+
+// firstTransientFinding returns the first severityTransient finding, if any.
+// Checked BEFORE firstErrorFinding at every admission call site: a transient
+// registry error must never be classified FailedUser, even when it happens
+// to be bundled alongside genuine validation findings for other components.
+func firstTransientFinding(findings []validate.Finding) (validate.Finding, bool) {
+	for _, f := range findings {
+		if f.Severity == severityTransient {
+			return f, true
+		}
+	}
+	return validate.Finding{}, false
 }
 
 // runtimePullPolicy returns r.RuntimePullPolicy when set, else PullAlways
@@ -122,9 +277,17 @@ func (r *PipelineRunReconciler) runtimePullPolicy() corev1.PullPolicy {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+//
+// Secrets: intentionally NO cluster-wide +kubebuilder:rbac marker (RFC 026
+// P1.5). Secret access is per-project-namespace only: the operator gets `get`
+// (managed project Secret) + `create` (per-run snapshot Secret) via the
+// `datuplet-secrets-operator` Role that pipeline-api binds to this SA in each
+// project namespace (EnsureProjectNamespace) — never a cluster-wide grant.
+// NB: this repo hand-maintains RBAC (charts/datuplet-app/templates/ +
+// utils/deploy/k8s/rbac/); there is no controller-gen `make manifests` target,
+// so these markers are documentation only and do not generate any manifest.
 
 // Reconcile handles PipelineRun reconciliation.
 func (r *PipelineRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -199,23 +362,6 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		return ctrl.Result{}, err
 	}
 
-	// Check if Pipeline is ready
-	if pipeline.Status.Phase == datupletv1.PipelinePhaseInvalid {
-		// Pipeline is invalid - fail the run
-		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
-		pr.Status.Message = fmt.Sprintf("Pipeline '%s' is invalid: %s", pipeline.Name, pipeline.Status.Message)
-		if err := r.Status().Update(ctx, pr); err != nil {
-			logger.Error(err, "Failed to update PipelineRun status")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-	if pipeline.Status.Phase != datupletv1.PipelinePhaseReady {
-		// Pipeline not ready yet - requeue and wait
-		logger.Info("Pipeline not ready yet, waiting", "pipeline", pipeline.Name, "phase", pipeline.Status.Phase)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
-
 	// Determine run ID: use spec value if provided, otherwise generate
 	runID := pr.Spec.RunID
 	if runID == "" {
@@ -232,21 +378,141 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 			return ctrl.Result{}, nil
 		}
 	}
+	// RunID must be set before snapshotRunSecrets: the per-run snapshot name
+	// (runSecretsName) is derived from it.
+	pr.Status.RunID = runID
+
+	// Snapshot the referenced project secrets into a per-run Secret at
+	// admission — before any Job is built. A missing key fails the run
+	// FailedUser here, so no snapshot and no Jobs are ever created for it.
+	missing, err := r.snapshotRunSecrets(ctx, pr, pipeline)
+	if err != nil {
+		logger.Error(err, "Failed to snapshot run secrets")
+		return ctrl.Result{}, err
+	}
+	if len(missing) > 0 {
+		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+		pr.Status.Message = fmt.Sprintf("%s referenced secret(s) not found in project secrets: %s",
+			status.StatusMessagePrefix, strings.Join(missing, ", "))
+		meta.SetStatusCondition(&pr.Status.Conditions, metav1.Condition{
+			Type:    datupletv1.PipelineRunSecretsResolved,
+			Status:  metav1.ConditionFalse,
+			Reason:  datupletv1.PipelineRunReasonSnapshotMissing,
+			Message: pr.Status.Message,
+		})
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Run admission: validate the fetched Pipeline with the same semantic
+	// checks the pipeline-api save path runs, now resolving every component
+	// against the registry (r.Registry). This does NOT gate on
+	// pipeline.Status.Phase, so a run is never admitted against an invalid
+	// Pipeline regardless of whether the Pipeline controller reconciled it.
+	// A registry resolution error (unknown component, invalid definition,
+	// unresolvable version) surfaces as a finding here, before any Job. A
+	// TRANSIENT registry error (checked first) never fails the run — see the
+	// taxonomy comment on ComponentRegistry.Resolve.
+	admissionFindings := validate.ValidateTyped(pipeline, r.Registry, nil)
+	if tf, ok := firstTransientFinding(admissionFindings); ok {
+		return r.requeueOnTransientAdmissionError(ctx, pr, tf.Message)
+	}
+	// Resource-policy findings (over-Max / unlisted names) do NOT fail the run
+	// here: the controller CLAMPS resources to the registry ceiling in the
+	// resolve loop below (RFC 026 §4.4 Layer 2 — defense-in-depth for the
+	// direct-kubectl path, where the API's reject never ran). Every other error
+	// finding still fails the run FailedUser.
+	if f, ok := firstErrorFinding(nonResourceFindings(admissionFindings)); ok {
+		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+		pr.Status.Message = f.Message
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Resolve every component and FREEZE the result into status: the run
+	// executes exclusively from this snapshot, so later registry changes or
+	// mid-run edits to the Pipeline spec cannot change what runs (RFC 026
+	// §4.3). resolvedSpec is a DeepCopy of the validated spec; components[]
+	// records the resolved component/version/image per instance.
+	resolvedSpec := pipeline.Spec.DeepCopy()
+	var resolvedComponents []datupletv1.ResolvedComponentStatus
+	var clampNotes []string
+	for i := range resolvedSpec.Stages {
+		stage := &resolvedSpec.Stages[i]
+		for j := range stage.Components {
+			comp := &stage.Components[j]
+			rc, findings := r.Registry.Resolve(comp.Component, comp.Version)
+			if rc == nil {
+				if tf, ok := firstTransientFinding(findings); ok {
+					return r.requeueOnTransientAdmissionError(ctx, pr, tf.Message)
+				}
+				f, _ := firstErrorFinding(findings)
+				pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+				pr.Status.Message = f.Message
+				if err := r.Status().Update(ctx, pr); err != nil {
+					logger.Error(err, "Failed to update PipelineRun status")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+			resolvedComponents = append(resolvedComponents, datupletv1.ResolvedComponentStatus{
+				Name:      comp.Name,
+				Component: rc.Component,
+				Version:   rc.Version,
+				Image:     rc.Image,
+			})
+			// Compute EFFECTIVE resources once, here at admission: registry
+			// Default when the spec is nil, else clamp every entry to Max and
+			// strip unlisted names (RFC 026 §4.4). The clamped value is frozen
+			// into resolvedSpec so buildComponentJob consumes it verbatim and a
+			// mid-run registry edit can never change any stage's resources.
+			res := applyDefaultsThenClamp(comp.Resources, rc.Resources.Default, rc.Resources.Max)
+			comp.Resources = &res.Resources
+			if res.Note != "" {
+				clampNotes = append(clampNotes, fmt.Sprintf("resources clamped for component %s: %s", comp.Name, res.Note))
+			}
+		}
+	}
+	pr.Status.ResolvedSpec = resolvedSpec
+	pr.Status.PipelineGeneration = pipeline.Generation
+	pr.Status.Components = resolvedComponents
+
+	// Admission succeeded past every transient check — clear any
+	// accumulated retry count so a later, unrelated admission (e.g. this
+	// PipelineRun name reused after delete/recreate) starts with a fresh
+	// budget.
+	r.clearTransientRetries(types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name})
 
 	// Initialize status
 	pr.Status.Phase = datupletv1.PipelineRunPhaseRunning
-	pr.Status.RunID = runID
 	now := metav1.Now()
 	pr.Status.StartTime = &now
 
-	// Initialize stage statuses
-	pr.Status.StageStatuses = make([]datupletv1.StageStatus, len(pipeline.Spec.Stages))
-	for i, stage := range pipeline.Spec.Stages {
+	// Surface any resource clamps/strips on the run message; the run still
+	// proceeds (RFC 026 §4.4: "clamped run proceeds, with the clamp noted").
+	// Pure default application (nil spec → registry Default) records no note.
+	if len(clampNotes) > 0 {
+		pr.Status.Message = strings.Join(clampNotes, "; ")
+	}
+
+	// Initialize stage statuses from the FROZEN spec (not the live Pipeline).
+	pr.Status.StageStatuses = make([]datupletv1.StageStatus, len(resolvedSpec.Stages))
+	for i, stage := range resolvedSpec.Stages {
 		pr.Status.StageStatuses[i] = datupletv1.StageStatus{
 			Name:  stage.Name,
 			Phase: datupletv1.StagePhasePending,
 		}
 	}
+
+	// The snapshot exists (or the pipeline references no secrets); reflect that
+	// on the SecretsResolved condition. Absent when there are no references.
+	r.updateSecretsResolvedCondition(pr, pipeline)
 
 	if err := r.Status().Update(ctx, pr); err != nil {
 		logger.Error(err, "Failed to update PipelineRun status")
@@ -257,19 +523,173 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
 }
 
-// handleRunning continues the PipelineRun execution.
+// requeueOnTransientAdmissionError implements the transient half of the
+// admission error taxonomy (see the comment on severityTransient /
+// ComponentRegistry.Resolve): a registry Get failing with anything other than
+// NotFound is infrastructure noise, not a verdict on the pipeline, so the run
+// is NOT failed here. It requeues with backoff for up to
+// admissionTransientRetryBudget CONSECUTIVE occurrences (tracked in-memory,
+// per PipelineRun); once the budget is exhausted the run is failed
+// FailedApplication (exit-code contract >=20).
+func (r *PipelineRunReconciler) requeueOnTransientAdmissionError(ctx context.Context, pr *datupletv1.PipelineRun, msg string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	key := types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name}
+	attempt := r.noteTransientRetry(key)
+
+	if attempt < admissionTransientRetryBudget {
+		logger.Info("Transient registry error at admission, requeueing",
+			"attempt", attempt, "budget", admissionTransientRetryBudget, "error", msg)
+		return ctrl.Result{RequeueAfter: admissionTransientRetryInterval}, nil
+	}
+
+	logger.Info("Transient registry error retry budget exhausted, failing run FailedApplication",
+		"attempts", attempt, "error", msg)
+	r.clearTransientRetries(key)
+	pr.Status.Phase = datupletv1.PipelineRunPhaseFailedApplication
+	pr.Status.Message = fmt.Sprintf("registry unavailable after %d consecutive attempts: %s", attempt, msg)
+	now := metav1.Now()
+	pr.Status.CompletionTime = &now
+	if err := r.Status().Update(ctx, pr); err != nil {
+		logger.Error(err, "Failed to update PipelineRun status")
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// noteTransientRetry increments and returns the CONSECUTIVE transient-error
+// count for key.
+func (r *PipelineRunReconciler) noteTransientRetry(key types.NamespacedName) int {
+	r.transientRetriesMu.Lock()
+	defer r.transientRetriesMu.Unlock()
+	if r.transientRetries == nil {
+		r.transientRetries = make(map[types.NamespacedName]int)
+	}
+	r.transientRetries[key]++
+	return r.transientRetries[key]
+}
+
+// clearTransientRetries resets the CONSECUTIVE transient-error count for key,
+// called once admission proceeds past every transient check (success or a
+// terminal failure) so a stale count never leaks into an unrelated future
+// admission of the same name.
+func (r *PipelineRunReconciler) clearTransientRetries(key types.NamespacedName) {
+	r.transientRetriesMu.Lock()
+	defer r.transientRetriesMu.Unlock()
+	delete(r.transientRetries, key)
+}
+
+// snapshotRunSecrets copies the exact set of $[name] keys the pipeline
+// references from the managed project Secret into a per-run snapshot Secret
+// owned by the run. It is the admission gate for secret resolution:
+//
+//   - returns (nil, nil) when the pipeline references no secrets (skip), the
+//     snapshot already exists (run already admitted), or the snapshot was just
+//     created;
+//   - returns (missing, nil) — a sorted list of referenced keys absent from the
+//     project Secret (or the whole ref set when the project Secret itself is
+//     missing) — signalling a user error the caller surfaces as FailedUser;
+//   - returns (nil, err) on a transient API error the caller requeues on.
+//
+// The snapshot's EXISTENCE is authoritative. It is checked FIRST, before the
+// project Secret is touched: once the snapshot exists the run has already been
+// admitted for secrets, so a re-reconcile (e.g. after a partial admission where
+// the snapshot was created but the status Update that flips the run to Running
+// failed) must NOT re-read the project Secret and must NOT re-run the
+// missing-key check. Otherwise a project-Secret rotation / key removal between
+// the two reconciles could flip a run with a valid, immutable snapshot to
+// FailedUser. Reading the project Secret only when the snapshot is absent keeps
+// the snapshot immutable for the run's life — rotation-exact isolation.
+//
+// Both Gets use the UNCACHED APIReader — the project Secret and the operator's
+// own run-snapshot Secret alike. Using the cached client for the snapshot would
+// spin up a cluster-wide Secret informer (the very thing APIReader avoids); a
+// direct read needs only per-namespace secrets:get RBAC and is strongly
+// consistent, which is exactly what an authoritative existence check wants.
+func (r *PipelineRunReconciler) snapshotRunSecrets(ctx context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline) ([]string, error) {
+	refs := validate.ReferencedSecrets(pipeline)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	// Authoritative: an existing snapshot means the run is already admitted.
+	// Do not read the project Secret, re-run the missing-key check, or rewrite.
+	snapName := runSecretsName(pr)
+	existing := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: snapName, Namespace: pr.Namespace}, existing); err == nil {
+		return nil, nil
+	} else if !errors.IsNotFound(err) {
+		return nil, err
+	}
+
+	// Snapshot absent → first admission: read the project Secret and run the
+	// missing-key check before creating the snapshot.
+	project := &corev1.Secret{}
+	err := r.APIReader.Get(ctx, types.NamespacedName{
+		Name:      datupletv1.ProjectSecretsName,
+		Namespace: pr.Namespace,
+	}, project)
+	if err != nil && !errors.IsNotFound(err) {
+		return nil, err
+	}
+	// On NotFound, project.Data is nil and every referenced key is missing.
+
+	data := make(map[string][]byte, len(refs))
+	var missing []string
+	for _, name := range refs {
+		v, ok := project.Data[name]
+		if !ok {
+			missing = append(missing, name)
+			continue
+		}
+		data[name] = v
+	}
+	if len(missing) > 0 {
+		return missing, nil
+	}
+
+	snap := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      snapName,
+			Namespace: pr.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/component": "run-secrets",
+				"app.kubernetes.io/part-of":   "datuplet",
+				"datuplet.io/pipelinerun":     pr.Name,
+				"datuplet.io/run-id":          pr.Status.RunID,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: data,
+	}
+	// OwnerRef -> PipelineRun so the snapshot is garbage-collected with the run.
+	if err := ctrl.SetControllerReference(pr, snap, r.Scheme); err != nil {
+		return nil, err
+	}
+	if err := r.Create(ctx, snap); err != nil && !errors.IsAlreadyExists(err) {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// handleRunning continues the PipelineRun execution. It reads exclusively from
+// the FROZEN status.resolvedSpec — never the live Pipeline — so mid-run edits
+// and registry changes cannot alter what executes.
 func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv1.PipelineRun) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the Pipeline
-	pipeline := &datupletv1.Pipeline{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      pr.Spec.PipelineRef.Name,
-		Namespace: pr.Namespace,
-	}, pipeline); err != nil {
-		logger.Error(err, "Failed to get Pipeline")
-		return ctrl.Result{}, err
+	if pr.Status.ResolvedSpec == nil {
+		// A Running run must carry the frozen spec written at admission.
+		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedApplication
+		pr.Status.Message = "internal: resolvedSpec missing on a Running PipelineRun"
+		now := metav1.Now()
+		pr.Status.CompletionTime = &now
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
+	resolvedSpec := pr.Status.ResolvedSpec
 
 	// Find the current stage to execute
 	currentStageIdx := -1
@@ -294,7 +714,7 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 		return ctrl.Result{}, nil
 	}
 
-	stage := &pipeline.Spec.Stages[currentStageIdx]
+	stage := &resolvedSpec.Stages[currentStageIdx]
 	stageStatus := &pr.Status.StageStatuses[currentStageIdx]
 	pr.Status.CurrentStage = stage.Name
 
@@ -302,10 +722,10 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 	switch stageStatus.Phase {
 	case datupletv1.StagePhasePending:
 		// Start the stage
-		return r.startStage(ctx, pr, pipeline, currentStageIdx)
+		return r.startStage(ctx, pr, currentStageIdx)
 	case datupletv1.StagePhaseRunning:
 		// Check component status
-		return r.checkStageComponents(ctx, pr, pipeline, currentStageIdx)
+		return r.checkStageComponents(ctx, pr, currentStageIdx)
 	case datupletv1.StagePhaseFailedUser:
 		// Stage failed due to user error - fail the entire run
 		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
@@ -333,11 +753,12 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
 }
 
-// startStage creates Jobs for all components in the stage.
-func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, stageIdx int) (ctrl.Result, error) {
+// startStage creates Jobs for all components in the stage, reading from the
+// FROZEN status.resolvedSpec.
+func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.PipelineRun, stageIdx int) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	stage := &pipeline.Spec.Stages[stageIdx]
+	stage := &pr.Status.ResolvedSpec.Stages[stageIdx]
 	stageStatus := &pr.Status.StageStatuses[stageIdx]
 
 	logger.Info("Starting stage", "stage", stage.Name)
@@ -356,7 +777,7 @@ func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.P
 		comp := &stage.Components[i]
 		compStatus := &stageStatus.ComponentStatuses[i]
 
-		job, configMap, err := r.buildComponentJob(ctx, pr, pipeline, comp)
+		job, configMap, err := r.buildComponentJob(ctx, pr, comp)
 		if err != nil {
 			logger.Error(err, "Failed to build component job", "component", comp.Name)
 			compStatus.Phase = datupletv1.ComponentPhaseFailedApplication
@@ -412,11 +833,12 @@ func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.P
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
 }
 
-// checkStageComponents checks the status of all component Jobs in a stage.
-func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, stageIdx int) (ctrl.Result, error) {
+// checkStageComponents checks the status of all component Jobs in a stage,
+// reading from the FROZEN status.resolvedSpec.
+func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *datupletv1.PipelineRun, stageIdx int) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	stage := &pipeline.Spec.Stages[stageIdx]
+	stage := &pr.Status.ResolvedSpec.Stages[stageIdx]
 	stageStatus := &pr.Status.StageStatuses[stageIdx]
 
 	allSucceeded := true
@@ -462,11 +884,14 @@ func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *da
 			return ctrl.Result{}, err
 		}
 
-		// Observe Secret mount/resolve state and surface it as a condition.
-		r.updateSecretsResolvedCondition(ctx, pr, pipeline, job)
-
 		// Try to extract exit code from pod
 		exitCode := r.extractExitCodeFromJob(ctx, job)
+
+		// Observe the pulled image digest (RFC 026 §4.3). Captured from
+		// whichever reconcile first sees it on the pod's containerStatuses
+		// — while the component is still Running, or on the terminal
+		// reconcile below — and never overwritten afterward.
+		recordComponentImageID(pr, compStatus.Name, r.extractImageIDFromJob(ctx, job))
 
 		// Check Job conditions
 		for _, condition := range job.Status.Conditions {

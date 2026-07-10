@@ -10,7 +10,8 @@ spec:
     - name: extract
       components:
         - name: json-extractor
-          image: datuplet/http-json-extractor:latest
+          component: http-json-extractor
+          version: dev
           config:
             url: "https://jsonplaceholder.typicode.com/posts"
           outputs:
@@ -21,7 +22,8 @@ spec:
     - name: transform
       components:
         - name: sql-transform
-          image: datuplet/sql-transform:latest
+          component: sql-transform
+          version: dev
           inputs:
             tables:
               - bucket: "{{.RunPrefix}}-raw"
@@ -49,4 +51,3 @@ metadata:
 spec:
   pipelineRef:
     name: "{{.RunPrefix}}-duckdb-etl"
-  parameters: {}

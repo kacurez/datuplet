@@ -52,8 +52,13 @@ type Stage struct {
 // Component defines a single pipeline component.
 // Note: Type field is removed - component behavior is determined by inputs/outputs.
 type Component struct {
-	Name    string         `yaml:"name"`
-	Image   string         `yaml:"image"`
+	Name      string `yaml:"name"`
+	Component string `yaml:"component"`
+	Version   string `yaml:"version,omitempty"`
+	// Image is the container image. On the K8s surface it is resolved from
+	// the registry at admission and not carried here; retained for the
+	// legacy local orchestrator path only.
+	Image   string         `yaml:"image,omitempty"`
 	Config  map[string]any `yaml:"config,omitempty"`
 	Inputs  *InputSpec     `yaml:"inputs,omitempty"`
 	Outputs *OutputSpec    `yaml:"outputs,omitempty"`

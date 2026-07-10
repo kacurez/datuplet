@@ -81,9 +81,10 @@ These are conventions a new contributor wouldn't infer from the code:
 - **`UseSSL` and `UsePathStyle`** are independent storage-credential
   concerns — never infer one from the other.
 - **Secret references use `$[name]`** (whole-scalar only) inside
-  `component.config`. Resolved by the Data Gateway sidecar at boot from
-  files mounted under `/var/run/secrets/datuplet/`. The K8s
-  `Pipeline.spec.secretsRef.name` names a Secret in the same namespace.
+  `component.config`. Secrets are stored in a managed per-project Secret
+  named `datuplet-project-secrets` (written via the project secrets API/UI).
+  The Data Gateway sidecar resolves `$[name]` values at boot from the
+  per-run snapshot Secret mounted at `/var/run/secrets/datuplet/`.
 - **Run-token references** use `PipelineRun.spec.runTokenRef.name`. The
   named Secret carries a `token` key projected at
   `/var/run/secrets/datuplet-runtoken/token` **on the gateway sidecar
@@ -126,7 +127,9 @@ These are conventions a new contributor wouldn't infer from the code:
 - **Browser UI** lives at `ui/product/` (vanilla ES modules, no build step).
   Pipeline-api serves it at `/ui/*` when `PIPELINE_API_UI_DIR` is set; the
   K8s Deployment sets this to `/app/ui/product`. On 401 the fetch wrapper
-  redirects to `/ui/login`.
+  redirects to `/ui/login`. Includes a registry-driven component catalog
+  (`/ui/components`) and a schema-form pipeline builder (`/ui/pipelines/:name`,
+  one-way "Edit as YAML"; `$[key]` secret + storage-catalog pickers).
 - **`pipeline-observer` runs in its own Deployment** (single replica,
   single-writer to the `runs` table). Pipeline-api defaults to 2 replicas
   (HTTP-only). The 24h reaper lives in a separate CronJob with a narrower
@@ -185,8 +188,8 @@ These are conventions a new contributor wouldn't infer from the code:
   helm's pre-flight REST-mapper validation issue for
   `Cluster.postgresql.cnpg.io`).
 - **Monorepo `go mod tidy`**: the repo has multiple Go modules
-  (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`,
-  `examples/local-dev/`). Tidying root in isolation drifts the others —
+  (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`).
+  Tidying root in isolation drifts the others —
   their Docker builds + e2e enforce parity and fail CI. Always run
   `make tidy` (covers every module).
 
@@ -214,4 +217,4 @@ These are conventions a new contributor wouldn't infer from the code:
 | `ui/product/` | Browser SPA (vanilla ES modules). |
 | `charts/` | Four Helm charts: `datuplet-operators`, `-infra`, `-app`, `-lakekeeper`. |
 | `utils/docker/` | Dockerfiles for all services. |
-| `examples/k8s/`, `examples/pipelines/` | Example manifests. |
+| `examples/pipelines/` | Example K8s pipeline manifests (CI-guarded). |

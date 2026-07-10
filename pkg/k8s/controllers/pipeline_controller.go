@@ -2,9 +2,10 @@ package controllers
 
 import (
 	"context"
-	"fmt"
+	stderrors "errors"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -82,140 +83,16 @@ func (r *PipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{}, nil
 }
 
-// validatePipeline validates the Pipeline spec.
+// validatePipeline validates the Pipeline spec using validate.ValidateTyped —
+// the same semantic checks the pipeline-api save path runs — so the kubectl
+// path never diverges into a second validation dialect. The first Finding
+// (if any) becomes the returned error.
 func (r *PipelineReconciler) validatePipeline(_ context.Context, pipeline *datupletv1.Pipeline) error {
-	spec := &pipeline.Spec
-
-	// Validate stages
-	if len(spec.Stages) == 0 {
-		return fmt.Errorf("pipeline must have at least one stage")
+	findings := validate.ValidateTyped(pipeline, nil, nil)
+	if len(findings) == 0 {
+		return nil
 	}
-
-	seenComponentNames := make(map[string]bool)
-	for i, stage := range spec.Stages {
-		if stage.Name == "" {
-			return fmt.Errorf("stage %d: name is required", i)
-		}
-
-		if len(stage.Components) == 0 {
-			return fmt.Errorf("stage %s: must have at least one component", stage.Name)
-		}
-
-		for j, comp := range stage.Components {
-			if comp.Name == "" {
-				return fmt.Errorf("stage %s, component %d: name is required", stage.Name, j)
-			}
-
-			if seenComponentNames[comp.Name] {
-				return fmt.Errorf("duplicate component name: %s", comp.Name)
-			}
-			seenComponentNames[comp.Name] = true
-
-			if comp.Image == "" {
-				return fmt.Errorf("stage %s, component %s: image is required", stage.Name, comp.Name)
-			}
-
-			// Validate inputs
-			if comp.Inputs != nil {
-				// Validate bucket names
-				for _, bucket := range comp.Inputs.Buckets {
-					if err := validateTableName(bucket); err != nil {
-						return fmt.Errorf("stage %s, component %s: invalid input bucket name %q: %w",
-							stage.Name, comp.Name, bucket, err)
-					}
-				}
-
-				// Validate table specifications
-				for _, tableSpec := range comp.Inputs.Tables {
-					if tableSpec.Bucket == "" {
-						return fmt.Errorf("stage %s, component %s: input table bucket is required",
-							stage.Name, comp.Name)
-					}
-					if tableSpec.Table == "" {
-						return fmt.Errorf("stage %s, component %s: input table name is required",
-							stage.Name, comp.Name)
-					}
-					if err := validateTableName(tableSpec.Bucket); err != nil {
-						return fmt.Errorf("stage %s, component %s: invalid input bucket name %q: %w",
-							stage.Name, comp.Name, tableSpec.Bucket, err)
-					}
-					if err := validateTableName(tableSpec.Table); err != nil {
-						return fmt.Errorf("stage %s, component %s: invalid input table name %q: %w",
-							stage.Name, comp.Name, tableSpec.Table, err)
-					}
-				}
-			}
-
-			// Validate outputs
-			if comp.Outputs != nil {
-				// Check for exclusive DefaultBucket mode
-				hasDefaultBucket := comp.Outputs.DefaultBucket != ""
-				hasBuckets := len(comp.Outputs.Buckets) > 0
-				hasTables := len(comp.Outputs.Tables) > 0
-
-				if hasDefaultBucket && (hasBuckets || hasTables) {
-					return fmt.Errorf("stage %s, component %s: defaultBucket cannot be combined with explicit buckets or tables",
-						stage.Name, comp.Name)
-				}
-
-				// Validate defaultBucket
-				if hasDefaultBucket {
-					if err := validateTableName(comp.Outputs.DefaultBucket); err != nil {
-						return fmt.Errorf("stage %s, component %s: invalid defaultBucket name %q: %w",
-							stage.Name, comp.Name, comp.Outputs.DefaultBucket, err)
-					}
-				}
-
-				// Validate explicit buckets
-				for _, bucketSpec := range comp.Outputs.Buckets {
-					if bucketSpec.Name == "" {
-						return fmt.Errorf("stage %s, component %s: output bucket name is required",
-							stage.Name, comp.Name)
-					}
-					if err := validateTableName(bucketSpec.Name); err != nil {
-						return fmt.Errorf("stage %s, component %s: invalid output bucket name %q: %w",
-							stage.Name, comp.Name, bucketSpec.Name, err)
-					}
-				}
-
-				// Validate explicit tables
-				for _, tableSpec := range comp.Outputs.Tables {
-					if tableSpec.Name == "" {
-						return fmt.Errorf("stage %s, component %s: output table name is required",
-							stage.Name, comp.Name)
-					}
-					if tableSpec.Bucket == "" {
-						return fmt.Errorf("stage %s, component %s: output table bucket is required",
-							stage.Name, comp.Name)
-					}
-					if err := validateTableName(tableSpec.Name); err != nil {
-						return fmt.Errorf("stage %s, component %s: invalid output table name %q: %w",
-							stage.Name, comp.Name, tableSpec.Name, err)
-					}
-					if err := validateTableName(tableSpec.Bucket); err != nil {
-						return fmt.Errorf("stage %s, component %s: invalid output bucket name %q: %w",
-							stage.Name, comp.Name, tableSpec.Bucket, err)
-					}
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// validateTableName validates that a table name is a logical identifier.
-// Table names must not contain slashes, colons, or whitespace.
-func validateTableName(table string) error {
-	if table == "" {
-		return fmt.Errorf("table name cannot be empty")
-	}
-	for _, ch := range table {
-		if ch == '/' || ch == ':' || ch == ' ' || ch == '\t' || ch == '\n' {
-			return fmt.Errorf("table name must not contain '/', ':', or whitespace")
-		}
-	}
-	return nil
+	return stderrors.New(findings[0].Message)
 }
 
 // setCondition updates or appends a condition.

@@ -27,6 +27,14 @@ type OpenFGAAuthorizer struct {
 	fga      *client.OpenFgaClient
 	modelID  string
 	deadline time.Duration
+
+	// apiURL/apiKey/storeID are retained so the same authorizer can feed
+	// the one-time server-object /changes discovery used by the superadmin
+	// ServerAdminChecker (see NewServerAdmin). They are not used by the
+	// Authorizer methods themselves.
+	apiURL  string
+	apiKey  string
+	storeID string
 }
 
 // NewOpenFGAAuthorizer creates an OpenFGAAuthorizer that wraps the OpenFGA
@@ -74,6 +82,9 @@ func NewOpenFGAAuthorizer(apiURL, storeID, modelID, apiKey string, deadline time
 		fga:      fgaClient,
 		modelID:  modelID,
 		deadline: deadline,
+		apiURL:   apiURL,
+		apiKey:   apiKey,
+		storeID:  storeID,
 	}, nil
 }
 
@@ -256,6 +267,15 @@ func (a *OpenFGAAuthorizer) DeleteTuples(ctx context.Context, tuples []Tuple) er
 // of 500. Without this, connection-refused / DNS failures would propagate as
 // raw *url.Error / *net.OpError and be misclassified as unexpected 500s.
 func (a *OpenFGAAuthorizer) wrapErr(ctx context.Context, err error) error {
+	return unavailableIfTransport(ctx, err)
+}
+
+// unavailableIfTransport maps a context deadline/cancellation error or a
+// network-level transport error to ErrAuthzUnavailable, preserving other
+// errors as-is. Shared by OpenFGAAuthorizer.wrapErr (SDK calls) and
+// DiscoverServerObject (raw /changes HTTP) so both classify unreachable-FGA
+// failures identically. Does not depend on the authorizer receiver.
+func unavailableIfTransport(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}

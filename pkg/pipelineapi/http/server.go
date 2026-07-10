@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
@@ -50,6 +51,37 @@ type Server struct {
 	// main.go whenever the signer exists (so the policy-off 403 path works
 	// even when client-side query is disabled). Nil → route unregistered.
 	localQueryMintHandler http.Handler
+	// secretsK8s is the K8s client the project-secrets handlers use to
+	// lazily ensure the managed Secret and apply merge-PATCHes. Wired via
+	// WithSecrets; when nil, the secrets routes are left unregistered.
+	secretsK8s client.Client
+	// secretsClock supplies "now" for the "datuplet.io/updated-<key>"
+	// annotation. Injected (not read inside the patch helper) so tests get
+	// deterministic timestamps.
+	secretsClock func() time.Time
+	// registry is pipeline-api's view of the component registry: Resolve is
+	// threaded into ValidatePipeline on the pipeline save path (replacing
+	// R5's temporary nil), and List backs the /api/v1/components catalog
+	// handlers. When nil, both the catalog routes stay unregistered AND
+	// handlePutPipeline validates with a nil RegistryView (registry
+	// resolution + config-schema checks skipped) — same soft-degrade shape
+	// as the other With* seams.
+	registry ComponentRegistry
+	// serverAdmin answers "is this user a platform superadmin?" for the
+	// mustBeSuperadmin guard and the is_superadmin flag on GET
+	// /api/v1/auth/me. Wired via WithServerAdmin; nil (authz disabled) →
+	// the guard returns 503 and is_superadmin degrades to false.
+	serverAdmin authz.ServerAdminChecker
+	// componentAdmin is the write seam behind the superadmin-gated
+	// PUT/DELETE /api/v1/admin/components/{name} routes. Wired via
+	// WithComponentAdmin over the ComponentDefinition K8s client; nil leaves
+	// those routes unregistered.
+	componentAdmin ComponentRegistryWriter
+	// policy carries the chart-configured pipeline-policy bounds (RFC 026
+	// §4.6) enforced on the PUT diff-gate for non-superadmins. Wired via
+	// WithPipelinePolicy from PIPELINE_POLICY_* env in main.go; nil disables
+	// all bound checks (ValidateTyped treats a nil *Policy as "no policy").
+	policy *validate.Policy
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -199,6 +231,60 @@ func (s *Server) WithLocalQueryMint(h http.Handler) *Server {
 	return s
 }
 
+// WithSecrets wires the project-scoped secrets endpoints
+// (GET/PUT/DELETE /api/v1/projects/{pid}/secrets...). k8sClient lazily
+// ensures the project namespace + managed Secret exist and applies the
+// per-key merge-PATCHes; clock supplies "now" for the
+// "datuplet.io/updated-<key>" annotation so tests get deterministic
+// timestamps instead of the handler reading time.Now() itself. When
+// k8sClient is nil, the secrets routes are left unregistered.
+func (s *Server) WithSecrets(k8sClient client.Client, clock func() time.Time) *Server {
+	s.secretsK8s = k8sClient
+	s.secretsClock = clock
+	return s
+}
+
+// WithRegistry wires pipeline-api's view of the component registry. Resolve
+// is threaded into ValidatePipeline on the pipeline save path (PUT
+// /api/v1/projects/{pid}/pipelines/{name}); List backs the
+// GET /api/v1/components catalog routes, which register only when both this
+// and WithUserResolver are wired. When nil (the default), the catalog
+// routes stay unregistered and pipeline saves validate with a nil
+// RegistryView, matching R5's pre-registry behavior.
+func (s *Server) WithRegistry(r ComponentRegistry) *Server {
+	s.registry = r
+	return s
+}
+
+// WithServerAdmin wires the platform-superadmin checker used by the
+// mustBeSuperadmin guard and the is_superadmin flag on GET /api/v1/auth/me.
+// When nil (authz disabled), the guard returns 503, is_superadmin degrades to
+// false, and the superadmin-gated admin routes stay unregistered.
+func (s *Server) WithServerAdmin(c authz.ServerAdminChecker) *Server {
+	s.serverAdmin = c
+	return s
+}
+
+// WithComponentAdmin wires the write seam behind the superadmin-gated
+// PUT/DELETE /api/v1/admin/components/{name} routes. Production passes a
+// *registry.Writer over the ComponentDefinition K8s client. When nil, those
+// routes stay unregistered — same soft-degrade gate as WithK8sClient.
+func (s *Server) WithComponentAdmin(w ComponentRegistryWriter) *Server {
+	s.componentAdmin = w
+	return s
+}
+
+// WithPipelinePolicy wires the chart-configured pipeline-policy bounds (RFC 026
+// §4.6) consumed by the PUT /api/v1/projects/{pid}/pipelines/{name} diff-gate:
+// a non-superadmin whose gateway knobs exceed a bound gets a 403. main.go builds
+// the *Policy from the PIPELINE_POLICY_* env vars. When nil (no env / all
+// bounds zero), bound checks are disabled — ValidateTyped treats a nil *Policy
+// as "no policy".
+func (s *Server) WithPipelinePolicy(p *validate.Policy) *Server {
+	s.policy = p
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -258,6 +344,15 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("DELETE /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeletePipeline)))
 	}
 
+	// Project-secrets handlers gate on s.secretsK8s in addition to the
+	// standard resolver/authzr/projects trio — mirrors the pipeline routes'
+	// gate shape above.
+	if s.resolver != nil && s.authzr != nil && s.projects != nil && s.secretsK8s != nil {
+		mux.Handle("GET /api/v1/projects/{pid}/secrets", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListSecrets)))
+		mux.Handle("PUT /api/v1/projects/{pid}/secrets/{key}", auth.WithUser(s.resolver, http.HandlerFunc(s.handlePutSecret)))
+		mux.Handle("DELETE /api/v1/projects/{pid}/secrets/{key}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeleteSecret)))
+	}
+
 	if s.resolver != nil && s.authzr != nil && s.runs != nil {
 		mux.Handle("GET /api/v1/projects/{pid}/runs",
 			auth.WithUser(s.resolver, http.HandlerFunc(s.handleListRuns)))
@@ -272,6 +367,23 @@ func (s *Server) Handler() http.Handler {
 	if s.resolver != nil && s.authzr != nil && s.backend != nil && s.pipelines != nil {
 		mux.Handle("POST /api/v1/projects/{pid}/pipelines/{name}/runs",
 			auth.WithUser(s.resolver, http.HandlerFunc(s.handleTriggerRun)))
+	}
+
+	// Component catalog routes: any authenticated user (WithUser only — no
+	// project-scoped authz check, spec §4.7's shared picker).
+	if s.resolver != nil && s.registry != nil {
+		mux.Handle("GET /api/v1/components", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListComponents)))
+		mux.Handle("GET /api/v1/components/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleGetComponent)))
+	}
+
+	// Superadmin-gated component registry mutation routes (RFC 026 P3).
+	// Registered only when the resolver, superadmin checker, and registry
+	// writer are all wired; the handlers themselves run mustBeSuperadmin so
+	// a request that reaches them is still gated on the FGA server.admin
+	// relation.
+	if s.resolver != nil && s.serverAdmin != nil && s.componentAdmin != nil {
+		mux.Handle("PUT /api/v1/admin/components/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handlePutComponentDefinition)))
+		mux.Handle("DELETE /api/v1/admin/components/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeleteComponentDefinition)))
 	}
 
 	// Query service route. When a pre-built queryHandler + resolver are wired,

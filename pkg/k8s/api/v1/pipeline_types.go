@@ -1,7 +1,11 @@
 package v1
 
 import (
+	"encoding/json"
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -24,24 +28,9 @@ type PipelineSpec struct {
 	// +optional
 	Gateway GatewaySpec `json:"gateway,omitempty"`
 
-	// SecretsRef names a Kubernetes Secret in the same namespace whose keys
-	// are resolvable via $[name] references in component configs. Optional.
-	// +optional
-	SecretsRef *SecretsRef `json:"secretsRef,omitempty"`
-
 	// Stages defines the pipeline stages
 	// +kubebuilder:validation:MinItems=1
 	Stages []StageSpec `json:"stages"`
-}
-
-// SecretsRef is a reference to a Kubernetes Secret whose keys back $[name]
-// secret references in the pipeline's component configs.
-type SecretsRef struct {
-	// Name is the Secret's name in the same namespace as the PipelineRun.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	Name string `json:"name"`
 }
 
 // GatewaySpec configures the data gateway sidecar
@@ -141,16 +130,23 @@ type ComponentSpec struct {
 	// Name is the component name
 	Name string `json:"name"`
 
-	// Image is the container image to run
-	Image string `json:"image"`
+	// Component is the registry component name (ComponentDefinition.Name)
+	// this instance runs. Resolved against the component registry at run
+	// admission (RFC 026).
+	Component string `json:"component"`
 
-	// Config contains component-specific configuration (simple key-value pairs)
+	// Version pins the registry version. Empty resolves to the component's
+	// default version (its DefaultVersion, or the highest registered stable
+	// semver).
 	// +optional
-	Config map[string]string `json:"config,omitempty"`
+	Version string `json:"version,omitempty"`
 
-	// ConfigJSON contains component-specific configuration as JSON (for complex/nested values)
+	// Config contains component-specific configuration as an arbitrary
+	// structured object, validated against the component's registry
+	// schema (RFC 026). Nested YAML is first-class.
+	// +kubebuilder:pruning:PreserveUnknownFields
 	// +optional
-	ConfigJSON string `json:"configJSON,omitempty"`
+	Config apiextensionsv1.JSON `json:"config,omitempty"`
 
 	// Inputs defines input configuration
 	// +optional
@@ -163,6 +159,19 @@ type ComponentSpec struct {
 	// Resources defines resource requirements
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// ConfigMap decodes Config into a generic map. Nil-safe: an unset
+// config yields (nil, nil).
+func (c *ComponentSpec) ConfigMap() (map[string]any, error) {
+	if len(c.Config.Raw) == 0 {
+		return nil, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(c.Config.Raw, &m); err != nil {
+		return nil, fmt.Errorf("component %q config: %w", c.Name, err)
+	}
+	return m, nil
 }
 
 // OutputSpec defines output configuration for a component.
@@ -369,11 +378,6 @@ func (in *PipelineList) DeepCopyObject() runtime.Object {
 func (in *PipelineSpec) DeepCopyInto(out *PipelineSpec) {
 	*out = *in
 	out.Gateway = in.Gateway
-	if in.SecretsRef != nil {
-		in, out := &in.SecretsRef, &out.SecretsRef
-		*out = new(SecretsRef)
-		**out = **in
-	}
 	if in.Stages != nil {
 		in, out := &in.Stages, &out.Stages
 		*out = make([]StageSpec, len(*in))
@@ -383,17 +387,12 @@ func (in *PipelineSpec) DeepCopyInto(out *PipelineSpec) {
 	}
 }
 
-// DeepCopyInto for SecretsRef
-func (in *SecretsRef) DeepCopyInto(out *SecretsRef) {
-	*out = *in
-}
-
-// DeepCopy creates a deep copy of SecretsRef
-func (in *SecretsRef) DeepCopy() *SecretsRef {
+// DeepCopy creates a deep copy of PipelineSpec
+func (in *PipelineSpec) DeepCopy() *PipelineSpec {
 	if in == nil {
 		return nil
 	}
-	out := new(SecretsRef)
+	out := new(PipelineSpec)
 	in.DeepCopyInto(out)
 	return out
 }
@@ -413,13 +412,7 @@ func (in *StageSpec) DeepCopyInto(out *StageSpec) {
 // DeepCopyInto for ComponentSpec
 func (in *ComponentSpec) DeepCopyInto(out *ComponentSpec) {
 	*out = *in
-	if in.Config != nil {
-		in, out := &in.Config, &out.Config
-		*out = make(map[string]string, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
-		}
-	}
+	in.Config.DeepCopyInto(&out.Config)
 	if in.Inputs != nil {
 		in, out := &in.Inputs, &out.Inputs
 		*out = new(InputSpec)
@@ -435,6 +428,16 @@ func (in *ComponentSpec) DeepCopyInto(out *ComponentSpec) {
 		*out = new(corev1.ResourceRequirements)
 		(*in).DeepCopyInto(*out)
 	}
+}
+
+// DeepCopy for ComponentSpec
+func (in *ComponentSpec) DeepCopy() *ComponentSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(ComponentSpec)
+	in.DeepCopyInto(out)
+	return out
 }
 
 // DeepCopyInto for InputSpec

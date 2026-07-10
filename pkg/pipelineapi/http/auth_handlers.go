@@ -3,6 +3,7 @@ package http
 import (
 	"crypto/rand"
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -119,12 +120,25 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "not authenticated")
 		return
 	}
+	// is_superadmin drives the Phase-4 builder affordance (the resources
+	// block is hidden unless true). The whoami call must never 5xx over
+	// authz availability, so an unwired checker or any Check error degrades
+	// to false rather than propagating.
+	isSuperadmin := false
+	if s.serverAdmin != nil {
+		if ok, err := s.serverAdmin.IsServerAdmin(r.Context(), user.ID.String()); err != nil {
+			log.Printf("me: superadmin check failed for user %s: %v", user.ID, err)
+		} else {
+			isSuperadmin = ok
+		}
+	}
 	// The UI reads "mode" to decide which nav to render.
 	// "local" = single-user pipeline-api without Postgres; "cluster" =
 	// the standard multi-tenant deploy.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":    user.ID.String(),
-		"email": user.Email,
-		"mode":  s.resolver.Mode(),
+		"id":            user.ID.String(),
+		"email":         user.Email,
+		"mode":          s.resolver.Mode(),
+		"is_superadmin": isSuperadmin,
 	})
 }

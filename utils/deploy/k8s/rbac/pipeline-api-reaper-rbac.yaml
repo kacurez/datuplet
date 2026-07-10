@@ -1,8 +1,13 @@
 ---
-# ServiceAccount for the pipeline-api-reaper CronJob. Strictly narrower
-# than the pipeline-api ServiceAccount: list+delete on PipelineRun and
-# Secret, nothing else. No namespace create, no Pipeline CRUD, no
-# signing-key mount.
+# ServiceAccount for the pipeline-api-reaper CronJob. Strictly narrower than
+# the pipeline-api ServiceAccount: list+delete on PipelineRun plus `list` on
+# namespaces (to enumerate per-project namespaces for the orphan-Secret
+# sweep), nothing else. RFC 026 P1.5: NO cluster-wide Secret verbs — Secret
+# deletion moved into per-project-namespace `datuplet-secrets` Roles (bound to
+# the pipeline-api SA). The Helm chart runs the reaper under the pipeline-api
+# SA so its orphan-Secret sweep is authorized by that per-namespace binding;
+# orphan run Secrets otherwise GC via their PipelineRun OwnerReference. No
+# namespace create, no Pipeline CRUD, no signing-key mount.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -17,9 +22,14 @@ rules:
   - apiGroups: ["datuplet.io"]
     resources: ["pipelineruns"]
     verbs: ["list", "delete"]
+  # Enumerate per-project namespaces (datuplet-<uuid>) via the
+  # datuplet.io/project-id label for the orphan-Secret sweep. NO cluster-wide
+  # `secrets` verbs (RFC 026 P1.5): per-namespace Secret deletion is authorized
+  # by the `datuplet-secrets` Role bound to the pipeline-api SA — the chart
+  # runs this sweep under that SA. See header.
   - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["list", "delete"]
+    resources: ["namespaces"]
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

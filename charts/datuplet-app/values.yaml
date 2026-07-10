@@ -114,6 +114,17 @@ warehouse:
     # existingSecret is NOT here — GCS credentials flow via lakekeeper-bootstrap
     # flags, not a pipeline-api volume mount.
 
+# Pipeline-policy bounds (RFC 026 §4.6). pipeline-api enforces these on the
+# PUT /api/v1/projects/{pid}/pipelines/{name} diff-gate (§4.4): a non-superadmin
+# whose gateway knobs exceed a bound gets a 403. A zero/unset value means "no
+# bound on that knob". Resource ceilings are NOT here — they are registry-driven
+# (per-ComponentDefinition Max, clamped by the controller).
+pipelinePolicy:
+  gateway:                    # non-superadmins must stay within these
+    maxChunkSize: 268435456       # 256Mi
+    maxBufferSize: 536870912      # 512Mi
+    maxTargetFileSize: 1073741824 # 1Gi
+
 pipelineOperator:
   replicas: 1
   resources:
@@ -259,6 +270,25 @@ queryWorker:
 # that egress posture is acceptable. Independent of queryWorker.enabled (which
 # controls the server-side POST /api/v1/query path).
 allowClientSideQuery: false
+
+# Built-in ComponentDefinition catalog (RFC 026 Task R10). Each component's
+# image ref is "<components.registry>/<component-name>:<components.tag>",
+# rendered by charts/datuplet-app/templates/components/*.yaml.
+components:
+  # builtins: install the six built-in ComponentDefinition CRs shipped by
+  # this chart. Disable in environments that register their own definitions
+  # out-of-band (the K8s e2e harness registers locally-built ":latest"
+  # images via tests/e2e/framework/components_bootstrap.go, so it sets this
+  # false to avoid two owners of the same cluster-scoped object).
+  builtins: true
+  registry: ghcr.io/kacurez
+  # tag: a stable vMAJOR.MINOR.PATCH version — never "latest" (the
+  # ComponentDefinition CRD's CEL rule and the R8 registration-time
+  # reconciler both reject a stable version pinned to a ":latest" image).
+  # Chart.yaml's appVersion ("1.0") is not vX.Y.Z-shaped, so this is pinned
+  # explicitly instead of deriving from appVersion; it matches the image tag
+  # documented for all six built-in components in docs/components.md.
+  tag: v0.1.0
 
 bootstrap:
   externalImages:

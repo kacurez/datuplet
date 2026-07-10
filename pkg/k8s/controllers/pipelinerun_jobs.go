@@ -2,13 +2,13 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	pipelineconfig "github.com/datuplet/datuplet/pkg/pipeline/config"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"gopkg.in/yaml.v3"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -33,10 +33,25 @@ func componentJobName(pr *datupletv1.PipelineRun, stageName, componentName strin
 		shortID(pr.Status.RunID))
 }
 
-// buildComponentJob builds the Job + gateway ConfigMap for a single component.
-func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, comp *datupletv1.ComponentSpec) (*batchv1.Job, *corev1.ConfigMap, error) {
+// runSecretsName returns the per-run snapshot Secret name for pr. The snapshot
+// holds exactly the $[name] keys the pipeline references, subset-copied from
+// the managed project Secret at admission (see snapshotRunSecrets). It is
+// ownerRef'd to the PipelineRun and garbage-collected with it.
+func runSecretsName(pr *datupletv1.PipelineRun) string {
+	return "datuplet-runsecrets-" + shortID(pr.Status.RunID)
+}
+
+// buildComponentJob builds the Job + gateway ConfigMap for a single component,
+// reading exclusively from the FROZEN status.resolvedSpec + status.components
+// (never the live Pipeline). The resolved image + pull policy come from the
+// snapshot recorded at admission.
+func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datupletv1.PipelineRun, comp *datupletv1.ComponentSpec) (*batchv1.Job, *corev1.ConfigMap, error) {
+	// The frozen spec drives gateway settings, stage lookup, and secret-ref
+	// detection. Wrap it as a Pipeline so the existing helpers keep working.
+	frozen := &datupletv1.Pipeline{Spec: *pr.Status.ResolvedSpec}
+
 	stageIdx := -1
-	for i, stage := range pipeline.Spec.Stages {
+	for i, stage := range frozen.Spec.Stages {
 		for _, c := range stage.Components {
 			if c.Name == comp.Name {
 				stageIdx = i
@@ -45,16 +60,34 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		}
 	}
 	if stageIdx == -1 {
-		return nil, nil, fmt.Errorf("component not found in pipeline")
+		return nil, nil, fmt.Errorf("component not found in resolved spec")
 	}
 
-	stage := &pipeline.Spec.Stages[stageIdx]
+	// Resolved image + version were frozen at admission.
+	var componentImage, componentVersion string
+	found := false
+	for _, rc := range pr.Status.Components {
+		if rc.Name == comp.Name {
+			componentImage = rc.Image
+			componentVersion = rc.Version
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, nil, fmt.Errorf("component %q not found in resolved components", comp.Name)
+	}
+
+	stage := &frozen.Spec.Stages[stageIdx]
 
 	jobName := componentJobName(pr, stage.Name, comp.Name)
 	configMapName := fmt.Sprintf("gateway-config-%s", jobName)
 
 	// Generate gateway config
-	gatewayConfig := r.generateGatewayConfig(pr, pipeline, comp)
+	gatewayConfig, err := r.generateGatewayConfig(pr, frozen, comp)
+	if err != nil {
+		return nil, nil, fmt.Errorf("component %q: %w", comp.Name, err)
+	}
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -194,11 +227,14 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 					Containers: []corev1.Container{
 						{
 							Name:  "component",
-							Image: comp.Image,
-							// PullAlways: same RFC 020 iteration-loop reasoning as the gateway
-							// sidecar — every iteration pushes a fresh image to ttl.sh, so we
-							// must pull.
-							ImagePullPolicy: r.runtimePullPolicy(),
+							Image: componentImage,
+							// Registry-driven when no operator override is set: a
+							// prerelease-resolved version uses a mutable tag →
+							// Always; a stable semver version is immutable →
+							// IfNotPresent. The operator-wide RuntimePullPolicy
+							// override (e2e/kind) wins when set, for both the
+							// gateway sidecar and this component container.
+							ImagePullPolicy: r.componentImagePullPolicy(componentVersion),
 							Env:             env,
 							// Component container hardening: makes the
 							// sidecar-only run-token mount a real defense.
@@ -235,11 +271,14 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		job.Spec.Template.Spec.Containers[0].Resources = *comp.Resources
 	}
 
-	// Mount the referenced Secret on the gateway sidecar (only) when secretsRef is set.
+	// Mount the per-run secret snapshot on the gateway sidecar (only) when the
+	// pipeline references $[name] secrets. Keyed off ReferencedSecrets, not a
+	// spec field — the snapshot was materialised at admission (snapshotRunSecrets).
 	applySecretsMount(
 		&job.Spec.Template.Spec,
 		&job.Spec.Template.Spec.InitContainers[0],
-		pipeline,
+		pr,
+		frozen,
 	)
 
 	// Mount the referenced Secret on the gateway sidecar (only) when runTokenRef is set.
@@ -261,26 +300,30 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 	// Pod-level automount of the ServiceAccount token is disabled
 	// unconditionally. Nothing in the gateway sidecar or component container
 	// talks to the K8s API; removing the token closes an unused bypass path
-	// even for pipelines without secretsRef or runTokenRef.
+	// even for pipelines without runTokenRef.
 	automount := false
 	job.Spec.Template.Spec.AutomountServiceAccountToken = &automount
 
 	return job, configMap, nil
 }
 
-// secretsMountPath is the in-container directory where pkg/lib/secrets.FileProvider
-// looks up $[name] references.
-const secretsMountPath = "/var/run/secrets/datuplet"
-
 // secretsMountFSGroup is the GID the gateway process runs as so it can read files
 // from the Secret volume when DefaultMode is 0440.
 const secretsMountFSGroup = int64(65532)
 
-// applySecretsMount augments podSpec with the Secret volume + gateway mount + pod
-// security context needed to deliver Pipeline.spec.secretsRef.Name to the gateway
-// sidecar. No-op when SecretsRef is nil.
-func applySecretsMount(podSpec *corev1.PodSpec, gatewayContainer *corev1.Container, pipeline *datupletv1.Pipeline) {
-	if pipeline.Spec.SecretsRef == nil {
+// secretsMountPath is the in-container directory the gateway's
+// pkg/lib/secrets.FileProvider resolves $[name] references from. The per-run
+// snapshot Secret is projected here — one file per referenced key — so gateway
+// resolution is identical to the pre-snapshot mount.
+const secretsMountPath = "/var/run/secrets/datuplet"
+
+// applySecretsMount augments podSpec with the per-run snapshot Secret volume +
+// gateway mount + pod/sidecar security context needed to deliver the referenced
+// secret keys to the gateway sidecar only. No-op when the pipeline references
+// no $[name] secrets. Idempotent with applyRunTokenMount for fsGroup and the
+// gateway SecurityContext (only sets fields when nil).
+func applySecretsMount(podSpec *corev1.PodSpec, gatewayContainer *corev1.Container, pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline) {
+	if len(validate.ReferencedSecrets(pipeline)) == 0 {
 		return
 	}
 
@@ -290,8 +333,10 @@ func applySecretsMount(podSpec *corev1.PodSpec, gatewayContainer *corev1.Contain
 	if podSpec.SecurityContext == nil {
 		podSpec.SecurityContext = &corev1.PodSecurityContext{}
 	}
-	fsGroup := secretsMountFSGroup
-	podSpec.SecurityContext.FSGroup = &fsGroup
+	if podSpec.SecurityContext.FSGroup == nil {
+		fs := secretsMountFSGroup
+		podSpec.SecurityContext.FSGroup = &fs
+	}
 
 	optional := false
 	mode := int32(0o440)
@@ -299,7 +344,7 @@ func applySecretsMount(podSpec *corev1.PodSpec, gatewayContainer *corev1.Contain
 		Name: "datuplet-secrets",
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
-				SecretName:  pipeline.Spec.SecretsRef.Name,
+				SecretName:  runSecretsName(pr),
 				Optional:    &optional, // FailedMount if absent
 				DefaultMode: &mode,     // root:fsGroup, readable by group
 			},
@@ -307,22 +352,28 @@ func applySecretsMount(podSpec *corev1.PodSpec, gatewayContainer *corev1.Contain
 	})
 
 	// Gateway sidecar only — NOT the component container. Do not use subPath:
-	// atomic Secret updates (future rotation) only propagate to non-subPath mounts.
+	// atomic Secret updates only propagate to non-subPath mounts.
 	gatewayContainer.VolumeMounts = append(gatewayContainer.VolumeMounts, corev1.VolumeMount{
 		Name:      "datuplet-secrets",
 		MountPath: secretsMountPath,
 		ReadOnly:  true,
 	})
 
-	runAsNonRoot := true
-	uid := int64(65532)
-	gid := int64(65532)
 	if gatewayContainer.SecurityContext == nil {
 		gatewayContainer.SecurityContext = &corev1.SecurityContext{}
 	}
-	gatewayContainer.SecurityContext.RunAsNonRoot = &runAsNonRoot
-	gatewayContainer.SecurityContext.RunAsUser = &uid
-	gatewayContainer.SecurityContext.RunAsGroup = &gid
+	if gatewayContainer.SecurityContext.RunAsNonRoot == nil {
+		t := true
+		gatewayContainer.SecurityContext.RunAsNonRoot = &t
+	}
+	if gatewayContainer.SecurityContext.RunAsUser == nil {
+		u := int64(65532)
+		gatewayContainer.SecurityContext.RunAsUser = &u
+	}
+	if gatewayContainer.SecurityContext.RunAsGroup == nil {
+		g := int64(65532)
+		gatewayContainer.SecurityContext.RunAsGroup = &g
+	}
 }
 
 // runTokenMountPath is the in-container directory where the gateway sidecar
@@ -442,19 +493,13 @@ func applyCancelAnnotationMount(podSpec *corev1.PodSpec, gatewayContainer *corev
 }
 
 // generateGatewayConfig creates the gateway configuration YAML.
-func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, comp *datupletv1.ComponentSpec) string {
-	// Convert config - handle both Config map and ConfigJSON
-	config := make(map[string]any)
-	for k, v := range comp.Config {
-		config[k] = v
+func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun, pipeline *datupletv1.Pipeline, comp *datupletv1.ComponentSpec) (string, error) {
+	config, err := comp.ConfigMap()
+	if err != nil {
+		return "", err
 	}
-	if comp.ConfigJSON != "" {
-		var jsonConfig map[string]any
-		if err := json.Unmarshal([]byte(comp.ConfigJSON), &jsonConfig); err == nil {
-			for k, v := range jsonConfig {
-				config[k] = v
-			}
-		}
+	if config == nil {
+		config = map[string]any{}
 	}
 
 	// Build gateway settings
@@ -664,6 +709,13 @@ func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun
 		configMap["component"] = componentMap
 	}
 
+	// Tell the gateway where the per-run snapshot Secret is mounted so its
+	// FileProvider can resolve $[name] references. Only set when the pipeline
+	// actually references a secret (matches applySecretsMount's condition).
+	if len(validate.ReferencedSecrets(pipeline)) > 0 {
+		configMap["secrets_dir"] = secretsMountPath
+	}
+
 	// The gateway sidecar talks directly to lakekeeper. Warehouse +
 	// project_id come from the validated JWT claims; the operator does
 	// not inject them into the configMap.
@@ -672,13 +724,6 @@ func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun
 		if r.PipelineAPIURL != "" {
 			configMap["pipeline_api_jwks_url"] = strings.TrimSuffix(r.PipelineAPIURL, "/") + "/api/v1/auth/jwks.json"
 		}
-	}
-
-	// Tell the gateway where the mounted Secret files live (Task 10 wires the
-	// corresponding volume + mount on the gateway sidecar). Only set when the
-	// pipeline actually references a Secret.
-	if pipeline.Spec.SecretsRef != nil {
-		configMap["secrets_dir"] = secretsMountPath
 	}
 
 	// Marshal to YAML
@@ -698,10 +743,10 @@ gateway:
 			chunkSize,
 			bufferSize,
 			rowGroupSize,
-			targetFileSize)
+			targetFileSize), nil
 	}
 
-	return string(yamlBytes)
+	return string(yamlBytes), nil
 }
 
 // buildGatewaySidecarEnv returns the env-var slice attached to every
