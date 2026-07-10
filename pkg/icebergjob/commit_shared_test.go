@@ -218,6 +218,24 @@ func TestCommitTable_AppendHappyPath(t *testing.T) {
 	if len(postFiles) != 3 {
 		t.Errorf("post-commit file count=%d want 3 (paths=%v)", len(postFiles), postFiles)
 	}
+
+	// RFC 025 §4.2 proof obligation: TableInfo will read total-records /
+	// total-data-files from the committed snapshot summary instead of
+	// walking manifests. Prove iceberg-go actually emits both keys.
+	// writeParquet writes exactly ONE row per file (the int64 arg is the
+	// row's "id" value, not a row count) — 3 files here means 3 rows.
+	const wantTotalRows, wantTotalFiles = 3, 3
+	cur := tbl.CurrentSnapshot()
+	if cur == nil || cur.Summary == nil || cur.Summary.Properties == nil {
+		t.Fatalf("committed snapshot has no summary properties: %+v", cur)
+	}
+	t.Logf("append snapshot Summary.Properties=%+v", cur.Summary.Properties)
+	if got := cur.Summary.Properties["total-records"]; got != fmt.Sprintf("%d", wantTotalRows) {
+		t.Fatalf("total-records = %q, want %d — RFC 025 §4.2 relies on this summary key (props=%+v)", got, wantTotalRows, cur.Summary.Properties)
+	}
+	if got := cur.Summary.Properties["total-data-files"]; got != fmt.Sprintf("%d", wantTotalFiles) {
+		t.Fatalf("total-data-files = %q, want %d (props=%+v)", got, wantTotalFiles, cur.Summary.Properties)
+	}
 }
 
 // TestCommitTable_FullLoadHappyPath: table has 2 existing files (via
@@ -272,6 +290,22 @@ func TestCommitTable_FullLoadHappyPath(t *testing.T) {
 	}
 	if len(postFiles) != 1 {
 		t.Errorf("post-commit file count=%d want 1 (paths=%v)", len(postFiles), postFiles)
+	}
+
+	// RFC 025 §4.2 proof obligation: full-load REPLACES the prior files,
+	// so the summary totals must reflect only the new file (1 row, 1
+	// file), not the cumulative history (writeParquet writes 1 row/file).
+	const wantTotalRows, wantTotalFiles = 1, 1
+	cur := tbl.CurrentSnapshot()
+	if cur == nil || cur.Summary == nil || cur.Summary.Properties == nil {
+		t.Fatalf("committed snapshot has no summary properties: %+v", cur)
+	}
+	t.Logf("full-load snapshot Summary.Properties=%+v", cur.Summary.Properties)
+	if got := cur.Summary.Properties["total-records"]; got != fmt.Sprintf("%d", wantTotalRows) {
+		t.Fatalf("total-records = %q, want %d — RFC 025 §4.2 relies on this summary key (props=%+v)", got, wantTotalRows, cur.Summary.Properties)
+	}
+	if got := cur.Summary.Properties["total-data-files"]; got != fmt.Sprintf("%d", wantTotalFiles) {
+		t.Fatalf("total-data-files = %q, want %d (props=%+v)", got, wantTotalFiles, cur.Summary.Properties)
 	}
 }
 
