@@ -1,10 +1,10 @@
 name: release-services
 
-# Reusable: builds + manifests the six datuplet service images
-# (pipeline-api, pipeline-observer, pipeline-operator, gateway, iceberg-job,
+# Reusable: builds + manifests the five datuplet service images
+# (pipeline-api, pipeline-observer, pipeline-operator, gateway,
 # query-worker). Each is a call to _release-image.yml. Called once from
 # release.yml as the `services` job; appears as a collapsible group in the
-# run-detail UI containing 18 flat entries (6 images × 3 sub-jobs).
+# run-detail UI containing 15 flat entries (5 images × 3 sub-jobs).
 
 on:
   workflow_call:
@@ -40,13 +40,6 @@ jobs:
     with:
       name: gateway
       dockerfile: utils/docker/Dockerfile.gateway
-    secrets: inherit
-
-  iceberg-job:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: iceberg-job
-      dockerfile: utils/docker/Dockerfile.iceberg-job
     secrets: inherit
 
   # query-worker (RFC 022): the ad-hoc SQL query service Deployment image,

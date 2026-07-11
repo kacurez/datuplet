@@ -74,7 +74,6 @@ jobs:
             datuplet/pipeline-observer:latest \
             datuplet/pipeline-operator:latest \
             datuplet/gateway:latest \
-            datuplet/iceberg-job:latest \
             datuplet/data-generator:latest \
             datuplet/sql-transform:latest \
             datuplet/stdout-writer:latest \
