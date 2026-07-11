@@ -132,7 +132,7 @@ var queryScenarioSeedErr error
 // scenarios) once per test process to produce a well-known table.  Subsequent
 // calls are no-ops that return the cached namespace/table or the cached error.
 //
-// The table has 100 rows (jsonplaceholder /posts):
+// The table has 100 rows (in-cluster http-fixture /posts):
 //
 //	schema: userId BIGINT, id BIGINT, title VARCHAR, body VARCHAR
 func ensureQueryTable(t *testing.T) (ns, table string) {

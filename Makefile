@@ -199,6 +199,16 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	  -f tests/e2e/values-lakekeeper.yaml \
 	  --wait --wait-for-jobs --timeout 10m
 	./scripts/register.sh --namespace datuplet-e2e
+	# Hermetic in-cluster HTTP fixture (RFC 024 W7 T7.4) — replaces the
+	# external jsonplaceholder.typicode.com dependency so the e2e data path
+	# has zero outbound network. nginx serves the committed posts.json /
+	# users.json snapshots (tests/e2e/manifests/) at /posts and /users.
+	kubectl -n datuplet-e2e create configmap e2e-http-fixture-data \
+	  --from-file=posts.json=tests/e2e/manifests/posts.json \
+	  --from-file=users.json=tests/e2e/manifests/users.json \
+	  --dry-run=client -o yaml | kubectl apply -n datuplet-e2e -f -
+	kubectl apply -n datuplet-e2e -f tests/e2e/manifests/http-fixture.yaml
+	kubectl -n datuplet-e2e rollout status deploy/e2e-http-fixture --timeout=60s
 	# Run the suite with host-side port-forwards for the framework's
 	# localhost endpoints (OpenFGA/Lakekeeper/pipeline-api/MinIO). Needed
 	# on CI kind (no host port exposure); a no-op on OrbStack where the

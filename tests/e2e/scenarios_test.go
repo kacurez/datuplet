@@ -239,7 +239,7 @@ var scenarios = []framework.Scenario{
 		Name:        "fga-matrix-alice-trigger-and-browse",
 		Description: "alice (project_admin) triggers a pipeline and browses the result — both succeed",
 		// Use the http-json fixture which works without local CSV test
-		// data and produces a stable 100-row output (jsonplaceholder posts).
+		// data and produces a stable 100-row output (in-cluster http-fixture posts).
 		K8sPipeline: "k8s/http-json-extract.yaml",
 		User:        framework.AliceID,
 		Assertions: []framework.Assertion{

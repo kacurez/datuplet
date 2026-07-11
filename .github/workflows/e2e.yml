@@ -71,6 +71,10 @@ jobs:
       - name: Load images into kind
         run: |
           set -eu
+          # nginx backs the in-cluster http-fixture (RFC 024 W7 T7.4) that
+          # replaces jsonplaceholder.typicode.com; it isn't built locally so
+          # it must be pulled before it can be kind-loaded like the others.
+          docker pull public.ecr.aws/nginx/nginx:1.27-alpine
           for img in \
             datuplet/pipeline-api:latest \
             datuplet/pipeline-observer:latest \
@@ -81,6 +85,7 @@ jobs:
             datuplet/stdout-writer:latest \
             datuplet/http-json-extractor:latest \
             datuplet/query-worker:latest \
+            public.ecr.aws/nginx/nginx:1.27-alpine \
           ; do
             kind load docker-image --name datuplet-e2e "$img"
           done
