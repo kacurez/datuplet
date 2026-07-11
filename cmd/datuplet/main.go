@@ -15,17 +15,6 @@ import (
 )
 
 func main() {
-	testCmd := flag.NewFlagSet("test-component", flag.ExitOnError)
-	testImage := testCmd.String("image", "", "Component image to test")
-	testConfig := testCmd.String("config", "{}", "Component config (JSON)")
-	testEndpoint := testCmd.String("endpoint", "localhost:9000", "Data lake endpoint")
-	testBucket := testCmd.String("bucket", "datuplet", "Data lake bucket")
-
-	sampleCmd := flag.NewFlagSet("sample", flag.ExitOnError)
-	sampleImage := sampleCmd.String("image", "", "Component image to sample (required)")
-	sampleConfig := sampleCmd.String("config", "{}", "Component config (JSON)")
-	sampleLimit := sampleCmd.Int("limit", 10, "Maximum number of rows to return")
-
 	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
 	loginRemote := loginCmd.String("remote", "", "pipeline-api URL (required)")
 
@@ -71,30 +60,6 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "test-component":
-		testCmd.Parse(os.Args[2:])
-		if *testImage == "" {
-			fmt.Println("Error: --image is required")
-			fmt.Println("Usage: datuplet test-component --image <image> [options]")
-			os.Exit(1)
-		}
-		if err := testComponent(*testImage, *testConfig, *testEndpoint, *testBucket); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "sample":
-		sampleCmd.Parse(os.Args[2:])
-		if *sampleImage == "" {
-			fmt.Println("Error: --image is required")
-			fmt.Println("Usage: datuplet sample --image <image> [options]")
-			os.Exit(1)
-		}
-		if err := sampleComponent(*sampleImage, *sampleConfig, *sampleLimit); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
 	case "gateway":
 		gatewayCmd.Parse(os.Args[2:])
 		if !*gatewayLocal && !*gatewayMinio {
@@ -253,8 +218,6 @@ Commands:
   gateway                Start the data gateway server (container entrypoint)
   iceberg-job            (REMOVED in RFC 021) Inline commit now lives in the data gateway sidecar
   table-gateway          (REMOVED) Lakekeeper now serves the catalog directly
-  test-component         Test a single component
-  sample                 Get sample data from a component (for AI/automation)
   version                Show version
   help                   Show this help
 
@@ -294,19 +257,6 @@ Options for 'gateway':
   -data-dir string       Data directory for local mode (default: ./data)
   -addr string           gRPC server address (default: :50051)
 
-Options for 'test-component':
-  -image string          Component image to test (required)
-  -config string         Component config as JSON (default: {})
-  -endpoint string       Data lake endpoint (default: localhost:9000)
-  -bucket string         Data lake bucket (default: datuplet)
-
-Options for 'sample':
-  -image string          Component image to sample (required)
-  -config string         Component config as JSON (default: {})
-  -limit int             Maximum number of rows to return (default: 10)
-
 Examples:
-  datuplet gateway --minio --config minio.yaml
-  datuplet test-component --image datuplet/data-generator:latest --config '{"tables":[{"name":"t","random":{"schema":{"id":"int"},"limit":{"rowsCount":5}}}]}'
-  datuplet sample --image datuplet/data-generator:latest --config '{"tables":[{"name":"t","random":{"schema":{"id":"int"},"limit":{"rowsCount":5}}}]}' --limit 5`)
+  datuplet gateway --minio --config minio.yaml`)
 }
