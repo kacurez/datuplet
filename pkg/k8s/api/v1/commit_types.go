@@ -24,17 +24,3 @@ const (
 	// catalog write.
 	TableCommitPhaseFailedApplication TableCommitPhase = "FailedApplication"
 )
-
-// WriteMode is the APPEND/FULL_LOAD enum. Retained in the v1 API surface
-// for back-compat; the live write-mode plumbing uses plain strings (see
-// PipelineSpec) and the inline commit path uses icebergjob.WriteMode, so
-// this type currently has no in-tree consumer. Formerly also used by the
-// Docker/local execution path, removed along with pkg/lib/orchestrator.
-type WriteMode string
-
-const (
-	// WriteModeAppend adds new data files to the table
-	WriteModeAppend WriteMode = "APPEND"
-	// WriteModeFullLoad replaces all existing data in the table
-	WriteModeFullLoad WriteMode = "FULL_LOAD"
-)
