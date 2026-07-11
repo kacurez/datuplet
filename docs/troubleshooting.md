@@ -213,27 +213,35 @@ cause issues).
 
 ---
 
-## 9. TableCommit Job fails with "no files.json"
+## 9. Table commit fails / no data committed
 
-**Symptom.** A PipelineRun completes with `FailedApplication`; the tablecommit
-pod log contains "files.json not found" or "missing manifest".
+**Symptom.** A PipelineRun completes with `FailedApplication`; the component
+Pod's gateway sidecar log contains a commit error (e.g. "commit failed" or a
+lakekeeper 409 after retries exhausted).
 
-**Diagnosis.**
+**Diagnosis.** Since RFC 021 the Data Gateway sidecar commits Iceberg tables
+inline via its commit pool — there is no separate TableCommit Job/Pod to
+inspect. Check the gateway sidecar container logs of the component Pod:
 
 ```bash
-kubectl logs -n datuplet <tablecommit-pod-name> -c tablecommit
+kubectl logs -n datuplet <component-pod-name> -c gateway
 ```
 
 **Causes and fixes.**
 
-- The Data Gateway sidecar never wrote data for this table. This is expected when
-  an upstream stage produced zero rows for a table; the TableCommit Job treats a
-  missing `files.json` as success-zero and exits 0. If you see this as a failure,
-  check that the component actually produced output.
-- `RUN_ID` environment variable mismatch. The DG sidecar writes
-  `files.json` at `<table-base>/.run-state/<run-id>/files.json`; the commit Job
-  reads from the same path using the run ID injected by the operator. If there is
-  a mismatch, the file won't be found. Check operator logs for the run.
+- No rows were produced for a table. This is expected when an upstream stage
+  produced zero rows; the commit pool treats zero parquet paths for a table as
+  success-zero and skips the commit. If you see this as a failure, check that
+  the component actually produced output.
+- Lakekeeper returned a 409 conflict and the retry budget
+  (`catalogwriter.RetryOnConflict`) was exhausted. This happens when multiple
+  runs write to the same table concurrently; retries are automatic, but a
+  persistent conflict surfaces as a failed commit in the gateway log.
+- `files.json` at `<table-base>/.run-state/<run-id>/files.json` is written as
+  an audit breadcrumb only — its absence or a write failure is a logged
+  warning, not the cause of a commit failure. Don't treat a missing
+  `files.json` as the root cause; look at the commit-pool error in the gateway
+  log instead.
 
 ---
 
@@ -245,15 +253,16 @@ no new data (or the table doesn't exist).
 **Diagnosis.**
 
 ```bash
-# Check that the TableCommit Job ran
-kubectl get jobs -n datuplet -l datuplet.io/run-id=<run-id>
-kubectl logs -n datuplet job/<tablecommit-job-name> -c tablecommit
+# Check the gateway sidecar logs for each component Pod in the run
+kubectl get pods -n datuplet -l datuplet.io/run-id=<run-id>
+kubectl logs -n datuplet <component-pod-name> -c gateway
 ```
 
 **Causes and fixes.**
 
-- TableCommit Job failed silently. Check the job logs for `FailedUser` or
-  `FailedApplication` exit codes.
+- The commit failed silently in the gateway sidecar's commit pool. Check the
+  gateway logs for `FailedUser` or `FailedApplication` exit codes on the
+  component Pod.
 - Lakekeeper returned a 409 conflict and the retry budget was exhausted. This
   happens when multiple runs write to the same table concurrently. The next run
   will succeed; the failed run's data is orphaned in S3 but not committed.

@@ -152,7 +152,7 @@ a Postgres participant. The ordering is:
 
 ---
 
-## Leg 3 — Run executes (DG sidecar + TableCommit)
+## Leg 3 — Run executes (DG sidecar)
 
 ```
 DG sidecar (run identity)             lakekeeper REST          OpenFGA (lakekeeper-embedded)
@@ -176,8 +176,9 @@ DG sidecar (run identity)             lakekeeper REST          OpenFGA (lakekeep
 **Actor:** Synthetic run user (`user:oidc~<run-uuid>`).
 
 **Token shape:** The run-token JWT is mounted at
-`/var/run/secrets/datuplet-runtoken/token` on the DG sidecar pod and at the
-same path on the TableCommit Job container. Both read it at startup.
+`/var/run/secrets/datuplet-runtoken/token` on the DG sidecar container only
+(never on the component container). The DG sidecar reads it at startup and
+validates it against pipeline-api's JWKS before proceeding.
 
 **Trust boundary:** Lakekeeper validates the JWT locally using a cached
 public key polled from pipeline-api's JWKS endpoint:

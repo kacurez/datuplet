@@ -90,7 +90,10 @@ type PipelineRunStatus struct {
 	// +optional
 	StageStatuses []StageStatus `json:"stageStatuses,omitempty"`
 
-	// TableCommits tracks the TableCommit resources created for this run
+	// TableCommits is a legacy per-(stage,bucket) commit-status list, mirroring
+	// the shape of the old TableCommit CRD's status. Since RFC 021 commits run
+	// inline in the DG sidecar (no TableCommit resources are created); this
+	// field is retained for UI/pipeline-api compatibility.
 	// +optional
 	TableCommits []TableCommitRef `json:"tableCommits,omitempty"`
 
@@ -238,15 +241,19 @@ const (
 	ComponentPhaseFailedApplication ComponentPhase = "FailedApplication"
 )
 
-// TableCommitRef references a TableCommit resource
+// TableCommitRef is a legacy status entry mirroring the old TableCommit CRD's
+// shape. Since RFC 021 no TableCommit resource is created — commits run
+// inline in the DG sidecar — so Name is a synthetic label, not a live
+// resource reference.
 type TableCommitRef struct {
-	// Name is the name of the TableCommit resource
+	// Name is a synthetic label for this commit-status entry (no
+	// corresponding TableCommit resource exists since RFC 021).
 	Name string `json:"name"`
 
 	// Bucket is the bucket being committed
 	Bucket string `json:"bucket"`
 
-	// Phase is the current phase of the TableCommit
+	// Phase is the current phase of this commit-status entry
 	Phase TableCommitPhase `json:"phase"`
 }
 
