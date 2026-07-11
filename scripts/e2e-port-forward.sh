@@ -30,7 +30,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 declare -a PF_PIDS=()
 cleanup() {
 	for pid in "${PF_PIDS[@]:-}"; do
-		[ -n "${pid:-}" ] && kill "$pid" >/dev/null 2>&1 || true
+		[ -n "${pid:-}" ] && pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null || true
 	done
 }
 trap cleanup EXIT INT TERM
@@ -51,14 +51,24 @@ wait_port() {
 	return 1
 }
 
-# maybe_pf <local_port> <svc> <target_port> <name>
+# supervise_pf <local_port> <svc> <target_port> <name> — respawn the forward
+# whenever it dies (kubectl port-forward exits when its target pod restarts;
+# the query e2e rolls pipeline-api mid-suite).
+supervise_pf() {
+	while true; do
+		kubectl port-forward -n "$NS" --address 127.0.0.1 "svc/$2" "$1:$3" >/dev/null 2>&1 || true
+		echo "e2e: port-forward $4 (localhost:$1) exited; respawning in 1s" >&2
+		sleep 1
+	done
+}
+
 maybe_pf() {
 	if port_open "$1"; then
 		echo "e2e: $4 already reachable on localhost:$1 (skipping port-forward)"
 		return 0
 	fi
-	echo "e2e: port-forward svc/$2 $1:$3 (ns $NS)"
-	kubectl port-forward -n "$NS" --address 127.0.0.1 "svc/$2" "$1:$3" >/dev/null 2>&1 &
+	echo "e2e: supervised port-forward svc/$2 $1:$3 (ns $NS)"
+	supervise_pf "$1" "$2" "$3" "$4" &
 	PF_PIDS+=("$!")
 	wait_port "$1" "$4"
 }
@@ -87,8 +97,18 @@ fi
 
 echo "e2e: endpoints ready; running suite"
 cd "$REPO_ROOT/tests/e2e"
-E2E_K8S=1 \
-	DATUPLET_OPENFGA_URL="http://localhost:8180" \
-	DATUPLET_LAKEKEEPER_URL="http://localhost:8181" \
-	DATUPLET_PIPELINE_API_URL="http://localhost:30081" \
-	go test -v -count=1 -timeout 30m ./...
+if [ -n "${E2E_JSON:-}" ]; then
+	E2E_K8S=1 \
+		DATUPLET_OPENFGA_URL="http://localhost:8180" \
+		DATUPLET_LAKEKEEPER_URL="http://localhost:8181" \
+		DATUPLET_PIPELINE_API_URL="http://localhost:30081" \
+		go test -v -count=1 -timeout 30m -json ./... | tee "$E2E_JSON" | \
+		grep -E '"Action":"(pass|fail|skip)"' --line-buffered | \
+		jq -r 'select(.Test != null) | "\(.Action)\t\(.Test)"' || exit 1
+else
+	E2E_K8S=1 \
+		DATUPLET_OPENFGA_URL="http://localhost:8180" \
+		DATUPLET_LAKEKEEPER_URL="http://localhost:8181" \
+		DATUPLET_PIPELINE_API_URL="http://localhost:30081" \
+		go test -v -count=1 -timeout 30m ./...
+fi

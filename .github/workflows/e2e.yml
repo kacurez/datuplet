@@ -94,7 +94,25 @@ jobs:
           df -h /
 
       - name: Run e2e (deploy + test + teardown)
+        env:
+          E2E_JSON: /tmp/e2e-report.json
         run: make e2e-k8s-deploy
+
+      - name: Test summary
+        if: always()
+        run: |
+          set -eu
+          [ -f /tmp/e2e-report.json ] || { echo "no e2e report produced" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          {
+            echo "## e2e results"
+            echo '| outcome | count |'; echo '|---|---|'
+            for a in pass fail skip; do
+              n=$(jq -r --arg a "$a" 'select(.Action==$a and .Test!=null) | .Test' /tmp/e2e-report.json | wc -l)
+              echo "| $a | $n |"
+            done
+            echo; echo "### skipped"
+            jq -r 'select(.Action=="skip" and .Test!=null) | "- \(.Test)"' /tmp/e2e-report.json
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # GCS e2e (`make e2e-k8s-gcs`) is intentionally NOT wired here.
       # Lakekeeper hardcodes storage.googleapis.com — no GCS endpoint
