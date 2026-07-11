@@ -3,7 +3,7 @@ export DOCKER_BUILDKIT=1
 
 .PHONY: \
 	build build-pipeline-api build-gateway build-iceberg-job build-services \
-	build-components build-components-e2e build-component-data-generator build-operators \
+	build-components build-components-e2e build-components-local build-component-data-generator build-operators \
 	build-component-sql-transform build-component-datuplet-query \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
@@ -83,6 +83,21 @@ build-component-datuplet-query: ## Build datuplet-query image (RFC 022, BYO-loca
 
 build-component-data-generator: ## Build data-generator component image
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
+
+# Built-in component images for a LOCAL OrbStack deploy. The datuplet-app chart
+# ships ComponentDefinition CRs whose image is
+# `<components.registry>/<name>:<components.tag>` — defaulting to
+# ghcr.io/kacurez + v0.1.0 for production (those tags are published to GHCR).
+# deploy-local overrides components.registry=datuplet, so build the built-ins
+# and tag them datuplet/<name>:$(COMPONENT_TAG) — present in the local Docker
+# daemon, no GHCR pull. Runtime pull policy is IfNotPresent (the operator's
+# DATUPLET_RUNTIME_PULL_POLICY, wired from image.pullPolicy), so a local tag is
+# all K8s needs. Skips pandas-transform (no build wired anywhere yet).
+COMPONENT_TAG ?= v0.1.0
+build-components-local: build-components ## Build + tag built-in component images as datuplet/<name>:$(COMPONENT_TAG) for deploy-local
+	for c in data-generator sql-transform stdout-writer http-json-extractor finnhub-extractor; do \
+	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
+	done
 
 docker-build-operators: ## Build pipeline-operator Docker image
 	docker build -t datuplet/pipeline-operator:latest -f utils/docker/Dockerfile.pipeline-operator .
@@ -200,6 +215,11 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	helm uninstall datuplet-app -n datuplet-e2e || true
 	helm uninstall datuplet-infra -n datuplet-e2e || true
 	helm uninstall datuplet-operators -n datuplet-e2e || true
+	# Cluster-scoped ComponentDefinitions created by the e2e bootstrap
+	# (tests/e2e/framework/components_bootstrap.go, outside helm) survive the
+	# namespace delete — sweep them so they don't collide with a later
+	# deploy-local install's helm ownership check.
+	kubectl delete componentdefinition --all --ignore-not-found || true
 	kubectl delete namespace datuplet-e2e --wait=false || true
 
 e2e-all: e2e-k8s ## Run all e2e tiers (K8s is the only supported surface; alias for e2e-k8s)
@@ -212,7 +232,7 @@ e2e-k8s-gcs: ## Run the GCS e2e scenario against fake-gcs-server (skips when no 
 # =============================================================================
 
 .PHONY: deploy-local deploy-local-helm undeploy-local
-deploy-local: docker-build-k8s deploy-local-helm ## Build images + helm install all 4 charts + register.sh
+deploy-local: docker-build-k8s build-components-local deploy-local-helm ## Build images + helm install all 4 charts + register.sh
 
 # Helm-only deploy — skips image rebuild. Use this when images already exist
 # in the local Docker daemon (OrbStack shares its image cache with K8s, so
@@ -227,8 +247,16 @@ deploy-local-helm: ## Helm install all 4 charts + register.sh (no docker build)
 	  -n datuplet --create-namespace --wait --timeout 5m
 	helm upgrade --install datuplet-infra charts/datuplet-infra \
 	  -n datuplet --wait --wait-for-jobs --timeout 10m
+	# image.pullPolicy=IfNotPresent: local `datuplet/*` images live only in the
+	# OrbStack Docker daemon (no registry) — the chart default `Always` would
+	# fail every pull. components.registry=datuplet: point the built-in
+	# ComponentDefinition CRs at the locally-built+tagged component images
+	# (see build-components-local) instead of the production ghcr.io/kacurez.
 	helm upgrade --install datuplet-app charts/datuplet-app \
-	  -n datuplet --wait --wait-for-jobs --timeout 10m
+	  -n datuplet \
+	  --set image.pullPolicy=IfNotPresent \
+	  --set components.registry=datuplet \
+	  --wait --wait-for-jobs --timeout 10m
 	helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
 	  -n datuplet --wait --wait-for-jobs --timeout 10m
 	./scripts/register.sh --namespace datuplet
@@ -243,6 +271,11 @@ undeploy-local: ## Helm uninstall all 4 charts + delete datuplet namespace
 	-helm uninstall datuplet-app -n datuplet
 	-helm uninstall datuplet-infra -n datuplet
 	-helm uninstall datuplet-operators -n datuplet
+	# ComponentDefinitions are cluster-scoped — the namespace delete below does
+	# NOT remove them, and a leftover set blocks the next install's helm
+	# ownership check (esp. after an e2e run, which creates them programmatically
+	# outside helm). Sweep them explicitly.
+	-kubectl delete componentdefinition --all --ignore-not-found
 	-kubectl delete namespace datuplet --wait=false
 
 # =============================================================================
