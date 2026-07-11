@@ -76,7 +76,7 @@
 | T5.2 | known-limitations: N-1→N policy + snapshot rec; gate; commit (no PR) | sonnet | T5.1 | no |
 | T6.1 | `renovate.json` | sonnet | — | with T6.2 |
 | T6.2 | `docs/dependency-upgrades.md` runbook; gate; commit (no PR) | sonnet | — | with T6.1 |
-| T6.3 | Close component-image publish gap (`components.tag` → published tag) | sonnet | — | independent |
+| T6.3 | Close component-image publish gap (`components.tag` → published tag + pandas-transform) | sonnet | T2.1, T2.4 | land after Phase 2, before Phase 3 (blocks W3/W5) |
 | T7.1 | Generalize `PreCheck` (drop the OrbStack context sniff) | sonnet | — | no |
 | T7.2 | Fail-closed CI mode: `E2E_REQUIRE=1` + `SkipOrFail` sweep | **opus** | T7.1 | no |
 | T7.3 | Supervised port-forwards + `go test -json` summary in CI | sonnet | — | with T7.4 |
@@ -1289,7 +1289,7 @@ jobs:
 
 ### Task T3.4: Phase 3 gate
 
-- [ ] **Step 1:** Push the shared branch; run the workflow manually against it: `gh workflow run release-verify.yml --ref claude/modest-easley-f5173d -f version=<latest released tag>` and watch: `gh run watch` → conclusion success. (This is the task's real test — it exercises the full published-artifact path.) Debug failures via the failure-dump step output; jq-path mismatches from T3.2 surface here if the local check was skipped.
+- [ ] **Step 1:** Push the shared branch; run the workflow manually against it: `gh workflow run release-verify.yml --ref claude/modest-easley-f5173d -f version=<latest released tag>` and watch: `gh run watch`. (This is the task's real test — it exercises the full published-artifact path.) Debug failures via the failure-dump step output; jq-path mismatches from T3.2 surface here if the local check was skipped. **⚠ Bootstrap caveat (F7):** if the latest published tag pre-dates T6.3, the built-in-component pipeline step **will** fail with `ImagePullBackOff` (`:v0.1.0` images were never published) — that's expected, not a plan defect. Until a post-T6.3 release exists, either run against such a release, or accept this as a known bootstrap failure (log it loudly, don't gate the branch on it). Green is required only once a post-T6.3 release is published.
 - [ ] **Step 2:** Add the release-discipline note to `docs/install.md` (§Helm repo): "A release is announceable when its `release-verify` workflow run is green."
 - [ ] **Step 3:** Cumulative `mcp__codex__codex` review → clean. Commit on the shared branch. **No PR** (single PR at Final integration).
 
@@ -1611,7 +1611,7 @@ CNPG backups are not configured by the charts (see above), so this is a
 manual step.
 ```
 
-- [ ] **Step 2:** Trigger the workflow on the shared branch (`gh workflow run upgrade-e2e.yml --ref claude/modest-easley-f5173d`) → success. jq-path or seed issues surface here.
+- [ ] **Step 2:** Trigger the workflow on the shared branch (`gh workflow run upgrade-e2e.yml --ref claude/modest-easley-f5173d`). jq-path or seed issues surface here. **⚠ Same bootstrap caveat as release-verify (F7):** the N-1 install pulls the latest published chart, whose built-in component images don't exist until a post-T6.3 release — so the seed step fails on `ImagePullBackOff` until then. Gate green only once a post-T6.3 release is the N-1; before that, run with a `-f-app` overlay pointing components at pullable images, or treat as a known, logged bootstrap failure.
 - [ ] **Step 3:** Cumulative `mcp__codex__codex` review → clean. Commit on the shared branch. **No PR** (single PR at Final integration).
 
 ---
@@ -1736,7 +1736,7 @@ repo). Gate: PR suite + e2e.
 > CRs pin `ghcr.io/kacurez/<comp>:v0.1.0` (`components.tag`), but `_release-image.yml`
 > tags component images with the *platform* version, so `:v0.1.0` is never produced.
 > A stock `--from-repo` install `ImagePullBackOff`s the built-ins (W3 release-verify
-> catches this). Close it here. **Depends on nothing; blocks W3/W5 going green.**
+> catches this). Close it here. **Depends on T2.1 (image helper) + T2.4 (bump-version); blocks W3 and W5 going green — land right after Phase 2, before Phase 3.**
 >
 > **Code-graph note (2026-07-11):** the ComponentDefinition reconciler
 > (`pkg/k8s/controllers/componentdefinition_controller.go`) validates spec *format*
@@ -1782,9 +1782,16 @@ repo). Gate: PR suite + e2e.
     `builtins:true` install ships only built-ins whose images are published.
   Recommend disable-until-published (smaller, honest) unless pandas-transform is
   actually needed at launch.
-- [ ] **Step 4: Add a CI drift guard** (fold into T4.1 verify-versions or standalone):
-  assert every `charts/datuplet-app/templates/components/*.yaml` component name has a
-  matching build+release job — so a future built-in can't ship image-less again.
+- [ ] **Step 4: Local/e2e tag consistency (closes F2's tail).** With built-ins now
+  pinned to `components.tag: v<release>`, the **local** path must resolve too: today
+  `docker-build-k8s` tags components `datuplet/<comp>:latest`, but the T1.3 local
+  overlay sets `components.registry: datuplet` with the chart's `v<release>` tag →
+  mismatch, and `:latest` can't be used for a *stable* built-in (reconciler ban). Pick
+  one and record it in T1.3's overlay + the Makefile: (i) local dev uses
+  `components.builtins: false` + dev-version registration (the e2e pattern — cleanest,
+  mutable `:latest` allowed on prerelease), or (ii) `docker-build-k8s` tags local
+  component images at the same `v<release>` the overlay pins. Do the same for the
+  upgrade-e2e overlay (T5.1). Verify a built-in pipeline actually runs on `make deploy-local`.
 - [ ] **Step 5: Verify** no built-in resolves to an unpublished image:
   `helm template datuplet-app charts/datuplet-app | grep -oE 'ghcr.io/kacurez/[a-z-]+:[^"]+' | sort -u`
   — every tag equals the (v-prefixed) release version, and every component appears in
@@ -2168,6 +2175,16 @@ green-light remains.
     post-T6.3 published release — T6.3 can't retro-fix published charts) → T5.1 gate;
     F5 (T6.3 depends on T2.1/T2.4, not independent) → DAG fixed; F6 (fixture missing
     `/users`) → T7.4 covers both paths, verify = zero remaining matches.
+13. **✅ Second Codex review (2026-07-11, after the single-PR model change + spec/plan
+    commit `602de9e`)**: F1/F3/F4/F6 confirmed resolved; 8 mostly spec↔plan drift issues
+    folded in — spec §8 rewritten to the one-branch/one-PR model (was "each phase
+    independently landable / same PR"); §6 "six"→"seven workstreams"; §6.7 + Phase-7
+    row de-stale'd ("first within RFC 024", not "before RFC 025/026"); §8 Phase-0 drops
+    the moot sample-secret relocation; §5.2/§6.6/§8 now distinguish the deferred
+    component *train* from T6.3's immediate publish-gap fix; plan T6.3 index-row + intro
+    corrected to depend on T2.1/T2.4 (F5 tail); plan T6.3 Step 4 added for local/e2e tag
+    consistency (F2 tail); interim release-verify/upgrade-e2e gates flagged to expect a
+    loud skip until the first post-T6.3 release (F7).
 
 ## Self-review checklist (run before handing off)
 

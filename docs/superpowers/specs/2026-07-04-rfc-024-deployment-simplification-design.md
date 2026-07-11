@@ -304,11 +304,13 @@ publish a ComponentDefinition manifest* — no helm release, no platform version
 and it works identically from this repo or another one. Splitting **before** RFC 026
 lands buys nothing and costs SDK/e2e plumbing while the interfaces are still moving.
 
-**Recommendation (accepted)**: stay single-train until RFC 026 ships; the component
-release train that follows is specced and delivered under RFC 026, not here (§6.6);
-split into a separate repo only when a concrete forcing function appears (external
-contributors, private components, genuinely divergent cadence). Same logic applies
-to charts: keep them in-repo.
+**Recommendation (accepted)**: stay single-train. RFC 026 (merged) built the registry
+consumption side; the long-term component *release train* (independent cadence) stays
+deferred (§6.6 option B) — split into a separate repo only when a concrete forcing
+function appears (external contributors, private components, genuinely divergent
+cadence). What is **not** deferred is the immediate publish gap RFC 026 left — the
+built-in component images must exist for a from-repo install to work — which RFC 024
+closes now as plan task T6.3 (§6.6). Same in-repo logic applies to charts.
 
 ### 5.3 Version source of truth
 
@@ -321,7 +323,7 @@ generated compatibility docs.
 
 ## 6. Design
 
-Six workstreams; each lands independently (§8).
+Seven workstreams (W1–W7); see §8 for the single-branch rollout.
 
 ### 6.1 W1 — `scripts/install.sh`: the one entrypoint
 
@@ -596,13 +598,12 @@ mitigated (prune steps). Revisit only if image-copy time/disk becomes the
 bottleneck again; the next step then is a kind-local-registry pattern, not a
 cluster-tool swap.
 
-**Sequencing exception (recommendation).** Unlike the rest of this RFC, W7
-should execute **before** RFC 025/026 implementation: both gate every phase on
-`make e2e-k8s`, and P8 means that gate currently proves deploy-ability but
-almost no behaviour. W7 touches only the e2e harness/fixtures/workflow, so it
-is collision-free with 025 and near-collision-free with 026 (one-line URL
-swaps in fixtures 026 later rewrites more heavily). Maintainer decides; the
-plan marks the phase accordingly.
+**Sequencing (recommendation).** W7 should be implemented **first within RFC 024**
+(RFC 025/026 are already merged). Every other phase's gate leans on `make e2e-k8s`,
+and P8 means that gate currently proves deploy-ability but almost no behaviour — so
+making it fail-closed first is what makes all the *other* RFC 024 gates trustworthy.
+W7 touches only the e2e harness/fixtures/workflow. The plan commits phases in the
+order 7 → 0 → 1 → 2 → T6.3 → 3 → 4 → 5 → 6 on a single branch (§8).
 
 ## 7. Deliberately unchanged
 
@@ -613,8 +614,14 @@ helm repo, multi-arch image pipeline, K8s-only. Complexity that earns its keep.
 
 ## 8. Rollout
 
-Each phase is independently landable; greenfield discipline per §4 — every phase
-replaces the old mechanism in the same PR, no dual paths or interim variants:
+**Execution model (maintainer decision 2026-07-11): one branch, one PR.** All phases
+are implemented and committed on a single branch (`claude/modest-easley-f5173d`) and
+land as **one final draft PR** — not per-phase PRs. Phases below are commit *groups*
+on that branch, gated individually (tests + a cumulative Codex review, then commit),
+with a single integration PR at the end (see the plan's "Final integration"). The
+phases are still designed so each is a self-contained, greenfield replacement (no dual
+paths); they just accumulate on one branch. Recommended commit order: 7 → 0 → 1 → 2 →
+T6.3 → 3 → 4 → 5 → 6.
 
 | Phase | Contents | Depends on |
 |---|---|---|
@@ -624,18 +631,25 @@ replaces the old mechanism in the same PR, no dual paths or interim variants:
 | 3 | W3 release-verify workflow (runs on the next tag) | 1 |
 | 4 | W4 verify-versions CI check | 0 |
 | 5 | W5 upgrade e2e lane + N-1→N policy in known-limitations.md | 1, a published release to upgrade from |
-| 6 | W6 Renovate + dependency-upgrades doc | — |
-| 7 | W7 e2e effectiveness (fail-closed CI, precheck generalization, supervised forwards + summary, hermetic fixtures, dead-test revival) | — ; **recommended to execute FIRST, before RFC 025/026 implementation** (§6.7) |
+| 6 | W6 Renovate + dependency-upgrades doc; **plan task T6.3** closes RFC 026's component-image publish gap (tag sync + `pandas-transform`) — lands after Phase 2, blocks 3/5 | 2 (for T6.3) |
+| 7 | W7 e2e effectiveness (fail-closed CI, precheck generalization, supervised forwards + summary, hermetic fixtures, dead-test revival) | — ; **recommended to implement FIRST within RFC 024** (§6.7) |
 
-The component train (formerly a Phase 7 here, pre-renumbering) is owned by RFC 026 (§6.6, §9 Q6).
+**Component train vs T6.3 (distinct things).** The long-term *component release
+train* (independent `components-vX.Y.Z` cadence, off-platform-version) stays deferred
+— out of RFC 024's committed scope, revisited if a component needs to ship
+off-cadence (§5.2, §6.6 option B). What RFC 024 **does** own now is the *immediate
+publish gap* (plan task T6.3): the built-in component images the merged chart already
+references must actually exist (tag sync + wiring/disabling `pandas-transform`). T6.3
+is the minimum to make a from-repo install pull its built-ins; the train is the
+larger future refactor.
 
 **Phase 0 detail — legacy deploy-tree removal.** `utils/deploy/k8s/` (14 raw
 manifests; §2.6) is deleted outright — greenfield, no deprecation:
 
-- `rbac/sample-pipeline-secret.yaml` is the one keeper: it is a documentation
-  example for `Pipeline.spec.secretsRef` / `$[key]` references, not deploy code.
-  Relocate to `examples/k8s/` and update the `docs/secrets.md` link. Everything
-  else in the tree is deleted.
+- No keepers to relocate: RFC 026 already deleted `rbac/sample-pipeline-secret.yaml`
+  (secretsRef was removed from the CRD) and rewrote `docs/secrets.md`, so the whole
+  tree — all 14 files, including the third CRD copy (`componentdefinitions`) — is
+  deleted outright.
 - `k8s-reload-crds` → `kubectl apply -f charts/datuplet-app/crds/` — one canonical
   CRD source (the chart, as CLAUDE.md already states). The `k8s-retry-*` targets
   inherit the fix via their dependency.
@@ -752,6 +766,15 @@ changed (reusing an old version number currently passes).
   the review confirmed the repo-reality claims (iceberg-job gone, release guard broken
   on `components.tag`, built-ins as templates, `admin component register` CLI, bare
   operator name).
+- **Second Codex review (2026-07-11, after the single-branch/single-PR model change +
+  spec/plan commit `602de9e`)**: confirmed the first-round fixes landed; its remaining
+  findings were spec↔plan drift, now reconciled in this doc — §8 rewritten to the
+  one-branch/one-PR model, §6 "six"→"seven workstreams", §6.7/§8 Phase-7 sequencing
+  de-stale'd ("first within RFC 024"), §8 Phase-0 relocation removed (RFC 026 already
+  deleted the file), and §5.2/§6.6/§8 now separate the deferred component *train* from
+  T6.3's immediate publish-gap fix. Plan-side: T6.3 dependency corrected, a local/e2e
+  tag-consistency step added, and the interim release-verify/upgrade-e2e gates marked
+  as expected-to-fail until the first post-T6.3 release.
 
 ## 10. Risks
 
