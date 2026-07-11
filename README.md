@@ -77,7 +77,7 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
   storage browse, and the registry-driven component catalog.
 - `pipeline-observer` K8s informer that mirrors PipelineRun status into Postgres.
 - `pipeline-operator` controller that reconciles PipelineRun CRDs into component
-  Pods and per-table iceberg commit Jobs.
+  Pods, each with a Data Gateway sidecar.
 - Lakekeeper Iceberg REST catalog with OIDC validation and STS-vended credentials.
   No long-lived warehouse credentials on any Datuplet Deployment.
 - OpenFGA fine-grained authorization per project, run, and table.
@@ -91,10 +91,10 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
 A user triggers a pipeline via the UI or REST API. `pipeline-api` mints a
 per-run RS256 JWT and creates a PipelineRun CRD. `pipeline-operator` schedules
 component Pods, each with a Data Gateway sidecar. The sidecar fetches
-STS credentials from Lakekeeper, writes parquet to S3/GCS, records a
-per-table `files.json` manifest, then the operator schedules a TableCommit Job
-that commits the files to the Iceberg table via iceberg-go. OpenFGA enforces
-authorization at every step.
+STS credentials from Lakekeeper, writes parquet to S3/GCS, and commits the
+files to the Iceberg table inline via its commit pool (iceberg-go against
+Lakekeeper), leaving a per-table `files.json` audit breadcrumb. OpenFGA
+enforces authorization at every step.
 
 Full diagram and component descriptions: [docs/architecture.md](docs/architecture.md)
 

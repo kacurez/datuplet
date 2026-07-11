@@ -51,8 +51,9 @@ spec:
           image: "{{ .Values.image.pipelineOperator.repository }}:{{ .Values.image.pipelineOperator.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            # LAKEKEEPER_URL is forwarded to spawned commit containers for
-            # metadata commits.
+            # LAKEKEEPER_URL is injected into every component/gateway Pod so
+            # the Data Gateway sidecar can reach the catalog for its inline
+            # commits.
             - name: LAKEKEEPER_URL
               value: {{ include "datuplet-app.lakekeeperUrl" . | quote }}
             # Base URL of pipeline-api. The operator derives the JWKS URL

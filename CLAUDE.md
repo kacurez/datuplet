@@ -67,9 +67,9 @@ These are conventions a new contributor wouldn't infer from the code:
   `pkg/datagateway/server_v2.go`, `pkg/datagateway/partition/router.go`,
   `pkg/datagateway/buffer/manager.go`).
 - **`pkg/lib/datalake/` is metadata-only fallback I/O** (Read / Write / List),
-  used by the local pipeline engine (`pkg/pipeline`) and the pipeline-api
-  storage walker fallback. **`pkg/datagateway/backend/`** is the full data-plane
-  abstraction (buffering, format conversion, backends). Don't confuse the two.
+  used by the pipeline-api storage walker fallback. **`pkg/datagateway/backend/`**
+  is the full data-plane abstraction (buffering, format conversion, backends).
+  Don't confuse the two.
 - **Buffer package (`pkg/datagateway/buffer/`) outputs Parquet only.** For
   other formats on read, use `pkg/datagateway/format/` adapters to convert
   on the fly.
@@ -202,7 +202,7 @@ These are conventions a new contributor wouldn't infer from the code:
 
 | Directory | Purpose |
 |-----------|---------|
-| `pkg/pipeline/` | Pipeline execution engine. |
+| `pkg/pipeline/config/` | Pipeline YAML spec parser (shared by operator + pipeline-api). |
 | `pkg/datagateway/` | Data Gateway service (format conversion, processors, buffering). |
 | `pkg/datagateway/backend/` | Storage backends (MinIO/S3, GCS, local FS). |
 | `pkg/datagateway/lakekeeper/` | Data Gateway's lakekeeper resolver. |

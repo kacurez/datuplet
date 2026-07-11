@@ -1,9 +1,8 @@
 // Package icebergjob — shared CommitTable function.
 //
-// CommitTable is the single Go function `--mode=table-commit` (the
-// post-stage commit driven by extractors / writers) calls to land a
-// per-table `files.json` manifest into the Iceberg catalog. It has one
-// production caller today; the signature stays stable for future modes.
+// CommitTable is the manifest-path variant retained for out-of-band
+// files.json consumers; it has no in-repo production caller since RFC 021
+// (the DG commit pool calls CommitTableFiles directly).
 //
 // CommitTable is a *pure consumer* of the `files.json` wire shape — it
 // does not assume the writer was DG, and does not couple to any

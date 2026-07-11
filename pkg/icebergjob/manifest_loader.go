@@ -4,7 +4,7 @@
 // at `<table-base>/.run-state/<run-id>/files.json`. Per-table placement
 // keeps the manifest inside the per-table STS scope DG holds.
 // See pkg/datagateway/files_manifest.go for the writer side and the
-// canonical wire shape. This file is the inverse: TableCommit reads the
+// canonical wire shape. This file is the inverse: CommitTable reads the
 // per-table manifest, picks up the parquet path list, and feeds it into
 // iceberg-go's `txn.AddFiles(ctx, paths, nil, false)`.
 //
@@ -22,7 +22,7 @@ import (
 // pkg/datagateway/tableManifestJSON exactly — the two are kept
 // structurally identical on purpose; if the wire shape ever needs to
 // change, update both packages in lockstep. Owning a local copy here
-// (rather than importing from pkg/datagateway) keeps TableCommit's
+// (rather than importing from pkg/datagateway) keeps CommitTable's
 // import graph independent of DG — the two services are deployed as
 // separate binaries.
 type FilesManifest struct {
