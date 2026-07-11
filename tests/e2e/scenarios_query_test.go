@@ -242,9 +242,9 @@ var queryProjectIDErr error
 // h.LakekeeperProjectID). It's idempotent — safe to call here even if
 // TestSecretsLadder already ran it in the same process.
 //
-// Reuses remoteCLIFindProject (tests/e2e/scenarios_remote_cli_test.go), the
-// ground-truth helper for this exact GET /api/v1/projects call — it decodes
-// the bare JSON array the endpoint returns and matches by exact name.
+// Uses remoteCLIFindProject (defined below in this file), the ground-truth
+// helper for this exact GET /api/v1/projects call — it decodes the bare JSON
+// array the endpoint returns and matches by exact name.
 func getQueryProjectID(t *testing.T) string {
 	t.Helper()
 	// getAdminSession is called OUTSIDE queryProjectIDOnce.Do: it may itself
@@ -437,6 +437,44 @@ func queryMeUserID(ctx context.Context, baseURL, cookie string) (string, error) 
 		return "", fmt.Errorf("/me returned empty id")
 	}
 	return meResp.ID, nil
+}
+
+// remoteCLIFindProject lists the user's projects and returns the ID of the
+// one matching projectName. Falls back to the first project when only one exists.
+func remoteCLIFindProject(ctx context.Context, baseURL, sessionCookie, projectName string) (string, error) {
+	url := strings.TrimRight(baseURL, "/") + "/api/v1/projects"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.AddCookie(&http.Cookie{Name: "pipeline_api_session", Value: sessionCookie})
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("list projects HTTP %d: %s", resp.StatusCode, string(b))
+	}
+
+	var projects []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
+		return "", fmt.Errorf("decode projects: %w", err)
+	}
+	for _, p := range projects {
+		if p.Name == projectName {
+			return p.ID, nil
+		}
+	}
+	if len(projects) == 1 {
+		return projects[0].ID, nil
+	}
+	return "", fmt.Errorf("project %q not found in %d projects: %+v", projectName, len(projects), projects)
 }
 
 // queryFindPipelineAPIPod returns the name of a running pipeline-api pod

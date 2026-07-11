@@ -29,11 +29,6 @@ func main() {
 	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
 	loginRemote := loginCmd.String("remote", "", "pipeline-api URL (required)")
 
-	runCmd := flag.NewFlagSet("run", flag.ExitOnError)
-	runRemoteFlag := runCmd.String("remote", "", "pipeline-api URL of the target cluster (required for remote runs)")
-	runTokenFile := runCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
-	runProject := runCmd.String("project", "", "Project name to run under (required if you have access to >1 project; auto-defaulted if you have exactly one)")
-
 	triggerCmd := flag.NewFlagSet("trigger", flag.ExitOnError)
 	triggerRemote := triggerCmd.String("remote", "", "pipeline-api URL (required)")
 	triggerTokenFile := triggerCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
@@ -122,24 +117,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Inline commit now lives in the data gateway sidecar. This binary will")
 		fmt.Fprintln(os.Stderr, "grow --mode=compact / expire-snapshots / remove-orphans in a future RFC.")
 		os.Exit(2)
-
-	case "run":
-		runCmd.Parse(os.Args[2:])
-		if *runRemoteFlag == "" {
-			fmt.Fprintln(os.Stderr, "Error: --remote is required")
-			fmt.Fprintln(os.Stderr, "Usage: datuplet run --remote <pipeline-api-url> <pipeline.yaml>")
-			os.Exit(1)
-		}
-		pipelineArgs := runCmd.Args()
-		if len(pipelineArgs) == 0 {
-			fmt.Fprintln(os.Stderr, "Error: pipeline YAML path is required")
-			fmt.Fprintln(os.Stderr, "Usage: datuplet run --remote <pipeline-api-url> <pipeline.yaml>")
-			os.Exit(1)
-		}
-		if err := runRemote(*runRemoteFlag, *runTokenFile, *runProject, pipelineArgs[0]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
 
 	case "login":
 		loginCmd.Parse(os.Args[2:])
@@ -269,7 +246,6 @@ Usage:
 
 Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
-  run                    Run a pipeline against a remote Datuplet cluster
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
   pipeline               CRUD for pipeline specs (list, get, put, delete)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
@@ -284,11 +260,6 @@ Commands:
 
 Options for 'login':
   -remote string         pipeline-api URL (required)
-
-Options for 'run':
-  -remote string         pipeline-api URL of the target cluster (required)
-  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
-  <pipeline.yaml>        Path to pipeline YAML file (positional, required)
 
 Options for 'trigger':
   -remote string         pipeline-api URL (required)

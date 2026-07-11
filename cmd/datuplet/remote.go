@@ -2,20 +2,13 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
-
-	"github.com/datuplet/datuplet/pkg/lib/orchestrator/docker"
-	"github.com/datuplet/datuplet/pkg/pipeline"
-	"github.com/google/uuid"
 )
 
 // remoteArgs holds the resolved configuration for `datuplet run --remote`.
@@ -131,9 +124,7 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		return nil, err
 	}
 
-	// NOTE: lakekeeper_url validation is consumer-specific. `run --remote`
-	// (local-Docker exec) calls requireLakekeeperURL() in runRemote because
-	// it bind-mounts the URL into spawned containers. `trigger` and
+	// NOTE: lakekeeper_url validation is consumer-specific. `trigger` and
 	// `storage` talk only to pipeline-api, which has its own lakekeeper
 	// connection — they don't need this field. Earlier we validated it
 	// unconditionally here, which incorrectly blocked the trigger/storage
@@ -224,13 +215,6 @@ func (r *remoteArgs) RequireAPIToken() error {
 	return nil
 }
 
-// generateRunID returns a fresh UUID string for use as a pipeline run
-// identifier. Extracted as a function so tests can assert uniqueness without
-// launching Docker containers.
-func generateRunID() string {
-	return uuid.New().String()
-}
-
 // normalizeURL strips trailing slashes and lowercases the scheme + host so
 // that minor formatting differences (e.g. "HTTP://Localhost:30081/" vs
 // "http://localhost:30081") compare equal.
@@ -257,97 +241,3 @@ func validateRemoteURL(requested, saved string) error {
 	return nil
 }
 
-// runRemote implements `datuplet run --remote <url> <pipeline.yaml>`.
-//
-// It reads the stored token + cluster config, generates a fresh run-id,
-// sets the process env so the pipeline Controller and Docker orchestrator
-// pick up the remote lakekeeper details, mounts the token file into every
-// spawned container, and drives pkg/pipeline.Controller to completion.
-//
-// Security invariants:
-//   - args.Token is NEVER printed, logged, or interpolated into any
-//     user-visible string.
-//   - The token file is bind-mounted read-only; its host path is always
-//     absolute.
-//   - Ctrl+C cancels the context; the orchestrator's existing container
-//     cleanup on ctx cancellation prevents token-holding containers from
-//     lingering beyond the JWT's TTL.
-func runRemote(remoteFlag, tokenFileFlag, projectFlag, pipelineYAML string) error {
-	args, err := loadRemoteArgs(remoteFlag, tokenFileFlag, projectFlag)
-	if err != nil {
-		return err
-	}
-	// Local-Docker exec mode REQUIRES lakekeeper_url — it bind-mounts the
-	// URL into spawned containers as DATUPLET_LAKEKEEPER_URL. Trigger and
-	// storage do not need this and skip the check.
-	if args.LakekeeperURL == "" {
-		return fmt.Errorf("cluster.json missing lakekeeper_url\n(run `datuplet login --remote %s` first against a cluster that publishes it)", remoteFlag)
-	}
-	args.PipelineYAML = pipelineYAML
-
-	// Generate a fresh run-id. This is pre-seeded into the Controller so
-	// the printed run-id matches the datuplet.run-id iceberg snapshot key.
-	runID := generateRunID()
-
-	// Set process env so the Controller (loadInfraConfigFromEnv) and
-	// spawned containers pick up the remote lakekeeper config.
-	// We use the DATUPLET_* prefixed names that runner.go reads; the
-	// orchestrator translates them into container-level LAKEKEEPER_URL /
-	// WAREHOUSE_NAME / LAKEKEEPER_PROJECT_ID vars automatically.
-	os.Setenv("DATUPLET_LAKEKEEPER_URL", args.LakekeeperURL)              //nolint:errcheck
-	os.Setenv("DATUPLET_LAKEKEEPER_WAREHOUSE", args.WarehouseName)        //nolint:errcheck
-	os.Setenv("DATUPLET_LAKEKEEPER_PROJECT_ID", args.LakekeeperProjectID) //nolint:errcheck
-
-	// Build the Docker orchestrator. The network name is intentionally
-	// generic — containers only need to reach each other via the gateway
-	// sidecar hostname, which is on the same network.
-	orch, err := docker.NewDockerOrchestrator("datuplet-cli-net")
-	if err != nil {
-		return fmt.Errorf("create docker orchestrator: %w", err)
-	}
-	defer orch.Cleanup(context.Background()) //nolint:errcheck
-
-	// Tell the orchestrator to bind-mount ~/.datuplet/token (host) at
-	// /var/run/secrets/datuplet-runtoken/token (container) in every
-	// gateway sidecar and table-commit container so they can authenticate
-	// to lakekeeper. The path is already absolute (loadRemoteArgs calls
-	// filepath.Abs). Docker requires absolute paths for -v mounts.
-	orch.SetRunTokenHostPath(args.TokenPath)
-
-	// Ensure the bridge network exists before launching any container.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := orch.EnsureNetwork(ctx); err != nil {
-		return fmt.Errorf("ensure docker network: %w", err)
-	}
-
-	ctrl := pipeline.New(orch)
-	// Pre-seed run-id so the success message matches the iceberg audit trail.
-	ctrl.SetRunID(runID)
-
-	if err := ctrl.LoadPipeline(pipelineYAML); err != nil {
-		return fmt.Errorf("load pipeline: %w", err)
-	}
-
-	// Wire Ctrl+C → context cancel → orchestrator's existing container
-	// cleanup path. No additional cleanup is needed here: the
-	// orchestrator's defer in ExecuteComponent / ExecuteTableCommit stops
-	// and removes containers on any exit path.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		fmt.Fprintln(os.Stderr, "\nreceived interrupt — stopping containers")
-		cancel()
-	}()
-
-	fmt.Printf("datuplet run --remote %s (project=%s run-id=%s)\n", args.Remote, args.ProjectName, runID)
-
-	if err := ctrl.Run(ctx); err != nil {
-		return fmt.Errorf("pipeline run failed: %w", err)
-	}
-
-	fmt.Printf("run %s succeeded — snapshots: %s/ui/storage\n", runID, args.Remote)
-	return nil
-}
