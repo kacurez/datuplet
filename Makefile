@@ -2,7 +2,7 @@
 export DOCKER_BUILDKIT=1
 
 .PHONY: \
-	build build-pipeline-api build-gateway build-iceberg-job build-services \
+	build build-pipeline-api build-gateway \
 	build-components build-components-e2e build-components-local build-component-data-generator build-operators \
 	build-component-sql-transform build-component-datuplet-query \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
@@ -39,12 +39,6 @@ build-operators: ## Build pipeline-operator binary
 # Build the data gateway sidecar image
 build-gateway: ## Build gateway Docker image
 	docker build -t datuplet/gateway:latest -f utils/docker/Dockerfile.gateway .
-
-# Build the iceberg job image
-build-iceberg-job: ## Build iceberg-job Docker image
-	docker build -t datuplet/iceberg-job:latest -f utils/docker/Dockerfile.iceberg-job .
-
-build-services: build-iceberg-job ## Build service images (iceberg-job)
 
 # Build all components (from root context)
 build-components: build-gateway ## Build all component Docker images
@@ -111,7 +105,7 @@ docker-build-pipeline-observer: ## Build pipeline-observer Docker image (RFC 015
 # Build all K8s images (operators + services). RFC 025 Task 3.3: query-worker
 # is included here now that queryWorker.enabled defaults to true in the chart
 # — a stock deploy-local must have the image available.
-docker-build-k8s: docker-build-operators build-gateway build-iceberg-job docker-build-pipeline-api docker-build-pipeline-observer ## Build all K8s images (operators + gateway + iceberg-job + pipeline-api + pipeline-observer + query-worker)
+docker-build-k8s: docker-build-operators build-gateway docker-build-pipeline-api docker-build-pipeline-observer ## Build all K8s images (operators + gateway + pipeline-api + pipeline-observer + query-worker)
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
 # =============================================================================
@@ -304,8 +298,7 @@ k8s-rebuild-operators: docker-build-operators ## Rebuild operator image + apply 
 	kubectl rollout status deployment/pipeline-operator -n datuplet-e2e --timeout=60s
 	@echo "Operators rebuilt and ready!"
 
-# Rebuild services: gateway, iceberg-job (RFC 007 Slice 9: TG retired)
-k8s-rebuild-services: build-gateway build-iceberg-job ## Rebuild gateway + iceberg-job images
+k8s-rebuild-services: build-gateway ## Rebuild the gateway image
 	@echo "Services rebuilt!"
 
 # Clean up pipelineruns and retry the example (with CRD reload)

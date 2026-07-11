@@ -50,10 +50,6 @@ func main() {
 	gatewayRunTokenPath := gatewayCmd.String("run-token-path", "", "Path to the mounted run-token file (K8s typically sets /var/run/secrets/datuplet-runtoken/tokens). When set, the gateway holds the per-table JSON map of JWTs the gateway forwards to lakekeeper for catalog + STS calls. Also RUN_TOKEN_PATH env var.")
 	gatewayPodAnnotationsPath := gatewayCmd.String("pod-annotations-path", "", "Path to the kubelet downward-API pod-annotations file (K8s typically sets /etc/podinfo/annotations). When set, the gateway polls the file every 5s and exits cleanly on `datuplet.io/cancel=true`. Also POD_ANNOTATIONS_PATH env var.")
 
-	// The table-gateway subcommand has been removed; lakekeeper is now the
-	// catalog of record. The case below still exists so users running the old
-	// subcommand see a clear error instead of a generic "unknown command".
-
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -76,12 +72,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-
-	case "iceberg-job":
-		fmt.Fprintln(os.Stderr, "Error: `datuplet iceberg-job --mode=table-commit` is removed in RFC 021.")
-		fmt.Fprintln(os.Stderr, "Inline commit now lives in the data gateway sidecar. This binary will")
-		fmt.Fprintln(os.Stderr, "grow --mode=compact / expire-snapshots / remove-orphans in a future RFC.")
-		os.Exit(2)
 
 	case "login":
 		loginCmd.Parse(os.Args[2:])
@@ -177,10 +167,6 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "table-gateway":
-		fmt.Fprintln(os.Stderr, "Error: the `table-gateway` subcommand has been removed. Lakekeeper now serves the catalog directly.")
-		os.Exit(1)
-
 	case "version":
 		fmt.Println("datuplet version 0.1.0-poc")
 
@@ -216,8 +202,6 @@ Commands:
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
   gateway                Start the data gateway server (container entrypoint)
-  iceberg-job            (REMOVED in RFC 021) Inline commit now lives in the data gateway sidecar
-  table-gateway          (REMOVED) Lakekeeper now serves the catalog directly
   version                Show version
   help                   Show this help
 
