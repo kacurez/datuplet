@@ -382,7 +382,7 @@ const runTokenMountPath = "/var/run/secrets/datuplet-runtoken"
 
 // runTokenKey is the Secret data key projected to a file at runTokenMountPath.
 // The value is a SINGLE per-run JWT (raw string, no JSON wrapping).
-// DG + TableCommit read this singular file.
+// The DG sidecar reads this singular file.
 const runTokenKey = "token"
 
 // cancelAnnotationFile is the relative path inside the downward-API
@@ -422,8 +422,8 @@ func applyRunTokenMount(podSpec *corev1.PodSpec, gatewayContainer *corev1.Contai
 				DefaultMode: &mode,     // root:fsGroup, readable by group only
 				// Project the SINGLE per-run JWT (raw string, no JSON
 				// wrapping) as a file named `token` under
-				// runTokenMountPath. DG + TableCommit open
-				// /var/run/secrets/datuplet-runtoken/token and attach
+				// runTokenMountPath. The DG sidecar opens
+				// /var/run/secrets/datuplet-runtoken/token and attaches
 				// the contents as `Authorization: Bearer …` on every
 				// lakekeeper call.
 				Items: []corev1.KeyToPath{

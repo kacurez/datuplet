@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **`datuplet run --remote`, `datuplet sample`, `datuplet test-component`.**
+  All local-Docker execution is gone; `datuplet trigger` (cluster-side runs)
+  is the supported path. The local runner had been broken since the run-token
+  hardening + RFC 021 (gateway boot validation + inline commits).
+- **iceberg-job image and `datuplet iceberg-job` subcommand.** Dead since
+  RFC 021 moved commits into the Data Gateway sidecar; the operator chart no
+  longer sets `ICEBERG_JOB_IMAGE` and `image.icebergJob` values are removed.
+- **`pkg/lib/orchestrator` and `pkg/pipeline` runner** (internal packages);
+  `pkg/pipeline/config` (the YAML spec parser) is unchanged.
+
 ## [0.2.1] — 2026-05-19
 
 ### Fixed

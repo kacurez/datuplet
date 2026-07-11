@@ -6,7 +6,6 @@ require (
 	cloud.google.com/go/storage v1.62.1
 	github.com/apache/arrow-go/v18 v18.6.0
 	github.com/apache/iceberg-go v0.5.1-0.20260429200022-af2ddd4adf06
-	github.com/docker/docker v28.5.2+incompatible
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/grafana/pyroscope-go v1.3.0

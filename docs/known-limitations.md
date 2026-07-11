@@ -40,7 +40,7 @@ templates ship with the charts. Recommended manual alert:
 
 **runtimeDefaults.tolerations on a live cluster.** Operators changing
 `runtimeDefaults.tolerations` after the operator is already running must delete
-any Pending per-run Pods (PipelineRun components + TableCommit Jobs) so the
+any Pending per-run Pods (PipelineRun components) so the
 operator rebuilds them with the new tolerations. K8s Pods are immutable; the
 operator doesn't re-template in-place. See RFC 019 §12.6 R1.
 
@@ -48,19 +48,19 @@ operator doesn't re-template in-place. See RFC 019 §12.6 R1.
 
 ## GCS
 
-## GCS TableCommit transaction TTL ceiling
+## GCS inline-commit transaction TTL ceiling
 
 `pkg/datupleticeio/`'s `loadTableRefresh` (the default refresh strategy)
 is currently an unimplemented stub — the factory's vended OAuth bearer
 expires after the lakekeeper-issued TTL (~15 min default; ~1 hour on
-some warehouses) and any in-flight TableCommit transaction that
-exceeds that window fails with `loadTableRefresh: caller did not
-inject a refresh closure`. RFC 019 §4.5.3 describes the planned wiring;
-v0.2 ships the latent code path with a hard-error stub. Typical
-TableCommit transactions complete in seconds to a few minutes, so the
+some warehouses) and any in-flight inline commit transaction (in the DG
+sidecar) that exceeds that window fails with `loadTableRefresh: caller
+did not inject a refresh closure`. RFC 019 §4.5.3 describes the planned
+wiring; v0.2 ships the latent code path with a hard-error stub. Typical
+inline commit transactions complete in seconds to a few minutes, so the
 ceiling is rarely hit in practice. Sufficiently large commits
 (e.g., ReplaceDataFiles on a 100GB+ partition) may exceed the window —
-in which case the operator must retry with a smaller batch.
+in which case the run must be retried with a smaller batch.
 
 **GCS audit attribution.** Lakekeeper vends GCS tokens scoped to the per-table
 prefix (via Credential Access Boundaries). However, GCP Cloud Audit Logs record
@@ -135,12 +135,13 @@ tooling is follow-up work.
 
 ---
 
-## Pipeline operator + TableCommit
+## Pipeline operator + inline commits
 
 **Cold-start tables fail.** Tables not yet registered in Lakekeeper fail with
 "table not found in catalog" on first read. The Data Gateway creates tables on
 first write via `LoadOrCreate`, so this path is rare in practice. Creating tables
-at TableCommit time rather than at write time is follow-up work.
+at inline-commit time (in the DG sidecar's commit pool) rather than at write
+time is follow-up work.
 
 ---
 

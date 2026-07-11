@@ -162,9 +162,10 @@ func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]s
 // must be explicitly set to "true". Lakekeeper's standard loadTable response
 // includes the gcs.oauth2.refresh-credentials-endpoint key by default; the
 // prior `enabled != "false"` condition would have fail-fasted every WIF
-// TableCommit (the endpoint prop is always present). The opt-in guard ensures
-// the factory construction succeeds when Lakekeeper emits the endpoint without
-// the caller explicitly enabling it, which is the default deployment shape.
+// inline commit (the endpoint prop is always present). The opt-in guard
+// ensures the factory construction succeeds when Lakekeeper emits the
+// endpoint without the caller explicitly enabling it, which is the default
+// deployment shape.
 func pickRefresh(props map[string]string) (refreshFunc, bool) {
 	ep := props["gcs.oauth2.refresh-credentials-endpoint"]
 	enabled := props["gcs.oauth2.refresh-credentials-enabled"]
@@ -381,7 +382,7 @@ func (g *gcsIO) Remove(name string) error {
 // is a no-op, but it is the correct cleanup point — future gcsblob
 // versions may close the storage.Client there.
 //
-// TODO(rfc-019): wire defer io.Close() in pkg/icebergjob/commit.go and
+// TODO(rfc-019): wire defer io.Close() in pkg/icebergjob/commit_shared.go and
 // pkg/datagateway/lakekeeper/lakekeeper.go once the iceio.IO interface
 // is annotated to accept a Closer, or the call sites obtain *gcsIO
 // directly via a type assertion.
@@ -390,10 +391,10 @@ func (g *gcsIO) Close() error {
 }
 
 // Create satisfies iceio.WriteFileIO.Create. iceberg-go calls this for
-// snapshot manifest avro files and table metadata.json on every
-// TableCommit AddFiles → updateSnapshot path. Without this method,
-// iceberg-go's type-assert to iceio.WriteFileIO panics at write time
-// (v0.2.0 regression fixed in v0.2.1).
+// snapshot manifest avro files and table metadata.json on every inline
+// commit's AddFiles → updateSnapshot path (icebergjob.CommitTableFiles).
+// Without this method, iceberg-go's type-assert to iceio.WriteFileIO panics
+// at write time (v0.2.0 regression fixed in v0.2.1).
 func (g *gcsIO) Create(name string) (iceio.FileWriter, error) {
 	key, err := g.preprocess(name)
 	if err != nil {

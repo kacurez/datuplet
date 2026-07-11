@@ -166,8 +166,8 @@ The component is intentionally creds-clean. Per-step:
 
 1. **Inputs.** For each declared input, DG opens the input via `OpenReader(FORMAT_ARROW_IPC)` and row-group-streams parquet→arrow IPC. The SDK's `sdk/go/arrow.NewReader` wraps the gRPC stream as an `array.RecordReader`. The component calls `arrow.RegisterView(reader, viewName)` to register the input as a DuckDB view via the arrow_scan extension. **No parquet files touch the component's local disk.**
 2. **SQL.** The user's SQL string runs verbatim against the view set. DuckDB executes it in-process; intermediate `CREATE TABLE …` statements stay in DuckDB local memory or spill to `/tmp/duckdb-spill` (configurable via `config.temp_directory`).
-3. **Outputs.** For each declared output, the component runs `COPY <sdk-name> TO '<staged>.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY)`, reads the staged parquet, and streams it to DG via `OpenWriterToBucket` + `WriteChunk` + `Close`. DG re-emits the parquet to the iceberg target prefix using lakekeeper-vended STS creds, and writes the per-target `files.json` the post-stage iceberg-job consumes.
-4. **Commit.** Outside the component. The standard `iceberg-job --mode=table-commit` Job runs once per output bucket; CommitTable reads the `files.json`, opens an iceberg transaction, calls `txn.AddFiles` (APPEND) or `txn.ReplaceDataFiles` (FULL_LOAD), and commits via lakekeeper. 409 conflicts retry via `catalogwriter.RetryOnConflict`.
+3. **Outputs.** For each declared output, the component runs `COPY <sdk-name> TO '<staged>.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY)`, reads the staged parquet, and streams it to DG via `OpenWriterToBucket` + `WriteChunk` + `Close`. DG re-emits the parquet to the iceberg target prefix using lakekeeper-vended STS creds, and writes the per-target `files.json` as an audit breadcrumb.
+4. **Commit.** Inline in the DG sidecar, outside the component. CloseWriter dispatches the writer's parquet paths to the DG's in-process commit pool, which calls `icebergjob.CommitTableFiles`: it opens an iceberg transaction, calls `txn.AddFiles` (APPEND) or `txn.ReplaceDataFiles` (FULL_LOAD), and commits via lakekeeper. There is no separate commit Job. 409 conflicts retry via `catalogwriter.RetryOnConflict`.
 
 The component process never holds production S3 credentials; DG's `pkg/catalogwriter/VendedCreds` handles per-table STS scoping + auto-refresh at 50%-elapsed TTL.
 
@@ -185,7 +185,7 @@ config:
 
 ## Failure semantics
 
-- **Bad SQL / missing column** → component exits 1 (`FailedUser`); operator marks the run failed; no commit Job runs.
+- **Bad SQL / missing column** → component exits 1 (`FailedUser`); operator marks the run failed; no commit happens.
 - **DG / lakekeeper unavailable, transient network failure** → component exits ≥20 (`FailedApplication`); same teardown.
 - **Identifier rejected** (logical or physical name doesn't match `^[A-Za-z_][A-Za-z0-9_]*$`) → `FailedUser` at component startup.
 - **Run cancelled** → DG's gateway sidecar's annotation watcher fires; in-flight writers close cleanly; partial parquet at target prefixes are orphans (sweepable later).

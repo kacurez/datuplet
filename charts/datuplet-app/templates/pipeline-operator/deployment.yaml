@@ -1,16 +1,17 @@
 {{- /*
 pipeline-operator Deployment.
 
-This is the only operator. The PipelineRun controller schedules commit Jobs
-directly when a stage's component Pods complete.
+This is the only operator. The PipelineRun controller builds one component
+Job per stage component; the Data Gateway sidecar commits Iceberg tables
+inline (RFC 021), so there are no separate commit Jobs.
 
-Long-lived S3/GCS credentials are NOT forwarded to the operator or to spawned
-commit Job Pods. Commit Pods use only the run-token JWT; lakekeeper vends
-per-table STS credentials for all data-plane access.
+Long-lived S3/GCS credentials are NOT forwarded to the operator or to the
+spawned component Pods. The DG sidecar uses only the run-token JWT; lakekeeper
+vends per-table STS credentials for all data-plane access.
 
 The operator no longer carries warehouse/project knowledge. The PipelineAPIURL
-drives the JWKS endpoint DG sidecars + commit Jobs use to validate the mounted
-run-token JWT, which carries warehouse + project_id claims.
+drives the JWKS endpoint DG sidecars use to validate the mounted run-token
+JWT, which carries warehouse + project_id claims.
 
 Note: automountServiceAccountToken left at default (true) — operator needs K8s
 API access.
@@ -50,26 +51,24 @@ spec:
           image: "{{ .Values.image.pipelineOperator.repository }}:{{ .Values.image.pipelineOperator.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            # LAKEKEEPER_URL is forwarded to spawned commit containers for
-            # metadata commits.
+            # LAKEKEEPER_URL is injected into every component/gateway Pod so
+            # the Data Gateway sidecar can reach the catalog for its inline
+            # commits.
             - name: LAKEKEEPER_URL
               value: {{ include "datuplet-app.lakekeeperUrl" . | quote }}
             # Base URL of pipeline-api. The operator derives the JWKS URL
             # ({PIPELINE_API_URL}/api/v1/auth/jwks.json) and injects it into every
-            # DG sidecar configMap + commit Job env so they can validate the
-            # mounted run-token JWT against pipeline-api's published keys.
+            # DG sidecar configMap so it can validate the mounted run-token
+            # JWT against pipeline-api's published keys.
             - name: PIPELINE_API_URL
               value: {{ include "datuplet-app.pipelineApiInClusterUrl" . | quote }}
-            # Image tags for the two pod types the operator spawns:
-            # component-pod gateway sidecars and per-table commit Jobs.
-            # Plumbed from chart values so release artifacts pin versioned
-            # tags while local dev defaults to :latest.
+            # Image tag for the gateway sidecar the operator injects into
+            # component Pods. Plumbed from chart values so release artifacts
+            # pin versioned tags while local dev defaults to :latest.
             - name: GATEWAY_IMAGE
               value: "{{ .Values.image.gateway.repository }}:{{ .Values.image.gateway.tag }}"
-            - name: ICEBERG_JOB_IMAGE
-              value: "{{ .Values.image.icebergJob.repository }}:{{ .Values.image.icebergJob.tag }}"
             # Runtime pull policy applied by the operator to per-run
-            # pods (gateway sidecar, component container, commit Job).
+            # pods (gateway sidecar, component container).
             # Mirrors image.pullPolicy so a single helm value drives
             # both chart-managed Deployments and operator-spawned pods.
             # Empty = operator default (Always).

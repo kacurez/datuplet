@@ -67,9 +67,9 @@ These are conventions a new contributor wouldn't infer from the code:
   `pkg/datagateway/server_v2.go`, `pkg/datagateway/partition/router.go`,
   `pkg/datagateway/buffer/manager.go`).
 - **`pkg/lib/datalake/` is metadata-only fallback I/O** (Read / Write / List),
-  used by TableCommit (manifest read) and the pipeline-api storage walker
-  fallback. **`pkg/datagateway/backend/`** is the full data-plane
-  abstraction (buffering, format conversion, backends). Don't confuse the two.
+  used by the pipeline-api storage walker fallback. **`pkg/datagateway/backend/`**
+  is the full data-plane abstraction (buffering, format conversion, backends).
+  Don't confuse the two.
 - **Buffer package (`pkg/datagateway/buffer/`) outputs Parquet only.** For
   other formats on read, use `pkg/datagateway/format/` adapters to convert
   on the fly.
@@ -100,8 +100,9 @@ These are conventions a new contributor wouldn't infer from the code:
   handlers.
 - **Lakekeeper is the catalog of record.** Data Gateway calls lakekeeper
   for table create/load + STS-vended credentials
-  (`pkg/datagateway/lakekeeper/`); TableCommit posts metadata commits to
-  lakekeeper REST (`pkg/icebergjob/`); pipeline-api's `/api/v1/storage`
+  (`pkg/datagateway/lakekeeper/`); the Data Gateway's inline commit pool
+  posts metadata commits to lakekeeper REST via the `pkg/icebergjob/`
+  library (RFC 021); pipeline-api's `/api/v1/storage`
   handlers proxy lakekeeper via a service-account JWT
   (`pkg/pipelineapi/storage/catalog_proxy.go`) when
   `DATUPLET_LAKEKEEPER_URL` is set, falling back to a directory walker
@@ -111,10 +112,15 @@ These are conventions a new contributor wouldn't infer from the code:
   (inside the table's lakekeeper-managed prefix). Wire shape in
   `pkg/datagateway/files_manifest.go`:
   `{"run_id":"...", "namespace":"...", "table":"...", "paths":[...]}`.
-  TableCommit loads the table, derives the per-table manifest path, reads
-  through the iceberg-go FS (vended creds, not the long-lived MinIO mount),
-  then runs `txn.AddFiles` + `Commit`. Missing manifest on a known table
-  = success-zero.
+  Since RFC 021 the manifest is an audit breadcrumb (write failure is a
+  logged warning, not fatal): commits happen inline in the Data Gateway.
+  CloseWriter dispatches the writer's parquet paths to the commit pool
+  (`pkg/datagateway/commit_pool.go`), which calls
+  `icebergjob.CommitTableFiles` — `txn.AddFiles` (APPEND) or
+  `txn.ReplaceDataFiles` (FULL_LOAD), 409-conflict retry, idempotency key
+  in the snapshot summary. The session Commit RPC is the barrier that
+  drains the pool and reconciles per-writer results. Zero paths =
+  success-zero.
 - **Per-run JWT**: pipeline-api mints **one RS256 JWT per run** via
   `tokens.MintRunToken`. Audience is `datuplet-catalog` (lakekeeper). The
   K8s run-token Secret carries a single `token` key.
@@ -141,11 +147,10 @@ These are conventions a new contributor wouldn't infer from the code:
   `user:oidc~<run-uuid>`; trigger writes
   `(user:oidc~<run-uuid>, editor, project:<lakekeeper-project-id>)`. Each
   run gets one RS256 JWT (`aud=datuplet-catalog`, 24h). Interactive
-  storage browse uses 5-minute impersonation JWTs
+  storage browse uses 60-second impersonation JWTs
   (`tokens.MintImpersonation`).
-- **JWT-driven warehouse routing**: Data Gateway sidecars and TableCommit
-  Jobs validate the mounted run-token JWT against pipeline-api's JWKS at
-  boot. The validator checks signature (RS256 only), `iss=datuplet-api`,
+- **JWT-driven warehouse routing**: Data Gateway sidecars validate the
+  mounted run-token JWT against pipeline-api's JWKS at boot. The validator checks signature (RS256 only), `iss=datuplet-api`,
   `aud=datuplet-catalog`, exp/nbf with ±60 s skew, `token_kind=run`,
   required non-empty `project_id`/`warehouse`/`run_id`/`sub`,
   `sub == run_id`, and `run_id == $RUN_ID` (Secret-swap defence). On any
@@ -197,15 +202,15 @@ These are conventions a new contributor wouldn't infer from the code:
 
 | Directory | Purpose |
 |-----------|---------|
-| `pkg/pipeline/` | Pipeline execution engine. |
+| `pkg/pipeline/config/` | Pipeline YAML spec parser (shared by operator + pipeline-api). |
 | `pkg/datagateway/` | Data Gateway service (format conversion, processors, buffering). |
 | `pkg/datagateway/backend/` | Storage backends (MinIO/S3, GCS, local FS). |
 | `pkg/datagateway/lakekeeper/` | Data Gateway's lakekeeper resolver. |
 | `pkg/datupleticeio/` | iceberg-go `gs://` IO factory override (vended OAuth tokens). |
-| `pkg/icebergjob/` | TableCommit Job binary (per-table iceberg-go transactions). |
+| `pkg/icebergjob/` | Shared iceberg-commit library (`CommitTableFiles` / `CommitTable`); used by the DG commit pool. |
 | `pkg/catalogwriter/` | Shared lakekeeper REST client + VendedCreds. |
 | `pkg/k8s/api/v1/` | CRD types (Pipeline, PipelineRun). |
-| `pkg/k8s/controllers/` | PipelineRun controller; schedules per-table commit Jobs. |
+| `pkg/k8s/controllers/` | PipelineRun controller; builds per-stage component Jobs. |
 | `cmd/pipeline-operator/` | Operator binary. |
 | `cmd/pipeline-observer/` | Standalone informer; mirrors PipelineRun status to DB. |
 | `cmd/pipeline-api/` | HTTP server + admin subcommands. |

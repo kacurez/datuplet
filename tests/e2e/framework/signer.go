@@ -108,7 +108,7 @@ func MintTestUserImpersonation(ctx context.Context, signer *tokens.Signer, userI
 // jti=run-tok-<run-uuid>.
 //
 // projectID is forwarded as the JWT `project_id` claim — pass
-// FGAHarness.LakekeeperProjectID. DG / TableCommit forward it as the
+// FGAHarness.LakekeeperProjectID. DG forwards it as the
 // x-project-id header on every lakekeeper REST call, so the value MUST
 // be the lakekeeper Project UUID, not the Datuplet project UUID.
 //

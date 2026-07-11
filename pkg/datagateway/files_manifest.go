@@ -2,10 +2,9 @@
 //
 // At end-of-stream the gateway writes ONE manifest per (namespace, table)
 // the run touched. Each manifest lists the parquet files DG produced for
-// that table; TableCommit consumes it via iceberg-go's
-// `txn.AddFiles(paths, nil, false)` (the catalog re-reads the parquet
-// footers and extracts column statistics on its side, so the manifest
-// itself only carries paths — no DataFileRecord stats).
+// that table; since RFC 021 it is an audit breadcrumb (the inline commit
+// pool passes paths in memory), and icebergjob.CommitTable remains the
+// reader for out-of-band consumers.
 //
 // Manifest placement:
 //
@@ -63,7 +62,7 @@ type TableFiles struct {
 
 // tableManifestJSON is the on-the-wire shape of the per-table manifest.
 // One manifest blob = one (namespace, table); no `tables` array.
-// Consumed by TableCommit via iceberg-go's txn.AddFiles.
+// Read back by icebergjob.CommitTable (out-of-band consumers).
 type tableManifestJSON struct {
 	RunID     string   `json:"run_id"`
 	Namespace string   `json:"namespace"`
@@ -84,7 +83,9 @@ func (m *FilesManifest) RunID() string { return m.runID }
 
 // Append records a single parquet file write. namespace == bucket,
 // table == table name. path is the fully-qualified URL the file was written
-// to (passed verbatim to TableCommit later).
+// to (the inline commit pool passes these paths to
+// icebergjob.CommitTableFiles at CloseWriter; the files.json manifest is an
+// audit breadcrumb).
 //
 // Safe for concurrent use. Within a (namespace, table) bucket the call
 // order is preserved so the resulting manifest is deterministic for a

@@ -10,9 +10,9 @@ stringData:
   # Standard AWS env var names
   AWS_ACCESS_KEY_ID: minioadmin
   AWS_SECRET_ACCESS_KEY: minioadmin
-  # S3 env var names (for table-commit).
+  # S3 env var names.
   # S3_ENDPOINT must be an FQDN: returned to clients verbatim
-  # verbatim to DataGateway + TableCommit pods in other namespaces
+  # verbatim to DataGateway pods in other namespaces
   # (datuplet-<project-uuid>) via ResolveWrite/ResolveCommit
   # responses, and a bare `minio:9000` only resolves in the namespace
   # MinIO itself lives in. Using the FQDN keeps the same value working

@@ -15,24 +15,8 @@ import (
 )
 
 func main() {
-	testCmd := flag.NewFlagSet("test-component", flag.ExitOnError)
-	testImage := testCmd.String("image", "", "Component image to test")
-	testConfig := testCmd.String("config", "{}", "Component config (JSON)")
-	testEndpoint := testCmd.String("endpoint", "localhost:9000", "Data lake endpoint")
-	testBucket := testCmd.String("bucket", "datuplet", "Data lake bucket")
-
-	sampleCmd := flag.NewFlagSet("sample", flag.ExitOnError)
-	sampleImage := sampleCmd.String("image", "", "Component image to sample (required)")
-	sampleConfig := sampleCmd.String("config", "{}", "Component config (JSON)")
-	sampleLimit := sampleCmd.Int("limit", 10, "Maximum number of rows to return")
-
 	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
 	loginRemote := loginCmd.String("remote", "", "pipeline-api URL (required)")
-
-	runCmd := flag.NewFlagSet("run", flag.ExitOnError)
-	runRemoteFlag := runCmd.String("remote", "", "pipeline-api URL of the target cluster (required for remote runs)")
-	runTokenFile := runCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
-	runProject := runCmd.String("project", "", "Project name to run under (required if you have access to >1 project; auto-defaulted if you have exactly one)")
 
 	triggerCmd := flag.NewFlagSet("trigger", flag.ExitOnError)
 	triggerRemote := triggerCmd.String("remote", "", "pipeline-api URL (required)")
@@ -66,40 +50,12 @@ func main() {
 	gatewayRunTokenPath := gatewayCmd.String("run-token-path", "", "Path to the mounted run-token file (K8s typically sets /var/run/secrets/datuplet-runtoken/tokens). When set, the gateway holds the per-table JSON map of JWTs the gateway forwards to lakekeeper for catalog + STS calls. Also RUN_TOKEN_PATH env var.")
 	gatewayPodAnnotationsPath := gatewayCmd.String("pod-annotations-path", "", "Path to the kubelet downward-API pod-annotations file (K8s typically sets /etc/podinfo/annotations). When set, the gateway polls the file every 5s and exits cleanly on `datuplet.io/cancel=true`. Also POD_ANNOTATIONS_PATH env var.")
 
-	// The table-gateway subcommand has been removed; lakekeeper is now the
-	// catalog of record. The case below still exists so users running the old
-	// subcommand see a clear error instead of a generic "unknown command".
-
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
 	}
 
 	switch os.Args[1] {
-	case "test-component":
-		testCmd.Parse(os.Args[2:])
-		if *testImage == "" {
-			fmt.Println("Error: --image is required")
-			fmt.Println("Usage: datuplet test-component --image <image> [options]")
-			os.Exit(1)
-		}
-		if err := testComponent(*testImage, *testConfig, *testEndpoint, *testBucket); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "sample":
-		sampleCmd.Parse(os.Args[2:])
-		if *sampleImage == "" {
-			fmt.Println("Error: --image is required")
-			fmt.Println("Usage: datuplet sample --image <image> [options]")
-			os.Exit(1)
-		}
-		if err := sampleComponent(*sampleImage, *sampleConfig, *sampleLimit); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
 	case "gateway":
 		gatewayCmd.Parse(os.Args[2:])
 		if !*gatewayLocal && !*gatewayMinio {
@@ -113,30 +69,6 @@ func main() {
 		runTokenPath := resolveRunTokenPath(*gatewayRunTokenPath, os.Getenv("RUN_TOKEN_PATH"))
 		podAnnotationsPath := resolveRunTokenPath(*gatewayPodAnnotationsPath, os.Getenv("POD_ANNOTATIONS_PATH"))
 		if err := runGateway(mode, *gatewayConfig, *gatewayDataDir, *gatewayAddr, runTokenPath, podAnnotationsPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "iceberg-job":
-		fmt.Fprintln(os.Stderr, "Error: `datuplet iceberg-job --mode=table-commit` is removed in RFC 021.")
-		fmt.Fprintln(os.Stderr, "Inline commit now lives in the data gateway sidecar. This binary will")
-		fmt.Fprintln(os.Stderr, "grow --mode=compact / expire-snapshots / remove-orphans in a future RFC.")
-		os.Exit(2)
-
-	case "run":
-		runCmd.Parse(os.Args[2:])
-		if *runRemoteFlag == "" {
-			fmt.Fprintln(os.Stderr, "Error: --remote is required")
-			fmt.Fprintln(os.Stderr, "Usage: datuplet run --remote <pipeline-api-url> <pipeline.yaml>")
-			os.Exit(1)
-		}
-		pipelineArgs := runCmd.Args()
-		if len(pipelineArgs) == 0 {
-			fmt.Fprintln(os.Stderr, "Error: pipeline YAML path is required")
-			fmt.Fprintln(os.Stderr, "Usage: datuplet run --remote <pipeline-api-url> <pipeline.yaml>")
-			os.Exit(1)
-		}
-		if err := runRemote(*runRemoteFlag, *runTokenFile, *runProject, pipelineArgs[0]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -235,10 +167,6 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "table-gateway":
-		fmt.Fprintln(os.Stderr, "Error: the `table-gateway` subcommand has been removed. Lakekeeper now serves the catalog directly.")
-		os.Exit(1)
-
 	case "version":
 		fmt.Println("datuplet version 0.1.0-poc")
 
@@ -269,26 +197,16 @@ Usage:
 
 Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
-  run                    Run a pipeline against a remote Datuplet cluster
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
   pipeline               CRUD for pipeline specs (list, get, put, delete)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
   gateway                Start the data gateway server (container entrypoint)
-  iceberg-job            (REMOVED in RFC 021) Inline commit now lives in the data gateway sidecar
-  table-gateway          (REMOVED) Lakekeeper now serves the catalog directly
-  test-component         Test a single component
-  sample                 Get sample data from a component (for AI/automation)
   version                Show version
   help                   Show this help
 
 Options for 'login':
   -remote string         pipeline-api URL (required)
-
-Options for 'run':
-  -remote string         pipeline-api URL of the target cluster (required)
-  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
-  <pipeline.yaml>        Path to pipeline YAML file (positional, required)
 
 Options for 'trigger':
   -remote string         pipeline-api URL (required)
@@ -323,19 +241,6 @@ Options for 'gateway':
   -data-dir string       Data directory for local mode (default: ./data)
   -addr string           gRPC server address (default: :50051)
 
-Options for 'test-component':
-  -image string          Component image to test (required)
-  -config string         Component config as JSON (default: {})
-  -endpoint string       Data lake endpoint (default: localhost:9000)
-  -bucket string         Data lake bucket (default: datuplet)
-
-Options for 'sample':
-  -image string          Component image to sample (required)
-  -config string         Component config as JSON (default: {})
-  -limit int             Maximum number of rows to return (default: 10)
-
 Examples:
-  datuplet gateway --minio --config minio.yaml
-  datuplet test-component --image datuplet/data-generator:latest --config '{"tables":[{"name":"t","random":{"schema":{"id":"int"},"limit":{"rowsCount":5}}}]}'
-  datuplet sample --image datuplet/data-generator:latest --config '{"tables":[{"name":"t","random":{"schema":{"id":"int"},"limit":{"rowsCount":5}}}]}' --limit 5`)
+  datuplet gateway --minio --config minio.yaml`)
 }

@@ -14,7 +14,7 @@ env:
 
 jobs:
   # Service images: pipeline-api, pipeline-observer, pipeline-operator,
-  # gateway, iceberg-job. Appears as one top-level "services" row in
+  # gateway, query-worker. Appears as one top-level "services" row in
   # the run-detail UI; expanding shows 15 flat entries (5 images × 3
   # sub-jobs) named "<image>:amd64", "<image>:arm64", "<image>:manifest".
   # Per-image collapsible groups inside the bucket aren't possible —
@@ -68,11 +68,11 @@ jobs:
           APP_VALUES=charts/datuplet-app/values.yaml
           INFRA_VALUES=charts/datuplet-infra/values.yaml
 
-          # Repoint image.repository to ghcr.io/<owner>/<image>. The six
+          # Repoint image.repository to ghcr.io/<owner>/<image>. The five
           # image refs in datuplet-app and the one in datuplet-infra are
           # the only "repository: datuplet/X" lines in these files, so
           # bare-line sed is unambiguous.
-          for img in pipeline-api pipeline-operator pipeline-observer gateway iceberg-job query-worker; do
+          for img in pipeline-api pipeline-operator pipeline-observer gateway query-worker; do
             sed -i "s|repository: datuplet/${img}\$|repository: ${REGISTRY}/${OWNER}/${img}|" "$APP_VALUES"
           done
           sed -i "s|repository: datuplet/pipeline-api\$|repository: ${REGISTRY}/${OWNER}/pipeline-api|" "$INFRA_VALUES"

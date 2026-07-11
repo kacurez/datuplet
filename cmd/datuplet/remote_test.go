@@ -176,52 +176,6 @@ func TestLoadRemoteArgs_MissingClusterJSON(t *testing.T) {
 	}
 }
 
-// TestRunRemote_GeneratesUniqueRunID verifies that two consecutive
-// loadRemoteArgs calls (which underpins the run-id generation path)
-// would produce different UUIDs. We test the uuid generation directly
-// since runRemote itself launches Docker containers — full orchestration
-// coverage lives in slice B.6's Helm-install e2e.
-func TestRunRemote_GeneratesUniqueRunID(t *testing.T) {
-	// We test uuid.New() indirectly: call the helper twice and confirm
-	// uniqueness. This pins the guarantee that run-ids are never reused.
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	meta := clusterMeta{
-		LakekeeperURL:  "http://lk:8181/catalog",
-		WarehouseName:  "datuplet",
-		ExpiresAt:      "2099-01-01T00:00:00Z",
-		PipelineAPIURL: "http://api",
-		Projects: []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
-	}
-	writeDatupletFiles(t, tmp, fakeJWT, meta)
-
-	args1, err := loadRemoteArgs("http://api", "", "")
-	if err != nil {
-		t.Fatalf("first loadRemoteArgs: %v", err)
-	}
-	args2, err := loadRemoteArgs("http://api", "", "")
-	if err != nil {
-		t.Fatalf("second loadRemoteArgs: %v", err)
-	}
-
-	// loadRemoteArgs itself doesn't generate run-ids (runRemote does),
-	// but we can confirm both calls return valid args, then separately
-	// confirm the UUID generation is unique.
-	_ = args1
-	_ = args2
-
-	// Direct test of the UUID generation: two calls must differ.
-	id1 := generateRunID()
-	id2 := generateRunID()
-	if id1 == id2 {
-		t.Errorf("expected unique run-ids, got identical: %q", id1)
-	}
-	if id1 == "" || id2 == "" {
-		t.Errorf("run-id must be non-empty")
-	}
-}
-
 // TestLoadRemoteArgs_TokenNotInError ensures the raw JWT is never leaked
 // into error messages (security invariant).
 func TestLoadRemoteArgs_TokenNotInError(t *testing.T) {

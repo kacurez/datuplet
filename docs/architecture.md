@@ -25,9 +25,7 @@ graph LR
     DG -->|STS vended creds| S3[(S3 / GCS / MinIO)]
     DG -->|LoadOrCreate table| LK[Lakekeeper]
     LK -->|Vend STS| DG
-
-    PO -->|Schedules| TC[TableCommit Job]
-    TC -->|AddFiles + Commit| LK
+    DG -->|AddFiles + Commit| LK
 
     PA -->|Check| FGA[OpenFGA]
     PO -->|Check| FGA
@@ -110,7 +108,7 @@ Responsibilities:
 - OIDC discovery (`/.well-known/openid-configuration`) and JWKS publication.
   Lakekeeper polls this to validate run-token JWTs.
 - Storage browse proxy at `/api/v1/storage/*` — forwards requests to Lakekeeper
-  with a short-lived (5 min) impersonation JWT.
+  with a short-lived (60 s) impersonation JWT.
 - Browser SPA at `/ui/*` (vanilla ES modules, no build step).
 
 ### pipeline-observer
@@ -130,8 +128,10 @@ lifecycle:
 
 1. Creates per-stage component Pods (one Pod per component per stage).
 2. Injects the Data Gateway sidecar + run-token Secret into every Pod.
-3. On stage completion, schedules a TableCommit Job per output table.
-4. Propagates cancellation via pod annotation `datuplet.io/cancel=true`.
+3. Propagates cancellation via pod annotation `datuplet.io/cancel=true`.
+
+Iceberg commits are not the operator's job: since RFC 021 the Data Gateway
+sidecar commits tables inline (see below).
 
 ### Data Gateway sidecar
 
@@ -148,23 +148,23 @@ Responsibilities per write:
 - Calls Lakekeeper `LoadOrCreate` to get (or create) the table and STS credentials.
 - Buffers incoming data (up to 128 MB per file), converts to Parquet, writes via
   STS-vended S3 credentials.
-- Writes a `files.json` manifest at
+- Writes a `files.json` audit breadcrumb at
   `<table-base>/.run-state/<run-id>/files.json` listing the written parquet paths.
+
+Responsibilities per commit (RFC 021 — inline, no separate Job):
+- On `CloseWriter`, dispatches the writer's parquet paths to an in-process
+  commit worker pool (`pkg/datagateway/commit_pool.go`).
+- Each commit opens an Iceberg transaction at Lakekeeper via the
+  `pkg/icebergjob` library: `txn.AddFiles` (APPEND) or `txn.ReplaceDataFiles`
+  (FULL_LOAD), retried on 409 conflict with exponential backoff, with an
+  idempotency key stamped into the snapshot summary.
+- The session `Commit` RPC is the barrier: it drains the pool and reconciles
+  per-writer results.
 
 Responsibilities per read:
 - Fetches the current Iceberg snapshot from Lakekeeper.
 - Streams parquet row-groups to the component in the requested format (Parquet,
   Arrow IPC, CSV, JSON).
-
-### TableCommit Job
-
-A short-lived Job scheduled by the operator after each pipeline stage. One Job per
-output table.
-
-Reads the `files.json` manifest left by the Data Gateway, opens an Iceberg
-transaction at Lakekeeper, calls `txn.AddFiles` (APPEND) or
-`txn.ReplaceDataFiles` (FULL_LOAD), and commits. Retries on 409 conflict up to 5
-times with exponential backoff.
 
 ### Lakekeeper
 
@@ -216,12 +216,14 @@ A complete pipeline run from trigger to committed Iceberg table:
    table, receives STS credentials, writes parquet to S3/GCS. DG accumulates
    chunks into 128 MB parquet files.
 
-5. **Finalize.** Component calls `Commit` → DG writes `files.json` manifest per
-   table inside the table's Iceberg-managed prefix.
+5. **Finalize.** Component closes each writer → DG writes a `files.json` audit
+   breadcrumb per table inside the table's Iceberg-managed prefix and dispatches
+   the writer's parquet paths to its inline commit pool.
 
-6. **Commit.** Operator schedules a TableCommit Job per output table. Job reads
-   `files.json`, opens an iceberg-go transaction against Lakekeeper, `AddFiles` /
-   `ReplaceDataFiles`, commits.
+6. **Commit.** The pool opens an iceberg-go transaction against Lakekeeper,
+   `AddFiles` / `ReplaceDataFiles`, commits (retrying on 409 conflict). The
+   component's session `Commit` call blocks until every dispatched commit
+   finishes, then reconciles the results.
 
 7. **Cancel.** If the run is cancelled, pipeline-api deletes the FGA tuple (blast
    radius: next STS renewal after ≤15 s will fail). Operator sets
@@ -237,8 +239,8 @@ Four token types in descending lifetime:
 | Token | Who holds it | Lifetime | Purpose |
 |---|---|---|---|
 | Session cookie | Browser / API client | 24 h sliding | Authenticate to pipeline-api |
-| Run-token JWT | DG sidecar + TableCommit Job | 24 h | Authenticate to Lakekeeper catalog |
-| Impersonation JWT | pipeline-api storage proxy | 5 min | Interactive storage browse |
+| Run-token JWT | DG sidecar | 24 h | Authenticate to Lakekeeper catalog |
+| Impersonation JWT | pipeline-api storage proxy | 60 s | Interactive storage browse |
 | STS credential | DG sidecar (in-memory) | ≤15 min | S3 / GCS object writes |
 
 For the full token lifecycle, see [docs/auth-flow.md](auth-flow.md).
