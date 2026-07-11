@@ -10,7 +10,7 @@
 tolerations: []
 
 # Tolerations applied to per-run Pods spawned by the pipeline-operator
-# (PipelineRun component Pods + TableCommit Job Pods). Empty default
+# (PipelineRun component Pods). Empty default
 # means no tolerations are injected (pass-through to spec.tolerations on each Pod).
 #
 # Example for an all-ARM GKE node pool:
@@ -35,11 +35,6 @@ image:
   # component Pod's gateway sidecar via the GATEWAY_IMAGE env var.
   gateway:
     repository: datuplet/gateway
-    tag: latest
-  # iceberg-job image — pipeline-operator passes this to every spawned
-  # TableCommit Job via the ICEBERG_JOB_IMAGE env var.
-  icebergJob:
-    repository: datuplet/iceberg-job
     tag: latest
 
 # FGA model version. Bump when files/fga/** changes.

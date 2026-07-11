@@ -22,7 +22,7 @@ TEMP SPILL:
     per-slot = 2048 / 2 = 1024 MiB → "1024MiB"
 
 JWKS URL: uses the same in-cluster pipeline-api endpoint as DG sidecars
-and tablecommit Jobs ({pipelineApiInClusterUrl}/api/v1/auth/jwks.json).
+({pipelineApiInClusterUrl}/api/v1/auth/jwks.json).
 
 Pod hardening matches the repo convention:
   automountServiceAccountToken: false — query-worker needs no K8s API access.
@@ -78,7 +78,7 @@ spec:
           env:
             # ---- Required ------------------------------------------------
             # JWKS endpoint: same in-cluster pipeline-api URL used by DG
-            # sidecars and tablecommit Jobs for run-token validation.
+            # sidecars for run-token validation.
             - name: DATUPLET_QUERY_WORKER_JWKS_URL
               value: "{{ include "datuplet-app.pipelineApiInClusterUrl" . }}/api/v1/auth/jwks.json"
             # Lakekeeper catalog: same in-cluster URL as all other components.
