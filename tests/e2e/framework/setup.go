@@ -1,7 +1,8 @@
 // Package framework — fixture setup helpers.
 //
-// PreCheck validates K8s infrastructure availability. Requires an OrbStack
-// context with `make deploy-local` having run `pipeline-api admin authz-bootstrap`.
+// PreCheck validates K8s infrastructure availability on the current kubectl
+// context. Set DATUPLET_E2E_CONTEXT to guard against running against an
+// unintended cluster.
 package framework
 
 import (
@@ -11,44 +12,29 @@ import (
 	"strings"
 )
 
-// PreCheck validates that the K8s infrastructure is available.
-//
-//   - K8s: kubectl on orbstack context + pipeline-operator deployed.
+// PreCheck validates that the K8s infrastructure is available on the
+// CURRENT kubectl context. It never switches contexts. Set
+// DATUPLET_E2E_CONTEXT to guard against running the suite against an
+// unintended cluster (mismatch = error, not a silent switch).
 func PreCheck() error {
 	out, err := exec.Command("kubectl", "config", "current-context").Output()
 	if err != nil {
 		return fmt.Errorf("kubectl context not available: %w", err)
 	}
-	if !strings.Contains(string(out), "orbstack") {
-		contexts, err := exec.Command("kubectl", "config", "get-contexts", "-o", "name").Output()
-		if err != nil {
-			return fmt.Errorf("failed to list kubectl contexts: %w", err)
-		}
-		var orbCtx string
-		for _, ctx := range strings.Split(strings.TrimSpace(string(contexts)), "\n") {
-			if strings.Contains(ctx, "orbstack") {
-				orbCtx = ctx
-				break
-			}
-		}
-		if orbCtx == "" {
-			return fmt.Errorf("no orbstack kubectl context found (current: %q)", strings.TrimSpace(string(out)))
-		}
-		if err := exec.Command("kubectl", "config", "use-context", orbCtx).Run(); err != nil {
-			return fmt.Errorf("failed to switch to orbstack context %q: %w", orbCtx, err)
-		}
+	current := strings.TrimSpace(string(out))
+	if want := os.Getenv("DATUPLET_E2E_CONTEXT"); want != "" && current != want {
+		return fmt.Errorf("kubectl context is %q, DATUPLET_E2E_CONTEXT wants %q — switch manually", current, want)
 	}
 
-	// pipeline-operator lives in the cluster-singleton e2e namespace
-	// (default datuplet-e2e, override via DATUPLET_E2E_NAMESPACE);
-	// PipelineRun apply happens in the per-project namespace but the
-	// operator deployment is here.
+	// The real availability check: the operator Deployment exists in the
+	// e2e namespace (name is not release-prefixed — the chart renders a
+	// bare `pipeline-operator`).
 	ns := os.Getenv("DATUPLET_E2E_NAMESPACE")
 	if ns == "" {
 		ns = "datuplet-e2e"
 	}
 	if err := exec.Command("kubectl", "get", "deploy", "pipeline-operator", "-n", ns).Run(); err != nil {
-		return fmt.Errorf("pipeline-operator not deployed in %s namespace: %w", ns, err)
+		return fmt.Errorf("pipeline-operator not deployed in %s namespace (context %s): %w", ns, current, err)
 	}
 	return nil
 }
