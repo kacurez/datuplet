@@ -455,10 +455,15 @@ Returns every directory under the project's `tables/` prefix that contains a val
   "snapshots": [
     { "id": 1777057648904, "timestamp_ms": 1777057648904, "operation": "append" }
   ],
-  "data_files": ["s3://datuplet/…/data/part-….parquet"],
-  "row_count": 10
+  "row_count": 10,
+  "data_file_count": 1
 }
 ```
+
+`row_count` and `data_file_count` come from the current snapshot's summary
+totals (`total-records` / `total-data-files`) — no manifest walk. Both are
+`null` when the snapshot summary lacks these properties (e.g. a foreign
+writer that didn't populate them).
 
 ### Table schema
 
@@ -478,25 +483,47 @@ Returns every directory under the project's `tables/` prefix that contains a val
 `GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/preview`
 
 Returns up to 100 rows / 1 MiB. Sets `truncated: true` if either cap is hit.
+The read runs as `SELECT * FROM lk."{ns}"."{t}" LIMIT 100` inside the
+query-worker sandbox (RFC 025 §4.1) — pipeline-api never touches parquet
+bytes for this endpoint. Column `type` values are DuckDB type names (e.g.
+`"INTEGER"`, `"VARCHAR"`), not Iceberg/Arrow ones — a v3 change from the
+prior in-process Arrow scan.
 
 ```json
 {
-  "columns": [{ "name": "id", "type": "int64" }, { "name": "name", "type": "utf8" }],
+  "columns": [{ "name": "id", "type": "INTEGER" }, { "name": "name", "type": "VARCHAR" }],
   "rows": [[1, "Laptop Pro"], [2, "Wireless Mouse"]],
   "truncated": false
 }
 ```
 
+Preview requires the query service (`queryWorker.enabled=true`); when it
+isn't configured, the endpoint returns 501 with `{"error": "...", "kind":
+"query_disabled"}`. Query-service preview errors carry this
+`{error, kind}` envelope, with `kind` one of: `query_disabled` (query
+service not wired), `rate_limited` (a preview is already running for this
+user — the per-principal preview gate caps at 1 concurrent preview),
+`capacity` (query-worker is busy), `result_too_large` (schema/rows exceed
+the preview byte cap), `sql_error` (lakekeeper/DuckDB rejected the
+generated statement), `timeout` (query exceeded its time budget). The
+shared request prologue's own errors — invalid project id (400),
+unauthenticated (401), forbidden (403), and backend-not-configured (503) —
+return a bare `{"error": "..."}` without a `kind`.
+
 ### Errors
 
 | Status | Meaning |
 |--------|---------|
-| 400 | Invalid project UUID, `ns`/`t` fails identifier regex, or resolved path escapes the warehouse root |
+| 400 | Invalid project UUID, `ns`/`t` fails identifier regex, resolved path escapes the warehouse root, or (preview only) `sql_error` — lakekeeper/DuckDB rejected the statement |
 | 401 | No valid session cookie (cluster mode only) |
 | 403 | Not a member of the requested project |
 | 404 | Table or its metadata not found |
+| 408 | Preview only: `timeout` — query exceeded its time budget |
+| 413 | Preview only: `result_too_large` — table too wide/large to preview |
+| 429 | Preview only: `rate_limited` — a preview is already running for this user |
 | 500 | Unexpected error reading warehouse or scanning table |
-| 503 | Storage service disabled (missing env config) or OpenFGA unreachable |
+| 501 | Preview only: `query_disabled` — query service not configured |
+| 503 | Storage service disabled (missing env config), OpenFGA unreachable, or (preview only) query-worker `capacity` |
 
 ## Observer + reaper split
 

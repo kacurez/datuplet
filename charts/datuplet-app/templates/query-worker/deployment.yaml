@@ -54,6 +54,11 @@ spec:
       # query-worker needs NO K8s API access — disable SA token automount to
       # match the pod-hardening convention applied to component Pods.
       automountServiceAccountToken: false
+      # Let in-flight queries (≤ maxTimeoutS) finish on rollout/scale-in. The
+      # binary's SIGTERM drain window is maxTimeoutS+30s (RFC 025 §5.2); this
+      # is intentionally a few seconds ABOVE that so the graceful drain always
+      # wins the kubelet's SIGKILL race instead of tying with it.
+      terminationGracePeriodSeconds: {{ add (((.Values.queryWorker).query).maxTimeoutS | default 300) 35 }}
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
         {{- range . }}

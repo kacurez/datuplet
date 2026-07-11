@@ -67,6 +67,10 @@ func newWorkerClient(workerURL string, maxTimeoutS int, slack time.Duration, max
 		respCap: int64(maxRespBytes)*2 + 64*1024,
 		hc: &http.Client{
 			Timeout: time.Duration(maxTimeoutS)*time.Second + slack,
+			// Fresh connection per request: admission rejections are
+			// per-pod, so a retry must be able to land elsewhere. Queries
+			// are heavyweight; per-request TCP setup is noise.
+			Transport: &http.Transport{DisableKeepAlives: true},
 			// The worker URL is static cluster-internal config; a redirect
 			// can only mean misconfiguration or an active attempt to move
 			// the Bearer header elsewhere. Refuse them all.
@@ -78,7 +82,29 @@ func newWorkerClient(workerURL string, maxTimeoutS int, slack time.Duration, max
 }
 
 // Do POSTs body to {base}/internal/query with the internal-query JWT in
-// the Authorization header and returns the worker's status + raw body.
+// the Authorization header and returns the worker's status + raw body. It
+// retries exactly once on a worker 429: admission rejections happen before
+// any execution, so the retry is safe by construction (RFC 025 §5.2). The
+// retry rides a fresh connection (keep-alives are disabled on this
+// transport), so it can land on a different backend behind the Service.
+//
+// SECURITY: see attempt's doc comment for the token/body audit-point notes
+// that apply to both the initial call and the retry.
+func (c *workerClient) Do(ctx context.Context, internalToken tokens.QueryToken, body workerRequest) (workerResponse, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return workerResponse{}, fmt.Errorf("queryproxy: marshal worker request: %w", err)
+	}
+	resp, err := c.attempt(ctx, internalToken, raw)
+	if err != nil || resp.status != http.StatusTooManyRequests {
+		return resp, err
+	}
+	return c.attempt(ctx, internalToken, raw)
+}
+
+// attempt performs a single POST of the pre-marshalled request body to
+// {base}/internal/query. It is factored out of Do so that a 429 retry can
+// share the already-marshalled bytes without a second json.Marshal.
 //
 // SECURITY: the internalToken.Reveal() call below is the ONLY site that
 // un-redacts the internal-query bearer credential — the audit point for
@@ -87,12 +113,7 @@ func newWorkerClient(workerURL string, maxTimeoutS int, slack time.Duration, max
 // Neither the token nor the request body is ever logged here. Transport
 // errors are wrapped WITHOUT the path/query (which is fixed and
 // secret-free anyway); the host is fine to surface for debugging.
-func (c *workerClient) Do(ctx context.Context, internalToken tokens.QueryToken, body workerRequest) (workerResponse, error) {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return workerResponse{}, fmt.Errorf("queryproxy: marshal worker request: %w", err)
-	}
-
+func (c *workerClient) attempt(ctx context.Context, internalToken tokens.QueryToken, raw []byte) (workerResponse, error) {
 	endpoint := c.base.JoinPath("internal", "query").String()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {

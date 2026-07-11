@@ -13,12 +13,12 @@
 // variables are absent — matching the Data Gateway sidecar's fail-closed posture.
 //
 // Signal handling mirrors cmd/pipeline-observer: SIGTERM or SIGINT triggers
-// graceful HTTP shutdown with a 15s drain, then the process exits.
+// graceful HTTP shutdown with a drain window of MaxTimeoutS+30s (so a
+// legitimate in-flight query can finish), then the process exits.
 //
-// Metrics: pipeline-observer exposes Prometheus /metrics; this binary is a
-// single-purpose sidecar service (not a long-lived informer) so we do not wire
-// a Prometheus registry here — only /healthz is exposed alongside the query
-// endpoint.  A future hardening pass can add /metrics if desired.
+// Metrics: GET /metrics (default Prometheus registry via promhttp) exposes
+// query_worker_inflight, query_worker_capacity_slots, and
+// query_worker_admission_total{outcome} alongside /healthz (RFC 025 §5.3).
 package main
 
 import (
@@ -55,6 +55,7 @@ func run() error {
 		TempDir:        envOr("DATUPLET_QUERY_WORKER_TEMP_DIR", "/scratch"),
 		MaxTempSize:    os.Getenv("DATUPLET_QUERY_WORKER_MAX_TEMP_SIZE"),
 		MaxConcurrency: envInt("DATUPLET_QUERY_WORKER_CONCURRENCY", 2),
+		AdmissionWait:  time.Duration(envInt("DATUPLET_QUERY_WORKER_ADMISSION_WAIT_MS", 2000)) * time.Millisecond,
 		Threads:        envInt("DATUPLET_QUERY_WORKER_THREADS", 0), // 0 = engine default (2)
 		MaxTimeoutS:    envInt("DATUPLET_QUERY_WORKER_MAX_TIMEOUT_S", 300),
 		MaxRows:        envInt("DATUPLET_QUERY_WORKER_MAX_ROWS", 10000),
@@ -75,9 +76,11 @@ func run() error {
 	fmt.Printf("  JWKS URL:     %s\n", cfg.JWKSUrl)
 	fmt.Printf("  Lakekeeper:   %s\n", cfg.LakekeeperURL)
 	fmt.Printf("  Concurrency:  %d\n", cfg.MaxConcurrency)
+	fmt.Printf("  AdmissionWait: %s\n", cfg.AdmissionWait)
 	fmt.Printf("  MaxTimeoutS:  %d\n", cfg.MaxTimeoutS)
 	fmt.Printf("  MaxRows:      %d\n", cfg.MaxRows)
 	fmt.Printf("  MaxBytes:     %d\n", cfg.MaxBytes)
+	fmt.Printf("  Metrics:      /metrics\n")
 
 	// ---- wire JWKS client + token verifier --------------------------------
 	// jwks.Client.KeyFor holds a mutex across HTTP re-fetches, which makes it
@@ -99,6 +102,13 @@ func run() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           srv,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Request bodies are ≤1 MiB JSON (maxBodyBytes) — 30s is generous.
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout spans the whole handler; it must comfortably exceed
+		// the longest admitted query (MaxTimeoutS) + admission wait +
+		// response serialisation, or it would kill legitimate results.
+		WriteTimeout: time.Duration(cfg.MaxTimeoutS)*time.Second + 60*time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// ---- signal handling (mirrors pipeline-observer) ---------------------
@@ -107,7 +117,7 @@ func run() error {
 
 	httpErrCh := make(chan error, 1)
 	go func() {
-		fmt.Printf("  HTTP: listening on %s (/healthz, /internal/query)\n", cfg.ListenAddr)
+		fmt.Printf("  HTTP: listening on %s (/healthz, /metrics, /internal/query)\n", cfg.ListenAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			httpErrCh <- fmt.Errorf("http listen: %w", err)
 			return
@@ -121,7 +131,10 @@ func run() error {
 		// Graceful shutdown: drain in-flight requests, then exit.
 		// After Shutdown returns, ListenAndServe exits with http.ErrServerClosed,
 		// which the goroutine filters to nil and sends on httpErrCh — drain it.
-		const drainTimeout = 15 * time.Second
+		// Drain window: a legitimate query may run the full MaxTimeoutS; cutting
+		// it off at SIGTERM turns every rollout/scale-in into a failed query.
+		// +30s covers response serialisation (RFC 025 §5.2).
+		drainTimeout := time.Duration(cfg.MaxTimeoutS)*time.Second + 30*time.Second
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), drainTimeout)
 		defer shutdownCancel()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {

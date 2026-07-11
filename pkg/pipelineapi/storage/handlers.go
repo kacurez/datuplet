@@ -4,21 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"iter"
 	"log"
 	"net/http"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
-	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 )
 
 // EmailLookup resolves a user UUID (as it appears in JWT actor claims
@@ -33,18 +32,48 @@ type EmailLookup interface {
 }
 
 // HTTPHandlers wires the four /api/v1/storage handlers against a
-// Service + the pipeline-api authz seam (Authorizer). The UserResolver
-// is applied by the caller via auth.WithUser middleware before each
-// request reaches these handlers — so we only need an Authorizer here
-// to decide whether the already-authenticated user may access a project.
+// Service + the pipeline-api authz seam. The UserResolver is applied by
+// the caller via auth.WithUser middleware before each request reaches
+// these handlers — authorization of the already-authenticated user's
+// project access flows through Gate.
 // Emails (optional — nil means "don't enrich actor_email") resolves the
 // snapshot-history actor UUID → email for display.
 // Constructed once at server startup; handlers are safe for concurrent
 // use.
 type HTTPHandlers struct {
-	Svc        *Service
-	Authorizer authz.Authorizer
-	Emails     EmailLookup
+	Svc    *Service
+	Emails EmailLookup
+	// Gate is the shared project-authz + warehouse prologue (RFC 025 §4.6
+	// amendment) — the same instance the query proxy uses.
+	Gate *projectgate.Gate
+	// Query runs storage previews through the shared query-service core.
+	// nil (query service not configured) → preview returns 501 query_disabled.
+	Query PreviewRunner
+}
+
+// PreviewRunner is the seam Preview uses to run the server-generated
+// SELECT ... LIMIT statement through the query-worker (RFC 025 §4.1).
+// queryproxy.Core satisfies it; tests use a fake.
+type PreviewRunner interface {
+	Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table string, lim queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError)
+}
+
+// PreviewResponse is the JSON body returned by the preview handler.
+// One entry per column in Columns; one slice per row in Rows.
+type PreviewResponse struct {
+	Columns   []ColumnInfo `json:"columns"`
+	Rows      [][]any      `json:"rows"`
+	Truncated bool         `json:"truncated"`
+}
+
+// ColumnInfo describes one column in a PreviewResponse. Type is the
+// DuckDB type name (e.g. "INTEGER", "VARCHAR") as reported by the
+// query-worker — not the Iceberg/Arrow type string. This is a
+// documented v3 change (RFC 025 Task 3.1): previously Type carried the
+// Arrow type string (e.g. "int64", "utf8").
+type ColumnInfo struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 // Preview caps. Kept as package-level variables (not const) so tests
@@ -68,51 +97,44 @@ func writeErrResp(w http.ResponseWriter, status int, msg string) {
 	writeJSONResp(w, status, map[string]string{"error": msg})
 }
 
+// writeGateErrResp writes a *projectgate.Error response with the same
+// {"error","kind"} shape the query proxy uses for the same shared-gate
+// errors (pkg/pipelineapi/queryproxy/audit.go). Kept as a helper so the
+// three gate-error call sites below (resolveProject, plus the two
+// resolveWarehouse callers) don't drift from each other.
+func writeGateErrResp(w http.ResponseWriter, gerr *projectgate.Error) {
+	writeJSONResp(w, gerr.Status, map[string]string{"error": gerr.Msg, "kind": gerr.Kind})
+}
+
 // resolveProject pulls pid from the URL, validates it, enforces
-// FGA datuplet_member authorization, and returns the parsed project UUID.
-// On any failure it writes the appropriate HTTP error and returns ok=false;
-// callers must return immediately.
+// FGA datuplet_member authorization via the shared projectgate.Gate, and
+// returns the parsed project UUID plus the lakekeeper project UUID (so
+// callers don't have to re-resolve it). On any failure it writes the
+// appropriate HTTP error and returns ok=false; callers must return
+// immediately.
 //
 // Shared by all four handlers — inlining the same checks in every
 // caller would be busier and easier to get wrong than a single helper.
-func (h *HTTPHandlers) resolveProject(w http.ResponseWriter, r *http.Request) (projectID uuid.UUID, ok bool) {
-	pid := r.PathValue("pid")
-	// Project IDs are UUIDs. uuid.Parse fails closed on any malformed
-	// input (including path-separators and traversal sequences), so it
-	// subsumes the ValidIdentifier check for this particular segment.
-	parsed, err := uuid.Parse(pid)
-	if err != nil {
-		writeErrResp(w, http.StatusBadRequest, "invalid project id")
-		return uuid.Nil, false
-	}
+func (h *HTTPHandlers) resolveProject(w http.ResponseWriter, r *http.Request) (projectID uuid.UUID, lkPID string, ok bool) {
 	u, authed := auth.UserFromContext(r.Context())
 	if !authed {
 		writeErrResp(w, http.StatusUnauthorized, "not authenticated")
-		return uuid.Nil, false
+		return uuid.Nil, "", false
 	}
-	// Resolve the lakekeeper project ID for the FGA check. If none is
-	// provisioned yet (e.g. ensureLocalProjectAuthz hasn't completed),
-	// return 503 so the caller can retry rather than getting a spurious 403.
-	lkPID := h.resolveLakekeeperProjectID(r.Context(), parsed)
-	if lkPID == "" {
-		writeErrResp(w, http.StatusServiceUnavailable, "project authz not yet provisioned")
-		return uuid.Nil, false
+	// Nil-safe: storage routes register on (storage+resolver+authzr) non-nil
+	// (server.go), but the gate is built in the lakekeeper/signer wiring
+	// block — a signer-less deployment could register these routes with a
+	// nil gate. Soft-degrade with 503 instead of panicking.
+	if h.Gate == nil {
+		writeErrResp(w, http.StatusServiceUnavailable, "storage backend not fully configured")
+		return uuid.Nil, "", false
 	}
-	userStr := authz.UserObject(u.ID.String()).String()
-	allowed, err := h.Authorizer.Check(r.Context(), userStr, "datuplet_member", authz.ProjectObject(lkPID))
-	if err != nil {
-		if errors.Is(err, authz.ErrAuthzUnavailable) {
-			writeErrResp(w, http.StatusServiceUnavailable, "authz backend unavailable")
-			return uuid.Nil, false
-		}
-		writeErrResp(w, http.StatusInternalServerError, "check authz")
-		return uuid.Nil, false
+	pid, lk, gerr := h.Gate.Authorize(r.Context(), u.ID.String(), r.PathValue("pid"))
+	if gerr != nil {
+		writeGateErrResp(w, gerr)
+		return uuid.Nil, "", false
 	}
-	if !allowed {
-		writeErrResp(w, http.StatusForbidden, "forbidden")
-		return uuid.Nil, false
-	}
-	return parsed, true
+	return pid, lk, true
 }
 
 // projectURI builds the absolute URI rooted at the project's
@@ -173,42 +195,11 @@ func (h *HTTPHandlers) guardTablePath(w http.ResponseWriter, tableURI string) bo
 	return true
 }
 
-// resolveLakekeeperProjectID maps a Datuplet project UUID to the lakekeeper
-// Project UUID needed for x-project-id routing. Returns "" when the resolver
-// is nil or returns an error — callers omit the header in that case and
-// lakekeeper falls back to its default project (LAKEKEEPER__ENABLE_DEFAULT_PROJECT).
-func (h *HTTPHandlers) resolveLakekeeperProjectID(ctx context.Context, datupletPID uuid.UUID) string {
-	if h.Svc.LakekeeperProjectIDFor == nil {
-		return ""
-	}
-	lkPID, err := h.Svc.LakekeeperProjectIDFor(ctx, datupletPID)
-	if err != nil {
-		log.Printf("storage: resolveLakekeeperProjectID(%s): %v (omitting x-project-id)", datupletPID, err)
-		return ""
-	}
-	return lkPID
-}
-
-// resolveWarehouse returns the lakekeeper warehouse name to use for a
-// per-request catalog call against project `lakekeeperProjectID`.
-// Pipeline-api asks lakekeeper for warehouses attached to the project
-// and picks the first. An explicit per-project selector is not yet
-// implemented.
-//
-// Resolution priority:
-//
-//  1. WarehouseResolver (production): per-request lakekeeper API call.
-//  2. WarehouseName (legacy / tests): fall back to the deployment-time default.
-//
-// Returns ("", err) when neither is wired — callers surface 500.
-func (h *HTTPHandlers) resolveWarehouse(ctx context.Context, lakekeeperProjectID string) (string, error) {
-	if h.Svc.WarehouseResolver != nil {
-		return h.Svc.WarehouseResolver(ctx, lakekeeperProjectID)
-	}
-	if h.Svc.WarehouseName != "" {
-		return h.Svc.WarehouseName, nil
-	}
-	return "", fmt.Errorf("no warehouse configured: neither WarehouseResolver nor WarehouseName is set")
+// resolveWarehouse resolves the bare warehouse name for an authorized
+// lakekeeper project. Returns a *projectgate.Error (nil on success) so the
+// caller can map status/kind directly.
+func (h *HTTPHandlers) resolveWarehouse(ctx context.Context, lkPID string) (string, *projectgate.Error) {
+	return h.Gate.Warehouse(ctx, lkPID)
 }
 
 // loadRequestedTable runs the full per-table prologue shared by
@@ -222,7 +213,7 @@ func (h *HTTPHandlers) resolveWarehouse(ctx context.Context, lakekeeperProjectID
 //   - LakekeeperURL empty → fall back to ResolveCurrentMetadata against
 //     the directory walker (tests + legacy).
 func (h *HTTPHandlers) loadRequestedTable(w http.ResponseWriter, r *http.Request) (tbl *table.Table, metaURI string, ok bool) {
-	pid, ok := h.resolveProject(w, r)
+	pid, lkPID, ok := h.resolveProject(w, r)
 	if !ok {
 		return nil, "", false
 	}
@@ -233,10 +224,9 @@ func (h *HTTPHandlers) loadRequestedTable(w http.ResponseWriter, r *http.Request
 	}
 
 	if h.Svc.LakekeeperURL != "" {
-		lkPID := h.resolveLakekeeperProjectID(r.Context(), pid)
-		warehouse, werr := h.resolveWarehouse(r.Context(), lkPID)
-		if werr != nil {
-			writeErrResp(w, http.StatusInternalServerError, "resolve warehouse")
+		warehouse, gerr := h.resolveWarehouse(r.Context(), lkPID)
+		if gerr != nil {
+			writeGateErrResp(w, gerr)
 			return nil, "", false
 		}
 		proxy, err := newCatalogProxy(r.Context(), h.Svc, lkPID, warehouse)
@@ -325,17 +315,16 @@ type tableListEntry struct {
 //   - When LakekeeperURL is empty (tests + legacy fixture warehouses),
 //     it falls back to the directory walker.
 func (h *HTTPHandlers) ListTables(w http.ResponseWriter, r *http.Request) {
-	pid, ok := h.resolveProject(w, r)
+	pid, lkPID, ok := h.resolveProject(w, r)
 	if !ok {
 		return
 	}
 
 	if h.Svc.LakekeeperURL != "" {
-		lkPID := h.resolveLakekeeperProjectID(r.Context(), pid)
-		warehouse, werr := h.resolveWarehouse(r.Context(), lkPID)
-		if werr != nil {
-			log.Printf("storage: resolve warehouse (lakekeeper=%s lkPID=%s): %v", h.Svc.LakekeeperURL, lkPID, werr)
-			writeErrResp(w, http.StatusInternalServerError, "resolve warehouse: "+werr.Error())
+		warehouse, gerr := h.resolveWarehouse(r.Context(), lkPID)
+		if gerr != nil {
+			log.Printf("storage: resolve warehouse (lakekeeper=%s lkPID=%s): %s", h.Svc.LakekeeperURL, lkPID, gerr.Msg)
+			writeGateErrResp(w, gerr)
 			return
 		}
 		proxy, err := newCatalogProxy(r.Context(), h.Svc, lkPID, warehouse)
@@ -395,8 +384,24 @@ type infoResp struct {
 	MetadataLocation  string          `json:"metadata_location"`
 	CurrentSnapshotID int64           `json:"current_snapshot_id"`
 	Snapshots         []snapshotBrief `json:"snapshots"`
-	DataFiles         []string        `json:"data_files"`
-	RowCount          int64           `json:"row_count"`
+	// RowCount/DataFileCount come from the current snapshot's summary
+	// (total-records / total-data-files). nil = summary absent (foreign
+	// writer); the UI renders "—". RFC 025 §4.2 replaced the manifest
+	// walk this used to do.
+	RowCount      *int64 `json:"row_count"`
+	DataFileCount *int64 `json:"data_file_count"`
+}
+
+// parseSummaryInt parses an Iceberg summary property value ("" = absent).
+func parseSummaryInt(v string) (int64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // TableInfo handles GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/info.
@@ -409,7 +414,6 @@ func (h *HTTPHandlers) TableInfo(w http.ResponseWriter, r *http.Request) {
 	resp := infoResp{
 		MetadataLocation: metaURI,
 		Snapshots:        []snapshotBrief{},
-		DataFiles:        []string{},
 	}
 	if cur := tbl.CurrentSnapshot(); cur != nil {
 		resp.CurrentSnapshotID = cur.SnapshotID
@@ -427,36 +431,15 @@ func (h *HTTPHandlers) TableInfo(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Collect data-file paths + row count from the current snapshot's
-	// manifests. Failure to fetch entries is non-fatal for the response
-	// — we still return metadata; we just log via the error shape and
-	// leave the data_files empty.
-	if cur := tbl.CurrentSnapshot(); cur != nil {
-		fs, err := tbl.FS(r.Context())
-		if err == nil {
-			manifests, mErr := cur.Manifests(fs)
-			if mErr == nil {
-				for _, m := range manifests {
-					// discardDeleted=true drops entries whose Iceberg
-					// status is DELETED — rows that were overwritten /
-					// removed and are no longer part of the current
-					// snapshot's logical state. Without this, row_count
-					// and data_files over-count for tables with delete
-					// manifests or overwrite snapshots.
-					entries, eErr := m.FetchEntries(fs, true)
-					if eErr != nil {
-						continue
-					}
-					for _, e := range entries {
-						df := e.DataFile()
-						if df == nil {
-							continue
-						}
-						resp.DataFiles = append(resp.DataFiles, df.FilePath())
-						resp.RowCount += df.Count()
-					}
-				}
-			}
+	// Row/file counts come straight from the current snapshot's summary
+	// totals — no manifest walk. Absent or unparseable totals (foreign
+	// writer that didn't populate them) leave the pointers nil.
+	if cur := tbl.CurrentSnapshot(); cur != nil && cur.Summary != nil && cur.Summary.Properties != nil {
+		if n, ok := parseSummaryInt(cur.Summary.Properties["total-records"]); ok {
+			resp.RowCount = &n
+		}
+		if n, ok := parseSummaryInt(cur.Summary.Properties["total-data-files"]); ok {
+			resp.DataFileCount = &n
 		}
 	}
 
@@ -498,48 +481,44 @@ func (h *HTTPHandlers) TableSchema(w http.ResponseWriter, r *http.Request) {
 // ----- Preview -------------------------------------------------------
 
 // Preview handles GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/preview.
+// The data read runs inside the query-worker sandbox (RFC 025 §4.1);
+// pipeline-api never touches parquet bytes. Column types are DuckDB type
+// names (e.g. VARCHAR), not Iceberg ones — a documented v3 change.
 func (h *HTTPHandlers) Preview(w http.ResponseWriter, r *http.Request) {
-	tbl, _, ok := h.loadRequestedTable(w, r)
+	_, lkPID, ok := h.resolveProject(w, r) // shared projectgate prologue (Task 0.2)
 	if !ok {
 		return
 	}
-	// Ask iceberg-go for previewRowCap+1 rows so EncodeRecords can see
-	// the "one more row would fit" signal via its end-of-stream peek
-	// and correctly set Truncated=true. Capping at previewRowCap at the
-	// scan level hides that signal and makes Truncated stuck at false.
-	schema, iter2, err := tbl.Scan(table.WithLimit(int64(previewRowCap) + 1)).ToArrowRecords(r.Context())
-	if err != nil {
-		writeErrResp(w, http.StatusInternalServerError, "scan table")
+	ns, name := r.PathValue("ns"), r.PathValue("t")
+	if !validateTableIdentifiers(w, ns, name) {
 		return
 	}
-
-	// EncodeRecords takes a pull-shaped next() closure and Release()s
-	// each batch after consuming. The iter.Seq2 from iceberg-go yields
-	// batches the consumer is expected to release; wrapping with
-	// iter.Pull2 preserves that contract.
-	pull, stop := iter.Pull2(iter2)
-	defer stop()
-	next := func() (arrow.RecordBatch, error) {
-		batch, yieldErr, more := pull()
-		if !more {
-			return nil, nil
-		}
-		if yieldErr != nil {
-			// Release any batch the iterator emitted alongside an error
-			// before surfacing it — EncodeRecords would otherwise leak
-			// it since it returns early on a non-nil error.
-			if batch != nil {
-				batch.Release()
-			}
-			return nil, yieldErr
-		}
-		return batch, nil
-	}
-
-	resp, err := EncodeRecords(schema, next, previewRowCap, previewByteCap)
-	if err != nil {
-		writeErrResp(w, http.StatusInternalServerError, "encode records: "+err.Error())
+	if h.Query == nil {
+		writeJSONResp(w, http.StatusNotImplemented, map[string]string{
+			"error": "preview requires the query service (queryWorker.enabled=true)",
+			"kind":  "query_disabled",
+		})
 		return
+	}
+	u, _ := auth.UserFromContext(r.Context()) // resolveProject already 401'd if absent
+	warehouse, gerr := h.Gate.Warehouse(r.Context(), lkPID)
+	if gerr != nil {
+		writeGateErrResp(w, gerr)
+		return
+	}
+	res, qerr := h.Query.Preview(r.Context(), u.ID.String(), lkPID+"/"+warehouse, ns, name,
+		queryproxy.PreviewLimits{TimeoutS: 30, MaxRows: previewRowCap, MaxBytes: previewByteCap})
+	if qerr != nil {
+		msg := qerr.Msg
+		if qerr.Kind == "result_too_large" {
+			msg = "table too wide to preview (schema exceeds the preview byte cap)"
+		}
+		writeJSONResp(w, qerr.Status, map[string]string{"error": msg, "kind": qerr.Kind})
+		return
+	}
+	resp := PreviewResponse{Columns: make([]ColumnInfo, len(res.Schema)), Rows: res.Rows, Truncated: res.Truncated}
+	for i, c := range res.Schema {
+		resp.Columns[i] = ColumnInfo{Name: c.Name, Type: c.Type}
 	}
 	writeJSONResp(w, http.StatusOK, resp)
 }

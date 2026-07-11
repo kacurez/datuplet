@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage/testdata"
 )
 
@@ -27,7 +28,17 @@ import (
 func newSnapshotsTestServerFull(t *testing.T, svc *Service) *httptest.Server {
 	t.Helper()
 	authzr := allowedFake()
-	h := &HTTPHandlers{Svc: svc, Authorizer: authzr}
+	// Gate is built from the same stubs (svc.LakekeeperProjectIDFor + authzr)
+	// that resolveProject used to call directly. WarehouseFor is left nil —
+	// these fixtures use the fixture-walker path (LakekeeperURL == ""), so
+	// resolveWarehouse is never invoked.
+	h := &HTTPHandlers{
+		Svc: svc,
+		Gate: &projectgate.Gate{
+			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+			Authorizer:             authzr,
+		},
+	}
 	injectUser := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := auth.WithCtxUser(r.Context(), stubUser)

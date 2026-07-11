@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -65,7 +66,8 @@ func resolveQuerySQL(sqlFlag, filePath string, stdin io.Reader) (string, error) 
 	return string(data), nil
 }
 
-// serverQueryRequest mirrors the client-facing body for POST /api/v1/query
+// serverQueryRequest mirrors the client-facing body for
+// POST /api/v1/projects/{pid}/query
 // (pkg/pipelineapi/queryproxy/handler.go::queryRequest). Only sql is required;
 // the server clamps the optional limit fields.
 type serverQueryRequest struct {
@@ -73,19 +75,21 @@ type serverQueryRequest struct {
 }
 
 // serverQuery submits the SQL to the server-side query service
-// (POST /api/v1/query on pipeline-api) and renders the returned
-// queryengine.Result in the chosen format. This is the default route when
-// the operator's allowClientSideQuery policy is off (RFC 022 §4.1): compute
-// and credentials stay in-cluster and the user gets identical results.
+// (POST /api/v1/projects/{pid}/query on pipeline-api) and renders the
+// returned queryengine.Result in the chosen format. This is the default
+// route when the operator's allowClientSideQuery policy is off (RFC 022
+// §4.1): compute and credentials stay in-cluster and the user gets
+// identical results.
 //
 // SECURITY: apiToken is the pipeline-api bearer (aud=datuplet-api). It is sent
 // only in the Authorization header and is NEVER logged or echoed.
-func serverQuery(remote, apiToken, sql, format string, out io.Writer) error {
+func serverQuery(remote, apiToken, projectID, sql, format string, out io.Writer) error {
 	reqBody, err := json.Marshal(serverQueryRequest{SQL: sql})
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
-	url := strings.TrimRight(remote, "/") + "/api/v1/query"
+	url := fmt.Sprintf("%s/api/v1/projects/%s/query",
+		strings.TrimRight(remote, "/"), neturl.PathEscape(projectID))
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return err
@@ -196,7 +200,7 @@ func runQuery(remote, tokenFile, project, sqlFlag, filePath, format string, loca
 	if err != nil {
 		return err
 	}
-	return serverQuery(args.Remote, args.APIToken, sql, format, os.Stdout)
+	return serverQuery(args.Remote, args.APIToken, args.ID, sql, format, os.Stdout)
 }
 
 // writeTable renders rows as an aligned, human-readable text table.

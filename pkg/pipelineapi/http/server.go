@@ -11,6 +11,8 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
@@ -31,6 +33,12 @@ type Server struct {
 	pipelines    PipelineStore
 	runs         RunReader
 	storage      *storage.Service
+	// projectGate is the shared project-authz + warehouse prologue (RFC 025
+	// §4.6 amendment) consumed by the storage handlers' resolveProject /
+	// resolveWarehouse — the same instance the query proxy uses. Wired via
+	// WithProjectGate from the lakekeeper wiring block in main.go. nil is
+	// safe: resolveProject soft-degrades to 503 instead of nil-derefing.
+	projectGate *projectgate.Gate
 	// cliToken: deploy-time public URL + warehouse name returned in the
 	// `POST /api/v1/auth/token` response body so the CLI can talk to
 	// lakekeeper directly. Empty = endpoint stays
@@ -41,10 +49,17 @@ type Server struct {
 	// cliTokenLimiter rate-limits POST /api/v1/auth/token by client IP.
 	// Initialised in NewServer; never nil.
 	cliTokenLimiter *auth.Limiter
-	// queryHandler is a pre-built http.Handler for POST /api/v1/query,
-	// constructed in main.go at config time (same pattern as storage.NewForLakekeeper).
+	// queryHandler is a pre-built http.Handler for
+	// POST /api/v1/projects/{pid}/query, constructed in main.go at config
+	// time (same pattern as storage.NewForLakekeeper).
 	// Nil when the query service is not configured; the route stays unregistered.
 	queryHandler http.Handler
+	// queryCore is the same *queryproxy.Core queryHandler wraps (Task 3.1).
+	// The storage-preview handler drives it directly via Core.Preview,
+	// bypassing the HTTP request/response plumbing. nil when the query
+	// service is not configured — the storage block guards on it before
+	// setting HTTPHandlers.Query, to avoid a typed-nil PreviewRunner.
+	queryCore *queryproxy.Core
 	// localQueryMintHandler is the pre-built http.Handler for
 	// POST /api/v1/query/token (RFC 022 §5.3) — the per-invocation query-JWT
 	// mint endpoint the laptop-side `datuplet-query` CLI calls. Built in
@@ -205,7 +220,18 @@ func (s *Server) WithCLIClusterInfo(lakekeeperPublicURL, warehouseName string) *
 	return s
 }
 
-// WithQueryService wires the pre-built http.Handler for POST /api/v1/query.
+// WithProjectGate wires the shared project-authz + warehouse prologue
+// (RFC 025 §4.6 amendment) used by the storage handlers' resolveProject /
+// resolveWarehouse. main.go builds ONE Gate instance in the lakekeeper
+// wiring block; Task 0.4 (the query proxy) reuses the same instance. When
+// nil, resolveProject soft-degrades to 503 instead of nil-derefing.
+func (s *Server) WithProjectGate(g *projectgate.Gate) *Server {
+	s.projectGate = g
+	return s
+}
+
+// WithQueryService wires the pre-built http.Handler for
+// POST /api/v1/projects/{pid}/query.
 // The handler must have been constructed by the caller (e.g. via
 // queryproxy.Handler in main.go) so that construction errors surface as a
 // normal return error at config time rather than a panic at request time.
@@ -214,6 +240,17 @@ func (s *Server) WithCLIClusterInfo(lakekeeperPublicURL, warehouseName string) *
 // auth.WithUser middleware can identify the caller.
 func (s *Server) WithQueryService(h http.Handler) *Server {
 	s.queryHandler = h
+	return s
+}
+
+// WithQueryCore wires the same *queryproxy.Core queryHandler was built
+// from (Task 3.1), so the storage-preview handler can drive Core.Preview
+// directly instead of going through the console's HTTP request/response
+// path. When c is nil, the storage-handler construction leaves
+// HTTPHandlers.Query as the nil interface (never set it to a typed-nil
+// *queryproxy.Core) so Preview's `h.Query == nil` check still works.
+func (s *Server) WithQueryCore(c *queryproxy.Core) *Server {
+	s.queryCore = c
 	return s
 }
 
@@ -387,12 +424,15 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	// Query service route. When a pre-built queryHandler + resolver are wired,
-	// register POST /api/v1/query behind auth.WithUser middleware.
+	// register POST /api/v1/projects/{pid}/query behind auth.WithUser
+	// middleware. {pid} is resolved + authorized by the query proxy's
+	// projectgate.Gate (RFC 025 §4.6 amendment) — the same gate the storage
+	// handlers use.
 	// The handler is constructed in main.go at config time (same pattern as
 	// storage.NewForLakekeeper), so no construction can fail here.
 	// Absent env → queryHandler is nil → route stays unregistered (404).
 	if s.queryHandler != nil && s.resolver != nil {
-		mux.Handle("POST /api/v1/query", auth.WithUser(s.resolver, s.queryHandler))
+		mux.Handle("POST /api/v1/projects/{pid}/query", auth.WithUser(s.resolver, s.queryHandler))
 	}
 
 	// Local query-JWT mint route (RFC 022 §5.3). Registered whenever the
@@ -413,9 +453,12 @@ func (s *Server) Handler() http.Handler {
 	switch {
 	case s.storage != nil && s.resolver != nil && s.authzr != nil:
 		h := &storage.HTTPHandlers{
-			Svc:        s.storage,
-			Authorizer: s.authzr,
-			Emails:     pgxEmailLookup{pool: s.db},
+			Svc:    s.storage,
+			Emails: pgxEmailLookup{pool: s.db},
+			Gate:   s.projectGate,
+		}
+		if s.queryCore != nil {
+			h.Query = s.queryCore
 		}
 		mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
 			auth.WithUser(s.resolver, http.HandlerFunc(h.ListTables)))

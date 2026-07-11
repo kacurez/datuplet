@@ -15,7 +15,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/datuplet/datuplet/components/queryengine"
+)
+
+// Prometheus surface (RFC 025 §5.3): capacity is legible so a future
+// autoscaler is a bolt-on. Default registry + promauto, exposed on the
+// same mux as /healthz — cluster-internal only (NetworkPolicy).
+var (
+	inflightGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "query_worker_inflight", Help: "Queries currently holding an admission slot."})
+	capacitySlots = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "query_worker_capacity_slots", Help: "Total admission slots (DATUPLET_QUERY_WORKER_CONCURRENCY)."})
+	admissionTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "query_worker_admission_total", Help: "Admission decisions by outcome."}, []string{"outcome"})
 )
 
 // Runner is the engine seam: lets server.go be tested with a fake without
@@ -38,7 +54,8 @@ type workerConfig struct {
 	ListenAddr     string
 	JWKSUrl        string
 	LakekeeperURL  string
-	MaxConcurrency int // default 2
+	MaxConcurrency int           // default 2
+	AdmissionWait  time.Duration // default 2s
 	MemoryLimit    string
 	TempDir        string // default /scratch
 	MaxTempSize    string
@@ -64,6 +81,9 @@ func newQueryServer(verifier *tokenVerifier, runner Runner, cfg workerConfig) *q
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 2
 	}
+	if cfg.AdmissionWait <= 0 {
+		cfg.AdmissionWait = 2 * time.Second
+	}
 	if cfg.MaxTimeoutS <= 0 {
 		cfg.MaxTimeoutS = 300
 	}
@@ -83,9 +103,11 @@ func newQueryServer(verifier *tokenVerifier, runner Runner, cfg workerConfig) *q
 		cfg:      cfg,
 		sem:      make(chan struct{}, cfg.MaxConcurrency),
 	}
+	capacitySlots.Set(float64(cfg.MaxConcurrency))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
+	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.HandleFunc("POST /internal/query", srv.handleQuery)
 	srv.mux = mux
 
@@ -139,16 +161,35 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Admission: acquire semaphore non-blocking.
+	// 2. Admission: try immediately, then wait up to AdmissionWait for a
+	//    slot. The bounded wait smooths transient collisions when the
+	//    Service LB lands two requests on the same pod (RFC 025 §5.2); the
+	//    proxy's retry-on-429 covers the genuinely-full case.
+	admitted := false
 	select {
 	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
+		admitted = true
 	default:
+		waitT := time.NewTimer(s.cfg.AdmissionWait)
+		select {
+		case s.sem <- struct{}{}:
+			admitted = true
+		case <-r.Context().Done():
+			// Client gone while queued — nothing to answer.
+		case <-waitT.C:
+		}
+		waitT.Stop()
+	}
+	if !admitted {
+		admissionTotal.WithLabelValues("rejected").Inc()
 		log.Printf("query-worker: capacity exhausted sub=%s jti=%s", sub, jti)
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "capacity", "server at capacity, try again shortly")
 		return
 	}
+	inflightGauge.Inc()
+	admissionTotal.WithLabelValues("admitted").Inc()
+	defer func() { <-s.sem; inflightGauge.Dec() }()
 
 	// 3. Parse and validate the request body.
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
@@ -231,8 +272,13 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadRequest
 			kind = "sql_error"
 		}
-		log.Printf("query-worker: sub=%s jti=%s kind=%s duration=%s err=%v", sub, jti, kind, duration, runErr)
-		writeError(w, status, kind, runErr.Error())
+		// SECURITY: queryengine.Run's error is DuckDB's native message, which
+		// echoes the offending statement text ("\nLINE N: <SQL>\n   ^") after
+		// the leading diagnostic. Strip that echo before it reaches the log
+		// or the client — the SQL may carry sensitive literals.
+		safeMsg := sanitizeEngineError(runErr)
+		log.Printf("query-worker: sub=%s jti=%s kind=%s duration=%s err=%s", sub, jti, kind, duration, safeMsg)
+		writeError(w, status, kind, safeMsg)
 		return
 	}
 
@@ -258,4 +304,25 @@ func (s *queryServer) extractAndVerify(r *http.Request) (sub, jti string, err er
 		return "", "", errors.New("empty bearer token")
 	}
 	return s.verifier.Verify(r.Context(), tokenStr)
+}
+
+// sqlLineEcho marks the start of DuckDB's statement echo in a native error
+// message, e.g. "Catalog Error: Table with name X does not exist.\n\nLINE 1:
+// SELECT * FROM \"ns\".\"X\"\n                       ^". Everything from
+// this marker onward reproduces (part of) the query text, which may carry
+// sensitive literals — see sanitizeEngineError.
+const sqlLineEcho = "\nLINE "
+
+// sanitizeEngineError strips DuckDB's SQL statement echo from a
+// queryengine.Run error before it is logged or returned to the client. It
+// keeps the leading diagnostic (e.g. "Catalog Error: Table with name X does
+// not exist.") — which callers rely on to distinguish error kinds — and
+// drops everything from the first "\nLINE " marker onward. Errors without a
+// LINE echo pass through unchanged (aside from TrimSpace, a no-op for them).
+func sanitizeEngineError(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, sqlLineEcho); i >= 0 {
+		msg = msg[:i]
+	}
+	return strings.TrimSpace(msg)
 }

@@ -190,6 +190,30 @@ GKE Dataplane V2 or Calico. Clusters without such a CNI (e.g. a local OrbStack
 dev cluster) do not enforce the policy — the query-worker has unrestricted egress
 in those environments.
 
+**Storage preview depends on the query service (RFC 025).** Table preview now
+runs inside the query-worker sandbox instead of pipeline-api reading parquet
+in-process. The query service is on by default (`queryWorker.enabled: true`);
+when disabled, `GET .../preview` returns `501 {"kind":"query_disabled"}` and the
+UI shows an "enable the query service" hint.
+
+**Preview column types are DuckDB type names, not Iceberg/Arrow names (RFC 025
+v3 change).** A column that previously showed `utf8`/`int64` now shows
+`VARCHAR`/`INTEGER` — the type strings come from the query-worker's DuckDB
+result schema, not iceberg-go's Arrow schema.
+
+**Wide-table preview errors instead of trimming columns (RFC 025).** The old
+in-process path silently dropped trailing columns when a row exceeded the
+preview byte cap. The query-worker never trims: a table whose schema exceeds the
+cap returns `413 {"kind":"result_too_large"}` ("table too wide to preview")
+rather than a partial row.
+
+**Info row/file counts come from the snapshot summary (RFC 025).** The Info tab's
+`row_count` and `data_file_count` are read from the current snapshot's
+`total-records` / `total-data-files` summary properties instead of an in-process
+manifest walk. A table written by a foreign writer that omits those properties
+reports `null` for both (the UI renders "—"); the `data_files[]` list is no
+longer returned.
+
 ---
 
 ## Validated deployment targets

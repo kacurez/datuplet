@@ -361,12 +361,14 @@ export async function renderQuery() {
       });
     });
 
-    // Table click: insert "namespace.table" at textarea cursor.
+    // Table click: insert quoted "namespace"."table" at textarea cursor —
+    // identifiers may contain '-' or '.', which break unquoted resolution.
     schemaTree.querySelectorAll('.qc-table-item').forEach((btn) => {
       btn.addEventListener('click', () => {
+        const q = (s) => `"${String(s).replaceAll('"', '""')}"`;
         const ns = btn.dataset.ns;
         const name = btn.dataset.name;
-        const insert = `${ns}.${name}`;
+        const insert = `${q(ns)}.${q(name)}`;
         const ed = document.getElementById('qc-editor');
         if (!ed) return;
         const start = ed.selectionStart;

@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
 
@@ -74,13 +75,12 @@ type Config struct {
 	// Default 2.
 	PerPrincipalInflight int
 
-	// Warehouse is the project-qualified "projectID/warehouse" opaque
-	// string the worker passes to lakekeeper's iceberg-REST attach (§6.1:
-	// the attach arg MUST be project-qualified). It comes from the same
-	// source the storage handlers resolve their warehouse from
-	// (storage warehouse_resolver.go / catalog_proxy.go); pipeline-api
-	// forwards it verbatim. Required for queries to resolve tables.
-	Warehouse string
+	// Gate resolves + authorizes the {pid} route segment and returns the
+	// project-qualified warehouse per request (RFC 025 §4.6). The SAME
+	// instance the storage handlers use (wired in main.go) — one seam, two
+	// consumers. Replaces the old static per-boot Warehouse config field.
+	// Required.
+	Gate *projectgate.Gate
 
 	// CatalogTTLSlack pads the catalog JWT TTL beyond the clamped timeout.
 	// Default 30s.
@@ -154,10 +154,14 @@ func Handler(cfg Config, signer *tokens.Signer) (http.Handler, error) {
 
 // handler is the concrete POST /api/v1/query implementation.
 type handler struct {
-	cfg          Config
-	signer       *tokens.Signer
-	client       *workerClient
-	gate         *gate
+	cfg    Config
+	signer *tokens.Signer
+	client *workerClient
+	gate   *gate
+	// previewGate is the separate per-principal in-flight cap (capacity 1)
+	// for Core.Preview (Task 3.1). Previews and console queries never share
+	// a gate slot so one path can't starve the other.
+	previewGate  *gate
 	auditCounter *prometheus.CounterVec // nil → use package-level promauto counter
 }
 
@@ -173,7 +177,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	sub := user.ID.String()
 
-	// Steps 2–6 run under the audit deferred emit (serveWithAudit). The
+	// Steps 2–7 run under the audit deferred emit (serveWithAudit). The
 	// deferred emit fires exactly once regardless of which exit path is
 	// taken — the structural guarantee replaces per-branch discipline.
 	h.serveWithAudit(w, r, sub, time.Now())

@@ -19,6 +19,8 @@ import (
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate/projectgatetest"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
@@ -31,7 +33,7 @@ func stubQueryHandler(t *testing.T, workerURL string, signer *tokens.Signer) std
 	t.Helper()
 	h, err := queryproxy.Handler(queryproxy.Config{
 		WorkerURL: workerURL,
-		Warehouse: "test-project/test-warehouse",
+		Gate:      projectgatetest.AllowAll("test-project", "test-warehouse"),
 	}, signer)
 	if err != nil {
 		t.Fatalf("queryproxy.Handler: %v", err)
@@ -113,8 +115,17 @@ func TestServer_StorageRoute_WithServiceWired(t *testing.T) {
 	}
 	// Empty fake — Check returns (false, nil) → 403 from the handler.
 	fakeAuthz := authztest.New()
+	// The gate is built from the same stubs the Service already carries
+	// (LakekeeperProjectIDFor) plus the same authzr wired via WithAuthorizer
+	// — resolveProject now delegates to h.Gate instead of calling
+	// h.Svc.LakekeeperProjectIDFor / h.Authorizer directly.
+	gate := &projectgate.Gate{
+		LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+		Authorizer:             fakeAuthz,
+	}
 	srv := apihttp.NewServer(nil).
 		WithStorage(svc).
+		WithProjectGate(gate).
 		WithUserResolver(stubResolver{}).
 		WithAuthorizer(fakeAuthz)
 
@@ -137,16 +148,18 @@ func TestServer_StorageRoute_WithServiceWired(t *testing.T) {
 	}
 }
 
-// TestServer_QueryRoute_NotConfigured asserts that POST /api/v1/query
-// returns 404 when the query service is not wired.
+// TestServer_QueryRoute_NotConfigured asserts that
+// POST /api/v1/projects/{pid}/query returns 404 when the query service is
+// not wired.
 func TestServer_QueryRoute_NotConfigured(t *testing.T) {
 	srv := apihttp.NewServer(nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := stdhttp.Post(ts.URL+"/api/v1/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
+	pid := uuid.NewString()
+	resp, err := stdhttp.Post(ts.URL+"/api/v1/projects/"+pid+"/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
 	if err != nil {
-		t.Fatalf("POST /api/v1/query: %v", err)
+		t.Fatalf("POST /api/v1/projects/%s/query: %v", pid, err)
 	}
 	defer resp.Body.Close()
 
@@ -155,10 +168,10 @@ func TestServer_QueryRoute_NotConfigured(t *testing.T) {
 	}
 }
 
-// TestServer_QueryRoute_WithServiceWired asserts that POST /api/v1/query is
-// registered behind auth.WithUser when a pre-built query handler + resolver
-// are wired. It exercises the full chain: route → auth.WithUser → queryproxy
-// → fake worker.
+// TestServer_QueryRoute_WithServiceWired asserts that
+// POST /api/v1/projects/{pid}/query is registered behind auth.WithUser when
+// a pre-built query handler + resolver are wired. It exercises the full
+// chain: route → auth.WithUser → queryproxy → fake worker.
 func TestServer_QueryRoute_WithServiceWired(t *testing.T) {
 	// Fixed result JSON the fake worker returns verbatim.
 	const resultJSON = `{"schema":[{"name":"a","type":"INTEGER"}],"rows":[[1]],"truncated":false,"stats":{"duration_ms":3}}`
@@ -187,34 +200,41 @@ func TestServer_QueryRoute_WithServiceWired(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
+	pid := uuid.NewString()
+	queryURL := ts.URL + "/api/v1/projects/" + pid + "/query"
+
 	// Test 1: Unauthenticated request.
 	// auth.WithUser (middleware.go) always returns exactly 401 when the resolver
 	// returns (nil, false, nil) — it writes writeJSONError(w, 401, "not authenticated")
 	// regardless of resolver Mode. The selectiveResolver.Mode() returns "test" which
 	// does not trigger any redirect path.
-	resp, err := stdhttp.Post(ts.URL+"/api/v1/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
+	resp, err := stdhttp.Post(queryURL, "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
 	if err != nil {
-		t.Fatalf("POST /api/v1/query (unauthenticated): %v", err)
+		t.Fatalf("POST %s (unauthenticated): %v", queryURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != stdhttp.StatusUnauthorized {
 		t.Errorf("unauthenticated: status = %d, want 401 (auth.WithUser always returns 401 on (nil,false,nil))", resp.StatusCode)
 	}
 
-	// Test 2: Authenticated request — full chain: route → auth → queryproxy → fake worker.
+	// Test 2: Authenticated request — full chain: route → auth → queryproxy
+	// (Gate authorizes {pid} via projectgatetest.AllowAll) → fake worker.
 	resolver.allow = true
-	resp2, err := stdhttp.Post(ts.URL+"/api/v1/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
+	resp2, err := stdhttp.Post(queryURL, "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
 	if err != nil {
-		t.Fatalf("POST /api/v1/query (authenticated): %v", err)
+		t.Fatalf("POST %s (authenticated): %v", queryURL, err)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != stdhttp.StatusOK {
 		body, _ := io.ReadAll(resp2.Body)
 		t.Fatalf("authenticated: status = %d, want 200; body=%s", resp2.StatusCode, body)
 	}
-	got, _ := io.ReadAll(resp2.Body)
-	if strings.TrimRight(string(got), "\n") != resultJSON {
-		t.Errorf("authenticated body = %q, want %q", strings.TrimRight(string(got), "\n"), resultJSON)
+	body2, err := io.ReadAll(resp2.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body2) != resultJSON {
+		t.Errorf("body = %q, want %q", string(body2), resultJSON)
 	}
 }
 

@@ -14,7 +14,7 @@ import (
 // Service holds everything the four /api/v1/storage handlers need at
 // request time. Two distinct production shapes:
 //
-//   - Catalog-backed: LakekeeperURL + WarehouseName + Minter are set;
+//   - Catalog-backed: LakekeeperURL + WarehouseResolver + Minter are set;
 //     the handlers proxy List/Load/Schema through a
 //     `pkg/catalogwriter.Client` and read parquet via the iceberg-go
 //     REST-catalog table (which carries lakekeeper-vended STS credentials
@@ -42,18 +42,13 @@ type Service struct {
 	// fixture walker).
 	LakekeeperURL string
 
-	// WarehouseName is a deployment-time default lakekeeper warehouse name
-	// (legacy field, used by tests + the per-request fallback when
-	// WarehouseResolver is nil). When WarehouseResolver is set, callers
-	// resolve per-request and ignore this field.
-	WarehouseName string
-
 	// WarehouseResolver resolves the lakekeeper warehouse name for a given
 	// lakekeeper project UUID at request time. Pipeline-api asks lakekeeper
 	// for the warehouses attached to the user's project and picks the first.
 	// An explicit per-project warehouse selector is not yet implemented.
 	//
-	// nil → falls back to WarehouseName (legacy / tests).
+	// nil → warehouse resolution fails per-request (projectgate.Gate.Warehouse
+	// returns 503 unavailable); production wiring always supplies it.
 	WarehouseResolver func(ctx context.Context, lakekeeperProjectID string) (string, error)
 
 	// Minter mints an impersonation JWT for the authenticated user in ctx.

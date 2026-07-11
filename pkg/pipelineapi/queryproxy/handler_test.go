@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate/projectgatetest"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
@@ -50,7 +51,9 @@ func testSigner(t *testing.T) *tokens.Signer {
 // this ctx, so without it they would refuse to mint.
 func authedRequest(t *testing.T, sub uuid.UUID, jsonBody string) *http.Request {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(jsonBody))
+	pid := uuid.NewString()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/projects/"+pid+"/query", strings.NewReader(jsonBody))
+	r.SetPathValue("pid", pid)
 	u := &store.User{ID: sub, Email: "test@example.com"}
 	return r.WithContext(auth.WithCtxUser(r.Context(), u))
 }
@@ -69,7 +72,10 @@ func newHandler(t *testing.T, cfg Config) http.Handler {
 }
 
 func TestHandler_RequiresWorkerURL(t *testing.T) {
-	if _, err := Handler(Config{}, testSigner(t)); err == nil {
+	// A valid Gate is supplied so the Gate-nil guard does not short-circuit
+	// before newWorkerClient's WorkerURL-empty check — this test must exercise
+	// the WorkerURL requirement specifically.
+	if _, err := Handler(Config{Gate: projectgatetest.AllowAll("p", "w")}, testSigner(t)); err == nil {
 		t.Fatal("expected error when WorkerURL is empty")
 	}
 }
@@ -100,7 +106,7 @@ func TestHandler_HappyPath_PassthroughBytes(t *testing.T) {
 	}))
 	defer worker.Close()
 
-	h := newHandler(t, Config{WorkerURL: worker.URL, Warehouse: "proj-id/wh"})
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("proj-id", "wh")})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
 
@@ -149,7 +155,7 @@ func TestHandler_Clamping(t *testing.T) {
 	}))
 	defer worker.Close()
 
-	cfg := Config{WorkerURL: worker.URL, Warehouse: "p/w"}
+	cfg := Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}
 
 	cases := []struct {
 		name                          string
@@ -190,7 +196,7 @@ func TestHandler_MalformedAndEmptySQL(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer worker.Close()
-	h := newHandler(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"})
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
 
 	for _, body := range []string{`{not json`, `{"sql":""}`, `{}`} {
 		rec := httptest.NewRecorder()
@@ -209,7 +215,7 @@ func TestHandler_Unauthenticated(t *testing.T) {
 		t.Error("worker should not be called for an unauthenticated request")
 	}))
 	defer worker.Close()
-	h := newHandler(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"})
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
 
 	// No auth.WithCtxUser on this request → no user in ctx.
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
@@ -240,7 +246,7 @@ func TestHandler_PerPrincipal429WhenCapExhausted(t *testing.T) {
 	}))
 	defer worker.Close()
 
-	cfg := Config{WorkerURL: worker.URL, Warehouse: "p/w", PerPrincipalInflight: 2}
+	cfg := Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w"), PerPrincipalInflight: 2}
 	h := newHandler(t, cfg)
 	sub := uuid.New()
 
@@ -309,7 +315,7 @@ func TestHandler_TranslatesWorkerOutcomes(t *testing.T) {
 			}))
 			defer worker.Close()
 
-			h := newHandler(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"})
+			h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
 
@@ -331,7 +337,7 @@ func TestHandler_TranslatesWorkerOutcomes(t *testing.T) {
 
 func TestHandler_TransportErrorTo502(t *testing.T) {
 	// Worker URL points at a closed port → transport error.
-	h := newHandler(t, Config{WorkerURL: "http://127.0.0.1:1/", Warehouse: "p/w"})
+	h := newHandler(t, Config{WorkerURL: "http://127.0.0.1:1/", Gate: projectgatetest.AllowAll("p", "w")})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
 	if rec.Code != http.StatusBadGateway {
@@ -356,7 +362,7 @@ func TestHandler_NeverLogsTokens(t *testing.T) {
 	}))
 	defer worker.Close()
 
-	h := newHandler(t, Config{WorkerURL: worker.URL, Warehouse: "p/w"})
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SECRET SQL 12345"}`))
 
@@ -368,5 +374,40 @@ func TestHandler_NeverLogsTokens(t *testing.T) {
 	// SQL text must never be logged.
 	if strings.Contains(logs, "SECRET SQL 12345") {
 		t.Fatalf("logs leaked SQL text: %s", logs)
+	}
+}
+
+func TestHandler_GateForbidden(t *testing.T) {
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("worker must not be called when the gate denies")
+	}))
+	defer worker.Close()
+	g := projectgatetest.AllowAll("p", "w")
+	g.Authorizer = projectgatetest.FakeAuthorizer{Allow: false}
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: g})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_GateInvalidPID(t *testing.T) {
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer worker.Close()
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/projects/not-a-uuid/query", strings.NewReader(`{"sql":"SELECT 1"}`))
+	r.SetPathValue("pid", "not-a-uuid")
+	r = r.WithContext(auth.WithCtxUser(r.Context(), &store.User{ID: uuid.New(), Email: "t@e.c"}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandler_RequiresGate(t *testing.T) {
+	if _, err := Handler(Config{WorkerURL: "http://worker"}, testSigner(t)); err == nil {
+		t.Fatal("expected error when Gate is nil")
 	}
 }

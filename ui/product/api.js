@@ -131,10 +131,28 @@ export async function getTableSchema(projectId, namespace, name) {
 
 /**
  * First N rows (server-capped at 100) plus column types. May set
- * truncated=true when row or byte cap fires.
+ * truncated=true. Errors carry .status and .kind (query_disabled /
+ * rate_limited / capacity / result_too_large / sql_error / timeout) so the
+ * page can render actionable states instead of a generic failure.
  */
 export async function getTablePreview(projectId, namespace, name) {
-  return api(`/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/preview`);
+  const r = await fetch(
+    `/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/preview`,
+    { credentials: 'include' },
+  );
+  if (r.status === 401) {
+    if (typeof window.__datupletGoToLogin === 'function') window.__datupletGoToLogin();
+    throw new Error('not authenticated');
+  }
+  const ct = r.headers.get('content-type') || '';
+  const payload = ct.includes('application/json') ? await r.json() : await r.text();
+  if (!r.ok) {
+    const err = new Error((payload && payload.error) || `preview failed (HTTP ${r.status})`);
+    err.status = r.status;
+    err.kind = payload && payload.kind;
+    throw err;
+  }
+  return payload;
 }
 
 /**
@@ -208,11 +226,10 @@ export async function deleteSecret(projectId, key) {
 // and returns the queryengine Result JSON: { schema:[{name,type}], rows:[[...]],
 // truncated:bool, stats:{duration_ms,...} }.
 //
-// The warehouse is server-configured (one per deploy via DATUPLET_QUERY_WAREHOUSE),
-// so `projectId` is NOT sent in the body — it is accepted for parity with the
-// storage API and so the console can pass its active project for future
-// per-project routing. `opts` may carry { timeoutS, maxRows, maxBytes } (clamped
-// server-side).
+// The route is project-scoped (RFC 025 §4.6): pipeline-api enforces FGA
+// datuplet_member on `projectId` and resolves the lakekeeper warehouse for
+// that project per request. `opts` may carry { timeoutS, maxRows, maxBytes }
+// (clamped server-side).
 //
 // This does NOT use the api() wrapper: query errors (400 sql_error, 403,
 // 408 timeout, 429 rate_limited) are EXPECTED outcomes the console renders
@@ -226,7 +243,7 @@ export async function runQuery(projectId, sql, opts = {}) {
   if (opts.maxRows != null) body.max_rows = opts.maxRows;
   if (opts.maxBytes != null) body.max_bytes = opts.maxBytes;
 
-  const r = await fetch('/api/v1/query', {
+  const r = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/query`, {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },

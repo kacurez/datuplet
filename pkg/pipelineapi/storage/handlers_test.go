@@ -3,10 +3,13 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -14,6 +17,9 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate/projectgatetest"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/storage/testdata"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
@@ -84,7 +90,19 @@ func makeFixtureServiceWithLK(t *testing.T) *Service {
 // though we don't use it here.
 func newTestServer(t *testing.T, svc *Service, resolver auth.UserResolver, authzr *authztest.Fake) *httptest.Server {
 	t.Helper()
-	h := &HTTPHandlers{Svc: svc, Authorizer: authzr}
+	// Gate is built from the SAME stubs the fixture Service already carries
+	// (svc.LakekeeperProjectIDFor) plus authzr — resolveProject delegates
+	// to it instead of calling h.Svc.LakekeeperProjectIDFor + an authorizer
+	// directly. WarehouseFor is left nil: every test here uses the
+	// fixture-walker path (LakekeeperURL == ""), so resolveWarehouse is
+	// never invoked.
+	h := &HTTPHandlers{
+		Svc: svc,
+		Gate: &projectgate.Gate{
+			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+			Authorizer:             authzr,
+		},
+	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
 		auth.WithUser(resolver, http.HandlerFunc(h.ListTables)))
@@ -187,6 +205,16 @@ func TestListTables_NoMembership(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", resp.StatusCode)
 	}
+	// The gate-error body must carry "kind" alongside "error" — parity with
+	// the query proxy's {"error","kind"} shape for the same shared
+	// projectgate.Error (RFC 025 Codex review, Minor finding).
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kind"] != "forbidden" {
+		t.Errorf(`kind = %q, want "forbidden"`, body["kind"])
+	}
 }
 
 func TestListTables_NoSession(t *testing.T) {
@@ -214,6 +242,53 @@ func TestListTables_InvalidProjectID(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kind"] != "bad_request" {
+		t.Errorf(`kind = %q, want "bad_request"`, body["kind"])
+	}
+}
+
+// TestListTables_WarehouseResolutionFails: on the lakekeeper-configured
+// path, a resolveWarehouse gate failure (e.g. no warehouse registered yet
+// for the project) must carry "kind" alongside "error" — same parity as
+// resolveProject and the query proxy (Minor finding, RFC 025 Codex review).
+func TestListTables_WarehouseResolutionFails(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	svc.LakekeeperURL = "http://lakekeeper.invalid" // never dialed: warehouse resolution fails first
+	h := &HTTPHandlers{
+		Svc: svc,
+		Gate: &projectgate.Gate{
+			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+			Authorizer:             allowedFake(),
+			WarehouseFor: func(_ context.Context, _ string) (string, error) {
+				return "", errors.New("no warehouse registered")
+			},
+		},
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
+		auth.WithUser(stubResolver{}, http.HandlerFunc(h.ListTables)))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
+	if err != nil {
+		t.Fatalf("GET tables: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kind"] != "unavailable" {
+		t.Errorf(`kind = %q, want "unavailable"`, body["kind"])
 	}
 }
 
@@ -270,9 +345,53 @@ func TestTableSchema_InvalidIdentifier(t *testing.T) {
 	}
 }
 
-func TestTablePreview_Success(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+// fakePreviewRunner implements PreviewRunner for the storage preview tests
+// (RFC 025 Task 3.1). Preview no longer scans the table itself — it
+// delegates the actual data read to the query-worker via this seam, so the
+// walker-backed EncodeRecords tests this replaces no longer apply.
+type fakePreviewRunner struct {
+	res  *queryproxy.Result
+	qerr *queryproxy.QueryError
+	got  struct{ warehouse, ns, table string }
+}
+
+func (f *fakePreviewRunner) Preview(_ context.Context, _, warehouse, ns, table string, _ queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError) {
+	f.got.warehouse, f.got.ns, f.got.table = warehouse, ns, table
+	return f.res, f.qerr
+}
+
+// previewWarehouseName is the bare warehouse name projectgatetest.AllowAll
+// resolves for the preview tests below.
+const previewWarehouseName = "mywarehouse"
+
+// newPreviewTestServer wires just the Preview route against h. Preview no
+// longer touches h.Svc (the query-worker owns the data read), so these
+// tests build a minimal HTTPHandlers instead of reusing the fixture-walker
+// newTestServer harness.
+func newPreviewTestServer(t *testing.T, h *HTTPHandlers, resolver auth.UserResolver) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/preview",
+		auth.WithUser(resolver, http.HandlerFunc(h.Preview)))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPreview_Success covers the happy path: the fake runner's
+// queryproxy.Result maps onto PreviewResponse verbatim, and Preview passes
+// through the resolved ns/table/qualified-warehouse to the runner.
+func TestPreview_Success(t *testing.T) {
+	runner := &fakePreviewRunner{res: &queryproxy.Result{
+		Schema:    []queryproxy.ResultColumn{{Name: "id", Type: "INTEGER"}},
+		Rows:      [][]any{{1}},
+		Truncated: true,
+	}}
+	h := &HTTPHandlers{
+		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		Query: runner,
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
 
 	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
 	resp, err := http.Get(url)
@@ -287,27 +406,34 @@ func TestTablePreview_Success(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.Rows) != 3 {
-		t.Errorf("rows = %d, want 3 (%v)", len(body.Rows), body.Rows)
+	if len(body.Columns) != 1 || body.Columns[0].Name != "id" || body.Columns[0].Type != "INTEGER" {
+		t.Errorf("columns = %+v, want [{id INTEGER}]", body.Columns)
 	}
-	if body.Truncated {
-		t.Errorf("preview should not be truncated for 3-row fixture")
+	if len(body.Rows) != 1 {
+		t.Errorf("rows = %d, want 1 (%v)", len(body.Rows), body.Rows)
+	}
+	if !body.Truncated {
+		t.Errorf("truncated = false, want true")
+	}
+	if runner.got.ns != "public" || runner.got.table != "simple" {
+		t.Errorf("runner got ns/table = %q/%q, want public/simple", runner.got.ns, runner.got.table)
+	}
+	if want := fixtureLakekeeperProjectID + "/" + previewWarehouseName; runner.got.warehouse != want {
+		t.Errorf("runner got warehouse = %q, want %q", runner.got.warehouse, want)
 	}
 }
 
-// TestTablePreview_TruncationFlag exercises the P1 regression path:
-// EncodeRecords sets Truncated=true only when the underlying scan yields
-// one more row past the cap. Lowering previewRowCap below the fixture's
-// row count means iceberg-go must still hand at least one extra row to
-// the post-loop peek; if Preview caps at the scan layer itself, this
-// test fails.
-func TestTablePreview_TruncationFlag(t *testing.T) {
-	orig := previewRowCap
-	previewRowCap = 2
-	t.Cleanup(func() { previewRowCap = orig })
-
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+// TestPreview_QueryDisabled asserts the 501 query_disabled soft-degrade
+// when no query-service core is wired (h.Query left as the nil interface).
+func TestPreview_QueryDisabled(t *testing.T) {
+	h := &HTTPHandlers{
+		Gate: projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		// Query intentionally left nil.
+	}
+	if h.Query != nil {
+		t.Fatal("precondition: h.Query must be the nil interface")
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
 
 	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
 	resp, err := http.Get(url)
@@ -315,18 +441,70 @@ func TestTablePreview_TruncationFlag(t *testing.T) {
 		t.Fatalf("GET preview: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", resp.StatusCode)
 	}
-	var body PreviewResponse
+	var body map[string]string
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.Rows) != 2 {
-		t.Errorf("rows = %d, want 2 (capped by previewRowCap)", len(body.Rows))
+	if body["kind"] != "query_disabled" {
+		t.Errorf(`kind = %q, want "query_disabled"`, body["kind"])
 	}
-	if !body.Truncated {
-		t.Errorf("truncated = false, want true (fixture has 3 rows > cap of 2)")
+}
+
+// TestPreview_ResultTooLarge asserts the query-worker's result_too_large
+// QueryError maps to a 413 whose message explains the cap in storage-UI
+// terms ("too wide") rather than the query-worker's generic wording.
+func TestPreview_ResultTooLarge(t *testing.T) {
+	runner := &fakePreviewRunner{qerr: &queryproxy.QueryError{Status: http.StatusRequestEntityTooLarge, Kind: "result_too_large", Msg: "result too large"}}
+	h := &HTTPHandlers{
+		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		Query: runner,
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/simple/preview"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET preview: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(body["error"], "too wide") {
+		t.Errorf("error = %q, want it to contain %q", body["error"], "too wide")
+	}
+}
+
+// TestPreview_InvalidIdentifier asserts identifiers are still rejected
+// BEFORE the runner is invoked. "_bad" (not "../x") is the canonical
+// invalid-identifier probe here — Go's ServeMux strips dot segments out of
+// the path before PathValue, so "../x" never reaches the handler.
+func TestPreview_InvalidIdentifier(t *testing.T) {
+	runner := &fakePreviewRunner{}
+	h := &HTTPHandlers{
+		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		Query: runner,
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/_bad/simple/preview"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET preview: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if runner.got.ns != "" || runner.got.table != "" {
+		t.Errorf("runner invoked despite invalid identifier: got=%+v", runner.got)
 	}
 }
 
@@ -343,8 +521,19 @@ func TestTableInfo_Success(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	var body infoResp
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	var body struct {
+		MetadataLocation  string          `json:"metadata_location"`
+		CurrentSnapshotID int64           `json:"current_snapshot_id"`
+		Snapshots         []snapshotBrief `json:"snapshots"`
+		RowCount          *int64          `json:"row_count"`
+		DataFileCount     *int64          `json:"data_file_count"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if body.MetadataLocation == "" {
@@ -356,11 +545,62 @@ func TestTableInfo_Success(t *testing.T) {
 	if len(body.Snapshots) != 1 {
 		t.Errorf("snapshots = %d, want 1 (fixture commits only one real snapshot)", len(body.Snapshots))
 	}
-	if body.RowCount != 3 {
-		t.Errorf("row_count = %d, want 3", body.RowCount)
+	if body.RowCount == nil || *body.RowCount != 3 {
+		t.Errorf("row_count = %v, want 3 (from total-records summary)", body.RowCount)
 	}
-	if len(body.DataFiles) != 1 {
-		t.Errorf("data_files = %d, want 1", len(body.DataFiles))
+	if body.DataFileCount == nil || *body.DataFileCount != 1 {
+		t.Errorf("data_file_count = %v, want 1 (from total-data-files summary)", body.DataFileCount)
+	}
+
+	// data_files must be gone from the wire shape entirely (not just
+	// empty) — decode into a permissive map to check for its absence.
+	var raw2 map[string]any
+	if err := json.Unmarshal(raw, &raw2); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if _, present := raw2["data_files"]; present {
+		t.Error("data_files must be gone from the wire shape")
+	}
+}
+
+// TestTableInfo_NoSummary exercises a table whose current snapshot's
+// Summary lacks total-records/total-data-files (e.g. a writer that
+// didn't populate the standard Iceberg totals). RowCount and
+// DataFileCount must come back nil rather than 0 or a manifest-derived
+// approximation — the UI renders "—" for nil.
+func TestTableInfo_NoSummary(t *testing.T) {
+	warehouse := filepath.Join(t.TempDir(), "warehouse")
+	if err := testdata.GenerateNoSummaryErr(warehouse); err != nil {
+		t.Fatalf("generate no-summary fixture: %v", err)
+	}
+	svc := &Service{
+		WarehouseURI: "file://" + warehouse,
+		OrgName:      "myorg",
+		AllowLocal:   true,
+		LakekeeperProjectIDFor: func(_ context.Context, _ uuid.UUID) (string, error) {
+			return fixtureLakekeeperProjectID, nil
+		},
+	}
+	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
+
+	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/nosummary/info"
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET info: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body infoResp
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.RowCount != nil {
+		t.Errorf("row_count = %v, want nil (no total-records in summary)", *body.RowCount)
+	}
+	if body.DataFileCount != nil {
+		t.Errorf("data_file_count = %v, want nil (no total-data-files in summary)", *body.DataFileCount)
 	}
 }
 

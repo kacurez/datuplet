@@ -109,8 +109,8 @@ async function renderInfo(gen, app, projectId, ns, name) {
       <dt>Metadata location</dt><dd>${esc(info.metadata_location || '')}</dd>
       <dt>Current snapshot</dt><dd>${esc(String(info.current_snapshot_id ?? ''))}</dd>
       <dt>Snapshot count</dt><dd>${(info.snapshots || []).length}</dd>
-      <dt>Data files</dt><dd>${(info.data_files || []).length}</dd>
-      <dt>Row count</dt><dd>${esc(String(info.row_count ?? 0))}</dd>
+      <dt>Data files</dt><dd>${info.data_file_count == null ? '—' : esc(String(info.data_file_count))}</dd>
+      <dt>Row count</dt><dd>${info.row_count == null ? '—' : esc(String(info.row_count))}</dd>
     </dl>
   `;
 
@@ -182,6 +182,18 @@ async function renderPreview(gen, app, projectId, ns, name) {
     resp = await getTablePreview(projectId, ns, name);
   } catch (e) {
     if (_aborted() || gen !== _tabGen) return; // stale — superseded fetch or route change
+    if (e.kind === 'query_disabled') {
+      app.innerHTML = '<div class="callout callout--warn">Preview needs the query service. Ask your operator to set <code>queryWorker.enabled=true</code>.</div>';
+      return;
+    }
+    if (e.status === 429 || e.status === 503) {
+      app.innerHTML = '<div class="callout callout--warn">The query service is busy — try again in a moment.</div>';
+      return;
+    }
+    if (e.kind === 'result_too_large') {
+      app.innerHTML = `<p style="color: var(--fg-2);">${esc(e.message)}</p>`;
+      return;
+    }
     app.innerHTML = `<p style="color: var(--status-fail-fg);">Failed to load: ${esc(e.message)}</p>`;
     return;
   }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/apache/iceberg-go/catalog"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
@@ -96,7 +97,10 @@ func newCatalogProxy(ctx context.Context, svc *Service, projectID, warehouse str
 // paths don't carry project identity, so any prefix check would be either
 // useless or wrong.
 func (p *catalogProxy) listAllTables(ctx context.Context) ([]TableRef, error) {
-	var out []TableRef
+	// Listing is cheap; LoadTable dominates wall-clock (one REST call +
+	// credential vend per table). Collect identifiers first, then load
+	// with bounded parallelism (RFC 025 §4.3).
+	var idents []icebergtable.Identifier
 	namespaces, err := p.cli.Catalog.ListNamespaces(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -106,25 +110,63 @@ func (p *catalogProxy) listAllTables(ctx context.Context) ([]TableRef, error) {
 			if tErr != nil {
 				return nil, fmt.Errorf("list tables in %v: %w", ns, tErr)
 			}
-			tbl, lErr := p.cli.Catalog.LoadTable(ctx, ident)
+			idents = append(idents, ident)
+		}
+	}
+
+	loaded := make([]*TableRef, len(idents))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
+	for i, ident := range idents {
+		g.Go(func() error {
+			tbl, lErr := p.cli.Catalog.LoadTable(gctx, ident)
 			if lErr != nil {
 				// A table that fails to load (orphan, mid-creation,
 				// permission denied) is skipped rather than failing the
-				// whole list — same behaviour as the fixture walker.
-				continue
+				// whole list — same behaviour as the sequential version.
+				return nil
 			}
 			var snapID int64
 			if cur := tbl.CurrentSnapshot(); cur != nil {
 				snapID = cur.SnapshotID
 			}
-			out = append(out, TableRef{
+			loaded[i] = &TableRef{
 				Namespace:         joinNS(ident),
 				Name:              shortName(ident),
 				MetadataLocation:  tbl.MetadataLocation(),
 				CurrentSnapshotID: snapID,
-			})
+			}
+			return nil
+		})
+	}
+	// goroutines only ever return nil (per-table load failures are
+	// intentionally swallowed above), so g.Wait()'s error is always nil —
+	// ctx cancellation no longer surfaces here; it's checked explicitly
+	// below via ctx.Err().
+	_ = g.Wait()
+
+	// A cancelled/deadline-exceeded request context must surface as an
+	// error, not a silently-empty (or silently-partial) table list.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
+
+	out := make([]TableRef, 0, len(loaded))
+	for _, ref := range loaded {
+		if ref != nil {
+			out = append(out, *ref)
 		}
 	}
+
+	// Distinguish "every LoadTable call failed" (likely a lakekeeper/STS
+	// outage) from a genuinely empty catalog. A partial result (some
+	// loaded, some skipped) is left as success — that's the intended
+	// orphan/mid-creation/permission-denied skip behavior above, and
+	// can't be distinguished from a partial outage without more signal.
+	if len(idents) > 0 && len(out) == 0 {
+		return nil, fmt.Errorf("failed to load any of %d catalog tables (lakekeeper/STS outage?)", len(idents))
+	}
+
 	return out, nil
 }
 

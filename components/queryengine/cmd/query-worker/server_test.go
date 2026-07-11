@@ -36,7 +36,7 @@ type fakeRunner struct {
 	result  *queryengine.Result
 	err     error
 	blocked chan struct{} // if non-nil, Run blocks until closed
-	onCall  func()       // if non-nil, called at the very start of Run (before blocking)
+	onCall  func()        // if non-nil, called at the very start of Run (before blocking)
 }
 
 func (f *fakeRunner) Run(ctx context.Context, r queryengine.Request) (*queryengine.Result, error) {
@@ -556,6 +556,159 @@ func TestServer_MalformedJSON_Returns400(t *testing.T) {
 	}
 	if runner.wasCalled() {
 		t.Error("runner should not be called on malformed JSON")
+	}
+}
+
+// Test 11: GET /metrics → 200, body exposes inflight + capacity gauges.
+func TestMetricsEndpoint(t *testing.T) {
+	priv := genTestKey(t)
+	ok := RunnerFunc(func(_ context.Context, _ queryengine.Request) (*queryengine.Result, error) {
+		return &queryengine.Result{Rows: [][]any{}}, nil
+	})
+	srv := newTestServer(t, priv, ok, workerConfig{MaxConcurrency: 3})
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "query_worker_capacity_slots 3") {
+		t.Fatalf("metrics missing capacity gauge:\n%s", body)
+	}
+	if !strings.Contains(body, "query_worker_inflight 0") {
+		t.Fatalf("metrics missing inflight gauge:\n%s", body)
+	}
+}
+
+// queryBody is the minimal valid /internal/query body (the fake runner
+// never attaches, so the JWT/warehouse just need to be non-empty).
+var queryBody = map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
+
+// Test 12a: bounded-wait admission — a slot that frees inside the window
+// admits the queued request instead of rejecting it immediately.
+func TestAdmission_BoundedWaitAdmitsWhenSlotFrees(t *testing.T) {
+	priv := genTestKey(t)
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	slow := RunnerFunc(func(_ context.Context, _ queryengine.Request) (*queryengine.Result, error) {
+		started <- struct{}{}
+		<-release
+		return &queryengine.Result{Rows: [][]any{}}, nil
+	})
+	srv := newTestServer(t, priv, slow, workerConfig{MaxConcurrency: 1, AdmissionWait: 500 * time.Millisecond})
+	tok := mintTestToken(t, priv)
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- doPost(t, srv, queryBody, tok) }()
+	<-started // first request now holds the only slot
+
+	// Second request arrives while full; the slot frees inside the window.
+	time.AfterFunc(100*time.Millisecond, func() { close(release) })
+	rec := doPost(t, srv, queryBody, tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d, want 200 (admitted after bounded wait); body=%s", rec.Code, rec.Body.String())
+	}
+	<-firstDone
+}
+
+// Test 12b: bounded-wait admission — a slot that never frees within the
+// window still 429s, with a Retry-After header.
+func TestAdmission_BoundedWaitExpires429(t *testing.T) {
+	priv := genTestKey(t)
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	slow := RunnerFunc(func(_ context.Context, _ queryengine.Request) (*queryengine.Result, error) {
+		started <- struct{}{}
+		<-release
+		return &queryengine.Result{Rows: [][]any{}}, nil
+	})
+	srv := newTestServer(t, priv, slow, workerConfig{MaxConcurrency: 1, AdmissionWait: 50 * time.Millisecond})
+	tok := mintTestToken(t, priv)
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- doPost(t, srv, queryBody, tok) }()
+	<-started
+
+	rec := doPost(t, srv, queryBody, tok) // window expires — slot never frees
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 after AdmissionWait expiry; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("Retry-After header missing on 429")
+	}
+	close(release)
+	<-firstDone
+}
+
+// TestSanitizeEngineError: DuckDB's native error message appends a
+// "\nLINE N: <SQL>\n   ^" echo of the offending statement, which may carry
+// sensitive literals (RFC 025 Codex review F1). sanitizeEngineError must
+// keep the leading diagnostic (used by callers to distinguish error kinds)
+// and drop everything from the LINE echo onward.
+func TestSanitizeEngineError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "line_echo_stripped",
+			err: errors.New("Catalog Error: Table with name secret_table does not exist.\n" +
+				"\nLINE 1: SELECT secret_column FROM \"ns\".\"secret_table\"\n" +
+				"                                     ^"),
+			want: "Catalog Error: Table with name secret_table does not exist.",
+		},
+		{
+			name: "no_line_echo_passthrough",
+			err:  errors.New("connection refused"),
+			want: "connection refused",
+		},
+		{
+			name: "wrapped_timeout_no_line_echo",
+			err:  fmt.Errorf("timeout: %w", queryengine.ErrTimeout),
+			want: "timeout: query timed out",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeEngineError(tc.err); got != tc.want {
+				t.Errorf("sanitizeEngineError(%q) = %q, want %q", tc.err.Error(), got, tc.want)
+			}
+			if strings.Contains(sanitizeEngineError(tc.err), "secret_column") {
+				t.Errorf("sanitized error must not contain the SQL echo: %q", sanitizeEngineError(tc.err))
+			}
+		})
+	}
+}
+
+// TestServer_RunnerError_LogAndBodyStripSQLEcho: a DuckDB-shaped error
+// containing a LINE echo of the SQL text must not leak that echo into the
+// HTTP error body (the worker log isn't observable from this test, but
+// sanitizeEngineError is the single choke point both use).
+func TestServer_RunnerError_LogAndBodyStripSQLEcho(t *testing.T) {
+	priv := genTestKey(t)
+	duckdbErr := errors.New("Catalog Error: Table with name nonexistent_t does not exist.\n" +
+		"\nLINE 1: SELECT * FROM \"ns\".\"nonexistent_t\" WHERE ssn = '123-45-6789'\n" +
+		"                       ^")
+	runner := &fakeRunner{err: duckdbErr}
+	srv := newTestServer(t, priv, runner, testWorkerCfg())
+
+	token := mintTestToken(t, priv)
+	body := map[string]any{"sql": "SELECT * FROM \"ns\".\"nonexistent_t\" WHERE ssn = '123-45-6789'", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
+	resp := doPost(t, srv, body, token)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", resp.Code, resp.Body.String())
+	}
+	errMsg, kind := decodeError(t, resp.Body.String())
+	if kind != "sql_error" {
+		t.Errorf("kind = %q, want sql_error", kind)
+	}
+	if !strings.Contains(errMsg, "nonexistent_t") {
+		t.Errorf("error body should still name the offending table, got: %q", errMsg)
+	}
+	if strings.Contains(errMsg, "LINE ") || strings.Contains(errMsg, "123-45-6789") {
+		t.Errorf("error body must not echo the SQL statement, got: %q", errMsg)
 	}
 }
 

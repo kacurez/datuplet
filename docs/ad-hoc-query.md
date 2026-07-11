@@ -1,7 +1,8 @@
 # Ad-hoc SQL query (RFC 022)
 
-**Experimental.** The query surface is opt-in and disabled by default in the
-Helm charts. APIs and limits may change between 0.x releases.
+**Experimental.** The server query service is ON by default in the Helm
+charts (RFC 025 Q1); the BYO-local CLI remains opt-in. APIs and limits may
+change between 0.x releases.
 
 ---
 
@@ -9,7 +10,7 @@ Datuplet provides two ways to run read-only ad-hoc SQL against the warehouse:
 
 | Surface | How it runs | Who enables it |
 |---|---|---|
-| **Server query service** (`POST /api/v1/query`) | DuckDB inside a query-worker Pod; pipeline-api proxies | `queryWorker.enabled: true` in values |
+| **Server query service** (`POST /api/v1/projects/{pid}/query`) | DuckDB inside a query-worker Pod; pipeline-api proxies | on by default; `queryWorker.enabled: false` in values to disable |
 | **BYO-local CLI** (`datuplet-query`) | DuckDB on the user's laptop | `allowClientSideQuery: true` + separate binary |
 
 Both surfaces use lakekeeper for table metadata and lakekeeper-vended credentials
@@ -35,57 +36,42 @@ staging PUT or commit. Do not rely on engine-level write blocking.
 
 ### Enabling
 
-The query service ships **disabled by default** (`queryWorker.enabled: false`)
-— it is experimental, so a stock install does not deploy it. Enabling it is a
-**post-install** step because the warehouse value depends on the lakekeeper
-project created during registration.
+The query service is **on by default** (`queryWorker.enabled: true`) — a
+stock install deploys the query-worker Pod as part of the standard footprint.
+`make deploy-local` / `docker-build-k8s` build the query-worker image
+automatically, and no warehouse value needs to be resolved or set — the route
+resolves the warehouse per request from the project (`{pid}`) in the URL
+(RFC 025).
 
-1. **Build the query-worker image.** It bakes the DuckDB iceberg/httpfs
-   extensions and is NOT built by `make deploy-local` / `docker-build-k8s` — build
-   it explicitly:
+To **disable** it (per-deploy opt-out), helm upgrade with the flag flipped
+off:
 
-   ```bash
-   make build-components      # builds query-worker (+ the other components)
-   # or only the worker:
-   # docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
-   # kind only — load it into the cluster node:
-   # kind load docker-image datuplet/query-worker:latest --name <cluster>
-   ```
+```bash
+helm upgrade datuplet-app charts/datuplet-app -n datuplet --reuse-values \
+  --set queryWorker.enabled=false
+```
 
-2. **Register first.** The standard install's Phase 5 (`scripts/register.sh`)
-   creates the lakekeeper project + warehouse; the query service reuses them.
+Registration still happens via the standard install's Phase 5
+(`scripts/register.sh`), which creates the lakekeeper project + warehouse
+that the query service reuses.
 
-3. **Resolve the project-qualified warehouse.** The `warehouse` value MUST be
-   `<lakekeeper-project-id>/<warehouse-name>` (e.g. `<id>/datuplet`) — a bare name
-   resolves against lakekeeper's nil-UUID default project and 401s. The id is the
-   `lakekeeper_project_id` column of pipeline-api's `projects` table (also
-   returned by `GET /api/v1/projects` and stored in `~/.datuplet/cluster.json`
-   after `datuplet login --remote`):
+Optional: also allow the laptop-side `datuplet-query` CLI (see below) with
+`--set allowClientSideQuery=true`.
 
-   ```sql
-   SELECT lakekeeper_project_id FROM projects WHERE name = 'default';
-   ```
+**Verify.** The `query-worker` Pod is Running and
+`POST /api/v1/projects/{pid}/query` returns rows (or open the console at
+`/ui/query`). `{pid}` is the Datuplet project UUID, returned by
+`GET /api/v1/projects`.
 
-4. **Enable + set the warehouse** via a helm upgrade (per-deploy opt-in; the chart
-   default stays off):
+Route registration soft-degrades to 404 when `DATUPLET_QUERY_WORKER_URL` is
+unset or the query-worker is disabled — never on a per-project warehouse
+value, since the warehouse is now resolved per request.
 
-   ```bash
-   helm upgrade datuplet-app charts/datuplet-app -n datuplet --reuse-values \
-     --set queryWorker.enabled=true \
-     --set queryWorker.query.warehouse="<lakekeeper-project-id>/datuplet"
-   # optional: also allow the laptop-side datuplet-query CLI (see below)
-   #   --set allowClientSideQuery=true
-   ```
+### POST /api/v1/projects/{pid}/query
 
-5. **Verify.** The `query-worker` Pod is Running and `POST /api/v1/query` returns
-   rows (or open the console at `/ui/query`).
-
-Until the warehouse is set, pipeline-api soft-degrades to 404 on
-`POST /api/v1/query` (also 404 when `DATUPLET_QUERY_WORKER_URL` is unset).
-
-### POST /api/v1/query
-
-Runs a SQL statement against the warehouse and returns results as JSON.
+Runs a SQL statement against the project's warehouse and returns results as
+JSON. `{pid}` is the Datuplet project UUID (see `GET /api/v1/projects`); the
+warehouse is resolved from the project per request.
 
 **Authentication:** bearer token (`Authorization: Bearer <api-token>`) or
 session cookie.
@@ -221,7 +207,7 @@ manually after deployment:
 - [ ] A table outside your FGA grants surfaces a 400 `sql_error` (not a
       generic error or crash).
 
-The `POST /api/v1/query` path itself is covered by the e2e suite in
+The `POST /api/v1/projects/{pid}/query` path itself is covered by the e2e suite in
 `tests/e2e/scenarios_query_test.go`.
 
 ---
