@@ -32,6 +32,10 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
 				"E2E: FGA bootstrap failed (K8s scenarios will skip): %v\n", err)
+			if os.Getenv("E2E_REQUIRE") == "1" {
+				fmt.Fprintln(os.Stderr, "E2E: E2E_REQUIRE=1 — treating bootstrap failure as fatal")
+				os.Exit(1)
+			}
 		} else if err := framework.RegisterBuiltinComponents(ctx); err != nil {
 			// Registration failing (e.g. ComponentDefinition CRD not installed on
 			// an older cluster) must not silently let every scenario run against

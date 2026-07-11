@@ -107,20 +107,20 @@ func TestSecretsLadder(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil — SetupFGABootstrap must have run in TestMain")
+		framework.SkipOrFail(t, "SharedHarness nil — SetupFGABootstrap must have run in TestMain")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable on NodePort 30081 — start port-forward")
+		framework.SkipOrFail(t, "pipeline-api not reachable on NodePort 30081 — start port-forward")
 	}
 
 	ctx := context.Background()
 
 	projectID, err := ensureSecretsLadderProject(ctx, h)
 	if err != nil {
-		t.Skipf("could not provision secrets-ladder project: %v", err)
+		framework.SkipOrFail(t, "could not provision secrets-ladder project: %v", err)
 	}
 	namespace := "datuplet-" + projectID
 

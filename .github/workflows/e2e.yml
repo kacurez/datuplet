@@ -20,6 +20,8 @@ jobs:
     name: kind + helm + e2e
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    env:
+      E2E_REQUIRE: "1"
     steps:
       - uses: actions/checkout@v6
 

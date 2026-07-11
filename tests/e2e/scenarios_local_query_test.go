@@ -97,10 +97,10 @@ func decodeJWTClaims(t *testing.T, token string) map[string]any {
 // package doc for why we don't toggle the policy at e2e time.
 func TestQuery_LocalMint_Enabled(t *testing.T) {
 	if framework.SharedHarness() == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 	ctx := context.Background()
 	session := getAdminSession(t)

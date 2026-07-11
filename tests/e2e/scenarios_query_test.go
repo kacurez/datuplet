@@ -108,7 +108,7 @@ func getAdminSession(t *testing.T) string {
 		queryAdminSessionErr = fmt.Errorf("admin login: %w", lastErr)
 	})
 	if queryAdminSessionErr != nil {
-		t.Skipf("admin session login failed: %v", queryAdminSessionErr)
+		framework.SkipOrFail(t, "admin session login failed: %v", queryAdminSessionErr)
 	}
 	return queryAdminSession
 }
@@ -139,10 +139,10 @@ func ensureQueryTable(t *testing.T) (ns, table string) {
 	t.Helper()
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil — E2E_K8S=1 + bootstrap required")
+		framework.SkipOrFail(t, "SharedHarness nil — E2E_K8S=1 + bootstrap required")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 
 	queryScenarioNamespaceOnce.Do(func() {
@@ -277,7 +277,7 @@ func getQueryProjectID(t *testing.T) string {
 		queryProjectIDCached = pid
 	})
 	if queryProjectIDErr != nil {
-		t.Skipf("%v", queryProjectIDErr)
+		framework.SkipOrFail(t, "%v", queryProjectIDErr)
 	}
 	return queryProjectIDCached
 }
@@ -571,13 +571,13 @@ func TestQueryBootstrap(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil — SetupFGABootstrap must have run in TestMain")
+		framework.SkipOrFail(t, "SharedHarness nil — SetupFGABootstrap must have run in TestMain")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable on NodePort 30081 — start port-forward")
+		framework.SkipOrFail(t, "pipeline-api not reachable on NodePort 30081 — start port-forward")
 	}
 
 	// Verify query-worker Deployment exists and has at least 1 ready replica.
@@ -585,11 +585,11 @@ func TestQueryBootstrap(t *testing.T) {
 		"-n", queryE2ENamespace,
 		"-o", "jsonpath={.status.readyReplicas}").Output()
 	if err != nil {
-		t.Skipf("query-worker Deployment not found — did you set queryWorker.enabled=true in values-app.yaml? err=%v", err)
+		framework.SkipOrFail(t, "query-worker Deployment not found — did you set queryWorker.enabled=true in values-app.yaml? err=%v", err)
 	}
 	ready := strings.TrimSpace(string(out))
 	if ready == "" || ready == "0" {
-		t.Skipf("query-worker has 0 ready replicas — worker may still be starting (readyReplicas=%q)", ready)
+		framework.SkipOrFail(t, "query-worker has 0 ready replicas — worker may still be starting (readyReplicas=%q)", ready)
 	}
 	t.Logf("query-worker ready replicas: %s", ready)
 
@@ -627,10 +627,10 @@ func TestQuery_HappyPath(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ns, table := ensureQueryTable(t)
@@ -714,10 +714,10 @@ func TestQuery_AuthzDenied(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ns, table := ensureQueryTable(t)
@@ -731,7 +731,7 @@ func TestQuery_AuthzDenied(t *testing.T) {
 	// Find the pipeline-api pod for kubectl exec.
 	podName := queryFindPipelineAPIPod(ctx)
 	if podName == "" {
-		t.Skip("pipeline-api pod not found — cannot create deny-test user")
+		framework.SkipOrFail(t, "pipeline-api pod not found — cannot create deny-test user")
 	}
 
 	// Create user via pipeline-api admin subcommand (idempotent: already-exists
@@ -742,14 +742,14 @@ func TestQuery_AuthzDenied(t *testing.T) {
 		"--email="+denyEmail,
 		"--password="+denyPassword).CombinedOutput()
 	if err != nil {
-		t.Skipf("create deny-test user failed: %v\noutput: %s", err, string(createOut))
+		framework.SkipOrFail(t, "create deny-test user failed: %v\noutput: %s", err, string(createOut))
 	}
 	t.Logf("deny-test user creation: %s", strings.TrimSpace(string(createOut)))
 
 	// Login as the deny-test user to get a session cookie.
 	denyCookie, _, err := querySessionLogin(ctx, framework.PipelineAPIBaseURL(), denyEmail, denyPassword)
 	if err != nil {
-		t.Skipf("deny-test user login failed: %v", err)
+		framework.SkipOrFail(t, "deny-test user login failed: %v", err)
 	}
 
 	// Resolve {pid} via the admin session, NOT the deny-test session: the
@@ -802,14 +802,14 @@ func TestQuery_Truncation(t *testing.T) {
 		t.Skip("E2E_K8S=1 required")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ctx := context.Background()
@@ -852,14 +852,14 @@ func TestQuery_Timeout(t *testing.T) {
 		t.Skip("E2E_K8S=1 required")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ctx := context.Background()
@@ -926,14 +926,14 @@ func TestQuery_Concurrency(t *testing.T) {
 		t.Skip("E2E_K8S=1 required")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ctx := context.Background()
@@ -1060,10 +1060,10 @@ func TestQuery_WriteProbe(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ns, table := ensureQueryTable(t)
@@ -1075,7 +1075,7 @@ func TestQuery_WriteProbe(t *testing.T) {
 	viewerPassword := "viewer-changeme"
 	podName := queryFindPipelineAPIPod(ctx)
 	if podName == "" {
-		t.Skip("pipeline-api pod not found — cannot create viewer user")
+		framework.SkipOrFail(t, "pipeline-api pod not found — cannot create viewer user")
 	}
 	createOut, err := exec.CommandContext(ctx, "kubectl", "exec",
 		podName, "-n", queryE2ENamespace,
@@ -1083,19 +1083,19 @@ func TestQuery_WriteProbe(t *testing.T) {
 		"--email="+viewerEmail,
 		"--password="+viewerPassword).CombinedOutput()
 	if err != nil {
-		t.Skipf("create viewer user failed: %v\noutput: %s", err, string(createOut))
+		framework.SkipOrFail(t, "create viewer user failed: %v\noutput: %s", err, string(createOut))
 	}
 	t.Logf("viewer user creation: %s", strings.TrimSpace(string(createOut)))
 
 	viewerCookie, _, err := querySessionLogin(ctx, framework.PipelineAPIBaseURL(), viewerEmail, viewerPassword)
 	if err != nil {
-		t.Skipf("viewer login failed: %v", err)
+		framework.SkipOrFail(t, "viewer login failed: %v", err)
 	}
 	// Resolve the viewer's UUID (the FGA subject the catalog JWT carries as
 	// sub). /api/v1/auth/me is the only path that surfaces it (login is 204).
 	viewerUUID, err := queryMeUserID(ctx, framework.PipelineAPIBaseURL(), viewerCookie)
 	if err != nil {
-		t.Skipf("resolve viewer UUID: %v", err)
+		framework.SkipOrFail(t, "resolve viewer UUID: %v", err)
 	}
 
 	// Grant the viewer read-only access on the e2e lakekeeper project. Mirrors
@@ -1167,10 +1167,10 @@ func TestQuery_NetworkPolicyEgress(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ctx := context.Background()
@@ -1324,10 +1324,10 @@ func TestQuery_AuditSmoke(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ns, table := ensureQueryTable(t)
@@ -1396,13 +1396,13 @@ func TestQuery_StoragePreview(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil")
+		framework.SkipOrFail(t, "SharedHarness nil")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable")
+		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
 	ctx := context.Background()

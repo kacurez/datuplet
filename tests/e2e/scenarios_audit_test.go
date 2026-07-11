@@ -38,11 +38,11 @@ func TestAuditTrail_ClusterRun(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("K8s tier requires SetupFGABootstrap to have run in TestMain — see framework/bootstrap.go")
+		framework.SkipOrFail(t, "K8s tier requires SetupFGABootstrap to have run in TestMain — see framework/bootstrap.go")
 	}
 
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
