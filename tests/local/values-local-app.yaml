@@ -1,0 +1,41 @@
+# Local-development overrides for charts/datuplet-app (OrbStack / kind).
+# Images are built locally (make docker-build-k8s) and already present on
+# the node; Always would pull from a registry and fail/timeout.
+# Passed automatically by `make deploy-local` / `deploy-local-helm`.
+image:
+  pullPolicy: IfNotPresent
+  pipelineApi:
+    repository: datuplet/pipeline-api
+    tag: latest
+  pipelineOperator:
+    repository: datuplet/pipeline-operator
+    tag: latest
+  pipelineObserver:
+    repository: datuplet/pipeline-observer
+    tag: latest
+  gateway:
+    repository: datuplet/gateway
+    tag: latest
+
+# query-worker is enabled by default; without this override its image
+# resolves to ghcr.io/kacurez/query-worker:<appVersion> post-RFC-024-W2,
+# which isn't on the node, so `make deploy-local` ImagePullBackOffs.
+queryWorker:
+  image:
+    repository: datuplet/query-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# Point the built-in ComponentDefinitions at the locally-built component
+# images. Preserves what `deploy-local-helm` does today via
+# `--set components.registry=datuplet` (Makefile) — WITHOUT this the built-ins
+# resolve to ghcr.io/kacurez/<comp>:<components.tag>, which isn't on the node,
+# so every built-in pipeline ImagePullBackOffs (F2 of the 2026-07-11 codex
+# review). `docker-build-k8s` must produce images at <registry>/<comp>:<tag>
+# for whatever tag components.tag carries (verify against the Makefile build
+# tags — today the built components are tagged `datuplet/<comp>:latest`; if
+# components.tag is a stable vX.Y.Z the reconciler's :latest-ban does NOT
+# apply to it, but the TAG must still match a locally-present image — align
+# the two, or tag the local builds to match components.tag).
+components:
+  registry: datuplet

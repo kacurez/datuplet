@@ -87,8 +87,22 @@ Lakekeeper DBs), upgrade both charts, re-run `register.sh`. See
 **`platform.fgaModelVersion` cross-chart drift.** `charts/datuplet-app/values.yaml`
 (`fgaModel.version`) and `charts/datuplet-lakekeeper/values.yaml`
 (`platform.fgaModelVersion`) must be bumped together on every FGA model upgrade. CI
-enforces DSL→version coupling within `datuplet-app` but does not enforce cross-chart
-sync. Bump both values manually.
+enforces DSL→version coupling within `datuplet-app` (the `fga-version-check` workflow)
+**and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4). Still bump both
+values together — the check fails the PR if they drift.
+
+**Upgrade support statement (0.x).** Upgrades are tested for exactly one
+hop — latest published release → next (the `upgrade-e2e` workflow).
+Skipping releases is best-effort. Upgrades are forward-only: `upgrade.sh`
+uses no `--atomic` and there is no rollback path for hook Jobs, CRD
+applies, or DB migrations — recovery is fix-and-re-run. See
+[docs/dependency-upgrades.md](dependency-upgrades.md) for the per-dependency
+upgrade checklist.
+
+**Snapshot before infra upgrades.** Take a CNPG backup/snapshot before
+Phase 2 (`datuplet-infra`) or Phase 4 (`datuplet-lakekeeper`) upgrades —
+CNPG backups are not configured by the charts (see above), so this is a
+manual step.
 
 ---
 
@@ -97,9 +111,12 @@ sync. Bump both values manually.
 **No umbrella chart.** The four-chart install is documented and tested; a single
 umbrella chart wrapping all four phases is not provided for v0.1.
 
-**Mutable `bitnami/kubectl:latest` tag.** The wait-for-platform init containers use
-`bitnami/kubectl:latest`, which can change between upgrades. Pin to a versioned tag
-for production installs.
+**One remaining mutable `bitnami/kubectl:latest` tag.** The four values-driven
+wait-for-platform init containers now use a pinned `alpine/k8s:1.31.12`
+image. One initContainer — `wait-for-fga-pin-job` in
+`charts/datuplet-lakekeeper/templates/bootstrap/wait-for-fga-pin-job.yaml` —
+still hardcodes `bitnami/kubectl:latest` in the template rather than reading
+from values. Pinning it is follow-up work.
 
 **Reaper ServiceAccount is shared with pipeline-api.** The reaper CronJob uses
 pipeline-api's ServiceAccount, which has broader verbs than the reaper needs. A

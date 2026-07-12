@@ -40,6 +40,9 @@ the browser UI.
   feature branch, open a draft PR with `gh pr create --draft`, mention
   the PR number in the response. The maintainer reviews, merges, and cuts
   release tags (`v0.x.y`) — the tag triggers the release workflow.
+  Release prep: `make bump-version VERSION=X.Y.Z` → commit → tag `vX.Y.Z`
+  (the release workflow fails on tag/chart-version mismatch, and charts
+  publish exactly as committed).
 - Applies to partial-progress checkpoints too: land via PR, not direct push.
 
 ## Documentation pointers
@@ -53,6 +56,7 @@ the browser UI.
   [docs/warehouse-setup.md](docs/warehouse-setup.md).
 - Upgrade discipline: [docs/postgres-migrations.md](docs/postgres-migrations.md),
   [docs/fga-model-upgrades.md](docs/fga-model-upgrades.md).
+- Dependency bumps: [docs/dependency-upgrades.md](docs/dependency-upgrades.md).
 - Honesty list: [docs/known-limitations.md](docs/known-limitations.md).
 - Proto definitions: `api/proto/`; main service is
   `api/proto/gateway/v2/gateway.proto`. Generated Go is checked in alongside.

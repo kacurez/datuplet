@@ -76,10 +76,10 @@ func registrySkipUnlessReady(t *testing.T) *framework.FGAHarness {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil — E2E_K8S=1 + bootstrap (incl. component registration) must have run in TestMain")
+		framework.SkipOrFail(t, "SharedHarness nil — E2E_K8S=1 + bootstrap (incl. component registration) must have run in TestMain")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	return h
 }

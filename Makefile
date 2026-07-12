@@ -80,14 +80,24 @@ build-component-data-generator: ## Build data-generator component image
 
 # Built-in component images for a LOCAL OrbStack deploy. The datuplet-app chart
 # ships ComponentDefinition CRs whose image is
-# `<components.registry>/<name>:<components.tag>` — defaulting to
-# ghcr.io/kacurez + v0.1.0 for production (those tags are published to GHCR).
+# `<components.registry>/<name>:<components.tag>` — for production this is
+# ghcr.io/kacurez + the chart's components.tag (the release version, kept in
+# lockstep with COMPONENT_TAG by `make bump-version`; those tags are published
+# to GHCR by the release workflow).
 # deploy-local overrides components.registry=datuplet, so build the built-ins
 # and tag them datuplet/<name>:$(COMPONENT_TAG) — present in the local Docker
 # daemon, no GHCR pull. Runtime pull policy is IfNotPresent (the operator's
 # DATUPLET_RUNTIME_PULL_POLICY, wired from image.pullPolicy), so a local tag is
 # all K8s needs. Skips pandas-transform (no build wired anywhere yet).
-COMPONENT_TAG ?= v0.1.0
+COMPONENT_TAG ?= v0.8.0
+
+# Namespace for the k8s-* developer-loop targets (deploy-local installs
+# into `datuplet`; override for e2e clusters: make k8s-reload-crds K8S_NS=datuplet-e2e).
+K8S_NS ?= datuplet
+
+# Base URL for k8s-smoke probes. Defaults to the OrbStack NodePort; release-verify
+# (RFC 024 W3) overrides it to a port-forwarded address in the verify cluster.
+SMOKE_URL ?= http://localhost:30081
 build-components-local: build-components ## Build + tag built-in component images as datuplet/<name>:$(COMPONENT_TAG) for deploy-local
 	for c in data-generator sql-transform stdout-writer http-json-extractor finnhub-extractor; do \
 	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
@@ -119,19 +129,19 @@ docker-build-k8s: docker-build-operators build-gateway docker-build-pipeline-api
 # the API layer".
 k8s-smoke: ## Smoke the OrbStack cluster via NodePort 30081 (health + OIDC probes)
 	@echo "=== k8s-smoke: probing NodePort :30081 ==="
-	@if ! curl -fsS http://localhost:30081/healthz >/dev/null 2>&1; then \
-		echo "ERROR: pipeline-api not reachable at http://localhost:30081"; \
-		echo "  Run 'make k8s-up' first."; \
+	@if ! curl -fsS $(SMOKE_URL)/healthz >/dev/null 2>&1; then \
+		echo "ERROR: pipeline-api not reachable at $(SMOKE_URL)"; \
+		echo "  Run 'make deploy-local' first."; \
 		exit 1; \
 	fi
 	@echo "  /healthz: OK"
-	@if ! curl -fsS http://localhost:30081/.well-known/openid-configuration >/dev/null 2>&1; then \
-		echo "ERROR: OIDC discovery not reachable at http://localhost:30081/.well-known/openid-configuration"; \
+	@if ! curl -fsS $(SMOKE_URL)/.well-known/openid-configuration >/dev/null 2>&1; then \
+		echo "ERROR: OIDC discovery not reachable at $(SMOKE_URL)/.well-known/openid-configuration"; \
 		exit 1; \
 	fi
 	@echo "  /.well-known/openid-configuration: OK"
-	@if ! curl -fsS http://localhost:30081/api/v1/auth/jwks.json >/dev/null 2>&1; then \
-		echo "ERROR: JWKS not reachable at http://localhost:30081/api/v1/auth/jwks.json"; \
+	@if ! curl -fsS $(SMOKE_URL)/api/v1/auth/jwks.json >/dev/null 2>&1; then \
+		echo "ERROR: JWKS not reachable at $(SMOKE_URL)/api/v1/auth/jwks.json"; \
 		exit 1; \
 	fi
 	@echo "  /api/v1/auth/jwks.json: OK"
@@ -164,10 +174,12 @@ e2e-k8s: docker-build-k8s build-components-e2e e2e-k8s-deploy ## Run e2e against
 # build. Used by the GitHub Actions e2e workflow which builds + `kind load`s
 # images before invoking this target. Locally, prefer `make e2e-k8s`.
 e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on the cluster nodes)
-	helm dependency update charts/datuplet-operators
-	helm dependency update charts/datuplet-infra
-	helm dependency update charts/datuplet-app
-	helm dependency update charts/datuplet-lakekeeper
+	# `helm dependency build` (unlike `update`) requires each dependency's
+	# repo to be locally registered — it won't auto-fetch "unmanaged" repos.
+	helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts >/dev/null 2>&1 || true
+	helm repo add openfga https://openfga.github.io/helm-charts >/dev/null 2>&1 || true
+	helm repo add minio https://charts.min.io/ >/dev/null 2>&1 || true
+	helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts >/dev/null 2>&1 || true
 	# Refresh the Datuplet CRDs up front. Helm installs CRDs from a chart's
 	# crds/ dir only on FIRST install and never upgrades them (nor removes
 	# them on uninstall), so on a reused cluster (the OrbStack dev loop) a
@@ -176,29 +188,28 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	# the schema in place; a no-op on a fresh cluster the first helm install
 	# would populate anyway.
 	kubectl apply -f charts/datuplet-app/crds/
-	# Five-phase install: operators → infra → app → lakekeeper → register.
-	# Sequential, each --wait --wait-for-jobs. Phases 2-4 are strict order:
+	# Five-phase install (operators → infra → app → lakekeeper → register),
+	# driven by the RFC 024 W1 single tested install entrypoint below.
+	# Phases 2-4 are strict order:
 	#   - infra owns CNPG + OpenFGA + MinIO + keygen (no Datuplet code)
 	#   - app owns pipeline-api/observer/operator + authz-bootstrap (writes FGA pin)
 	#   - lakekeeper installs after app finishes (its wait-for-fga-pin pre-install
 	#     Job polls the pin tuple authz-bootstrap wrote)
-	helm upgrade --install datuplet-operators charts/datuplet-operators \
-	  -n datuplet-e2e --create-namespace \
-	  -f tests/e2e/values-operators.yaml \
-	  --wait --timeout 5m
-	helm upgrade --install datuplet-infra charts/datuplet-infra \
-	  -n datuplet-e2e \
-	  -f tests/e2e/values-infra.yaml \
-	  --wait --wait-for-jobs --timeout 10m
-	helm upgrade --install datuplet-app charts/datuplet-app \
-	  -n datuplet-e2e \
-	  -f tests/e2e/values-app.yaml \
-	  --wait --wait-for-jobs --timeout 10m
-	helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-	  -n datuplet-e2e \
-	  -f tests/e2e/values-lakekeeper.yaml \
-	  --wait --wait-for-jobs --timeout 10m
-	./scripts/register.sh --namespace datuplet-e2e
+	./scripts/install.sh --namespace datuplet-e2e --from-source \
+	  -f-operators tests/e2e/values-operators.yaml \
+	  -f-infra tests/e2e/values-infra.yaml \
+	  -f-app tests/e2e/values-app.yaml \
+	  -f-lakekeeper tests/e2e/values-lakekeeper.yaml
+	# Hermetic in-cluster HTTP fixture (RFC 024 W7 T7.4) — replaces the
+	# external jsonplaceholder.typicode.com dependency so the e2e data path
+	# has zero outbound network. nginx serves the committed posts.json /
+	# users.json snapshots (tests/e2e/manifests/) at /posts and /users.
+	kubectl -n datuplet-e2e create configmap e2e-http-fixture-data \
+	  --from-file=posts.json=tests/e2e/manifests/posts.json \
+	  --from-file=users.json=tests/e2e/manifests/users.json \
+	  --dry-run=client -o yaml | kubectl apply -n datuplet-e2e -f -
+	kubectl apply -n datuplet-e2e -f tests/e2e/manifests/http-fixture.yaml
+	kubectl -n datuplet-e2e rollout status deploy/e2e-http-fixture --timeout=60s
 	# Run the suite with host-side port-forwards for the framework's
 	# localhost endpoints (OpenFGA/Lakekeeper/pipeline-api/MinIO). Needed
 	# on CI kind (no host port exposure); a no-op on OrbStack where the
@@ -231,29 +242,14 @@ deploy-local: docker-build-k8s build-components-local deploy-local-helm ## Build
 # Helm-only deploy — skips image rebuild. Use this when images already exist
 # in the local Docker daemon (OrbStack shares its image cache with K8s, so
 # `make docker-build-k8s` once is enough; iterate on charts via this target).
-deploy-local-helm: ## Helm install all 4 charts + register.sh (no docker build)
-	helm dependency update charts/datuplet-operators
-	helm dependency update charts/datuplet-infra
-	helm dependency update charts/datuplet-app
-	helm dependency update charts/datuplet-lakekeeper
-	# RFC 015 5-phase install — see e2e-k8s target for ordering rationale.
-	helm upgrade --install datuplet-operators charts/datuplet-operators \
-	  -n datuplet --create-namespace --wait --timeout 5m
-	helm upgrade --install datuplet-infra charts/datuplet-infra \
-	  -n datuplet --wait --wait-for-jobs --timeout 10m
-	# image.pullPolicy=IfNotPresent: local `datuplet/*` images live only in the
-	# OrbStack Docker daemon (no registry) — the chart default `Always` would
-	# fail every pull. components.registry=datuplet: point the built-in
-	# ComponentDefinition CRs at the locally-built+tagged component images
-	# (see build-components-local) instead of the production ghcr.io/kacurez.
-	helm upgrade --install datuplet-app charts/datuplet-app \
-	  -n datuplet \
-	  --set image.pullPolicy=IfNotPresent \
-	  --set components.registry=datuplet \
-	  --wait --wait-for-jobs --timeout 10m
-	helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-	  -n datuplet --wait --wait-for-jobs --timeout 10m
-	./scripts/register.sh --namespace datuplet
+# Drives scripts/install.sh (RFC 024 W1) — the single tested install path;
+# tests/local/values-local-{infra,app}.yaml carry the local-dev image
+# overrides (infra keygen image; app pullPolicy + components.registry) that
+# used to be --set flags here.
+deploy-local-helm: ## Install/upgrade all 4 charts + register.sh via scripts/install.sh (no docker build)
+	./scripts/install.sh --namespace datuplet --from-source \
+	  -f-infra tests/local/values-local-infra.yaml \
+	  -f-app tests/local/values-local-app.yaml
 
 # Symmetric tear-down for deploy-local-helm. Uninstalls in reverse install
 # order (lakekeeper → app → infra → operators) so dependents are gone
@@ -276,26 +272,15 @@ undeploy-local: ## Helm uninstall all 4 charts + delete datuplet namespace
 # K8s (cluster ops — OrbStack only)
 # =============================================================================
 
-# Reload CRDs into cluster (apply updated CRD manifests).
-# RFC 007 Slice 8: TableCommit CRD deleted — only Pipeline + PipelineRun remain.
-k8s-reload-crds: ## Apply updated CRD manifests to cluster
-	@echo "Reloading CRDs..."
-	kubectl apply -f utils/deploy/k8s/crds/datuplet.io_pipelines.yaml
-	kubectl apply -f utils/deploy/k8s/crds/datuplet.io_pipelineruns.yaml
+k8s-reload-crds: ## Apply the chart's CRD manifests to the cluster
+	@echo "Reloading CRDs from charts/datuplet-app/crds/ ..."
+	kubectl apply --server-side --force-conflicts \
+	  --field-manager=datuplet-dev -f charts/datuplet-app/crds/
 	@echo "CRDs reloaded successfully"
 
-# Rebuild operators: build images, apply CRDs & manifests, wait for rollout.
-# OrbStack shares the host Docker daemon with its K8s node so no image load step is needed.
-k8s-rebuild-operators: docker-build-operators ## Rebuild operator image + apply CRDs/RBAC + rollout restart
-	@echo "Applying CRDs..."
-	kubectl apply -f utils/deploy/k8s/crds/
-	@echo "Applying RBAC..."
-	kubectl apply -f utils/deploy/k8s/rbac/
-	@echo "Applying operator deployments..."
-	kubectl apply -f utils/deploy/k8s/operators.yaml
-	kubectl rollout restart deployment/pipeline-operator -n datuplet-e2e
-	@echo "Waiting for operators to be ready..."
-	kubectl rollout status deployment/pipeline-operator -n datuplet-e2e --timeout=60s
+k8s-rebuild-operators: docker-build-operators k8s-reload-crds ## Rebuild operator image + reload CRDs + rollout restart
+	kubectl rollout restart deployment/pipeline-operator -n $(K8S_NS)
+	kubectl rollout status deployment/pipeline-operator -n $(K8S_NS) --timeout=60s
 	@echo "Operators rebuilt and ready!"
 
 k8s-rebuild-services: build-gateway ## Rebuild the gateway image
@@ -390,6 +375,28 @@ chart-render-check: ## Diff helm template output against golden renders in chart
 
 # All-in-one: tidy, build, test
 all: tidy build test ## Tidy + build + test (all-in-one)
+
+# =============================================================================
+# Release
+# =============================================================================
+
+.PHONY: bump-version
+bump-version: ## Set version+appVersion in all four charts + component tag (make bump-version VERSION=0.8.0)
+ifndef VERSION
+	$(error VERSION is required, e.g. make bump-version VERSION=0.8.0)
+endif
+	@for c in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do \
+	  perl -pi -e 's/^version: .*/version: $(VERSION)/; s/^appVersion: .*/appVersion: "$(VERSION)"/' charts/$$c/Chart.yaml; \
+	done
+	@# RFC 024 T6.3: keep the built-in component image tag in lockstep with the
+	@# release version (Option A) — components.tag must stay vX.Y.Z-shaped (the
+	@# ComponentDefinition stable-version CEL rule), and COMPONENT_TAG (the local
+	@# build-components-local/-e2e default) must match it so deploy-local resolves.
+	@perl -pi -e 's/^  tag: v[0-9]+\.[0-9]+\.[0-9]+$$/  tag: v$(VERSION)/' charts/datuplet-app/values.yaml
+	@perl -pi -e 's/^COMPONENT_TAG \?= v[0-9]+\.[0-9]+\.[0-9]+$$/COMPONENT_TAG ?= v$(VERSION)/' Makefile
+	@grep -H -E '^(version|appVersion):' charts/*/Chart.yaml
+	@grep -H -E '^  tag: v' charts/datuplet-app/values.yaml
+	@grep -H -E '^COMPONENT_TAG' Makefile
 
 prune-images: ## Prune unused Docker images and system volumes
 	@echo "Pruning unused Docker images..."

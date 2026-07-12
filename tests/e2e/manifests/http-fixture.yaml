@@ -1,0 +1,60 @@
+# tests/e2e/manifests/http-fixture.yaml
+#
+# Hermetic in-cluster HTTP fixture (RFC 024 W7 T7.4). Replaces the external
+# jsonplaceholder.typicode.com dependency in the e2e suite: nginx serves the
+# committed posts.json / users.json snapshots (originally curled from
+# https://jsonplaceholder.typicode.com/{posts,users}) at /posts and /users,
+# so the e2e data path has zero outbound network. The data ConfigMap
+# (e2e-http-fixture-data, keys posts.json + users.json) is created
+# separately from file by `make e2e-k8s-deploy` to keep this manifest small.
+#
+# Reached by component pods (running in per-project namespaces) via the
+# cross-namespace Service DNS FQDN:
+#   http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/{posts,users}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: e2e-http-fixture-nginx
+data:
+  default.conf: |
+    server {
+      listen 80;
+      location /posts {
+        default_type application/json;
+        alias /data/posts.json;
+      }
+      location /users {
+        default_type application/json;
+        alias /data/users.json;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: e2e-http-fixture
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: e2e-http-fixture}}
+  template:
+    metadata: {labels: {app: e2e-http-fixture}}
+    spec:
+      containers:
+        - name: nginx
+          # ECR Public mirror — no Docker Hub anonymous-pull rate limits.
+          image: public.ecr.aws/nginx/nginx:1.27-alpine
+          ports: [{containerPort: 80}]
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/conf.d}
+            - {name: data, mountPath: /data}
+      volumes:
+        - {name: conf, configMap: {name: e2e-http-fixture-nginx}}
+        - {name: data, configMap: {name: e2e-http-fixture-data}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: e2e-http-fixture
+spec:
+  selector: {app: e2e-http-fixture}
+  ports: [{port: 80, targetPort: 80}]

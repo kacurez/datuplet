@@ -42,7 +42,7 @@ func SharedHarness() *FGAHarness {
 	return sharedHarness
 }
 
-// MinIO credentials for K8s cluster (matches utils/deploy/k8s/minio.yaml)
+// MinIO credentials for K8s cluster (matches the datuplet-infra chart's MinIO values + tests/e2e/values-infra.yaml)
 const (
 	minioAccessKey    = "minioadmin"
 	minioSecretKey    = "minioadmin"
@@ -114,12 +114,12 @@ func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir strin
 
 	h := SharedHarness()
 	if h == nil {
-		t.Skip("K8s e2e requires E2E_K8S=1 and SetupFGABootstrap to have run in TestMain — see framework/bootstrap.go")
+		SkipOrFail(t, "K8s e2e requires E2E_K8S=1 and SetupFGABootstrap to have run in TestMain — see framework/bootstrap.go")
 		return
 	}
 
 	if err := PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		SkipOrFail(t, "precheck failed: %v", err)
 		return
 	}
 

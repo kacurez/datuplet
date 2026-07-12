@@ -1,5 +1,15 @@
 {{/* charts/datuplet-app/templates/_helpers.tpl */}}
 
+{{/*
+datuplet-app.image — render "<repository>:<tag>", defaulting the tag to the
+chart appVersion (RFC 024 W2: charts are released as committed; the release
+pipeline no longer rewrites values). Usage:
+  {{ include "datuplet-app.image" (dict "img" .Values.image.pipelineApi "root" $) }}
+*/}}
+{{- define "datuplet-app.image" -}}
+{{- printf "%s:%s" .img.repository (.img.tag | default .root.Chart.AppVersion) -}}
+{{- end -}}
+
 {{- define "datuplet-app.prefix" -}}
 {{- /* Empty prefix — namespace disambiguates cross-install collisions. */ -}}
 {{- end -}}

@@ -38,7 +38,7 @@ spec:
       {{- end }}
       containers:
         - name: migrate
-          image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"
+          image: "{{ include "datuplet-app.image" (dict "img" .Values.image.pipelineApi "root" $) }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["pipeline-api", "admin", "migrate"]
           envFrom:

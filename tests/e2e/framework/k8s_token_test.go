@@ -27,7 +27,7 @@ spec:
           component: http-json-extractor
           version: dev
           config:
-            url: "https://jsonplaceholder.typicode.com/posts"
+            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
           outputs:
             defaultBucket: myrun-api
             defaultWriteMode: FULL_LOAD

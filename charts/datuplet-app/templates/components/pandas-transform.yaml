@@ -1,8 +1,13 @@
-{{- if .Values.components.builtins }}
+{{- if and .Values.components.builtins .Values.components.enablePandasTransform }}
 {{- /*
 ComponentDefinition CR for the built-in pandas-transform component (RFC 026
 Task R10). See data-generator.yaml in this directory for the cluster-scoped
 naming rationale.
+
+Gated behind components.enablePandasTransform (default false, RFC 024 T6.3):
+no image is published for this component yet (absent from
+_release-components.yml and docker-build-k8s), so a stock install must not
+register a ComponentDefinition that can never be pulled.
 
 configSchema derived from components/pandas-transform/main.py (the actual
 source, not docs/components.md, per the task brief — the two agree):

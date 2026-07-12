@@ -1,0 +1,29 @@
+# Release-verification pipeline (RFC 024 W3). Rendered with:
+#   PIPELINE_NAME=release-verify envsubst '$PIPELINE_NAME' < pipeline.yaml
+# Uses the chart's built-in ComponentDefinitions (version omitted → defaultVersion).
+apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: ${PIPELINE_NAME}
+  namespace: datuplet
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: json-extractor
+          component: http-json-extractor
+          config:
+            url: "https://jsonplaceholder.typicode.com/posts"
+          outputs:
+            defaultBucket: verify
+            defaultWriteMode: FULL_LOAD
+    - name: read
+      components:
+        - name: stdout-writer
+          component: stdout-writer
+          inputs:
+            tables:
+              - bucket: verify
+                table: data
+          config:
+            format: json

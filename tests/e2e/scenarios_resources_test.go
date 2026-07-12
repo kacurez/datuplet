@@ -336,13 +336,13 @@ func ensureResourcesAPIFixture(t *testing.T) (projectID, adminSession, nonadminS
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil — E2E_K8S=1 + bootstrap must have run in TestMain")
+		framework.SkipOrFail(t, "SharedHarness nil — E2E_K8S=1 + bootstrap must have run in TestMain")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable on NodePort 30081 — start port-forward")
+		framework.SkipOrFail(t, "pipeline-api not reachable on NodePort 30081 — start port-forward")
 	}
 
 	resourcesAPIOnce.Do(func() {
@@ -384,7 +384,7 @@ func ensureResourcesAPIFixture(t *testing.T) (projectID, adminSession, nonadminS
 		resourcesAPINonadminSession = cookie
 	})
 	if resourcesAPISetupErr != nil {
-		t.Skipf("resources API fixture setup failed: %v", resourcesAPISetupErr)
+		framework.SkipOrFail(t, "resources API fixture setup failed: %v", resourcesAPISetupErr)
 	}
 	// getAdminSession has its own once + skip-on-failure; admin was granted
 	// superadmin in TestMain.

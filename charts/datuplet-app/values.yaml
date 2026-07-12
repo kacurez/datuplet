@@ -18,24 +18,29 @@ tolerations: []
 runtimeDefaults:
   tolerations: []
 
+# tag "" resolves to the chart appVersion; local dev overrides via
+# tests/local/values-local-app.yaml.
 image:
-  pullPolicy: Always
+  # IfNotPresent is safe: image tags are pinned (default = chart appVersion).
+  # Local dev with :latest overrides keeps working because the local image is
+  # already present.
+  pullPolicy: IfNotPresent
   pullSecrets: []
   pipelineApi:
-    repository: datuplet/pipeline-api
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-api
+    tag: ""
   pipelineOperator:
-    repository: datuplet/pipeline-operator
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-operator
+    tag: ""
   # pipeline-observer is the single-writer to the runs DB.
   pipelineObserver:
-    repository: datuplet/pipeline-observer
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-observer
+    tag: ""
   # Data Gateway sidecar image — pipeline-operator passes this to every
   # component Pod's gateway sidecar via the GATEWAY_IMAGE env var.
   gateway:
-    repository: datuplet/gateway
-    tag: latest
+    repository: ghcr.io/kacurez/gateway
+    tag: ""
 
 # FGA model version. Bump when files/fga/** changes.
 # See docs/fga-model-upgrades.md for the upgrade procedure.
@@ -176,11 +181,13 @@ queryWorker:
   # DuckDB instance; scale via concurrency knob inside the pod).
   replicas: 1
 
+  # tag "" resolves to the chart appVersion; local dev overrides via
+  # tests/local/values-local-app.yaml.
   image:
     # repository: image repository for the query-worker binary.
-    repository: datuplet/query-worker
-    # tag: image tag. Defaults to :latest (matches all other chart images).
-    tag: latest
+    repository: ghcr.io/kacurez/query-worker
+    # tag: image tag. Defaults to the chart appVersion.
+    tag: ""
     # pullPolicy: overrides the chart-global image.pullPolicy for the
     # query-worker only. Leave empty ("") to inherit the global setting.
     pullPolicy: ""
@@ -269,13 +276,20 @@ components:
   # Chart.yaml's appVersion ("1.0") is not vX.Y.Z-shaped, so this is pinned
   # explicitly instead of deriving from appVersion; it matches the image tag
   # documented for all six built-in components in docs/components.md.
-  tag: v0.1.0
+  tag: v0.8.0
+  # pandas-transform has no published image yet (no build wired in
+  # _release-components.yml or docker-build-k8s); off until its image
+  # ships (RFC 024 T6.3). The other five built-ins are unaffected.
+  enablePandasTransform: false
 
 bootstrap:
   externalImages:
-    # bitnami/kubectl:1.31 retired when Bitnami restructured the registry —
-    # only :latest and bitnamilegacy/kubectl:X.Y remain. See platform values.
-    kubectl: "bitnami/kubectl:latest"
+    # Bitnami retired versioned bitnami/kubectl tags; the bitnamilegacy
+    # replacement images use dash as /bin/sh, which lacks `set -o pipefail`
+    # and breaks the bootstrap Job scripts below. This is a multi-arch
+    # kubectl toolbox whose busybox ash supports pipefail (verified
+    # amd64+arm64).
+    kubectl: "alpine/k8s:1.31.12"
     # openfga/cli used by authz-bootstrap model-write initContainer.
     openfgaCli: "openfga/cli:v0.6.2"
   resources:

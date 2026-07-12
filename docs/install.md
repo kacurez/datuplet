@@ -17,14 +17,20 @@ the previous.
 
 ## Helm repo
 
-Once 0.1.0 is released, install from the public repo:
+Datuplet charts are published to the public helm repo on every release tag:
 
 ```bash
 helm repo add datuplet https://kacurez.github.io/datuplet
 helm repo update
 ```
 
-Until then, install from a local clone using the path-based commands below.
+`scripts/install.sh` (below) handles both sources itself: it installs from a
+local clone by default, or from this published repo when called with
+`--from-repo --version vX.Y.Z`.
+
+A release is announceable when its `release-verify` workflow run is green — that
+job installs the published charts + images on a fresh kind cluster and runs a
+real pipeline end-to-end.
 
 ## Credential model
 
@@ -59,41 +65,26 @@ Jobs.
 - `kubectl` configured to the target cluster.
 - Network access to: `https://cloudnative-pg.github.io/charts`,
   `https://lakekeeper.github.io/lakekeeper-charts`, `https://openfga.github.io/helm-charts`,
-  `https://charts.bitnami.com/bitnami` (MinIO subchart).
+  `https://charts.min.io/` (MinIO subchart).
 
 ## Install
 
 ```bash
-# 0. Fetch subchart tarballs (gitignored; required once per clone or version bump)
-helm dependency update charts/datuplet-operators
-helm dependency update charts/datuplet-infra
-helm dependency update charts/datuplet-app
-helm dependency update charts/datuplet-lakekeeper
+# From a local clone (development):
+./scripts/install.sh --namespace datuplet
 
-# 1. Phase 1 — CNPG operator + CRDs
-helm upgrade --install datuplet-operators charts/datuplet-operators \
-  -n datuplet --create-namespace --wait --timeout 5m
-
-# 2. Phase 2 — stateful infrastructure (Postgres, OpenFGA, MinIO, keygen)
-helm upgrade --install datuplet-infra charts/datuplet-infra \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
-
-# 3. Phase 3 — Datuplet control plane (pipeline-api, observer, operator, CRDs, authz-bootstrap)
-#    --wait-for-jobs is required: the pre-install migrate + authz-bootstrap Jobs must complete
-#    before Deployments become Ready.
-#    Note: chart default is image.pullPolicy=Always (safe with pinned registry tags).
-#    Local/kind clusters that pre-load images via `kind load docker-image` must
-#    add `--set image.pullPolicy=IfNotPresent` here — see docs/quickstart-kind.md.
-helm upgrade --install datuplet-app charts/datuplet-app \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
-
-# 4. Phase 4 — Lakekeeper (requires Phase 3 FGA pin to exist; will poll + fail if missing)
-helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
-
-# 5. Phase 5 — one-time business-state registration (idempotent; safe to re-run)
-./scripts/register.sh --namespace datuplet
+# From the published helm repo (no clone of the charts needed):
+./scripts/install.sh --namespace datuplet --from-repo --version v0.8.0
 ```
+
+`install.sh` runs preflight checks (kubectl/helm versions, cluster
+reachability, K8s ≥ 1.28, StorageClass present, chart availability, no
+half-installed releases), then the four helm phases in order — each with
+`--wait`/`--wait-for-jobs` — and finally `scripts/register.sh`. Pass
+per-chart values with `-f-app my-app-values.yaml` (also `-f-infra`,
+`-f-operators`, `-f-lakekeeper`); flags after `--` go to register.sh.
+Re-running is safe (idempotent). `--preflight-only` and `--dry-run` are
+available for checking a cluster before touching it.
 
 After `register.sh` completes, open `http://localhost:30081/ui/` (OrbStack NodePort) and log
 in with the admin credentials printed by the script (or stored in the `datuplet-app-admin-creds`
@@ -124,23 +115,20 @@ it is idempotent and safe to re-run.
 Upgrade phases independently based on what changed:
 
 ```bash
-# Phase 1 — CNPG operator upgrade (cluster-admin; rarely needed)
-helm upgrade datuplet-operators charts/datuplet-operators \
-  -n datuplet --wait --timeout 5m
+# The common case — a Datuplet release (Phase 3 only). Applies the chart's
+# CRDs first (helm never upgrades crds/), then upgrades datuplet-app:
+./scripts/upgrade.sh --namespace datuplet --phase app
 
-# Phase 2 — infrastructure upgrade (rare; ops review required)
-helm upgrade datuplet-infra charts/datuplet-infra \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
-
-# Phase 3 — Datuplet release (most common; every Datuplet version bump)
-helm upgrade datuplet-app charts/datuplet-app \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
-
-# Phase 4 — Lakekeeper upgrade (rare; catalog admin; update platform.fgaModelVersion
-#            to match datuplet-app's fgaModel.version before upgrading)
-helm upgrade datuplet-lakekeeper charts/datuplet-lakekeeper \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
+# Everything (dependency bumps, FGA model changes):
+./scripts/upgrade.sh --namespace datuplet --phase all
 ```
+
+Upgrades are **forward-only**: no `--atomic`, no `helm rollback` (hook
+Jobs, CRD applies, and DB migrations sit outside helm's rollback scope).
+Recovery from a failed upgrade is: fix the cause, re-run the same command.
+
+`--phase` also accepts `operators`, `infra`, or `lakekeeper` individually
+(rare; cluster-admin/catalog-admin territory) — see `./scripts/upgrade.sh --help`.
 
 `register.sh` is NOT re-run on upgrade unless adding new warehouses or projects.
 
@@ -150,12 +138,19 @@ version-bump procedure and the cross-chart `platform.fgaModelVersion` coupling r
 ## Local development (OrbStack)
 
 ```bash
-make deploy-local    # runs all 4 helm upgrade --installs + register.sh (namespace: datuplet)
+make deploy-local
 ```
 
-The `make deploy-local` target is the canonical local workflow. It runs
-`make deploy-local-helm` (sequential helm upgrades with values overrides from
-`tests/local/values-*.yaml`) followed by `scripts/register.sh`.
+`make deploy-local` is image build + `install.sh`: it builds the five service
+images and the five built-in component images
+(`docker-build-k8s build-components-local`), then runs
+`./scripts/install.sh --namespace datuplet -f-infra tests/local/values-local-infra.yaml -f-app tests/local/values-local-app.yaml`
+(`deploy-local-helm`), which sets `image.pullPolicy=IfNotPresent`,
+`components.registry=datuplet`, and the infra keygen image so the freshly built
+local images are used
+instead of pulling from a registry. OrbStack shares its image cache with the
+cluster, so the build step only needs to run once — after that,
+`make deploy-local-helm` alone re-applies chart changes without rebuilding.
 
 ## Service URLs (OrbStack)
 
@@ -181,7 +176,7 @@ succeeds.
 
 **Phase 4 `wait-for-fga-pin` Job fails.**
 Phase 3's authz-bootstrap has not completed successfully. Ensure Phase 3 is fully installed
-before installing Phase 4. Re-run `helm upgrade datuplet-app` if in doubt.
+before installing Phase 4. Re-run `./scripts/upgrade.sh --namespace datuplet --phase app` if in doubt.
 
 **CNPG cluster not healthy.**
 `kubectl describe cluster -n datuplet pg`. Look for `managed.roles[]`

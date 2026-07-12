@@ -69,8 +69,17 @@ jobs:
         with:
           version: 'v3.14.4'
 
-      - name: helm dependency update
-        run: helm dependency update charts/${{ matrix.chart }}
+      - name: Add chart dependency repos
+        # `helm dependency build` (unlike `update`) requires each dependency's
+        # repo to be locally registered — it won't auto-fetch "unmanaged" repos.
+        run: |
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+          helm repo add openfga https://openfga.github.io/helm-charts
+          helm repo add minio https://charts.min.io/
+          helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
+
+      - name: helm dependency build
+        run: helm dependency build charts/${{ matrix.chart }}
 
       - name: helm lint
         run: helm lint charts/${{ matrix.chart }}
@@ -81,3 +90,16 @@ jobs:
             --namespace datuplet > /tmp/${{ matrix.chart }}.yaml
           # Sanity: rendered output should be non-trivial.
           test "$(wc -l < /tmp/${{ matrix.chart }}.yaml)" -gt 50
+
+  verify-versions:
+    name: version-sync checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: 'v3.14.4'
+      - name: verify-versions
+        run: scripts/verify-versions.sh

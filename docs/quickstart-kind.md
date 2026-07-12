@@ -47,45 +47,64 @@ git clone https://github.com/kacurez/datuplet
 cd datuplet
 ```
 
-Once 0.1.0 is released you can also install from the Helm repo
-(`helm repo add datuplet https://kacurez.github.io/datuplet`). Until then, use
-the path-based commands below.
+You can install from the Helm repo using:
+
+```bash
+helm repo add datuplet https://kacurez.github.io/datuplet
+```
+
+Or use the path-based commands below for development:
 
 ---
 
-## 3. Install the four charts
+## 3. Build images, load them into kind, and install
 
-Each `helm dependency update` fetches subchart tarballs (gitignored). Run once
-per clone or after a version bump.
+kind does **not** share the host Docker daemon (unlike OrbStack) — images built
+locally have to be explicitly loaded onto the kind node before Kubernetes can
+use them. Build the same images `make deploy-local` builds on OrbStack, then
+`kind load` each one:
 
 ```bash
-helm dependency update charts/datuplet-operators
-helm dependency update charts/datuplet-infra
-helm dependency update charts/datuplet-app
-helm dependency update charts/datuplet-lakekeeper
+# Build the five service images (pipeline-api, pipeline-observer,
+# pipeline-operator, gateway, query-worker) + the five built-in component
+# images. `build-components-local` tags the built-ins at the chart's
+# `components.tag` (a stable vX.Y.Z, via COMPONENT_TAG).
+make docker-build-k8s build-components-local
 
-# Phase 1 — CNPG operator + CRDs
-helm upgrade --install datuplet-operators charts/datuplet-operators \
-  -n datuplet --create-namespace --wait --timeout 5m
+# Derive the component tag from the chart so this stays correct across release
+# bumps (services are :latest; built-in components are :$CTAG).
+CTAG=$(sed -n 's/^  tag: *//p' charts/datuplet-app/values.yaml | tail -1)
+for img in \
+  datuplet/pipeline-api:latest \
+  datuplet/pipeline-observer:latest \
+  datuplet/pipeline-operator:latest \
+  datuplet/gateway:latest \
+  datuplet/query-worker:latest \
+  "datuplet/data-generator:$CTAG" \
+  "datuplet/sql-transform:$CTAG" \
+  "datuplet/stdout-writer:$CTAG" \
+  "datuplet/http-json-extractor:$CTAG" \
+  "datuplet/finnhub-extractor:$CTAG" \
+; do
+  kind load docker-image --name datuplet "$img"
+done
 
-# Phase 2 — stateful infra (Postgres, OpenFGA, MinIO)
-helm upgrade --install datuplet-infra charts/datuplet-infra \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
-
-# Phase 3 — Datuplet control plane (pipeline-api, observer, operator)
-# kind clusters use locally-loaded images (no registry); override the
-# chart-default pullPolicy=Always so Kubernetes uses kind-loaded images
-# rather than trying to pull non-existent "datuplet/*:latest" paths from
-# Docker Hub. Production deploys (chart pinned to versioned registry
-# tags) want the chart default; only override for local/kind/e2e.
-helm upgrade --install datuplet-app charts/datuplet-app \
-  -n datuplet --wait --wait-for-jobs --timeout 10m \
-  --set image.pullPolicy=IfNotPresent
-
-# Phase 4 — Lakekeeper Iceberg catalog
-helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-  -n datuplet --wait --wait-for-jobs --timeout 10m
+./scripts/install.sh --namespace datuplet \
+  -f-infra tests/local/values-local-infra.yaml \
+  -f-app tests/local/values-local-app.yaml
 ```
+
+Note: the chart ships a sixth built-in, `pandas-transform`, with no local build
+target yet — don't use it on a local/kind cluster (it will ImagePullBackOff); the
+five built-ins above, including `http-json-extractor` used by the example, work fine.
+
+`tests/local/values-local-app.yaml` sets `image.pullPolicy=IfNotPresent` (so
+kubelet uses the kind-loaded image instead of trying to pull a non-existent
+`datuplet/*:latest` from Docker Hub) and `components.registry=datuplet` (so the
+built-in ComponentDefinitions point at the images just loaded, not `ghcr.io`).
+`install.sh` runs preflight checks, the four helm phases in order, and finally
+`scripts/register.sh` — see [docs/install.md](install.md) for the full command
+reference.
 
 Phase 2 provisions CNPG Postgres (30–60 s on first install), so the timeout is
 intentionally generous. If it times out, check:
@@ -102,26 +121,32 @@ No warehouse credentials are needed for the quickstart path.
 
 ## 4. Bootstrap the warehouse + admin user
 
-`register.sh` runs five idempotent steps: create the Lakekeeper warehouse, create
-an admin user, create a project, attach the warehouse, and grant the admin role.
-
-```bash
-./scripts/register.sh --namespace datuplet
-```
-
-The script reads MinIO credentials from the `minio` Secret in the namespace
-automatically. At the end it prints the admin email and password.
+`register.sh` already ran as the last step of `install.sh` above — it runs five
+idempotent steps: create the Lakekeeper warehouse, create an admin user, create
+a project, attach the warehouse, and grant the admin role. At the end it prints
+the admin email and password.
 
 Default credentials (POC — change before any production use):
 
 - Email: `admin@datuplet.local`
 - Password: `changeme`
 
-To use custom credentials:
+To use custom credentials instead, pass them through `install.sh`'s `--`
+passthrough (everything after `--` goes to `register.sh`):
+
+```bash
+./scripts/install.sh --namespace datuplet \
+  -f-infra tests/local/values-local-infra.yaml \
+  -f-app tests/local/values-local-app.yaml \
+  -- --admin-email you@example.com --admin-password 'replace-with-a-strong-password'
+```
+
+Or re-run `register.sh` directly after the fact — it's idempotent and safe to
+re-run with different flags:
 
 ```bash
 ./scripts/register.sh --namespace datuplet \
-  --admin-email you@example.com --admin-password <strong-password>
+  --admin-email you@example.com --admin-password 'replace-with-a-strong-password'
 ```
 
 ---

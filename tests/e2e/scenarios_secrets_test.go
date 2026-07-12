@@ -48,7 +48,7 @@ spec:
           component: http-json-extractor
           version: dev
           config:
-            url: "https://jsonplaceholder.typicode.com/posts"
+            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
             api_token: "$[api_token]"
           outputs:
             defaultBucket: secrets-ladder-bucket
@@ -73,10 +73,8 @@ spec:
 // {pid} against a real `projects` row in Postgres (mustHaveRelation, see
 // pkg/pipelineapi/http/pipeline_handlers.go). SetupFGABootstrap
 // (framework/bootstrap.go) only ever provisions a *lakekeeper* Project for
-// the whole suite — it never creates the matching Datuplet DB row. That is
-// the exact same gap TestFGAMatrix_UnauthorisedTrigger (scenarios_test.go)
-// already documents and skips on, so h.LakekeeperProjectID cannot be used
-// directly as {pid} here either.
+// the whole suite — it never creates the matching Datuplet DB row, so
+// h.LakekeeperProjectID cannot be used directly as {pid} here.
 //
 // This test bridges the gap the same way an operator would: by running
 // `pipeline-api admin create-project` (idempotent — safe to call on every
@@ -107,20 +105,20 @@ func TestSecretsLadder(t *testing.T) {
 	}
 	h := framework.SharedHarness()
 	if h == nil {
-		t.Skip("SharedHarness nil — SetupFGABootstrap must have run in TestMain")
+		framework.SkipOrFail(t, "SharedHarness nil — SetupFGABootstrap must have run in TestMain")
 	}
 	if err := framework.PreCheck(); err != nil {
-		t.Skipf("precheck failed: %v", err)
+		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	if !framework.PipelineAPIReachable() {
-		t.Skip("pipeline-api not reachable on NodePort 30081 — start port-forward")
+		framework.SkipOrFail(t, "pipeline-api not reachable on NodePort 30081 — start port-forward")
 	}
 
 	ctx := context.Background()
 
 	projectID, err := ensureSecretsLadderProject(ctx, h)
 	if err != nil {
-		t.Skipf("could not provision secrets-ladder project: %v", err)
+		framework.SkipOrFail(t, "could not provision secrets-ladder project: %v", err)
 	}
 	namespace := "datuplet-" + projectID
 

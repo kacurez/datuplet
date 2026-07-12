@@ -10,19 +10,23 @@
 #   --set-json 'tolerations=[{"key":"kubernetes.io/arch","operator":"Equal","value":"arm64","effect":"NoSchedule"}]'
 tolerations: []
 
+# tag "" resolves to the chart appVersion; local dev overrides via
+# tests/local/values-local-app.yaml.
 image:
   pullPolicy: IfNotPresent
   pullSecrets: []
   pipelineApi:
-    repository: datuplet/pipeline-api
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-api
+    tag: ""
 
 bootstrap:
   externalImages:
-    # bitnami/kubectl:1.31 was retired when Bitnami restructured their
-    # registry — only the :latest tag and bitnamilegacy/kubectl:X.Y tags
-    # remain. Using :latest to match the existing charts/datuplet/ chart.
-    kubectl: "bitnami/kubectl:latest"
+    # Bitnami retired versioned bitnami/kubectl tags; the bitnamilegacy
+    # replacement images use dash as /bin/sh, which lacks `set -o pipefail`
+    # and breaks the bootstrap Job scripts below. This is a multi-arch
+    # kubectl toolbox whose busybox ash supports pipefail (verified
+    # amd64+arm64).
+    kubectl: "alpine/k8s:1.31.12"
     openfgaCli: "openfga/cli:v0.6.2"
   resources:
     requests: { cpu: 50m, memory: 64Mi }

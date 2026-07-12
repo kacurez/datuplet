@@ -46,7 +46,7 @@ spec:
       {{- end }}
       initContainers:
         - name: keygen
-          image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"
+          image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["sh", "-c"]
           args:

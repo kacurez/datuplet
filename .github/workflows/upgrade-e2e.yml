@@ -1,0 +1,185 @@
+name: upgrade-e2e
+
+# Installs the latest PUBLISHED release, seeds real state, upgrades
+# in place to HEAD (charts + images from this checkout), and proves the
+# upgrade: hooks + migrations succeed, seeded history survives, a fresh
+# pipeline runs. This is the tested "N-1 → N, one hop" support statement
+# (RFC 024 W5, known-limitations.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+concurrency:
+  group: upgrade-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade:
+    # PRs run only when labeled 'upgrade-e2e' (keeps PR cost flat).
+    if: >
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'upgrade-e2e')
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      NS: datuplet-e2e
+      HELM_REPO_URL: https://kacurez.github.io/datuplet
+      ADMIN_EMAIL: upgrade@datuplet.local
+      ADMIN_PASSWORD: ue-ci-password-1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: 'v3.14.4'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Write kind config (NodePort 30081 → host)
+        run: |
+          cat > /tmp/kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30081
+                  hostPort: 30081
+          EOF
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.14.0
+        with:
+          version: v0.23.0
+          cluster_name: datuplet-e2e
+          node_image: kindest/node:v1.30.0
+          config: /tmp/kind-config.yaml
+
+      - name: Resolve latest published release
+        id: prev
+        run: |
+          set -euo pipefail
+          V=$(curl -fsSL "$HELM_REPO_URL/index.yaml" \
+            | yq '.entries.datuplet-app[].version' | sort -V | tail -1)
+          [ -n "$V" ] && [ "$V" != "null" ] \
+            || { echo "::error::could not resolve a published release to upgrade FROM"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "upgrading FROM $V"
+
+      - name: Install published release N-1
+        run: |
+          ./scripts/install.sh --namespace "$NS" \
+            --from-repo --version "${{ steps.prev.outputs.version }}" \
+            --register-mode job \
+            -- --admin-email "$ADMIN_EMAIL" --admin-password "$ADMIN_PASSWORD"
+
+      - name: Seed state (pipeline run + second project)
+        run: |
+          # Component refs (no image templating). This N-1 seed run depends on
+          # the built-in ComponentDefinition images being pullable at the N-1
+          # release's components.tag — i.e. on the §6.6 component-image gap being
+          # closed (T6.3). If T6.3 hasn't landed, this step is the failure signal.
+          PIPELINE_NAME=seeded-pipeline envsubst '$PIPELINE_NAME' \
+            < tests/release-verify/pipeline.yaml > /tmp/seed.yaml
+          DATUPLET_ADMIN_EMAIL="$ADMIN_EMAIL" DATUPLET_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            tests/release-verify/run-pipeline.sh /tmp/seed.yaml
+          cp /tmp/datuplet-last-run-id /tmp/seeded-run-id
+          # Second project + grants → real FGA tuples + DB rows to migrate.
+          ./scripts/register.sh --namespace "$NS" --mode job \
+            --project-name seeded-project \
+            --admin-email "$ADMIN_EMAIL" --admin-password "$ADMIN_PASSWORD"
+
+      - name: Build + load HEAD images
+        run: |
+          set -euo pipefail
+          # build-components-local (not -e2e) additionally re-tags the built-in
+          # component images to datuplet/<comp>:$(COMPONENT_TAG) — the STABLE
+          # v-tag the built-in ComponentDefinitions pin (components.tag). A
+          # mutable ':latest' would be rejected by the stable-version validator
+          # (^v\d+\.\d+\.\d+$). No iceberg-job (deleted by PR #26).
+          make docker-build-k8s build-components-local
+          # Derive the component tag from the committed chart (bump-version keeps
+          # components.tag == COMPONENT_TAG) instead of hardcoding it — so this
+          # lane doesn't silently break after a version bump.
+          CTAG=$(sed -n 's/^  tag: *//p' charts/datuplet-app/values.yaml | tail -1)
+          echo "component tag = $CTAG"
+          # Services + query-worker: :latest (the overlay's service-image
+          # overrides). Built-in components: $CTAG (the stable components.tag).
+          for img in \
+            datuplet/pipeline-api:latest datuplet/pipeline-observer:latest \
+            datuplet/pipeline-operator:latest datuplet/gateway:latest \
+            datuplet/query-worker:latest \
+            "datuplet/data-generator:$CTAG" "datuplet/sql-transform:$CTAG" \
+            "datuplet/stdout-writer:$CTAG" "datuplet/http-json-extractor:$CTAG" \
+            "datuplet/finnhub-extractor:$CTAG" \
+          ; do kind load docker-image --name datuplet-e2e "$img"; done
+          docker image prune --all --force || true
+
+      - name: Upgrade in place to HEAD
+        run: |
+          # ⚠ Component resolution: do NOT reuse tests/e2e/values-app.yaml's
+          # components.builtins:false here — that path expects the Go e2e harness
+          # to register dev ComponentDefinitions, which this REST-driven lane never
+          # runs. Keep builtins:true and point the built-ins at the HEAD-built local
+          # images so `component:` refs resolve. Use a dedicated overlay:
+          #   tests/upgrade-e2e/values-app.yaml = tests/e2e/values-app.yaml MINUS the
+          #   components.builtins:false line, PLUS:
+          #     components: {builtins: true, registry: datuplet}
+          #     (tag OMITTED → inherits the chart's components.tag = stable vX.Y.Z,
+          #      which the build step above kind-loads as datuplet/<comp>:$CTAG;
+          #      chart pullPolicy IfNotPresent keeps the kind-loaded images in use)
+          ./scripts/upgrade.sh --namespace "$NS" --phase all --from-source \
+            -f-operators tests/e2e/values-operators.yaml \
+            -f-infra tests/e2e/values-infra.yaml \
+            -f-app tests/upgrade-e2e/values-app.yaml \
+            -f-lakekeeper tests/e2e/values-lakekeeper.yaml
+
+      - name: Assert seeded run survived + fresh pipeline works
+        run: |
+          set -eu
+          make k8s-smoke SMOKE_URL=http://localhost:30081
+          # Fresh pipeline on the upgraded stack — built-in component refs now
+          # resolve against the HEAD-built local images (registry=datuplet, tag =
+          # the chart's components.tag, kind-loaded above).
+          PIPELINE_NAME=post-upgrade envsubst '$PIPELINE_NAME' \
+            < tests/release-verify/pipeline.yaml > /tmp/post.yaml
+          DATUPLET_ADMIN_EMAIL="$ADMIN_EMAIL" DATUPLET_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            tests/release-verify/run-pipeline.sh /tmp/post.yaml
+          # Seeded run id still listable through the API after migrations:
+          SEEDED=$(cat /tmp/seeded-run-id)
+          JAR=$(mktemp)
+          curl -fsS -c "$JAR" -H 'Content-Type: application/json' \
+            -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}" \
+            http://localhost:30081/api/v1/auth/login >/dev/null
+          PID=$(curl -fsS -b "$JAR" http://localhost:30081/api/v1/projects | jq -r '.[0].id // .projects[0].id')
+          curl -fsS -b "$JAR" "http://localhost:30081/api/v1/projects/$PID/runs" \
+            | grep -q "$SEEDED" || { echo "FAIL: seeded run $SEEDED missing after upgrade"; exit 1; }
+          echo "OK: seeded run survived, fresh pipeline succeeded"
+
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          kubectl get pods -n "$NS" -o wide || true
+          kubectl get jobs -n "$NS" || true
+          for pod in $(kubectl -n "$NS" get pods -o name 2>/dev/null); do
+            echo "=== $pod ==="; kubectl -n "$NS" logs "$pod" --all-containers --tail=100 || true
+          done

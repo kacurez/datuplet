@@ -56,7 +56,7 @@ spec:
       {{- end }}
       containers:
         - name: pipeline-observer
-          image: "{{ .Values.image.pipelineObserver.repository }}:{{ .Values.image.pipelineObserver.tag }}"
+          image: "{{ include "datuplet-app.image" (dict "img" .Values.image.pipelineObserver "root" $) }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - { containerPort: 8081, name: metrics }

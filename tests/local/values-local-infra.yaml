@@ -1,0 +1,10 @@
+# Local-development override for charts/datuplet-infra (OrbStack / kind).
+# Post-RFC-024-W2 the chart default for the pipeline-api image (used by the
+# infra keygen Job's initContainer) is ghcr.io/kacurez/pipeline-api:<appVersion>,
+# which isn't present on a local node — so the keygen pre-install hook would
+# ImagePullBackOff. Point it at the locally-built image instead.
+# Passed automatically by `make deploy-local` / `deploy-local-helm`.
+image:
+  pipelineApi:
+    repository: datuplet/pipeline-api
+    tag: latest

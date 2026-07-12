@@ -1,0 +1,80 @@
+fgaModel:
+  version: "4.4"
+
+platform:
+  releaseName: datuplet-infra
+
+image:
+  # e2e loads images into the kind cluster via `kind load docker-image`;
+  # Always would make K8s try to pull from Docker Hub instead of using
+  # the locally-loaded image and time out the chart pre-install hook.
+  # (The chart default is also IfNotPresent now that image tags are pinned.)
+  pullPolicy: IfNotPresent
+  pipelineApi:
+    repository: datuplet/pipeline-api
+    tag: latest
+  pipelineOperator:
+    repository: datuplet/pipeline-operator
+    tag: latest
+  pipelineObserver:
+    repository: datuplet/pipeline-observer
+    tag: latest
+  gateway:
+    repository: datuplet/gateway
+    tag: latest
+
+# RFC 022 Task 2.7: enable the query-worker for e2e query scenarios.
+#
+# RFC 025: the warehouse is resolved per request from the project-scoped
+# route (POST /api/v1/projects/{pid}/query) — no bootstrap-ordering env patch
+# is needed. TestQueryBootstrap verifies the worker is ready and skips the
+# query suite if it is not.
+queryWorker:
+  enabled: true
+  image:
+    repository: datuplet/query-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Reduced resources for the e2e cluster (OrbStack / kind has limited RAM).
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 250m
+      ephemeral-storage: 1Gi
+    limits:
+      memory: 1Gi
+      cpu: "1"
+      ephemeral-storage: 1Gi
+  concurrency: 2
+  memoryHeadroomPct: 25
+  scratch:
+    sizeLimit: 1Gi
+  query:
+    defaultTimeoutS: 60
+    maxTimeoutS: 300
+    defaultMaxRows: 1000
+    maxMaxRows: 10000
+
+# RFC 022 Task 3.3: enable the client-side query mint endpoint
+# (POST /api/v1/query/token) for the BYO-local e2e (TestQuery_LocalMint_Enabled).
+# Production defaults this OFF (chart values.yaml); the e2e fixes it ON at deploy
+# time so the mint path is exercised against a live pipeline-api WITHOUT toggling
+# the env at test time — a runtime toggle forces a pipeline-api rollout, and the
+# rollout churn destabilizes the NodePort the framework reaches pipeline-api
+# through, skipping unrelated query scenarios. The policy-off 403 refusal is
+# covered by the pkg/pipelineapi/http unit test instead.
+allowClientSideQuery: true
+
+# Upgrade-e2e is REST-driven (no Go harness), so built-ins must stay
+# registered and point at the HEAD-built local images. The workflow builds
+# them via `build-components-local` (re-tags each to datuplet/<comp>:$COMPONENT_TAG)
+# and kind-loads that tag. `tag` is intentionally OMITTED here so it inherits the
+# chart's committed `components.tag` (a stable vX.Y.Z that bump-version keeps ==
+# COMPONENT_TAG) — hardcoding it would drift after a version bump. Must be the
+# stable v-tag, not :latest — the built-in ComponentDefinition version is
+# components.tag and the stable-version validator requires ^v\d+\.\d+\.\d+$.
+# Unlike tests/e2e which sets builtins:false and lets the Go harness register
+# dev defs.
+components:
+  builtins: true
+  registry: datuplet

@@ -21,10 +21,11 @@
 //	charlie viewer         browse only; trigger → 403
 //	dora    (no grants)    403 everywhere
 //
-// alice + bob: exercised as standard K8s scenarios in the scenarios slice.
-// charlie + dora (negative): TestFGAMatrix_UnauthorisedTrigger calls pipeline-api
-// HTTP directly and asserts 403. TestFGAMatrix_CharlieBrowseOnly is skipped with
-// an explanation of the two-phase sequencing constraint.
+// alice + bob positive paths are exercised as standard K8s scenarios in the
+// scenarios slice (kubectl-apply trigger + lakekeeper browse). The charlie
+// (viewer) and dora (no-grants) negative-authz paths are covered at the unit
+// level in pkg/pipelineapi/http (mustHaveRelation → 403); they are not
+// e2e-covered — see the note above the fga-matrix scenarios below.
 package e2e
 
 import (
@@ -229,17 +230,22 @@ var scenarios = []framework.Scenario{
 	// resulting table is browsable. The per-run JWT is minted for
 	// their respective identities via K8sBackend.RunAsUser = User.
 	//
-	// charlie + dora (negative paths): a separate standalone test
-	// TestFGAMatrix_UnauthorisedTrigger checks the pipeline-api HTTP
-	// trigger endpoint (POST /api/v1/projects/:pid/pipelines/:name/runs)
-	// returns 403 for these users. This requires pipeline-api to be
-	// reachable via its NodePort — the test is skipped when it isn't.
+	// charlie + dora (negative paths): the pipeline-api HTTP trigger
+	// endpoint (POST /api/v1/projects/:pid/pipelines/:name/runs) returning
+	// 403 for viewer / no-grant users is exercised by mustHaveRelation
+	// handler unit tests in pkg/pipelineapi/http, not by an e2e scenario:
+	// the e2e negative-trigger path needs a cli-api Bearer JWT (or session
+	// cookie) whose subject is a Datuplet DB user row whose UUID matches the
+	// FGA-seeded test-user UUID — infrastructure this harness does not have
+	// (create-user mints a random UUID; the only test-user token helper
+	// mints an impersonation/datuplet-catalog token the REST resolver
+	// rejects). See docs/superpowers/plans for the RFC 024 W7 decision.
 	// ============================================================
 	{
 		Name:        "fga-matrix-alice-trigger-and-browse",
 		Description: "alice (project_admin) triggers a pipeline and browses the result — both succeed",
 		// Use the http-json fixture which works without local CSV test
-		// data and produces a stable 100-row output (jsonplaceholder posts).
+		// data and produces a stable 100-row output (in-cluster http-fixture posts).
 		K8sPipeline: "k8s/http-json-extract.yaml",
 		User:        framework.AliceID,
 		Assertions: []framework.Assertion{
@@ -317,50 +323,4 @@ func TestBigDataJoinProof(t *testing.T) {
 		},
 	}
 	framework.RunScenario(t, sc, runPrefix, pipelinesDir, testDataDir)
-}
-
-// TestFGAMatrix_UnauthorisedTrigger verifies the negative FGA-grant-matrix
-// paths: charlie (viewer) and dora (no grants) get HTTP 403 when they
-// attempt to POST a run trigger against pipeline-api.
-//
-// Currently skipped: the K8s e2e harness only provisions a *lakekeeper*
-// project (via SetupFGABootstrap). It never creates a corresponding
-// Datuplet project DB row inside pipeline-api's Postgres. mustHaveRelation
-// looks up s.projects.GetByID(URL :pid) BEFORE running the FGA Check, so
-// the request short-circuits with HTTP 404 ("project not found") and the
-// authz layer never gets exercised — the test cannot distinguish "FGA
-// denied this user" from "the harness never seeded the project row."
-//
-// To revive properly: extend SetupFGABootstrap (or e2e-up-k8s) to call
-// `pipeline-api admin create-project` and capture the Datuplet UUID into
-// the harness, then drive TriggerRunHTTP with that UUID instead of
-// LakekeeperProjectID.
-//
-// alice/bob positive paths still cover the FGA grant matrix: see
-// fga-matrix-alice-trigger-and-browse + fga-matrix-bob-trigger-and-browse
-// scenarios above (kubectl-apply trigger + lakekeeper browse — both go
-// through FGA via the run-token JWT and impersonation JWT respectively).
-func TestFGAMatrix_UnauthorisedTrigger(t *testing.T) {
-	t.Skip("FGA-matrix negative-trigger skip: e2e harness does not seed a Datuplet " +
-		"project DB row matching h.LakekeeperProjectID, so mustHaveRelation returns " +
-		"404 before authz fires. See test docstring for the revival plan.")
-}
-
-// TestFGAMatrix_CharlieBrowseOnly documents the charlie (viewer) browse-only
-// scenario. Full verification requires alice to first run a pipeline that
-// produces rows, then charlie to browse the resulting table — a sequencing
-// constraint that this harness doesn't express in a single scenario struct.
-//
-// This test is intentionally a compile-time placeholder that skips with a
-// clear message. A follow-on slice should either:
-//  1. Implement two-phase scenario support (setup user + browse user), or
-//  2. Run charlie's browse as a sub-step after an alice fga-matrix run.
-//
-// For now, charlie's browse capability is tested implicitly by the
-// fga-matrix-alice-trigger-and-browse scenario: if alice can write and the
-// table is visible at lakekeeper, the viewer chain works (FGA model
-// verification covers the relation resolution).
-func TestFGAMatrix_CharlieBrowseOnly(t *testing.T) {
-	t.Skip("charlie browse-only: two-phase setup needed (alice produces data, " +
-		"charlie reads it). See scenarios_test.go comment above for the revival plan.")
 }

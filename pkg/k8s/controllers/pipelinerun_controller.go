@@ -285,8 +285,8 @@ func (r *PipelineRunReconciler) runtimePullPolicy() corev1.PullPolicy {
 // (managed project Secret) + `create` (per-run snapshot Secret) via the
 // `datuplet-secrets-operator` Role that pipeline-api binds to this SA in each
 // project namespace (EnsureProjectNamespace) — never a cluster-wide grant.
-// NB: this repo hand-maintains RBAC (charts/datuplet-app/templates/ +
-// utils/deploy/k8s/rbac/); there is no controller-gen `make manifests` target,
+// NB: this repo hand-maintains RBAC (charts/datuplet-app/templates/) and CRDs
+// (charts/datuplet-app/crds/); there is no controller-gen `make manifests` target,
 // so these markers are documentation only and do not generate any manifest.
 
 // Reconcile handles PipelineRun reconciliation.
