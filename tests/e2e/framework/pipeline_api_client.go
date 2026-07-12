@@ -16,7 +16,7 @@ import (
 
 const (
 	// pipelineAPINodePort is the OrbStack NodePort for pipeline-api.
-	// Matches utils/deploy/k8s/pipeline-api.yaml.
+	// Matches the datuplet-app chart's pipeline-api NodePort (pipelineApi.service.nodePort).
 	pipelineAPINodePort = "30081"
 	pipelineAPIAddress  = "localhost:" + pipelineAPINodePort
 )

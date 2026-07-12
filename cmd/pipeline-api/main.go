@@ -536,7 +536,7 @@ Usage:
   pipeline-api admin <command>               Admin operations
   pipeline-api reap-once [--max-age 24h]     Run the reaper once, then exit
                                              (used by the CronJob — see
-                                             utils/deploy/k8s/pipeline-api-reaper.yaml)
+                                             charts/datuplet-app/templates/reaper/cronjob.yaml)
 
 Env:
   PIPELINE_API_ADDR           HTTP listen address (default :8081)

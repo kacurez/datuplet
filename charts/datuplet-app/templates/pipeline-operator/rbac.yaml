@@ -4,7 +4,7 @@ ServiceAccount + ClusterRole + ClusterRoleBinding for pipeline-operator.
 The operator reconciles PipelineRuns and schedules component Pods + per-bucket
 commit Jobs across all per-project Namespaces (datuplet-<uuid>), so
 namespace-scoped roles are insufficient — ClusterRole + ClusterRoleBinding
-are required (mirrors utils/deploy/k8s/rbac/pipeline-operator-rbac.yaml).
+are required.
 
 ClusterRole + ClusterRoleBinding use <namespace>-pipeline-operator as name
 to avoid cross-namespace collisions across installs in different namespaces

@@ -42,7 +42,7 @@ func SharedHarness() *FGAHarness {
 	return sharedHarness
 }
 
-// MinIO credentials for K8s cluster (matches utils/deploy/k8s/minio.yaml)
+// MinIO credentials for K8s cluster (matches the datuplet-infra chart's MinIO values + tests/e2e/values-infra.yaml)
 const (
 	minioAccessKey    = "minioadmin"
 	minioSecretKey    = "minioadmin"
