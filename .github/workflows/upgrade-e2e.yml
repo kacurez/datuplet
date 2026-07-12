@@ -77,8 +77,11 @@ jobs:
       - name: Resolve latest published release
         id: prev
         run: |
+          set -euo pipefail
           V=$(curl -fsSL "$HELM_REPO_URL/index.yaml" \
             | yq '.entries.datuplet-app[].version' | sort -V | tail -1)
+          [ -n "$V" ] && [ "$V" != "null" ] \
+            || { echo "::error::could not resolve a published release to upgrade FROM"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "upgrading FROM $V"
 
@@ -107,16 +110,23 @@ jobs:
 
       - name: Build + load HEAD images
         run: |
-          make docker-build-k8s build-components-e2e
-          set -eu
-          # No iceberg-job (deleted by PR #26). Component images are loaded so the
-          # post-upgrade run can resolve built-ins against locally-built images.
+          set -euo pipefail
+          # build-components-local (not -e2e) additionally re-tags the built-in
+          # component images to datuplet/<comp>:$(COMPONENT_TAG) = v0.1.0 — the
+          # STABLE v-tag the built-in ComponentDefinitions pin (components.tag in
+          # tests/upgrade-e2e/values-app.yaml). A mutable ':latest' would be
+          # rejected by the stable-version validator (^v\d+\.\d+\.\d+$). No
+          # iceberg-job (deleted by PR #26).
+          make docker-build-k8s build-components-local
+          # Services + query-worker: :latest (the overlay's service-image
+          # overrides). Built-in components: :v0.1.0 (the stable components.tag).
           for img in \
             datuplet/pipeline-api:latest datuplet/pipeline-observer:latest \
             datuplet/pipeline-operator:latest datuplet/gateway:latest \
-            datuplet/data-generator:latest datuplet/sql-transform:latest \
-            datuplet/stdout-writer:latest datuplet/http-json-extractor:latest \
             datuplet/query-worker:latest \
+            datuplet/data-generator:v0.1.0 datuplet/sql-transform:v0.1.0 \
+            datuplet/stdout-writer:v0.1.0 datuplet/http-json-extractor:v0.1.0 \
+            datuplet/finnhub-extractor:v0.1.0 \
           ; do kind load docker-image --name datuplet-e2e "$img"; done
           docker image prune --all --force || true
 
