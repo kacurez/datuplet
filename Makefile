@@ -92,6 +92,10 @@ COMPONENT_TAG ?= v0.1.0
 # Namespace for the k8s-* developer-loop targets (deploy-local installs
 # into `datuplet`; override for e2e clusters: make k8s-reload-crds K8S_NS=datuplet-e2e).
 K8S_NS ?= datuplet
+
+# Base URL for k8s-smoke probes. Defaults to the OrbStack NodePort; release-verify
+# (RFC 024 W3) overrides it to a port-forwarded address in the verify cluster.
+SMOKE_URL ?= http://localhost:30081
 build-components-local: build-components ## Build + tag built-in component images as datuplet/<name>:$(COMPONENT_TAG) for deploy-local
 	for c in data-generator sql-transform stdout-writer http-json-extractor finnhub-extractor; do \
 	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
@@ -123,19 +127,19 @@ docker-build-k8s: docker-build-operators build-gateway docker-build-pipeline-api
 # the API layer".
 k8s-smoke: ## Smoke the OrbStack cluster via NodePort 30081 (health + OIDC probes)
 	@echo "=== k8s-smoke: probing NodePort :30081 ==="
-	@if ! curl -fsS http://localhost:30081/healthz >/dev/null 2>&1; then \
-		echo "ERROR: pipeline-api not reachable at http://localhost:30081"; \
+	@if ! curl -fsS $(SMOKE_URL)/healthz >/dev/null 2>&1; then \
+		echo "ERROR: pipeline-api not reachable at $(SMOKE_URL)"; \
 		echo "  Run 'make deploy-local' first."; \
 		exit 1; \
 	fi
 	@echo "  /healthz: OK"
-	@if ! curl -fsS http://localhost:30081/.well-known/openid-configuration >/dev/null 2>&1; then \
-		echo "ERROR: OIDC discovery not reachable at http://localhost:30081/.well-known/openid-configuration"; \
+	@if ! curl -fsS $(SMOKE_URL)/.well-known/openid-configuration >/dev/null 2>&1; then \
+		echo "ERROR: OIDC discovery not reachable at $(SMOKE_URL)/.well-known/openid-configuration"; \
 		exit 1; \
 	fi
 	@echo "  /.well-known/openid-configuration: OK"
-	@if ! curl -fsS http://localhost:30081/api/v1/auth/jwks.json >/dev/null 2>&1; then \
-		echo "ERROR: JWKS not reachable at http://localhost:30081/api/v1/auth/jwks.json"; \
+	@if ! curl -fsS $(SMOKE_URL)/api/v1/auth/jwks.json >/dev/null 2>&1; then \
+		echo "ERROR: JWKS not reachable at $(SMOKE_URL)/api/v1/auth/jwks.json"; \
 		exit 1; \
 	fi
 	@echo "  /api/v1/auth/jwks.json: OK"
