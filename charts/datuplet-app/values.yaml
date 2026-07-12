@@ -276,7 +276,7 @@ components:
   # Chart.yaml's appVersion ("1.0") is not vX.Y.Z-shaped, so this is pinned
   # explicitly instead of deriving from appVersion; it matches the image tag
   # documented for all six built-in components in docs/components.md.
-  tag: v0.1.0
+  tag: v0.8.0
   # pandas-transform has no published image yet (no build wired in
   # _release-components.yml or docker-build-k8s); off until its image
   # ships (RFC 024 T6.3). The other five built-ins are unaffected.
