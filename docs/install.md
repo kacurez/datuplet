@@ -28,6 +28,10 @@ helm repo update
 local clone by default, or from this published repo when called with
 `--from-repo --version vX.Y.Z`.
 
+A release is announceable when its `release-verify` workflow run is green — that
+job installs the published charts + images on a fresh kind cluster and runs a
+real pipeline end-to-end.
+
 ## Credential model
 
 Datuplet Deployments carry **zero long-lived S3 credentials** at runtime:
