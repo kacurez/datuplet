@@ -5,6 +5,13 @@ on:
     tags:
       - 'v*.*.*'
 
+# Serialize release runs: two tags pushed close together would otherwise run
+# chart-releaser concurrently against gh-pages and one git push loses the
+# race. No cancel-in-progress — a started release must run to completion.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: write    # charts job: gh-pages bootstrap + chart-releaser commits
   packages: write    # image jobs (via reusable workflows): ghcr.io push

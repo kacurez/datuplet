@@ -10,7 +10,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Verify version bump if DSL changed
@@ -30,9 +30,9 @@ jobs:
             | yq '.fgaModel.version' - 2>/dev/null || echo "")
           new_version=$(yq '.fgaModel.version' "$VALUES")
 
-          if [ -z "$old_version" ] || [ "$old_version" != "$new_version" ]; then
-            echo "✓ DSL changed AND fgaModel.version bumped: $old_version → $new_version"
-          else
+          if [ -z "$old_version" ]; then
+            echo "✓ DSL changed; no prior fgaModel.version on $BASE — accepting $new_version"
+          elif [ "$old_version" = "$new_version" ]; then
             cat <<EOF >&2
           ✗ DSL files changed but fgaModel.version did not bump.
 
@@ -40,4 +40,9 @@ jobs:
           to indicate the model is being updated. See docs/fga-model-upgrades.md.
           EOF
             exit 1
+          elif [ "$(printf '%s\n%s\n' "$old_version" "$new_version" | sort -V | tail -1)" != "$new_version" ]; then
+            echo "✗ fgaModel.version moved backwards or reuses an older number: $old_version → $new_version" >&2
+            exit 1
+          else
+            echo "✓ DSL changed AND fgaModel.version bumped: $old_version → $new_version"
           fi
