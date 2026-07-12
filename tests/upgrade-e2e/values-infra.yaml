@@ -1,0 +1,25 @@
+# N-1 (previous published release) infra overlay for the upgrade-e2e lane.
+#
+# Mirrors tests/e2e/values-infra.yaml EXCEPT its image.pipelineApi pin: the N-1
+# install must run its own published image (ghcr.io/kacurez/pipeline-api:<N-1>),
+# NOT the HEAD-built datuplet/pipeline-api:latest — that image isn't built or
+# kind-loaded until the later "Build + load HEAD images" step.
+#
+# Why this exists: the HEAD upgrade applies tests/e2e/values-infra.yaml, so the
+# N-1 install must match it on the immutable/monotonic fields, or the upgrade
+# helm patch is rejected:
+#   - storage: PVCs and CNPG forbid shrinking. A chart-default N-1 (pg 5Gi) →
+#     HEAD (1Gi) upgrade fails with "can't shrink existing storage from 5Gi to
+#     1Gi". Pin both sides to 1Gi.
+#   - MinIO root creds: pin on both sides so the root password doesn't change
+#     across the upgrade hop (a mid-upgrade cred rotation would break access to
+#     the seeded warehouse the assert step reads back).
+postgres:
+  cluster:
+    storageSize: 1Gi
+
+minio:
+  rootUser: minioadmin
+  rootPassword: minioadmin
+  persistence:
+    size: 1Gi

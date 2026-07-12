@@ -87,9 +87,15 @@ jobs:
 
       - name: Install published release N-1
         run: |
+          # -f-infra pins storage + MinIO creds to match the HEAD upgrade's
+          # tests/e2e/values-infra.yaml, so the in-place upgrade doesn't try to
+          # shrink PVC/CNPG storage (forbidden) or rotate the MinIO root creds.
+          # A dedicated overlay (not tests/e2e/values-infra.yaml) omits the
+          # image.pipelineApi pin — N-1 must run its own published image.
           ./scripts/install.sh --namespace "$NS" \
             --from-repo --version "${{ steps.prev.outputs.version }}" \
             --register-mode job \
+            -f-infra tests/upgrade-e2e/values-infra.yaml \
             -- --admin-email "$ADMIN_EMAIL" --admin-password "$ADMIN_PASSWORD"
 
       - name: Seed state (pipeline run + second project)
