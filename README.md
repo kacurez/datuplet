@@ -47,7 +47,9 @@ for img in \
 ; do kind load docker-image --name datuplet "$img"; done
 
 # 4. Install the four charts + bootstrap warehouse/admin user (register.sh runs last)
-./scripts/install.sh --namespace datuplet -f-app tests/local/values-local-app.yaml
+./scripts/install.sh --namespace datuplet \
+  -f-infra tests/local/values-local-infra.yaml \
+  -f-app tests/local/values-local-app.yaml
 
 # 5. Open the UI
 open http://localhost:8080/ui/

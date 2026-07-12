@@ -81,6 +81,7 @@ jobs:
             datuplet/pipeline-operator:latest \
             datuplet/gateway:latest \
             datuplet/data-generator:latest \
+            datuplet/data-generator:v0.0.1 \
             datuplet/sql-transform:latest \
             datuplet/stdout-writer:latest \
             datuplet/http-json-extractor:latest \

@@ -86,7 +86,9 @@ for img in \
   kind load docker-image --name datuplet "$img"
 done
 
-./scripts/install.sh --namespace datuplet -f-app tests/local/values-local-app.yaml
+./scripts/install.sh --namespace datuplet \
+  -f-infra tests/local/values-local-infra.yaml \
+  -f-app tests/local/values-local-app.yaml
 ```
 
 Note: the chart ships a sixth built-in, `pandas-transform`, with no local build
@@ -130,7 +132,9 @@ To use custom credentials instead, pass them through `install.sh`'s `--`
 passthrough (everything after `--` goes to `register.sh`):
 
 ```bash
-./scripts/install.sh --namespace datuplet -f-app tests/local/values-local-app.yaml \
+./scripts/install.sh --namespace datuplet \
+  -f-infra tests/local/values-local-infra.yaml \
+  -f-app tests/local/values-local-app.yaml \
   -- --admin-email you@example.com --admin-password 'replace-with-a-strong-password'
 ```
 

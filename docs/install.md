@@ -144,9 +144,10 @@ make deploy-local
 `make deploy-local` is image build + `install.sh`: it builds the five service
 images and the five built-in component images
 (`docker-build-k8s build-components-local`), then runs
-`./scripts/install.sh --namespace datuplet -f-app tests/local/values-local-app.yaml`
-(`deploy-local-helm`), which sets `image.pullPolicy=IfNotPresent` and
-`components.registry=datuplet` so the freshly built local images are used
+`./scripts/install.sh --namespace datuplet -f-infra tests/local/values-local-infra.yaml -f-app tests/local/values-local-app.yaml`
+(`deploy-local-helm`), which sets `image.pullPolicy=IfNotPresent`,
+`components.registry=datuplet`, and the infra keygen image so the freshly built
+local images are used
 instead of pulling from a registry. OrbStack shares its image cache with the
 cluster, so the build step only needs to run once — after that,
 `make deploy-local-helm` alone re-applies chart changes without rebuilding.

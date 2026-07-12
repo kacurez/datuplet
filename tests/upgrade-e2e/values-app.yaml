@@ -67,13 +67,14 @@ allowClientSideQuery: true
 
 # Upgrade-e2e is REST-driven (no Go harness), so built-ins must stay
 # registered and point at the HEAD-built local images. The workflow builds
-# them via `build-components-local`, which re-tags each to
-# datuplet/<comp>:v0.1.0 (= COMPONENT_TAG), and kind-loads that tag. Must be
-# the STABLE v-tag, not :latest — the built-in ComponentDefinition version is
+# them via `build-components-local` (re-tags each to datuplet/<comp>:$COMPONENT_TAG)
+# and kind-loads that tag. `tag` is intentionally OMITTED here so it inherits the
+# chart's committed `components.tag` (a stable vX.Y.Z that bump-version keeps ==
+# COMPONENT_TAG) — hardcoding it would drift after a version bump. Must be the
+# stable v-tag, not :latest — the built-in ComponentDefinition version is
 # components.tag and the stable-version validator requires ^v\d+\.\d+\.\d+$.
 # Unlike tests/e2e which sets builtins:false and lets the Go harness register
 # dev defs.
 components:
   builtins: true
   registry: datuplet
-  tag: v0.1.0

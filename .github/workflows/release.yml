@@ -38,6 +38,14 @@ jobs:
             [ "$v" = "$VERSION" ]  || { echo "::error::charts/$c version=$v != tag $VERSION"; fail=1; }
             [ "$av" = "$VERSION" ] || { echo "::error::charts/$c appVersion=$av != tag $VERSION"; fail=1; }
           done
+          # Built-in ComponentDefinitions pin components.tag as their (stable,
+          # v-prefixed) version + image tag. It must equal v<VERSION> so a release
+          # never publishes charts whose built-ins reference an unpublished image
+          # tag. bump-version keeps it in sync; this guards a hand-edit that didn't.
+          # components.tag is the only 2-space-indented `tag:` line (the image
+          # tags under image:/queryWorker.image are 4-space and default to "").
+          ct=$(sed -n 's/^  tag: *//p' charts/datuplet-app/values.yaml | tail -1)
+          [ "$ct" = "v$VERSION" ] || { echo "::error::charts/datuplet-app components.tag=$ct != v$VERSION (run 'make bump-version')"; fail=1; }
           [ $fail -eq 0 ] || { echo "::error::Run 'make bump-version VERSION=$VERSION', commit, then re-tag."; exit 1; }
 
   # Service images: pipeline-api, pipeline-observer, pipeline-operator,

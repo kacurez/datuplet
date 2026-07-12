@@ -67,5 +67,17 @@ for c in $CHARTS; do
   fi
 done
 
+# 5. Built-in component tag: stable v-shaped + local build tag in lockstep. The
+# built-in ComponentDefinitions use components.tag as a STABLE version, which the
+# reconciler requires to match ^v\d+\.\d+\.\d+$; and the Makefile COMPONENT_TAG
+# (what build-components-local tags local images) must equal it, or deploy-local /
+# upgrade-e2e built-ins resolve to an image that was never built. (appVersion sync
+# is a RELEASE-time concern — release.yml verify-tag enforces components.tag=v<tag>.)
+ct=$(yq '.components.tag' charts/datuplet-app/values.yaml)
+[[ "$ct" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || err "charts/datuplet-app components.tag=$ct is not a stable vX.Y.Z version (built-in ComponentDefinitions require ^v\\d+\\.\\d+\\.\\d+\$)"
+mct=$(sed -n 's/^COMPONENT_TAG *?*= *//p' Makefile | tail -1)
+[ "$ct" = "$mct" ] || err "components.tag=$ct != Makefile COMPONENT_TAG=$mct (local/e2e built-in images would not resolve)"
+
 if [ "$fail" -ne 0 ]; then echo "verify-versions: FAILED"; exit 1; fi
 echo "verify-versions: OK"
