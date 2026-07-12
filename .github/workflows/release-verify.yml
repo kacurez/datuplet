@@ -31,7 +31,7 @@ jobs:
       - name: Resolve version to verify
         id: ver
         run: |
-          set -eu
+          set -euo pipefail
           case "${{ github.event_name }}" in
             workflow_dispatch) V="${{ inputs.version }}" ;;
             workflow_run)      V="${{ github.event.workflow_run.head_branch }}" ;;  # the tag name
@@ -41,6 +41,8 @@ jobs:
             V=$(curl -fsSL "$HELM_REPO_URL/index.yaml" \
               | yq '.entries.datuplet-app[].version' | sort -V | tail -1)
           fi
+          [ -n "$V" ] && [ "$V" != "null" ] \
+            || { echo "::error::could not resolve a version to verify (empty index.yaml or yq/curl failure)"; exit 1; }
           echo "version=${V#v}" >> "$GITHUB_OUTPUT"
           echo "verifying version ${V#v}"
 

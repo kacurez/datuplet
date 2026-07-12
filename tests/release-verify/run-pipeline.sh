@@ -47,7 +47,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   echo "  status: $STATUS"
   case "$STATUS" in
     Succeeded) echo "OK: run $RUN_ID Succeeded"; exit 0 ;;
-    Failed*|Cancelled) echo "FAIL: run $RUN_ID ended $STATUS" >&2; exit 1 ;;
+    Failed*|Cancelled|Expired) echo "FAIL: run $RUN_ID ended $STATUS" >&2; exit 1 ;;
   esac
   sleep 10
 done
