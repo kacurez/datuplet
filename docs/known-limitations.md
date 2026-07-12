@@ -87,8 +87,20 @@ Lakekeeper DBs), upgrade both charts, re-run `register.sh`. See
 **`platform.fgaModelVersion` cross-chart drift.** `charts/datuplet-app/values.yaml`
 (`fgaModel.version`) and `charts/datuplet-lakekeeper/values.yaml`
 (`platform.fgaModelVersion`) must be bumped together on every FGA model upgrade. CI
-enforces DSL→version coupling within `datuplet-app` but does not enforce cross-chart
-sync. Bump both values manually.
+enforces DSL→version coupling within `datuplet-app` (the `fga-version-check` workflow)
+**and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4). Still bump both
+values together — the check fails the PR if they drift.
+
+**Upgrade support statement (0.x).** Upgrades are tested for exactly one
+hop — latest published release → next (the `upgrade-e2e` workflow).
+Skipping releases is best-effort. Upgrades are forward-only: `upgrade.sh`
+uses no `--atomic` and there is no rollback path for hook Jobs, CRD
+applies, or DB migrations — recovery is fix-and-re-run.
+
+**Snapshot before infra upgrades.** Take a CNPG backup/snapshot before
+Phase 2 (`datuplet-infra`) or Phase 4 (`datuplet-lakekeeper`) upgrades —
+CNPG backups are not configured by the charts (see above), so this is a
+manual step.
 
 ---
 
