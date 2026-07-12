@@ -17,7 +17,7 @@
     {
       "customType": "regex",
       "description": "Helper images pinned in chart values (kubectl, openfga CLI)",
-      "managerFilePatterns": ["/^charts/.+/values\\.yaml$/"],
+      "fileMatch": ["charts/.+/values\\.yaml$"],
       "matchStrings": [
         "(?:kubectl|openfgaCli):\\s*\"(?<depName>[A-Za-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)\"",
         "image:\\s*(?<depName>[A-Za-z0-9./-]+/kubectl):(?<currentValue>[A-Za-z0-9._-]+)"
