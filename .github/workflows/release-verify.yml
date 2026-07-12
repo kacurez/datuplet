@@ -91,8 +91,9 @@ jobs:
         run: |
           # Pipeline references built-in ComponentDefinitions (component:/version:
           # omitted → defaultVersion). This exercises the chart's registry CRs and
-          # will surface the §6.6 component-image gap (built-ins pinned to :v0.1.0)
-          # as an ImagePullBackOff → run failure if those tags were never published.
+          # will surface the §6.6 component-image gap (built-ins pinned to the
+          # release's components.tag) as an ImagePullBackOff → run failure if
+          # those component images were never published for this release.
           PIPELINE_NAME=release-verify envsubst '$PIPELINE_NAME' \
             < tests/release-verify/pipeline.yaml > /tmp/rv.yaml
           DATUPLET_ADMIN_EMAIL=verify@datuplet.local \
