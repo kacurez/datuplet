@@ -5,7 +5,10 @@ name: release-image
 #   1. amd64    — native build on ubuntu-latest, push by digest
 #   2. arm64    — native build on ubuntu-24.04-arm, push by digest
 #   3. manifest — needs both; stitches per-arch digests into a single
-#                 tagged multi-arch manifest list (:$VERSION, :$MINOR, :latest)
+#                 tagged multi-arch manifest list (:$VERSION, :v$VERSION,
+#                 :$MINOR, :latest — the v-prefixed tag lets stable
+#                 ComponentDefinition versions (which must be vX.Y.Z-shaped,
+#                 RFC 024 T6.3) resolve to the same image)
 #
 # Called once per image from release.yml. The parent's run-detail UI
 # shows each call as one collapsible row labeled with the image name;
@@ -161,6 +164,7 @@ jobs:
           cd /tmp/digests
           docker buildx imagetools create \
             -t "$IMG:${{ steps.meta.outputs.version }}" \
+            -t "$IMG:v${{ steps.meta.outputs.version }}" \
             -t "$IMG:${{ steps.meta.outputs.minor }}" \
             -t "$IMG:latest" \
             $(printf "${IMG}@sha256:%s " *)

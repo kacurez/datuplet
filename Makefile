@@ -375,14 +375,22 @@ all: tidy build test ## Tidy + build + test (all-in-one)
 # =============================================================================
 
 .PHONY: bump-version
-bump-version: ## Set version+appVersion in all four charts (make bump-version VERSION=0.8.0)
+bump-version: ## Set version+appVersion in all four charts + component tag (make bump-version VERSION=0.8.0)
 ifndef VERSION
 	$(error VERSION is required, e.g. make bump-version VERSION=0.8.0)
 endif
 	@for c in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do \
 	  perl -pi -e 's/^version: .*/version: $(VERSION)/; s/^appVersion: .*/appVersion: "$(VERSION)"/' charts/$$c/Chart.yaml; \
 	done
+	@# RFC 024 T6.3: keep the built-in component image tag in lockstep with the
+	@# release version (Option A) — components.tag must stay vX.Y.Z-shaped (the
+	@# ComponentDefinition stable-version CEL rule), and COMPONENT_TAG (the local
+	@# build-components-local/-e2e default) must match it so deploy-local resolves.
+	@perl -pi -e 's/^  tag: v[0-9]+\.[0-9]+\.[0-9]+$$/  tag: v$(VERSION)/' charts/datuplet-app/values.yaml
+	@perl -pi -e 's/^COMPONENT_TAG \?= v[0-9]+\.[0-9]+\.[0-9]+$$/COMPONENT_TAG ?= v$(VERSION)/' Makefile
 	@grep -H -E '^(version|appVersion):' charts/*/Chart.yaml
+	@grep -H -E '^  tag: v' charts/datuplet-app/values.yaml
+	@grep -H -E '^COMPONENT_TAG' Makefile
 
 prune-images: ## Prune unused Docker images and system volumes
 	@echo "Pruning unused Docker images..."

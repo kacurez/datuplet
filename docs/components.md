@@ -1,8 +1,10 @@
 # Built-in Components
 
-Datuplet ships six component images. Each runs as an ordinary container alongside
-the Data Gateway sidecar; the component communicates with the sidecar via gRPC and
-HTTP — it never touches S3 directly.
+Datuplet ships five published component images, plus a sixth (pandas-transform)
+that exists as a ComponentDefinition template but has no published image yet —
+see its section below. Each runs as an ordinary container alongside the Data
+Gateway sidecar; the component communicates with the sidecar via gRPC and HTTP —
+it never touches S3 directly.
 
 Image registry: `ghcr.io/kacurez/<name>:v0.1.0`
 
@@ -252,6 +254,12 @@ the component.
 ---
 
 ## pandas-transform
+
+> **Not yet shipped.** No image is published for this component (it's absent
+> from `_release-components.yml` and `docker-build-k8s`), so its
+> ComponentDefinition template is disabled by default
+> (`components.enablePandasTransform: false`, RFC 024 T6.3) until an image
+> exists.
 
 Applies a sequence of pandas operations to input data. Reads the input table as
 CSV from the Data Gateway, applies the operations in order, and writes the
