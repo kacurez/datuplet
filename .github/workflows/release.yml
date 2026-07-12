@@ -16,10 +16,30 @@ permissions:
   contents: write    # charts job: gh-pages bootstrap + chart-releaser commits
   packages: write    # image jobs (via reusable workflows): ghcr.io push
 
-env:
-  REGISTRY: ghcr.io
-
 jobs:
+  # Guards that the pushed tag matches the version/appVersion already
+  # committed in every chart's Chart.yaml — charts publish exactly as
+  # committed, no in-CI rewriting. Run `make bump-version VERSION=X.Y.Z`,
+  # commit, then tag.
+  verify-tag:
+    name: tag matches committed chart versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          fail=0
+          for c in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do
+            v=$(sed -n 's/^version: *//p' "charts/$c/Chart.yaml")
+            av=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' "charts/$c/Chart.yaml")
+            [ "$v" = "$VERSION" ]  || { echo "::error::charts/$c version=$v != tag $VERSION"; fail=1; }
+            [ "$av" = "$VERSION" ] || { echo "::error::charts/$c appVersion=$av != tag $VERSION"; fail=1; }
+          done
+          [ $fail -eq 0 ] || { echo "::error::Run 'make bump-version VERSION=$VERSION', commit, then re-tag."; exit 1; }
+
   # Service images: pipeline-api, pipeline-observer, pipeline-operator,
   # gateway, query-worker. Appears as one top-level "services" row in
   # the run-detail UI; expanding shows 15 flat entries (5 images × 3
@@ -27,6 +47,7 @@ jobs:
   # Per-image collapsible groups inside the bucket aren't possible —
   # GitHub Actions flattens nested-reusable-workflow jobs at runtime.
   services:
+    needs: verify-tag
     uses: ./.github/workflows/_release-services.yml
     secrets: inherit
 
@@ -34,6 +55,7 @@ jobs:
   # http-json-extractor, finnhub-extractor. Same UI shape as the
   # services bucket.
   components:
+    needs: verify-tag
     uses: ./.github/workflows/_release-components.yml
     secrets: inherit
 
@@ -56,64 +78,6 @@ jobs:
         uses: azure/setup-helm@v5
         with:
           version: 'v3.14.4'
-
-      - name: Resolve version tag
-        id: meta
-        run: |
-          set -eu
-          REF="${GITHUB_REF#refs/tags/}"
-          VERSION="${REF#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Pin chart image tags + versions to release tag
-        env:
-          VERSION:  ${{ steps.meta.outputs.version }}
-          REGISTRY: ${{ env.REGISTRY }}
-          OWNER:    ${{ github.repository_owner }}
-        run: |
-          set -eu
-          APP_VALUES=charts/datuplet-app/values.yaml
-          INFRA_VALUES=charts/datuplet-infra/values.yaml
-
-          # Repoint image.repository to ghcr.io/<owner>/<image>. The five
-          # image refs in datuplet-app and the one in datuplet-infra are
-          # the only "repository: datuplet/X" lines in these files, so
-          # bare-line sed is unambiguous.
-          for img in pipeline-api pipeline-operator pipeline-observer gateway query-worker; do
-            sed -i "s|repository: datuplet/${img}\$|repository: ${REGISTRY}/${OWNER}/${img}|" "$APP_VALUES"
-          done
-          sed -i "s|repository: datuplet/pipeline-api\$|repository: ${REGISTRY}/${OWNER}/pipeline-api|" "$INFRA_VALUES"
-
-          # Pin every `tag: latest` value line in both values files to the
-          # release version. The guard refuses a blanket replace if a real
-          # tag: value is non-latest — anchored to ^\s*tag: so descriptive
-          # comments (e.g. queryWorker's "# tag: image tag.") are not flagged.
-          # Note: -P (PCRE) cannot be combined with -E (ERE) in GNU grep.
-          for f in "$APP_VALUES" "$INFRA_VALUES"; do
-            if grep -qP "^[[:space:]]*tag:[[:space:]]+(?!latest$)" "$f"; then
-              echo "ERROR: $f has a non-'latest' tag line; refusing blanket replace" >&2
-              grep -nE "tag:" "$f" >&2 || true
-              exit 1
-            fi
-            sed -i "s|tag: latest|tag: ${VERSION}|g" "$f"
-          done
-
-          echo "--- pinned datuplet-app values (image block) ---"
-          sed -n '1,28p' "$APP_VALUES"
-          echo "--- pinned datuplet-infra values (image block) ---"
-          sed -n '1,10p' "$INFRA_VALUES"
-
-          # Bump every chart's Chart.yaml version + appVersion to match
-          # the release tag.
-          for chart in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do
-            sed -i -E "s|^version: .*\$|version: ${VERSION}|" "charts/${chart}/Chart.yaml"
-            sed -i -E "s|^appVersion: .*\$|appVersion: \"${VERSION}\"|" "charts/${chart}/Chart.yaml"
-          done
-          echo "--- Chart.yaml versions ---"
-          for chart in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do
-            echo "[$chart]"
-            grep -E "^version:|^appVersion:" "charts/${chart}/Chart.yaml" || true
-          done
 
       - name: Bootstrap gh-pages branch if it does not exist
         env:

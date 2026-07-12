@@ -40,6 +40,9 @@ the browser UI.
   feature branch, open a draft PR with `gh pr create --draft`, mention
   the PR number in the response. The maintainer reviews, merges, and cuts
   release tags (`v0.x.y`) — the tag triggers the release workflow.
+  Release prep: `make bump-version VERSION=X.Y.Z` → commit → tag `vX.Y.Z`
+  (the release workflow fails on tag/chart-version mismatch, and charts
+  publish exactly as committed).
 - Applies to partial-progress checkpoints too: land via PR, not direct push.
 
 ## Documentation pointers

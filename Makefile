@@ -368,6 +368,20 @@ chart-render-check: ## Diff helm template output against golden renders in chart
 # All-in-one: tidy, build, test
 all: tidy build test ## Tidy + build + test (all-in-one)
 
+# =============================================================================
+# Release
+# =============================================================================
+
+.PHONY: bump-version
+bump-version: ## Set version+appVersion in all four charts (make bump-version VERSION=0.8.0)
+ifndef VERSION
+	$(error VERSION is required, e.g. make bump-version VERSION=0.8.0)
+endif
+	@for c in datuplet-operators datuplet-infra datuplet-app datuplet-lakekeeper; do \
+	  perl -pi -e 's/^version: .*/version: $(VERSION)/; s/^appVersion: .*/appVersion: "$(VERSION)"/' charts/$$c/Chart.yaml; \
+	done
+	@grep -H -E '^(version|appVersion):' charts/*/Chart.yaml
+
 prune-images: ## Prune unused Docker images and system volumes
 	@echo "Pruning unused Docker images..."
 	docker image prune -f
