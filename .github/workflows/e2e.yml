@@ -130,6 +130,34 @@ jobs:
       # scenario at tests/e2e/scenarios/gcs-pipeline-k8s/ stays in the
       # repo as a skeleton for whichever path lands first.
 
+      - name: Dump failed-test output on failure
+        if: failure()
+        run: |
+          # The suite runs `go test -json | tee $E2E_JSON | grep pass|fail|skip`,
+          # so every `output` line — assertion errors AND the framework's
+          # on-failure gateway/component log dump (scenario.go) — is stripped
+          # from the step's stdout. Replay the full output of each failed test
+          # from the JSON so the commit-path evidence is visible in CI. This is
+          # where a read-back NoSuchTable failure explains itself (did the DG
+          # commit dispatch? error? never fire?).
+          REPORT=/tmp/e2e-report.json
+          [ -f "$REPORT" ] || { echo "no $REPORT produced"; exit 0; }
+          jq -rs '
+            [ .[] | select(.Action=="fail" and .Test!=null) | .Test ] as $failed
+            | .[]
+            | select(.Action=="output" and .Test!=null
+                     and (.Test as $t | $failed | index($t)))
+            | .Output
+          ' "$REPORT" || true
+
+      - name: Upload e2e JSON report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-json
+          path: /tmp/e2e-report.json
+          if-no-files-found: ignore
+
       - name: Dump pod state on failure
         if: failure()
         run: |
