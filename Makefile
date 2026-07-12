@@ -88,6 +88,10 @@ build-component-data-generator: ## Build data-generator component image
 # DATUPLET_RUNTIME_PULL_POLICY, wired from image.pullPolicy), so a local tag is
 # all K8s needs. Skips pandas-transform (no build wired anywhere yet).
 COMPONENT_TAG ?= v0.1.0
+
+# Namespace for the k8s-* developer-loop targets (deploy-local installs
+# into `datuplet`; override for e2e clusters: make k8s-reload-crds K8S_NS=datuplet-e2e).
+K8S_NS ?= datuplet
 build-components-local: build-components ## Build + tag built-in component images as datuplet/<name>:$(COMPONENT_TAG) for deploy-local
 	for c in data-generator sql-transform stdout-writer http-json-extractor finnhub-extractor; do \
 	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
@@ -121,7 +125,7 @@ k8s-smoke: ## Smoke the OrbStack cluster via NodePort 30081 (health + OIDC probe
 	@echo "=== k8s-smoke: probing NodePort :30081 ==="
 	@if ! curl -fsS http://localhost:30081/healthz >/dev/null 2>&1; then \
 		echo "ERROR: pipeline-api not reachable at http://localhost:30081"; \
-		echo "  Run 'make k8s-up' first."; \
+		echo "  Run 'make deploy-local' first."; \
 		exit 1; \
 	fi
 	@echo "  /healthz: OK"
@@ -286,26 +290,15 @@ undeploy-local: ## Helm uninstall all 4 charts + delete datuplet namespace
 # K8s (cluster ops — OrbStack only)
 # =============================================================================
 
-# Reload CRDs into cluster (apply updated CRD manifests).
-# RFC 007 Slice 8: TableCommit CRD deleted — only Pipeline + PipelineRun remain.
-k8s-reload-crds: ## Apply updated CRD manifests to cluster
-	@echo "Reloading CRDs..."
-	kubectl apply -f utils/deploy/k8s/crds/datuplet.io_pipelines.yaml
-	kubectl apply -f utils/deploy/k8s/crds/datuplet.io_pipelineruns.yaml
+k8s-reload-crds: ## Apply the chart's CRD manifests to the cluster
+	@echo "Reloading CRDs from charts/datuplet-app/crds/ ..."
+	kubectl apply --server-side --force-conflicts \
+	  --field-manager=datuplet-dev -f charts/datuplet-app/crds/
 	@echo "CRDs reloaded successfully"
 
-# Rebuild operators: build images, apply CRDs & manifests, wait for rollout.
-# OrbStack shares the host Docker daemon with its K8s node so no image load step is needed.
-k8s-rebuild-operators: docker-build-operators ## Rebuild operator image + apply CRDs/RBAC + rollout restart
-	@echo "Applying CRDs..."
-	kubectl apply -f utils/deploy/k8s/crds/
-	@echo "Applying RBAC..."
-	kubectl apply -f utils/deploy/k8s/rbac/
-	@echo "Applying operator deployments..."
-	kubectl apply -f utils/deploy/k8s/operators.yaml
-	kubectl rollout restart deployment/pipeline-operator -n datuplet-e2e
-	@echo "Waiting for operators to be ready..."
-	kubectl rollout status deployment/pipeline-operator -n datuplet-e2e --timeout=60s
+k8s-rebuild-operators: docker-build-operators k8s-reload-crds ## Rebuild operator image + reload CRDs + rollout restart
+	kubectl rollout restart deployment/pipeline-operator -n $(K8S_NS)
+	kubectl rollout status deployment/pipeline-operator -n $(K8S_NS) --timeout=60s
 	@echo "Operators rebuilt and ready!"
 
 k8s-rebuild-services: build-gateway ## Rebuild the gateway image
