@@ -1940,7 +1940,13 @@ maybe_pf() {
 }
 ```
 
-  `cleanup()` must also kill the supervisors' children — and **reap the child BEFORE the parent** (killing the supervisor first orphans its `kubectl port-forward` child to PID 1 on Linux, which survives — defeating the point). Change the `kill "$pid"` line to `[ -n "${pid:-}" ] && pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null || true` (pkill children first, then kill the parent).
+  `cleanup()` must also kill the supervisors' children — **reap the child BEFORE the parent** (killing the supervisor first orphans its `kubectl port-forward` child to PID 1 on Linux), and make BOTH kills best-effort so `set -e` doesn't abort the trap mid-loop when one finds nothing. Use an if-block:
+  ```bash
+  if [ -n "${pid:-}" ]; then
+      pkill -P "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+  fi
+  ```
 
 - [ ] **Step 2: JSON stream.** Change the final `go test` invocation to emit both human and machine output when `E2E_JSON` is set:
 

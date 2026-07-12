@@ -30,7 +30,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 declare -a PF_PIDS=()
 cleanup() {
 	for pid in "${PF_PIDS[@]:-}"; do
-		[ -n "${pid:-}" ] && pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null || true
+		# Reap the supervisor's child (the real kubectl port-forward) BEFORE the
+		# supervisor, so it isn't orphaned to PID 1. Both best-effort: under
+		# `set -e`, a pkill/kill that finds nothing returns non-zero and would
+		# otherwise abort the trap mid-loop, leaking the remaining forwards.
+		if [ -n "${pid:-}" ]; then
+			pkill -P "$pid" 2>/dev/null || true
+			kill "$pid" 2>/dev/null || true
+		fi
 	done
 }
 trap cleanup EXIT INT TERM
