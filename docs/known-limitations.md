@@ -95,7 +95,9 @@ values together — the check fails the PR if they drift.
 hop — latest published release → next (the `upgrade-e2e` workflow).
 Skipping releases is best-effort. Upgrades are forward-only: `upgrade.sh`
 uses no `--atomic` and there is no rollback path for hook Jobs, CRD
-applies, or DB migrations — recovery is fix-and-re-run.
+applies, or DB migrations — recovery is fix-and-re-run. See
+[docs/dependency-upgrades.md](dependency-upgrades.md) for the per-dependency
+upgrade checklist.
 
 **Snapshot before infra upgrades.** Take a CNPG backup/snapshot before
 Phase 2 (`datuplet-infra`) or Phase 4 (`datuplet-lakekeeper`) upgrades —

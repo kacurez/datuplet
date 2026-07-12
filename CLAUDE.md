@@ -56,6 +56,7 @@ the browser UI.
   [docs/warehouse-setup.md](docs/warehouse-setup.md).
 - Upgrade discipline: [docs/postgres-migrations.md](docs/postgres-migrations.md),
   [docs/fga-model-upgrades.md](docs/fga-model-upgrades.md).
+- Dependency bumps: [docs/dependency-upgrades.md](docs/dependency-upgrades.md).
 - Honesty list: [docs/known-limitations.md](docs/known-limitations.md).
 - Proto definitions: `api/proto/`; main service is
   `api/proto/gateway/v2/gateway.proto`. Generated Go is checked in alongside.
