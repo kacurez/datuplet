@@ -134,10 +134,21 @@ jobs:
         if: failure()
         run: |
           echo "=== nodes ===" && kubectl get nodes -o wide || true
-          echo "=== pods ===" && kubectl -n datuplet-e2e get pods -o wide || true
-          for pod in $(kubectl -n datuplet-e2e get pods -o name 2>/dev/null); do
-            echo "=== describe $pod ==="
-            kubectl -n datuplet-e2e describe "$pod" || true
-            echo "=== logs $pod (all containers, last 200 lines) ==="
-            kubectl -n datuplet-e2e logs "$pod" --all-containers=true --tail=200 || true
+          # Sweep every Datuplet namespace, not just datuplet-e2e: PipelineRuns
+          # land in per-project namespaces (datuplet-<uuid>), so the gateway
+          # sidecar + component pods — where a failed commit shows up — live
+          # there, not in the install namespace. Per-scenario cleanup deletes
+          # those pods, so this backstop mostly catches infra-level failures
+          # (openfga/lakekeeper/pg not coming up); the surviving run-level
+          # evidence comes from the framework's on-failure log dump.
+          for ns in $(kubectl get ns -o name 2>/dev/null | sed 's|namespace/||' | grep -E '^datuplet'); do
+            echo "############ namespace: $ns ############"
+            echo "=== pods ===" && kubectl -n "$ns" get pods -o wide || true
+            echo "=== events ===" && kubectl -n "$ns" get events --sort-by=.lastTimestamp | tail -40 || true
+            for pod in $(kubectl -n "$ns" get pods -o name 2>/dev/null); do
+              echo "=== describe $pod ==="
+              kubectl -n "$ns" describe "$pod" || true
+              echo "=== logs $pod (all containers, last 200 lines) ==="
+              kubectl -n "$ns" logs "$pod" --all-containers=true --tail=200 || true
+            done
           done
