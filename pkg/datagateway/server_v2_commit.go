@@ -89,6 +89,9 @@ func (s *ServerV2) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Commi
 		default:
 			tcr.Status = pb.TableCommitResult_STATUS_COMMITTED
 			tcr.FilesAdded = int32(r.DataFilesAdded)
+			if ws, ok := expected[r.WriterID]; ok {
+				tcr.RowsAdded = writerRowsWritten(ws)
+			}
 		}
 		bucketTables[r.Namespace] = append(bucketTables[r.Namespace], tcr)
 	}
@@ -113,7 +116,8 @@ func (s *ServerV2) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Commi
 			// iceberg commit happens, which is expected in test mode.
 			bucketTables[ws.bucket] = append(bucketTables[ws.bucket], &pb.TableCommitResult{
 				Table: ws.table, Bucket: ws.bucket,
-				Status: pb.TableCommitResult_STATUS_COMMITTED,
+				Status:    pb.TableCommitResult_STATUS_COMMITTED,
+				RowsAdded: writerRowsWritten(ws),
 			})
 		default:
 			// Pool is live but this writer has no result — should not happen.
@@ -162,6 +166,32 @@ func writerProducedFiles(ws *writerState) bool {
 	default:
 		return len(ws.externalFiles) > 0
 	}
+}
+
+// writerRowsWritten sums the row counts across every parquet file the writer
+// produced — the number of rows the commit actually persisted. Mirrors the
+// three file sources finalizeAndDispatch commits from (partition → external →
+// buffer). Reporting-only: surfaced as TableCommitResult.RowsAdded so the
+// gateway log and component status message read honestly. The iceberg commit
+// itself works by file path and never sees a row count, which is why RowsAdded
+// otherwise defaulted to 0.
+func writerRowsWritten(ws *writerState) int64 {
+	var rows int64
+	switch {
+	case ws.partitionRouter != nil:
+		for _, pf := range ws.partitionRouter.FilesWritten() {
+			rows += pf.FileInfo.RowCount
+		}
+	case len(ws.externalFiles) > 0:
+		for _, f := range ws.externalFiles {
+			rows += f.RowCount
+		}
+	case ws.bufferMgr != nil:
+		for _, f := range ws.bufferMgr.FilesWritten() {
+			rows += f.RowCount
+		}
+	}
+	return rows
 }
 
 // writeSchemaAndManifest writes the _schema.json and _manifest.json files for a writer.

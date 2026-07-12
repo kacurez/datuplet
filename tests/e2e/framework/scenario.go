@@ -229,6 +229,24 @@ func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir strin
 		}
 	}
 
+	// On assertion failure, dump the run's gateway + component logs. A run
+	// can reach Succeeded (component exit 0) yet leave nothing committed —
+	// e.g. the Data Gateway's inline commit never lands the table, so a
+	// read-back assertion fails with lakekeeper NoSuchTable. RunPipeline
+	// captured those logs into lastResult.Logs at Succeeded, *before* the
+	// deferred kb.Cleanup deletes the per-project pods; the
+	// end-of-job workflow dump runs after that cleanup and finds nothing, so
+	// this is the only place the commit-path evidence survives. Registered
+	// after the run loop so it does not double-dump run failures (those
+	// already print logs via t.Fatalf above); as a defer (LIFO before
+	// Cleanup) it still fires when an assertion calls t.Fatalf.
+	defer func() {
+		if t.Failed() && lastResult != nil {
+			t.Logf("run diagnostics (run_id=%s, namespace=%s) — gateway + component logs captured at Succeeded:\n%s",
+				lastResult.RunID, kb.Namespace, lastResult.Logs)
+		}
+	}()
+
 	// Run assertions.
 	for _, a := range sc.Assertions {
 		bucket := strings.ReplaceAll(a.Bucket, "{{.RunPrefix}}", runPrefix)

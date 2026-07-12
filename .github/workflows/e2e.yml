@@ -99,6 +99,23 @@ jobs:
           docker builder prune --all --force || true
           df -h /
 
+      - name: Install DuckDB CLI
+        run: |
+          set -euo pipefail
+          # The e2e assertion helpers (tests/e2e/framework/assertions.go) shell
+          # out to a `duckdb` CLI to verify committed Iceberg tables. It isn't
+          # preinstalled on the runner, so every data assertion fails with
+          # `exec: "duckdb": executable file not found in $PATH`. This went
+          # unnoticed because the K8s scenarios silently SKIPped in CI until
+          # RFC 024 Phase 7 (E2E_REQUIRE=1) forced them to run. Pin the version
+          # dev machines use so CI and local behave identically; the prelude
+          # INSTALLs httpfs+iceberg at query time (the runner has network).
+          DUCKDB_VERSION=v1.4.1
+          curl -fsSL -o /tmp/duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          duckdb --version
+
       - name: Run e2e (deploy + test + teardown)
         env:
           E2E_JSON: /tmp/e2e-report.json
@@ -130,14 +147,53 @@ jobs:
       # scenario at tests/e2e/scenarios/gcs-pipeline-k8s/ stays in the
       # repo as a skeleton for whichever path lands first.
 
+      - name: Dump failed-test output on failure
+        if: failure()
+        run: |
+          # The suite runs `go test -json | tee $E2E_JSON | grep pass|fail|skip`,
+          # so every `output` line — assertion errors AND the framework's
+          # on-failure gateway/component log dump (scenario.go) — is stripped
+          # from the step's stdout. Replay the full output of each failed test
+          # from the JSON so the commit-path evidence is visible in CI. This is
+          # where a read-back NoSuchTable failure explains itself (did the DG
+          # commit dispatch? error? never fire?).
+          REPORT=/tmp/e2e-report.json
+          [ -f "$REPORT" ] || { echo "no $REPORT produced"; exit 0; }
+          jq -rs '
+            [ .[] | select(.Action=="fail" and .Test!=null) | .Test ] as $failed
+            | .[]
+            | select(.Action=="output" and .Test!=null
+                     and (.Test as $t | $failed | index($t)))
+            | .Output
+          ' "$REPORT" || true
+
+      - name: Upload e2e JSON report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-json
+          path: /tmp/e2e-report.json
+          if-no-files-found: ignore
+
       - name: Dump pod state on failure
         if: failure()
         run: |
           echo "=== nodes ===" && kubectl get nodes -o wide || true
-          echo "=== pods ===" && kubectl -n datuplet-e2e get pods -o wide || true
-          for pod in $(kubectl -n datuplet-e2e get pods -o name 2>/dev/null); do
-            echo "=== describe $pod ==="
-            kubectl -n datuplet-e2e describe "$pod" || true
-            echo "=== logs $pod (all containers, last 200 lines) ==="
-            kubectl -n datuplet-e2e logs "$pod" --all-containers=true --tail=200 || true
+          # Sweep every Datuplet namespace, not just datuplet-e2e: PipelineRuns
+          # land in per-project namespaces (datuplet-<uuid>), so the gateway
+          # sidecar + component pods — where a failed commit shows up — live
+          # there, not in the install namespace. Per-scenario cleanup deletes
+          # those pods, so this backstop mostly catches infra-level failures
+          # (openfga/lakekeeper/pg not coming up); the surviving run-level
+          # evidence comes from the framework's on-failure log dump.
+          for ns in $(kubectl get ns -o name 2>/dev/null | sed 's|namespace/||' | grep -E '^datuplet'); do
+            echo "############ namespace: $ns ############"
+            echo "=== pods ===" && kubectl -n "$ns" get pods -o wide || true
+            echo "=== events ===" && kubectl -n "$ns" get events --sort-by=.lastTimestamp | tail -40 || true
+            for pod in $(kubectl -n "$ns" get pods -o name 2>/dev/null); do
+              echo "=== describe $pod ==="
+              kubectl -n "$ns" describe "$pod" || true
+              echo "=== logs $pod (all containers, last 200 lines) ==="
+              kubectl -n "$ns" logs "$pod" --all-containers=true --tail=200 || true
+            done
           done
