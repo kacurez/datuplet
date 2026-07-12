@@ -47,9 +47,13 @@ git clone https://github.com/kacurez/datuplet
 cd datuplet
 ```
 
-Once 0.1.0 is released you can also install from the Helm repo
-(`helm repo add datuplet https://kacurez.github.io/datuplet`). Until then, use
-the path-based commands below.
+You can install from the Helm repo using:
+
+```bash
+helm repo add datuplet https://kacurez.github.io/datuplet
+```
+
+Or use the path-based commands below for development:
 
 ---
 

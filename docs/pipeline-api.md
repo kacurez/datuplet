@@ -327,34 +327,25 @@ The catalog and the pipeline builder are driven by the component registry
 
 ### Full K8s bootstrap (OrbStack)
 
-**Prerequisites:** OrbStack with Kubernetes enabled (the `orbstack` kubectl context must resolve). Plain `kind` is not supported — the MinIO manifest uses a `hostPath` volume that maps through OrbStack's node to your Mac filesystem.
+**Prerequisites:** OrbStack with Kubernetes enabled (the `orbstack` kubectl context must resolve). `make deploy-local` builds images straight into OrbStack's Docker daemon (no registry push) and installs the charts with `image.pullPolicy=IfNotPresent`; plain `kind` isn't supported unless you separately `kind load docker-image` every built image. MinIO's data now lives on a chart-managed PVC (`charts/datuplet-infra` `minio.persistence`, default 5Gi) rather than a host-path mount — it does not survive `make undeploy-local`.
 
 ```bash
-# Optional: point the data lake at any absolute path on your Mac.
-# Defaults to $PROJECT_ROOT/tmp/minio-data. Survives undeploy.
-export DATUPLET_DATA_HOST_PATH=/Users/you/datuplet-data
-
 make deploy-local
 ```
 
-What the script does:
+What it does (see the `deploy-local` / `deploy-local-helm` Makefile targets):
 
-1. Builds every Docker image.
-2. Creates the `datuplet` namespace, CRDs, and RBAC; brings up the `lakekeeper` namespace + Deployment.
-3. Applies `minio.yaml` with `$DATUPLET_DATA_HOST_PATH` substituted into the `hostPath:` volume.
-4. Applies `postgres.yaml` (StatefulSet + 500Mi PVC + `pipeline-api-db` Secret).
-5. Generates an RS256 signing key if the `pipeline-api-signing-key` Secret doesn't exist.
-6. Applies `pipeline-api.yaml` (sets `PIPELINE_API_PUBLIC_URL`, `DATUPLET_OPENFGA_URL`, `DATUPLET_LAKEKEEPER_URL`, `SIGNING_KEY_FILE`).
-7. Applies operator deployments.
-8. Runs `pipeline-api admin lakekeeper-bootstrap` via `kubectl exec` to create the lakekeeper warehouse.
+1. Builds every service image and tags the built-in component images as `datuplet/<name>:latest` (`docker-build-k8s` + `build-components-local`).
+2. Helm-installs the four charts in phase order, each waited on before the next: `datuplet-operators` (CRDs, RBAC, the CNPG operator), `datuplet-infra` (Postgres cluster, OpenFGA, MinIO), `datuplet-app` (pipeline-api, pipeline-operator, pipeline-observer — with `image.pullPolicy=IfNotPresent` and `components.registry=datuplet` so the built-in ComponentDefinitions point at the locally-built images), then `datuplet-lakekeeper`.
+3. Runs `./scripts/register.sh --namespace datuplet`, which `kubectl exec`s into the `pipeline-api` Pod and runs five idempotent `pipeline-api admin` steps: `lakekeeper-bootstrap` (creates the warehouse + server-admin FGA tuple), `create-user` (default admin `admin@datuplet.local` / `changeme`), `create-project` (default project `default`), `attach-warehouse`, and `grant --role admin`.
 
-Seed the first user + project:
+`register.sh` already seeds a default admin user + project (printed at the end of its output). To create an additional user/project instead:
 
 ```bash
 kubectl -n datuplet exec deploy/pipeline-api -- pipeline-api admin create-user \
   --email you@example.com --password 'CHANGEME'
 kubectl -n datuplet exec deploy/pipeline-api -- pipeline-api admin create-project \
-  --name demo
+  --name demo --creator-email you@example.com
 kubectl -n datuplet exec deploy/pipeline-api -- pipeline-api admin grant \
   --user you@example.com --project demo --role admin
 ```
@@ -363,9 +354,7 @@ Open `http://localhost:30081/ui/` and log in.
 
 ### Undeploy / redeploy
 
-`make undeploy-local` wipes the K8s objects but **leaves** the Postgres PVC, the signing-key Secret, the `datuplet` namespace, and the MinIO host-path directory. Re-running `make deploy-local` with the same `DATUPLET_DATA_HOST_PATH` brings everything back with the previous data lake and user history intact.
-
-`./undeploy-local.sh --delete-namespace` additionally drops namespace + CRDs + PVC but never touches the host data directory. `rm -rf $DATUPLET_DATA_HOST_PATH` is the only way to wipe the data lake.
+`make undeploy-local` helm-uninstalls all four charts, removes the cluster-scoped ComponentDefinitions, and deletes the `datuplet` namespace — taking the MinIO and Postgres PVCs, the signing-key Secret, and the CRD instances with it. It is a full teardown: the object store and database are wiped, so a subsequent `make deploy-local` starts from an empty data lake.
 
 ## Components endpoints
 

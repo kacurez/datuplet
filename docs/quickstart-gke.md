@@ -271,8 +271,7 @@ Open `http://localhost:8080/ui/` and log in with the admin credentials from step
 
 ## 7. Trigger a pipeline
 
-Apply the example pipeline (update the image tag to `ghcr.io/kacurez/*:v0.1.0`
-once 0.1.0 is released):
+Apply the example pipeline:
 
 ```bash
 kubectl apply -f examples/pipelines/simple-http-extract.yaml

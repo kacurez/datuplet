@@ -17,14 +17,16 @@ the previous.
 
 ## Helm repo
 
-Once 0.1.0 is released, install from the public repo:
+Datuplet charts are published to the public helm repo on every release tag:
 
 ```bash
 helm repo add datuplet https://kacurez.github.io/datuplet
 helm repo update
 ```
 
-Until then, install from a local clone using the path-based commands below.
+The commands below install from a local clone (development default). To
+install a published version instead, replace `charts/<name>` with
+`datuplet/<name> --version <X.Y.Z>` in each command.
 
 ## Credential model
 
@@ -59,7 +61,7 @@ Jobs.
 - `kubectl` configured to the target cluster.
 - Network access to: `https://cloudnative-pg.github.io/charts`,
   `https://lakekeeper.github.io/lakekeeper-charts`, `https://openfga.github.io/helm-charts`,
-  `https://charts.bitnami.com/bitnami` (MinIO subchart).
+  `https://charts.min.io/` (MinIO subchart).
 
 ## Install
 
@@ -154,8 +156,7 @@ make deploy-local    # runs all 4 helm upgrade --installs + register.sh (namespa
 ```
 
 The `make deploy-local` target is the canonical local workflow. It runs
-`make deploy-local-helm` (sequential helm upgrades with values overrides from
-`tests/local/values-*.yaml`) followed by `scripts/register.sh`.
+the four helm upgrades in phase order followed by `scripts/register.sh`.
 
 ## Service URLs (OrbStack)
 
