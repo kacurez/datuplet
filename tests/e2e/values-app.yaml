@@ -16,6 +16,12 @@ image:
   pipelineOperator:
     repository: datuplet/pipeline-operator
     tag: latest
+  pipelineObserver:
+    repository: datuplet/pipeline-observer
+    tag: latest
+  gateway:
+    repository: datuplet/gateway
+    tag: latest
 
 # RFC 022 Task 2.7: enable the query-worker for e2e query scenarios.
 #

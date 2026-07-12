@@ -14,3 +14,8 @@ minio:
   rootPassword: minioadmin
   persistence:
     size: 1Gi
+
+# Post-RFC-024-W2 the chart default is ghcr.io/kacurez/pipeline-api:<appVersion>;
+# e2e runs the locally built image (kind-loaded).
+image:
+  pipelineApi: {repository: datuplet/pipeline-api, tag: latest}
