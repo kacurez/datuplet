@@ -649,8 +649,8 @@ fga_sync_warn() {
   # app-only upgrade, warn when the deployed lakekeeper FGA pin differs.
   command -v jq >/dev/null 2>&1 || { echo "note: jq not found — skipping FGA cross-chart check"; return 0; }
   local a b
-  a=$(helm get values -n "$NAMESPACE" datuplet-app -a -o json 2>/dev/null | jq -r '.fgaModel.version // empty')
-  b=$(helm get values -n "$NAMESPACE" datuplet-lakekeeper -a -o json 2>/dev/null | jq -r '.platform.fgaModelVersion // empty')
+  a=$(helm get values -n "$NAMESPACE" datuplet-app -a -o json 2>/dev/null | jq -r '.fgaModel.version // empty' || true)
+  b=$(helm get values -n "$NAMESPACE" datuplet-lakekeeper -a -o json 2>/dev/null | jq -r '.platform.fgaModelVersion // empty' || true)
   if [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]; then
     echo "WARNING: fgaModel.version=$a (datuplet-app) != platform.fgaModelVersion=$b (datuplet-lakekeeper)." >&2
     echo "         Upgrade datuplet-lakekeeper too — see docs/fga-model-upgrades.md." >&2
