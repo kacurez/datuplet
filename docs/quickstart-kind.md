@@ -95,12 +95,11 @@ five built-ins above, including `http-json-extractor` used by the example, work 
 
 `tests/local/values-local-app.yaml` sets `image.pullPolicy=IfNotPresent` (so
 kubelet uses the kind-loaded image instead of trying to pull a non-existent
-`datuplet/*:latest` from Docker Hub — the chart default is
-`pullPolicy=Always`, correct for production's pinned registry tags but wrong
-here) and `components.registry=datuplet` (so the built-in ComponentDefinitions
-point at the images just loaded, not `ghcr.io`). `install.sh` runs preflight
-checks, the four helm phases in order, and finally `scripts/register.sh` —
-see [docs/install.md](install.md) for the full command reference.
+`datuplet/*:latest` from Docker Hub) and `components.registry=datuplet` (so the
+built-in ComponentDefinitions point at the images just loaded, not `ghcr.io`).
+`install.sh` runs preflight checks, the four helm phases in order, and finally
+`scripts/register.sh` — see [docs/install.md](install.md) for the full command
+reference.
 
 Phase 2 provisions CNPG Postgres (30–60 s on first install), so the timeout is
 intentionally generous. If it times out, check:

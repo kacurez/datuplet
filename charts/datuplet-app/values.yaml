@@ -21,7 +21,10 @@ runtimeDefaults:
 # tag "" resolves to the chart appVersion; local dev overrides via
 # tests/local/values-local-app.yaml.
 image:
-  pullPolicy: Always
+  # IfNotPresent is safe: image tags are pinned (default = chart appVersion).
+  # Local dev with :latest overrides keeps working because the local image is
+  # already present.
+  pullPolicy: IfNotPresent
   pullSecrets: []
   pipelineApi:
     repository: ghcr.io/kacurez/pipeline-api
