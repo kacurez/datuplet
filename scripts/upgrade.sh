@@ -66,6 +66,13 @@ if [ "$MODE" = from-repo ]; then
   [ -n "$VERSION" ] || die "--from-repo requires --version"
   run helm repo add datuplet "$HELM_REPO_URL" --force-update
   run helm repo update datuplet
+else
+  # helm dependency build (unlike update) requires each dependency repo to be
+  # registered locally first; do this once, up front, before any chart's build.
+  run helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+  run helm repo add openfga https://openfga.github.io/helm-charts
+  run helm repo add minio https://charts.min.io/
+  run helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
 fi
 
 apply_crds() {  # $1 = chart that ships a crds/ dir

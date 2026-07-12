@@ -183,7 +183,7 @@ OFGA_URL=http://openfga.datuplet.svc.cluster.local:8080
 # 1. Admin user
 kubectl exec -n datuplet "${POD}" -- \
   /usr/local/bin/pipeline-api admin create-user \
-    --email=admin@example.com --password=<strong-password>
+    --email=admin@example.com --password='replace-with-a-strong-password'
 
 # 2. Project (allocates a fresh lakekeeper project ID)
 kubectl exec -n datuplet "${POD}" -- \

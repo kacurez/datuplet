@@ -416,11 +416,17 @@ preflight() {
   [ "${minor:-0}" -ge 28 ] || die "Kubernetes >= 1.28 required (server minor: ${minor:-unknown})"
   kubectl get storageclass -o name 2>/dev/null | grep -q . \
     || die "no StorageClass in the cluster (CNPG Postgres + MinIO need PVCs)"
+  kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null | grep -qx true \
+    || echo "WARNING: no default StorageClass; CNPG Postgres + MinIO PVCs will stay Pending unless you set storageClass via -f values" >&2
   if [ "$MODE" = from-repo ]; then
     [ -n "$VERSION" ] || die "--from-repo requires --version"
     curl -fsS "$HELM_REPO_URL/index.yaml" >/dev/null \
       || die "helm repo unreachable: $HELM_REPO_URL"
   else
+    run helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+    run helm repo add openfga https://openfga.github.io/helm-charts
+    run helm repo add minio https://charts.min.io/
+    run helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
     for c in $CHARTS; do
       run helm dependency build "$REPO_ROOT/charts/$c" \
         || die "helm dependency build failed for $c (Chart.lock drift?)"
@@ -431,7 +437,7 @@ preflight() {
     st=$(helm status -n "$NAMESPACE" "$c" -o json 2>/dev/null \
       | sed -n 's/.*"status":"\([^"]*\)".*/\1/p' | head -1) || true
     case "${st:-}" in
-      pending-*|failed)
+      pending-*|failed|uninstalling)
         die "release $c is '$st' — resolve first (helm rollback/uninstall $c -n $NAMESPACE)" ;;
     esac
   done
@@ -480,7 +486,7 @@ apply_crds() {
     run kubectl apply --server-side --force-conflicts \
       --field-manager=datuplet-install -f "$REPO_ROOT/charts/$chart/crds/"
   elif $DRY_RUN; then
-    echo "+ helm show crds datuplet/$chart --version $VERSION | kubectl apply --server-side -f -"
+    echo "+ helm show crds datuplet/$chart --version $VERSION | kubectl apply --server-side --force-conflicts --field-manager=datuplet-install -f -"
   else
     helm show crds "datuplet/$chart" --version "$VERSION" \
       | kubectl apply --server-side --force-conflicts --field-manager=datuplet-install -f -
@@ -602,6 +608,13 @@ if [ "$MODE" = from-repo ]; then
   [ -n "$VERSION" ] || die "--from-repo requires --version"
   run helm repo add datuplet "$HELM_REPO_URL" --force-update
   run helm repo update datuplet
+else
+  # helm dependency build (unlike update) requires each dependency repo to be
+  # registered locally first; do this once, up front, before any chart's build.
+  run helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+  run helm repo add openfga https://openfga.github.io/helm-charts
+  run helm repo add minio https://charts.min.io/
+  run helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
 fi
 
 apply_crds() {  # $1 = chart that ships a crds/ dir
