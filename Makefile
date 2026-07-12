@@ -174,10 +174,6 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	helm repo add openfga https://openfga.github.io/helm-charts >/dev/null 2>&1 || true
 	helm repo add minio https://charts.min.io/ >/dev/null 2>&1 || true
 	helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts >/dev/null 2>&1 || true
-	helm dependency build charts/datuplet-operators
-	helm dependency build charts/datuplet-infra
-	helm dependency build charts/datuplet-app
-	helm dependency build charts/datuplet-lakekeeper
 	# Refresh the Datuplet CRDs up front. Helm installs CRDs from a chart's
 	# crds/ dir only on FIRST install and never upgrades them (nor removes
 	# them on uninstall), so on a reused cluster (the OrbStack dev loop) a
@@ -186,29 +182,18 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	# the schema in place; a no-op on a fresh cluster the first helm install
 	# would populate anyway.
 	kubectl apply -f charts/datuplet-app/crds/
-	# Five-phase install: operators → infra → app → lakekeeper → register.
-	# Sequential, each --wait --wait-for-jobs. Phases 2-4 are strict order:
+	# Five-phase install (operators → infra → app → lakekeeper → register),
+	# driven by the RFC 024 W1 single tested install entrypoint below.
+	# Phases 2-4 are strict order:
 	#   - infra owns CNPG + OpenFGA + MinIO + keygen (no Datuplet code)
 	#   - app owns pipeline-api/observer/operator + authz-bootstrap (writes FGA pin)
 	#   - lakekeeper installs after app finishes (its wait-for-fga-pin pre-install
 	#     Job polls the pin tuple authz-bootstrap wrote)
-	helm upgrade --install datuplet-operators charts/datuplet-operators \
-	  -n datuplet-e2e --create-namespace \
-	  -f tests/e2e/values-operators.yaml \
-	  --wait --timeout 5m
-	helm upgrade --install datuplet-infra charts/datuplet-infra \
-	  -n datuplet-e2e \
-	  -f tests/e2e/values-infra.yaml \
-	  --wait --wait-for-jobs --timeout 10m
-	helm upgrade --install datuplet-app charts/datuplet-app \
-	  -n datuplet-e2e \
-	  -f tests/e2e/values-app.yaml \
-	  --wait --wait-for-jobs --timeout 10m
-	helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-	  -n datuplet-e2e \
-	  -f tests/e2e/values-lakekeeper.yaml \
-	  --wait --wait-for-jobs --timeout 10m
-	./scripts/register.sh --namespace datuplet-e2e
+	./scripts/install.sh --namespace datuplet-e2e --from-source \
+	  -f-operators tests/e2e/values-operators.yaml \
+	  -f-infra tests/e2e/values-infra.yaml \
+	  -f-app tests/e2e/values-app.yaml \
+	  -f-lakekeeper tests/e2e/values-lakekeeper.yaml
 	# Hermetic in-cluster HTTP fixture (RFC 024 W7 T7.4) — replaces the
 	# external jsonplaceholder.typicode.com dependency so the e2e data path
 	# has zero outbound network. nginx serves the committed posts.json /
@@ -251,35 +236,12 @@ deploy-local: docker-build-k8s build-components-local deploy-local-helm ## Build
 # Helm-only deploy — skips image rebuild. Use this when images already exist
 # in the local Docker daemon (OrbStack shares its image cache with K8s, so
 # `make docker-build-k8s` once is enough; iterate on charts via this target).
-deploy-local-helm: ## Helm install all 4 charts + register.sh (no docker build)
-	# `helm dependency build` (unlike `update`) requires each dependency's
-	# repo to be locally registered — it won't auto-fetch "unmanaged" repos.
-	helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts >/dev/null 2>&1 || true
-	helm repo add openfga https://openfga.github.io/helm-charts >/dev/null 2>&1 || true
-	helm repo add minio https://charts.min.io/ >/dev/null 2>&1 || true
-	helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts >/dev/null 2>&1 || true
-	helm dependency build charts/datuplet-operators
-	helm dependency build charts/datuplet-infra
-	helm dependency build charts/datuplet-app
-	helm dependency build charts/datuplet-lakekeeper
-	# RFC 015 5-phase install — see e2e-k8s target for ordering rationale.
-	helm upgrade --install datuplet-operators charts/datuplet-operators \
-	  -n datuplet --create-namespace --wait --timeout 5m
-	helm upgrade --install datuplet-infra charts/datuplet-infra \
-	  -n datuplet --wait --wait-for-jobs --timeout 10m
-	# image.pullPolicy=IfNotPresent: local `datuplet/*` images live only in the
-	# OrbStack Docker daemon (no registry) — the chart default `Always` would
-	# fail every pull. components.registry=datuplet: point the built-in
-	# ComponentDefinition CRs at the locally-built+tagged component images
-	# (see build-components-local) instead of the production ghcr.io/kacurez.
-	helm upgrade --install datuplet-app charts/datuplet-app \
-	  -n datuplet \
-	  --set image.pullPolicy=IfNotPresent \
-	  --set components.registry=datuplet \
-	  --wait --wait-for-jobs --timeout 10m
-	helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-	  -n datuplet --wait --wait-for-jobs --timeout 10m
-	./scripts/register.sh --namespace datuplet
+# Drives scripts/install.sh (RFC 024 W1) — the single tested install path;
+# tests/local/values-local-app.yaml carries the local-dev image overrides
+# (pullPolicy + components.registry) that used to be --set flags here.
+deploy-local-helm: ## Install/upgrade all 4 charts + register.sh via scripts/install.sh (no docker build)
+	./scripts/install.sh --namespace datuplet --from-source \
+	  -f-app tests/local/values-local-app.yaml
 
 # Symmetric tear-down for deploy-local-helm. Uninstalls in reverse install
 # order (lakekeeper → app → infra → operators) so dependents are gone
