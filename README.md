@@ -21,7 +21,7 @@ versions. GKE is the only validated cloud target for 0.1.
 
 ```bash
 # 1. Create a kind cluster
-kind create cluster --config - <<'EOF'
+kind create cluster --name datuplet --config - <<'EOF'
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -32,25 +32,28 @@ nodes:
         protocol: TCP
 EOF
 
-# 2. Clone + install the four Helm charts
+# 2. Clone the repo
 git clone https://github.com/kacurez/datuplet && cd datuplet
-helm dependency update charts/datuplet-operators
-helm dependency update charts/datuplet-infra
-helm dependency update charts/datuplet-app
-helm dependency update charts/datuplet-lakekeeper
-helm upgrade --install datuplet-operators charts/datuplet-operators -n datuplet --create-namespace --wait --timeout 5m
-helm upgrade --install datuplet-infra      charts/datuplet-infra      -n datuplet --wait --wait-for-jobs --timeout 10m
-helm upgrade --install datuplet-app        charts/datuplet-app        -n datuplet --wait --wait-for-jobs --timeout 10m
-helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper -n datuplet --wait --wait-for-jobs --timeout 10m
 
-# 3. Bootstrap warehouse + admin user
-./scripts/register.sh --namespace datuplet
+# 3. Build images and load them into kind (kind doesn't share the host
+#    Docker daemon, unlike OrbStack, so images must be loaded explicitly)
+make docker-build-k8s build-components-local
+for img in \
+  datuplet/pipeline-api:latest datuplet/pipeline-observer:latest \
+  datuplet/pipeline-operator:latest datuplet/gateway:latest datuplet/query-worker:latest \
+  datuplet/data-generator:v0.1.0 datuplet/sql-transform:v0.1.0 \
+  datuplet/stdout-writer:v0.1.0 datuplet/http-json-extractor:v0.1.0 \
+  datuplet/finnhub-extractor:v0.1.0 \
+; do kind load docker-image --name datuplet "$img"; done
 
-# 4. Open the UI
+# 4. Install the four charts + bootstrap warehouse/admin user (register.sh runs last)
+./scripts/install.sh --namespace datuplet -f-app tests/local/values-local-app.yaml
+
+# 5. Open the UI
 open http://localhost:8080/ui/
 # Login: admin@datuplet.local / changeme  (change these in production)
 
-# 5. Trigger a pipeline
+# 6. Trigger a pipeline
 kubectl apply -f examples/pipelines/simple-http-extract.yaml
 kubectl get pipelineruns -n datuplet -w
 ```

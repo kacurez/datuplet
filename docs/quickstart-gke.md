@@ -113,54 +113,55 @@ bootstrap, after which the file can be deleted.
 
 ## 4. Install the four Helm charts
 
-Each `helm dependency build` fetches subchart tarballs (gitignored). Run once
-per clone or after a version bump. `build` (unlike `update`) requires each
-dependency's repo to be locally registered first — it won't auto-fetch
-"unmanaged" repos.
+`install.sh` runs the four helm phases in order — preflight checks, dependency
+chart repo registration, `--wait`/`--wait-for-jobs` — described in full in
+[docs/install.md](install.md). Write the GKE-specific overrides to values
+files and pass them per chart; `--skip-register` stops after the four helm
+installs because `register.sh` only drives the S3/MinIO bootstrap flow — the
+GCS warehouse is bootstrapped manually in step 5 below.
 
 ```bash
 cd datuplet  # repo root
 
-helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
-helm repo add openfga https://openfga.github.io/helm-charts
-helm repo add minio https://charts.min.io/
-helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
+# Phase 2 — disable bundled MinIO; GCS is the warehouse.
+cat > /tmp/datuplet-gke-infra.yaml <<EOF
+minio:
+  enabled: false
+EOF
 
-helm dependency build charts/datuplet-operators
-helm dependency build charts/datuplet-infra
-helm dependency build charts/datuplet-app
-helm dependency build charts/datuplet-lakekeeper
+# Phase 3 — point the control plane at the GCS bucket.
+cat > /tmp/datuplet-gke-app.yaml <<EOF
+warehouse:
+  type: gcs
+  gcs:
+    bucket: "${GCS_BUCKET}"
+EOF
 
-# Phase 1 — CNPG operator + CRDs
-helm upgrade --install datuplet-operators charts/datuplet-operators \
-  -n datuplet --create-namespace --wait --timeout 5m
+# Phase 4, Mode A (Workload Identity) — GSA was set in step 3 above.
+cat > /tmp/datuplet-gke-lakekeeper.yaml <<EOF
+workloadIdentity:
+  enabled: true
+  gcpServiceAccount: "${GSA}"
+platform:
+  enableGcpSystemCredentials: true
+EOF
 
-# Phase 2 — stateful infra (Postgres, OpenFGA).
-# Disable bundled MinIO — GCS is the warehouse.
-helm upgrade --install datuplet-infra charts/datuplet-infra \
-  -n datuplet --wait --wait-for-jobs --timeout 10m \
-  --set minio.enabled=false
+# Mode A:
+./scripts/install.sh --namespace datuplet --skip-register \
+  -f-infra /tmp/datuplet-gke-infra.yaml \
+  -f-app /tmp/datuplet-gke-app.yaml \
+  -f-lakekeeper /tmp/datuplet-gke-lakekeeper.yaml
 
-# Phase 3 — Datuplet control plane
-helm upgrade --install datuplet-app charts/datuplet-app \
-  -n datuplet --wait --wait-for-jobs --timeout 10m \
-  --set warehouse.type=gcs \
-  --set warehouse.gcs.bucket="${GCS_BUCKET}"
-
-# Phase 4 — Lakekeeper (Mode A — Workload Identity)
-helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-  -n datuplet --wait --wait-for-jobs --timeout 10m \
-  --set workloadIdentity.enabled=true \
-  --set workloadIdentity.gcpServiceAccount="${GSA}" \
-  --set platform.enableGcpSystemCredentials=true
-
-# Phase 4 — Lakekeeper (Mode B — static key; no extra flags needed)
-# helm upgrade --install datuplet-lakekeeper charts/datuplet-lakekeeper \
-#   -n datuplet --wait --wait-for-jobs --timeout 10m
+# Mode B (static service-account key) — no lakekeeper values file needed,
+# so drop -f-lakekeeper entirely:
+./scripts/install.sh --namespace datuplet --skip-register \
+  -f-infra /tmp/datuplet-gke-infra.yaml \
+  -f-app /tmp/datuplet-gke-app.yaml
 ```
 
-Phase 2 provisions a CNPG Postgres cluster (30–60 s on first install). If it
-times out, check: `kubectl get pods -n datuplet`.
+Run **one** of the two `install.sh` invocations above, matching the GCS
+access mode you chose in step 3. Phase 2 provisions a CNPG Postgres cluster
+(30–60 s on first install). If it times out, check: `kubectl get pods -n datuplet`.
 
 ---
 
