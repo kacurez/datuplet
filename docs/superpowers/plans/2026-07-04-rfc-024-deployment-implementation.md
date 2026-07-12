@@ -357,7 +357,7 @@ DRY_RUN=false
 COMMON_VALUES=() OPERATORS_VALUES=() INFRA_VALUES=() APP_VALUES=() LAKEKEEPER_VALUES=()
 REGISTER_ARGS=()
 
-usage() { sed -n '3,10p' "$0"; cat <<'EOF'
+usage() { sed -n '3,9p' "$0"; cat <<'EOF'
 
 Options:
   --namespace NS          Target namespace (default: datuplet)
@@ -559,7 +559,7 @@ VERSION=""
 DRY_RUN=false
 COMMON_VALUES=() OPERATORS_VALUES=() INFRA_VALUES=() APP_VALUES=() LAKEKEEPER_VALUES=()
 
-usage() { sed -n '3,13p' "$0"; cat <<'EOF'
+usage() { sed -n '3,11p' "$0"; cat <<'EOF'
 
 Options:
   --namespace NS       Target namespace (default: datuplet)
