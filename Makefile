@@ -237,10 +237,12 @@ deploy-local: docker-build-k8s build-components-local deploy-local-helm ## Build
 # in the local Docker daemon (OrbStack shares its image cache with K8s, so
 # `make docker-build-k8s` once is enough; iterate on charts via this target).
 # Drives scripts/install.sh (RFC 024 W1) — the single tested install path;
-# tests/local/values-local-app.yaml carries the local-dev image overrides
-# (pullPolicy + components.registry) that used to be --set flags here.
+# tests/local/values-local-{infra,app}.yaml carry the local-dev image
+# overrides (infra keygen image; app pullPolicy + components.registry) that
+# used to be --set flags here.
 deploy-local-helm: ## Install/upgrade all 4 charts + register.sh via scripts/install.sh (no docker build)
 	./scripts/install.sh --namespace datuplet --from-source \
+	  -f-infra tests/local/values-local-infra.yaml \
 	  -f-app tests/local/values-local-app.yaml
 
 # Symmetric tear-down for deploy-local-helm. Uninstalls in reverse install
