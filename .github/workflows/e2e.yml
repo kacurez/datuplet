@@ -99,6 +99,23 @@ jobs:
           docker builder prune --all --force || true
           df -h /
 
+      - name: Install DuckDB CLI
+        run: |
+          set -euo pipefail
+          # The e2e assertion helpers (tests/e2e/framework/assertions.go) shell
+          # out to a `duckdb` CLI to verify committed Iceberg tables. It isn't
+          # preinstalled on the runner, so every data assertion fails with
+          # `exec: "duckdb": executable file not found in $PATH`. This went
+          # unnoticed because the K8s scenarios silently SKIPped in CI until
+          # RFC 024 Phase 7 (E2E_REQUIRE=1) forced them to run. Pin the version
+          # dev machines use so CI and local behave identically; the prelude
+          # INSTALLs httpfs+iceberg at query time (the runner has network).
+          DUCKDB_VERSION=v1.4.1
+          curl -fsSL -o /tmp/duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          duckdb --version
+
       - name: Run e2e (deploy + test + teardown)
         env:
           E2E_JSON: /tmp/e2e-report.json
