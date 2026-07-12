@@ -135,6 +135,22 @@ jobs:
           git switch --detach "${GITHUB_SHA}"
           git stash pop --quiet || true
 
+      - name: Add chart dependency repos + build
+        # chart-releaser packages each chart in charts_dir; a chart with a
+        # committed Chart.lock is packaged via `helm dependency build`, which
+        # (unlike `update`) needs every dependency repo locally registered and
+        # won't auto-fetch "unmanaged" repos. Build the subchart tarballs here,
+        # AFTER the gh-pages bootstrap's branch dance, so they're present when
+        # chart-releaser runs. datuplet-app has no dependencies.
+        run: |
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+          helm repo add openfga https://openfga.github.io/helm-charts
+          helm repo add minio https://charts.min.io/
+          helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
+          for c in datuplet-operators datuplet-infra datuplet-lakekeeper; do
+            helm dependency build "charts/$c"
+          done
+
       - name: Run chart-releaser
         # packages_with_index=true uploads chart tarballs directly to the
         # gh-pages branch alongside index.yaml; it BYPASSES the GitHub

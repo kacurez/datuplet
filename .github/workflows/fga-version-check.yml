@@ -26,9 +26,16 @@ jobs:
             exit 0
           fi
 
+          # `// ""` coerces a missing/null key to an empty string — yq prints
+          # the literal "null" otherwise, which would defeat the [ -z ] checks.
           old_version=$(git show "$BASE:$VALUES" 2>/dev/null \
-            | yq '.fgaModel.version' - 2>/dev/null || echo "")
-          new_version=$(yq '.fgaModel.version' "$VALUES")
+            | yq '.fgaModel.version // ""' - 2>/dev/null || echo "")
+          new_version=$(yq '.fgaModel.version // ""' "$VALUES")
+
+          if [ -z "$new_version" ]; then
+            echo "✗ fgaModel.version is missing or empty in $VALUES" >&2
+            exit 1
+          fi
 
           if [ -z "$old_version" ]; then
             echo "✓ DSL changed; no prior fgaModel.version on $BASE — accepting $new_version"
