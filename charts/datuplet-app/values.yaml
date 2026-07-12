@@ -274,8 +274,10 @@ components:
 bootstrap:
   externalImages:
     # bitnami/kubectl:1.31 retired when Bitnami restructured the registry —
-    # only :latest and bitnamilegacy/kubectl:X.Y remain. See platform values.
-    kubectl: "bitnami/kubectl:latest"
+    # only :latest and bitnamilegacy/kubectl:X.Y remain. Pinned to the
+    # legacy multi-arch tag (verified amd64+arm64) instead of floating
+    # :latest. See platform values.
+    kubectl: "bitnamilegacy/kubectl:1.31"
     # openfga/cli used by authz-bootstrap model-write initContainer.
     openfgaCli: "openfga/cli:v0.6.2"
   resources:

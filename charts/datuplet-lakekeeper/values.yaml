@@ -98,7 +98,10 @@ lakekeeper:
     #                                 actually serving JWKS.
     extraInitContainers:
       - name: wait-for-fga-store
-        image: bitnami/kubectl:latest
+        # bitnami/kubectl:1.31 was retired when Bitnami restructured their
+        # registry. Pinned to the legacy multi-arch tag (verified
+        # amd64+arm64) instead of floating :latest.
+        image: bitnamilegacy/kubectl:1.31
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c"]
         args:
@@ -159,7 +162,10 @@ lakekeeper:
           capabilities: { drop: ["ALL"] }
           seccompProfile: { type: RuntimeDefault }
       - name: wait-for-pipeline-api
-        image: bitnami/kubectl:latest
+        # bitnami/kubectl:1.31 was retired when Bitnami restructured their
+        # registry. Pinned to the legacy multi-arch tag (verified
+        # amd64+arm64) instead of floating :latest.
+        image: bitnamilegacy/kubectl:1.31
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c"]
         args:

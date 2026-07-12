@@ -97,9 +97,12 @@ sync. Bump both values manually.
 **No umbrella chart.** The four-chart install is documented and tested; a single
 umbrella chart wrapping all four phases is not provided for v0.1.
 
-**Mutable `bitnami/kubectl:latest` tag.** The wait-for-platform init containers use
-`bitnami/kubectl:latest`, which can change between upgrades. Pin to a versioned tag
-for production installs.
+**One remaining mutable `bitnami/kubectl:latest` tag.** The four values-driven
+wait-for-platform init containers now use a pinned `bitnamilegacy/kubectl:1.31`
+image. One initContainer — `wait-for-fga-pin-job` in
+`charts/datuplet-lakekeeper/templates/bootstrap/wait-for-fga-pin-job.yaml` —
+still hardcodes `bitnami/kubectl:latest` in the template rather than reading
+from values. Pinning it is follow-up work.
 
 **Reaper ServiceAccount is shared with pipeline-api.** The reaper CronJob uses
 pipeline-api's ServiceAccount, which has broader verbs than the reaper needs. A

@@ -168,10 +168,16 @@ e2e-k8s: docker-build-k8s build-components-e2e e2e-k8s-deploy ## Run e2e against
 # build. Used by the GitHub Actions e2e workflow which builds + `kind load`s
 # images before invoking this target. Locally, prefer `make e2e-k8s`.
 e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on the cluster nodes)
-	helm dependency update charts/datuplet-operators
-	helm dependency update charts/datuplet-infra
-	helm dependency update charts/datuplet-app
-	helm dependency update charts/datuplet-lakekeeper
+	# `helm dependency build` (unlike `update`) requires each dependency's
+	# repo to be locally registered — it won't auto-fetch "unmanaged" repos.
+	helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts >/dev/null 2>&1 || true
+	helm repo add openfga https://openfga.github.io/helm-charts >/dev/null 2>&1 || true
+	helm repo add minio https://charts.min.io/ >/dev/null 2>&1 || true
+	helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts >/dev/null 2>&1 || true
+	helm dependency build charts/datuplet-operators
+	helm dependency build charts/datuplet-infra
+	helm dependency build charts/datuplet-app
+	helm dependency build charts/datuplet-lakekeeper
 	# Refresh the Datuplet CRDs up front. Helm installs CRDs from a chart's
 	# crds/ dir only on FIRST install and never upgrades them (nor removes
 	# them on uninstall), so on a reused cluster (the OrbStack dev loop) a
@@ -246,10 +252,16 @@ deploy-local: docker-build-k8s build-components-local deploy-local-helm ## Build
 # in the local Docker daemon (OrbStack shares its image cache with K8s, so
 # `make docker-build-k8s` once is enough; iterate on charts via this target).
 deploy-local-helm: ## Helm install all 4 charts + register.sh (no docker build)
-	helm dependency update charts/datuplet-operators
-	helm dependency update charts/datuplet-infra
-	helm dependency update charts/datuplet-app
-	helm dependency update charts/datuplet-lakekeeper
+	# `helm dependency build` (unlike `update`) requires each dependency's
+	# repo to be locally registered — it won't auto-fetch "unmanaged" repos.
+	helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts >/dev/null 2>&1 || true
+	helm repo add openfga https://openfga.github.io/helm-charts >/dev/null 2>&1 || true
+	helm repo add minio https://charts.min.io/ >/dev/null 2>&1 || true
+	helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts >/dev/null 2>&1 || true
+	helm dependency build charts/datuplet-operators
+	helm dependency build charts/datuplet-infra
+	helm dependency build charts/datuplet-app
+	helm dependency build charts/datuplet-lakekeeper
 	# RFC 015 5-phase install — see e2e-k8s target for ordering rationale.
 	helm upgrade --install datuplet-operators charts/datuplet-operators \
 	  -n datuplet --create-namespace --wait --timeout 5m

@@ -59,14 +59,21 @@ Or use the path-based commands below for development:
 
 ## 3. Install the four charts
 
-Each `helm dependency update` fetches subchart tarballs (gitignored). Run once
-per clone or after a version bump.
+Each `helm dependency build` fetches subchart tarballs (gitignored). Run once
+per clone or after a version bump. `build` (unlike `update`) requires each
+dependency's repo to be locally registered first — it won't auto-fetch
+"unmanaged" repos.
 
 ```bash
-helm dependency update charts/datuplet-operators
-helm dependency update charts/datuplet-infra
-helm dependency update charts/datuplet-app
-helm dependency update charts/datuplet-lakekeeper
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+helm repo add openfga https://openfga.github.io/helm-charts
+helm repo add minio https://charts.min.io/
+helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
+
+helm dependency build charts/datuplet-operators
+helm dependency build charts/datuplet-infra
+helm dependency build charts/datuplet-app
+helm dependency build charts/datuplet-lakekeeper
 
 # Phase 1 — CNPG operator + CRDs
 helm upgrade --install datuplet-operators charts/datuplet-operators \

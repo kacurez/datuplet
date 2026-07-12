@@ -107,13 +107,6 @@ tests/e2e/testdata/e2e-*/
 docs/tmp/
 
 # Helm chart dependency tarballs — Chart.lock is source of truth, run
-# `helm dependency update charts/datuplet` to repopulate after clone.
+# `helm dependency build charts/<name>` to repopulate after clone.
 charts/*/charts/
-
-# New split-chart locks (datuplet-operators + datuplet-infra + datuplet-app + datuplet-lakekeeper) — regenerated
-# via `helm dependency update`; not committed, unlike charts/datuplet/Chart.lock.
-charts/datuplet-operators/Chart.lock
-charts/datuplet-infra/Chart.lock
-charts/datuplet-app/Chart.lock
-charts/datuplet-lakekeeper/Chart.lock
 

@@ -21,8 +21,9 @@ bootstrap:
   externalImages:
     # bitnami/kubectl:1.31 was retired when Bitnami restructured their
     # registry — only the :latest tag and bitnamilegacy/kubectl:X.Y tags
-    # remain. Using :latest to match the existing charts/datuplet/ chart.
-    kubectl: "bitnami/kubectl:latest"
+    # remain. Pinned to the legacy multi-arch tag (verified amd64+arm64)
+    # instead of floating :latest.
+    kubectl: "bitnamilegacy/kubectl:1.31"
     openfgaCli: "openfga/cli:v0.6.2"
   resources:
     requests: { cpu: 50m, memory: 64Mi }

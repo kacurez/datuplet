@@ -66,11 +66,19 @@ Jobs.
 ## Install
 
 ```bash
-# 0. Fetch subchart tarballs (gitignored; required once per clone or version bump)
-helm dependency update charts/datuplet-operators
-helm dependency update charts/datuplet-infra
-helm dependency update charts/datuplet-app
-helm dependency update charts/datuplet-lakekeeper
+# 0a. Register each dependency chart's repo — `helm dependency build` (unlike
+# `update`) requires these to be locally registered; it won't auto-fetch
+# "unmanaged" repos.
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+helm repo add openfga https://openfga.github.io/helm-charts
+helm repo add minio https://charts.min.io/
+helm repo add lakekeeper https://lakekeeper.github.io/lakekeeper-charts
+
+# 0b. Fetch subchart tarballs (gitignored; required once per clone or version bump)
+helm dependency build charts/datuplet-operators
+helm dependency build charts/datuplet-infra
+helm dependency build charts/datuplet-app
+helm dependency build charts/datuplet-lakekeeper
 
 # 1. Phase 1 — CNPG operator + CRDs
 helm upgrade --install datuplet-operators charts/datuplet-operators \
