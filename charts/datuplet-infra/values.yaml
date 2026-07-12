@@ -10,12 +10,14 @@
 #   --set-json 'tolerations=[{"key":"kubernetes.io/arch","operator":"Equal","value":"arm64","effect":"NoSchedule"}]'
 tolerations: []
 
+# tag "" resolves to the chart appVersion; local dev overrides via
+# tests/local/values-local-app.yaml.
 image:
   pullPolicy: IfNotPresent
   pullSecrets: []
   pipelineApi:
-    repository: datuplet/pipeline-api
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-api
+    tag: ""
 
 bootstrap:
   externalImages:

@@ -48,7 +48,7 @@ spec:
       {{- end }}
       containers:
         - name: operator
-          image: "{{ .Values.image.pipelineOperator.repository }}:{{ .Values.image.pipelineOperator.tag }}"
+          image: "{{ include "datuplet-app.image" (dict "img" .Values.image.pipelineOperator "root" $) }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             # LAKEKEEPER_URL is injected into every component/gateway Pod so
@@ -66,7 +66,7 @@ spec:
             # component Pods. Plumbed from chart values so release artifacts
             # pin versioned tags while local dev defaults to :latest.
             - name: GATEWAY_IMAGE
-              value: "{{ .Values.image.gateway.repository }}:{{ .Values.image.gateway.tag }}"
+              value: "{{ include "datuplet-app.image" (dict "img" .Values.image.gateway "root" $) }}"
             # Runtime pull policy applied by the operator to per-run
             # pods (gateway sidecar, component container).
             # Mirrors image.pullPolicy so a single helm value drives

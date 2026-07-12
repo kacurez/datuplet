@@ -69,7 +69,7 @@ spec:
           {{- end }}
           containers:
             - name: reap
-              image: "{{ .Values.image.pipelineApi.repository }}:{{ .Values.image.pipelineApi.tag }}"
+              image: "{{ include "datuplet-app.image" (dict "img" .Values.image.pipelineApi "root" $) }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command: ["pipeline-api", "reap-once"]
               securityContext:

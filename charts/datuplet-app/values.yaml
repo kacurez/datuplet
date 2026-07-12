@@ -18,24 +18,26 @@ tolerations: []
 runtimeDefaults:
   tolerations: []
 
+# tag "" resolves to the chart appVersion; local dev overrides via
+# tests/local/values-local-app.yaml.
 image:
   pullPolicy: Always
   pullSecrets: []
   pipelineApi:
-    repository: datuplet/pipeline-api
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-api
+    tag: ""
   pipelineOperator:
-    repository: datuplet/pipeline-operator
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-operator
+    tag: ""
   # pipeline-observer is the single-writer to the runs DB.
   pipelineObserver:
-    repository: datuplet/pipeline-observer
-    tag: latest
+    repository: ghcr.io/kacurez/pipeline-observer
+    tag: ""
   # Data Gateway sidecar image — pipeline-operator passes this to every
   # component Pod's gateway sidecar via the GATEWAY_IMAGE env var.
   gateway:
-    repository: datuplet/gateway
-    tag: latest
+    repository: ghcr.io/kacurez/gateway
+    tag: ""
 
 # FGA model version. Bump when files/fga/** changes.
 # See docs/fga-model-upgrades.md for the upgrade procedure.
@@ -176,11 +178,13 @@ queryWorker:
   # DuckDB instance; scale via concurrency knob inside the pod).
   replicas: 1
 
+  # tag "" resolves to the chart appVersion; local dev overrides via
+  # tests/local/values-local-app.yaml.
   image:
     # repository: image repository for the query-worker binary.
-    repository: datuplet/query-worker
-    # tag: image tag. Defaults to :latest (matches all other chart images).
-    tag: latest
+    repository: ghcr.io/kacurez/query-worker
+    # tag: image tag. Defaults to the chart appVersion.
+    tag: ""
     # pullPolicy: overrides the chart-global image.pullPolicy for the
     # query-worker only. Leave empty ("") to inherit the global setting.
     pullPolicy: ""

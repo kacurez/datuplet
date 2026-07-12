@@ -71,7 +71,7 @@ spec:
       {{- end }}
       containers:
         - name: query-worker
-          image: "{{ ((.Values.queryWorker).image).repository | default "datuplet/query-worker" }}:{{ ((.Values.queryWorker).image).tag | default "latest" }}"
+          image: "{{ include "datuplet-app.image" (dict "img" .Values.queryWorker.image "root" $) }}"
           imagePullPolicy: {{ ((.Values.queryWorker).image).pullPolicy | default .Values.image.pullPolicy }}
           ports:
             - { containerPort: 8090, name: http }
