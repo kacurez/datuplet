@@ -304,12 +304,15 @@ job_admin() {
     return 0
   fi
 
+  # kubectl create job has no --env/--volume flags, and a Job's spec.template
+  # is immutable once the Job exists — patching the live Job fails with
+  # "field is immutable". Render the Job client-side, patch the template
+  # locally (pre-creation, immutability does not apply), then create the
+  # fully-formed Job in one shot.
   $KUBECTL create job -n "$NAMESPACE" "$job_name" \
-    --image="$image" \
-    -- /usr/local/bin/pipeline-api admin "$subcommand" "$@"
-
-  # Patch the Job with required env vars via patch (kubectl create job doesn't accept --env).
-  $KUBECTL patch job -n "$NAMESPACE" "$job_name" --type=json -p="[
+    --image="$image" --dry-run=client -o json \
+    -- /usr/local/bin/pipeline-api admin "$subcommand" "$@" \
+  | $KUBECTL patch --local -f - -o json --type=json -p="[
     {\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/env\", \"value\": [
       {\"name\": \"DATABASE_URL\",    \"value\": \"${db_url}\"},
       {\"name\": \"SIGNING_KEY_FILE\",\"value\": \"${SIGNING_KEY_FILE}\"},
@@ -324,7 +327,8 @@ job_admin() {
     {\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/volumeMounts\", \"value\": [
       {\"name\": \"signing-key\", \"mountPath\": \"/var/run/secrets/datuplet-signing-key\", \"readOnly\": true}
     ]}
-  ]"
+  ]" \
+  | $KUBECTL create -n "$NAMESPACE" -f -
 
   echo "  Waiting for Job ${job_name} to complete..."
   $KUBECTL wait job -n "$NAMESPACE" "$job_name" \
