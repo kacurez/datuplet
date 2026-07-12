@@ -271,7 +271,14 @@ job_admin() {
   local db_url
   db_url=$($KUBECTL get deployment -n "$NAMESPACE" "pipeline-api" \
     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")].value}' 2>/dev/null || true)
-  if [[ -z "$db_url" ]]; then
+  # The Deployment defines DATABASE_URL via K8s $(VAR) dependent-env
+  # substitution (postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):…),
+  # expanded at pod start from envFrom + POSTGRES_PASSWORD. jsonpath returns
+  # that template verbatim, and the spawned Job carries none of those vars, so
+  # pgx would get a literal "$(POSTGRES_PORT)". Treat an unexpanded value
+  # (empty, or still containing "$(") as unresolved and build a concrete URL
+  # from the platform postgres connection Secret instead.
+  if [[ -z "$db_url" || "$db_url" == *'$('* ]]; then
     # Fallback: construct from the platform postgres connection Secret.
     local pg_secret="pg-pipeline-api"
     local pg_host pg_port pg_db pg_user pg_pass
