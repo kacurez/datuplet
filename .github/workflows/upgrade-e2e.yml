@@ -143,8 +143,10 @@ jobs:
           # images so `component:` refs resolve. Use a dedicated overlay:
           #   tests/upgrade-e2e/values-app.yaml = tests/e2e/values-app.yaml MINUS the
           #   components.builtins:false line, PLUS:
-          #     components: {builtins: true, registry: datuplet, tag: latest}
-          #     (chart pullPolicy IfNotPresent keeps the kind-loaded images in use)
+          #     components: {builtins: true, registry: datuplet}
+          #     (tag OMITTED → inherits the chart's components.tag = stable vX.Y.Z,
+          #      which the build step above kind-loads as datuplet/<comp>:$CTAG;
+          #      chart pullPolicy IfNotPresent keeps the kind-loaded images in use)
           ./scripts/upgrade.sh --namespace "$NS" --phase all --from-source \
             -f-operators tests/e2e/values-operators.yaml \
             -f-infra tests/e2e/values-infra.yaml \
@@ -156,7 +158,8 @@ jobs:
           set -eu
           make k8s-smoke SMOKE_URL=http://localhost:30081
           # Fresh pipeline on the upgraded stack — built-in component refs now
-          # resolve against the HEAD-built local images (registry=datuplet tag=latest).
+          # resolve against the HEAD-built local images (registry=datuplet, tag =
+          # the chart's components.tag, kind-loaded above).
           PIPELINE_NAME=post-upgrade envsubst '$PIPELINE_NAME' \
             < tests/release-verify/pipeline.yaml > /tmp/post.yaml
           DATUPLET_ADMIN_EMAIL="$ADMIN_EMAIL" DATUPLET_ADMIN_PASSWORD="$ADMIN_PASSWORD" \

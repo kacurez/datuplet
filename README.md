@@ -38,12 +38,15 @@ git clone https://github.com/kacurez/datuplet && cd datuplet
 # 3. Build images and load them into kind (kind doesn't share the host
 #    Docker daemon, unlike OrbStack, so images must be loaded explicitly)
 make docker-build-k8s build-components-local
+# component images are tagged with the chart's components.tag (a stable vX.Y.Z);
+# derive it so this stays correct across release bumps
+CTAG=$(sed -n 's/^  tag: *//p' charts/datuplet-app/values.yaml | tail -1)
 for img in \
   datuplet/pipeline-api:latest datuplet/pipeline-observer:latest \
   datuplet/pipeline-operator:latest datuplet/gateway:latest datuplet/query-worker:latest \
-  datuplet/data-generator:v0.1.0 datuplet/sql-transform:v0.1.0 \
-  datuplet/stdout-writer:v0.1.0 datuplet/http-json-extractor:v0.1.0 \
-  datuplet/finnhub-extractor:v0.1.0 \
+  "datuplet/data-generator:$CTAG" "datuplet/sql-transform:$CTAG" \
+  "datuplet/stdout-writer:$CTAG" "datuplet/http-json-extractor:$CTAG" \
+  "datuplet/finnhub-extractor:$CTAG" \
 ; do kind load docker-image --name datuplet "$img"; done
 
 # 4. Install the four charts + bootstrap warehouse/admin user (register.sh runs last)

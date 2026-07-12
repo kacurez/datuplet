@@ -6,7 +6,9 @@ see its section below. Each runs as an ordinary container alongside the Data
 Gateway sidecar; the component communicates with the sidecar via gRPC and HTTP —
 it never touches S3 directly.
 
-Image registry: `ghcr.io/kacurez/<name>:v0.1.0`
+Image registry: `ghcr.io/kacurez/<name>:<components.tag>` — the tag tracks the
+chart's `components.tag` (the release version; `v0.8.0` in this release). The
+per-component `Image:` lines below show the current release's tag.
 
 ---
 
@@ -15,7 +17,7 @@ Image registry: `ghcr.io/kacurez/<name>:v0.1.0`
 Generates random or literal rows inline from pipeline YAML — useful for testing
 pipelines without an external data source.
 
-**Image:** `ghcr.io/kacurez/data-generator:v0.1.0`
+**Image:** `ghcr.io/kacurez/data-generator:v0.8.0`
 
 **Registry name:** `data-generator` · default version from the chart
 
@@ -78,7 +80,7 @@ from SHA-256 of the pair).
 Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports
 single-request and paginated modes.
 
-**Image:** `ghcr.io/kacurez/http-json-extractor:v0.1.0`
+**Image:** `ghcr.io/kacurez/http-json-extractor:v0.8.0`
 
 **Registry name:** `http-json-extractor` · default version from the chart
 
@@ -134,7 +136,7 @@ project's managed secrets. See [docs/secrets.md](secrets.md).
 Fetches market data from the [Finnhub](https://finnhub.io/) API. Requires a
 Finnhub API key.
 
-**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.1.0`
+**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.8.0`
 
 **Registry name:** `finnhub-extractor` · default version from the chart
 
@@ -195,7 +197,7 @@ Data Gateway via Arrow IPC and are materialized into DuckDB tables before the SQ
 runs. Outputs are written back through the Data Gateway; no S3 credentials touch
 the component.
 
-**Image:** `ghcr.io/kacurez/sql-transform:v0.1.0`
+**Image:** `ghcr.io/kacurez/sql-transform:v0.8.0`
 
 **Registry name:** `sql-transform` · default version from the chart
 
@@ -265,7 +267,7 @@ Applies a sequence of pandas operations to input data. Reads the input table as
 CSV from the Data Gateway, applies the operations in order, and writes the
 result back as CSV — no S3 or Lakekeeper credentials touch the component.
 
-**Image:** `ghcr.io/kacurez/pandas-transform:v0.1.0`
+**Image:** `ghcr.io/kacurez/pandas-transform:v0.8.0`
 
 **Registry name:** `pandas-transform` · default version from the chart
 
@@ -323,7 +325,7 @@ skipped rather than failing the run.
 Reads input tables and prints them to stdout. For debugging only — no Iceberg
 output.
 
-**Image:** `ghcr.io/kacurez/stdout-writer:v0.1.0`
+**Image:** `ghcr.io/kacurez/stdout-writer:v0.8.0`
 
 **Registry name:** `stdout-writer` · default version from the chart
 

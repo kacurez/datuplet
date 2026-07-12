@@ -80,8 +80,10 @@ build-component-data-generator: ## Build data-generator component image
 
 # Built-in component images for a LOCAL OrbStack deploy. The datuplet-app chart
 # ships ComponentDefinition CRs whose image is
-# `<components.registry>/<name>:<components.tag>` — defaulting to
-# ghcr.io/kacurez + v0.1.0 for production (those tags are published to GHCR).
+# `<components.registry>/<name>:<components.tag>` — for production this is
+# ghcr.io/kacurez + the chart's components.tag (the release version, kept in
+# lockstep with COMPONENT_TAG by `make bump-version`; those tags are published
+# to GHCR by the release workflow).
 # deploy-local overrides components.registry=datuplet, so build the built-ins
 # and tag them datuplet/<name>:$(COMPONENT_TAG) — present in the local Docker
 # daemon, no GHCR pull. Runtime pull policy is IfNotPresent (the operator's

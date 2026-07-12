@@ -67,21 +67,24 @@ use them. Build the same images `make deploy-local` builds on OrbStack, then
 ```bash
 # Build the five service images (pipeline-api, pipeline-observer,
 # pipeline-operator, gateway, query-worker) + the five built-in component
-# images. `build-components-local` additionally tags the built-ins
-# `:v0.1.0` (COMPONENT_TAG) to match the chart's `components.tag` default.
+# images. `build-components-local` tags the built-ins at the chart's
+# `components.tag` (a stable vX.Y.Z, via COMPONENT_TAG).
 make docker-build-k8s build-components-local
 
+# Derive the component tag from the chart so this stays correct across release
+# bumps (services are :latest; built-in components are :$CTAG).
+CTAG=$(sed -n 's/^  tag: *//p' charts/datuplet-app/values.yaml | tail -1)
 for img in \
   datuplet/pipeline-api:latest \
   datuplet/pipeline-observer:latest \
   datuplet/pipeline-operator:latest \
   datuplet/gateway:latest \
   datuplet/query-worker:latest \
-  datuplet/data-generator:v0.1.0 \
-  datuplet/sql-transform:v0.1.0 \
-  datuplet/stdout-writer:v0.1.0 \
-  datuplet/http-json-extractor:v0.1.0 \
-  datuplet/finnhub-extractor:v0.1.0 \
+  "datuplet/data-generator:$CTAG" \
+  "datuplet/sql-transform:$CTAG" \
+  "datuplet/stdout-writer:$CTAG" \
+  "datuplet/http-json-extractor:$CTAG" \
+  "datuplet/finnhub-extractor:$CTAG" \
 ; do
   kind load docker-image --name datuplet "$img"
 done
