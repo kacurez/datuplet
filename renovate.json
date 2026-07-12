@@ -20,7 +20,7 @@
       "fileMatch": ["charts/.+/values\\.yaml$"],
       "matchStrings": [
         "(?:kubectl|openfgaCli):\\s*\"(?<depName>[A-Za-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)\"",
-        "image:\\s*(?<depName>[A-Za-z0-9./-]+/kubectl):(?<currentValue>[A-Za-z0-9._-]+)"
+        "image:\\s*(?<depName>alpine/k8s):(?<currentValue>[A-Za-z0-9._-]+)"
       ],
       "datasourceTemplate": "docker"
     }

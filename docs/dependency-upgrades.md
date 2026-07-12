@@ -42,10 +42,17 @@ checklist per dependency — what CI cannot see.
    rootUser/rootPassword for the framework.
 2. Gate: e2e.
 
-## Helper images (chart values: kubectl, openfga/cli)
-1. Bumps arrive via the Renovate regex manager. kubectl minor should stay
-   within one minor of the cluster versions we target (K8s 1.28+).
-2. Gate: e2e (every hook Job uses these images).
+## Helper images (chart values: kubectl helper = alpine/k8s, openfga/cli)
+1. Bumps arrive via the Renovate custom regex manager, which scans
+   `charts/*/values.yaml` for the `kubectl:`/`openfgaCli:` keys (datuplet-app,
+   datuplet-infra) and the inline `image: alpine/k8s:...` lines (datuplet-lakekeeper).
+   The kubectl toolbox minor should stay within one minor of the cluster
+   versions we target (K8s 1.28+).
+2. **Exception:** one hook Job image is NOT values-driven and NOT Renovate-tracked
+   — `charts/datuplet-lakekeeper/templates/bootstrap/wait-for-fga-pin-job.yaml`
+   hardcodes `bitnami/kubectl:latest` in the template. Bump it by hand until it's
+   moved behind a values key (tracked in known-limitations.md).
+3. Gate: e2e (the values-driven hook Jobs use these images).
 
 ## Go modules / Dockerfile bases / GitHub Actions
 Grouped weekly Renovate PRs; `make tidy` discipline applies (multi-module
