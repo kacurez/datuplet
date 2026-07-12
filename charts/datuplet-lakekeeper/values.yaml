@@ -98,10 +98,11 @@ lakekeeper:
     #                                 actually serving JWKS.
     extraInitContainers:
       - name: wait-for-fga-store
-        # bitnami/kubectl:1.31 was retired when Bitnami restructured their
-        # registry. Pinned to the legacy multi-arch tag (verified
-        # amd64+arm64) instead of floating :latest.
-        image: bitnamilegacy/kubectl:1.31
+        # Bitnami retired versioned bitnami/kubectl tags; the bitnamilegacy
+        # replacement images use dash as /bin/sh, which lacks `set -o pipefail`
+        # and breaks this bootstrap script. This is a multi-arch kubectl
+        # toolbox whose busybox ash supports pipefail.
+        image: alpine/k8s:1.31.12
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c"]
         args:
@@ -162,10 +163,11 @@ lakekeeper:
           capabilities: { drop: ["ALL"] }
           seccompProfile: { type: RuntimeDefault }
       - name: wait-for-pipeline-api
-        # bitnami/kubectl:1.31 was retired when Bitnami restructured their
-        # registry. Pinned to the legacy multi-arch tag (verified
-        # amd64+arm64) instead of floating :latest.
-        image: bitnamilegacy/kubectl:1.31
+        # Bitnami retired versioned bitnami/kubectl tags; the bitnamilegacy
+        # replacement images use dash as /bin/sh, which lacks `set -o pipefail`
+        # and breaks this bootstrap script. This is a multi-arch kubectl
+        # toolbox whose busybox ash supports pipefail.
+        image: alpine/k8s:1.31.12
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c"]
         args:

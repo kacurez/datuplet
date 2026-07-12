@@ -98,7 +98,7 @@ sync. Bump both values manually.
 umbrella chart wrapping all four phases is not provided for v0.1.
 
 **One remaining mutable `bitnami/kubectl:latest` tag.** The four values-driven
-wait-for-platform init containers now use a pinned `bitnamilegacy/kubectl:1.31`
+wait-for-platform init containers now use a pinned `alpine/k8s:1.31.12`
 image. One initContainer — `wait-for-fga-pin-job` in
 `charts/datuplet-lakekeeper/templates/bootstrap/wait-for-fga-pin-job.yaml` —
 still hardcodes `bitnami/kubectl:latest` in the template rather than reading
