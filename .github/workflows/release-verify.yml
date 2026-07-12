@@ -1,0 +1,112 @@
+name: release-verify
+
+# Installs the PUBLISHED artifacts (gh-pages charts + ghcr images) on a
+# fresh kind cluster and runs a real pipeline. A release is announceable
+# when this is green (RFC 024 W3). Deliberately a separate workflow from
+# release.yml, whose publish jobs must only ever run on tag pushes.
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  schedule:
+    - cron: '17 5 * * 1'   # weekly bit-rot canary (gh-pages/ghcr/upstream repos)
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to verify (vX.Y.Z or X.Y.Z); empty = latest published
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # For workflow_run: only verify successful releases.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      HELM_REPO_URL: https://kacurez.github.io/datuplet
+    steps:
+      - name: Resolve version to verify
+        id: ver
+        run: |
+          set -eu
+          case "${{ github.event_name }}" in
+            workflow_dispatch) V="${{ inputs.version }}" ;;
+            workflow_run)      V="${{ github.event.workflow_run.head_branch }}" ;;  # the tag name
+            *)                 V="" ;;
+          esac
+          if [ -z "$V" ]; then
+            V=$(curl -fsSL "$HELM_REPO_URL/index.yaml" \
+              | yq '.entries.datuplet-app[].version' | sort -V | tail -1)
+          fi
+          echo "version=${V#v}" >> "$GITHUB_OUTPUT"
+          echo "verifying version ${V#v}"
+
+      - uses: actions/checkout@v6
+        with:
+          # Verify with the scripts as released for tag-triggered runs;
+          # scheduled runs use main's scripts against the latest release.
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: 'v3.14.4'
+
+      - name: Write kind config (NodePort 30081 → host)
+        run: |
+          cat > /tmp/kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30081
+                  hostPort: 30081
+          EOF
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.14.0
+        with:
+          version: v0.23.0
+          cluster_name: release-verify
+          node_image: kindest/node:v1.30.0
+          config: /tmp/kind-config.yaml
+
+      - name: Install from published artifacts
+        run: |
+          ./scripts/install.sh --namespace datuplet \
+            --from-repo --version "${{ steps.ver.outputs.version }}" \
+            --register-mode job \
+            -- --admin-email verify@datuplet.local --admin-password 'rv-ci-password-1'
+
+      - name: Smoke
+        run: make k8s-smoke SMOKE_URL=http://localhost:30081
+
+      - name: Run verification pipeline (built-in component refs)
+        run: |
+          # Pipeline references built-in ComponentDefinitions (component:/version:
+          # omitted → defaultVersion). This exercises the chart's registry CRs and
+          # will surface the §6.6 component-image gap (built-ins pinned to :v0.1.0)
+          # as an ImagePullBackOff → run failure if those tags were never published.
+          PIPELINE_NAME=release-verify envsubst '$PIPELINE_NAME' \
+            < tests/release-verify/pipeline.yaml > /tmp/rv.yaml
+          DATUPLET_ADMIN_EMAIL=verify@datuplet.local \
+          DATUPLET_ADMIN_PASSWORD='rv-ci-password-1' \
+            tests/release-verify/run-pipeline.sh /tmp/rv.yaml
+
+      - name: Idempotent re-upgrade (no-op)
+        run: |
+          ./scripts/upgrade.sh --namespace datuplet --phase app \
+            --from-repo --version "${{ steps.ver.outputs.version }}"
+
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          kubectl get pods -n datuplet -o wide || true
+          for pod in $(kubectl -n datuplet get pods -o name 2>/dev/null); do
+            echo "=== $pod ==="; kubectl -n datuplet describe "$pod" | tail -30 || true
+            kubectl -n datuplet logs "$pod" --all-containers --tail=100 || true
+          done
