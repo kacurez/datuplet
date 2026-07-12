@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommits"],
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 3,
+  "packageRules": [
+    { "matchManagers": ["helmv3"], "groupName": "helm chart dependencies",
+      "postUpdateOptions": ["helmUpdateSubChartArchives"] },
+    { "matchManagers": ["gomod"], "groupName": "go modules",
+      "matchUpdateTypes": ["minor", "patch"],
+      "postUpdateOptions": ["gomodTidy"] },
+    { "matchManagers": ["dockerfile"], "groupName": "docker base images" },
+    { "matchManagers": ["github-actions"], "groupName": "github actions" }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Helper images pinned in chart values (kubectl, openfga CLI)",
+      "managerFilePatterns": ["/^charts/.+/values\\.yaml$/"],
+      "matchStrings": [
+        "(?:kubectl|openfgaCli):\\s*\"(?<depName>[A-Za-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)\"",
+        "image:\\s*(?<depName>[A-Za-z0-9./-]+/kubectl):(?<currentValue>[A-Za-z0-9._-]+)"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}
