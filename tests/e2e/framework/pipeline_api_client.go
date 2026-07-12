@@ -1,23 +1,14 @@
-// Package framework — minimal pipeline-api HTTP client for FGA-grant-matrix assertions.
+// Package framework — pipeline-api endpoint-discovery helpers.
 //
-// The FGA-matrix negative-path tests (charlie/dora) need to POST to
-// pipeline-api's trigger endpoint and assert a 403. The K8sBackend's
-// RunPipeline goes directly via kubectl apply, bypassing pipeline-api HTTP
-// auth entirely — so these tests need a separate HTTP path.
-//
-// This file is intentionally minimal: one function (TriggerRunHTTP) that
-// POSTs to /api/v1/projects/:pid/pipelines/:name/runs with a bearer token
-// and returns the HTTP status code. The caller asserts the code; no run
-// polling or cleanup is needed for 403 cases because pipeline-api rejects
-// the request before creating any K8s resources.
+// The K8s scenarios that talk to pipeline-api over HTTP (query, secrets,
+// resource-gate, local-query) need the service base URL and a cheap
+// reachability probe so they can skip cleanly when the NodePort / port-forward
+// isn't up. Those two helpers live here; the per-endpoint request builders
+// live alongside the tests that use them.
 package framework
 
 import (
-	"context"
-	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -60,40 +51,4 @@ func PipelineAPIReachable() bool {
 	}
 	conn.Close()
 	return true
-}
-
-// TriggerRunHTTP POSTs to
-// /api/v1/projects/:projectID/pipelines/:pipelineName/runs
-// with the given bearer token and returns the HTTP status code.
-//
-// A 403 means pipeline-api denied the request (FGA check failed — the
-// user lacks data_admin on the project). The caller should not poll for
-// run completion after a 403; no K8s resources are created.
-//
-// The token is expected to be an impersonation JWT minted via
-// MintTestUserImpersonation for the user under test. pipeline-api accepts
-// bearer tokens on its REST endpoints.
-func TriggerRunHTTP(ctx context.Context, projectID, pipelineName, bearerToken string) (int, error) {
-	url := fmt.Sprintf("%s/api/v1/projects/%s/pipelines/%s/runs",
-		PipelineAPIBaseURL(), projectID, pipelineName)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url,
-		strings.NewReader("{}"))
-	if err != nil {
-		return 0, fmt.Errorf("build trigger request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+bearerToken)
-	}
-
-	cli := &http.Client{Timeout: 15 * time.Second}
-	resp, err := cli.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("POST %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-	// Drain body so connections are reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, nil
 }

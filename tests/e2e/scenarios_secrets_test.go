@@ -73,10 +73,8 @@ spec:
 // {pid} against a real `projects` row in Postgres (mustHaveRelation, see
 // pkg/pipelineapi/http/pipeline_handlers.go). SetupFGABootstrap
 // (framework/bootstrap.go) only ever provisions a *lakekeeper* Project for
-// the whole suite — it never creates the matching Datuplet DB row. That is
-// the exact same gap TestFGAMatrix_UnauthorisedTrigger (scenarios_test.go)
-// already documents and skips on, so h.LakekeeperProjectID cannot be used
-// directly as {pid} here either.
+// the whole suite — it never creates the matching Datuplet DB row, so
+// h.LakekeeperProjectID cannot be used directly as {pid} here.
 //
 // This test bridges the gap the same way an operator would: by running
 // `pipeline-api admin create-project` (idempotent — safe to call on every
