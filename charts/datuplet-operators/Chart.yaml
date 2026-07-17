@@ -2,8 +2,8 @@ apiVersion: v2
 name: datuplet-operators
 description: Datuplet operators — CNPG (CloudNativePG) operator. Install before datuplet-infra so the operator's mutating webhook has endpoints when the Cluster CR is applied.
 type: application
-version: 0.8.0
-appVersion: "0.8.0"
+version: 0.9.1
+appVersion: "0.9.1"
 home: https://github.com/kacurez/datuplet
 sources:
   - https://github.com/kacurez/datuplet
