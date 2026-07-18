@@ -56,6 +56,44 @@ type ComponentDefinitionSpec struct {
 
 	// Versions lists the available versions of this component.
 	Versions []VersionSpec `json:"versions"`
+
+	// IO declares this component's input/output capability. Nil means
+	// optional/optional (the component may or may not read/write tables).
+	// IO lives at the definition level, not per-version, by design.
+	// +optional
+	IO *ComponentIO `json:"io,omitempty"`
+}
+
+// ComponentIO declares a component's input/output capability. Valid mode
+// values are "none", "optional", and "required"; empty is treated as
+// "optional". Use InputsMode/OutputsMode to read the resolved value —
+// consumers should never inspect the fields directly.
+type ComponentIO struct {
+	// Inputs is the component's input capability mode.
+	// +optional
+	Inputs string `json:"inputs,omitempty"`
+
+	// Outputs is the component's output capability mode.
+	// +optional
+	Outputs string `json:"outputs,omitempty"`
+}
+
+// InputsMode returns the resolved input mode: the explicit value, or
+// "optional" when io is nil or the field is empty.
+func (io *ComponentIO) InputsMode() string {
+	if io == nil || io.Inputs == "" {
+		return "optional"
+	}
+	return io.Inputs
+}
+
+// OutputsMode returns the resolved output mode: the explicit value, or
+// "optional" when io is nil or the field is empty.
+func (io *ComponentIO) OutputsMode() string {
+	if io == nil || io.Outputs == "" {
+		return "optional"
+	}
+	return io.Outputs
 }
 
 // VersionSpec defines a single version of a component.
@@ -236,6 +274,11 @@ func (in *ComponentDefinitionSpec) DeepCopyInto(out *ComponentDefinitionSpec) {
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
+	}
+	if in.IO != nil {
+		in, out := &in.IO, &out.IO
+		*out = new(ComponentIO)
+		**out = **in
 	}
 }
 

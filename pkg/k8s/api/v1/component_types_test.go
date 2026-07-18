@@ -174,6 +174,26 @@ func TestComponentDefinition_DeepCopy_Isolation(t *testing.T) {
 	}
 }
 
+func TestComponentIODefaults(t *testing.T) {
+	var io *ComponentIO
+	if io.InputsMode() != "optional" || io.OutputsMode() != "optional" {
+		t.Fatal("nil ComponentIO must default to optional/optional")
+	}
+	io = &ComponentIO{Inputs: "none", Outputs: "required"}
+	if io.InputsMode() != "none" || io.OutputsMode() != "required" {
+		t.Fatal("explicit values must pass through")
+	}
+}
+
+func TestComponentIODeepCopy(t *testing.T) {
+	in := &ComponentDefinitionSpec{IO: &ComponentIO{Inputs: "none"}}
+	out := in.DeepCopy()
+	out.IO.Inputs = "required"
+	if in.IO.Inputs != "none" {
+		t.Fatal("DeepCopy aliased the IO pointer")
+	}
+}
+
 func TestPipelineRunStatus_DeepCopy_ResolvedSpec_Isolation(t *testing.T) {
 	orig := &PipelineRun{
 		Status: PipelineRunStatus{
