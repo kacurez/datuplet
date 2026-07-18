@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pandas Transform",
+  "description": "Applies an ordered sequence of pandas operations (filter, select, sort, rename, drop, fillna) to the input table.",
+  "type": "object",
+  "additionalProperties": false,
+  "x-datuplet-produces": "output_table",
+  "properties": {
+    "output_table": {
+      "type": "string",
+      "description": "Output table name. Defaults to the input table's name when omitted.",
+      "x-datuplet-doc": "The runtime default (the input table's own name) is computed, not a fixed literal, so only the case where output_table is set directly can be resolved by the pipeline builder's upstream-output picker (x-datuplet-produces points at this property); leaving it unset still works at runtime but shows as an unresolvable dynamic name in the UI."
+    },
+    "operations": {
+      "type": "array",
+      "default": [],
+      "description": "Operations applied in order; an empty or omitted list passes the input through unchanged.",
+      "x-datuplet-doc": "Every operation reads and writes the same DataFrame, so ordering matters (e.g. a 'rename' must precede a 'filter' that references the new column name).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type"
+        ],
+        "description": "A single operation. Which of the other fields apply depends on 'type' (see each field's notes).",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "filter",
+              "select",
+              "sort",
+              "rename",
+              "drop",
+              "fillna"
+            ],
+            "description": "Which operation to apply.",
+            "x-datuplet-doc": "An unrecognized or missing type is not a fatal error: the component logs a WARN and passes the DataFrame through unchanged for that step."
+          },
+          "column": {
+            "type": "string",
+            "description": "Column name (filter: the column to test; fillna: the column to fill — omit to fill every column).",
+            "x-datuplet-doc": "Used by 'filter' (required for the filter to do anything — a missing or unknown column logs a WARN and is a no-op step) and by 'fillna' (optional — omitted means 'value' is applied to every column). Ignored by every other type."
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              ">",
+              ">=",
+              "<",
+              "<=",
+              "==",
+              "!=",
+              "in",
+              "contains"
+            ],
+            "default": "==",
+            "description": "Comparison operator (filter only).",
+            "x-datuplet-doc": "Only consulted by 'filter'; ignored otherwise. 'in' expects 'value' to be an array of candidate values; 'contains' does a case-insensitive substring match; the rest compare directly (pandas performs the actual type coercion against the column's dtype)."
+          },
+          "value": {
+            "type": [
+              "string",
+              "number",
+              "boolean",
+              "array"
+            ],
+            "description": "Comparison value (filter) or fill value (fillna).",
+            "x-datuplet-doc": "Used by 'filter' (compared against 'column' using 'op' — a scalar for every operator except 'in', which expects an array of candidate values) and by 'fillna' (the literal value written into missing cells). No single JSON Schema type covers every case the component actually accepts; array items are left unconstrained."
+          },
+          "columns": {
+            "type": [
+              "array",
+              "object"
+            ],
+            "description": "Column list (select: columns to keep; drop: columns to remove) or old-name-to-new-name map (rename).",
+            "x-datuplet-doc": "Shape depends on 'type': for 'select'/'drop', an array of column names to keep/remove. For 'rename', an object mapping each existing column name (key) to its new name (value); this reuses the same 'columns' key with a different shape because the component reads them from the same config field, which the platform's Form Subset (no oneOf) cannot express as two distinct properties. Docs (docs/components.md) additionally show 'drop' accepting a bare string for a single column and 'select'/'drop' accepting the same object-map shape (only its keys are read, values are ignored) — both still parse correctly if hand-authored in YAML, but only the array/object forms shown here are exposed by this schema.",
+            "items": {
+              "type": "string",
+              "description": "A column name."
+            },
+            "additionalProperties": {
+              "type": "string",
+              "description": "New name for this (old) column key. Only meaningful when type=rename; ignored for select/drop."
+            }
+          },
+          "by": {
+            "type": "array",
+            "description": "Column(s) to sort by, in priority order (sort only).",
+            "x-datuplet-doc": "Only consulted by 'sort'; ignored otherwise. The component also accepts a bare string for a single sort column when hand-authored in YAML, but this schema always emits an array.",
+            "items": {
+              "type": "string",
+              "description": "A column name."
+            }
+          },
+          "ascending": {
+            "type": "boolean",
+            "default": true,
+            "description": "Sort direction (sort only)."
+          }
+        }
+      }
+    }
+  }
+}

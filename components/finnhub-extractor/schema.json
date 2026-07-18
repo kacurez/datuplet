@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Finnhub Extractor",
+  "description": "Fetches market data from the Finnhub API: quotes, news, financials, earnings, recommendations, or insider transactions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mode"
+  ],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "quote",
+        "news",
+        "company-news",
+        "basic-financials",
+        "earnings",
+        "recommendations",
+        "insider-transactions"
+      ],
+      "description": "Which Finnhub extraction to run; determines the output table and which of the other fields apply.",
+      "x-datuplet-doc": "Each mode writes a fixed, component-internal output table name (quote -> market_data, news -> news_raw, company-news -> company_news, basic-financials -> basic_financials, earnings -> earnings, recommendations -> recommendations, insider-transactions -> insider_tx). Those names live only in the component's Go source, not in this config, so they cannot be resolved by the pipeline builder's automatic upstream-output picker (no x-datuplet-produces path can point at them) — reference the fixed name directly when wiring a downstream stage's input."
+    },
+    "symbols": {
+      "type": "array",
+      "description": "Stock ticker symbols to fetch, one call per symbol.",
+      "x-datuplet-doc": "Required for every mode except 'news' (which uses 'category' instead). Not enforced as schema-required because the component only warns and produces zero records — it does not fail the run — when a symbol-driven mode is given an empty list.",
+      "items": {
+        "type": "string",
+        "description": "A single ticker symbol, e.g. AAPL."
+      }
+    },
+    "category": {
+      "type": "string",
+      "default": "general",
+      "description": "News category (mode=news only).",
+      "x-datuplet-doc": "Only consulted in 'news' mode; ignored in every other mode. Passed directly to the Finnhub market-news endpoint (e.g. general, forex, crypto, merger)."
+    },
+    "lookback_days": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many days back to keep results (mode-dependent meaning; 0 behaves differently per mode — see notes).",
+      "x-datuplet-doc": "No single literal default applies across modes: in 'news' and 'insider-transactions', 0 (the omitted value) disables the date filter entirely (all results kept); in 'company-news', 0 is silently replaced with 2 days; in 'quote', 'basic-financials', 'earnings', and 'recommendations' this field is ignored entirely."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 4,
+      "description": "Max earnings periods to fetch per symbol (mode=earnings only).",
+      "x-datuplet-doc": "Only consulted in 'earnings' mode; ignored in every other mode. Omitted or set to 0 is replaced with 4 at runtime."
+    },
+    "apiKey": {
+      "type": "string",
+      "x-datuplet-secret": true,
+      "description": "Finnhub API token.",
+      "x-datuplet-doc": "Not schema-required: the component falls back to the FINNHUB_API_KEY environment variable when this is omitted, and only fails the run if both are empty. Prefer the $[name] secret reference over a plaintext literal."
+    }
+  }
+}
