@@ -13,6 +13,8 @@ import (
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/secrets"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 )
 
@@ -72,6 +74,57 @@ func ValidatePipeline(data []byte, reg RegistryView, pol *Policy) (*datupletv1.P
 		return nil, []Finding{{Path: "", Message: err.Error(), Severity: severityError}}, nil
 	}
 	return &p, ValidateTyped(&p, reg, pol), nil
+}
+
+// ValidatePipelineDoc is the doc-shaped front door for pipeline validation
+// (RFC 027 §5.4). It strict-decodes an envelope-free PipelineDoc, checks the
+// pipeline name against the caller's routing context, converts to the CRD
+// shape via config.DocToCR, and runs the shared semantic rules through
+// ValidateTyped. The returned *datupletv1.Pipeline is the converted CR (nil
+// only when the doc fails to decode at all).
+//
+// contextName is the name the pipeline is being saved/routed under (e.g. the
+// URL path name on a PUT). The effective name — contextName when set, else the
+// doc's own name — must be a DNS-1123 subdomain because it becomes a K8s
+// resource name. When both a contextName and a doc name are present and
+// disagree, that is an error: the doc would be stored under one name but
+// referenced under another. An empty contextName (POST /validate, no routing
+// name) skips the equality check.
+//
+// reg and pol behave exactly as in ValidateTyped: a nil reg skips registry
+// resolution and config-schema checks; a nil pol disables gateway-bound checks.
+func ValidatePipelineDoc(raw []byte, contextName string, reg RegistryView, pol *Policy) (*datupletv1.Pipeline, []Finding) {
+	doc, err := config.Parse(raw)
+	if err != nil {
+		return nil, []Finding{{Path: "", Message: err.Error(), Severity: severityError}}
+	}
+
+	var findings []Finding
+
+	effectiveName := contextName
+	if effectiveName == "" {
+		effectiveName = doc.Name
+	}
+	if effectiveName != "" {
+		for _, msg := range validation.IsDNS1123Subdomain(effectiveName) {
+			findings = append(findings, Finding{
+				Path:     "name",
+				Message:  fmt.Sprintf("invalid pipeline name %q: %s", effectiveName, msg),
+				Severity: severityError,
+			})
+		}
+	}
+	if contextName != "" && doc.Name != "" && doc.Name != contextName {
+		findings = append(findings, Finding{
+			Path:     "name",
+			Message:  fmt.Sprintf("name %q does not match the pipeline name %q it is being saved under", doc.Name, contextName),
+			Severity: severityError,
+		})
+	}
+
+	cr := config.DocToCR(doc)
+	findings = append(findings, ValidateTyped(cr, reg, pol)...)
+	return cr, findings
 }
 
 // ValidateTyped runs the semantic checks on an already-decoded Pipeline.
@@ -323,14 +376,17 @@ func validateInputs(compName string, in *datupletv1.InputSpec, stageIdx, compIdx
 				Severity: severityError,
 			})
 		}
-		// Check table or bucket is available from previous stages (skip for stage 0).
+		// Cross-stage input check: an input table that no earlier stage
+		// produces is a warning, not an error — it is assumed to pre-exist in
+		// storage (an external table seeded outside this pipeline). The run
+		// fails at read time if it turns out not to exist. (skip for stage 0).
 		if stageIdx > 0 {
 			tableKey := t.Bucket + "." + t.Table
 			if !availableTables[tableKey] && !availableBuckets[t.Bucket] {
 				findings = append(findings, Finding{
 					Path:     tablePath,
-					Message:  fmt.Sprintf("component %s: input table %q not available from previous stages", compName, tableKey),
-					Severity: severityError,
+					Message:  fmt.Sprintf("component %s: input table %q not produced by an earlier stage — assumed to pre-exist in storage; the run fails at read time if it doesn't", compName, tableKey),
+					Severity: severityWarning,
 				})
 			}
 		}
