@@ -291,8 +291,8 @@ func validateComponent(c *datupletv1.ComponentSpec, stageIdx, compIdx int, avail
 		findings = append(findings, validateOutputs(c.Name, c.Outputs, stageIdx, compIdx)...)
 	}
 
-	hasInputs := c.Inputs != nil && (len(c.Inputs.Buckets) > 0 || len(c.Inputs.Tables) > 0)
-	hasOutputs := c.Outputs != nil && (c.Outputs.DefaultBucket != "" || len(c.Outputs.Buckets) > 0 || len(c.Outputs.Tables) > 0)
+	hasInputs := componentHasInputs(c)
+	hasOutputs := componentHasOutputs(c)
 	if !hasInputs && !hasOutputs {
 		findings = append(findings, Finding{
 			Path:     base,
@@ -302,6 +302,16 @@ func validateComponent(c *datupletv1.ComponentSpec, stageIdx, compIdx int, avail
 	}
 
 	return findings
+}
+
+// componentHasInputs reports whether a component instance declares any input.
+func componentHasInputs(c *datupletv1.ComponentSpec) bool {
+	return c.Inputs != nil && (len(c.Inputs.Buckets) > 0 || len(c.Inputs.Tables) > 0)
+}
+
+// componentHasOutputs reports whether a component instance declares any output.
+func componentHasOutputs(c *datupletv1.ComponentSpec) bool {
+	return c.Outputs != nil && (c.Outputs.DefaultBucket != "" || len(c.Outputs.Buckets) > 0 || len(c.Outputs.Tables) > 0)
 }
 
 // validateInputs validates component input configuration.
@@ -627,6 +637,54 @@ func validateSecretRefs(c *datupletv1.ComponentSpec, stageIdx, compIdx int) []Fi
 	return findings
 }
 
+// checkIOCapability enforces the resolved definition's IO declaration (RFC 027
+// §4.3) against the pipeline instance's declared inputs/outputs: "none"
+// rejects any declaration, "required" rejects an absent one; "optional" (the
+// nil-io default) never fires. io is nil-safe via InputsMode/OutputsMode.
+func checkIOCapability(c *datupletv1.ComponentSpec, io *datupletv1.ComponentIO, base string) []Finding {
+	var findings []Finding
+
+	switch io.InputsMode() {
+	case "none":
+		if componentHasInputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".inputs",
+				Message:  fmt.Sprintf("component %s takes no inputs", c.Name),
+				Severity: severityError,
+			})
+		}
+	case "required":
+		if !componentHasInputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".inputs",
+				Message:  fmt.Sprintf("component %s requires at least one input", c.Name),
+				Severity: severityError,
+			})
+		}
+	}
+
+	switch io.OutputsMode() {
+	case "none":
+		if componentHasOutputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".outputs",
+				Message:  fmt.Sprintf("component %s takes no outputs", c.Name),
+				Severity: severityError,
+			})
+		}
+	case "required":
+		if !componentHasOutputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".outputs",
+				Message:  fmt.Sprintf("component %s requires at least one output", c.Name),
+				Severity: severityError,
+			})
+		}
+	}
+
+	return findings
+}
+
 // validateRegistry resolves a component against reg and validates its config
 // against the resolved version's JSON Schema. A nil reg skips both (Phase-1
 // callers during the R5 cutover; R6/R9 pass a real view). Resolution findings
@@ -652,6 +710,11 @@ func validateRegistry(c *datupletv1.ComponentSpec, stageIdx, compIdx int, reg Re
 	if rc == nil {
 		return findings
 	}
+
+	// RFC 027 §4.3: enforce the resolved definition's IO capability against
+	// this instance's declared inputs/outputs. Checked whenever the component
+	// resolves, independent of any config schema.
+	findings = append(findings, checkIOCapability(c, rc.IO, base)...)
 
 	// Phase 3: reject resource requests/limits that exceed the resolved
 	// version's registry Max, or name a resource not listed in Max. Checked

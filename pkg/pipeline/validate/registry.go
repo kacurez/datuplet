@@ -30,6 +30,12 @@ type ResolvedComponent struct {
 	ConfigSchema *jsonschema.Schema
 	Resources    datupletv1.ComponentResources
 
+	// IO is the resolved definition's IO capability declaration (RFC 027
+	// §4.3). Nil means the definition declares no io — callers must go
+	// through IO.InputsMode()/OutputsMode() (both nil-safe) rather than
+	// inspecting the fields directly.
+	IO *datupletv1.ComponentIO
+
 	// rawConfigSchema is the source text ConfigSchema was compiled from.
 	// ValidateConfig needs it for its x-datuplet-secret / type introspection.
 	// Only registry impls in this package (StaticRegistry) populate it; other
@@ -76,6 +82,7 @@ func (r StaticRegistry) Resolve(component, version string) (*ResolvedComponent, 
 		Version:    ver.Version,
 		Image:      ver.Image,
 		Prerelease: ver.Prerelease,
+		IO:         spec.IO,
 	}
 	if ver.Resources != nil {
 		rc.Resources = *ver.Resources

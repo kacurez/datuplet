@@ -27,6 +27,18 @@ type componentVersionJSON struct {
 	Image      string `json:"image"`
 }
 
+// componentIOJSON is the catalog's io capability object (RFC 027 §4.3),
+// always present with resolved (never-empty) mode strings — see
+// datupletv1.ComponentIO.InputsMode/OutputsMode.
+type componentIOJSON struct {
+	Inputs  string `json:"inputs"`
+	Outputs string `json:"outputs"`
+}
+
+func componentIOToJSON(io *datupletv1.ComponentIO) componentIOJSON {
+	return componentIOJSON{Inputs: io.InputsMode(), Outputs: io.OutputsMode()}
+}
+
 // componentSummaryJSON is one entry of GET /api/v1/components.
 type componentSummaryJSON struct {
 	Name           string                 `json:"name"`
@@ -34,6 +46,7 @@ type componentSummaryJSON struct {
 	Description    string                 `json:"description"`
 	Deprecated     bool                   `json:"deprecated"`
 	DefaultVersion string                 `json:"defaultVersion"`
+	IO             componentIOJSON        `json:"io"`
 	Versions       []componentVersionJSON `json:"versions"`
 }
 
@@ -53,6 +66,7 @@ type componentDetailJSON struct {
 	Description    string                       `json:"description"`
 	Deprecated     bool                         `json:"deprecated"`
 	DefaultVersion string                       `json:"defaultVersion"`
+	IO             componentIOJSON              `json:"io"`
 	Versions       []componentDetailVersionJSON `json:"versions"`
 }
 
@@ -63,6 +77,7 @@ func componentSummaryToJSON(d datupletv1.ComponentDefinition) componentSummaryJS
 		Description:    d.Spec.Description,
 		Deprecated:     d.Spec.Deprecated,
 		DefaultVersion: d.Spec.DefaultVersion,
+		IO:             componentIOToJSON(d.Spec.IO),
 		Versions:       make([]componentVersionJSON, 0, len(d.Spec.Versions)),
 	}
 	for _, v := range d.Spec.Versions {
@@ -80,6 +95,7 @@ func componentDetailToJSON(d datupletv1.ComponentDefinition) componentDetailJSON
 		Description:    d.Spec.Description,
 		Deprecated:     d.Spec.Deprecated,
 		DefaultVersion: d.Spec.DefaultVersion,
+		IO:             componentIOToJSON(d.Spec.IO),
 		Versions:       make([]componentDetailVersionJSON, 0, len(d.Spec.Versions)),
 	}
 	for _, v := range d.Spec.Versions {

@@ -235,6 +235,116 @@ func TestValidateTyped_ConfigSchemaViolation_FullPath(t *testing.T) {
 	}
 }
 
+// pipelineWithComponentIO builds a single-stage pipeline whose sole component
+// carries the given name plus explicit inputs/outputs presence, for exercising
+// the IO-capability rules (RFC 027 §4.3).
+func pipelineWithComponentIO(name string, withInputs, withOutputs bool) *datupletv1.Pipeline {
+	c := datupletv1.ComponentSpec{Name: name, Component: name}
+	if withInputs {
+		c.Inputs = &datupletv1.InputSpec{Buckets: []string{"raw"}}
+	}
+	if withOutputs {
+		c.Outputs = &datupletv1.OutputSpec{DefaultBucket: "processed"}
+	}
+	p := &datupletv1.Pipeline{
+		Spec: datupletv1.PipelineSpec{
+			Stages: []datupletv1.StageSpec{{Name: "s0", Components: []datupletv1.ComponentSpec{c}}},
+		},
+	}
+	p.Name = "p"
+	return p
+}
+
+func TestValidateTyped_IOCapability_InputsNone_RejectsDeclaredInputs(t *testing.T) {
+	reg := StaticRegistry{
+		"data-generator": {Spec: datupletv1.ComponentDefinitionSpec{
+			IO:       &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"},
+			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
+		}},
+	}
+	p := pipelineWithComponentIO("data-generator", true, true)
+	findings := ValidateTyped(p, reg, nil)
+	f, ok := findingAt(findings, "stages[0].components[0].inputs")
+	if !ok {
+		t.Fatalf("want a finding at stages[0].components[0].inputs, got %+v", findings)
+	}
+	if f.Severity != severityError || f.Message != "component data-generator takes no inputs" {
+		t.Fatalf("unexpected finding: %+v", f)
+	}
+}
+
+func TestValidateTyped_IOCapability_InputsRequired_RejectsMissingInputs(t *testing.T) {
+	reg := StaticRegistry{
+		"sql-transform": {Spec: datupletv1.ComponentDefinitionSpec{
+			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "required"},
+			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
+		}},
+	}
+	p := pipelineWithComponentIO("sql-transform", false, true)
+	findings := ValidateTyped(p, reg, nil)
+	f, ok := findingAt(findings, "stages[0].components[0].inputs")
+	if !ok {
+		t.Fatalf("want a finding at stages[0].components[0].inputs, got %+v", findings)
+	}
+	if f.Severity != severityError || f.Message != "component sql-transform requires at least one input" {
+		t.Fatalf("unexpected finding: %+v", f)
+	}
+}
+
+func TestValidateTyped_IOCapability_OutputsNone_RejectsDeclaredOutputs(t *testing.T) {
+	reg := StaticRegistry{
+		"stdout-writer": {Spec: datupletv1.ComponentDefinitionSpec{
+			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "none"},
+			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
+		}},
+	}
+	p := pipelineWithComponentIO("stdout-writer", true, true)
+	findings := ValidateTyped(p, reg, nil)
+	f, ok := findingAt(findings, "stages[0].components[0].outputs")
+	if !ok {
+		t.Fatalf("want a finding at stages[0].components[0].outputs, got %+v", findings)
+	}
+	if f.Severity != severityError || f.Message != "component stdout-writer takes no outputs" {
+		t.Fatalf("unexpected finding: %+v", f)
+	}
+}
+
+func TestValidateTyped_IOCapability_OutputsRequired_RejectsMissingOutputs(t *testing.T) {
+	reg := StaticRegistry{
+		"stdout-writer": {Spec: datupletv1.ComponentDefinitionSpec{
+			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "required"},
+			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
+		}},
+	}
+	p := pipelineWithComponentIO("stdout-writer", true, false)
+	findings := ValidateTyped(p, reg, nil)
+	f, ok := findingAt(findings, "stages[0].components[0].outputs")
+	if !ok {
+		t.Fatalf("want a finding at stages[0].components[0].outputs, got %+v", findings)
+	}
+	if f.Severity != severityError || f.Message != "component stdout-writer requires at least one output" {
+		t.Fatalf("unexpected finding: %+v", f)
+	}
+}
+
+func TestValidateTyped_IOCapability_OptionalDefault_NoFindings(t *testing.T) {
+	// A component with no io declaration defaults to optional/optional: any
+	// combination of inputs/outputs (including neither) is acceptable from
+	// the IO-capability rules' point of view.
+	reg := StaticRegistry{
+		"generic": {Spec: datupletv1.ComponentDefinitionSpec{
+			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
+		}},
+	}
+	p := pipelineWithComponentIO("generic", true, true)
+	findings := ValidateTyped(p, reg, nil)
+	for _, f := range findings {
+		if strings.Contains(f.Message, "takes no") || strings.Contains(f.Message, "requires at least one") {
+			t.Fatalf("optional/optional (no io declared) must not produce IO-capability findings, got %+v", findings)
+		}
+	}
+}
+
 func TestValidateTyped_NilRegistry_SkipsResolution(t *testing.T) {
 	// "ghost" is in no registry, but a nil registry must skip resolution
 	// entirely, so no "unknown component" finding is produced.
