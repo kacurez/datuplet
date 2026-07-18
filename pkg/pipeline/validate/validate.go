@@ -122,6 +122,11 @@ func ValidatePipelineDoc(raw []byte, contextName string, reg RegistryView, pol *
 		})
 	}
 
+	// Both checks above have run against the original body-supplied doc.Name;
+	// only now do we apply the effective name so the converted CR (and the
+	// metadata.name-required check in ValidateTyped) sees it, per spec §3
+	// ("name" is optional in the body when the route/CLI supplies contextName).
+	doc.Name = effectiveName
 	cr := config.DocToCR(doc)
 	findings = append(findings, ValidateTyped(cr, reg, pol)...)
 	return cr, findings

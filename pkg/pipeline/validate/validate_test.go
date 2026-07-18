@@ -528,6 +528,44 @@ func TestValidatePipelineDocNameContext(t *testing.T) {
 	forbidFinding(t, fs, "does not match")
 }
 
+// TestValidatePipelineDocEffectiveName is a regression test for the bug where
+// effectiveName (contextName when the body omits name) was used only for the
+// DNS-1123 check and never written back onto doc.Name before config.DocToCR,
+// so a body-omits-name PUT/validate/trigger request produced a CR with an
+// empty ObjectMeta.Name and spuriously failed the "metadata.name is required"
+// check in ValidateTyped.
+func TestValidatePipelineDocEffectiveName(t *testing.T) {
+	validBody := func(nameLine string) []byte {
+		return []byte(nameLine + `stages:
+  - name: a
+    components:
+      - {name: c1, component: x, outputs: {defaultBucket: raw}}
+`)
+	}
+
+	t.Run("name absent, contextName supplies it", func(t *testing.T) {
+		cr, fs := ValidatePipelineDoc(validBody(""), "my-pipeline", nil, nil)
+		forbidFinding(t, fs, "metadata.name is required")
+		if cr == nil || cr.Name != "my-pipeline" {
+			t.Fatalf("want cr.Name == %q, got %+v", "my-pipeline", cr)
+		}
+	})
+
+	t.Run("name present and matches contextName", func(t *testing.T) {
+		cr, fs := ValidatePipelineDoc(validBody("name: my-pipeline\n"), "my-pipeline", nil, nil)
+		forbidFinding(t, fs, "metadata.name is required")
+		forbidFinding(t, fs, "does not match")
+		if cr == nil || cr.Name != "my-pipeline" {
+			t.Fatalf("want cr.Name == %q, got %+v", "my-pipeline", cr)
+		}
+	})
+
+	t.Run("name present and mismatches contextName still flagged", func(t *testing.T) {
+		_, fs := ValidatePipelineDoc(validBody("name: other\n"), "my-pipeline", nil, nil)
+		requireFinding(t, fs, "error", `name "other" does not match`)
+	})
+}
+
 func TestUpstreamInputDemotedToWarning(t *testing.T) {
 	body := []byte(`name: p
 stages:

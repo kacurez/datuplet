@@ -207,19 +207,12 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// The doc's own name (if set) must match the URL name: otherwise
-	// ApplyPipelineCRD at run-trigger time would create a CRD under the
-	// doc's name while the PipelineRun would reference the URL name, and
-	// the operator would fail to find the Pipeline. ValidatePipelineDoc
-	// already folds this into `findings` as an error Finding, but that
-	// check runs after the diff-gate below (which can 403 first) — keep
-	// this fast, early-returning duplicate so a name mismatch always wins
-	// with a clear 400, matching the pre-RFC-027 behavior.
-	if pl.Name != "" && pl.Name != name {
-		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("pipeline name %q does not match URL name %q", pl.Name, name))
-		return
-	}
+	// NOTE: pl.Name is always the *effective* name here (ValidatePipelineDoc
+	// applies contextName — always non-empty for PUT — onto the returned CR),
+	// so a `pl.Name != name` early-return can never fire; the doc-vs-URL name
+	// mismatch is caught purely via the "name" Finding in `findings` below,
+	// surfaced through the ordinary error-findings 400 path (RFC 027 fix:
+	// see ValidatePipelineDoc doc comment).
 
 	// RFC 026 §4.4 resources/gateway diff-gate. A non-superadmin may not
 	// add/alter/remove any component `resources` block, nor exceed a gateway
@@ -252,7 +245,10 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		}
 		// Re-validate against the policy so gateway-bound violations surface;
 		// reject any as 403 for a non-superadmin (before the 400 findings path).
-		findings = validate.ValidateTyped(pl, s.registry, s.policy)
+		// Re-running ValidatePipelineDoc (not ValidateTyped alone) keeps the
+		// ValidatePipelineDoc-only findings (name-format, name-mismatch) that a
+		// bare ValidateTyped call would silently drop — mirrors handleValidatePipeline.
+		_, findings = validate.ValidatePipelineDoc(body, name, s.registry, s.policy)
 		for _, f := range findings {
 			if f.Severity == "error" && strings.HasPrefix(f.Path, "gateway.") {
 				writeError(w, http.StatusForbidden,
