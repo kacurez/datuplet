@@ -536,6 +536,53 @@ func TestListPipelines(t *testing.T) {
 	}
 }
 
+// TestListPipelines_EmptyDescriptionKeyPresent proves the RFC 027 S6 fix: the
+// list item's "description" field has no `omitempty`, so an empty description
+// must still appear as `"description":""` in the JSON, not be dropped from the
+// object entirely. Decoding into a typed Go struct can't distinguish those two
+// cases (an absent key would just decode to the zero value ""), so this test
+// decodes into a raw map and checks key presence directly.
+func TestListPipelines_EmptyDescriptionKeyPresent(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-list-empty-desc"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
+
+	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines", nil)
+	req.AddCookie(cookie)
+	resp, err := stdhttp.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var items []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("list len = %d, want 1", len(items))
+	}
+	desc, ok := items[0]["description"]
+	if !ok {
+		t.Fatalf("list item missing %q key entirely, want key present with empty value; item = %+v", "description", items[0])
+	}
+	if desc != "" {
+		t.Errorf("list item description = %v, want empty string", desc)
+	}
+}
+
 func TestGetPipeline_NotMember(t *testing.T) {
 	ts, pool, _, cleanup := freshServer(t)
 	defer cleanup()
