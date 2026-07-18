@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Data Generator",
+  "description": "Generates random or literal rows inline from pipeline YAML.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tables"
+  ],
+  "x-datuplet-produces": "tables[*].name",
+  "properties": {
+    "tables": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One or more output tables to generate.",
+      "x-datuplet-doc": "Each entry produces one output table. The table's name becomes an output logical table other components can consume (see x-datuplet-produces at the schema root).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "description": "A single output table. Choose exactly one generation mode: 'random' or 'literal'.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
+            "description": "Output table name (the destination logical table).",
+            "x-datuplet-doc": "Must be a valid identifier: ASCII letters, digits, underscores, hyphens and dots, starting with a letter, up to 128 characters (^[A-Za-z][A-Za-z0-9_.-]{0,127}$). The component rejects invalid names at start."
+          },
+          "rowInsertSpeed": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Milliseconds to sleep between emitted rows (0 = no throttling).",
+            "x-datuplet-doc": "Honoured by both random and literal modes. Use it to simulate a slow upstream source when exercising backpressure or timing behaviour in a test pipeline. The runtime default is 0 (rows are emitted as fast as possible)."
+          },
+          "random": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema",
+              "limit"
+            ],
+            "description": "Random-data mode: a column-to-type schema plus stop limits.",
+            "x-datuplet-doc": "Set exactly one of 'random' or 'literal' on a table. Setting both, or neither, is a component-enforced semantic invariant: the data-generator fails fast at start with exit 1 (this cannot be expressed in the schema itself). In random mode both 'schema' and 'limit' are required.",
+            "properties": {
+              "schema": {
+                "type": "object",
+                "description": "Map of column name to column type.",
+                "x-datuplet-doc": "At least one column is required. Column names must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$ — the component enforces this at start (JSON Schema cannot pattern-check map keys within the Form Subset). Allowed types: string, int, long, float, double, boolean, date, timestamp, now, uuid.",
+                "additionalProperties": {
+                  "type": "string",
+                  "enum": [
+                    "string",
+                    "int",
+                    "long",
+                    "float",
+                    "double",
+                    "boolean",
+                    "date",
+                    "timestamp",
+                    "now",
+                    "uuid"
+                  ],
+                  "description": "The generated data type for this column."
+                }
+              },
+              "limit": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Stop condition(s); generation stops when the first limit trips (OR semantics).",
+                "x-datuplet-doc": "At least one of rowsCount / sizeInBytes / timeoutInSeconds must be non-zero — the component enforces this at start and fails with exit 1 if all are zero. A field left at 0 is disabled.",
+                "properties": {
+                  "rowsCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Stop after this many rows have been emitted (0 = disabled).",
+                    "x-datuplet-doc": "When userErrorMessage is set, the injected failure fires at a random row in [0, rowsCount)."
+                  },
+                  "sizeInBytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Stop after approximately this many bytes have been written (0 = disabled).",
+                    "x-datuplet-doc": "Measured against generated output size; the first limit to trip wins across all three limit fields."
+                  },
+                  "timeoutInSeconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Stop after this many seconds of wall-clock generation (0 = disabled).",
+                    "x-datuplet-doc": "A time-based ceiling, useful with rowInsertSpeed to bound a slow-source simulation."
+                  }
+                }
+              },
+              "userErrorMessage": {
+                "type": "string",
+                "description": "If set, inject a user-error failure (exit 1) at a random row.",
+                "x-datuplet-doc": "Random mode only. Fires a user-error exit (code 1) at a random row in [0, limit.rowsCount), emitting the message on stdout with the 'DUPLET_STATUS_MESSAGE:' prefix. This is a first-class platform-test tool for exercising the failure path; leave unset for normal generation."
+              }
+            }
+          },
+          "literal": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "columns",
+              "rows"
+            ],
+            "description": "Literal-data mode: explicit column names and row values (types inferred).",
+            "x-datuplet-doc": "Set exactly one of 'random' or 'literal' on a table. Setting both, or neither, is a component-enforced semantic invariant: the data-generator fails fast at start with exit 1 (this cannot be expressed in the schema itself). Column types are inferred from the first non-null value in each column; a column of all-null values or with mixed value types is rejected at start.",
+            "properties": {
+              "columns": {
+                "type": "array",
+                "description": "Column names, one per value position in 'rows'.",
+                "x-datuplet-doc": "Required and non-empty. Arity must equal the width of every row. Each name must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$ and be unique; the component enforces this at start.",
+                "items": {
+                  "type": "string",
+                  "description": "A single column name."
+                }
+              },
+              "rows": {
+                "type": "array",
+                "description": "Row values; each inner array is one row aligned positionally to 'columns'.",
+                "x-datuplet-doc": "At least one row is required and all rows must share the same arity. Cell values may be string, number, boolean, or null; the schema (Form Subset) cannot type a heterogeneous value matrix, so per-cell types are inferred and validated by the component.",
+                "items": {
+                  "type": "array",
+                  "description": "One row: a list of scalar values (string / number / boolean / null) aligned to 'columns'."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
