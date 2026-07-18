@@ -22,8 +22,17 @@ func TestDocCRDocRoundTripLossless(t *testing.T) {
 			Resources: &ResourceSpec{Memory: "1Gi", CPU: "500m"},
 		}}}},
 	}
+	// Description is kept in the fixture (to prove it doesn't crash or
+	// corrupt other fields on the way through) but is expected to be lost:
+	// the CR has no Description field per spec §3, so the round-tripped
+	// result must match a copy of the fixture with Description zeroed out.
+	// Description's canonical home is the DB (wired in a later task), not
+	// the CR.
+	want := *doc
+	want.Description = ""
+
 	got := CRToDoc(DocToCR(doc))
-	if diff := cmp.Diff(doc, got); diff != "" {
+	if diff := cmp.Diff(&want, got); diff != "" {
 		t.Fatalf("round trip lost data (-want +got):\n%s", diff)
 	}
 }

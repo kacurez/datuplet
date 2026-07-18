@@ -19,17 +19,14 @@ import (
 //   - PartitionFieldSpec: doc "source_column" <-> CRD "sourceColumn"
 //
 // PipelineSpec has no Description field (the CRD is unchanged by RFC 027 -
-// see spec §3), so Description round-trips through the descriptionAnnotation
-// ObjectMeta annotation instead of a spec field; this needs no CRD manifest
-// change since `metadata` is left as a generic object in the CRD schema.
+// see spec §3): Description does NOT round-trip through the CR at all.
+// Its canonical home is the DB (store.Pipeline.Description, wired in a
+// later task); a Pipeline produced by CRToDoc always has Description == ""
+// because the CR never carried it in the first place, by spec design.
 //
 // Both directions are plain field-by-field struct copies (no reflection) so
 // the round-trip test (convert_test.go) is a meaningful tripwire against
 // silently dropped fields.
-
-// descriptionAnnotation carries Pipeline.Description across the CR boundary
-// since PipelineSpec has no Description field.
-const descriptionAnnotation = "datuplet.io/description"
 
 // DocToCR converts a PipelineDoc into the typed CRD representation, e.g. for
 // admission or storage as a Pipeline custom resource.
@@ -41,9 +38,6 @@ func DocToCR(p *Pipeline) *datupletv1.Pipeline {
 			Gateway: gatewayToCRD(p.Gateway),
 		},
 	}
-	if p.Description != "" {
-		cr.ObjectMeta.Annotations = map[string]string{descriptionAnnotation: p.Description}
-	}
 	for _, s := range p.Stages {
 		cr.Spec.Stages = append(cr.Spec.Stages, stageToCRD(s))
 	}
@@ -53,9 +47,8 @@ func DocToCR(p *Pipeline) *datupletv1.Pipeline {
 // CRToDoc converts the typed CRD representation back into a PipelineDoc.
 func CRToDoc(cr *datupletv1.Pipeline) *Pipeline {
 	out := &Pipeline{
-		Name:        cr.Name,
-		Description: cr.ObjectMeta.Annotations[descriptionAnnotation],
-		Gateway:     gatewayFromCRD(cr.Spec.Gateway),
+		Name:    cr.Name,
+		Gateway: gatewayFromCRD(cr.Spec.Gateway),
 	}
 	for _, s := range cr.Spec.Stages {
 		out.Stages = append(out.Stages, stageFromCRD(s))
@@ -266,16 +259,29 @@ func outputsFromCRD(o *datupletv1.OutputSpec) *OutputSpec {
 
 // resourcesToCRD expands the runtime's flat memory/cpu strings into the
 // CRD's corev1.ResourceRequirements limits, only where set.
+//
+// A malformed quantity string is silently dropped (left absent from the
+// resulting ResourceList) rather than panicking, since DocToCR's signature
+// has no error return. There is currently no resource-quantity-syntax check
+// upstream of DocToCR (ValidatePipelineDoc runs shared validation rules
+// AFTER DocToCR, per spec §5.4) — carried forward as an S3 TODO: S3 owns
+// re-pointing validation and should add resource-quantity-syntax validation
+// BEFORE conversion so malformed values become clean findings instead of
+// silently-dropped resources.
 func resourcesToCRD(r *ResourceSpec) *corev1.ResourceRequirements {
 	if r == nil || (r.Memory == "" && r.CPU == "") {
 		return nil
 	}
 	limits := corev1.ResourceList{}
 	if r.Memory != "" {
-		limits[corev1.ResourceMemory] = resource.MustParse(r.Memory)
+		if q, err := resource.ParseQuantity(r.Memory); err == nil {
+			limits[corev1.ResourceMemory] = q
+		}
 	}
 	if r.CPU != "" {
-		limits[corev1.ResourceCPU] = resource.MustParse(r.CPU)
+		if q, err := resource.ParseQuantity(r.CPU); err == nil {
+			limits[corev1.ResourceCPU] = q
+		}
 	}
 	return &corev1.ResourceRequirements{Limits: limits}
 }
