@@ -375,6 +375,12 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	if s.resolver != nil && s.authzr != nil && s.pipelines != nil {
+		// Registered before the {name} PUT route: "validate" is a reserved
+		// pipeline name (handlePutPipeline rejects it), so the literal
+		// segment here can never collide with a create/update by that name.
+		// Different HTTP method (POST vs PUT) means there's no mux ambiguity
+		// either way, but the ordering documents the intent.
+		mux.Handle("POST /api/v1/projects/{pid}/pipelines/validate", auth.WithUser(s.resolver, http.HandlerFunc(s.handleValidatePipeline)))
 		mux.Handle("PUT /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handlePutPipeline)))
 		mux.Handle("GET /api/v1/projects/{pid}/pipelines", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListPipelines)))
 		mux.Handle("GET /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleGetPipeline)))

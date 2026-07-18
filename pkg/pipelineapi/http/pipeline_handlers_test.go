@@ -1293,3 +1293,281 @@ func TestPutPipeline_NonSuperadmin_StoreReadError_ServiceUnavailable(t *testing.
 		t.Fatalf("status = %d, want 503 (fail closed on read error); body=%s", resp.StatusCode, body)
 	}
 }
+
+// --- RFC 027 S7: POST /pipelines/validate ---
+
+// postValidate POSTs body to the validate endpoint. contentType may be empty
+// to exercise the default (YAML-or-JSON-as-YAML-subset) parse path.
+func postValidate(t *testing.T, url string, body []byte, contentType string, cookie *stdhttp.Cookie) *stdhttp.Response {
+	t.Helper()
+	req, _ := stdhttp.NewRequest("POST", url, bytes.NewReader(body))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.AddCookie(cookie)
+	resp, err := stdhttp.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post validate: %v", err)
+	}
+	return resp
+}
+
+// TestValidatePipeline_ValidDoc_EmptyFindingsNotStored covers the headline
+// happy path: a valid doc gets 200 {"findings":[]} (literal empty array, not
+// null) and validate never writes to the store.
+func TestValidatePipeline_ValidDoc_EmptyFindingsNotStored(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-validate-valid"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := postValidate(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte(validPipelineYAML), "application/yaml", cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"findings":[]`) {
+		t.Fatalf("body = %s, want a literal empty findings array, not null", body)
+	}
+
+	if _, err := store.GetPipelineByName(ctx, pool, proj.ID, "etl"); err == nil {
+		t.Fatalf("validate must not persist anything, but GetPipelineByName found a row")
+	}
+}
+
+// TestValidatePipeline_ErrorFinding_Not400 proves the core status-code
+// contract difference from PUT: a doc with an error-severity finding (here,
+// an unresolvable component) still comes back 200 — validation outcomes are
+// findings, never HTTP errors (spec §5.2).
+func TestValidatePipeline_ErrorFinding_Not400(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerWithRegistry(t, newFakeComponentRegistry())
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-validate-error-finding"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := postValidate(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte(validPipelineYAML), "application/yaml", cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (errors are findings, not 400); body=%s", resp.StatusCode, body)
+	}
+	var fb secretsFindingsBody
+	if err := json.Unmarshal([]byte(body), &fb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range fb.Findings {
+		if f.Severity == "error" && strings.Contains(f.Message, `unknown component "datuplet/test:latest"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want an 'unknown component' error finding, got %+v", fb.Findings)
+	}
+}
+
+// TestValidatePipeline_UnreadableBody_BadRequest covers the one case that
+// stays a 400: a body that cannot be decoded as a PipelineDoc at all.
+func TestValidatePipeline_UnreadableBody_BadRequest(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-validate-unreadable"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := postValidate(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte("not: [valid yaml"), "application/yaml", cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		body, _ := readAll(resp)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+}
+
+// TestValidatePipeline_NameGiven_ResourceGate_SameResources_NoFinding proves
+// that a non-superadmin resubmitting the identical stored resources block via
+// ?name= passes with no resource-gate finding — unchanged is not a
+// modification, mirroring PUT's 204 case (204 there, no finding here).
+func TestValidatePipeline_NameGiven_ResourceGate_SameResources_NoFinding(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-resgate-same")
+	yaml := pipelineYAMLWithCPU("2")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", yaml); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := postValidate(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/validate?name=etl", yaml, "application/yaml", cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	var fb secretsFindingsBody
+	if err := json.Unmarshal([]byte(body), &fb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, f := range fb.Findings {
+		if strings.Contains(f.Message, "superadmin") {
+			t.Fatalf("unexpected resource-gate finding for unchanged resources: %+v", fb.Findings)
+		}
+	}
+}
+
+// TestValidatePipeline_NameGiven_ResourceGate_Added_Finding proves the
+// resource-gate diff runs against the stored doc when ?name= is given: adding
+// a resources block a non-superadmin didn't have before yields an error
+// finding (never the 403 PUT would return).
+func TestValidatePipeline_NameGiven_ResourceGate_Added_Finding(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-resgate-added")
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
+		t.Fatalf("seed stored pipeline: %v", err)
+	}
+
+	resp := postValidate(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/validate?name=etl", pipelineYAMLWithCPU("2"), "application/yaml", cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (resource-gate result is a finding, not 403); body=%s", resp.StatusCode, body)
+	}
+	var fb secretsFindingsBody
+	if err := json.Unmarshal([]byte(body), &fb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range fb.Findings {
+		if f.Severity == "error" && strings.Contains(f.Message, "superadmin") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a resource-gate finding naming superadmin, got %+v", fb.Findings)
+	}
+}
+
+// TestValidatePipeline_NoName_CreateSemantics_ResourcesFinding proves that
+// without ?name= the resource-gate validates with create semantics: any
+// resources block from a non-superadmin is a finding, since there is no
+// stored doc to diff against (an absent name is treated as "no old
+// resources", same as PUT's first-create path).
+func TestValidatePipeline_NoName_CreateSemantics_ResourcesFinding(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-create-sem")
+
+	resp := postValidate(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/validate", pipelineYAMLWithCPU("2"), "application/yaml", cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	var fb secretsFindingsBody
+	if err := json.Unmarshal([]byte(body), &fb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range fb.Findings {
+		if f.Severity == "error" && strings.Contains(f.Message, "superadmin") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a create-semantics resource-gate finding, got %+v", fb.Findings)
+	}
+}
+
+// TestValidatePipeline_NonSuperadmin_NameMismatchFindingSurvives is a
+// regression test: the non-superadmin branch re-validates against the
+// policy to surface gateway-bound findings (mirroring PUT's diff-gate), and
+// an earlier version of that re-validation used validate.ValidateTyped
+// directly — which silently dropped the doc-name-vs-?name= mismatch finding
+// that only validate.ValidatePipelineDoc folds in (ValidateTyped has no
+// notion of the routing-context name at all). This proves that finding
+// still survives the non-superadmin path.
+func TestValidatePipeline_NonSuperadmin_NameMismatchFindingSurvives(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+	defer cleanup()
+	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-name-mismatch")
+
+	mismatched := `{
+  "name": "wrong-name",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}}
+      ]
+    }
+  ]
+}`
+	resp := postValidate(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/validate?name=etl", []byte(mismatched), "application/yaml", cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	var fb secretsFindingsBody
+	if err := json.Unmarshal([]byte(body), &fb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range fb.Findings {
+		if f.Severity == "error" && strings.Contains(f.Message, `does not match the pipeline name`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a name-mismatch finding to survive the non-superadmin diff-gate path, got %+v", fb.Findings)
+	}
+}
+
+// TestPutPipeline_ReservedNameValidate_BadRequest proves the reserved-name
+// guard: "validate" is not a valid create target for PUT (it would make the
+// literal /pipelines/validate segment ambiguous with the POST validate
+// route), so PUT rejects it with a finding rather than silently creating a
+// pipeline literally named "validate".
+func TestPutPipeline_ReservedNameValidate_BadRequest(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-reserved-validate"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte(validPipelineYAML), cookie)
+	defer resp.Body.Close()
+	body, _ := readAll(resp)
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "reserved") {
+		t.Errorf("400 body = %q, want it to mention the reserved name", body)
+	}
+}

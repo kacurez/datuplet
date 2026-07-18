@@ -141,6 +141,22 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "pipeline name required")
 		return
 	}
+	// "validate" is reserved: POST /api/v1/projects/{pid}/pipelines/validate
+	// is the S7 validate-without-save endpoint. It can never collide with
+	// this route (different HTTP method), but a pipeline literally named
+	// "validate" would still be a confusing footgun, so it's rejected here
+	// with the same findings-shaped 400 the rest of PUT's early checks use.
+	if name == "validate" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "validation failed",
+			"findings": []validate.Finding{{
+				Path:     "name",
+				Message:  `pipeline name "validate" is reserved`,
+				Severity: "error",
+			}},
+		})
+		return
+	}
 	// The name becomes a K8s Pipeline/PipelineRun resource name, so it
 	// must satisfy DNS-1123 subdomain rules (lowercase alphanumerics
 	// plus '-' and '.', max 253 chars). Rejecting here yields a clean
@@ -314,6 +330,107 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleValidatePipeline runs the full PUT-time validation without
+// persisting (RFC 027 §5.2). Status contract: 200 {"findings":[...]} for
+// every readable body — validation outcomes (errors and warnings alike) are
+// findings, never HTTP errors; 400/413 stay reserved for a body that cannot
+// be read/decoded as a PipelineDoc at all or exceeds the size cap; 5xx is
+// reserved for infrastructure failures (the store read backing the resource
+// gate, or the superadmin check). Same authz as PUT.
+//
+// name is optional (?name=): when given, the resource/gateway diff-gate below
+// loads the stored doc under that name and diffs against it, mirroring PUT;
+// when absent (or nothing stored under it), the diff-gate validates with
+// create semantics (any component resources from a non-superadmin is a
+// finding, same as PUT's first-create path).
+func (s *Server) handleValidatePipeline(w http.ResponseWriter, r *http.Request) {
+	userID, projectID, ok := s.mustHaveRelation(w, r, "data_admin")
+	if !ok {
+		return
+	}
+	name := r.URL.Query().Get("name")
+
+	// Same body-read pattern as PUT (S6): 1 MiB cap, and a declared
+	// Content-Type of application/json must actually be valid JSON. Both are
+	// "unreadable body" cases — this handler's only 413/400-for-unreadable
+	// paths — everything past this point becomes a Finding, never an HTTP
+	// error.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "body exceeds 1 MiB: "+err.Error())
+		return
+	}
+	if mediaType, _, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type")); mtErr == nil && mediaType == "application/json" {
+		if !json.Valid(body) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "validation failed",
+				"findings": []validate.Finding{{
+					Message:  "Content-Type is application/json but the body is not valid JSON",
+					Severity: "error",
+				}},
+			})
+			return
+		}
+	}
+
+	pl, findings := validate.ValidatePipelineDoc(body, name, s.registry, nil)
+	// pl is nil only when the body could not be decoded as a PipelineDoc at
+	// all (e.g. the legacy Kubernetes CR envelope, or plain invalid
+	// YAML/JSON syntax) — the one case that stays an "unreadable body" 400
+	// rather than a finding; every other outcome (name mismatch, unknown
+	// component, over-max resources, ...) rides in `findings` below with a
+	// 200, per the status contract.
+	if pl == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "validation failed", "findings": findings,
+		})
+		return
+	}
+
+	// RFC 026 §4.4 resources/gateway diff-gate, mirrored from PUT — but
+	// surfaced as a Finding rather than a 403: validate never returns an HTTP
+	// error for a validation outcome.
+	isSuperadmin, ok := s.isRequestSuperadmin(w, r, userID)
+	if !ok {
+		return // 503/500 already written
+	}
+	if !isSuperadmin {
+		oldP := &datupletv1.Pipeline{}
+		if name != "" {
+			oldP, err = s.storedPipelineSpec(r.Context(), projectID, name)
+			if err != nil {
+				// Fail closed, same rationale as PUT's diff-gate: without the
+				// stored spec the resource-gate finding below can't be trusted.
+				http.Error(w, "could not read current pipeline to verify the resources gate", http.StatusInternalServerError)
+				return
+			}
+		}
+		modified := resourcesModified(oldP, pl)
+		// Re-run the same doc through the policy-applied ruleset so
+		// gateway-bound violations surface for a non-superadmin too (PUT
+		// rejects these with 403; here they ride along as ordinary error
+		// findings instead). PUT gets away with a plain ValidateTyped
+		// re-check here because it already early-returns on a name-format or
+		// name-mismatch problem before ever reaching the diff-gate; validate
+		// never early-returns on a readable body, so re-deriving via
+		// ValidateTyped alone would silently drop those two ValidatePipelineDoc-
+		// only findings. Re-running ValidatePipelineDoc instead keeps them.
+		_, findings = validate.ValidatePipelineDoc(body, name, s.registry, s.policy)
+		if modified {
+			findings = append(findings, validate.Finding{
+				Message:  "modifying component resources requires superadmin privileges",
+				Severity: "error",
+			})
+		}
+	}
+
+	if findings == nil {
+		findings = []validate.Finding{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"findings": findings})
 }
 
 // isRequestSuperadmin reports whether the request's user is a platform
