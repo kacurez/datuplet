@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
-	pipelineconfig "github.com/datuplet/datuplet/pkg/pipeline/config"
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"sigs.k8s.io/yaml"
 )
 
@@ -43,8 +43,19 @@ func TestExamplesAreValid(t *testing.T) {
 					if err := yaml.UnmarshalStrict([]byte(doc), &p); err != nil {
 						t.Errorf("doc %d strict decode: %v", i, err)
 					}
-					if _, err := pipelineconfig.Parse([]byte(doc)); err != nil {
-						t.Errorf("doc %d semantic validation: %v", i, err)
+					// Examples stay in the K8s CRD envelope shape (kubectl
+					// apply-able); validate.ValidatePipeline (not
+					// config.Parse, which post-RFC-027 is the envelope-free
+					// PipelineDoc front door) runs the same semantic checks
+					// pipeline-api's save path runs.
+					if cr, findings, err := validate.ValidatePipeline([]byte(doc), nil, nil); err != nil || cr == nil {
+						t.Errorf("doc %d semantic validation: %v (findings=%+v)", i, err, findings)
+					} else {
+						for _, f := range findings {
+							if f.Severity == "error" {
+								t.Errorf("doc %d semantic validation: %s: %s", i, f.Path, f.Message)
+							}
+						}
 					}
 					pipelineNames[p.Name] = true
 				case "PipelineRun":

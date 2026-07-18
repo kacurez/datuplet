@@ -4,36 +4,33 @@ import (
 	"testing"
 )
 
-const timelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: daily-orders
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: api
-          component: x
-          inputs:
-            buckets: [api]
-          outputs:
-            tables:
-              - name: orders
-                bucket: raw
-                writeMode: FULL_LOAD
-    - name: transform
-      components:
-        - name: sql
-          component: y
-          inputs:
-            tables:
-              - {bucket: raw, table: orders}
-          outputs:
-            tables:
-              - name: orders_enriched
-                bucket: processed
-                writeMode: FULL_LOAD
-`
+const timelineYAML = `{
+  "name": "daily-orders",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "api",
+          "component": "x",
+          "inputs": {"buckets": ["api"]},
+          "outputs": {"tables": [{"name": "orders", "bucket": "raw", "writeMode": "FULL_LOAD"}]}
+        }
+      ]
+    },
+    {
+      "name": "transform",
+      "components": [
+        {
+          "name": "sql",
+          "component": "y",
+          "inputs": {"tables": [{"bucket": "raw", "table": "orders"}]},
+          "outputs": {"tables": [{"name": "orders_enriched", "bucket": "processed", "writeMode": "FULL_LOAD"}]}
+        }
+      ]
+    }
+  ]
+}`
 
 func TestBuildTimeline_StagesImportsExports(t *testing.T) {
 	snap := []byte(`[

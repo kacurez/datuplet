@@ -8,6 +8,7 @@ import (
 	stdhttp "net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -18,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
@@ -38,40 +40,81 @@ type findingsBody struct {
 	} `json:"findings"`
 }
 
-const validPipelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: etl
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          outputs:
-            defaultBucket: raw
-            defaultWriteMode: APPEND
-`
+// validPipelineYAML is envelope-free PipelineDoc content (RFC 027 §3),
+// written as JSON — JSON is a valid YAML subset, so it exercises both the
+// PUT endpoint (which accepts YAML/JSON bodies) and the direct
+// store.CreatePipeline seeding calls below (which need valid JSON: the
+// `doc` column is jsonb).
+const validPipelineYAML = `{
+  "name": "etl",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}
+        }
+      ]
+    }
+  ]
+}`
 
 // pipelineYAMLWithSecretRef references the "api_token" secret key via the
 // whole-scalar $[name] syntax (pkg/lib/secrets), so validate.ReferencedSecrets
 // picks it up and the S7 save/trigger ladder has something to check.
-const pipelineYAMLWithSecretRef = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: etl-secret
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          config:
-            token: "$[api_token]"
-          outputs:
-            defaultBucket: raw
-            defaultWriteMode: APPEND
-`
+const pipelineYAMLWithSecretRef = `{
+  "name": "etl-secret",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "config": {"token": "$[api_token]"},
+          "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}
+        }
+      ]
+    }
+  ]
+}`
+
+// docsEqual compares two JSON byte slices by value rather than by exact
+// bytes: the PUT handler stores a re-marshaled canonical form (field order
+// may differ from a hand-written fixture), so byte-for-byte comparison
+// would be flaky.
+func docsEqual(t *testing.T, got, want []byte) bool {
+	t.Helper()
+	var gotVal, wantVal any
+	if err := json.Unmarshal(got, &gotVal); err != nil {
+		t.Fatalf("unmarshal got doc: %v", err)
+	}
+	if err := json.Unmarshal(want, &wantVal); err != nil {
+		t.Fatalf("unmarshal want doc: %v", err)
+	}
+	return reflect.DeepEqual(gotVal, wantVal)
+}
+
+// canonicalDoc runs raw through the same parse+marshal path handlePutPipeline
+// uses to build the stored `doc` column, so tests can compare persisted bytes
+// against what PUT is actually expected to store (e.g. config.Pipeline's
+// non-pointer Gateway field always marshals as "gateway":{} even when unset —
+// encoding/json's `omitempty` has no effect on struct-typed fields — so a
+// hand-written fixture without that key would never byte/structurally match).
+func canonicalDoc(t *testing.T, raw string) []byte {
+	t.Helper()
+	doc, err := config.Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	return b
+}
 
 // secretsFindingsBody is the wire shape of a 200 warning response from
 // PUT /pipelines under the S7 ladder: {"findings":[{path,message,severity}]}
@@ -119,8 +162,8 @@ func TestPutPipeline_ValidYAML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPipelineByName: %v", err)
 	}
-	if got.YAML != validPipelineYAML {
-		t.Error("YAML not persisted")
+	if !docsEqual(t, got.Doc, canonicalDoc(t, validPipelineYAML)) {
+		t.Errorf("doc not persisted: got %s", got.Doc)
 	}
 }
 
@@ -198,8 +241,8 @@ func TestListPipelines(t *testing.T) {
 		t.Fatalf("SetLakekeeperProjectID: %v", err)
 	}
 	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "p1", validPipelineYAML)
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "p2", validPipelineYAML)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "p1", "", []byte(validPipelineYAML))
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "p2", "", []byte(validPipelineYAML))
 
 	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines", nil)
 	req.AddCookie(cookie)
@@ -225,7 +268,7 @@ func TestGetPipeline_NotMember(t *testing.T) {
 	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, "lk-not-member"); err != nil {
 		t.Fatalf("SetLakekeeperProjectID: %v", err)
 	}
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "secret", validPipelineYAML)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "secret", "", []byte(validPipelineYAML))
 
 	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/secret", nil)
 	req.AddCookie(cookie)
@@ -251,7 +294,7 @@ func TestDeletePipeline(t *testing.T) {
 		t.Fatalf("SetLakekeeperProjectID: %v", err)
 	}
 	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", validPipelineYAML)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	req, _ := stdhttp.NewRequest("DELETE", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", nil)
 	req.AddCookie(cookie)
@@ -278,21 +321,18 @@ func TestPutPipeline_NameMismatch(t *testing.T) {
 	}
 	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
 
-	// YAML says metadata.name: "actual"; URL says "requested". Must 400.
-	yaml := `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: actual
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          outputs:
-            defaultBucket: raw
-            defaultWriteMode: APPEND
-`
+	// Doc says name: "actual"; URL says "requested". Must 400.
+	yaml := `{
+  "name": "actual",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}}
+      ]
+    }
+  ]
+}`
 	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/requested", []byte(yaml), cookie)
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
@@ -321,21 +361,21 @@ func TestPutPipeline_UnknownFieldFinding(t *testing.T) {
 	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
 
 	// "writeMod" is a typo of "writeMode" — an unknown field under strict decode.
-	yaml := `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: etl
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          outputs:
-            buckets:
-              - name: raw
-                writeMod: APPEND
-`
+	yaml := `{
+  "name": "etl",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "outputs": {"buckets": [{"name": "raw", "writeMod": "APPEND"}]}
+        }
+      ]
+    }
+  ]
+}`
 	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(yaml), cookie)
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
@@ -374,20 +414,17 @@ func TestPutPipeline_SemanticFindingHasPath(t *testing.T) {
 	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
 
 	// "RAW!" fails bucketNameRegex (uppercase + '!' not allowed).
-	yaml := `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: etl
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          outputs:
-            defaultBucket: "RAW!"
-            defaultWriteMode: APPEND
-`
+	yaml := `{
+  "name": "etl",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "RAW!", "defaultWriteMode": "APPEND"}}
+      ]
+    }
+  ]
+}`
 	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(yaml), cookie)
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
@@ -451,8 +488,8 @@ func TestPutPipeline_UnknownSecretKey_ReturnsWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPipelineByName: %v", err)
 	}
-	if saved.YAML != pipelineYAMLWithSecretRef {
-		t.Error("pipeline YAML not persisted despite the 200-with-warning response")
+	if !docsEqual(t, saved.Doc, canonicalDoc(t, pipelineYAMLWithSecretRef)) {
+		t.Error("pipeline doc not persisted despite the 200-with-warning response")
 	}
 }
 
@@ -609,7 +646,7 @@ func freshServerT6WithStore(t *testing.T, reg apihttp.ComponentRegistry, pol *va
 	return ts, pool, authzr, cleanup
 }
 
-// errGetByNamePipelineStore is a PipelineStore whose GetByName always fails with
+// errGetByNamePipelineStore is a PipelineStore whose Get always fails with
 // a non-NotFound error, to exercise the diff-gate's fail-closed 503 path. The
 // handler returns before touching any other method.
 type errGetByNamePipelineStore struct{}
@@ -618,15 +655,17 @@ func (errGetByNamePipelineStore) List(context.Context, uuid.UUID) ([]apihttp.Pip
 	return nil, nil
 }
 
-func (errGetByNamePipelineStore) GetByName(context.Context, uuid.UUID, string) (*apihttp.PipelineDetail, error) {
+func (errGetByNamePipelineStore) Get(context.Context, uuid.UUID, string) (*apihttp.PipelineDetail, error) {
 	return nil, errors.New("transient store read failure")
 }
 
-func (errGetByNamePipelineStore) GetYAMLByID(context.Context, uuid.UUID) (string, error) {
-	return "", nil
+func (errGetByNamePipelineStore) GetDocByID(context.Context, string) ([]byte, error) {
+	return nil, nil
 }
 
-func (errGetByNamePipelineStore) Put(context.Context, uuid.UUID, string, []byte) error { return nil }
+func (errGetByNamePipelineStore) Put(context.Context, uuid.UUID, string, []byte, string) error {
+	return nil
+}
 
 func (errGetByNamePipelineStore) Delete(context.Context, uuid.UUID, string) error { return nil }
 
@@ -688,44 +727,43 @@ func t6Seed(t *testing.T, ts *httptest.Server, pool *pgxpool.Pool, fakeAuthz *au
 	return cookie, proj.ID
 }
 
+// pipelineYAMLWithCPU builds a doc whose component sets resources.cpu — the
+// new envelope-free doc shape is flat ({"cpu": "..."}), unlike the old CRD's
+// nested resources.limits.cpu; config.DocToCR maps it into the CRD's nested
+// corev1.ResourceRequirements before the diff-gate ever sees it.
 func pipelineYAMLWithCPU(cpu string) []byte {
-	return []byte(`apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: etl
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          resources:
-            limits:
-              cpu: "` + cpu + `"
-          outputs:
-            defaultBucket: raw
-            defaultWriteMode: APPEND
-`)
+	return []byte(`{
+  "name": "etl",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "resources": {"cpu": "` + cpu + `"},
+          "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}
+        }
+      ]
+    }
+  ]
+}`)
 }
 
 // pipelineYAMLBigBuffer sets gateway.bufferSize (no resources block) so the
 // gateway-bound gate is what trips, not the resources modification gate.
-const pipelineYAMLBigBuffer = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: etl
-spec:
-  gateway:
-    bufferSize: 200
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          outputs:
-            defaultBucket: raw
-            defaultWriteMode: APPEND
-`
+const pipelineYAMLBigBuffer = `{
+  "name": "etl",
+  "gateway": {"bufferSize": 200},
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}}
+      ]
+    }
+  ]
+}`
 
 // Case 1: a non-superadmin adding a resources block where the stored pipeline
 // had none is rejected with 403 pointing at superadmin.
@@ -733,7 +771,7 @@ func TestPutPipeline_NonSuperadmin_AddResources_Forbidden(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
 	defer cleanup()
 	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-add-res")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", validPipelineYAML); err != nil {
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
 
@@ -755,7 +793,7 @@ func TestPutPipeline_NonSuperadmin_ResubmitSameResources_OK(t *testing.T) {
 	defer cleanup()
 	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-resubmit")
 	yaml := pipelineYAMLWithCPU("2")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", string(yaml)); err != nil {
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", yaml); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
 
@@ -772,7 +810,7 @@ func TestPutPipeline_NonSuperadmin_ChangeCPU_Forbidden(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
 	defer cleanup()
 	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-change-cpu")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", string(pipelineYAMLWithCPU("1"))); err != nil {
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", pipelineYAMLWithCPU("1")); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
 
@@ -790,7 +828,7 @@ func TestPutPipeline_NonSuperadmin_SemanticEqualResources_OK(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
 	defer cleanup()
 	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-semeq")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", string(pipelineYAMLWithCPU("1"))); err != nil {
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", pipelineYAMLWithCPU("1")); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
 
@@ -808,7 +846,7 @@ func TestPutPipeline_Superadmin_FreshResourcesWithinMax_OK(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: true})
 	defer cleanup()
 	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-super-fresh")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", validPipelineYAML); err != nil {
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
 
@@ -855,7 +893,7 @@ func TestPutPipeline_NonSuperadmin_OverGatewayBound_Forbidden(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), pol, stubServerAdminT6{result: false})
 	defer cleanup()
 	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-gw-bound")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", validPipelineYAML); err != nil {
+	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
 

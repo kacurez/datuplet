@@ -34,6 +34,12 @@ func TestK8sBackendTriggerRunReturnsRunIDAndNamespace(t *testing.T) {
 	// TableCapabilitiesFromPipeline produces at least one cap and the
 	// Minter is exercised. Bucket-level defaults don't generate per-table
 	// grants — only explicit table outputs do.
+	//
+	// TriggerRequest.PipelineYAML still carries the K8s CRD envelope shape
+	// (ApplyPipelineCRD — untouched here, that's S8's job — decodes it as
+	// a datupletv1.Pipeline), while Parsed is derived separately from the
+	// envelope-free doc shape via config.Parse (post-RFC-027, config.Parse
+	// rejects the envelope). The two fixtures describe the same pipeline.
 	yaml := []byte(`apiVersion: datuplet.io/v1
 kind: Pipeline
 metadata:
@@ -50,7 +56,7 @@ spec:
                 name: users
                 writeMode: APPEND
 `)
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -96,7 +102,7 @@ func TestK8sBackend_WarehouseResolver_PopulatesSpec(t *testing.T) {
 	})
 
 	yaml := minimalPipelineYAML()
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -131,7 +137,7 @@ func TestK8sBackend_WarehouseResolver_ErrorPropagates(t *testing.T) {
 	})
 
 	yaml := minimalPipelineYAML()
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -165,7 +171,7 @@ func TestK8sBackend_WarehouseResolver_NilDegrades(t *testing.T) {
 	})
 
 	yaml := minimalPipelineYAML()
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -184,7 +190,10 @@ func TestK8sBackend_WarehouseResolver_NilDegrades(t *testing.T) {
 }
 
 // minimalPipelineYAML returns a minimal pipeline YAML with one output table
-// so the Minter is exercised inside TriggerRun.
+// so the Minter is exercised inside TriggerRun. It stays in the K8s CRD
+// envelope shape because it feeds TriggerRequest.PipelineYAML, which
+// ApplyPipelineCRD (untouched here — S8's job) still decodes as a
+// datupletv1.Pipeline.
 func minimalPipelineYAML() []byte {
 	return []byte(`apiVersion: datuplet.io/v1
 kind: Pipeline
@@ -202,6 +211,27 @@ spec:
                 name: users
                 writeMode: APPEND
 `)
+}
+
+// minimalPipelineDoc is minimalPipelineYAML's envelope-free doc-shape
+// equivalent (RFC 027 §3), used only for config.Parse — which post-RFC-027
+// rejects the K8s CRD envelope — to derive TriggerRequest.Parsed.
+func minimalPipelineDoc() []byte {
+	return []byte(`{
+  "name": "p",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "outputs": {"tables": [{"bucket": "events", "name": "users", "writeMode": "APPEND"}]}
+        }
+      ]
+    }
+  ]
+}`)
 }
 
 // --- stubs ---

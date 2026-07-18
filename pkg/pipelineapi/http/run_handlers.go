@@ -70,7 +70,7 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 	}
 	pipelineName := r.PathValue("name")
 
-	pipe, err := s.pipelines.GetByName(r.Context(), projectID, pipelineName)
+	pipe, err := s.pipelines.Get(r.Context(), projectID, pipelineName)
 	if errors.Is(err, errStoreNotFound) {
 		writeError(w, http.StatusNotFound, "pipeline not found")
 		return
@@ -80,27 +80,30 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Re-parse the stored YAML so capability derivation always matches
+	// Re-parse the stored doc so capability derivation always matches
 	// what ApplyPipelineCRD will materialize. A parse failure here would
-	// be surprising — the same YAML was validated on PUT /pipelines — so
+	// be surprising — the same doc was validated on PUT /pipelines — so
 	// treat it as a client-side 400. No run row is inserted yet, so this
 	// doesn't leave a ghost row behind.
-	parsed, err := config.Parse([]byte(pipe.YAML))
+	parsed, err := config.Parse(pipe.Doc)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "pipeline YAML invalid: "+err.Error())
+		writeError(w, http.StatusBadRequest, "pipeline doc invalid: "+err.Error())
 		return
 	}
 
 	// Secrets trigger-reject ladder (RFC 026 P1.5 §7): hard-reject before any
 	// run row is inserted when a referenced $[key] isn't set in the
-	// project's managed Secret. config.Parse above already proved this YAML
-	// decodes and validates cleanly, so the re-decode here (needed for the
-	// typed CRD ReferencedSecrets walks) cannot fail in practice; a failure
-	// would mean the store returned different bytes than were just parsed.
-	crd, _, err := validate.ValidatePipeline([]byte(pipe.YAML), nil, nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "re-validate pipeline")
-		return
+	// project's managed Secret. ValidatePipelineDoc re-validates the stored
+	// doc (needed for the typed CRD ReferencedSecrets walk); an error
+	// finding here would mean the stored bytes changed since the PUT that
+	// validated them, so it maps to the same 500 the pre-RFC-027 code used
+	// for its "cannot fail in practice" re-decode.
+	crd, findings := validate.ValidatePipelineDoc(pipe.Doc, pipelineName, nil, nil)
+	for _, f := range findings {
+		if f.Severity == "error" {
+			writeError(w, http.StatusInternalServerError, "re-validate pipeline")
+			return
+		}
 	}
 	refs := validate.ReferencedSecrets(crd)
 	missing, err := s.missingSecretRefs(r.Context(), projectID, refs)
@@ -114,12 +117,17 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pipelineID, err := uuid.Parse(pipe.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid stored pipeline id")
+		return
+	}
 	resp, err := s.backend.TriggerRun(r.Context(), runbackend.TriggerRequest{
 		ProjectID:    projectID,
 		UserID:       user.ID,
 		PipelineName: pipelineName,
-		PipelineID:   pipe.ID, // zero in local mode
-		PipelineYAML: []byte(pipe.YAML),
+		PipelineID:   pipelineID,
+		PipelineYAML: pipe.Doc,
 		Parsed:       parsed,
 	})
 	if err != nil {
@@ -223,11 +231,13 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		Timeline []timelineStage `json:"timeline"`
 	}{runJSON: runToJSON(run)}
 
-	// Best-effort timeline: a missing YAML or parse error leaves Timeline nil
+	// Best-effort timeline: a missing doc or parse error leaves Timeline nil
 	// (UI shows "no stage timeline recorded"); it never fails the run fetch.
+	// buildTimeline takes a YAML string, but the stored doc is canonical
+	// JSON — JSON is a valid YAML subset, so this works unchanged.
 	if run.PipelineID != uuid.Nil {
-		if yaml, err := s.pipelines.GetYAMLByID(r.Context(), run.PipelineID); err == nil {
-			if tl, err := buildTimeline(run.StageStatuses, yaml); err == nil {
+		if doc, err := s.pipelines.GetDocByID(r.Context(), run.PipelineID.String()); err == nil {
+			if tl, err := buildTimeline(run.StageStatuses, string(doc)); err == nil {
 				detail.Timeline = tl
 			}
 		}

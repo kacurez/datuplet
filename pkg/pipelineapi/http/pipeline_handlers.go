@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
@@ -84,15 +86,15 @@ func (s *Server) mustHaveRelation(w http.ResponseWriter, r *http.Request, relati
 	return user.ID, pid, true
 }
 
-// pipelineDetailJSON is the full shape returned by GetByName. Fields
-// that are zero in local mode (ID) are rendered as their zero-UUID
-// string for wire stability.
+// pipelineDetailJSON is the full shape returned by Get. Doc is the raw
+// canonical-JSON PipelineDoc (RFC 027 §5.1) — no content negotiation yet
+// (S6).
 type pipelineDetailJSON struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	YAML      string `json:"yaml"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Doc       json.RawMessage `json:"doc"`
+	CreatedAt string          `json:"created_at"`
+	UpdatedAt string          `json:"updated_at"`
 }
 
 // pipelineRefJSON is the summary shape returned by List. Timestamps are
@@ -108,9 +110,9 @@ const pipelineTimeLayout = "2006-01-02T15:04:05Z07:00"
 
 func pipelineDetailToJSON(p PipelineDetail) pipelineDetailJSON {
 	return pipelineDetailJSON{
-		ID: p.ID.String(), Name: p.Name, YAML: p.YAML,
-		CreatedAt: p.CreatedAt.Format(pipelineTimeLayout),
-		UpdatedAt: p.UpdatedAt.Format(pipelineTimeLayout),
+		ID: p.ID, Name: p.Name, Doc: p.Doc,
+		CreatedAt: p.CreatedAt,
+		UpdatedAt: p.UpdatedAt,
 	}
 }
 
@@ -153,15 +155,11 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "body exceeds 1 MiB: "+err.Error())
 		return
 	}
-	// s.registry is nil when WithRegistry hasn't been wired; ValidatePipeline
+	// s.registry is nil when WithRegistry hasn't been wired; ValidatePipelineDoc
 	// treats a nil RegistryView as "skip resolution" (see R5), so this stays
-	// a soft-degrade rather than a nil-deref. Parse with pol=nil here — the
+	// a soft-degrade rather than a nil-deref. Validate with pol=nil here — the
 	// identity-correct policy is applied in the diff-gate below.
-	pl, findings, err := validate.ValidatePipeline(body, s.registry, nil)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid pipeline: "+err.Error())
-		return
-	}
+	pl, findings := validate.ValidatePipelineDoc(body, name, s.registry, nil)
 	// A strict-decode failure yields pl==nil with a single error finding;
 	// surface it with the findings contract before touching the diff-gate.
 	if pl == nil {
@@ -170,13 +168,17 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// metadata.name must match the URL name: otherwise ApplyPipelineCRD at
-	// run-trigger time would create a CRD under the YAML's name while the
-	// PipelineRun would reference the URL name, and the operator would fail
-	// to find the Pipeline. Structural check, before the identity-scoped gate.
+	// The doc's own name (if set) must match the URL name: otherwise
+	// ApplyPipelineCRD at run-trigger time would create a CRD under the
+	// doc's name while the PipelineRun would reference the URL name, and
+	// the operator would fail to find the Pipeline. ValidatePipelineDoc
+	// already folds this into `findings` as an error Finding, but that
+	// check runs after the diff-gate below (which can 403 first) — keep
+	// this fast, early-returning duplicate so a name mismatch always wins
+	// with a clear 400, matching the pre-RFC-027 behavior.
 	if pl.Name != "" && pl.Name != name {
 		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("YAML metadata.name %q does not match URL name %q", pl.Name, name))
+			fmt.Sprintf("pipeline name %q does not match URL name %q", pl.Name, name))
 		return
 	}
 
@@ -241,9 +243,25 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Store the canonical doc, not the raw request body: the body may be
+	// YAML (or JSON with arbitrary formatting), while the stored `doc`
+	// column is canonical JSON (RFC 027 §5.1). config.Parse can't fail
+	// here — ValidatePipelineDoc already proved body decodes cleanly —
+	// but errors are handled rather than ignored.
+	doc, err := config.Parse(body)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "re-parse pipeline")
+		return
+	}
+	canonical, err := json.Marshal(doc)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encode pipeline")
+		return
+	}
+
 	// PUT is upsert — pgx adapter tries UPDATE first and falls back to
-	// INSERT; local filesystem is last-write-wins. No conflict path today.
-	if err := s.pipelines.Put(r.Context(), projectID, name, body); err != nil {
+	// INSERT. No conflict path today.
+	if err := s.pipelines.Put(r.Context(), projectID, name, canonical, doc.Description); err != nil {
 		writeError(w, http.StatusInternalServerError, "put pipeline")
 		return
 	}
@@ -304,20 +322,20 @@ func (s *Server) isRequestSuperadmin(w http.ResponseWriter, r *http.Request, use
 //   - Any other read error: propagated so the caller can FAIL CLOSED. A
 //     transient read must not default to "no resources" — that would let a
 //     non-superadmin strip an admin-set block through on a flake (RFC 026 §4.4).
-//   - Unparseable stored YAML: empty spec, nil error (logged). Stored YAML
-//     always passed validation on its way in, so this is near-impossible;
+//   - Unparseable stored doc: empty spec, nil error (logged). Stored docs
+//     always passed validation on their way in, so this is near-impossible;
 //     treat-as-none rather than blocking a save on it.
 func (s *Server) storedPipelineSpec(ctx context.Context, projectID uuid.UUID, name string) (*datupletv1.Pipeline, error) {
-	stored, err := s.pipelines.GetByName(ctx, projectID, name)
+	stored, err := s.pipelines.Get(ctx, projectID, name)
 	switch {
 	case errors.Is(err, errStoreNotFound):
 		return &datupletv1.Pipeline{}, nil
 	case err != nil:
 		return nil, err
 	}
-	p, _, _ := validate.ValidatePipeline([]byte(stored.YAML), s.registry, nil)
+	p, _ := validate.ValidatePipelineDoc(stored.Doc, name, s.registry, nil)
 	if p == nil {
-		log.Printf("put-pipeline: stored YAML for %s/%s failed to parse; treating old resources as none", projectID, name)
+		log.Printf("put-pipeline: stored doc for %s/%s failed to parse; treating old resources as none", projectID, name)
 		return &datupletv1.Pipeline{}, nil
 	}
 	return p, nil
@@ -346,7 +364,7 @@ func (s *Server) handleGetPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	p, err := s.pipelines.GetByName(r.Context(), projectID, name)
+	p, err := s.pipelines.Get(r.Context(), projectID, name)
 	if errors.Is(err, errStoreNotFound) {
 		writeError(w, http.StatusNotFound, "pipeline not found")
 		return
