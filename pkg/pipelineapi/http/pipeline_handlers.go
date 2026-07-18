@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -104,7 +105,7 @@ type pipelineDetailJSON struct {
 // 0001-01-01 value.
 type pipelineRefJSON struct {
 	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	Description string `json:"description"`
 	CreatedAt   string `json:"created_at,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
 }
@@ -157,6 +158,25 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, "body exceeds 1 MiB: "+err.Error())
 		return
+	}
+	// Content-Type gates strictness: application/json means the body must be
+	// valid JSON syntax; anything else (or absent) is treated as YAML, which
+	// is what ValidatePipelineDoc/config.Parse already do below. Left
+	// unchecked, a JSON-content-typed body that is valid YAML but not valid
+	// JSON (e.g. an unquoted flow-style mapping) would silently pass, since
+	// config.Parse's YAML decoder accepts JSON as a subset — this check
+	// rejects that case before it ever reaches config.Parse.
+	if mediaType, _, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type")); mtErr == nil && mediaType == "application/json" {
+		if !json.Valid(body) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "validation failed",
+				"findings": []validate.Finding{{
+					Message:  "Content-Type is application/json but the body is not valid JSON",
+					Severity: "error",
+				}},
+			})
+			return
+		}
 	}
 	// s.registry is nil when WithRegistry hasn't been wired; ValidatePipelineDoc
 	// treats a nil RegistryView as "skip resolution" (see R5), so this stays

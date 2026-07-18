@@ -362,6 +362,63 @@ func TestPutPipeline_LegacyEnvelope_BadRequest(t *testing.T) {
 	}
 }
 
+// yamlFlowNotJSON is a complete, otherwise-valid PipelineDoc written as an
+// unquoted YAML flow-style mapping: config.Parse decodes it into a fully
+// valid Pipeline (one stage, one component) with zero validation findings,
+// so a YAML-content-typed PUT of these exact bytes succeeds with 204. But
+// the bytes are NOT valid JSON syntax — JSON requires quoted string keys and
+// values, and "datuplet/test:latest" (an unquoted scalar containing a bare
+// colon) is not valid outside quotes either. It is the case the Content-Type
+// gate exists for: a JSON-content-typed PUT of these bytes must be rejected,
+// not silently accepted because config.Parse's YAML decoder also understands
+// them.
+const yamlFlowNotJSON = `{name: etl, stages: [{name: extract, components: [{name: c1, component: datuplet/test:latest, outputs: {defaultBucket: raw, defaultWriteMode: APPEND}}]}]}`
+
+// TestPutPipeline_JSONContentType_RejectsNonJSONBody covers the Content-Type
+// gate described by yamlFlowNotJSON above.
+func TestPutPipeline_JSONContentType_RejectsNonJSONBody(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-json-ct-strict"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
+	resp := putJSON(t, base+"/etl", []byte(yamlFlowNotJSON), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400 (Content-Type: application/json must reject a non-JSON body)", resp.StatusCode)
+	}
+	var body findingsBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range body.Findings {
+		if strings.Contains(f.Message, "not valid JSON") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a finding naming the invalid-JSON body, got %+v", body.Findings)
+	}
+
+	// Sanity: the same bytes, sent as YAML (default), are accepted — proving
+	// this is a Content-Type-driven rejection, not a config.Parse rejection.
+	yamlResp := putYAML(t, base+"/etl", []byte(yamlFlowNotJSON), cookie)
+	defer yamlResp.Body.Close()
+	if yamlResp.StatusCode != 204 {
+		b, _ := readAll(yamlResp)
+		t.Fatalf("YAML-content-typed status = %d, want 204 (same bytes must parse fine as YAML); body=%s", yamlResp.StatusCode, b)
+	}
+}
+
 func TestPutPipeline_ValidYAML(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
