@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/datuplet/datuplet/pkg/pipeline/validate"
+	"sigs.k8s.io/yaml"
 )
 
 // ParseFile parses a pipeline YAML file and returns the Pipeline struct.
@@ -22,34 +22,28 @@ func ParseFile(path string) (*Pipeline, error) {
 	return Parse(data)
 }
 
-// Parse strict-decodes and validates pipeline YAML through the single
-// validation source (pkg/pipeline/validate), then converts the validated CRD
-// object into the runtime Pipeline. Any validation finding yields a non-nil
-// error (preserving the historical Parse error contract); there is no second
-// dialect and no duplicated checks here.
+// Parse strict-decodes an envelope-free PipelineDoc (RFC 027 §3) from YAML.
+// A legacy Kubernetes CR body (apiVersion/kind/metadata) is rejected with a
+// pointed error; unknown fields are rejected naming the offending key. Schema,
+// registry, secret-ref and resource validation live in pkg/pipeline/validate
+// and run separately against the doc (RFC 027 §5.4) — Parse itself only
+// decodes.
 func Parse(data []byte) (*Pipeline, error) {
-	p, findings, err := validate.ValidatePipeline(data, nil, nil)
-	if err != nil {
-		return nil, err
+	var probe map[string]any
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		return nil, fmt.Errorf("parse pipeline doc: %w", err)
 	}
-	if len(findings) > 0 {
-		return nil, findingsError(findings)
-	}
-	return FromCRD(p)
-}
-
-// findingsError joins validation findings into a single error, prefixing each
-// message with its structured path so callers can still locate the problem.
-func findingsError(findings []validate.Finding) error {
-	msgs := make([]string, 0, len(findings))
-	for _, f := range findings {
-		if f.Path != "" {
-			msgs = append(msgs, fmt.Sprintf("%s: %s", f.Path, f.Message))
-		} else {
-			msgs = append(msgs, f.Message)
+	for _, k := range []string{"apiVersion", "kind", "metadata"} {
+		if _, ok := probe[k]; ok {
+			return nil, errors.New("legacy Kubernetes CR format — Datuplet pipelines are envelope-free now; see docs/pipeline-api.md")
 		}
 	}
-	return errors.New(strings.Join(msgs, "; "))
+
+	var p Pipeline
+	if err := yaml.UnmarshalStrict(data, &p); err != nil {
+		return nil, fmt.Errorf("parse pipeline doc: %w", err)
+	}
+	return &p, nil
 }
 
 // ParseSinceDuration parses a "since" duration string.

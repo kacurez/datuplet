@@ -46,8 +46,8 @@ func buildTimeline(stageStatusesJSON []byte, pipelineYAML string) ([]timelineSta
 	imp := map[string][]timelineTable{}
 	exp := map[string][]timelineTable{}
 	if parsed, err := config.Parse([]byte(pipelineYAML)); err == nil {
-		for i := range parsed.Spec.Stages {
-			st := &parsed.Spec.Stages[i]
+		for i := range parsed.Stages {
+			st := &parsed.Stages[i]
 			for j := range st.Components {
 				c := &st.Components[j]
 				if c.Inputs != nil {

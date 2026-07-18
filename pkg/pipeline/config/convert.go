@@ -16,23 +16,8 @@ import (
 // Go decode (only by the API server), so FromCRD reproduces them.
 func FromCRD(p *datupletv1.Pipeline) (*Pipeline, error) {
 	out := &Pipeline{
-		APIVersion: p.APIVersion,
-		Kind:       p.Kind,
-		Metadata: Metadata{
-			Name:   p.Name,
-			Labels: p.Labels,
-		},
-		Spec: Spec{
-			Gateway: gatewayFromCRD(p.Spec.Gateway),
-		},
-	}
-
-	// Defaults for identity fields (old applyDefaults).
-	if out.APIVersion == "" {
-		out.APIVersion = DefaultAPIVersion
-	}
-	if out.Kind == "" {
-		out.Kind = DefaultKind
+		Name:    p.Name,
+		Gateway: gatewayFromCRD(p.Spec.Gateway),
 	}
 
 	for i := range p.Spec.Stages {
@@ -45,7 +30,7 @@ func FromCRD(p *datupletv1.Pipeline) (*Pipeline, error) {
 			}
 			s.Components = append(s.Components, comp)
 		}
-		out.Spec.Stages = append(out.Spec.Stages, s)
+		out.Stages = append(out.Stages, s)
 	}
 
 	return out, nil
