@@ -213,7 +213,7 @@ func (b *K8sBackend) TriggerRun(ctx context.Context, req TriggerRequest) (Trigge
 	if err != nil {
 		return TriggerResponse{}, err
 	}
-	if err := pkg8s.ApplyPipelineCRD(ctx, b.client, ns, string(req.PipelineYAML)); err != nil {
+	if err := pkg8s.ApplyPipelineCRD(ctx, b.client, ns, req.Doc); err != nil {
 		return TriggerResponse{}, fmt.Errorf("apply pipeline: %w", err)
 	}
 
@@ -248,7 +248,7 @@ func (b *K8sBackend) TriggerRun(ctx context.Context, req TriggerRequest) (Trigge
 
 	// Derive FGA tuples for the synthetic run user. One project-level
 	// grant; the lakekeeper FGA model chains it to namespaces + tables.
-	tuplesToWrite := buildRunTuples(syntheticSub, lakekeeperProjectID, req.Parsed)
+	tuplesToWrite := buildRunTuples(syntheticSub, lakekeeperProjectID, req.Doc)
 
 	// --- Step 1: run_tuples row (intent recorded). ---
 	if b.db != nil && len(tuplesToWrite) > 0 {

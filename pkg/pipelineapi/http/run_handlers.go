@@ -80,24 +80,15 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Re-parse the stored doc so capability derivation always matches
-	// what ApplyPipelineCRD will materialize. A parse failure here would
-	// be surprising — the same doc was validated on PUT /pipelines — so
-	// treat it as a client-side 400. No run row is inserted yet, so this
-	// doesn't leave a ghost row behind.
-	parsed, err := config.Parse(pipe.Doc)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "pipeline doc invalid: "+err.Error())
-		return
-	}
-
-	// Secrets trigger-reject ladder (RFC 026 P1.5 §7): hard-reject before any
-	// run row is inserted when a referenced $[key] isn't set in the
-	// project's managed Secret. ValidatePipelineDoc re-validates the stored
-	// doc (needed for the typed CRD ReferencedSecrets walk); an error
-	// finding here would mean the stored bytes changed since the PUT that
-	// validated them, so it maps to the same 500 the pre-RFC-027 code used
-	// for its "cannot fail in practice" re-decode.
+	// Parse + validate the stored doc exactly once. ValidatePipelineDoc
+	// decodes the doc, converts it to the typed CRD, and runs the shared
+	// semantic rules; the returned CR feeds both the ReferencedSecrets walk
+	// (below) and — via config.CRToDoc — the TriggerRequest.Doc the backend
+	// renders back into the applied Pipeline CR. An error finding here would
+	// mean the stored bytes changed since the PUT that validated them, so it
+	// maps to the same 500 the pre-RFC-027 code used for its "cannot fail in
+	// practice" re-decode. No run row is inserted yet, so this doesn't leave
+	// a ghost row behind.
 	crd, findings := validate.ValidatePipelineDoc(pipe.Doc, pipelineName, nil, nil)
 	for _, f := range findings {
 		if f.Severity == "error" {
@@ -127,8 +118,7 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 		UserID:       user.ID,
 		PipelineName: pipelineName,
 		PipelineID:   pipelineID,
-		PipelineYAML: pipe.Doc,
-		Parsed:       parsed,
+		Doc:          config.CRToDoc(crd),
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -233,12 +223,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 	// Best-effort timeline: a missing doc or parse error leaves Timeline nil
 	// (UI shows "no stage timeline recorded"); it never fails the run fetch.
-	// buildTimeline takes a YAML string, but the stored doc is canonical
-	// JSON — JSON is a valid YAML subset, so this works unchanged.
 	if run.PipelineID != uuid.Nil {
-		if doc, err := s.pipelines.GetDocByID(r.Context(), run.PipelineID.String()); err == nil {
-			if tl, err := buildTimeline(run.StageStatuses, string(doc)); err == nil {
-				detail.Timeline = tl
+		if raw, err := s.pipelines.GetDocByID(r.Context(), run.PipelineID.String()); err == nil {
+			if doc, err := config.Parse(raw); err == nil {
+				if tl, err := buildTimeline(run.StageStatuses, doc); err == nil {
+					detail.Timeline = tl
+				}
 			}
 		}
 	}
