@@ -139,6 +139,229 @@ func putYAML(t *testing.T, url string, yaml []byte, cookie *stdhttp.Cookie) *std
 	return resp
 }
 
+// putJSON PUTs a doc body with Content-Type: application/json, exercising the
+// content-negotiation branch (JSON body → validated → stored as canonical JSON).
+func putJSON(t *testing.T, url string, doc []byte, cookie *stdhttp.Cookie) *stdhttp.Response {
+	t.Helper()
+	req, _ := stdhttp.NewRequest("PUT", url, bytes.NewReader(doc))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	resp, err := stdhttp.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	return resp
+}
+
+// pipelineDocWithDescription is an envelope-free PipelineDoc carrying a
+// top-level description, used to prove the description round-trips into both
+// the detail `doc` object and the List `description` field.
+const pipelineDocWithDescription = `{
+  "name": "etl",
+  "description": "nightly customer load",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}
+        }
+      ]
+    }
+  ]
+}`
+
+// legacyEnvelopeYAML is a pre-RFC-027 Kubernetes CR body (apiVersion/kind/
+// metadata). config.Parse rejects it with a pointed error, so PUT must 400.
+const legacyEnvelopeYAML = `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: etl
+spec:
+  stages: []`
+
+// pipelineDetailBody is the wire shape of the GET detail response
+// ({id, name, doc, created_at, updated_at}); doc is a raw object.
+type pipelineDetailBody struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Doc       json.RawMessage `json:"doc"`
+	CreatedAt string          `json:"created_at"`
+	UpdatedAt string          `json:"updated_at"`
+}
+
+// pipelineRefBody is the wire shape of a List item; it must carry description.
+type pipelineRefBody struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+// TestPutPipeline_JSON_GetReturnsDocObject_ListHasDescription covers the S6
+// happy path: a JSON-content-type PUT stores the doc; GET returns doc as a JSON
+// object (not a string, no legacy "yaml" key); List surfaces the description.
+func TestPutPipeline_JSON_GetReturnsDocObject_ListHasDescription(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-json-get"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
+
+	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
+	putResp := putJSON(t, base+"/etl", []byte(pipelineDocWithDescription), cookie)
+	putResp.Body.Close()
+	if putResp.StatusCode != 204 {
+		t.Fatalf("PUT status = %d, want 204", putResp.StatusCode)
+	}
+
+	// GET detail: doc must decode as an object with name "etl" and no "yaml" key.
+	getReq, _ := stdhttp.NewRequest("GET", base+"/etl", nil)
+	getReq.AddCookie(cookie)
+	getResp, err := stdhttp.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != 200 {
+		t.Fatalf("GET status = %d, want 200", getResp.StatusCode)
+	}
+	var detail pipelineDetailBody
+	if err := json.NewDecoder(getResp.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.Name != "etl" {
+		t.Errorf("detail.name = %q, want etl", detail.Name)
+	}
+	var docObj map[string]any
+	if err := json.Unmarshal(detail.Doc, &docObj); err != nil {
+		t.Fatalf("doc is not a JSON object: %v (raw=%s)", err, detail.Doc)
+	}
+	if docObj["name"] != "etl" {
+		t.Errorf("doc.name = %v, want etl", docObj["name"])
+	}
+	if docObj["description"] != "nightly customer load" {
+		t.Errorf("doc.description = %v, want the seeded description", docObj["description"])
+	}
+
+	// LIST: the item must carry the description.
+	listReq, _ := stdhttp.NewRequest("GET", base, nil)
+	listReq.AddCookie(cookie)
+	listResp, err := stdhttp.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	defer listResp.Body.Close()
+	var items []pipelineRefBody
+	if err := json.NewDecoder(listResp.Body).Decode(&items); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("list len = %d, want 1", len(items))
+	}
+	if items[0].Description != "nightly customer load" {
+		t.Errorf("list item description = %q, want the seeded description", items[0].Description)
+	}
+}
+
+// TestGetPipeline_FormatYAML covers ?format=yaml: a YAML/JSON PUT can be read
+// back as text/yaml that re-parses through config.Parse without loss.
+func TestGetPipeline_FormatYAML(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-format-yaml"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
+
+	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
+	putResp := putYAML(t, base+"/etl", []byte(pipelineDocWithDescription), cookie)
+	putResp.Body.Close()
+	if putResp.StatusCode != 204 {
+		t.Fatalf("PUT status = %d, want 204", putResp.StatusCode)
+	}
+
+	getReq, _ := stdhttp.NewRequest("GET", base+"/etl?format=yaml", nil)
+	getReq.AddCookie(cookie)
+	getResp, err := stdhttp.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("get yaml: %v", err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != 200 {
+		t.Fatalf("GET ?format=yaml status = %d, want 200", getResp.StatusCode)
+	}
+	if ct := getResp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/yaml") {
+		t.Errorf("Content-Type = %q, want text/yaml", ct)
+	}
+	body, _ := readAll(getResp)
+	// A JSON body would start with '{'; YAML output must not.
+	if strings.HasPrefix(strings.TrimSpace(body), "{") {
+		t.Errorf("body looks like JSON, not YAML: %s", body)
+	}
+	pl, err := config.Parse([]byte(body))
+	if err != nil {
+		t.Fatalf("rendered YAML did not re-parse via config.Parse: %v\nbody=%s", err, body)
+	}
+	if pl.Name != "etl" {
+		t.Errorf("re-parsed name = %q, want etl", pl.Name)
+	}
+	if pl.Description != "nightly customer load" {
+		t.Errorf("re-parsed description = %q, want the seeded description", pl.Description)
+	}
+}
+
+// TestPutPipeline_LegacyEnvelope_BadRequest covers rejection of a pre-RFC-027
+// Kubernetes CR body: config.Parse rejects the envelope, surfaced as a 400 with
+// a finding naming the legacy format.
+func TestPutPipeline_LegacyEnvelope_BadRequest(t *testing.T) {
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, _ := store.CreateProject(ctx, pool, "proj")
+	lkID := "lk-legacy-envelope"
+	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	}
+	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+
+	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(legacyEnvelopeYAML), cookie)
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var body findingsBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, f := range body.Findings {
+		if strings.Contains(f.Message, "legacy Kubernetes CR format") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a finding naming the legacy Kubernetes CR format, got %+v", body.Findings)
+	}
+}
+
 func TestPutPipeline_ValidYAML(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()

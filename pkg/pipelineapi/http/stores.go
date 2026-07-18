@@ -58,8 +58,7 @@ type PipelineStore interface {
 }
 
 // PipelineRef is the summary row returned by List. Description is carried
-// on the struct (RFC 027 §5.1) but not yet serialized in the List response
-// JSON — that's S6.
+// on the struct (RFC 027 §5.1) and serialized in the List response JSON (S6).
 type PipelineRef struct {
 	Name        string
 	Description string

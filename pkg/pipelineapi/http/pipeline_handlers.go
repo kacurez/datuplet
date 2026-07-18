@@ -87,8 +87,8 @@ func (s *Server) mustHaveRelation(w http.ResponseWriter, r *http.Request, relati
 }
 
 // pipelineDetailJSON is the full shape returned by Get. Doc is the raw
-// canonical-JSON PipelineDoc (RFC 027 §5.1) — no content negotiation yet
-// (S6).
+// canonical-JSON PipelineDoc (RFC 027 §5.1). This is the default (JSON)
+// representation; GET ?format=yaml renders the doc as YAML instead (S6).
 type pipelineDetailJSON struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
@@ -97,13 +97,16 @@ type pipelineDetailJSON struct {
 	UpdatedAt string          `json:"updated_at"`
 }
 
-// pipelineRefJSON is the summary shape returned by List. Timestamps are
-// omitted when zero so local mode (which doesn't stat files on list)
-// doesn't emit a misleading 0001-01-01 value.
+// pipelineRefJSON is the summary shape returned by List. Description is the
+// doc's top-level description, surfaced here so the catalog can show it without
+// fetching each doc (RFC 027 §5.2). Timestamps are omitted when zero so local
+// mode (which doesn't stat files on list) doesn't emit a misleading
+// 0001-01-01 value.
 type pipelineRefJSON struct {
-	Name      string `json:"name"`
-	CreatedAt string `json:"created_at,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
 }
 
 const pipelineTimeLayout = "2006-01-02T15:04:05Z07:00"
@@ -117,7 +120,7 @@ func pipelineDetailToJSON(p PipelineDetail) pipelineDetailJSON {
 }
 
 func pipelineRefToJSON(p PipelineRef) pipelineRefJSON {
-	out := pipelineRefJSON{Name: p.Name}
+	out := pipelineRefJSON{Name: p.Name, Description: p.Description}
 	if !p.CreatedAt.IsZero() {
 		out.CreatedAt = p.CreatedAt.Format(pipelineTimeLayout)
 	}
@@ -371,6 +374,26 @@ func (s *Server) handleGetPipeline(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "get pipeline")
+		return
+	}
+	// ?format=yaml renders the stored canonical-JSON doc back to deterministic
+	// YAML for human editing (RFC 027 §5.2). The stored doc always passed
+	// config.Parse on its way in, so these re-parse/render steps can't fail in
+	// practice — errors are surfaced as 500 rather than ignored.
+	if r.URL.Query().Get("format") == "yaml" {
+		doc, err := config.Parse(p.Doc)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "parse stored pipeline")
+			return
+		}
+		out, err := config.RenderYAML(doc)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "render pipeline yaml")
+			return
+		}
+		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(out)
 		return
 	}
 	writeJSON(w, http.StatusOK, pipelineDetailToJSON(*p))
