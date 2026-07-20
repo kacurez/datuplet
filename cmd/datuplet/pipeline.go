@@ -24,21 +24,25 @@ var pipelineHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // pipelineDetailJSON mirrors pkg/pipelineapi/http/pipeline_handlers.go.
 // Kept in sync manually — the API never breaks this shape (we'd notice
-// in CLI tests).
+// in CLI tests). Doc is the raw canonical-JSON PipelineDoc (RFC 027 §5.1);
+// GET ?format=yaml renders it as YAML instead (S6) — see runPipelineGet.
 type pipelineDetailJSON struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	YAML      string `json:"yaml"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Doc       json.RawMessage `json:"doc"`
+	CreatedAt string          `json:"created_at"`
+	UpdatedAt string          `json:"updated_at"`
 }
 
-// pipelineRefJSON mirrors the list-item shape from the API. CreatedAt /
-// UpdatedAt are omitempty server-side (local-file mode doesn't stat).
+// pipelineRefJSON mirrors the list-item shape from the API. Description is
+// the doc's top-level description (RFC 027 §5.2, S6); older servers may omit
+// it, which decodes to "" here. CreatedAt / UpdatedAt are omitempty
+// server-side (local-file mode doesn't stat).
 type pipelineRefJSON struct {
-	Name      string `json:"name"`
-	CreatedAt string `json:"created_at,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
 }
 
 // runPipeline dispatches `datuplet pipeline <sub> ...`.
@@ -82,7 +86,7 @@ func pipelineHelpText() string {
   list                            list pipelines in the current project
   get <name>                      print one pipeline's YAML
   put [<name>] -f <file>          create-or-update from YAML/JSON file
-                                  (name is optional — defaults to metadata.name)
+                                  (name is optional — defaults to the doc's top-level name)
   delete <name>                   delete a pipeline (prompts unless -y)
 
 common flags:
@@ -184,15 +188,21 @@ func pipelineURL(remote, projectID, name string) string {
 // doAuthedRequest issues an HTTP request with Authorization: Bearer
 // <apiToken> and returns body bytes + status. Used by all four
 // CRUD ops here so error handling (status check, bounded read) lives
-// in one place.
-func doAuthedRequest(ctx context.Context, method, urlStr, apiToken string, body io.Reader) (status int, respBody []byte, err error) {
+// in one place. contentType is only set on the request when body != nil;
+// callers with no body (GET/DELETE) may pass "". A body with an empty
+// contentType defaults to "application/yaml" (the server treats anything
+// that isn't exactly "application/json" as YAML — see pipeline_handlers.go).
+func doAuthedRequest(ctx context.Context, method, urlStr, apiToken, contentType string, body io.Reader) (status int, respBody []byte, err error) {
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("build %s %s: %w", method, urlStr, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+apiToken)
 	if body != nil {
-		req.Header.Set("Content-Type", "application/yaml")
+		if contentType == "" {
+			contentType = "application/yaml"
+		}
+		req.Header.Set("Content-Type", contentType)
 	}
 	resp, err := pipelineHTTPClient.Do(req)
 	if err != nil {
@@ -227,7 +237,7 @@ func runPipelineList(args []string) error {
 
 	status, body, err := doAuthedRequest(context.Background(),
 		http.MethodGet, pipelineURL(resolved.Remote, resolved.ID, ""),
-		resolved.APIToken, nil)
+		resolved.APIToken, "", nil)
 	if err != nil {
 		return err
 	}
@@ -249,6 +259,27 @@ func runPipelineList(args []string) error {
 		fmt.Println("(no pipelines)")
 		return nil
 	}
+	// Render a DESCRIPTION column only when at least one item has a
+	// non-empty description — older servers omit the field entirely
+	// (decodes to "" here), so this keeps the table clean for them.
+	hasDescription := false
+	for _, p := range items {
+		if p.Description != "" {
+			hasDescription = true
+			break
+		}
+	}
+	if hasDescription {
+		fmt.Printf("%-40s %-40s %s\n", "NAME", "DESCRIPTION", "UPDATED")
+		for _, p := range items {
+			stamp := p.UpdatedAt
+			if stamp == "" {
+				stamp = p.CreatedAt
+			}
+			fmt.Printf("%-40s %-40s %s\n", p.Name, p.Description, stamp)
+		}
+		return nil
+	}
 	// Simple two-column table — name + updated_at (or created_at fallback).
 	// Local-mode responses may omit timestamps entirely.
 	fmt.Printf("%-40s %s\n", "NAME", "UPDATED")
@@ -262,7 +293,11 @@ func runPipelineList(args []string) error {
 	return nil
 }
 
-// runPipelineGet implements `datuplet pipeline get <name>`.
+// runPipelineGet implements `datuplet pipeline get <name>`. Default output
+// hits the server's `?format=yaml` rendering (S6) and prints the response
+// body verbatim, so callers can redirect straight to a file. `--json` hits
+// the plain detail endpoint instead and prints its JSON body verbatim
+// (including the `doc` field as a JSON object — never re-serialized).
 func runPipelineGet(args []string) error {
 	positional, remote, tokenFile, project, _, asJSON, _, err := parsePipelineFlags(args)
 	if err != nil {
@@ -281,9 +316,12 @@ func runPipelineGet(args []string) error {
 		return err
 	}
 
+	getURL := pipelineURL(resolved.Remote, resolved.ID, name)
+	if !asJSON {
+		getURL += "?format=yaml"
+	}
 	status, body, err := doAuthedRequest(context.Background(),
-		http.MethodGet, pipelineURL(resolved.Remote, resolved.ID, name),
-		resolved.APIToken, nil)
+		http.MethodGet, getURL, resolved.APIToken, "", nil)
 	if err != nil {
 		return err
 	}
@@ -295,21 +333,18 @@ func runPipelineGet(args []string) error {
 	}
 
 	if asJSON {
+		// Pass through the server's detail JSON verbatim.
 		fmt.Println(string(body))
 		return nil
 	}
-	var detail pipelineDetailJSON
-	if err := json.Unmarshal(body, &detail); err != nil {
-		return fmt.Errorf("decode get response: %w", err)
-	}
-	// Default view: just the YAML, so callers can redirect to a file.
-	fmt.Print(detail.YAML)
+	// Default view: the server's deterministic YAML rendering, verbatim.
+	fmt.Print(string(body))
 	return nil
 }
 
 // runPipelinePut implements `datuplet pipeline put [<name>] -f <file>`.
-// When the positional <name> is omitted, falls back to the YAML's
-// metadata.name. This makes simple "apply this file" usage one
+// When the positional <name> is omitted, falls back to the doc's
+// top-level name. This makes simple "apply this file" usage one
 // argument shorter and matches the kubectl-style ergonomic.
 func runPipelinePut(args []string) error {
 	positional, remote, tokenFile, project, file, _, _, err := parsePipelineFlags(args)
@@ -328,21 +363,22 @@ func runPipelinePut(args []string) error {
 		return err
 	}
 
-	// Resolve the name. Precedence: explicit positional > YAML's
-	// metadata.name. The API enforces they match; failing here gives a
-	// nicer error than the server's 400.
-	yamlName, _ := extractMetadataName(body)
+	// Resolve the name. Precedence: explicit positional > the doc's
+	// top-level name. The API enforces they match; failing here gives a
+	// nicer error than the server's 400 — and does so before any HTTP
+	// call is made.
+	docName, _ := extractDocName(body)
 	var name string
 	switch {
-	case len(positional) == 1 && yamlName != "" && positional[0] != yamlName:
-		return fmt.Errorf("pipeline name mismatch: arg=%q vs metadata.name=%q\n(omit the positional to use metadata.name, or update one to match the other)",
-			positional[0], yamlName)
+	case len(positional) == 1 && docName != "" && positional[0] != docName:
+		return fmt.Errorf("pipeline name mismatch: arg=%q vs doc name=%q\n(omit the positional to use the doc's name, or update one to match the other)",
+			positional[0], docName)
 	case len(positional) == 1:
 		name = positional[0]
-	case yamlName != "":
-		name = yamlName
+	case docName != "":
+		name = docName
 	default:
-		return fmt.Errorf("put: pipeline name required — pass it as the first positional or set metadata.name in the YAML")
+		return fmt.Errorf("put: pipeline name required — pass it as the first positional or set name in the doc")
 	}
 
 	resolved, err := loadRemoteArgs(remote, tokenFile, project)
@@ -355,7 +391,7 @@ func runPipelinePut(args []string) error {
 
 	status, respBody, err := doAuthedRequest(context.Background(),
 		http.MethodPut, pipelineURL(resolved.Remote, resolved.ID, name),
-		resolved.APIToken, bytes.NewReader(body))
+		resolved.APIToken, sniffContentType(body), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -408,7 +444,7 @@ func runPipelineDelete(args []string) error {
 
 	status, body, err := doAuthedRequest(context.Background(),
 		http.MethodDelete, pipelineURL(resolved.Remote, resolved.ID, name),
-		resolved.APIToken, nil)
+		resolved.APIToken, "", nil)
 	if err != nil {
 		return err
 	}
@@ -448,17 +484,37 @@ func readFileOrStdin(path string) ([]byte, error) {
 	return body, nil
 }
 
-// extractMetadataName parses just enough of the pipeline YAML to lift
-// metadata.name. Tolerates JSON (yaml.v3 handles both) and missing
-// metadata block. Caller decides what to do when the result is empty.
-func extractMetadataName(body []byte) (string, error) {
+// extractDocName parses just enough of the pipeline doc to lift its
+// top-level `name` (RFC 027 §5.1 — bodies are envelope-free; there is no
+// metadata block to descend into). Tolerates JSON (yaml.v3 handles both)
+// and a missing name. Caller decides what to do when the result is empty.
+func extractDocName(body []byte) (string, error) {
 	var doc struct {
-		Metadata struct {
-			Name string `yaml:"name" json:"name"`
-		} `yaml:"metadata" json:"metadata"`
+		Name string `yaml:"name" json:"name"`
 	}
 	if err := yaml.Unmarshal(body, &doc); err != nil {
-		return "", fmt.Errorf("parse metadata.name: %w", err)
+		return "", fmt.Errorf("parse doc name: %w", err)
 	}
-	return doc.Metadata.Name, nil
+	return doc.Name, nil
+}
+
+// sniffContentType inspects the first non-whitespace byte of a PUT body to
+// decide the Content-Type header: a leading '{' signals JSON syntax;
+// anything else is sent as YAML (which the server's config.Parse accepts
+// JSON as a subset of anyway). Matches the server's real negotiation in
+// pipeline_handlers.go's PUT handler: Content-Type: application/json
+// triggers a strict JSON-syntax check; any other Content-Type (or none)
+// is parsed as YAML.
+func sniffContentType(body []byte) string {
+	for _, b := range body {
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{':
+			return "application/json"
+		default:
+			return "application/yaml"
+		}
+	}
+	return "application/yaml"
 }

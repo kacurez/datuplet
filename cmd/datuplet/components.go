@@ -148,7 +148,7 @@ func componentsURL(remote, name string) string {
 // view). Split out from runComponentsList so it's testable directly
 // against an httptest.Server without going through os.Stdout.
 func fetchComponentsList(ctx context.Context, remote, apiToken string) (body []byte, items []componentSummaryJSON, err error) {
-	status, body, err := doAuthedRequest(ctx, http.MethodGet, componentsURL(remote, ""), apiToken, nil)
+	status, body, err := doAuthedRequest(ctx, http.MethodGet, componentsURL(remote, ""), apiToken, "", nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -166,7 +166,7 @@ func fetchComponentsList(ctx context.Context, remote, apiToken string) (body []b
 // code. Split out from runComponentsGet for the same reason as
 // fetchComponentsList above.
 func fetchComponentDetail(ctx context.Context, remote, apiToken, name string) (body []byte, detail componentDetailJSON, err error) {
-	status, body, err := doAuthedRequest(ctx, http.MethodGet, componentsURL(remote, name), apiToken, nil)
+	status, body, err := doAuthedRequest(ctx, http.MethodGet, componentsURL(remote, name), apiToken, "", nil)
 	if err != nil {
 		return nil, componentDetailJSON{}, err
 	}
