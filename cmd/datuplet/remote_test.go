@@ -41,7 +41,7 @@ func TestLoadRemoteArgs_LoadsTokenAndCluster(t *testing.T) {
 		ExpiresAt:      "2099-01-01T00:00:00Z",
 		UserID:         "u-1",
 		PipelineAPIURL: "http://api",
-		Projects: []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+		Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
 	}
 	writeDatupletFiles(t, tmp, fakeJWT, meta)
 
@@ -102,7 +102,7 @@ func TestLoadRemoteArgs_TokenFileFlag(t *testing.T) {
 		WarehouseName:  "datuplet",
 		ExpiresAt:      "2099-01-01T00:00:00Z",
 		PipelineAPIURL: "http://api",
-		Projects: []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+		Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
 	}
 	dotDir := filepath.Join(tmp, ".datuplet")
 	if err := os.MkdirAll(dotDir, 0o700); err != nil {
@@ -241,7 +241,7 @@ func TestLoadRemoteArgs_RemoteUrlNormalization(t *testing.T) {
 		WarehouseName:  "datuplet",
 		ExpiresAt:      "2099-01-01T00:00:00Z",
 		PipelineAPIURL: "http://localhost:30081",
-		Projects: []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+		Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
 	}
 	writeDatupletFiles(t, tmp, fakeJWT, meta)
 
@@ -252,6 +252,186 @@ func TestLoadRemoteArgs_RemoteUrlNormalization(t *testing.T) {
 	}
 	if args.LakekeeperURL != "http://lk:8181/catalog" {
 		t.Errorf("LakekeeperURL = %q", args.LakekeeperURL)
+	}
+}
+
+// TestLoadRemoteArgs_APITokenPrecedence is a table-driven test of the
+// api-token resolution precedence: --token-file > DATUPLET_API_TOKEN >
+// ~/.datuplet/api-token. Remote resolution is pinned to the explicit
+// "http://api" flag value in every case so this test isolates the
+// api-token axis only.
+func TestLoadRemoteArgs_APITokenPrecedence(t *testing.T) {
+	cases := []struct {
+		name          string
+		tokenFileFlag bool   // write a --token-file and pass it
+		envToken      string // DATUPLET_API_TOKEN value ("" = unset)
+		defaultToken  bool   // write ~/.datuplet/api-token
+		wantAPIToken  string
+	}{
+		{
+			name:          "token-file wins over env and default file",
+			tokenFileFlag: true,
+			envToken:      "env-token",
+			defaultToken:  true,
+			wantAPIToken:  "flag-token",
+		},
+		{
+			name:         "env wins over default file when no token-file",
+			envToken:     "env-token",
+			defaultToken: true,
+			wantAPIToken: "env-token",
+		},
+		{
+			name:         "default file used when no flag and no env",
+			defaultToken: true,
+			wantAPIToken: "default-token",
+		},
+		{
+			name:         "empty when nothing set (soft-fail)",
+			wantAPIToken: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			if tc.envToken != "" {
+				t.Setenv("DATUPLET_API_TOKEN", tc.envToken)
+			}
+
+			meta := clusterMeta{
+				LakekeeperURL:  "http://lk:8181/catalog",
+				ExpiresAt:      "2099-01-01T00:00:00Z",
+				PipelineAPIURL: "http://api",
+				Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+			}
+			dotDir := filepath.Join(tmp, ".datuplet")
+			if err := os.MkdirAll(dotDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			b, _ := json.MarshalIndent(meta, "", "  ")
+			if err := os.WriteFile(filepath.Join(dotDir, "cluster.json"), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// The lakekeeper token file must exist whenever we read it
+			// (always, and additionally as the source for --token-file).
+			if err := os.WriteFile(filepath.Join(dotDir, "token"), []byte(fakeJWT), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.defaultToken {
+				if err := os.WriteFile(filepath.Join(dotDir, "api-token"), []byte("default-token"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var tokenFileFlag string
+			if tc.tokenFileFlag {
+				customPath := filepath.Join(tmp, "custom-token")
+				if err := os.WriteFile(customPath, []byte("flag-token"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				tokenFileFlag = customPath
+			}
+
+			args, err := loadRemoteArgs("http://api", tokenFileFlag, "")
+			if err != nil {
+				t.Fatalf("loadRemoteArgs: %v", err)
+			}
+			if args.APIToken != tc.wantAPIToken {
+				t.Errorf("APIToken = %q, want %q", args.APIToken, tc.wantAPIToken)
+			}
+		})
+	}
+}
+
+// TestLoadRemoteArgs_RemotePrecedence is a table-driven test of the remote
+// resolution precedence: --remote > DATUPLET_REMOTE > ~/.datuplet/cluster.json.
+func TestLoadRemoteArgs_RemotePrecedence(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteFlag string
+		envRemote  string
+		clusterURL string
+		wantRemote string
+	}{
+		{
+			name:       "flag wins over env and cluster.json",
+			remoteFlag: "http://flag-api",
+			envRemote:  "http://env-api",
+			clusterURL: "http://flag-api",
+			wantRemote: "http://flag-api",
+		},
+		{
+			name:       "env wins over cluster.json when no flag",
+			envRemote:  "http://env-api",
+			clusterURL: "http://env-api",
+			wantRemote: "http://env-api",
+		},
+		{
+			name:       "cluster.json used when no flag and no env",
+			clusterURL: "http://cluster-api",
+			wantRemote: "http://cluster-api",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			if tc.envRemote != "" {
+				t.Setenv("DATUPLET_REMOTE", tc.envRemote)
+			}
+
+			meta := clusterMeta{
+				LakekeeperURL:  "http://lk:8181/catalog",
+				ExpiresAt:      "2099-01-01T00:00:00Z",
+				PipelineAPIURL: tc.clusterURL,
+				Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+			}
+			writeDatupletFiles(t, tmp, fakeJWT, meta)
+
+			args, err := loadRemoteArgs(tc.remoteFlag, "", "")
+			if err != nil {
+				t.Fatalf("loadRemoteArgs: %v", err)
+			}
+			if args.Remote != tc.wantRemote {
+				t.Errorf("Remote = %q, want %q", args.Remote, tc.wantRemote)
+			}
+		})
+	}
+}
+
+// TestLoadRemoteArgs_HeadlessNoDatupletFileRead verifies the core headless
+// promise (RFC 027 §7): with both DATUPLET_API_TOKEN and DATUPLET_REMOTE set
+// and no --token-file flag, loadRemoteArgs never touches ~/.datuplet at all
+// — not even to check it exists. HOME points at an empty temp dir (no
+// .datuplet subdirectory whatsoever); any attempt to read a file under it
+// would surface as an error, so a nil error here is proof no such read was
+// attempted.
+func TestLoadRemoteArgs_HeadlessNoDatupletFileRead(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
+	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
+
+	args, err := loadRemoteArgs("", "", "my-project")
+	if err != nil {
+		t.Fatalf("loadRemoteArgs: unexpected error in headless mode: %v", err)
+	}
+	if args.APIToken != "headless-api-token" {
+		t.Errorf("APIToken = %q, want %q", args.APIToken, "headless-api-token")
+	}
+	if args.Remote != "http://headless-api" {
+		t.Errorf("Remote = %q, want %q", args.Remote, "http://headless-api")
+	}
+	if args.ID != "my-project" {
+		t.Errorf("ID = %q, want %q", args.ID, "my-project")
+	}
+
+	// Confirm ~/.datuplet was never even created (no read/write attempt).
+	if _, statErr := os.Stat(filepath.Join(tmp, ".datuplet")); !os.IsNotExist(statErr) {
+		t.Errorf("expected ~/.datuplet to not exist, stat err = %v", statErr)
 	}
 }
 
@@ -267,7 +447,7 @@ func TestLoadRemoteArgs_MalformedExpiresAt(t *testing.T) {
 		WarehouseName:  "datuplet",
 		ExpiresAt:      "not-a-date",
 		PipelineAPIURL: "http://api",
-		Projects: []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+		Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
 	}
 	writeDatupletFiles(t, tmp, fakeJWT, meta)
 

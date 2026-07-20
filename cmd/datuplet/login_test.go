@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -253,6 +254,76 @@ func TestLogin_OverwritesExistingFiles(t *testing.T) {
 	}
 	if meta.LakekeeperURL != "http://lakekeeper:8181/catalog" {
 		t.Errorf("cluster.json not overwritten: lakekeeper_url = %q", meta.LakekeeperURL)
+	}
+}
+
+// TestLogin_PasswordStdin verifies that --password-stdin reads exactly one
+// line from stdin (the password only) and never prints an interactive
+// prompt; the email must come from the Email field, not stdin.
+func TestLogin_PasswordStdin(t *testing.T) {
+	home := setHomeDir(t)
+	srv := fakeLoginServer(t, http.StatusOK, happyBody(t))
+	defer srv.Close()
+
+	// Stdin carries only the password — a second line would remain unread
+	// if runLogin tried to consume more than one line.
+	input := strings.NewReader("hunter2\nSHOULD_NOT_BE_READ\n")
+	var out strings.Builder
+	args := loginArgs{
+		Remote:        srv.URL,
+		Email:         "alice@example.com",
+		PasswordStdin: true,
+		Stdin:         input,
+		Stdout:        &out,
+		Stderr:        &out,
+	}
+
+	if err := runLogin(args); err != nil {
+		t.Fatalf("runLogin: %v", err)
+	}
+
+	// No interactive prompt text should appear.
+	outStr := out.String()
+	if strings.Contains(outStr, "Password:") {
+		t.Errorf("stdout must not contain an interactive password prompt: %q", outStr)
+	}
+
+	// The token file must reflect a successful login.
+	tokenBytes, err := os.ReadFile(filepath.Join(home, ".datuplet", "token"))
+	if err != nil {
+		t.Fatalf("read token file: %v", err)
+	}
+	if string(tokenBytes) != fakeJWT {
+		t.Errorf("token file = %q, want %q", string(tokenBytes), fakeJWT)
+	}
+
+	// Exactly one line must have been consumed — the second line must
+	// remain unread in the reader.
+	rest, _ := io.ReadAll(input)
+	if string(rest) != "SHOULD_NOT_BE_READ\n" {
+		t.Errorf("expected second line to remain unread, got %q", string(rest))
+	}
+}
+
+// TestLogin_PasswordStdinRequiresEmail verifies that --password-stdin
+// without an --email value fails fast with a clear error instead of
+// silently falling back to an interactive prompt.
+func TestLogin_PasswordStdinRequiresEmail(t *testing.T) {
+	setHomeDir(t)
+	input := strings.NewReader("hunter2\n")
+	args := loginArgs{
+		Remote:        "http://unused",
+		PasswordStdin: true,
+		Stdin:         input,
+		Stdout:        &strings.Builder{},
+		Stderr:        &strings.Builder{},
+	}
+	err := runLogin(args)
+	if err == nil {
+		t.Fatal("expected error when --password-stdin is set without --email, got nil")
+	}
+	if !strings.Contains(err.Error(), "email") {
+		t.Errorf("error does not mention email: %v", err)
 	}
 }
 

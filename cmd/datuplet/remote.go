@@ -51,14 +51,35 @@ type remoteArgs struct {
 	ProjectName string
 }
 
+// Environment variables that close the loop for headless (agent) CLI usage
+// — see RFC 027 §7. Honored only when the corresponding flag is unset.
+const (
+	envAPIToken = "DATUPLET_API_TOKEN"
+	envRemote   = "DATUPLET_REMOTE"
+)
+
 // loadRemoteArgs reads ~/.datuplet/token (or tokenFileFlag if non-empty) and
 // ~/.datuplet/cluster.json, validates the token expiry, resolves the
 // active project from the user's available projects, and returns a
 // populated remoteArgs. Returns a human-friendly error mentioning
 // `datuplet login --remote` on any missing/expired credential.
 //
+// Headless resolution (RFC 027 §7): the pipeline-api bearer token and the
+// remote URL each resolve through a three-tier precedence so agents never
+// need to run `datuplet login` interactively:
+//   - api-token: --token-file > $DATUPLET_API_TOKEN > ~/.datuplet/api-token
+//   - remote:    --remote (the `remote` param) > $DATUPLET_REMOTE > cluster.json's
+//     stored pipeline_api_url
+//
+// When both the api-token and the remote resolve from flags/env alone (no
+// --token-file), loadRemoteArgs never touches ~/.datuplet at all — the
+// fast path below returns immediately. In that mode there is no local
+// project list to resolve against, so projectFlag (if any) is passed
+// straight through as the Datuplet project ID: agents must supply the
+// project UUID via --project when running fully headless.
+//
 // projectFlag is the value passed via `--project <name>` (empty = unset).
-// Resolution rules (multi-project ergonomics):
+// Resolution rules (multi-project ergonomics) for the disk-backed path:
 //   - 0 projects → error: ask an admin to grant.
 //   - 1 project + flag empty → use that one (most common dev case).
 //   - 1 project + flag matches its name → same outcome, explicit.
@@ -70,6 +91,22 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve home dir: %w", err)
+	}
+
+	envAPITokenVal := os.Getenv(envAPIToken)
+	effectiveRemote := remote
+	if effectiveRemote == "" {
+		effectiveRemote = os.Getenv(envRemote)
+	}
+
+	// Headless fast path: the api-token and the remote are both already
+	// resolved from flags/env — no ~/.datuplet file needs to be read.
+	if tokenFileFlag == "" && effectiveRemote != "" && envAPITokenVal != "" {
+		return &remoteArgs{
+			Remote:   effectiveRemote,
+			APIToken: envAPITokenVal, // SECURITY: never logged or printed
+			ID:       projectFlag,
+		}, nil
 	}
 
 	// Resolve token file path.
@@ -85,42 +122,49 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 
 	tokBytes, err := os.ReadFile(tokenPath)
 	if err != nil {
-		return nil, fmt.Errorf("read token file %s: %w\n(run `datuplet login --remote %s` first)", tokenPath, err, remote)
+		return nil, fmt.Errorf("read token file %s: %w\n(run `datuplet login --remote %s` first)", tokenPath, err, effectiveRemote)
 	}
 	rawToken := string(bytes.TrimSpace(tokBytes))
 	if rawToken == "" {
-		return nil, fmt.Errorf("token file %s is empty\n(run `datuplet login --remote %s` first)", tokenPath, remote)
+		return nil, fmt.Errorf("token file %s is empty\n(run `datuplet login --remote %s` first)", tokenPath, effectiveRemote)
 	}
 
 	// Read cluster.json — always from ~/.datuplet regardless of --token-file.
 	clusterPath := filepath.Join(home, ".datuplet", "cluster.json")
 	clusterBytes, err := os.ReadFile(clusterPath)
 	if err != nil {
-		return nil, fmt.Errorf("read cluster config: %w\n(run `datuplet login --remote %s` first)", err, remote)
+		return nil, fmt.Errorf("read cluster config: %w\n(run `datuplet login --remote %s` first)", err, effectiveRemote)
 	}
 
 	var meta clusterMeta
 	if err := json.Unmarshal(clusterBytes, &meta); err != nil {
-		return nil, fmt.Errorf("parse cluster.json: %w\n(run `datuplet login --remote %s` first)", err, remote)
+		return nil, fmt.Errorf("parse cluster.json: %w\n(run `datuplet login --remote %s` first)", err, effectiveRemote)
 	}
 
 	// Validate expiry — fail closed: a missing or unparseable expires_at is
 	// treated as a credentials problem, not silently skipped.
 	if meta.ExpiresAt == "" {
-		return nil, fmt.Errorf("token metadata corrupt (expires_at missing)\n(run `datuplet login --remote %s` first)", remote)
+		return nil, fmt.Errorf("token metadata corrupt (expires_at missing)\n(run `datuplet login --remote %s` first)", effectiveRemote)
 	}
 	exp, parseErr := time.Parse(time.RFC3339, meta.ExpiresAt)
 	if parseErr != nil {
-		return nil, fmt.Errorf("token metadata corrupt (expires_at not RFC3339: %v)\n(run `datuplet login --remote %s` first)", parseErr, remote)
+		return nil, fmt.Errorf("token metadata corrupt (expires_at not RFC3339: %v)\n(run `datuplet login --remote %s` first)", parseErr, effectiveRemote)
 	}
 	if time.Now().After(exp) {
-		return nil, fmt.Errorf("token expired at %s\n(run `datuplet login --remote %s` first)", meta.ExpiresAt, remote)
+		return nil, fmt.Errorf("token expired at %s\n(run `datuplet login --remote %s` first)", meta.ExpiresAt, effectiveRemote)
 	}
 
-	// Validate that --remote matches the URL we logged into. An empty
-	// PipelineAPIURL means this cluster.json was written by an older version
-	// of `datuplet login` that did not record the URL — treat as mismatch.
-	if err := validateRemoteURL(remote, meta.PipelineAPIURL); err != nil {
+	// Remote resolution's third tier: neither --remote nor $DATUPLET_REMOTE
+	// was set, so trust whatever this cluster.json was logged into.
+	if effectiveRemote == "" {
+		effectiveRemote = meta.PipelineAPIURL
+	}
+
+	// Validate that the resolved remote matches the URL we logged into. An
+	// empty PipelineAPIURL means this cluster.json was written by an older
+	// version of `datuplet login` that did not record the URL — treat as
+	// mismatch.
+	if err := validateRemoteURL(effectiveRemote, meta.PipelineAPIURL); err != nil {
 		return nil, err
 	}
 
@@ -131,34 +175,42 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 	// paths against clusters where the lakekeeper_url is not advertised
 	// in the /auth/token response (deploy-config-dependent).
 
-	// Read api-token — always from ~/.datuplet/api-token regardless of
-	// --token-file. Validate expiry from meta.APIExpiresAt so we catch
-	// stale tokens before the first HTTP call. Soft-fail: an empty api-token
-	// means the server is an older version; trigger/storage will report a
-	// clear error when they get 401.
-	apiTokenPath := filepath.Join(home, ".datuplet", "api-token")
-	apiTokBytes, apiTokErr := os.ReadFile(apiTokenPath)
+	// Resolve api-token: --token-file (reuse the file already read above as
+	// rawToken) > $DATUPLET_API_TOKEN > ~/.datuplet/api-token. Validate
+	// expiry from meta.APIExpiresAt so we catch stale tokens before the
+	// first HTTP call. Soft-fail on the default-file tier: an empty
+	// api-token means the server is an older version; trigger/storage will
+	// report a clear error when they get 401.
 	var rawAPIToken string
-	if apiTokErr == nil {
-		rawAPIToken = string(bytes.TrimSpace(apiTokBytes))
+	switch {
+	case tokenFileFlag != "":
+		rawAPIToken = rawToken
+	case envAPITokenVal != "":
+		rawAPIToken = envAPITokenVal
+	default:
+		apiTokenPath := filepath.Join(home, ".datuplet", "api-token")
+		apiTokBytes, apiTokErr := os.ReadFile(apiTokenPath)
+		if apiTokErr == nil {
+			rawAPIToken = string(bytes.TrimSpace(apiTokBytes))
+		}
 	}
 	if rawAPIToken != "" && meta.APIExpiresAt != "" {
 		apiExp, apiParseErr := time.Parse(time.RFC3339, meta.APIExpiresAt)
 		if apiParseErr != nil {
-			return nil, fmt.Errorf("api-token metadata corrupt (api_expires_at not RFC3339: %v)\n(run `datuplet login --remote %s` first)", apiParseErr, remote)
+			return nil, fmt.Errorf("api-token metadata corrupt (api_expires_at not RFC3339: %v)\n(run `datuplet login --remote %s` first)", apiParseErr, effectiveRemote)
 		}
 		if time.Now().After(apiExp) {
-			return nil, fmt.Errorf("api-token expired at %s\n(run `datuplet login --remote %s` first)", meta.APIExpiresAt, remote)
+			return nil, fmt.Errorf("api-token expired at %s\n(run `datuplet login --remote %s` first)", meta.APIExpiresAt, effectiveRemote)
 		}
 	}
 
-	id, projectID, projectName, perr := resolveProject(meta.Projects, projectFlag, remote)
+	id, projectID, projectName, perr := resolveProject(meta.Projects, projectFlag, effectiveRemote)
 	if perr != nil {
 		return nil, perr
 	}
 
 	return &remoteArgs{
-		Remote:              remote,
+		Remote:              effectiveRemote,
 		Token:               rawToken,    // SECURITY: never logged or printed
 		APIToken:            rawAPIToken, // SECURITY: never logged or printed
 		TokenPath:           tokenPath,
@@ -240,4 +292,3 @@ func validateRemoteURL(requested, saved string) error {
 	}
 	return nil
 }
-
