@@ -11,6 +11,8 @@ The pipeline-api is Datuplet's central product REST service. It owns:
 
 For the end-to-end token lifecycle (session cookie → run JWT → impersonation JWT → FGA legs), see [`docs/auth-flow.md`](auth-flow.md).
 
+For the `datuplet` CLI's agent-facing loop over this API (components → validate → put → trigger → storage sample, headless auth included), see [`docs/agent-quickstart.md`](agent-quickstart.md).
+
 ## Run locally
 
 ### 1. Start Postgres

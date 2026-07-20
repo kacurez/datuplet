@@ -119,6 +119,7 @@ Full diagram and component descriptions: [docs/architecture.md](docs/architectur
 | [docs/components.md](docs/components.md) | Built-in component catalog |
 | [docs/warehouse-setup.md](docs/warehouse-setup.md) | S3 / GCS / MinIO warehouse prep |
 | [docs/pipeline-api.md](docs/pipeline-api.md) | pipeline-api REST reference |
+| [docs/agent-quickstart.md](docs/agent-quickstart.md) | CLI loop for agents/scripts: components → validate → put → trigger → storage sample |
 | [docs/ad-hoc-query.md](docs/ad-hoc-query.md) | Ad-hoc SQL query (browser console, REST, CLI) |
 | [docs/auth-flow.md](docs/auth-flow.md) | Token lifecycle (session → run JWT → FGA) |
 | [docs/secrets.md](docs/secrets.md) | Secret references in pipeline YAML |
