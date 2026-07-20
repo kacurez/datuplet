@@ -183,6 +183,19 @@ function labelHTML(key, node, required) {
 
 function keyOf(path) { return path.length ? path[path.length - 1] : ''; }
 
+// rebasePath: rewrite the leading `oldBase` segment of an error path string to
+// `newBase`, matching only at a segment boundary (end / '.' / '['), so
+// `tables[2]` rebases `tables[2].name` but never `tables[20]`. Used to keep
+// error paths accurate when a repeater row's live index diverges from the index
+// it was created with (after a middle removal), and to map a map-value's `*`
+// placeholder segment onto the row's actual key.
+function rebasePath(p, oldBase, newBase) {
+  if (typeof p !== 'string' || oldBase === newBase) return p;
+  if (p === oldBase) return newBase;
+  if (p.startsWith(oldBase + '.') || p.startsWith(oldBase + '[')) return newBase + p.slice(oldBase.length);
+  return p;
+}
+
 // ---------------------------------------------------------------------------
 // Composite: object group
 // ---------------------------------------------------------------------------
@@ -301,7 +314,12 @@ function renderList(node, path, required, init, ctx) {
     const body = renderNode(itemsSchema, path.concat(idx), false, itemInit, ctx);
     card.appendChild(body.el);
 
-    const row = { card, read: body.read, titleEl };
+    // basePath captures the index this row's subtree was rendered with. After a
+    // middle removal the row's live position (below) diverges from it, so read()
+    // rebases child-error paths from basePath onto the current index. (Value
+    // reads stay correct without rebasing — each reader is scoped to its own
+    // card subtree, so a stale data-sf-path index never collides.)
+    const row = { card, read: body.read, titleEl, basePath: fmtPath(path.concat(idx)) };
     rm.addEventListener('click', () => {
       const i = rows.indexOf(row);
       if (i >= 0) { rows.splice(i, 1); card.remove(); renumber(); }
@@ -323,11 +341,16 @@ function renderList(node, path, required, init, ctx) {
   const read = () => {
     const arr = [];
     const errors = [];
-    for (const row of rows) {
+    rows.forEach((row, i) => {
       const r = row.read();
-      if (Array.isArray(r.errors)) errors.push(...r.errors);
+      if (Array.isArray(r.errors)) {
+        const newBase = fmtPath(path.concat(i));
+        for (const e of r.errors) {
+          errors.push(row.basePath === newBase ? e : { ...e, path: rebasePath(e.path, row.basePath, newBase) });
+        }
+      }
       if (r.present) arr.push(r.value);
-    }
+    });
     const minItems = required ? Math.max(1, node.minItems || 1) : (node.minItems || 0);
     if (arr.length < minItems) {
       errors.push({
@@ -372,9 +395,13 @@ function renderMap(node, path, required, init, ctx) {
     keyInput.placeholder = 'key';
     if (k != null) keyInput.value = String(k);
 
-    // The value control comes from the map's value schema (enum → select,
-    // else a plain input). Rendered bare (no key label of its own).
-    const valCtl = bareControl(valueSchema, path.concat('*'), v);
+    // The value control is the FULL recursive renderer applied to the map's
+    // value schema, so any value shape works: a secret picker
+    // (x-datuplet-secret), enum, nested object/array, multi-type, etc. — not
+    // just plain scalars. The key is unknown until the user types it, so the
+    // value renders under a `*` placeholder segment; read() rebases its error
+    // paths onto the actual key.
+    const valCtl = renderNode(valueSchema, path.concat('*'), false, v, ctx);
 
     const rm = document.createElement('button');
     rm.type = 'button';
@@ -406,6 +433,7 @@ function renderMap(node, path, required, init, ctx) {
   add.addEventListener('click', () => addRow('', undefined));
   el.appendChild(add);
 
+  const starBase = fmtPath(path.concat('*'));
   const read = () => {
     const out = Object.create(null); // schema-controlled keys → null-proto.
     const errors = [];
@@ -413,9 +441,14 @@ function renderMap(node, path, required, init, ctx) {
       const k = row.keyInput.value.trim();
       if (k === '') continue; // sparse: an empty key contributes nothing.
       const vr = row.valRead();
-      if (Array.isArray(vr.errors)) errors.push(...vr.errors);
+      const kBase = fmtPath(path.concat(k)); // `*` placeholder → the actual key.
+      if (Array.isArray(vr.errors)) {
+        for (const e of vr.errors) {
+          errors.push(starBase === kBase ? e : { ...e, path: rebasePath(e.path, starBase, kBase) });
+        }
+      }
       if (vr.present) out[k] = vr.value;
-      else errors.push({ path: `${fmtPath(path)}.${k}`, message: 'value required' });
+      else errors.push({ path: kBase, message: 'value required' });
     }
     const keys = Object.keys(out);
     if (required && keys.length === 0) errors.push({ path: fmtPath(path), message: 'required' });
