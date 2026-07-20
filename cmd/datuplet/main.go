@@ -171,6 +171,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "components":
+		if err := runComponents(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "version":
 		fmt.Println("datuplet version 0.1.0-poc")
 
@@ -203,6 +209,7 @@ Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
   pipeline               CRUD for pipeline specs (list, get, put, delete)
+  components             Browse the component catalog (list, get --schema)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
   gateway                Start the data gateway server (container entrypoint)
@@ -230,6 +237,16 @@ Options for 'storage':
   -rows int              Max preview rows for 'sample' subcommand (0 = server default)
   <subcommand>           One of: tables | info | schema | sample | history
   <ns>.<table>           Namespace.table reference (required for info/schema/sample/history)
+
+Options for 'components':
+  -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
+  -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
+  <subcommand>           One of: list | get
+  list -json             Emit the catalog as JSON (table: NAME, DISPLAY, DEFAULT, IO, DEPRECATED)
+  get <name>             Show one component's detail (always resolves the detail endpoint)
+  get -version <v>       Resolve a specific version (default: registry defaultVersion, else highest stable)
+  get -schema            Print the resolved version's configSchema verbatim (mutually exclusive with -json)
+  Not project-scoped: no -project flag (spec RFC 027 §4.7 — shared catalog).
 
 Options for 'query':
   -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
