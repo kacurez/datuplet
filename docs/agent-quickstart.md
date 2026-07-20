@@ -164,7 +164,7 @@ stages:                   # sequential; components within a stage run in paralle
     components:
       - name: gen                     # instance name, unique across the pipeline
         component: data-generator     # registry reference
-        version: 0.9.1                # optional → registry default resolution
+        version: v0.9.1               # optional → registry default resolution
         config:                       # validated against the version's configSchema
           tables:
             - name: events
