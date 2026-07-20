@@ -247,7 +247,7 @@ func runPipelineList(args []string) error {
 
 	if asJSON {
 		// Pass through the server's JSON verbatim.
-		fmt.Println(string(body))
+		fmt.Print(string(body))
 		return nil
 	}
 

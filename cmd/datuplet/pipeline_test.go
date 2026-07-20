@@ -355,3 +355,49 @@ func TestRunPipelineListOmitsDescriptionColumnWhenAbsent(t *testing.T) {
 		t.Errorf("output should not contain DESCRIPTION header when absent:\n%s", out)
 	}
 }
+
+// TestRunPipelineListJSONPrintsBodyVerbatim pins the `list --json` contract:
+// the server's JSON is printed byte-for-byte, not re-decoded/re-serialized
+// and not given an extra trailing newline on top of the encoder's own
+// (RFC 027 C3 fix 2 — mirrors TestRunPipelineGetJSONHitsPlainEndpoint).
+func TestRunPipelineListJSONPrintsBodyVerbatim(t *testing.T) {
+	const jsonBody = `[{"name":"p1","description":"desc one","updated_at":"2026-01-01T00:00:00Z"}]`
+	// The real server's json.Encoder.Encode appends exactly one trailing
+	// newline (pkg/pipelineapi/http/json.go) — mirror that here so this
+	// test can pin byte-for-byte fidelity, not just content equality.
+	wireBody := jsonBody + "\n"
+	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
+		onList: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(wireBody))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runPipelineList([]string{"--json", "--project", "proj1"})
+	})
+	if runErr != nil {
+		t.Fatalf("runPipelineList --json: %v", runErr)
+	}
+	// Byte-for-byte fidelity: exactly the server's body, one trailing
+	// newline — not zero (would mean truncation) and not two (would mean
+	// datuplet added its own on top of the encoder's, printing a blank
+	// line after the JSON).
+	if out != wireBody {
+		t.Errorf("stdout = %q, want server body verbatim (byte-for-byte): %q", out, wireBody)
+	}
+	if strings.HasSuffix(out, "\n\n") {
+		t.Errorf("stdout = %q, ends with two newlines; want exactly one (no extra fmt.Println newline)", out)
+	}
+	var decoded []pipelineRefJSON
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("output does not decode as []pipelineRefJSON: %v", err)
+	}
+	if len(decoded) != 1 || decoded[0].Name != "p1" {
+		t.Errorf("decoded = %+v, want one item named p1", decoded)
+	}
+}
