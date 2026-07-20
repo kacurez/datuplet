@@ -2,6 +2,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -168,7 +169,15 @@ func main() {
 	case "pipeline":
 		if err := runPipeline(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			// `validate` uses exitCodeErr to distinguish a transport/HTTP
+			// failure (>=2) from "the pipeline is invalid" (plain error,
+			// default exit 1) — spec §7.
+			code := 1
+			var ece *exitCodeErr
+			if errors.As(err, &ece) {
+				code = ece.code
+			}
+			os.Exit(code)
 		}
 
 	case "components":
@@ -208,7 +217,7 @@ Usage:
 Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
-  pipeline               CRUD for pipeline specs (list, get, put, delete)
+  pipeline               CRUD for pipeline specs (list, get, put, delete, validate)
   components             Browse the component catalog (list, get --schema)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
