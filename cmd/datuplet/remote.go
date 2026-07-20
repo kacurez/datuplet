@@ -56,6 +56,7 @@ type remoteArgs struct {
 const (
 	envAPIToken = "DATUPLET_API_TOKEN"
 	envRemote   = "DATUPLET_REMOTE"
+	envProject  = "DATUPLET_PROJECT"
 )
 
 // loadRemoteArgs reads ~/.datuplet/token (or tokenFileFlag if non-empty) and
@@ -64,19 +65,23 @@ const (
 // populated remoteArgs. Returns a human-friendly error mentioning
 // `datuplet login --remote` on any missing/expired credential.
 //
-// Headless resolution (RFC 027 §7): the pipeline-api bearer token and the
-// remote URL each resolve through a three-tier precedence so agents never
-// need to run `datuplet login` interactively:
+// Headless resolution (RFC 027 §7): the pipeline-api bearer token, the
+// remote URL, and the project each resolve through a precedence chain so
+// agents never need to run `datuplet login` interactively:
 //   - api-token: --token-file > $DATUPLET_API_TOKEN > ~/.datuplet/api-token
 //   - remote:    --remote (the `remote` param) > $DATUPLET_REMOTE > cluster.json's
 //     stored pipeline_api_url
+//   - project:   --project (the `projectFlag` param) > $DATUPLET_PROJECT >
+//     disk-backed resolution (single-project auto-default / multi-project
+//     ambiguous error) via resolveProject
 //
 // When both the api-token and the remote resolve from flags/env alone (no
 // --token-file), loadRemoteArgs never touches ~/.datuplet at all — the
 // fast path below returns immediately. In that mode there is no local
-// project list to resolve against, so projectFlag (if any) is passed
-// straight through as the Datuplet project ID: agents must supply the
-// project UUID via --project when running fully headless.
+// project list to resolve against, so the effective project value
+// (--project, falling back to $DATUPLET_PROJECT) is passed straight through
+// as the Datuplet project ID: agents supply the project UUID via either
+// --project or $DATUPLET_PROJECT when running fully headless.
 //
 // Partial case: when $DATUPLET_API_TOKEN is set but the remote still needs
 // cluster.json's tier-3 fallback (no --remote / $DATUPLET_REMOTE), the fast
@@ -86,7 +91,11 @@ const (
 // (remote resolution + expiry validation).
 //
 // projectFlag is the value passed via `--project <name>` (empty = unset).
-// Resolution rules (multi-project ergonomics) for the disk-backed path:
+// When projectFlag is empty, $DATUPLET_PROJECT is used as the effective
+// project value instead — so the env var can also disambiguate a
+// multi-project account on the disk-backed path without typing --project.
+// Resolution rules (multi-project ergonomics) for the disk-backed path,
+// applied to that effective value:
 //   - 0 projects → error: ask an admin to grant.
 //   - 1 project + flag empty → use that one (most common dev case).
 //   - 1 project + flag matches its name → same outcome, explicit.
@@ -106,13 +115,22 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		effectiveRemote = os.Getenv(envRemote)
 	}
 
+	// Effective project: --project flag wins, else $DATUPLET_PROJECT. This is
+	// the sole project-ID source on the headless fast path (no on-disk list),
+	// and it also feeds resolveProject on the disk-backed path so the env var
+	// can disambiguate a multi-project account without --project.
+	effectiveProject := projectFlag
+	if effectiveProject == "" {
+		effectiveProject = os.Getenv(envProject)
+	}
+
 	// Headless fast path: the api-token and the remote are both already
 	// resolved from flags/env — no ~/.datuplet file needs to be read.
 	if tokenFileFlag == "" && effectiveRemote != "" && envAPITokenVal != "" {
 		return &remoteArgs{
 			Remote:   effectiveRemote,
 			APIToken: envAPITokenVal, // SECURITY: never logged or printed
-			ID:       projectFlag,
+			ID:       effectiveProject,
 		}, nil
 	}
 
@@ -224,7 +242,7 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		}
 	}
 
-	id, projectID, projectName, perr := resolveProject(meta.Projects, projectFlag, effectiveRemote)
+	id, projectID, projectName, perr := resolveProject(meta.Projects, effectiveProject, effectiveRemote)
 	if perr != nil {
 		return nil, perr
 	}

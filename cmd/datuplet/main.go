@@ -232,7 +232,7 @@ Options for 'login':
 
 Options for 'trigger':
   -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
-  -project string        Project name (auto-defaulted if you have exactly one)
+  -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one)
   -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   -wait                  Block until the run reaches a terminal phase
   -timeout duration      Hard cap on --wait; cancels the run cluster-side on expiry (default 1h)
@@ -241,7 +241,7 @@ Options for 'trigger':
 
 Options for 'storage':
   -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
-  -project string        Project name (auto-defaulted if you have exactly one)
+  -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one)
   -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   -rows int              Max preview rows for 'sample' subcommand (0 = server default)
   <subcommand>           One of: tables | info | schema | sample | history
@@ -259,7 +259,7 @@ Options for 'components':
 
 Options for 'query':
   -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
-  -project string        Project name (auto-defaulted if you have exactly one)
+  -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one)
   -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   -sql string            Inline SQL (takes precedence over -f and stdin)
   -f string              Path to a .sql file (used when --sql is empty; else stdin)
@@ -269,7 +269,8 @@ Options for 'query':
 Headless / agent auth (RFC 027 §7):
   DATUPLET_API_TOKEN     pipeline-api bearer token; precedence: -token-file > $DATUPLET_API_TOKEN > ~/.datuplet/api-token
   DATUPLET_REMOTE        pipeline-api URL; precedence: -remote > $DATUPLET_REMOTE > ~/.datuplet/cluster.json
-  With both set, no ~/.datuplet state is needed. Use 'datuplet login -email <e> -password-stdin'
+  DATUPLET_PROJECT       Project UUID; precedence: -project > $DATUPLET_PROJECT > on-disk project resolution
+  With all set, no ~/.datuplet state is needed. Use 'datuplet login -email <e> -password-stdin'
   for explicit non-interactive login instead.
 
 Options for 'gateway':

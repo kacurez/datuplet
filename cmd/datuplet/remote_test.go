@@ -488,6 +488,107 @@ func TestLoadRemoteArgs_EnvAPITokenNoTokenFileClusterRemoteFallback(t *testing.T
 	}
 }
 
+// TestLoadRemoteArgs_ProjectEnvFastPath verifies that on the headless fast
+// path (both DATUPLET_API_TOKEN and DATUPLET_REMOTE set, no --token-file),
+// $DATUPLET_PROJECT supplies the project ID when --project is omitted.
+func TestLoadRemoteArgs_ProjectEnvFastPath(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "does-not-exist")
+	t.Setenv("HOME", home)
+	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
+	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
+	t.Setenv("DATUPLET_PROJECT", "env-project-uuid")
+
+	args, err := loadRemoteArgs("", "", "")
+	if err != nil {
+		t.Fatalf("loadRemoteArgs: unexpected error: %v", err)
+	}
+	if args.ID != "env-project-uuid" {
+		t.Errorf("ID = %q, want %q (from $DATUPLET_PROJECT)", args.ID, "env-project-uuid")
+	}
+	// Fast path must still not touch ~/.datuplet.
+	if _, statErr := os.Stat(home); !os.IsNotExist(statErr) {
+		t.Errorf("expected %s to not exist, stat err = %v", home, statErr)
+	}
+}
+
+// TestLoadRemoteArgs_ProjectFlagWinsOverEnv verifies the --project flag
+// overrides $DATUPLET_PROJECT when both are set (fast path).
+func TestLoadRemoteArgs_ProjectFlagWinsOverEnv(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "does-not-exist")
+	t.Setenv("HOME", home)
+	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
+	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
+	t.Setenv("DATUPLET_PROJECT", "env-project-uuid")
+
+	args, err := loadRemoteArgs("", "", "flag-project-uuid")
+	if err != nil {
+		t.Fatalf("loadRemoteArgs: unexpected error: %v", err)
+	}
+	if args.ID != "flag-project-uuid" {
+		t.Errorf("ID = %q, want %q (--project must win over env)", args.ID, "flag-project-uuid")
+	}
+}
+
+// TestLoadRemoteArgs_ProjectEmptyFastPath verifies existing behavior is
+// preserved: with neither --project nor $DATUPLET_PROJECT set, the pure fast
+// path still resolves ID to empty string (callers that don't need project
+// scoping are unaffected).
+func TestLoadRemoteArgs_ProjectEmptyFastPath(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "does-not-exist")
+	t.Setenv("HOME", home)
+	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
+	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
+	// DATUPLET_PROJECT deliberately unset.
+
+	args, err := loadRemoteArgs("", "", "")
+	if err != nil {
+		t.Fatalf("loadRemoteArgs: unexpected error: %v", err)
+	}
+	if args.ID != "" {
+		t.Errorf("ID = %q, want empty string (no project source)", args.ID)
+	}
+}
+
+// TestLoadRemoteArgs_ProjectEnvDiskBackedMultiProject verifies that on the
+// disk-backed (non-fast) path, $DATUPLET_PROJECT can disambiguate a
+// multi-project account via resolveProject without needing --project.
+func TestLoadRemoteArgs_ProjectEnvDiskBackedMultiProject(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("DATUPLET_PROJECT", "beta")
+
+	meta := clusterMeta{
+		LakekeeperURL:  "http://lk:8181/catalog",
+		WarehouseName:  "datuplet",
+		ExpiresAt:      "2099-01-01T00:00:00Z",
+		PipelineAPIURL: "http://api",
+		Projects: []clusterMetaProject{
+			{ID: "p-alpha", Name: "alpha", LakekeeperProjectID: "lk-alpha"},
+			{ID: "p-beta", Name: "beta", LakekeeperProjectID: "lk-beta"},
+		},
+	}
+	writeDatupletFiles(t, tmp, fakeJWT, meta)
+
+	// No --project flag, but $DATUPLET_PROJECT=beta must pick the beta project
+	// (and not error with the multi-project ambiguity message).
+	args, err := loadRemoteArgs("http://api", "", "")
+	if err != nil {
+		t.Fatalf("loadRemoteArgs: unexpected error: %v", err)
+	}
+	if args.ID != "p-beta" {
+		t.Errorf("ID = %q, want %q (resolved via $DATUPLET_PROJECT)", args.ID, "p-beta")
+	}
+	if args.LakekeeperProjectID != "lk-beta" {
+		t.Errorf("LakekeeperProjectID = %q, want %q", args.LakekeeperProjectID, "lk-beta")
+	}
+	if args.ProjectName != "beta" {
+		t.Errorf("ProjectName = %q, want %q", args.ProjectName, "beta")
+	}
+}
+
 // TestLoadRemoteArgs_MalformedExpiresAt verifies that a cluster.json with a
 // non-RFC3339 expires_at returns a credentials error instead of silently
 // skipping the expiry check (fail-closed requirement).

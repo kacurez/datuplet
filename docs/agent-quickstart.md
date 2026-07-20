@@ -21,15 +21,18 @@ Pick one of two auth paths (RFC 027 §7):
 ```bash
 export DATUPLET_REMOTE=https://pipeline-api.example.com
 export DATUPLET_API_TOKEN=<your cli-api bearer token>
+export DATUPLET_PROJECT=<your project uuid>
 ```
 
-With both set, `loadRemoteArgs` never touches `~/.datuplet` at all
-(`cmd/datuplet/remote.go`'s "headless fast path"). One consequence: there is
-no on-disk project list to auto-default from, so **every project-scoped
-subcommand** (`pipeline`, `trigger`, `storage` — but not `components`, which
-isn't project-scoped) **needs an explicit `--project <project-uuid>`** — the
-literal Datuplet project UUID, not a human-readable name. Get the UUID from
-whoever provisioned your project access.
+With `DATUPLET_REMOTE` + `DATUPLET_API_TOKEN` set, `loadRemoteArgs` never
+touches `~/.datuplet` at all (`cmd/datuplet/remote.go`'s "headless fast
+path"). One consequence: there is no on-disk project list to auto-default
+from, so **every project-scoped subcommand** (`pipeline`, `trigger`,
+`storage` — but not `components`, which isn't project-scoped) **needs a
+project UUID** — the literal Datuplet project UUID, not a human-readable
+name. Supply it once via `$DATUPLET_PROJECT` (as above) or per-command via
+`--project <project-uuid>`; the flag wins over the env var when both are
+set. Get the UUID from whoever provisioned your project access.
 
 **B. Explicit non-interactive login:**
 
@@ -43,12 +46,16 @@ This writes `~/.datuplet/token`, `~/.datuplet/api-token`, and
 be omitted, and `--project` takes the human-readable project *name* — it
 auto-defaults if you have exactly one project.
 
-The rest of this walkthrough uses path A (env vars); substitute your own
-`--project` value throughout. Set it once:
+The rest of this walkthrough uses path A (env vars). Set the project UUID
+once via `$DATUPLET_PROJECT` and every project-scoped command below picks it
+up automatically — no repeated `--project` flag needed:
 
 ```bash
-export PROJECT=3f9f9d2e-6b7a-4c1b-9e2f-6a2b7c9d1e10   # your project UUID
+export DATUPLET_PROJECT=3f9f9d2e-6b7a-4c1b-9e2f-6a2b7c9d1e10   # your project UUID
 ```
+
+(If you'd rather be explicit, pass `--project <uuid>` on each command
+instead; the flag overrides `$DATUPLET_PROJECT` when both are set.)
 
 ## Step 1 — Learn the component catalog
 
@@ -209,7 +216,7 @@ requires **both** `schema` and `limit`, per Step 1's schema read):
 ```
 
 ```bash
-datuplet pipeline validate -f events-etl.yaml --project "$PROJECT"
+datuplet pipeline validate -f events-etl.yaml
 echo "exit=$?"
 ```
 
@@ -227,7 +234,7 @@ exit=1
 `--json` gives you the same finding as structured output, for scripting:
 
 ```bash
-datuplet pipeline validate -f events-etl.yaml --project "$PROJECT" --json
+datuplet pipeline validate -f events-etl.yaml --json
 ```
 
 ```json
@@ -238,7 +245,7 @@ datuplet pipeline validate -f events-etl.yaml --project "$PROJECT" --json
 has it). Re-run:
 
 ```bash
-datuplet pipeline validate -f events-etl.yaml --project "$PROJECT"
+datuplet pipeline validate -f events-etl.yaml
 echo "exit=$?"
 ```
 
@@ -255,7 +262,7 @@ error-severity finding, `2+` = the validate request itself failed
 ## Step 4 — Persist it
 
 ```bash
-datuplet pipeline put -f events-etl.yaml --project "$PROJECT"
+datuplet pipeline put -f events-etl.yaml
 ```
 
 ```
@@ -265,17 +272,17 @@ pipeline "events-etl" upserted in project ""
 (The trailing `""` is expected in pure env-var headless mode: there's no
 on-disk project list to resolve a display name from, so `ProjectName` is
 blank — the upsert itself still lands in the correct project, addressed by
-the `--project` UUID. Logging in via `datuplet login` instead resolves and
-prints the real project name here.)
+the `$DATUPLET_PROJECT` UUID. Logging in via `datuplet login` instead
+resolves and prints the real project name here.)
 
 `put` takes the positional pipeline name from the doc's own `name:` field
-when omitted, so `datuplet pipeline put -f events-etl.yaml --project "$PROJECT"`
+when omitted, so `datuplet pipeline put -f events-etl.yaml`
 (no name arg) is equivalent here — the doc's `name: events-etl` supplies it.
 
 ## Step 5 — Trigger and wait
 
 ```bash
-datuplet trigger --project "$PROJECT" --wait --timeout 10m --json events-etl
+datuplet trigger --wait --timeout 10m --json events-etl
 ```
 
 (`--wait` polls the run every 2s until it reaches a terminal phase, up to
@@ -304,7 +311,7 @@ Drop `--json` for a one-line human summary instead:
 ## Step 6 — Verify the output
 
 ```bash
-datuplet storage --project "$PROJECT" sample curated.daily_summary
+datuplet storage sample curated.daily_summary
 ```
 
 (`storage` uses Go's `flag` package directly — flags must come **before**
@@ -331,18 +338,19 @@ the preview size; omit it for the server default.)
 
 Other `storage` subcommands you'll want alongside `sample`: `tables` (list
 every table in the project), `info` / `schema` / `history` — same
-`<ns>.<table>` argument, same `--project` requirement.
+`<ns>.<table>` argument, same project requirement (from `$DATUPLET_PROJECT`
+or `--project`).
 
 ## Full loop, back to back
 
 ```bash
 export DATUPLET_REMOTE=https://pipeline-api.example.com
 export DATUPLET_API_TOKEN=<your cli-api bearer token>
-export PROJECT=<your project uuid>
+export DATUPLET_PROJECT=<your project uuid>
 
 datuplet components get data-generator --schema        # learn the config shape
-datuplet pipeline validate -f events-etl.yaml --project "$PROJECT"   # findings + exit code
-datuplet pipeline put -f events-etl.yaml --project "$PROJECT"
-datuplet trigger --project "$PROJECT" --wait --json events-etl
-datuplet storage --project "$PROJECT" sample curated.daily_summary  # verify output
+datuplet pipeline validate -f events-etl.yaml          # findings + exit code
+datuplet pipeline put -f events-etl.yaml
+datuplet trigger --wait --json events-etl
+datuplet storage sample curated.daily_summary          # verify output
 ```
