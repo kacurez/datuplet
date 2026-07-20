@@ -9,6 +9,14 @@
 // editor), additionalProperties maps (key→value rows), and multi-type `type`
 // arrays (shape picker). No JSON-textarea fallback for built-ins.
 //
+// v2.1 (RFC 027 U2): display-metadata decorations layered onto the U1
+// structure — `default`/`examples[0]` placeholders, tri-state boolean
+// <select> when `default` is present (unset = absent from getValue()),
+// x-datuplet-doc hover icons, x-datuplet-advanced grouped into one trailing
+// collapsed <details> per object, and a per-node JSON sub-editor fallback for
+// out-of-subset constructs (oneOf/anyOf/allOf/not/$ref/$defs/if/then/else/
+// patternProperties/const) — see renderJsonFallback / outOfSubsetKey.
+//
 // Hardening (unchanged from v1, now enforced at every depth):
 //   * esc() every schema-derived string before it reaches innerHTML.
 //   * Object.create(null) accumulators wherever a schema-controlled key (which
@@ -103,6 +111,13 @@ function degenerate(initialValue) {
 function renderNode(node, path, required, init, ctx) {
   node = node || {};
 
+  // 0. Out-of-subset constructs (oneOf/anyOf/allOf/not/$ref/$defs/if/then/else/
+  //    patternProperties/const) render as a JSON sub-editor for JUST this node,
+  //    never a whole-form fallback. Built-ins lint-clean and never hit this path
+  //    (RFC 027 R5); it exists for third-party / operator-registered schemas.
+  const oosKey = outOfSubsetKey(node);
+  if (oosKey) return renderJsonFallback(node, path, required, init, oosKey);
+
   // 1. Secret picker has highest precedence (x-datuplet-secret).
   if (node['x-datuplet-secret'] === true) return renderSecret(node, path, required, init, ctx);
 
@@ -174,11 +189,13 @@ function fmtPath(path) {
 function labelHTML(key, node, required) {
   const title = typeof node.title === 'string' && node.title ? node.title : '';
   const req = required ? ' <span class="sform-req" title="required">*</span>' : '';
+  const doc = typeof node['x-datuplet-doc'] === 'string' && node['x-datuplet-doc']
+    ? ` <span class="doci" title="${esc(node['x-datuplet-doc'])}">ⓘ</span>` : '';
   const desc = node.description ? `<span class="sform-desc">${esc(node.description)}</span>` : '';
   const name = title
     ? `${esc(title)} <code class="mono">${esc(key)}</code>`
     : `<code class="mono">${esc(key)}</code>`;
-  return `<span class="sform-label">${name}${req}</span>${desc}`;
+  return `<span class="sform-label">${name}${req}${doc}</span>${desc}`;
 }
 
 function keyOf(path) { return path.length ? path[path.length - 1] : ''; }
@@ -208,7 +225,7 @@ function renderGroup(node, path, required, init, ctx) {
 
   const children = entries.map(([k, child]) => {
     const cr = renderNode(child || {}, path.concat(k), reqSet.has(k), iv ? iv[k] : undefined, ctx);
-    return { k, cr };
+    return { k, cr, advanced: !!(child && child['x-datuplet-advanced']) };
   });
 
   let el;
@@ -231,7 +248,24 @@ function renderGroup(node, path, required, init, ctx) {
     d.appendChild(body);
     el = d;
   }
-  for (const c of children) body.appendChild(c.cr.el);
+  // x-datuplet-advanced: all such properties of THIS object render together,
+  // in one collapsed <details> at the end of the group — not one per property.
+  // Partition preserves each side's original property order.
+  const normal = children.filter((c) => !c.advanced);
+  const advanced = children.filter((c) => c.advanced);
+  for (const c of normal) body.appendChild(c.cr.el);
+  if (advanced.length) {
+    const det = document.createElement('details');
+    det.className = 'sform-group sform-advanced';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced';
+    det.appendChild(summary);
+    const advBody = document.createElement('div');
+    advBody.className = 'sform-group-body';
+    for (const c of advanced) advBody.appendChild(c.cr.el);
+    det.appendChild(advBody);
+    body.appendChild(det);
+  }
 
   const read = () => {
     // Null-prototype: out["__proto__"] = v sets an own key, never mutates the
@@ -551,7 +585,10 @@ function detectType(v, types) {
 
 function renderScalar(node, path, required, init) {
   const key = keyOf(path);
-  const isCheck = node.type === 'boolean' && !Array.isArray(node.enum);
+  // A boolean WITH a default becomes a tri-state <select> (unset/true/false),
+  // laid out like any other labeled control; a boolean WITHOUT a default stays
+  // a plain checkbox (unchanged from U1/v1) with the checkbox-first layout.
+  const isCheck = node.type === 'boolean' && !Array.isArray(node.enum) && node.default === undefined;
   const label = document.createElement('label');
   label.className = isCheck ? 'field sform-field sform-field--check' : 'field sform-field';
 
@@ -581,6 +618,18 @@ function renderScalar(node, path, required, init) {
 // multi-type slots.
 // ---------------------------------------------------------------------------
 
+// setDefaultPlaceholder: `default` (display metadata only, spec §4.4) wins as
+// the input placeholder (`default: <v>`); `examples[0]` is a fallback shown
+// only when `default` is absent, as a plain value with no prefix. Neither is
+// ever copied into the stored value — placeholders don't populate .value.
+function setDefaultPlaceholder(el, node) {
+  if (node.default !== undefined) {
+    el.placeholder = `default: ${node.default}`;
+  } else if (Array.isArray(node.examples) && node.examples.length > 0 && node.examples[0] !== undefined) {
+    el.placeholder = String(node.examples[0]);
+  }
+}
+
 // bareControl: enum → select; boolean → checkbox; number/integer → number input;
 // string/unknown → text input or (x-datuplet-multiline) textarea. Returns
 // { el, read }; el is a wrapper whose single control carries data-sf-path, so
@@ -596,7 +645,7 @@ function bareControl(node, path, init) {
     sel.setAttribute('data-sf-path', ps);
     const ph = document.createElement('option');
     ph.value = '';
-    ph.textContent = '— choose —';
+    ph.textContent = node.default !== undefined ? `— default (${String(node.default)}) —` : '— choose —';
     sel.appendChild(ph);
     const initStr = init == null ? null : String(init);
     node.enum.forEach((e, i) => {
@@ -624,6 +673,39 @@ function bareControl(node, path, init) {
   }
 
   if (node.type === 'boolean') {
+    if (node.default !== undefined) {
+      // Tri-state: the "unset" option means absent from getValue() — the
+      // component applies its own default at runtime (spec §4.2/§4.4). Only
+      // an explicit true/false choice is ever stored.
+      const sel = document.createElement('select');
+      sel.className = 'input';
+      sel.setAttribute('data-sf-path', ps);
+      const unset = document.createElement('option');
+      unset.value = '';
+      unset.textContent = `— default (${String(node.default)}) —`;
+      sel.appendChild(unset);
+      const t = document.createElement('option');
+      t.value = 'true';
+      t.textContent = 'true';
+      sel.appendChild(t);
+      const f = document.createElement('option');
+      f.value = 'false';
+      f.textContent = 'false';
+      sel.appendChild(f);
+      if (init === true) sel.value = 'true';
+      else if (init === false) sel.value = 'false';
+      else sel.value = '';
+      wrap.appendChild(sel);
+      return {
+        el: wrap,
+        read: () => {
+          const el = ctlOf(wrap, ps);
+          const v = el ? el.value : '';
+          if (v === '') return { present: false, value: undefined, errors: [] };
+          return { present: true, value: v === 'true', errors: [] };
+        },
+      };
+    }
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.setAttribute('data-sf-path', ps);
@@ -643,6 +725,7 @@ function bareControl(node, path, init) {
     inp.type = 'number';
     inp.setAttribute('data-sf-path', ps);
     if (isInt) { inp.setAttribute('step', '1'); inp.setAttribute('inputmode', 'numeric'); }
+    setDefaultPlaceholder(inp, node);
     if (init != null) inp.value = String(init);
     wrap.appendChild(inp);
     return {
@@ -678,6 +761,7 @@ function bareControl(node, path, init) {
     ctl = document.createElement('textarea');
     ctl.className = 'input textarea input--mono';
     ctl.setAttribute('spellcheck', 'false');
+    ctl.setAttribute('rows', '10');
     if (lang) ctl.setAttribute('data-lang', lang);
   } else {
     ctl = document.createElement('input');
@@ -685,6 +769,7 @@ function bareControl(node, path, init) {
     ctl.type = 'text';
   }
   ctl.setAttribute('data-sf-path', ps);
+  setDefaultPlaceholder(ctl, node);
   if (init != null) ctl.value = String(init);
   wrap.appendChild(ctl);
   return {
@@ -823,6 +908,71 @@ function renderSecret(node, path, required, init, ctx) {
     return { present: true, value: v, errors: [] };
   };
   return { el: label, read };
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: out-of-subset JSON fallback (spec §4.2). A node using any of these
+// keywords is outside the Form Subset; render a JSON sub-editor for JUST that
+// node (never a whole-form fallback) with a callout naming the specific
+// construct. Built-ins lint-clean and never reach this path (RFC 027 R5); it
+// exists for third-party / operator-registered schemas only.
+// ---------------------------------------------------------------------------
+
+const OUT_OF_SUBSET_KEYS = [
+  'oneOf', 'anyOf', 'allOf', 'not', '$ref', '$defs',
+  'if', 'then', 'else', 'patternProperties', 'const',
+];
+
+// outOfSubsetKey: the first out-of-subset keyword found directly on `node`, or
+// null. Own-property check only — inherited Object.prototype keys never match.
+function outOfSubsetKey(node) {
+  for (const k of OUT_OF_SUBSET_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(node, k)) return k;
+  }
+  return null;
+}
+
+function renderJsonFallback(node, path, required, init, unsupportedKey) {
+  const key = keyOf(path);
+  const ps = fmtPath(path);
+  const el = document.createElement('div');
+  el.className = 'field sform-field sform-json-fallback';
+
+  // The schema root itself can be out-of-subset (no key to label); every
+  // nested occurrence (property, array item, map value) has one.
+  if (path.length > 0) el.insertAdjacentHTML('beforeend', labelHTML(key, node, required));
+
+  const warn = document.createElement('div');
+  warn.className = 'callout callout--warn';
+  warn.innerHTML = `This property uses <code class="mono">${esc(unsupportedKey)}</code>, `
+    + `which isn't supported by the form editor — edit as JSON.`;
+  el.appendChild(warn);
+
+  const ta = document.createElement('textarea');
+  ta.className = 'input textarea input--mono';
+  ta.setAttribute('spellcheck', 'false');
+  ta.setAttribute('data-sf-path', ps);
+  if (init !== undefined) {
+    try { ta.value = JSON.stringify(init, null, 2); } catch { /* leave blank */ }
+  }
+  el.appendChild(ta);
+
+  const read = () => {
+    const elx = ctlOf(el, ps);
+    const raw = elx ? elx.value.trim() : '';
+    if (raw === '') {
+      return { present: false, value: undefined, errors: required ? [{ path: ps, message: 'required' }] : [] };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      // Never throw out of read()/getValue() — a bad edit surfaces via getErrors().
+      return { present: false, value: undefined, errors: [{ path: ps, message: `invalid JSON: ${e.message}` }] };
+    }
+    return { present: true, value: parsed, errors: [] };
+  };
+  return { el, read };
 }
 
 // ---------------------------------------------------------------------------

@@ -900,3 +900,5 @@ code.inline {
 .sform-desc { display: block; color: var(--fg-2); font-size: var(--text-xs); font-weight: 400; margin-top: var(--s-1); }
 .sform-json summary { cursor: pointer; color: var(--fg-1); font-size: var(--text-sm); }
 .sform-manage { font-size: var(--text-xs); color: var(--accent); }
+.doci { color: var(--fg-2); cursor: help; font-size: 12px; border-bottom: 1px dotted var(--fg-2); }
+.doci:hover { color: var(--accent); border-bottom-color: var(--accent); }
