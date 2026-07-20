@@ -140,12 +140,16 @@ func TestRunPipelineGetDefaultHitsFormatYAML(t *testing.T) {
 func TestRunPipelineGetJSONHitsPlainEndpoint(t *testing.T) {
 	var gotQuery string
 	const jsonBody = `{"id":"abc","name":"mypipe","doc":{"name":"mypipe","stages":[]},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`
+	// The real server's json.Encoder.Encode appends exactly one trailing
+	// newline (pkg/pipelineapi/http/json.go) — mirror that here so this
+	// test can pin byte-for-byte fidelity, not just content equality.
+	wireBody := jsonBody + "\n"
 	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
 		onGet: func(w http.ResponseWriter, r *http.Request) {
 			gotQuery = r.URL.RawQuery
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(jsonBody))
+			_, _ = w.Write([]byte(wireBody))
 		},
 	})
 	defer srv.Close()
@@ -161,8 +165,15 @@ func TestRunPipelineGetJSONHitsPlainEndpoint(t *testing.T) {
 	if gotQuery != "" {
 		t.Errorf("query = %q, want empty (no format param)", gotQuery)
 	}
-	if strings.TrimSpace(out) != jsonBody {
-		t.Errorf("stdout = %q, want raw JSON body verbatim: %q", out, jsonBody)
+	// Byte-for-byte fidelity: exactly the server's body, one trailing
+	// newline — not zero (would mean truncation) and not two (would mean
+	// datuplet added its own on top of the encoder's, printing a blank
+	// line after the JSON).
+	if out != wireBody {
+		t.Errorf("stdout = %q, want server body verbatim (byte-for-byte): %q", out, wireBody)
+	}
+	if strings.HasSuffix(out, "\n\n") {
+		t.Errorf("stdout = %q, ends with two newlines; want exactly one (no extra fmt.Println newline)", out)
 	}
 	var decoded pipelineDetailJSON
 	if err := json.Unmarshal([]byte(out), &decoded); err != nil {

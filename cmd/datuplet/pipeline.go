@@ -334,7 +334,7 @@ func runPipelineGet(args []string) error {
 
 	if asJSON {
 		// Pass through the server's detail JSON verbatim.
-		fmt.Println(string(body))
+		fmt.Print(string(body))
 		return nil
 	}
 	// Default view: the server's deterministic YAML rendering, verbatim.
