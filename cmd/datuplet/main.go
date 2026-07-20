@@ -269,7 +269,7 @@ Options for 'query':
 Headless / agent auth (RFC 027 §7):
   DATUPLET_API_TOKEN     pipeline-api bearer token; precedence: -token-file > $DATUPLET_API_TOKEN > ~/.datuplet/api-token
   DATUPLET_REMOTE        pipeline-api URL; precedence: -remote > $DATUPLET_REMOTE > ~/.datuplet/cluster.json
-  DATUPLET_PROJECT       Project UUID; precedence: -project > $DATUPLET_PROJECT > on-disk project resolution
+  DATUPLET_PROJECT       Project name (resolved like -project) or UUID (fully-headless fast path only); precedence: -project > $DATUPLET_PROJECT > on-disk project resolution
   With all set, no ~/.datuplet state is needed. Use 'datuplet login -email <e> -password-stdin'
   for explicit non-interactive login instead.
 
