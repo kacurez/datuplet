@@ -269,8 +269,8 @@ the `--project` UUID. Logging in via `datuplet login` instead resolves and
 prints the real project name here.)
 
 `put` takes the positional pipeline name from the doc's own `name:` field
-when omitted, so `datuplet pipeline put -f events-etl.yaml` (no name arg) is
-equivalent here — the doc's `name: events-etl` supplies it.
+when omitted, so `datuplet pipeline put -f events-etl.yaml --project "$PROJECT"`
+(no name arg) is equivalent here — the doc's `name: events-etl` supplies it.
 
 ## Step 5 — Trigger and wait
 
@@ -304,13 +304,15 @@ Drop `--json` for a one-line human summary instead:
 ## Step 6 — Verify the output
 
 ```bash
-datuplet storage sample curated.daily_summary --project "$PROJECT"
+datuplet storage --project "$PROJECT" sample curated.daily_summary
 ```
 
-(`storage sample` takes a single `<namespace>.<table>` reference — here
-`curated.daily_summary`, matching the `transform` stage's output mapping
-from Step 2. Add `--rows N` to change the preview size; omit it for the
-server default.)
+(`storage` uses Go's `flag` package directly — flags must come **before**
+the subcommand and its positional args, since `flag.Parse` stops at the
+first non-flag token. `storage sample` takes a single `<namespace>.<table>`
+reference — here `curated.daily_summary`, matching the `transform` stage's
+output mapping from Step 2. Add `--rows N` before the subcommand to change
+the preview size; omit it for the server default.)
 
 ```json
 {
@@ -342,5 +344,5 @@ datuplet components get data-generator --schema        # learn the config shape
 datuplet pipeline validate -f events-etl.yaml --project "$PROJECT"   # findings + exit code
 datuplet pipeline put -f events-etl.yaml --project "$PROJECT"
 datuplet trigger --project "$PROJECT" --wait --json events-etl
-datuplet storage sample curated.daily_summary --project "$PROJECT"  # verify output
+datuplet storage --project "$PROJECT" sample curated.daily_summary  # verify output
 ```
