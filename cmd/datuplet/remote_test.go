@@ -405,13 +405,18 @@ func TestLoadRemoteArgs_RemotePrecedence(t *testing.T) {
 // TestLoadRemoteArgs_HeadlessNoDatupletFileRead verifies the core headless
 // promise (RFC 027 §7): with both DATUPLET_API_TOKEN and DATUPLET_REMOTE set
 // and no --token-file flag, loadRemoteArgs never touches ~/.datuplet at all
-// — not even to check it exists. HOME points at an empty temp dir (no
-// .datuplet subdirectory whatsoever); any attempt to read a file under it
-// would surface as an error, so a nil error here is proof no such read was
-// attempted.
+// — not even to check it exists. HOME points at a path that does not exist
+// on disk at all (not merely an empty existing temp dir): os.UserHomeDir()-
+// based path construction works fine either way, but any actual
+// os.ReadFile/os.Stat against a path under a non-existent parent directory
+// fails loudly with "no such file or directory". A nil error here is proof
+// loadRemoteArgs never attempted such a read — an empty-but-existing temp
+// dir would not distinguish "no read attempted" from "a read was attempted
+// and happened to find nothing", since both look identical from the outside.
 func TestLoadRemoteArgs_HeadlessNoDatupletFileRead(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
+	home := filepath.Join(tmp, "does-not-exist")
+	t.Setenv("HOME", home)
 	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
 	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
 
@@ -429,9 +434,57 @@ func TestLoadRemoteArgs_HeadlessNoDatupletFileRead(t *testing.T) {
 		t.Errorf("ID = %q, want %q", args.ID, "my-project")
 	}
 
-	// Confirm ~/.datuplet was never even created (no read/write attempt).
-	if _, statErr := os.Stat(filepath.Join(tmp, ".datuplet")); !os.IsNotExist(statErr) {
-		t.Errorf("expected ~/.datuplet to not exist, stat err = %v", statErr)
+	// Confirm the home dir itself was never created (no read/write attempt
+	// anywhere under it, including ~/.datuplet).
+	if _, statErr := os.Stat(home); !os.IsNotExist(statErr) {
+		t.Errorf("expected %s to not exist, stat err = %v", home, statErr)
+	}
+}
+
+// TestLoadRemoteArgs_EnvAPITokenNoTokenFileClusterRemoteFallback is a
+// regression test for the "partial headless" case: $DATUPLET_API_TOKEN is
+// set (so the api-token axis is fully resolved from env), but neither
+// --remote nor $DATUPLET_REMOTE is set, so the remote must fall back to
+// cluster.json's tier-3 pipeline_api_url. loadRemoteArgs must NOT require
+// ~/.datuplet/token to exist in this case — that file is never consulted
+// for the api-token when envAPITokenVal is already non-empty and
+// --token-file wasn't passed. cluster.json itself must still be read (it's
+// needed for the remote fallback and expiry validation).
+func TestLoadRemoteArgs_EnvAPITokenNoTokenFileClusterRemoteFallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("DATUPLET_API_TOKEN", "env-api-token")
+
+	meta := clusterMeta{
+		LakekeeperURL:  "http://lk:8181/catalog",
+		WarehouseName:  "datuplet",
+		ExpiresAt:      "2099-01-01T00:00:00Z",
+		PipelineAPIURL: "http://cluster-api",
+		Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+	}
+	dotDir := filepath.Join(tmp, ".datuplet")
+	if err := os.MkdirAll(dotDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dotDir, "cluster.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately do NOT write dotDir/"token" — the point of this test is
+	// that its absence must not matter when the api-token comes from env.
+
+	args, err := loadRemoteArgs("", "", "")
+	if err != nil {
+		t.Fatalf("loadRemoteArgs: unexpected error with missing ~/.datuplet/token: %v", err)
+	}
+	if args.APIToken != "env-api-token" {
+		t.Errorf("APIToken = %q, want %q", args.APIToken, "env-api-token")
+	}
+	if args.Remote != "http://cluster-api" {
+		t.Errorf("Remote = %q, want %q (from cluster.json)", args.Remote, "http://cluster-api")
 	}
 }
 

@@ -78,6 +78,13 @@ const (
 // straight through as the Datuplet project ID: agents must supply the
 // project UUID via --project when running fully headless.
 //
+// Partial case: when $DATUPLET_API_TOKEN is set but the remote still needs
+// cluster.json's tier-3 fallback (no --remote / $DATUPLET_REMOTE), the fast
+// path above doesn't apply, but ~/.datuplet/token is still skipped — it's
+// only read when tokenFileFlag is set or the api-token needs its
+// default-file fallback tier. cluster.json is always read on this path
+// (remote resolution + expiry validation).
+//
 // projectFlag is the value passed via `--project <name>` (empty = unset).
 // Resolution rules (multi-project ergonomics) for the disk-backed path:
 //   - 0 projects → error: ask an admin to grant.
@@ -109,24 +116,37 @@ func loadRemoteArgs(remote, tokenFileFlag, projectFlag string) (*remoteArgs, err
 		}, nil
 	}
 
-	// Resolve token file path.
-	tokenPath := tokenFileFlag
-	if tokenPath == "" {
-		tokenPath = filepath.Join(home, ".datuplet", "token")
-	}
-	// Always resolve to absolute path — Docker bind-mounts require it.
-	tokenPath, err = filepath.Abs(tokenPath)
-	if err != nil {
-		return nil, fmt.Errorf("resolve token path: %w", err)
-	}
+	// The lakekeeper token file (~/.datuplet/token, or tokenFileFlag) is only
+	// needed when it will actually be used downstream: as the explicit
+	// --token-file source, or as the final-tier api-token fallback when
+	// neither --token-file nor $DATUPLET_API_TOKEN supplied a value (see the
+	// rawAPIToken switch below). When envAPITokenVal is already set and no
+	// --token-file was given, skip this read entirely — cluster.json is
+	// still read unconditionally right after this, since it's needed for
+	// remote tier-3 resolution and expiry validation regardless of where
+	// the api-token came from.
+	var rawToken string
+	var tokenPath string
+	if tokenFileFlag != "" || envAPITokenVal == "" {
+		tokenPath = tokenFileFlag
+		if tokenPath == "" {
+			tokenPath = filepath.Join(home, ".datuplet", "token")
+		}
+		// Always resolve to absolute path — Docker bind-mounts require it.
+		var absErr error
+		tokenPath, absErr = filepath.Abs(tokenPath)
+		if absErr != nil {
+			return nil, fmt.Errorf("resolve token path: %w", absErr)
+		}
 
-	tokBytes, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return nil, fmt.Errorf("read token file %s: %w\n(run `datuplet login --remote %s` first)", tokenPath, err, effectiveRemote)
-	}
-	rawToken := string(bytes.TrimSpace(tokBytes))
-	if rawToken == "" {
-		return nil, fmt.Errorf("token file %s is empty\n(run `datuplet login --remote %s` first)", tokenPath, effectiveRemote)
+		tokBytes, readErr := os.ReadFile(tokenPath)
+		if readErr != nil {
+			return nil, fmt.Errorf("read token file %s: %w\n(run `datuplet login --remote %s` first)", tokenPath, readErr, effectiveRemote)
+		}
+		rawToken = string(bytes.TrimSpace(tokBytes))
+		if rawToken == "" {
+			return nil, fmt.Errorf("token file %s is empty\n(run `datuplet login --remote %s` first)", tokenPath, effectiveRemote)
+		}
 	}
 
 	// Read cluster.json — always from ~/.datuplet regardless of --token-file.
