@@ -260,7 +260,13 @@ async function getComponentDetail(name) {
 // JSON fallback node) are handled by the form itself, so they are not
 // preserved here — they come back through getValue().
 function unrenderedKeys(config, schemaStr) {
-  const out = {};
+  // Null-prototype accumulator: a stored config key literally named
+  // "__proto__" (or "constructor"/"prototype") copied via out[k] = … becomes a
+  // safe own property here instead of mutating the object's prototype chain —
+  // the same anti-prototype-pollution measure schema-form.js uses. The spread
+  // that consumes this in commitForm() ({...unrenderedKeys(...)}) copies own
+  // keys with CreateDataProperty semantics, so the safety carries through.
+  const out = Object.create(null);
   if (!config || typeof config !== 'object' || Array.isArray(config)) return out;
   let props = null;
   try {
@@ -307,7 +313,10 @@ function syncGateway() {
   const host = document.getElementById('pipeline-settings-body');
   if (!host) return;
   const cur = doc.gateway || {};
-  const g = {};
+  // Null-prototype accumulator: `cur` keys are doc-derived, so a stored gateway
+  // key named "__proto__" copied via g[k] = … must land as a safe own property,
+  // not mutate the prototype chain (same hardening as unrenderedKeys).
+  const g = Object.create(null);
   for (const k of Object.keys(cur)) {
     if (!GATEWAY_KEYS.includes(k)) g[k] = cur[k]; // preserve unknown keys
   }
@@ -357,7 +366,14 @@ export function renderOutline() {
     e.stopPropagation();
     const [s, c] = n.dataset.del.split(':').map(Number);
     doc.stages[s].components.splice(c, 1);
-    sel = null;
+    // Adjust the selection so it keeps pointing at the SAME component. Only the
+    // selected component's own removal clears the selection; removing an
+    // earlier sibling in the same stage shifts the selected index down by one;
+    // a removal in another stage (or after the selected one) leaves sel alone.
+    if (sel && sel.s === s) {
+      if (sel.c === c) sel = null;
+      else if (sel.c > c) sel = { s, c: sel.c - 1 };
+    }
     renderOutline();
     renderEditor();
   }));
@@ -381,7 +397,13 @@ export function renderOutline() {
   // Add a stage (auto-numbered).
   const addStage = document.getElementById('add-stage');
   if (addStage) addStage.addEventListener('click', () => {
-    doc.stages.push({ name: `stage-${doc.stages.length + 1}`, components: [] });
+    // Pick the smallest stage-N not already in use, so deleting/renaming stages
+    // can't make a fresh stage collide with an existing name (length + 1 would:
+    // with stage-1 and stage-3 present, length is 2 → stage-3, a duplicate).
+    const used = new Set(doc.stages.map((st) => st.name));
+    let n = 1;
+    while (used.has(`stage-${n}`)) n++;
+    doc.stages.push({ name: `stage-${n}`, components: [] });
     renderOutline();
   });
 }

@@ -267,15 +267,31 @@ function renderGroup(node, path, required, init, ctx) {
     body.appendChild(det);
   }
 
+  const declared = node.properties || {};
   const read = () => {
     // Null-prototype: out["__proto__"] = v sets an own key, never mutates the
     // prototype chain.
     const out = Object.create(null);
     const childErrors = [];
+    let renderedPresent = false;
     for (const c of children) {
       const r = c.cr.read();
       if (Array.isArray(r.errors)) childErrors.push(...r.errors);
-      if (r.present) out[c.k] = r.value;
+      if (r.present) { out[c.k] = r.value; renderedPresent = true; }
+    }
+    // Hidden-subtree preservation (spec §6), applied at EVERY object depth (not
+    // just the form root): keys present in THIS object's original init value
+    // but NOT declared in node.properties are ones the form rendered no control
+    // for. Merge them back verbatim so getValue() never silently drops an
+    // unrendered nested key. out is null-prototype, so out["__proto__"] = v
+    // creates a safe own property rather than mutating the prototype chain.
+    if (iv) {
+      for (const k of Object.keys(iv)) {
+        if (!Object.prototype.hasOwnProperty.call(declared, k)
+          && !Object.prototype.hasOwnProperty.call(out, k)) {
+          out[k] = iv[k];
+        }
+      }
     }
     const present = Object.keys(out).length > 0;
     const isRoot = path.length === 0;
@@ -285,9 +301,12 @@ function renderGroup(node, path, required, init, ctx) {
     // conceptually always present (it is the document), so it always surfaces
     // its children's errors; a present group does too. An absent but required
     // group reports a single required-missing at its own path rather than a
-    // noisy cascade of descendant errors.
+    // noisy cascade of descendant errors. Error gating keys off RENDERED
+    // children only: a group that exists solely because of a preserved
+    // unrendered key is not "touched" by the user, so it must not manufacture
+    // required-field errors for the controls they left empty.
     const errors = [];
-    if (present || isRoot) errors.push(...childErrors);
+    if (renderedPresent || isRoot) errors.push(...childErrors);
     else if (required) errors.push({ path: fmtPath(path), message: 'required' });
     return { present, value: out, errors };
   };
