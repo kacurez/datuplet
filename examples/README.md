@@ -15,27 +15,31 @@ This directory contains runnable pipeline examples demonstrating Datuplet's core
 
 ## How to Run
 
-Every file in this directory is validated by the CI guard (`examples/examples_guard_test.go`), ensuring all example pipelines are syntactically correct.
+Every file in this directory is envelope-free (RFC 027 §3 — no `apiVersion`/`kind`/`metadata`,
+just `name`/`description`/`gateway`/`stages` at the top level) and validated by the CI guard
+(`examples/examples_guard_test.go`), which checks each one parses via `config.Parse`.
 
 You can run a pipeline using any of these methods:
 
-### 1. UI (Pipeline Management Portal)
+### 1. CLI
+```bash
+datuplet pipeline put -f examples/pipelines/<example-file>
+datuplet trigger <pipeline-name>
+```
+`pipeline put` upserts the doc (the name is taken from the file's top-level `name` unless you
+pass one explicitly); `trigger` starts a run. See `datuplet pipeline help` and `datuplet help`
+for the full flag reference (`--remote`, `--project`, `--wait`, etc).
+
+### 2. UI (Pipeline Management Portal)
 1. Navigate to **Pipelines** → **New**
 2. Paste the entire YAML content from an example file
 3. Click **Save**
 4. Click **Trigger** to start a run
 
-### 2. REST API
+### 3. REST API
 See [`docs/pipeline-api.md`](../docs/pipeline-api.md) for:
 - **Upload a pipeline** — `PUT /api/v1/projects/{pid}/pipelines/{name}` with the YAML
 - **Trigger a run** — `POST /api/v1/projects/{pid}/pipelines/{name}/runs`
-
-### 3. kubectl (Direct Kubernetes Deployment)
-```bash
-kubectl apply -f examples/pipelines/<example-file>
-```
-
-This applies both the `Pipeline` resource and triggers a `PipelineRun` in the cluster.
 
 ## Prerequisites
 
