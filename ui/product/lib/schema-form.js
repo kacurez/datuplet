@@ -305,9 +305,15 @@ function renderGroup(node, path, required, init, ctx) {
     // children only: a group that exists solely because of a preserved
     // unrendered key is not "touched" by the user, so it must not manufacture
     // required-field errors for the controls they left empty.
+    // The group's OWN required-missing check must use the SAME merged
+    // presence (`present`, computed above from rendered children OR
+    // preserved hidden keys) — not renderedPresent alone. Otherwise a
+    // required object that's non-empty solely because of a preserved
+    // undeclared key is reported present by getValue() yet still flagged as
+    // a missing-required error here, contradicting itself.
     const errors = [];
     if (renderedPresent || isRoot) errors.push(...childErrors);
-    else if (required) errors.push({ path: fmtPath(path), message: 'required' });
+    else if (required && !present) errors.push({ path: fmtPath(path), message: 'required' });
     return { present, value: out, errors };
   };
   return { el, read };
