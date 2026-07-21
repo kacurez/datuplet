@@ -792,6 +792,11 @@ function setOutMode(comp, mode) {
 
 function renderOutputs(box, comp, si, token) {
   const o = comp.outputs || {};
+  // outputs.processors has no control here, but it's a valid OutputSpec sibling
+  // of buckets/tables (§6 hidden-subtree preservation). Every comp.outputs
+  // rebuild below (mode switches, dynamic sync, explicit init) must carry it
+  // along untouched, or it silently vanishes on any Outputs interaction.
+  const existingProcessors = (comp.outputs && comp.outputs.processors) ? comp.outputs.processors : undefined;
 
   // outputs.buckets[] preservation (see header comment) — read-only note,
   // no toggle, comp.outputs untouched.
@@ -813,7 +818,8 @@ function renderOutputs(box, comp, si, token) {
     if (comp.__outMode === 'dynamic') return;
     setOutMode(comp, 'dynamic');
     const first = ((comp.outputs || {}).tables || [])[0];
-    if (first && first.bucket) comp.outputs = { defaultBucket: first.bucket, ...(first.writeMode ? { defaultWriteMode: first.writeMode } : {}) };
+    if (first && first.bucket) comp.outputs = { defaultBucket: first.bucket, ...(first.writeMode ? { defaultWriteMode: first.writeMode } : {}), ...(existingProcessors ? { processors: existingProcessors } : {}) };
+    else if (existingProcessors) comp.outputs = { processors: existingProcessors };
     else delete comp.outputs;
     renderOutputs(box, comp, si, token);
   });
@@ -821,7 +827,7 @@ function renderOutputs(box, comp, si, token) {
     if (comp.__outMode === 'explicit') return;
     setOutMode(comp, 'explicit');
     const b = (comp.outputs || {}).defaultBucket, m = (comp.outputs || {}).defaultWriteMode;
-    comp.outputs = { tables: b ? [{ name: '', bucket: b, ...(m ? { writeMode: m } : {}) }] : [] };
+    comp.outputs = { tables: b ? [{ name: '', bucket: b, ...(m ? { writeMode: m } : {}) }] : [], ...(existingProcessors ? { processors: existingProcessors } : {}) };
     renderOutputs(box, comp, si, token);
   });
 
@@ -837,8 +843,8 @@ function renderOutputs(box, comp, si, token) {
       </div><p class="field" id="ochips"></p>`;
     const sync = () => {
       const b = body.querySelector('#ob').value.trim(), m = body.querySelector('#omw').value;
-      if (!b && !m) delete comp.outputs;
-      else comp.outputs = { ...(b ? { defaultBucket: b } : {}), ...(m ? { defaultWriteMode: m } : {}) };
+      if (!b && !m) { if (existingProcessors) comp.outputs = { processors: existingProcessors }; else delete comp.outputs; }
+      else comp.outputs = { ...(b ? { defaultBucket: b } : {}), ...(m ? { defaultWriteMode: m } : {}), ...(existingProcessors ? { processors: existingProcessors } : {}) };
       body.querySelector('#ochips').innerHTML = b ? `<span class="chip">${esc(b)} (dynamic)</span>` : '';
     };
     body.querySelector('#ob').addEventListener('input', sync);
@@ -846,7 +852,7 @@ function renderOutputs(box, comp, si, token) {
     sync();
   } else {
     const tables = (comp.outputs && Array.isArray(comp.outputs.tables)) ? comp.outputs.tables : [];
-    comp.outputs = { tables };
+    comp.outputs = { tables, ...(existingProcessors ? { processors: existingProcessors } : {}) };
     body.innerHTML = `<p class="hint">One mapping per table — bucket + table name. Name a new table, or select an existing one to write into.</p>
       <div id="orows"></div>
       <div class="out-actions">
@@ -1024,7 +1030,24 @@ export async function saveDoc() {
   // and do NOT re-serialize — PUT the user's literal YAML text.
   const yamlMode = mode === 'yaml';
   if (!yamlMode) commitForm();
-  const targetName = isNew ? String(doc.name || '').trim() : pipelineName;
+  // For a brand-new pipeline the PUT target name is derived from the doc's
+  // own name. In YAML mode the hidden form (doc.name) is stale and never
+  // reflects what the user typed in the textarea, so parse the YAML body and
+  // read its name instead of trusting doc.name (which would 400 or save under
+  // the wrong name). On a parse failure, stay in YAML and surface the error.
+  let targetName;
+  if (isNew && yamlMode) {
+    let parsedForName;
+    try {
+      parsedForName = yamlLoad(document.getElementById('yaml-ta').value);
+    } catch (e) {
+      if (msg) msg.innerHTML = `<div class="callout callout--warn">Cannot save: YAML is invalid (${esc(e.message)}). Fix the YAML first.</div>`;
+      return;
+    }
+    targetName = String((parsedForName && parsedForName.name) || '').trim();
+  } else {
+    targetName = isNew ? String(doc.name || '').trim() : pipelineName;
+  }
   if (!targetName) {
     if (msg) msg.innerHTML = `<div class="callout callout--warn">Name is required.</div>`;
     return;
