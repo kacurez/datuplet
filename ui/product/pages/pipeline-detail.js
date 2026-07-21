@@ -26,11 +26,12 @@
 // (`doc`, `sel`, renderOutline, renderEditor, saveDoc, validateDoc,
 // getComponentMeta).
 
-import { api, esc, getComponents, getComponent, getStorageCatalog, listSecrets } from '/ui/api.js';
+import { api, esc, getComponents, getComponent, getStorageCatalog, listSecrets, putPipelineYAML } from '/ui/api.js';
 import { timeTag, phaseToPillClass, formatDuration, durationFrom } from '/ui/format.js';
 import { renderFindings } from '/ui/lib/findings.js';
 import { buildSchemaForm } from '/ui/lib/schema-form.js';
 import { resolveProduces } from '/ui/lib/produces.js';
+import { load as yamlLoad, dump as yamlDump } from '/ui/vendor/js-yaml.mjs';
 
 // ---- Module-level builder state (state contract for U4–U6) ----------------
 // `doc` is the FULL stored doc — see the hidden-subtree note above. `sel` is
@@ -38,6 +39,12 @@ import { resolveProduces } from '/ui/lib/produces.js';
 // the module-level render functions close over.
 let doc = { name: '', stages: [{ name: 'stage-1', components: [] }] };
 let sel = null;
+
+// Builder surface: 'form' (schema-driven) or 'yaml' (raw text over the doc).
+// The doc is the ONLY bridge between the two — there is no hand-rolled YAML
+// serializer; →YAML dumps the live doc via js-yaml, →form parses the textarea
+// back onto the doc wholesale (RFC 027 §6, "YAML mode"). Form is the default.
+let mode = 'form';
 
 let pid = null;
 let pipelineName = '';
@@ -83,6 +90,7 @@ export async function renderPipelineDetail(ctx) {
   // Reset module state for this page instance.
   doc = { name: '', stages: [{ name: 'stage-1', components: [] }] };
   sel = null;
+  mode = 'form';
   activeForm = null;
   detailCache.clear();
 
@@ -124,13 +132,17 @@ export async function renderPipelineDetail(ctx) {
             title="Lowercase DNS-1123 subdomain."
             value="${esc(doc.name || '')}">
         </label>` : ''}
+      <div class="seg" id="builder-mode" role="tablist" aria-label="Editor mode">
+        <button type="button" id="mode-form" class="on" role="tab" aria-selected="true">Form</button>
+        <button type="button" id="mode-yaml" role="tab" aria-selected="false">YAML</button>
+      </div>
       <div class="builder-topbar-actions">
         <button type="button" class="btn btn--secondary" id="builder-validate">Validate</button>
         <button type="button" class="btn btn--primary" id="builder-save">Save</button>
       </div>
     </div>
     <div id="builder-msg" class="builder-msg"></div>
-    <div class="builder-shell">
+    <div class="builder-shell" id="builder-form-view">
       <div class="builder-outline">
         <details class="pipeline-settings">
           <summary>Pipeline settings</summary>
@@ -139,6 +151,12 @@ export async function renderPipelineDetail(ctx) {
         <div id="outline"></div>
       </div>
       <div class="builder-editor" id="editor"></div>
+    </div>
+    <div id="builder-yaml-view" style="display:none;">
+      <p class="hint">Raw mode — the same document, serialized. No <code>apiVersion</code>, <code>kind</code>, or <code>metadata</code> envelope. Switching back to Form parses it (round-trip); YAML comments don't survive a form-side save.</p>
+      <div id="yaml-err"></div>
+      <textarea id="yaml-ta" class="input--mono" spellcheck="false" autocapitalize="off" autocomplete="off"
+        style="width:100%;min-height:60vh;resize:vertical;padding:var(--s-3);border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-1);color:var(--fg-0);white-space:pre;overflow:auto;"></textarea>
     </div>
     <div id="catalog-host"></div>
     ${isNew ? '' : `
@@ -155,6 +173,8 @@ export async function renderPipelineDetail(ctx) {
   }
   document.getElementById('builder-save').addEventListener('click', saveDoc);
   document.getElementById('builder-validate').addEventListener('click', validateDoc);
+  document.getElementById('mode-form').addEventListener('click', () => setMode('form'));
+  document.getElementById('mode-yaml').addEventListener('click', () => setMode('yaml'));
 
   if (!isNew) {
     const delBtn = document.getElementById('delete-btn');
@@ -935,11 +955,75 @@ async function buildConfigForm(comp, token) {
   formEl.addEventListener('change', sync);
 }
 
+// ---- Mode toggle (Form ⇄ YAML) --------------------------------------------
+//
+// The doc is the ONLY bridge between the two surfaces (RFC 027 §6). There is
+// no hand-rolled serializer: →YAML dumps the live in-memory doc (reflecting
+// unsaved form edits, so commitForm() first) via js-yaml; →form parses the
+// textarea's current text back onto the doc WHOLESALE. A parse error keeps us
+// in YAML mode with the message shown inline and the user's text untouched —
+// nothing lost, nothing auto-corrected.
+export function setMode(m) {
+  if (m === mode) return;
+  if (m === 'yaml') {
+    // Flush any live form edits into the doc, then serialize it verbatim.
+    commitForm();
+    const ta = document.getElementById('yaml-ta');
+    if (ta) ta.value = yamlDump(doc, { noRefs: true, sortKeys: false });
+    const err = document.getElementById('yaml-err');
+    if (err) err.innerHTML = '';
+    applyMode('yaml');
+    return;
+  }
+  // →form: parse the textarea. On failure, STAY in YAML (don't switch, don't
+  // touch the text) and surface the parser's message.
+  const ta = document.getElementById('yaml-ta');
+  const err = document.getElementById('yaml-err');
+  let parsed;
+  try {
+    parsed = yamlLoad(ta ? ta.value : '');
+  } catch (e) {
+    if (err) err.innerHTML = `<div class="callout callout--warn">YAML parse error: ${esc(String(e && e.message || e))}</div>`;
+    return; // stay in YAML mode; textarea text is left exactly as-is
+  }
+  if (err) err.innerHTML = '';
+  // Wholesale replace — the user may have restructured the doc in ways a merge
+  // couldn't reconcile. normalizeDoc guarantees the shape the renderers assume
+  // (and coerces a scalar/empty document to an empty doc).
+  doc = normalizeDoc(parsed);
+  sel = null;
+  activeForm = null;
+  // Keep the (new-pipeline) name field in sync with the parsed doc.
+  const nameInput = document.getElementById('builder-name');
+  if (nameInput) nameInput.value = doc.name || '';
+  applyMode('form');
+  renderGateway();
+  renderOutline();
+  renderEditor();
+}
+
+// applyMode flips the visible surface and the toggle's pressed state.
+function applyMode(m) {
+  mode = m;
+  const formBtn = document.getElementById('mode-form');
+  const yamlBtn = document.getElementById('mode-yaml');
+  const formView = document.getElementById('builder-form-view');
+  const yamlView = document.getElementById('builder-yaml-view');
+  if (formBtn) { formBtn.classList.toggle('on', m === 'form'); formBtn.setAttribute('aria-selected', String(m === 'form')); }
+  if (yamlBtn) { yamlBtn.classList.toggle('on', m === 'yaml'); yamlBtn.setAttribute('aria-selected', String(m === 'yaml')); }
+  if (formView) formView.style.display = m === 'form' ? '' : 'none';
+  if (yamlView) yamlView.style.display = m === 'yaml' ? '' : 'none';
+}
+
 // ---- Save / Validate ------------------------------------------------------
 
 export async function saveDoc() {
-  commitForm();
   const msg = document.getElementById('builder-msg');
+  // In YAML mode the textarea is authoritative; the server parses/validates
+  // it (S6 content negotiation). Do NOT commitForm (the hidden form is stale)
+  // and do NOT re-serialize — PUT the user's literal YAML text.
+  const yamlMode = mode === 'yaml';
+  if (!yamlMode) commitForm();
   const targetName = isNew ? String(doc.name || '').trim() : pipelineName;
   if (!targetName) {
     if (msg) msg.innerHTML = `<div class="callout callout--warn">Name is required.</div>`;
@@ -948,7 +1032,9 @@ export async function saveDoc() {
   const btn = document.getElementById('builder-save');
   if (btn) btn.disabled = true;
   try {
-    const res = await putPipelineDoc(pid, targetName, doc);
+    const res = yamlMode
+      ? await putPipelineYAML(pid, targetName, document.getElementById('yaml-ta').value)
+      : await putPipelineDoc(pid, targetName, doc);
     if (res.ok && (!res.findings || res.findings.length === 0)) {
       msg.innerHTML = `<div class="callout">Saved.</div>`;
     } else if (res.ok) {
@@ -971,7 +1057,11 @@ export async function saveDoc() {
 }
 
 export async function validateDoc() {
-  commitForm();
+  // Mode-aware, mirroring saveDoc: YAML mode sends the raw textarea text with
+  // application/yaml (server is authoritative); form mode POSTs the doc as
+  // JSON. The validate endpoint negotiates both (S6/S7).
+  const yamlMode = mode === 'yaml';
+  if (!yamlMode) commitForm();
   const msg = document.getElementById('builder-msg');
   const targetName = isNew ? String(doc.name || '').trim() : pipelineName;
   const btn = document.getElementById('builder-validate');
@@ -983,8 +1073,8 @@ export async function validateDoc() {
       {
         method: 'POST',
         credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(doc),
+        headers: { 'Content-Type': yamlMode ? 'application/yaml' : 'application/json' },
+        body: yamlMode ? document.getElementById('yaml-ta').value : JSON.stringify(doc),
       },
     );
     if (r.status === 401) {
