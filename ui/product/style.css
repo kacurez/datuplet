@@ -975,3 +975,13 @@ code.inline {
 .cat-item .cin { font-family: var(--font-mono); font-weight: 600; font-size: var(--text-sm); white-space: nowrap; color: var(--fg-0); }
 .cat-item .cid { color: var(--fg-1); font-size: var(--text-sm); }
 .cat-item .cdep { color: var(--status-running-fg); font-size: var(--text-xs); font-weight: 400; }
+.cat-item--picked { border-color: var(--accent); background: var(--bg-2); }
+.cat-item--disabled { cursor: not-allowed; opacity: 0.55; }
+.cat-item--disabled:hover { border-color: var(--border); background: none; }
+.catalog .hint { color: var(--fg-2); font-size: var(--text-xs); margin: var(--s-2) 0 var(--s-1); }
+.catalog #pick-search { margin-bottom: var(--s-3); }
+.cat-actions { display: flex; gap: var(--s-2); margin-top: var(--s-3); }
+
+/* Inputs section (RFC 027 U4): chips + "+ Add input table…" modal picker. */
+#inputs-chips:not(:empty) { margin-bottom: var(--s-2); }
+#inputs-chips .chip { margin: 0 var(--s-2) var(--s-2) 0; gap: var(--s-1); }

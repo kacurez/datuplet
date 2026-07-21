@@ -26,10 +26,11 @@
 // (`doc`, `sel`, renderOutline, renderEditor, saveDoc, validateDoc,
 // getComponentMeta).
 
-import { api, esc, getComponents, getComponent, listSecrets } from '/ui/api.js';
+import { api, esc, getComponents, getComponent, getStorageCatalog, listSecrets } from '/ui/api.js';
 import { timeTag, phaseToPillClass, formatDuration, durationFrom } from '/ui/format.js';
 import { renderFindings } from '/ui/lib/findings.js';
 import { buildSchemaForm } from '/ui/lib/schema-form.js';
+import { resolveProduces } from '/ui/lib/produces.js';
 
 // ---- Module-level builder state (state contract for U4–U6) ----------------
 // `doc` is the FULL stored doc — see the hidden-subtree note above. `sel` is
@@ -514,6 +515,222 @@ export function renderEditor() {
     if (token !== editorToken || isStale()) return;
     const form = document.getElementById('cfg-form');
     if (form) form.innerHTML = `<div class="callout callout--warn">${esc(String(e && e.message || e))}</div>`;
+  });
+
+  renderInputsSection(el, comp, meta, sel.s, token);
+}
+
+// ---- Inputs (RFC 027 U4) ---------------------------------------------------
+//
+// Rendered only when the component can consume tables at all (io.inputs !==
+// 'none' — data-generator / http-json-extractor / finnhub-extractor all
+// declare 'none' and get no Inputs section, spec §6). Current inputs show as
+// chips; "+ Add input table…" opens a modal picker over two groups — tables
+// produced by earlier stages, and tables already in project storage.
+function renderInputsSection(el, comp, meta, si, token) {
+  const io = (meta && meta.io) || {};
+  if (io.inputs === 'none') return;
+
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <div class="section-h">Inputs<span class="sform-desc"> — tables this component reads${io.inputs === 'required' ? ' (required)' : ''}</span></div>
+    <div id="inputs-chips"></div>
+    <button type="button" class="btn" id="inputs-add">+ Add input table…</button>`;
+  el.appendChild(wrap);
+
+  renderInputsChips(comp);
+
+  document.getElementById('inputs-add').addEventListener('click', () => {
+    openInputTablePicker(comp, si, token).catch((e) => {
+      if (token !== editorToken || isStale()) return;
+      const host = document.getElementById('catalog-host');
+      if (host) host.innerHTML = `<div class="catalog-back" id="pickback"><div class="catalog"><div class="callout callout--warn">${esc(String(e && e.message || e))}</div><button type="button" class="btn" id="pick-cancel">Close</button></div></div>`;
+      const cancel = document.getElementById('pick-cancel');
+      if (cancel) cancel.addEventListener('click', () => { host.innerHTML = ''; });
+    });
+  });
+}
+
+// renderInputsChips (re)draws the current comp.inputs.tables as chips with a
+// remove control. Removing the last table drops the now-empty `tables` key
+// (and `inputs` itself only if it's now fully empty) — hidden-subtree rule:
+// other inputs-level fields (e.g. `buckets`) and other per-table fields (e.g.
+// `since`, `as`) on entries we don't touch ride along untouched.
+function renderInputsChips(comp) {
+  const host = document.getElementById('inputs-chips');
+  if (!host) return;
+  const tables = (comp.inputs && Array.isArray(comp.inputs.tables)) ? comp.inputs.tables : [];
+  host.innerHTML = tables.map((t, i) => `
+    <span class="chip chip--table">
+      <code class="mono">${esc(t.bucket)}.${esc(t.table)}</code>
+      <button type="button" class="icon-btn" data-rminput="${i}" title="Remove input">✕</button>
+    </span>`).join('');
+  host.querySelectorAll('[data-rminput]').forEach((n) => n.addEventListener('click', () => {
+    const i = Number(n.dataset.rminput);
+    comp.inputs.tables.splice(i, 1);
+    if (comp.inputs.tables.length === 0) delete comp.inputs.tables;
+    if (comp.inputs && Object.keys(comp.inputs).length === 0) delete comp.inputs;
+    renderInputsChips(comp);
+  }));
+}
+
+// resolveComponentProducesPath fetches (via the cached component detail) the
+// schema root's `x-datuplet-produces` annotation for a component at a given
+// version, or '' if the component/version/annotation can't be resolved.
+async function resolveComponentProducesPath(componentName, version) {
+  let detail;
+  try {
+    detail = await getComponentDetail(componentName);
+  } catch {
+    return '';
+  }
+  const schemaStr = schemaOf(detail, version);
+  try {
+    const s = JSON.parse(schemaStr || '{}');
+    return typeof s['x-datuplet-produces'] === 'string' ? s['x-datuplet-produces'] : '';
+  } catch {
+    return '';
+  }
+}
+
+// upstreamTables enumerates candidate input tables produced by stages BEFORE
+// stage index `si` (spec §6):
+//   (a) explicit outputs.tables entries — used verbatim (bucket + name);
+//   (b) a dynamic output (outputs.defaultBucket, no explicit outputs.tables)
+//       whose component schema declares x-datuplet-produces — resolved via
+//       resolveProduces() over that component's config, paired with
+//       defaultBucket;
+//   (c) a dynamic output with no resolvable produces path (unknown component,
+//       no annotation, or the path resolves to nothing) — surfaced as a
+//       single disabled `<bucket> (dynamic)` row, not selectable.
+async function upstreamTables(si) {
+  const out = [];
+  for (let i = 0; i < si; i++) {
+    for (const comp of doc.stages[i].components) {
+      const o = comp.outputs || {};
+      if (Array.isArray(o.tables) && o.tables.length) {
+        for (const t of o.tables) {
+          if (t && t.bucket && t.name) {
+            out.push({ bucket: t.bucket, table: t.name, from: doc.stages[i].name, disabled: false });
+          }
+        }
+      } else if (o.defaultBucket) {
+        const producesPath = await resolveComponentProducesPath(comp.component, comp.version);
+        const names = producesPath ? resolveProduces(producesPath, comp.config || {}) : [];
+        if (names.length) {
+          for (const name of names) {
+            if (typeof name === 'string' && name) {
+              out.push({ bucket: o.defaultBucket, table: name, from: doc.stages[i].name, disabled: false });
+            }
+          }
+        } else {
+          out.push({ bucket: o.defaultBucket, from: doc.stages[i].name, disabled: true });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// storageTableRows fetches the project's storage catalog and reshapes it to
+// {bucket, table} pairs (the catalog's `namespace` IS the pipeline doc's
+// `bucket` — see catalog_proxy.go). Best-effort: an unreachable catalog just
+// yields an empty "IN STORAGE" group rather than blocking the picker.
+async function storageTableRows() {
+  try {
+    const resp = await getStorageCatalog(pid);
+    const tables = Array.isArray(resp.tables) ? resp.tables : [];
+    return tables.map((t) => ({ bucket: t.namespace, table: t.name }));
+  } catch {
+    return [];
+  }
+}
+
+// openInputTablePicker gathers the two groups (upstream + storage) then hands
+// off to openInputPicker to render the modal. `token` guards against a stale
+// async continuation after the editor rebuilt for a different component.
+async function openInputTablePicker(comp, si, token) {
+  const have = (comp.inputs && Array.isArray(comp.inputs.tables))
+    ? comp.inputs.tables.map((t) => ({ bucket: t.bucket, table: t.table }))
+    : [];
+  const host = document.getElementById('catalog-host');
+  if (host) host.innerHTML = `<div class="catalog-back" id="pickback"><div class="catalog"><p aria-busy="true">Loading tables…</p></div></div>`;
+  const [upstreamRows, storageRows] = await Promise.all([upstreamTables(si), storageTableRows()]);
+  if (token !== editorToken || isStale()) return;
+  openInputPicker(upstreamRows, storageRows, have, (list) => {
+    comp.inputs = comp.inputs || {};
+    comp.inputs.tables = comp.inputs.tables || [];
+    for (const x of list) comp.inputs.tables.push({ bucket: x.bucket, table: x.table });
+    renderInputsChips(comp);
+  });
+}
+
+// openInputPicker renders the "+ Add input table…" modal (ported interaction
+// pattern from the RFC 027 UX mockup's openTablePicker): two groups —
+// PRODUCED UPSTREAM (already-resolved upstreamRows, including disabled
+// `<bucket> (dynamic)` rows) and IN STORAGE (storageRows) — with a search
+// filter and multi-select. `have` is the already-wired [{bucket,table}] list
+// (used to exclude already-added tables); onAdd receives the picked list.
+function openInputPicker(upstreamRows, storageRows, have, onAdd) {
+  const hasIt = (b, t) => have.some((x) => x.bucket === b && x.table === t);
+  const ups = upstreamRows.filter((u) => u.disabled || !hasIt(u.bucket, u.table));
+  const ex = storageRows.filter((u) => !hasIt(u.bucket, u.table));
+  const picked = new Set();
+  const host = document.getElementById('catalog-host');
+  if (!host) return;
+
+  const row = (u) => {
+    if (u.disabled) {
+      return `<div class="cat-item cat-item--disabled" aria-disabled="true">
+        <span class="cin">${esc(u.bucket)} (dynamic)</span>
+        <span class="cid">produced by stage ${esc(u.from)} — table names can't be resolved</span></div>`;
+    }
+    return `<div class="cat-item" data-t="${esc(u.bucket)}.${esc(u.table)}">
+      <span class="cin">${esc(u.bucket)}.${esc(u.table)}</span>
+      <span class="cid">${u.from ? `produced by stage ${esc(u.from)}` : 'in storage'}</span></div>`;
+  };
+
+  host.innerHTML = `<div class="catalog-back" id="pickback"><div class="catalog" role="dialog" aria-label="Add input tables">
+    <h3>Add input tables</h3>
+    <input class="input" id="pick-search" placeholder="Filter tables…" spellcheck="false">
+    ${ups.length ? '<p class="hint">PRODUCED UPSTREAM</p>' + ups.map(row).join('') : ''}
+    ${ex.length ? '<p class="hint">IN STORAGE</p>' + ex.map(row).join('') : ''}
+    ${!ups.length && !ex.length ? '<p class="hint">No tables available yet.</p>' : ''}
+    <div class="cat-actions">
+      <button type="button" class="btn btn--primary" id="pick-add" disabled>Add selected</button>
+      <button type="button" class="btn" id="pick-cancel">Cancel</button>
+    </div>
+  </div></div>`;
+
+  const sync = () => {
+    const b = document.getElementById('pick-add');
+    b.disabled = picked.size === 0;
+    b.textContent = picked.size ? `Add ${picked.size} table${picked.size > 1 ? 's' : ''}` : 'Add selected';
+  };
+  host.querySelectorAll('[data-t]').forEach((n) => n.addEventListener('click', () => {
+    const k = n.dataset.t;
+    if (picked.has(k)) { picked.delete(k); n.classList.remove('cat-item--picked'); }
+    else { picked.add(k); n.classList.add('cat-item--picked'); }
+    sync();
+  }));
+  const back = document.getElementById('pickback');
+  back.addEventListener('click', (e) => { if (e.target === back) host.innerHTML = ''; });
+  document.getElementById('pick-search').addEventListener('input', (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    host.querySelectorAll('.cat-item').forEach((n) => {
+      const key = (n.dataset.t || n.textContent || '').toLowerCase();
+      n.style.display = key.includes(q) ? '' : 'none';
+    });
+  });
+  document.getElementById('pick-cancel').addEventListener('click', () => { host.innerHTML = ''; });
+  document.getElementById('pick-add').addEventListener('click', () => {
+    const list = [];
+    for (const k of picked) {
+      const dot = k.indexOf('.');
+      list.push({ bucket: k.slice(0, dot), table: k.slice(dot + 1) });
+    }
+    host.innerHTML = '';
+    onAdd(list);
   });
 }
 
