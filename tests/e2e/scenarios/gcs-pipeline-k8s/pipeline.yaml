@@ -1,4 +1,3 @@
----
 # gcs-pipeline-k8s/pipeline.yaml
 # Smoke-test pipeline for the GCS backend. Writes to a gs:// warehouse
 # registered against an in-cluster fake-gcs-server.
@@ -8,22 +7,18 @@
 # aspect is the warehouse registered via `pipeline-api admin
 # lakekeeper-bootstrap --gcs-credential-type=service-account-key`
 # before the run (bootstrap wiring tracked in run.sh).
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: gcs-smoke
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-            table_name: "posts"
-          outputs:
-            tables:
-              - name: posts
-                bucket: gcs-smoke-staging
-                writeMode: FULL_LOAD
+name: gcs-smoke
+stages:
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+          table_name: "posts"
+        outputs:
+          tables:
+            - name: posts
+              bucket: gcs-smoke-staging
+              writeMode: FULL_LOAD

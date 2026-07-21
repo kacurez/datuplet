@@ -1,32 +1,17 @@
----
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-error-bad-config"
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: data-generator
-          component: data-generator
-          version: dev
-          config:
-            tables:
-              - name: bad
-                random:
-                  schema: {id: int}
-                  limit: {rowsCount: 10}
-                  userErrorMessage: "simulated user error: bad config"
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-err"
-            defaultWriteMode: APPEND
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-error-bad-config-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-error-bad-config"
+name: "{{.RunPrefix}}-error-bad-config"
+stages:
+  - name: extract
+    components:
+      - name: data-generator
+        component: data-generator
+        version: dev
+        config:
+          tables:
+            - name: bad
+              random:
+                schema: {id: int}
+                limit: {rowsCount: 10}
+                userErrorMessage: "simulated user error: bad config"
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-err"
+          defaultWriteMode: APPEND

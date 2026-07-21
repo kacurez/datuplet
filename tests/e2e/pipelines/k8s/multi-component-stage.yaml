@@ -1,41 +1,26 @@
----
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-multi-component-stage"
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: posts-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-            table_name: "posts"
-          outputs:
-            tables:
-              - name: posts
-                bucket: "{{.RunPrefix}}-multi"
-                writeMode: FULL_LOAD
-        - name: users-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/users"
-            table_name: "users"
-          outputs:
-            tables:
-              - name: users
-                bucket: "{{.RunPrefix}}-multi"
-                writeMode: FULL_LOAD
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-multi-component-stage-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-multi-component-stage"
+name: "{{.RunPrefix}}-multi-component-stage"
+stages:
+  - name: extract
+    components:
+      - name: posts-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+          table_name: "posts"
+        outputs:
+          tables:
+            - name: posts
+              bucket: "{{.RunPrefix}}-multi"
+              writeMode: FULL_LOAD
+      - name: users-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/users"
+          table_name: "users"
+        outputs:
+          tables:
+            - name: users
+              bucket: "{{.RunPrefix}}-multi"
+              writeMode: FULL_LOAD

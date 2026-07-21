@@ -1,39 +1,24 @@
----
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-read-back"
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-readback"
-            defaultWriteMode: FULL_LOAD
+name: "{{.RunPrefix}}-read-back"
+stages:
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-readback"
+          defaultWriteMode: FULL_LOAD
 
-    - name: read
-      components:
-        - name: stdout-writer
-          component: stdout-writer
-          version: dev
-          inputs:
-            tables:
-              - bucket: "{{.RunPrefix}}-readback"
-                table: data
-          config:
-            format: json
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-read-back-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-read-back"
+  - name: read
+    components:
+      - name: stdout-writer
+        component: stdout-writer
+        version: dev
+        inputs:
+          tables:
+            - bucket: "{{.RunPrefix}}-readback"
+              table: data
+        config:
+          format: json

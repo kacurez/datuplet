@@ -1,4 +1,3 @@
----
 # RFC 026 P2 Task R11: freeze scenario fixture. data-generator@dev throttled
 # via rowInsertSpeed so it runs for the full timeoutInSeconds budget (60s)
 # regardless of the huge rowsCount ceiling — giving the test a live window to
@@ -6,36 +5,22 @@
 # mid-run, then assert the run still completes from the admission-time
 # snapshot (status.resolvedSpec, status.components[].image, and the
 # already-built Job's container image all stay unchanged).
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-freeze-longrunning"
-  namespace: datuplet
-spec:
-  stages:
-    - name: generate
-      components:
-        - name: slow-generator
-          component: data-generator
-          version: dev
-          config:
-            tables:
-              - name: slow
-                rowInsertSpeed: 500
-                random:
-                  schema: {id: int}
-                  limit:
-                    rowsCount: 100000000
-                    timeoutInSeconds: 60
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-freeze"
-            defaultWriteMode: APPEND
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-freeze-longrunning-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-freeze-longrunning"
+name: "{{.RunPrefix}}-freeze-longrunning"
+stages:
+  - name: generate
+    components:
+      - name: slow-generator
+        component: data-generator
+        version: dev
+        config:
+          tables:
+            - name: slow
+              rowInsertSpeed: 500
+              random:
+                schema: {id: int}
+                limit:
+                  rowsCount: 100000000
+                  timeoutInSeconds: 60
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-freeze"
+          defaultWriteMode: APPEND

@@ -249,64 +249,53 @@ const (
 )
 
 // resourcesOverMaxPipelineYAML sets a component resources block whose
-// limits.cpu (4) exceeds the registry max (2) — over-max AND a modification.
-const resourcesOverMaxPipelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: resource-gate-overmax
-  namespace: datuplet
-spec:
-  stages:
-    - name: generate
-      components:
-        - name: gen
-          component: data-generator
-          version: v0.0.1
-          config:
-            tables:
-              - name: og
-                random:
-                  schema: {id: int}
-                  limit: {rowsCount: 10}
-          resources:
-            limits:
-              cpu: "4"
-              memory: 1Gi
-          outputs:
-            defaultBucket: resource-gate-overmax-bucket
-            defaultWriteMode: APPEND
+// cpu limit (4) exceeds the registry max (2) — over-max AND a modification.
+// Envelope-free PipelineDoc (RFC 027): resources is the flat memory/cpu
+// limits shape (config.ResourceSpec), not the CR limits/requests block.
+const resourcesOverMaxPipelineYAML = `name: resource-gate-overmax
+stages:
+  - name: generate
+    components:
+      - name: gen
+        component: data-generator
+        version: v0.0.1
+        config:
+          tables:
+            - name: og
+              random:
+                schema: {id: int}
+                limit: {rowsCount: 10}
+        resources:
+          cpu: "4"
+          memory: 1Gi
+        outputs:
+          defaultBucket: resource-gate-overmax-bucket
+          defaultWriteMode: APPEND
 `
 
 // resourcesWithinMaxPipelineYAML sets a component resources block entirely
-// within the registry max (cpu 1 <= 2, memory 256Mi <= 512Mi).
-const resourcesWithinMaxPipelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: resource-gate-within
-  namespace: datuplet
-spec:
-  stages:
-    - name: generate
-      components:
-        - name: gen
-          component: data-generator
-          version: v0.0.1
-          config:
-            tables:
-              - name: wi
-                random:
-                  schema: {id: int}
-                  limit: {rowsCount: 10}
-          resources:
-            limits:
-              cpu: "1"
-              memory: 256Mi
-            requests:
-              cpu: "100m"
-              memory: 128Mi
-          outputs:
-            defaultBucket: resource-gate-within-bucket
-            defaultWriteMode: APPEND
+// within the registry max (cpu 1 <= 2, memory 256Mi <= 512Mi). Envelope-free
+// PipelineDoc (RFC 027): flat memory/cpu limits — the CR requests split is
+// dropped (registry resources.default supplies requests at admission).
+const resourcesWithinMaxPipelineYAML = `name: resource-gate-within
+stages:
+  - name: generate
+    components:
+      - name: gen
+        component: data-generator
+        version: v0.0.1
+        config:
+          tables:
+            - name: wi
+              random:
+                schema: {id: int}
+                limit: {rowsCount: 10}
+        resources:
+          cpu: "1"
+          memory: 256Mi
+        outputs:
+          defaultBucket: resource-gate-within-bucket
+          defaultWriteMode: APPEND
 `
 
 var (

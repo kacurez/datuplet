@@ -1,53 +1,40 @@
----
-# RFC 026 P3 Task T10: controller resource clamp on the direct-kubectl path.
+# RFC 026 P3 Task T10: controller resource clamp on the admission path.
 # The data-generator@v0.0.1 component requests limits ABOVE the registry max
 # (cpu 4 > 2, memory 1Gi > 512Mi). At admission the controller clamps every
 # entry to the registry max, freezes the clamped values into
 # status.resolvedSpec, notes the clamp on status.message, and the run still
-# PROCEEDS to success. The within-max requests pass through unchanged.
+# PROCEEDS to success.
+#
+# NOTE (RFC 027 E2): the PipelineDoc resources shape expresses only flat
+# limits (memory/cpu). The explicit requests block (cpu 100m / memory 128Mi)
+# is dropped — those values now come from the registry resources.default,
+# which register the same 100m/128Mi (framework/components_bootstrap.go), so
+# the "requests pass through unchanged" assertion stays green. E5 confirms.
 #
 # The generator is throttled (rowInsertSpeed) against a large rowsCount with
 # a short timeoutInSeconds so it stays Running long enough for the test to
 # read the clamp note off status.message before the success path overwrites
 # it — then exits cleanly (Succeeded) on the timeout, exactly like the freeze
 # scenario.
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-resource-clamp"
-  namespace: datuplet
-spec:
-  stages:
-    - name: generate
-      components:
-        - name: gen
-          component: data-generator
-          version: v0.0.1
-          config:
-            tables:
-              - name: rc
-                rowInsertSpeed: 500
-                random:
-                  schema: {id: int}
-                  limit:
-                    rowsCount: 100000000
-                    timeoutInSeconds: 20
-          resources:
-            limits:
-              cpu: "4"
-              memory: 1Gi
-            requests:
-              cpu: "100m"
-              memory: 128Mi
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-resource-clamp"
-            defaultWriteMode: APPEND
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-resource-clamp-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-resource-clamp"
+name: "{{.RunPrefix}}-resource-clamp"
+stages:
+  - name: generate
+    components:
+      - name: gen
+        component: data-generator
+        version: v0.0.1
+        config:
+          tables:
+            - name: rc
+              rowInsertSpeed: 500
+              random:
+                schema: {id: int}
+                limit:
+                  rowsCount: 100000000
+                  timeoutInSeconds: 20
+        resources:
+          cpu: "4"
+          memory: 1Gi
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-resource-clamp"
+          defaultWriteMode: APPEND

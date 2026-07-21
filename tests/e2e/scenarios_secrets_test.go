@@ -33,26 +33,21 @@ import (
 const secretsLadderPipelineName = "secrets-ladder-pipeline"
 
 // secretsLadderPipelineYAML references $[api_token] exactly like
-// pipelines/k8s/secrets-happy.yaml, but as a bare Pipeline doc (no
-// PipelineRun) suitable for PUT /api/v1/projects/{pid}/pipelines/{name}.
-const secretsLadderPipelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: secrets-ladder-pipeline
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-            api_token: "$[api_token]"
-          outputs:
-            defaultBucket: secrets-ladder-bucket
-            defaultWriteMode: FULL_LOAD
+// pipelines/k8s/secrets-happy.yaml, as an envelope-free PipelineDoc (RFC 027)
+// suitable for PUT /api/v1/projects/{pid}/pipelines/{name}.
+const secretsLadderPipelineYAML = `name: secrets-ladder-pipeline
+stages:
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+          api_token: "$[api_token]"
+        outputs:
+          defaultBucket: secrets-ladder-bucket
+          defaultWriteMode: FULL_LOAD
 `
 
 // TestSecretsLadder exercises RFC 026 P1.5's full secrets lifecycle:

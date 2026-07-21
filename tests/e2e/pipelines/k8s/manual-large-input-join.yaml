@@ -1,4 +1,3 @@
----
 # RFC 011 big-data JOIN proof — opt-in via RFC011_BIG_DATA_PROOF=1.
 #
 # Stage 1 generates ~400MB of fact rows + a tiny 10-row dimension table.
@@ -7,89 +6,76 @@
 # DiskPressure-evicted; RFC 011 streams parquet → arrow → DuckDB
 # arrow_scan → CREATE TABLE materialize, then JOIN runs against the
 # materialized table.
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-manual-large-input-join"
-  namespace: datuplet
-spec:
-  stages:
-    # Stage 1: Generate facts (~400MB random) + dimensions (10 rows literal).
-    - name: generate
-      components:
-        - name: data-generator
-          component: data-generator
-          version: dev
-          config:
-            tables:
-              - name: facts
-                random:
-                  schema:
-                    id: long
-                    value: double
-                    payload: string
-                  limit: {rowsCount: 5000000}
-              - name: dimensions
-                literal:
-                  columns: [bucket_id, category]
-                  rows:
-                    - [0, small]
-                    - [1, small]
-                    - [2, small]
-                    - [3, medium]
-                    - [4, medium]
-                    - [5, medium]
-                    - [6, large]
-                    - [7, large]
-                    - [8, xl]
-                    - [9, xl]
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-raw"
-            defaultWriteMode: FULL_LOAD
+#
+# NOTE (RFC 027 E2): the PipelineDoc resources shape (config.ResourceSpec)
+# only expresses flat memory/cpu limits — it cannot carry the
+# ephemeral-storage cap or the requests split that made this proof precise.
+# Only `memory` survives the doc migration; E5 (OrbStack) must confirm
+# whether this scenario still meaningfully exercises the streaming path or
+# needs the doc resource model extended.
+name: "{{.RunPrefix}}-manual-large-input-join"
+stages:
+  # Stage 1: Generate facts (~400MB random) + dimensions (10 rows literal).
+  - name: generate
+    components:
+      - name: data-generator
+        component: data-generator
+        version: dev
+        config:
+          tables:
+            - name: facts
+              random:
+                schema:
+                  id: long
+                  value: double
+                  payload: string
+                limit: {rowsCount: 5000000}
+            - name: dimensions
+              literal:
+                columns: [bucket_id, category]
+                rows:
+                  - [0, small]
+                  - [1, small]
+                  - [2, small]
+                  - [3, medium]
+                  - [4, medium]
+                  - [5, medium]
+                  - [6, large]
+                  - [7, large]
+                  - [8, xl]
+                  - [9, xl]
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-raw"
+          defaultWriteMode: FULL_LOAD
 
-    # Stage 2: Join 400MB facts × 10-row dimensions under a 256Mi
-    # ephemeral-storage cap. Memory cap (2Gi) is generous; the cap
-    # that proves streaming works is ephemeral-storage.
-    - name: transform
-      components:
-        - name: sql-transform
-          component: sql-transform
-          version: dev
-          resources:
-            limits:
-              memory: 2Gi
-              ephemeral-storage: 256Mi
-            requests:
-              memory: 1Gi
-              ephemeral-storage: 64Mi
-          inputs:
-            tables:
-              - bucket: "{{.RunPrefix}}-raw"
-                table: facts
-              - bucket: "{{.RunPrefix}}-raw"
-                table: dimensions
-          outputs:
-            tables:
-              - name: summary
-                bucket: "{{.RunPrefix}}-out"
-                writeMode: FULL_LOAD
-          config:
-            sql: |
-              CREATE TABLE summary AS
-              SELECT
-                d.category,
-                COUNT(*) AS row_count,
-                SUM(f.value) AS total_value
-              FROM facts f
-              JOIN dimensions d ON (f.id % 10) = d.bucket_id
-              GROUP BY d.category
-              ORDER BY d.category;
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-manual-large-input-join-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-manual-large-input-join"
+  # Stage 2: Join 400MB facts × 10-row dimensions. In the CR era this ran
+  # under a 256Mi ephemeral-storage cap; the doc keeps only the memory limit.
+  - name: transform
+    components:
+      - name: sql-transform
+        component: sql-transform
+        version: dev
+        resources:
+          memory: 2Gi
+        inputs:
+          tables:
+            - bucket: "{{.RunPrefix}}-raw"
+              table: facts
+            - bucket: "{{.RunPrefix}}-raw"
+              table: dimensions
+        outputs:
+          tables:
+            - name: summary
+              bucket: "{{.RunPrefix}}-out"
+              writeMode: FULL_LOAD
+        config:
+          sql: |
+            CREATE TABLE summary AS
+            SELECT
+              d.category,
+              COUNT(*) AS row_count,
+              SUM(f.value) AS total_value
+            FROM facts f
+            JOIN dimensions d ON (f.id % 10) = d.bucket_id
+            GROUP BY d.category
+            ORDER BY d.category;

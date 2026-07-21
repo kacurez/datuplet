@@ -1,27 +1,12 @@
----
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-append-mode"
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-raw"
-            defaultWriteMode: APPEND
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-append-mode-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-append-mode"
+name: "{{.RunPrefix}}-append-mode"
+stages:
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-raw"
+          defaultWriteMode: APPEND

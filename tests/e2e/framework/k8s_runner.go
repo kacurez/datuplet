@@ -1,30 +1,33 @@
 // Package framework — K8s tier backend for the e2e test harness.
 //
-// The K8s tier applies PipelineRun YAML directly via kubectl rather
-// than going through pipeline-api's HTTP trigger. That sidesteps the
-// session-cookie auth surface, so we mint our own per-run JWT
-// in-process with the same shape pipeline-api would use, write it to
-// a Secret the operator can read, and patch the PipelineRun to
-// reference it.
+// RFC 027 E2: the K8s tier drives runs through pipeline-api's public REST
+// surface — the same path a real user takes — instead of hand-crafting a
+// PipelineRun CR and kubectl-applying it. RunPipeline authenticates as the
+// scenario's user, PUTs the envelope-free PipelineDoc, POSTs a run, and polls
+// the run to a terminal phase. pipeline-api's trigger path owns everything the
+// harness used to do by hand: it mints the per-run JWT, writes the
+// synthetic-run-user FGA tuple, and creates the PipelineRun CR + run-token /
+// snapshot Secrets. The harness no longer mints tokens, writes tuples, or
+// rewrites/apply-s CRs on the run path.
 //
 // Key design decisions:
 //
-//   - **Per-project namespace.** PipelineRuns land in
-//     `datuplet-<project-uuid>`; the harness mirrors that. The
-//     namespace is created (if absent) at fixture init via kubectl.
+//   - **Per-project namespace.** Runs land in `datuplet-<project-uuid>`. The
+//     namespace is created (if absent) at fixture init via kubectl; pipeline-api
+//     ensures its own project namespace at trigger time as well.
 //
-//   - **Single-token shape.** The Secret carries one JWT under the
-//     `token` key. The token is bound to a chosen test user via
-//     MintTestUserRunToken so FGA grants gate lakekeeper access.
+//   - **User binding via HTTP session.** Every K8sBackend.RunPipeline call
+//     authenticates as k.RunAsUser (defaults to AliceID / project_admin) so
+//     the run identity is the authenticated caller, exactly as in production.
+//     apiCredsFor (run_http.go) maps the TestUser to login credentials.
 //
-//   - **Test-user binding.** Every K8sBackend.RunPipeline call mints
-//     against k.RunAsUser; defaults to AliceID (project_admin) so
-//     pre-existing scenarios keep working without per-scenario
-//     user-selection plumbing. FGA-matrix tests override per scenario.
+//   - **Log + cleanup by run-id.** Component/gateway pods carry the
+//     `datuplet.io/run-id` label (pkg/k8s/controllers/pipelinerun_jobs.go), so
+//     logs are fetched and PipelineRuns are torn down by that label — no CR
+//     name bookkeeping required.
 package framework
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -35,23 +38,29 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
 )
 
-// K8sBackend implements Backend by applying K8s CRDs via kubectl.
+// K8sBackend implements Backend by driving pipeline-api over HTTP.
 // Constructed with a per-suite FGAHarness so every run is scoped to
 // the harness's lakekeeper Project (and per-project namespace).
 type K8sBackend struct {
 	Harness   *FGAHarness
 	Namespace string
 	RunPrefix string
-	// RunAsUser names the TestUser whose identity the per-run JWT
-	// carries. Defaults to AliceID (project_admin) so existing
-	// scenarios pass without modification. FGA-matrix scenarios
+	// RunAsUser names the TestUser whose identity the run authenticates
+	// as against pipeline-api. Defaults to AliceID (project_admin) so
+	// existing scenarios pass without modification. FGA-matrix scenarios
 	// override per-scenario.
 	RunAsUser uuid.UUID
 
-	Resources []string // resource names to clean up (e.g. "pipelinerun/foo")
+	Resources []string // legacy kubectl "kind/name" cleanup entries (unused by the HTTP path)
+
+	// apiSession caches the RunAsUser login cookie for the backend's lifetime.
+	apiSession string
+	// putPipelines / runIDs track what to tear down at Cleanup.
+	putPipelines []string
+	runIDs       []uuid.UUID
 }
 
 // NewK8sBackend creates a K8sBackend bound to the harness's
@@ -105,8 +114,12 @@ metadata:
 	return nil
 }
 
-// RunPipeline applies the pipeline YAML and polls until completion.
-func (k *K8sBackend) RunPipeline(ctx context.Context, pipelineYAML string, opts RunOpts) (*RunResult, error) {
+// RunPipeline uploads the PipelineDoc, triggers a run, and polls it to a
+// terminal phase — all through pipeline-api's public REST API.
+//
+// pipelinePath is a path to a rendered PipelineDoc YAML file (as produced by
+// RenderPipeline); the doc name is parsed from it via config.Parse.
+func (k *K8sBackend) RunPipeline(ctx context.Context, pipelinePath string, opts RunOpts) (*RunResult, error) {
 	timeout := opts.Timeout
 	if timeout == 0 {
 		timeout = 3 * time.Minute
@@ -116,87 +129,98 @@ func (k *K8sBackend) RunPipeline(ctx context.Context, pipelineYAML string, opts 
 
 	start := time.Now()
 
-	prName, err := extractResourceName(pipelineYAML, "PipelineRun")
+	raw, err := os.ReadFile(pipelinePath)
 	if err != nil {
-		return nil, fmt.Errorf("extracting PipelineRun name: %w", err)
+		return nil, fmt.Errorf("read pipeline doc %s: %w", pipelinePath, err)
 	}
-
-	runID := uuid.New()
-	tokenSecretName := prName + "-token"
-	if err := k.attachRunToken(ctx, pipelineYAML, prName, tokenSecretName, runID); err != nil {
-		return nil, fmt.Errorf("attach run token: %w", err)
-	}
-
-	out, err := exec.CommandContext(ctx, "kubectl", "apply", "-f", pipelineYAML).CombinedOutput()
+	doc, err := config.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("kubectl apply failed: %w\n%s", err, string(out))
+		return nil, fmt.Errorf("parse pipeline doc %s: %w", pipelinePath, err)
 	}
-	k.Resources = append(k.Resources, "pipelinerun/"+prName)
-	k.Resources = append(k.Resources, "secret/"+tokenSecretName)
+	if doc.Name == "" {
+		return nil, fmt.Errorf("pipeline doc %s has no top-level name", pipelinePath)
+	}
+	name := doc.Name
 
-	pName, err := extractResourceName(pipelineYAML, "Pipeline")
-	if err == nil && pName != "" {
-		k.Resources = append(k.Resources, "pipeline/"+pName)
+	// project = harness lakekeeper project UUID (the e2e convergence noted in
+	// NewK8sBackend). pipeline-api resolves {pid} against a real projects row.
+	projectID := k.Harness.LakekeeperProjectID
+	base := PipelineAPIBaseURL()
+
+	session, err := k.apiSessionFor(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	var phase string
+	if err := apiPutPipelineDoc(ctx, base, session, projectID, name, raw); err != nil {
+		return nil, fmt.Errorf("PUT pipeline: %w", err)
+	}
+	k.trackPipeline(name)
+
+	runID, err := apiTriggerRun(ctx, base, session, projectID, name)
+	if err != nil {
+		return nil, fmt.Errorf("trigger run: %w", err)
+	}
+	k.runIDs = append(k.runIDs, runID)
+
+	var lastPhase, lastMessage string
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("timeout waiting for PipelineRun %s: last phase=%q", prName, phase)
+			return nil, fmt.Errorf("timeout waiting for run %s (pipeline %s): last phase=%q", runID, name, lastPhase)
 		case <-ticker.C:
-			phaseOut, err := exec.CommandContext(ctx, "kubectl", "get", "pipelinerun", prName,
-				"-n", k.Namespace,
-				"-o", "jsonpath={.status.phase}").Output()
+			view, err := apiGetRun(ctx, base, session, projectID, runID.String())
 			if err != nil {
-				continue // resource may not exist yet
+				continue // transient; keep polling until the deadline
 			}
-			phase = strings.TrimSpace(string(phaseOut))
+			if view.Phase != "" {
+				lastPhase = view.Phase
+			}
+			if view.Message != "" {
+				lastMessage = view.Message
+			}
 
-			switch phase {
+			switch view.Phase {
 			case "Succeeded":
-				logs := k.fetchLogs(ctx, prName)
 				return &RunResult{
 					Success:  true,
 					ExitCode: 0,
-					Logs:     logs,
+					Logs:     k.fetchLogs(ctx, runID),
 					Duration: time.Since(start),
 					RunID:    runID,
 				}, nil
 			case "FailedUser":
-				logs := k.fetchLogs(ctx, prName)
 				return &RunResult{
 					Success:       false,
 					ExitCode:      1,
 					FailureType:   "FailedUser",
-					StatusMessage: k.fetchStatusMessage(ctx, prName),
-					Logs:          logs,
+					StatusMessage: lastMessage,
+					Logs:          k.fetchLogs(ctx, runID),
 					Duration:      time.Since(start),
 					RunID:         runID,
 				}, nil
 			case "FailedApplication":
-				logs := k.fetchLogs(ctx, prName)
 				return &RunResult{
 					Success:       false,
 					ExitCode:      20,
 					FailureType:   "FailedApplication",
-					StatusMessage: k.fetchStatusMessage(ctx, prName),
-					Logs:          logs,
+					StatusMessage: lastMessage,
+					Logs:          k.fetchLogs(ctx, runID),
 					Duration:      time.Since(start),
 					RunID:         runID,
 				}, nil
 			case "Pending", "Running", "":
 				// keep polling
 			default:
-				logs := k.fetchLogs(ctx, prName)
+				// Any other terminal phase (Cancelled / Expired / …).
 				return &RunResult{
 					Success:       false,
-					FailureType:   phase,
-					StatusMessage: k.fetchStatusMessage(ctx, prName),
-					Logs:          logs,
+					FailureType:   view.Phase,
+					StatusMessage: lastMessage,
+					Logs:          k.fetchLogs(ctx, runID),
 					Duration:      time.Since(start),
 					RunID:         runID,
 				}, nil
@@ -205,22 +229,41 @@ func (k *K8sBackend) RunPipeline(ctx context.Context, pipelineYAML string, opts 
 	}
 }
 
-// fetchStatusMessage retrieves the .status.message from a PipelineRun.
-func (k *K8sBackend) fetchStatusMessage(ctx context.Context, prName string) string {
-	out, err := exec.CommandContext(ctx, "kubectl", "get", "pipelinerun", prName,
-		"-n", k.Namespace,
-		"-o", "jsonpath={.status.message}").Output()
-	if err != nil {
-		return ""
+// apiSessionFor logs the backend's RunAsUser into pipeline-api and caches the
+// session cookie for the backend's lifetime.
+func (k *K8sBackend) apiSessionFor(ctx context.Context) (string, error) {
+	if k.apiSession != "" {
+		return k.apiSession, nil
 	}
-	return strings.TrimSpace(string(out))
+	email, password, ok := apiCredsFor(k.RunAsUser)
+	if !ok {
+		return "", fmt.Errorf("no pipeline-api login credentials mapped for RunAsUser %s "+
+			"(E5: provision a DB user + FGA grants for this identity before driving the HTTP run path as it)", k.RunAsUser)
+	}
+	cookie, err := apiLogin(ctx, PipelineAPIBaseURL(), email, password)
+	if err != nil {
+		return "", fmt.Errorf("login as %s: %w", email, err)
+	}
+	k.apiSession = cookie
+	return cookie, nil
 }
 
-// fetchLogs retrieves logs from all pods associated with a PipelineRun.
-func (k *K8sBackend) fetchLogs(ctx context.Context, prName string) string {
+// trackPipeline records a PUT pipeline name once for Cleanup.
+func (k *K8sBackend) trackPipeline(name string) {
+	for _, p := range k.putPipelines {
+		if p == name {
+			return
+		}
+	}
+	k.putPipelines = append(k.putPipelines, name)
+}
+
+// fetchLogs retrieves logs from all pods for a run, selected by the
+// datuplet.io/run-id label the controller stamps on every Job/Pod.
+func (k *K8sBackend) fetchLogs(ctx context.Context, runID uuid.UUID) string {
 	podOut, err := exec.CommandContext(ctx, "kubectl", "get", "pods",
 		"-n", k.Namespace,
-		"-l", "datuplet.io/pipelinerun="+prName,
+		"-l", "datuplet.io/run-id="+runID.String(),
 		"-o", "jsonpath={.items[*].metadata.name}").Output()
 	if err != nil {
 		return fmt.Sprintf("[error listing pods: %v]", err)
@@ -245,11 +288,34 @@ func (k *K8sBackend) fetchLogs(ctx context.Context, prName string) string {
 	return logs.String()
 }
 
-// Cleanup deletes all tracked resources. Best-effort — errors are
+// Cleanup tears down what the run created. Best-effort — errors are
 // joined and returned but never fatal.
 func (k *K8sBackend) Cleanup(ctx context.Context) error {
 	var errs []string
 
+	// PipelineRuns (and their owner-ref'd children: pods, run-token + snapshot
+	// Secrets) by run-id label.
+	for _, id := range k.runIDs {
+		out, err := exec.CommandContext(ctx, "kubectl", "delete", "pipelinerun",
+			"-l", "datuplet.io/run-id="+id.String(),
+			"-n", k.Namespace, "--ignore-not-found").CombinedOutput()
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("delete pipelinerun run-id=%s: %v (%s)", id, err, strings.TrimSpace(string(out))))
+		}
+	}
+
+	// Stored pipelines via the API, so re-runs of the same fixture under the
+	// same project don't collide.
+	if k.apiSession != "" && k.Harness != nil {
+		for _, name := range k.putPipelines {
+			if err := apiDeletePipeline(ctx, PipelineAPIBaseURL(), k.apiSession, k.Harness.LakekeeperProjectID, name); err != nil {
+				errs = append(errs, fmt.Sprintf("delete pipeline %s: %v", name, err))
+			}
+		}
+	}
+
+	// Legacy kubectl "kind/name" resources (unused by the HTTP path; retained
+	// so any externally-appended entries are still cleaned up).
 	for _, res := range k.Resources {
 		out, err := exec.CommandContext(ctx, "kubectl", "delete", res,
 			"-n", k.Namespace,
@@ -263,92 +329,4 @@ func (k *K8sBackend) Cleanup(ctx context.Context) error {
 		return fmt.Errorf("cleanup errors: %s", strings.Join(errs, "; "))
 	}
 	return nil
-}
-
-// attachRunToken mints the per-run JWT for k.RunAsUser, creates a
-// Secret holding it, and rewrites the rendered YAML in place so the
-// PipelineRun references the Secret via spec.runTokenRef.name AND
-// every doc's metadata.namespace targets k.Namespace.
-//
-// The Secret carries a single `token` key with one JWT
-// (sub=<run-uuid>, actor=<user-uuid>, jti=run-tok-<run-uuid>).
-func (k *K8sBackend) attachRunToken(ctx context.Context, yamlPath, prName, tokenSecretName string, runID uuid.UUID) error {
-	raw, err := os.ReadFile(yamlPath)
-	if err != nil {
-		return fmt.Errorf("read pipeline YAML: %w", err)
-	}
-	pipelineDoc, err := extractPipelineDoc(raw)
-	if err != nil {
-		return fmt.Errorf("find Pipeline doc in %s: %w", yamlPath, err)
-	}
-	pipelineName := pipelineNameFromYAML(pipelineDoc)
-
-	if k.Harness == nil || k.Harness.Signer == nil {
-		return errors.New("attachRunToken: harness or signer not initialised")
-	}
-	jwt, err := MintTestUserRunToken(ctx, k.Harness.Signer,
-		k.RunAsUser, runID, k.Harness.LakekeeperProjectID, k.Harness.WarehouseName, pipelineName)
-	if err != nil {
-		return fmt.Errorf("mint run token: %w", err)
-	}
-	// Mirror pkg/pipelineapi/runbackend/k8s.go::TriggerRun step 2: write
-	// the synthetic-run-user FGA tuple BEFORE the PipelineRun lands.
-	// Without this, DG's first lakekeeper call (post-vended-creds) gets
-	// 403 "list_warehouses forbidden" because the run-token's identity
-	// (user:oidc~<run-uuid>) has no grants on the per-test lakekeeper
-	// Project. The harness bypasses pipeline-api so production's
-	// 4-step compensating ordering is collapsed: write tuple + apply
-	// resources are both best-effort here, and cleanup() at scenario
-	// end deletes the tuple.
-	if k.Harness.Authorizer != nil {
-		runUserTuple := authz.Tuple{
-			User:     authz.UserObject(runID.String()).String(),
-			Relation: "editor",
-			Object:   authz.ProjectObject(k.Harness.LakekeeperProjectID),
-		}
-		if err := k.Harness.Authorizer.WriteTuples(ctx, []authz.Tuple{runUserTuple}); err != nil {
-			return fmt.Errorf("write synthetic-run-user FGA tuple: %w", err)
-		}
-	}
-	if err := createRunTokenSecret(ctx, k.Namespace, tokenSecretName, jwt, runID.String()); err != nil {
-		return fmt.Errorf("create token secret: %w", err)
-	}
-	if err := rewriteYAMLWithRunToken(yamlPath, runID, tokenSecretName, k.Namespace, k.Harness.LakekeeperProjectID); err != nil {
-		return fmt.Errorf("inject runTokenRef + namespace: %w", err)
-	}
-	return nil
-}
-
-// extractResourceName reads a YAML file and finds the metadata.name
-// for a given kind. Simple line-by-line parser that handles
-// multi-document YAML. Used by RunPipeline to discover the
-// PipelineRun + Pipeline names for cleanup tracking.
-func extractResourceName(yamlPath, kind string) (string, error) {
-	data, err := os.ReadFile(yamlPath)
-	if err != nil {
-		return "", fmt.Errorf("reading %s: %w", yamlPath, err)
-	}
-
-	docs := strings.Split(string(data), "---")
-	target := "kind: " + kind
-
-	for _, doc := range docs {
-		scanner := bufio.NewScanner(strings.NewReader(doc))
-		foundKind := false
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == target || line == target+" " {
-				foundKind = true
-				continue
-			}
-			if foundKind && strings.HasPrefix(line, "name:") {
-				name := strings.TrimSpace(strings.TrimPrefix(line, "name:"))
-				name = strings.Trim(name, "\"'") // strip YAML quotes
-				if name != "" {
-					return name, nil
-				}
-			}
-		}
-	}
-	return "", fmt.Errorf("kind %s not found in %s", kind, yamlPath)
 }

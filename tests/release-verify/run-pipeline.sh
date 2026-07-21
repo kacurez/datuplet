@@ -8,8 +8,10 @@ PASSWORD=${DATUPLET_ADMIN_PASSWORD:?set DATUPLET_ADMIN_PASSWORD}
 PIPELINE_FILE=${1:?usage: run-pipeline.sh <rendered-pipeline.yaml>}
 TIMEOUT_S=${TIMEOUT_S:-600}
 
-NAME=$(sed -n 's/^  name: //p' "$PIPELINE_FILE" | head -1)
-[ -n "$NAME" ] || { echo "FATAL: no metadata.name in $PIPELINE_FILE" >&2; exit 2; }
+# PipelineDoc is envelope-free (RFC 027): the pipeline name is the top-level
+# `name:` key (column 0), not the old CR metadata.name (2-space indent).
+NAME=$(sed -n 's/^name: //p' "$PIPELINE_FILE" | head -1)
+[ -n "$NAME" ] || { echo "FATAL: no top-level name in $PIPELINE_FILE" >&2; exit 2; }
 JAR=$(mktemp); trap 'rm -f "$JAR"' EXIT
 
 echo "--- login $BASE_URL as $EMAIL"
