@@ -518,6 +518,7 @@ export function renderEditor() {
   });
 
   renderInputsSection(el, comp, meta, sel.s, token);
+  renderOutputsSection(el, comp, meta, sel.s, token);
 }
 
 // ---- Inputs (RFC 027 U4) ---------------------------------------------------
@@ -731,6 +732,152 @@ function openInputPicker(upstreamRows, storageRows, have, onAdd) {
     }
     host.innerHTML = '';
     onAdd(list);
+  });
+}
+
+// ---- Outputs (RFC 027 U5) --------------------------------------------------
+//
+// Rendered only when the component can produce tables at all (io.outputs !==
+// 'none' — stdout-writer declares 'none' and gets no Outputs section, spec
+// §6). Dual-mode, mirroring the RFC 027 UX mockup's renderOutputs(box, comp):
+// "Dynamic — bucket only" (outputs.defaultBucket [+ defaultWriteMode]) vs
+// "Explicit tables" (outputs.tables[] rows of {name, bucket, writeMode?}).
+// Switching modes carries the first table's bucket (+ writeMode) over, and
+// vice versa — same as the mockup.
+//
+// A stored doc can carry outputs.buckets[] — a legacy/advanced multi-bucket
+// shape this editor has no mode for. That subtree is preserved verbatim
+// (hidden-subtree rule, same convention as unrenderedKeys/renderInputsChips):
+// the section renders a read-only note instead of the toggle, and nothing in
+// renderOutputs ever reads or writes comp.outputs while buckets[] is present.
+function renderOutputsSection(el, comp, meta, si, token) {
+  const io = (meta && meta.io) || {};
+  if (io.outputs === 'none') return;
+
+  const wrap = document.createElement('div');
+  el.appendChild(wrap);
+  renderOutputs(wrap, comp, si, token);
+}
+
+// setOutMode stashes the dynamic/explicit toggle choice as a NON-enumerable
+// own property. It has to live somewhere that survives re-renders of the same
+// comp object, but comp is part of `doc` and rides straight into
+// JSON.stringify(doc) on Save/Validate (§6) — a plain enumerable
+// `comp.__outMode = …` (as the mockup does) would leak into the saved
+// PipelineDoc. Non-enumerable keeps it invisible to JSON.stringify, object
+// spreads, and Object.keys, while remaining readable via comp.__outMode.
+function setOutMode(comp, mode) {
+  Object.defineProperty(comp, '__outMode', { value: mode, enumerable: false, configurable: true, writable: true });
+}
+
+function renderOutputs(box, comp, si, token) {
+  const o = comp.outputs || {};
+
+  // outputs.buckets[] preservation (see header comment) — read-only note,
+  // no toggle, comp.outputs untouched.
+  if (Array.isArray(o.buckets)) {
+    box.innerHTML = `<div class="section-h">Outputs<span class="sform-desc"> — tables this component writes</span></div>
+      <p class="hint">multi-bucket outputs — edit in YAML mode</p>`;
+    return;
+  }
+
+  if (!comp.__outMode) setOutMode(comp, (Array.isArray(o.tables) && o.tables.length) ? 'explicit' : 'dynamic');
+  const mode = comp.__outMode;
+  box.innerHTML = `<div class="section-h">Outputs<span class="sform-desc"> — tables this component writes</span></div>
+    <div class="seg">
+      <button type="button" id="om-dyn" class="${mode === 'dynamic' ? 'on' : ''}">Dynamic — bucket only</button>
+      <button type="button" id="om-exp" class="${mode === 'explicit' ? 'on' : ''}">Explicit tables</button>
+    </div>
+    <div id="out-body"></div>`;
+  box.querySelector('#om-dyn').addEventListener('click', () => {
+    if (comp.__outMode === 'dynamic') return;
+    setOutMode(comp, 'dynamic');
+    const first = ((comp.outputs || {}).tables || [])[0];
+    if (first && first.bucket) comp.outputs = { defaultBucket: first.bucket, ...(first.writeMode ? { defaultWriteMode: first.writeMode } : {}) };
+    else delete comp.outputs;
+    renderOutputs(box, comp, si, token);
+  });
+  box.querySelector('#om-exp').addEventListener('click', () => {
+    if (comp.__outMode === 'explicit') return;
+    setOutMode(comp, 'explicit');
+    const b = (comp.outputs || {}).defaultBucket, m = (comp.outputs || {}).defaultWriteMode;
+    comp.outputs = { tables: b ? [{ name: '', bucket: b, ...(m ? { writeMode: m } : {}) }] : [] };
+    renderOutputs(box, comp, si, token);
+  });
+
+  const body = box.querySelector('#out-body');
+  if (mode === 'dynamic') {
+    body.innerHTML = `<p class="hint">The component decides table names at runtime (e.g. from its config); they all land in this bucket.</p>
+      <div class="grid2">
+        <label class="field"><b>bucket</b><input class="input input--mono" id="ob" value="${esc(o.defaultBucket || '')}" placeholder="raw" spellcheck="false"></label>
+        <label class="field"><b>writeMode</b><select class="input" id="omw">
+          <option value=""${!o.defaultWriteMode ? ' selected' : ''}>— default (FULL_LOAD) —</option>
+          <option${o.defaultWriteMode === 'APPEND' ? ' selected' : ''}>APPEND</option>
+          <option${o.defaultWriteMode === 'FULL_LOAD' ? ' selected' : ''}>FULL_LOAD</option></select></label>
+      </div><p class="field" id="ochips"></p>`;
+    const sync = () => {
+      const b = body.querySelector('#ob').value.trim(), m = body.querySelector('#omw').value;
+      if (!b && !m) delete comp.outputs;
+      else comp.outputs = { ...(b ? { defaultBucket: b } : {}), ...(m ? { defaultWriteMode: m } : {}) };
+      body.querySelector('#ochips').innerHTML = b ? `<span class="chip">${esc(b)} (dynamic)</span>` : '';
+    };
+    body.querySelector('#ob').addEventListener('input', sync);
+    body.querySelector('#omw').addEventListener('change', sync);
+    sync();
+  } else {
+    const tables = (comp.outputs && Array.isArray(comp.outputs.tables)) ? comp.outputs.tables : [];
+    comp.outputs = { tables };
+    body.innerHTML = `<p class="hint">One mapping per table — bucket + table name. Name a new table, or select an existing one to write into.</p>
+      <div id="orows"></div>
+      <div class="out-actions">
+        <button type="button" class="btn" id="o-new">+ New table</button>
+        <button type="button" class="btn" id="o-exist">Select existing…</button>
+      </div>`;
+    const orows = body.querySelector('#orows');
+    tables.forEach((t, i) => {
+      const r = document.createElement('div'); r.className = 'maprow';
+      const bi = document.createElement('input'); bi.className = 'input input--mono'; bi.placeholder = 'bucket'; bi.value = t.bucket || ''; bi.spellcheck = false;
+      const ti = document.createElement('input'); ti.className = 'input input--mono'; ti.placeholder = 'table name'; ti.value = t.name || ''; ti.spellcheck = false;
+      const ws = document.createElement('select'); ws.className = 'input';
+      ws.innerHTML = `<option value=""${!t.writeMode ? ' selected' : ''}>— default (FULL_LOAD) —</option>
+        <option${t.writeMode === 'APPEND' ? ' selected' : ''}>APPEND</option>
+        <option${t.writeMode === 'FULL_LOAD' ? ' selected' : ''}>FULL_LOAD</option>`;
+      const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'icon-btn'; rm.title = 'Remove mapping'; rm.textContent = '✕';
+      bi.addEventListener('input', () => { t.bucket = bi.value.trim(); });
+      ti.addEventListener('input', () => { t.name = ti.value.trim(); });
+      ws.addEventListener('change', () => { if (ws.value) t.writeMode = ws.value; else delete t.writeMode; });
+      rm.addEventListener('click', () => { tables.splice(i, 1); renderOutputs(box, comp, si, token); });
+      r.append(bi, ti, ws, rm); orows.appendChild(r);
+    });
+    body.querySelector('#o-new').addEventListener('click', () => { tables.push({ name: '', bucket: '' }); renderOutputs(box, comp, si, token); });
+    body.querySelector('#o-exist').addEventListener('click', () => {
+      openOutputTablePicker(tables, si, token, () => renderOutputs(box, comp, si, token)).catch((e) => {
+        if (token !== editorToken || isStale()) return;
+        const host = document.getElementById('catalog-host');
+        if (host) host.innerHTML = `<div class="catalog-back" id="pickback"><div class="catalog"><div class="callout callout--warn">${esc(String(e && e.message || e))}</div><button type="button" class="btn" id="pick-cancel">Close</button></div></div>`;
+        const cancel = document.getElementById('pick-cancel');
+        if (cancel) cancel.addEventListener('click', () => { host.innerHTML = ''; });
+      });
+    });
+  }
+}
+
+// openOutputTablePicker gathers the two groups (upstream + storage) then
+// hands off to openInputPicker — the same shared modal U4 built for the
+// Inputs section's "+ Add input table…" (the RFC 027 UX mockup uses a single
+// openTablePicker for both Inputs and Outputs) — so picking an existing table
+// appends a {name, bucket} mapping to this component's explicit
+// outputs.tables list. `token` guards against a stale async continuation
+// after the editor rebuilt for a different component.
+async function openOutputTablePicker(tables, si, token, onAdded) {
+  const have = tables.map((t) => ({ bucket: t.bucket, table: t.name }));
+  const host = document.getElementById('catalog-host');
+  if (host) host.innerHTML = `<div class="catalog-back" id="pickback"><div class="catalog"><p aria-busy="true">Loading tables…</p></div></div>`;
+  const [upstreamRows, storageRows] = await Promise.all([upstreamTables(si), storageTableRows()]);
+  if (token !== editorToken || isStale()) return;
+  openInputPicker(upstreamRows, storageRows, have, (list) => {
+    for (const x of list) tables.push({ name: x.table, bucket: x.bucket });
+    onAdded();
   });
 }
 

@@ -985,3 +985,18 @@ code.inline {
 /* Inputs section (RFC 027 U4): chips + "+ Add input table…" modal picker. */
 #inputs-chips:not(:empty) { margin-bottom: var(--s-2); }
 #inputs-chips .chip { margin: 0 var(--s-2) var(--s-2) 0; gap: var(--s-1); }
+
+/* Outputs section (RFC 027 U5): dynamic/explicit segmented toggle, table
+   mapping rows, and the "Select existing…" modal (shared with Inputs' —
+   see openInputPicker). */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin-bottom: var(--s-3); }
+.seg button { all: unset; cursor: pointer; padding: 5px 14px; font-size: var(--text-sm); color: var(--fg-1); }
+.seg button.on { background: color-mix(in srgb, var(--accent) 15%, var(--bg-2)); color: var(--accent); font-weight: 600; }
+.seg button:hover:not(.on) { background: var(--bg-2); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); max-width: 560px; }
+.hint { color: var(--fg-2); font-size: var(--text-xs); margin: 0 0 var(--s-2); }
+.maprow {
+  display: grid; grid-template-columns: 1fr 1fr 170px auto; gap: var(--s-2);
+  align-items: center; margin-bottom: var(--s-2); max-width: 640px;
+}
+.out-actions { display: flex; gap: var(--s-2); margin-top: var(--s-2); }
