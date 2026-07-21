@@ -234,6 +234,77 @@ longer returned.
 
 ---
 
+## Pipeline config (schema-first, RFC 027)
+
+**PUT is last-write-wins.** There is no optimistic concurrency control (no
+ETag / version check) on `PUT /api/v1/projects/{pid}/pipelines/{name}`. Two
+concurrent editors saving the same pipeline silently overwrite each other —
+the second write wins with no conflict signal. Out of scope for this RFC.
+
+**Component-internal semantic invariants fail at runtime, not at PUT/validate.**
+Schema validation (the Form Subset, see [docs/components.md](components.md))
+deliberately excludes `oneOf`/`if`-`then`-`else`, so invariants like
+data-generator's "exactly one of `random`/`literal`" cannot be expressed in
+`schema.json` and are not caught by `PUT` or `POST .../validate`. A pipeline
+that passes validation can still fail at run time with `FailedUser` and a
+`DUPLET_STATUS_MESSAGE:`-prefixed explanation from the component itself.
+
+**Legacy Kubernetes CR envelope format is rejected, with no migration shim.**
+Datuplet is a POC/greenfield project: a pipeline body carrying a top-level
+`apiVersion`, `kind`, or `metadata` key (the pre-RFC-027 format) fails strict
+decoding with a pointed finding. There is no server-side conversion path —
+see the "RFC 027 upgrade notes" section below for the manual conversion.
+
+---
+
+## RFC 027 upgrade notes
+
+Upgrading to the release that ships schema-first pipeline config (RFC 027) is
+**destructive** for stored pipelines and run history. Read this before
+upgrading.
+
+- **Migration 012 truncates the `pipelines` table** (`TRUNCATE pipelines
+  CASCADE`) as part of retyping the stored column from a YAML-text blob to a
+  canonical `doc jsonb`. There is no conversion code — every stored pipeline
+  is dropped. **`runs.pipeline_id` references `pipelines(id) ON DELETE
+  CASCADE`, so run history is wiped too.** Take a `pg_dump` first if you care
+  about either.
+- **Cancel active runs before upgrading.** The migration does not touch the
+  Kubernetes side: any in-flight `PipelineRun` CRs/Jobs survive the DB reset
+  as inert cluster objects (Postgres no longer has a matching row). The
+  30-minute reaper CronJob eventually sweeps them, but cancelling first
+  avoids a window of orphaned, unobservable runs.
+- **API field rename: `yaml` → `doc`.** `GET .../pipelines/{name}` returns
+  `{"id","name","doc","created_at","updated_at"}` instead of the old
+  `{"id","name","yaml",...}` shape. This is a breaking API change with no
+  version negotiation — any script/integration reading the old `yaml` field
+  needs updating in lockstep with the upgrade.
+- **Legacy envelope bodies are rejected**, not converted. A stored or
+  submitted pipeline in the old Kubernetes-CR-envelope shape
+  (`apiVersion`/`kind`/`metadata`/`spec`) fails strict decoding with a
+  pointed finding. Manual conversion (mechanical, ~5 lines):
+
+  ```diff
+  -apiVersion: datuplet.io/v1
+  -kind: Pipeline
+  -metadata:
+  -  name: my-pipeline
+  -spec:
+  +name: my-pipeline
+     stages:
+       - name: extract
+         components: [...]
+  ```
+
+  i.e. delete `apiVersion`/`kind`, hoist `metadata.name` to top-level `name`,
+  and hoist everything under `spec:` to the top level.
+- **No automated backout.** Rolling back means redeploying the previous
+  chart version and restoring the pre-upgrade `pg_dump` — there is no
+  `down` migration for 012, and `upgrade.sh` runs with no `--atomic` flag
+  (see "Upgrade support statement" above).
+
+---
+
 ## Validated deployment targets
 
 GKE is the only validated cloud target for v0.1. EKS and AKS quickstarts are

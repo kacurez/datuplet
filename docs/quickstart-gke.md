@@ -282,12 +282,25 @@ Open `http://localhost:8080/ui/` and log in with the admin credentials from step
 
 ## 7. Trigger a pipeline
 
-Apply the example pipeline:
+Pipelines are envelope-free PipelineDocs (RFC 027) — upserted through the
+API/CLI/UI, not applied as Kubernetes manifests. Build the CLI locally and
+point it at the port-forwarded pipeline-api:
 
 ```bash
-kubectl apply -f examples/pipelines/simple-http-extract.yaml
+make build   # builds bin/datuplet, from the repo root
+
+export DATUPLET_REMOTE=http://localhost:8080
+echo 'replace-with-a-strong-password' | ./bin/datuplet login --remote $DATUPLET_REMOTE \
+  --email admin@example.com --password-stdin
+
+./bin/datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
+./bin/datuplet trigger simple-pipeline
+
 kubectl get pipelineruns -n datuplet -w
 ```
+
+(The UI at `http://localhost:8080/ui/` works too — Pipelines → paste the
+example YAML → Save → Trigger.)
 
 Watch the run reach `Succeeded`. Then browse results in the UI under "Storage".
 
