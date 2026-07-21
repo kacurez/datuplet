@@ -31,30 +31,41 @@ import (
 // apiSessionCookieName is the session cookie pipeline-api sets on login.
 const apiSessionCookieName = "pipeline_api_session"
 
-// e2e POC default DB admin, seeded by scripts/register.sh. This is the only
-// real Postgres-backed user in the e2e cluster today (the FGA TestUsers —
-// Alice/Bob/Charlie/Dora — are FGA-only UUIDs with no DB account and thus
-// cannot password-login). Production installs override these.
+// e2e POC default DB admin, seeded by scripts/register.sh. Alice maps to this
+// account (the sole DB user register.sh seeds); Bob is provisioned on demand as
+// a real DB login user (bobLogin* below) the first time an fga-matrix scenario
+// drives the HTTP run path as him. Production installs override these.
 const (
 	e2eAdminEmail    = "admin@datuplet.local"
 	e2eAdminPassword = "changeme"
+
+	// e2eBobLogin* is the real DB login user provisioned for the
+	// fga-matrix-bob scenario. K8sBackend.apiSessionFor create-users it (via
+	// `pipeline-api admin create-user`, idempotent) the first time Bob's
+	// identity drives a run, then logs in and seeds Bob's REAL minted UUID with
+	// the `editor` relation SetupFGABootstrap grants the fixed BobID. See the
+	// FGA-identity note in K8sBackend.apiSessionFor.
+	e2eBobLoginEmail    = "e2e-bob-login@datuplet.local"
+	e2eBobLoginPassword = "changeme-bob"
 )
 
 // apiCredsFor maps a framework TestUser identity to the pipeline-api login
 // credentials the run authenticates with.
 //
 // Production run-identity is the authenticated caller, so a per-user authz
-// scenario must drive the API AS that user. Today only Alice (project_admin)
-// is exercisable over HTTP: she maps to the seeded DB admin, the sole account
-// that can password-login. Bob/Charlie/Dora have no DB users yet, so this
-// returns ok=false for them — E5 must provision real per-user DB accounts (via
-// `pipeline-api admin create-user` + FGA grants) before the FGA-matrix
-// scenarios can drive the HTTP run path as those identities. The mechanism is
-// deliberately a lookup table so adding those rows is the only change needed.
+// scenario must drive the API AS that user. Alice maps to the seeded DB admin
+// (the account register.sh creates); Bob maps to a dedicated DB login user the
+// backend provisions on first use. Charlie/Dora are not exercised over the HTTP
+// run path (their negative-authz paths are covered at the unit level — see the
+// fga-matrix note in scenarios_test.go), so this returns ok=false for them. The
+// mechanism is deliberately a lookup table so adding a row is the only change
+// needed to extend it.
 func apiCredsFor(userID uuid.UUID) (email, password string, ok bool) {
 	switch userID {
 	case AliceID:
 		return e2eAdminEmail, e2eAdminPassword, true
+	case BobID:
+		return e2eBobLoginEmail, e2eBobLoginPassword, true
 	default:
 		return "", "", false
 	}
@@ -170,6 +181,64 @@ func apiDeletePipeline(ctx context.Context, baseURL, cookie, projectID, name str
 		return fmt.Errorf("delete pipeline %q: status=%d body=%s", name, status, truncate(body, 256))
 	}
 	return nil
+}
+
+// apiFindProjectIDByName lists the caller's projects (GET /api/v1/projects) and
+// returns the Datuplet projects-store UUID whose name matches. This is the
+// value pipeline-api resolves {pid} against (projects.GetByID) — NOT the
+// lakekeeper project UUID. Mirrors the test package's remoteCLIFindProject:
+// exact-name match, single-project fallback. Call with an ADMIN session — a
+// non-admin caller only sees projects it holds a relation on.
+func apiFindProjectIDByName(ctx context.Context, baseURL, cookie, name string) (string, error) {
+	u := strings.TrimRight(baseURL, "/") + "/api/v1/projects"
+	status, body, err := apiDo(ctx, http.MethodGet, u, cookie, "", nil)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("list projects: status=%d body=%s", status, truncate(body, 256))
+	}
+	var projects []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &projects); err != nil {
+		return "", fmt.Errorf("decode projects: %w (body=%s)", err, truncate(body, 256))
+	}
+	for _, p := range projects {
+		if p.Name == name {
+			return p.ID, nil
+		}
+	}
+	if len(projects) == 1 {
+		return projects[0].ID, nil
+	}
+	return "", fmt.Errorf("project %q not found in %d projects", name, len(projects))
+}
+
+// apiMeUserID returns the authenticated caller's REAL DB user UUID via
+// GET /api/v1/auth/me. Login answers 204 with no body, so /me is the only path
+// that surfaces the minted UUID — and that UUID (not the fixed TestUser UUID)
+// is the `sub` the run-trigger's mustHaveRelation FGA check runs against.
+func apiMeUserID(ctx context.Context, baseURL, cookie string) (string, error) {
+	u := strings.TrimRight(baseURL, "/") + "/api/v1/auth/me"
+	status, body, err := apiDo(ctx, http.MethodGet, u, cookie, "", nil)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("GET /auth/me: status=%d body=%s", status, truncate(body, 256))
+	}
+	var me struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &me); err != nil {
+		return "", fmt.Errorf("decode /auth/me: %w (body=%s)", err, truncate(body, 256))
+	}
+	if me.ID == "" {
+		return "", fmt.Errorf("/auth/me returned empty id")
+	}
+	return me.ID, nil
 }
 
 // apiDo issues one authenticated request and returns (status, body).

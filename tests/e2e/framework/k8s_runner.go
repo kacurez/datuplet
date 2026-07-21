@@ -54,6 +54,15 @@ type K8sBackend struct {
 	// override per-scenario.
 	RunAsUser uuid.UUID
 
+	// DatupletProjectID is the Datuplet projects-store UUID used as {pid}
+	// for PUT / trigger / get / delete, and the basis of the run namespace
+	// (datuplet-<DatupletProjectID>). This is NOT the lakekeeper project UUID
+	// — pipeline-api resolves {pid} against a real projects row (GetByID).
+	// NewK8sBackend resolves and caches it (from the harness's lakekeeper
+	// project, by name); callers that construct the backend as a literal (e.g.
+	// the secrets ladder) set it directly to target a specific project.
+	DatupletProjectID string
+
 	Resources []string // legacy kubectl "kind/name" cleanup entries (unused by the HTTP path)
 
 	// apiSession caches the RunAsUser login cookie for the backend's lifetime.
@@ -65,7 +74,15 @@ type K8sBackend struct {
 
 // NewK8sBackend creates a K8sBackend bound to the harness's
 // per-project namespace. Idempotent: re-creating the same namespace
-// is a kubectl no-op via --dry-run filtering.
+// is a kubectl no-op.
+//
+// It resolves the Datuplet projects-store row bound to the harness's lakekeeper
+// project (find-or-create by name, then discover its UUID — see
+// resolveDatupletProjectID) and uses THAT UUID both as {pid} and as the basis
+// of the run namespace. The two are distinct in production (and now in e2e):
+// pipeline-api resolves {pid} against projects.GetByID and creates the run in
+// datuplet-<datuplet-project-uuid> (pkg/pipelineapi/k8s.NamespaceForProject),
+// so the harness must fetch logs / clean up from that same namespace.
 func NewK8sBackend(h *FGAHarness, runPrefix string) (*K8sBackend, error) {
 	if h == nil {
 		return nil, errors.New("NewK8sBackend: harness is required")
@@ -73,25 +90,47 @@ func NewK8sBackend(h *FGAHarness, runPrefix string) (*K8sBackend, error) {
 	if h.LakekeeperProjectID == "" {
 		return nil, errors.New("NewK8sBackend: harness has no LakekeeperProjectID")
 	}
-	// We use the lakekeeper project UUID as the K8s project UUID for
-	// e2e — the harness-allocated project plays both roles. Production
-	// splits these (Postgres-side Datuplet project UUID drives the
-	// namespace, lakekeeper UUID lives on a label) but for e2e they
-	// converge.
-	lkProjectUUID, err := uuid.Parse(h.LakekeeperProjectID)
-	if err != nil {
-		return nil, fmt.Errorf("parse lakekeeper project UUID %q: %w", h.LakekeeperProjectID, err)
-	}
-	ns := "datuplet-" + lkProjectUUID.String()
-	if err := ensureNamespace(context.Background(), ns, lkProjectUUID); err != nil {
-		return nil, fmt.Errorf("ensure namespace %q: %w", ns, err)
-	}
-	return &K8sBackend{
+	k := &K8sBackend{
 		Harness:   h,
-		Namespace: ns,
 		RunPrefix: runPrefix,
 		RunAsUser: AliceID,
-	}, nil
+	}
+	ctx := context.Background()
+	pid, err := k.ensureDatupletProject(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Datuplet project for lakekeeper project %q: %w",
+			h.LakekeeperProjectName, err)
+	}
+	pidUUID, err := uuid.Parse(pid)
+	if err != nil {
+		return nil, fmt.Errorf("parse Datuplet project UUID %q: %w", pid, err)
+	}
+	k.Namespace = "datuplet-" + pidUUID.String()
+	// Belt-and-braces: pipeline-api ensures this namespace at trigger time too,
+	// with the same datuplet.io/project-id label (EnsureProjectNamespace). We
+	// pre-create it with the matching label so log-fetch / cleanup have a target
+	// even before the first trigger, and so a pre-existing namespace's label
+	// agrees with what pipeline-api would set.
+	if err := ensureNamespace(ctx, k.Namespace, pidUUID); err != nil {
+		return nil, fmt.Errorf("ensure namespace %q: %w", k.Namespace, err)
+	}
+	return k, nil
+}
+
+// ensureDatupletProject returns the Datuplet projects-store UUID this backend
+// drives {pid} against, resolving+caching it on first use. A literal-constructed
+// backend that already set DatupletProjectID (e.g. the secrets ladder) short-
+// circuits without any resolution.
+func (k *K8sBackend) ensureDatupletProject(ctx context.Context) (string, error) {
+	if k.DatupletProjectID != "" {
+		return k.DatupletProjectID, nil
+	}
+	id, err := resolveDatupletProjectID(ctx, k.Harness)
+	if err != nil {
+		return "", err
+	}
+	k.DatupletProjectID = id
+	return id, nil
 }
 
 // ensureNamespace kubectl-applies a Namespace with the
@@ -142,9 +181,13 @@ func (k *K8sBackend) RunPipeline(ctx context.Context, pipelinePath string, opts 
 	}
 	name := doc.Name
 
-	// project = harness lakekeeper project UUID (the e2e convergence noted in
-	// NewK8sBackend). pipeline-api resolves {pid} against a real projects row.
-	projectID := k.Harness.LakekeeperProjectID
+	// {pid} is the Datuplet projects-store UUID (resolved from the harness's
+	// lakekeeper project by name), NOT the lakekeeper UUID: pipeline-api
+	// resolves {pid} against a real projects row (projects.GetByID).
+	projectID, err := k.ensureDatupletProject(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Datuplet project: %w", err)
+	}
 	base := PipelineAPIBaseURL()
 
 	session, err := k.apiSessionFor(ctx)
@@ -231,6 +274,18 @@ func (k *K8sBackend) RunPipeline(ctx context.Context, pipelinePath string, opts 
 
 // apiSessionFor logs the backend's RunAsUser into pipeline-api and caches the
 // session cookie for the backend's lifetime.
+//
+// FGA IDENTITY (RFC 027 E2 review, Finding 2): SetupFGABootstrap seeds the
+// FIXED TestUser UUIDs (AliceID/BobID/…), but the HTTP run identity is the
+// authenticated DB user's REAL UUID — random for a `create-user`-minted account,
+// and the seeded-admin's own UUID for Alice. mustHaveRelation checks that real
+// UUID, so a grant keyed to the fixed UUID would not apply. This method
+// therefore (a) provisions a real DB login user for non-admin identities
+// (Alice maps to the pre-seeded admin), (b) logs in, and (c) seeds the run's
+// REAL UUID with the SAME project relation SetupFGABootstrap grants the fixed
+// UUID. The token-mint path (k8s_token.go, exercised by k8s_token_test.go and
+// the buildK8sVerifier browse impersonation) still uses the fixed UUIDs, which
+// SeedFGAGrants keeps granting — both identities are covered.
 func (k *K8sBackend) apiSessionFor(ctx context.Context) (string, error) {
 	if k.apiSession != "" {
 		return k.apiSession, nil
@@ -238,14 +293,43 @@ func (k *K8sBackend) apiSessionFor(ctx context.Context) (string, error) {
 	email, password, ok := apiCredsFor(k.RunAsUser)
 	if !ok {
 		return "", fmt.Errorf("no pipeline-api login credentials mapped for RunAsUser %s "+
-			"(E5: provision a DB user + FGA grants for this identity before driving the HTTP run path as it)", k.RunAsUser)
+			"(extend apiCredsFor + provision a DB user for this identity before driving the HTTP run path as it)", k.RunAsUser)
+	}
+	// Non-admin identities need a real DB login user provisioned; Alice maps to
+	// the admin account register.sh already seeded, so skip create-user for her.
+	if k.RunAsUser != AliceID {
+		if err := adminCreateUser(ctx, email, password); err != nil {
+			return "", fmt.Errorf("provision DB user %s: %w", email, err)
+		}
 	}
 	cookie, err := apiLogin(ctx, PipelineAPIBaseURL(), email, password)
 	if err != nil {
 		return "", fmt.Errorf("login as %s: %w", email, err)
 	}
+	if err := k.ensureRunAsUserGrant(ctx, cookie); err != nil {
+		return "", fmt.Errorf("seed FGA grant for %s: %w", email, err)
+	}
 	k.apiSession = cookie
 	return cookie, nil
+}
+
+// ensureRunAsUserGrant threads the run's REAL DB UUID into the same project
+// relation SetupFGABootstrap grants this TestUser's fixed UUID, so the
+// run-trigger's mustHaveRelation FGA check passes for the authenticated caller.
+// No-op for a no-grant identity (dora-like: relation == "").
+func (k *K8sBackend) ensureRunAsUserGrant(ctx context.Context, cookie string) error {
+	relation := relationForTestUser(k.RunAsUser)
+	if relation == "" {
+		return nil
+	}
+	realUUID, err := apiMeUserID(ctx, PipelineAPIBaseURL(), cookie)
+	if err != nil {
+		return fmt.Errorf("resolve real UUID: %w", err)
+	}
+	// seedProjectGrant writes on authz.ProjectObject(h.LakekeeperProjectID) —
+	// the exact object mustHaveRelation checks (proj.LakekeeperProjectID) — for
+	// the real UUID. Idempotent.
+	return seedProjectGrant(ctx, k.Harness, realUUID, relation)
 }
 
 // trackPipeline records a PUT pipeline name once for Cleanup.
@@ -305,10 +389,11 @@ func (k *K8sBackend) Cleanup(ctx context.Context) error {
 	}
 
 	// Stored pipelines via the API, so re-runs of the same fixture under the
-	// same project don't collide.
-	if k.apiSession != "" && k.Harness != nil {
+	// same project don't collide. Uses the resolved Datuplet project UUID (the
+	// {pid} the PUT/trigger used), never the lakekeeper UUID.
+	if k.apiSession != "" && k.DatupletProjectID != "" {
 		for _, name := range k.putPipelines {
-			if err := apiDeletePipeline(ctx, PipelineAPIBaseURL(), k.apiSession, k.Harness.LakekeeperProjectID, name); err != nil {
+			if err := apiDeletePipeline(ctx, PipelineAPIBaseURL(), k.apiSession, k.DatupletProjectID, name); err != nil {
 				errs = append(errs, fmt.Sprintf("delete pipeline %s: %v", name, err))
 			}
 		}
