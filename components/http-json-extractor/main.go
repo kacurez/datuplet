@@ -73,10 +73,14 @@ func main() {
 
 	// Check if pagination is enabled
 	if compCfg.Pagination != nil && compCfg.Pagination.Type != "" {
-		// Paginated mode - stream data incrementally
+		// Paginated mode - stream data incrementally. runPaginatedExtraction
+		// opens its own writer and commits inline, so we must return here
+		// rather than fall through to the single-request commit block below
+		// (a second Commit returns zero buckets and the status line panics).
 		if err := runPaginatedExtraction(ctx, client, compCfg.URL, compCfg.ArrayPath, compCfg.TableName, compCfg.Headers, compCfg.Pagination); err != nil {
 			sdk.ExitUserError(fmt.Sprintf("paginated extraction failed: %v", err))
 		}
+		return
 	} else {
 		// Single request mode - original behavior
 		client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
@@ -146,7 +150,11 @@ func main() {
 	}
 
 	client.Log(ctx, "INFO", "HTTP JSON extraction completed successfully")
-	sdk.StatusMessage(fmt.Sprintf("extracted %d records from %s", result.Buckets[0].Tables[0].RowsAdded, compCfg.URL))
+	var rowsAdded int64
+	if len(result.Buckets) > 0 && len(result.Buckets[0].Tables) > 0 {
+		rowsAdded = result.Buckets[0].Tables[0].RowsAdded
+	}
+	sdk.StatusMessage(fmt.Sprintf("extracted %d records from %s", rowsAdded, compCfg.URL))
 }
 
 // runPaginatedExtraction handles paginated API extraction with streaming writes.
@@ -349,13 +357,29 @@ func fetchJSON(ctx context.Context, url, arrayPath string, headers map[string]st
 
 // parseJSON parses JSON body into records, handling both array and wrapped formats.
 func parseJSON(body []byte, arrayPath string) ([]map[string]any, error) {
-	// Try parsing as array first
+	// Bare array of record objects: [ {...}, {...} ]
 	var records []map[string]any
 	if err := json.Unmarshal(body, &records); err == nil {
 		return records, nil
 	}
 
-	// Try parsing as object with array field
+	// Positional array whose records live in a nested array element, e.g. the
+	// World Bank API's [ {..pagination metadata..}, [ {..records..} ] ]. A bare
+	// record array never has a top-level element that is itself an array, so
+	// this branch only changes behaviour for the positional shape.
+	var positional []any
+	if err := json.Unmarshal(body, &positional); err == nil {
+		// Prefer a nested array of records over the top-level elements.
+		for _, el := range positional {
+			if inner, ok := el.([]any); ok {
+				return recordsFromSlice(inner), nil
+			}
+		}
+		// No nested array: fall back to the top-level object elements.
+		return recordsFromSlice(positional), nil
+	}
+
+	// Object wrapping an array field: { "results": [ ... ] }.
 	var wrapper map[string]any
 	if err := json.Unmarshal(body, &wrapper); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
@@ -382,15 +406,19 @@ func parseJSON(body []byte, arrayPath string) ([]map[string]any, error) {
 		return nil, fmt.Errorf("field '%s' is not an array", arrayKey)
 	}
 
-	// Convert []any to []map[string]any
-	records = make([]map[string]any, 0, len(arrayData))
-	for _, item := range arrayData {
+	return recordsFromSlice(arrayData), nil
+}
+
+// recordsFromSlice converts a slice of decoded JSON values into records,
+// keeping only the object-valued elements.
+func recordsFromSlice(items []any) []map[string]any {
+	records := make([]map[string]any, 0, len(items))
+	for _, item := range items {
 		if record, ok := item.(map[string]any); ok {
 			records = append(records, record)
 		}
 	}
-
-	return records, nil
+	return records
 }
 
 // getColumns extracts sorted column names from records, flattening nested objects.
