@@ -62,3 +62,39 @@ func TestEncodeJSONL_NoHTMLEscape(t *testing.T) {
 		t.Fatalf("value was HTML-escaped: %s", out)
 	}
 }
+
+func TestProjectRecords(t *testing.T) {
+	recs := []map[string]any{
+		{"country": map[string]any{"id": "ZH", "value": "Africa"}, "iso": "AFE", "value": 5.0},
+		{"country": "not-an-object", "iso": "XXX"}, // intermediate not object, missing value
+	}
+	fields := []FieldMapping{
+		{Path: "country.value", Name: "entity"},
+		{Path: "iso", Name: "iso3"},
+		{Path: "value", Name: "population"},
+	}
+	out := projectRecords(recs, fields)
+	if len(out) != 2 {
+		t.Fatalf("got %d rows, want 2", len(out))
+	}
+	// row 0: all resolved
+	if out[0]["entity"] != "Africa" || out[0]["iso3"] != "AFE" || out[0]["population"] != 5.0 {
+		t.Fatalf("row0 wrong: %v", out[0])
+	}
+	// only projected keys present
+	if len(out[0]) != 3 {
+		t.Fatalf("row0 should have exactly 3 keys, got %v", out[0])
+	}
+	// row 1: non-object intermediate -> nil; missing -> nil
+	if out[1]["entity"] != nil || out[1]["population"] != nil || out[1]["iso3"] != "XXX" {
+		t.Fatalf("row1 wrong: %v", out[1])
+	}
+}
+
+func TestProjectRecords_Identity(t *testing.T) {
+	recs := []map[string]any{{"a": 1, "b": 2}}
+	// nil / empty fields -> unchanged slice
+	if got := projectRecords(recs, nil); len(got) != 1 || len(got[0]) != 2 {
+		t.Fatalf("identity failed: %v", got)
+	}
+}

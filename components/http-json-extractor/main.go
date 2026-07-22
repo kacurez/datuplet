@@ -760,3 +760,22 @@ func getValueRaw(record map[string]any, path string) any {
 
 	return current
 }
+
+// projectRecords reshapes each record into a flat object containing only the
+// mapped fields (renamed). An unresolved path (missing key, or an intermediate
+// segment that is a scalar/array/null) yields nil for that field. With no
+// fields, records are returned unchanged.
+func projectRecords(records []map[string]any, fields []FieldMapping) []map[string]any {
+	if len(fields) == 0 {
+		return records
+	}
+	out := make([]map[string]any, len(records))
+	for i, rec := range records {
+		projected := make(map[string]any, len(fields))
+		for _, f := range fields {
+			projected[f.Name] = getValueRaw(rec, f.Path)
+		}
+		out[i] = projected
+	}
+	return out
+}
