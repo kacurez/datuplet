@@ -393,32 +393,6 @@ func doSessionRequest(ctx context.Context, method, url, cookie, contentType stri
 
 // --- kubectl assertion helpers ---
 
-func assertNoPodsForRun(t *testing.T, namespace, prName string) {
-	t.Helper()
-	out, err := exec.Command("kubectl", "get", "pods", "-n", namespace,
-		"-l", "datuplet.io/pipelinerun="+prName,
-		"-o", "jsonpath={.items[*].metadata.name}").Output()
-	if err != nil {
-		t.Fatalf("kubectl get pods: %v", err)
-	}
-	if names := strings.TrimSpace(string(out)); names != "" {
-		t.Errorf("expected zero pods for PipelineRun %q, found: %s", prName, names)
-	}
-}
-
-func assertNoJobsForRun(t *testing.T, namespace, prName string) {
-	t.Helper()
-	out, err := exec.Command("kubectl", "get", "jobs", "-n", namespace,
-		"-l", "datuplet.io/pipelinerun="+prName,
-		"-o", "jsonpath={.items[*].metadata.name}").Output()
-	if err != nil {
-		t.Fatalf("kubectl get jobs: %v", err)
-	}
-	if names := strings.TrimSpace(string(out)); names != "" {
-		t.Errorf("expected zero Jobs for PipelineRun %q, found: %s", prName, names)
-	}
-}
-
 func secretExists(t *testing.T, namespace, name string) bool {
 	t.Helper()
 	err := exec.Command("kubectl", "get", "secret", name, "-n", namespace).Run()

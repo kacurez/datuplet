@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/datuplet/datuplet/tests/e2e/framework"
 )
 
@@ -33,13 +35,18 @@ func kubectlJSONPath(kind, name, ns, path string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// waitForComponentJob polls until a Job exists for (prName, componentName)
+// waitForComponentJob polls until a Job exists for (runID, componentName)
 // via the operator's standard labels, returning its name. Fails the test if
 // no Job shows up within timeout — used to prove admission actually built
 // the Job from the frozen snapshot before a mid-run mutation is applied.
-func waitForComponentJob(t *testing.T, ns, prName, componentName string, timeout time.Duration) string {
+//
+// RFC 027 E5: the PipelineRun CR name is minted by pipeline-api
+// (<pipeline>-<run-uuid>), not chosen by the harness, so Jobs are selected by
+// the stable datuplet.io/run-id label the controller stamps on every Job/Pod
+// (pkg/k8s/controllers/pipelinerun_jobs.go) rather than by PipelineRun name.
+func waitForComponentJob(t *testing.T, ns string, runID uuid.UUID, componentName string, timeout time.Duration) string {
 	t.Helper()
-	sel := "datuplet.io/pipelinerun=" + prName + ",datuplet.io/component=" + componentName
+	sel := "datuplet.io/run-id=" + runID.String() + ",datuplet.io/component=" + componentName
 	deadline := time.Now().Add(timeout)
 	for {
 		out, err := exec.Command("kubectl", "get", "jobs", "-n", ns, "-l", sel,
@@ -52,6 +59,29 @@ func waitForComponentJob(t *testing.T, ns, prName, componentName string, timeout
 			t.Fatalf("timed out waiting for a Job matching %q in namespace %s", sel, ns)
 		}
 		time.Sleep(2 * time.Second)
+	}
+}
+
+// pipelineRunNameForRun resolves the PipelineRun CR name for a run by its
+// datuplet.io/run-id label. pipeline-api mints the CR name (<pipeline>-<uuid>,
+// with a DNS-1123 fallback form), so tests that read PipelineRun.status must
+// discover the name via the run-id label rather than reconstruct it. Polls
+// briefly because the CR is created asynchronously by the trigger path.
+func pipelineRunNameForRun(t *testing.T, ns string, runID uuid.UUID, timeout time.Duration) string {
+	t.Helper()
+	sel := "datuplet.io/run-id=" + runID.String()
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := exec.Command("kubectl", "get", "pipelinerun", "-n", ns, "-l", sel,
+			"-o", "jsonpath={.items[0].metadata.name}").Output()
+		name := strings.TrimSpace(string(out))
+		if err == nil && name != "" {
+			return name
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out resolving PipelineRun name for run-id=%s in namespace %s", runID, ns)
+		}
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -102,7 +132,16 @@ func renderRegistryFixture(t *testing.T, name string) string {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Unknown component → FailedUser, zero pods, zero Jobs.
+// Unknown component → rejected pre-flight at PUT (HTTP 400), no run created.
+//
+// RFC 027 E5: pre-RFC-027 the harness kubectl-applied the CR and the
+// controller's registry Resolve produced a FailedUser run with zero pods.
+// The migrated K8sBackend drives runs through pipeline-api, whose validator
+// rejects the unknown component at PUT /pipelines with a 400 + an error
+// finding naming stages[].components[].component — BEFORE any run / PipelineRun
+// / pod is created. RunPipeline surfaces that as an error carrying the 400
+// body. Asserting the rejection here proves the same bad input is refused;
+// the controller's own admission defence-in-depth is unit-covered.
 // ──────────────────────────────────────────────────────────────────────────
 
 func TestRegistry_UnknownComponent(t *testing.T) {
@@ -118,25 +157,27 @@ func TestRegistry_UnknownComponent(t *testing.T) {
 	defer kb.Cleanup(context.Background())
 
 	rendered := renderRegistryFixture(t, "unknown-component.yaml")
-	prName := runPrefix + "-unknown-component-run"
 
 	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
-	if err != nil {
-		t.Fatalf("run pipeline: %v", err)
+	if err == nil {
+		t.Fatalf("expected PUT pre-flight rejection for an unknown component, got success=%v", result != nil && result.Success)
 	}
-	if result.Success || result.FailureType != "FailedUser" {
-		t.Fatalf("got success=%v failureType=%q message=%q, want FailedUser",
-			result.Success, result.FailureType, result.StatusMessage)
+	// The error must carry the PUT 400 that names the unknown component and the
+	// offending path (stages[].components[].component).
+	msg := err.Error()
+	if !strings.Contains(msg, "status=400") {
+		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
 	}
-	if !strings.Contains(result.StatusMessage, "does-not-exist") {
-		t.Errorf("status message does not name the unknown component %q: %q", "does-not-exist", result.StatusMessage)
+	if !strings.Contains(msg, "does-not-exist") {
+		t.Errorf("rejection does not name the unknown component %q: %v", "does-not-exist", err)
 	}
-	assertNoPodsForRun(t, kb.Namespace, prName)
-	assertNoJobsForRun(t, kb.Namespace, prName)
+	if !strings.Contains(msg, "components[0].component") {
+		t.Errorf("rejection does not point at the offending component field: %v", err)
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Config violates the resolved (stable) schema → FailedUser, zero pods.
+// Config violates the resolved (stable) schema → rejected pre-flight at PUT.
 //
 // Deviation from the RFC's test-impact wording (flagged per the task
 // brief): the "dev" registration every built-in gets is deliberately
@@ -145,6 +186,11 @@ func TestRegistry_UnknownComponent(t *testing.T) {
 // data-generator to the STABLE v0.0.1 registration (the only one carrying
 // the real, additionalProperties:false schema) to exercise the rejection
 // path at all.
+//
+// RFC 027 E5: like the unknown-component case, the schema violation is now
+// caught by pipeline-api's validator at PUT (HTTP 400) with an error finding
+// naming the offending config path — before any run is created. RunPipeline
+// surfaces the 400 as an error.
 // ──────────────────────────────────────────────────────────────────────────
 
 func TestRegistry_ErrorSchemaInvalid(t *testing.T) {
@@ -160,21 +206,62 @@ func TestRegistry_ErrorSchemaInvalid(t *testing.T) {
 	defer kb.Cleanup(context.Background())
 
 	rendered := renderRegistryFixture(t, "error-schema-invalid.yaml")
-	prName := runPrefix + "-error-schema-invalid-run"
 
 	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
+	if err == nil {
+		t.Fatalf("expected PUT pre-flight rejection for a schema-invalid config, got success=%v", result != nil && result.Success)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "status=400") {
+		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
+	}
+	// The finding names the offending config path and the additional-property
+	// violation (bogusUnknownKey is not part of the registered schema).
+	if !strings.Contains(msg, "config.tables[0]") {
+		t.Errorf("rejection does not point at the offending config path: %v", err)
+	}
+	if !strings.Contains(msg, "additional propert") {
+		t.Errorf("rejection does not describe the schema violation: %v", err)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Reading a non-existent / invalid input table → rejected pre-flight at PUT.
+//
+// RFC 027 E5: this used to be a run scenario (error-missing-table) expecting a
+// FailedUser terminal from a runtime missing-table read. The migrated harness
+// drives runs through pipeline-api, whose validator rejects the fixture's
+// invalid input-table reference at PUT (HTTP 400, error finding naming
+// stages[].components[].inputs.tables[].table) before any run is created — so
+// it no longer fits the run-to-terminal Scenario{} table (see scenarios_test.go).
+// Asserting the rejection keeps the "bad input is refused" intent.
+// ──────────────────────────────────────────────────────────────────────────
+
+func TestErrorMissingTableRejected(t *testing.T) {
+	h := registrySkipUnlessReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	kb, err := framework.NewK8sBackend(h, runPrefix)
 	if err != nil {
-		t.Fatalf("run pipeline: %v", err)
+		t.Fatalf("init K8s backend: %v", err)
 	}
-	if result.Success || result.FailureType != "FailedUser" {
-		t.Fatalf("got success=%v failureType=%q message=%q, want FailedUser (schema violation)",
-			result.Success, result.FailureType, result.StatusMessage)
+	defer kb.Cleanup(context.Background())
+
+	rendered := renderRegistryFixture(t, "error-missing-table.yaml")
+
+	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
+	if err == nil {
+		t.Fatalf("expected PUT pre-flight rejection for an invalid input table, got success=%v", result != nil && result.Success)
 	}
-	if result.StatusMessage == "" {
-		t.Errorf("expected a non-empty status message describing the schema violation")
+	msg := err.Error()
+	if !strings.Contains(msg, "status=400") {
+		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
 	}
-	assertNoPodsForRun(t, kb.Namespace, prName)
-	assertNoJobsForRun(t, kb.Namespace, prName)
+	if !strings.Contains(msg, "inputs.tables[0].table") {
+		t.Errorf("rejection does not point at the offending input-table path: %v", err)
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -195,7 +282,6 @@ func TestRegistry_UnpinnedResolvesStable(t *testing.T) {
 	defer kb.Cleanup(context.Background())
 
 	rendered := renderRegistryFixture(t, "unpinned-resolution.yaml")
-	prName := runPrefix + "-unpinned-resolution-run"
 
 	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
 	if err != nil {
@@ -205,6 +291,8 @@ func TestRegistry_UnpinnedResolvesStable(t *testing.T) {
 		t.Fatalf("expected success, got failureType=%q message=%q logs=%s",
 			result.FailureType, result.StatusMessage, result.Logs)
 	}
+
+	prName := pipelineRunNameForRun(t, kb.Namespace, result.RunID, 30*time.Second)
 
 	component, err := kubectlJSONPath("pipelinerun", prName, kb.Namespace, "{.status.components[0].component}")
 	if err != nil {
@@ -266,7 +354,6 @@ func TestRegistry_Freeze_MidRunMutation(t *testing.T) {
 	ns := kb.Namespace
 
 	rendered := renderRegistryFixture(t, "freeze-longrunning.yaml")
-	prName := runPrefix + "-freeze-longrunning-run"
 	pipelineName := runPrefix + "-freeze-longrunning"
 
 	type runOutcome struct {
@@ -274,18 +361,38 @@ func TestRegistry_Freeze_MidRunMutation(t *testing.T) {
 		err    error
 	}
 	resultCh := make(chan runOutcome, 1)
+	// runIDCh receives the minted run id as soon as POST /runs returns, so the
+	// test can observe the in-flight run's Job / PipelineRun (both labelled
+	// datuplet.io/run-id) while RunPipeline is still polling in the goroutine.
+	runIDCh := make(chan uuid.UUID, 1)
 	go func() {
 		result, runErr := kb.RunPipeline(ctx, rendered, framework.RunOpts{
 			StorageType: "s3",
 			Timeout:     5 * time.Minute,
+			OnRunID:     func(id uuid.UUID) { runIDCh <- id },
 		})
 		resultCh <- runOutcome{result, runErr}
 	}()
 
+	var runID uuid.UUID
+	select {
+	case runID = <-runIDCh:
+	case oc := <-resultCh:
+		// RunPipeline returned before emitting a run id — surface its real
+		// error (e.g. a PUT/trigger rejection) instead of a misleading wait.
+		if oc.err != nil {
+			t.Fatalf("run pipeline (returned before a run id was observed): %v", oc.err)
+		}
+		t.Fatalf("run completed before a run id was observed: success=%v", oc.result != nil && oc.result.Success)
+	case <-time.After(90 * time.Second):
+		t.Fatalf("timed out waiting for the run id (POST /runs never returned)")
+	}
+	prName := pipelineRunNameForRun(t, ns, runID, 30*time.Second)
+
 	// Wait for the component Job to exist: proof that admission completed
 	// and startStage already built the Job from the frozen snapshot, before
 	// any mutation is applied.
-	jobName := waitForComponentJob(t, ns, prName, "slow-generator", 90*time.Second)
+	jobName := waitForComponentJob(t, ns, runID, "slow-generator", 90*time.Second)
 	preImage := jobComponentImage(t, ns, jobName)
 	if preImage == "" {
 		t.Fatalf("Job %s/%s has no component container image", ns, jobName)

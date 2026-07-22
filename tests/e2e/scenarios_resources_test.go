@@ -2,28 +2,33 @@
 // diff-gate) end-to-end coverage, plus the one-time platform-superadmin
 // bootstrap grant the API-mode scenarios depend on.
 //
-// The resource contract has two enforcement layers (RFC 026 §4.4), and this
-// file exercises both live:
+// The resource contract has two enforcement layers (RFC 026 §4.4, §4.6):
 //
-//   - Layer 2 (controller admission, direct-kubectl path):
-//     TestResources_RegistryDefaultsApplied asserts the registry
-//     resources.default lands on a component that sets none;
-//     TestResources_ClampedAtAdmission asserts an over-max spec is clamped to
-//     the registry max, frozen into status.resolvedSpec, noted on
-//     status.message, and the run still proceeds to success.
-//
-//   - Layer 1 (pipeline-api PUT diff-gate):
-//     TestResources_OverMaxModificationRejected asserts a NON-superadmin PUT
-//     that modifies a component's resources is 403'd (the modification gate
-//     wins over the over-max 400 — T6 precedence);
+//   - Layer 1 (pipeline-api PUT policy): a pipeline whose component sets a
+//     resources block OVER the registry max is rejected pre-flight — 400 for a
+//     superadmin (TestResources_ClampedAtAdmission), 403 for a non-superadmin
+//     via the modification gate that wins over the over-max 400 by T6
+//     precedence (TestResources_OverMaxModificationRejected).
 //     TestResources_SuperadminPutSucceeds asserts the granted superadmin can
 //     PUT a within-max resources block where the non-superadmin is blocked.
 //
+//   - Layer 2 (controller admission): the registry resources.default lands on a
+//     component that sets none (TestResources_RegistryDefaultsApplied,
+//     reachable via the HTTP run path because a no-resources doc has nothing to
+//     reject). The controller's OVER-MAX CLAMP is the direct-kubectl defence-in-
+//     depth (validate.Policy is nil on that path — policy.go); it is unreachable
+//     from the HTTP surface this harness now drives (RFC 027 E2/E5), exactly as
+//     TestSecretsLadder's kubectl-admission "missing key" case was, and is
+//     covered by the controller's own unit tests (pkg/k8s/controllers/
+//     resource_clamp*_test.go). TestResources_ClampedAtAdmission therefore
+//     asserts the Layer-1 over-max PUT rejection — the only over-max behaviour
+//     the API path can exhibit — rather than a clamp-and-proceed run.
+//
 // These don't fit the declarative Scenario{}/Assertion{} shape in
-// scenarios_test.go: the kubectl-path tests inspect Job container resources /
-// status.resolvedSpec / status.message directly, and the API-path tests drive
-// pipeline-api's HTTP PUT as two distinct identities. They mirror
-// TestRegistry_* (scenarios_registry_test.go) and TestSecretsLadder
+// scenarios_test.go: RegistryDefaultsApplied inspects Job container resources /
+// status.resolvedSpec directly, and the PUT-path tests drive pipeline-api's
+// HTTP PUT as distinct identities. They mirror TestRegistry_*
+// (scenarios_registry_test.go) and TestSecretsLadder
 // (scenarios_secrets_test.go) respectively.
 package e2e
 
@@ -116,7 +121,6 @@ func TestResources_RegistryDefaultsApplied(t *testing.T) {
 	ns := kb.Namespace
 
 	rendered := renderRegistryFixture(t, "resource-default.yaml")
-	prName := runPrefix + "-resource-default-run"
 
 	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
 	if err != nil {
@@ -127,7 +131,8 @@ func TestResources_RegistryDefaultsApplied(t *testing.T) {
 			result.FailureType, result.StatusMessage, result.Logs)
 	}
 
-	jobName := waitForComponentJob(t, ns, prName, "gen", 60*time.Second)
+	prName := pipelineRunNameForRun(t, ns, result.RunID, 30*time.Second)
+	jobName := waitForComponentJob(t, ns, result.RunID, "gen", 60*time.Second)
 
 	// The built Job container carries the registry resources.default verbatim.
 	assertJobResource(t, ns, jobName, "limits", "cpu", framework.DataGeneratorDefaultLimCPU)
@@ -141,13 +146,22 @@ func TestResources_RegistryDefaultsApplied(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// (c) Clamped at admission — kubectl path, over-max spec clamped to max.
+// (c) Over-max resources → rejected pre-flight at PUT (Layer 1).
+//
+// resource-clamp.yaml sets a component resources block over the registry max
+// (cpu 4 > max 2, memory 1Gi > max 512Mi). Pre-RFC-027 the harness kubectl-
+// applied the CR and the controller CLAMPED it to max and proceeded (Layer 2).
+// The migrated harness drives pipeline-api, whose PUT policy rejects over-max
+// with a 400 naming every offending resources path ("exceeds registry max") —
+// before any run is created. RunPipeline surfaces the 400 as an error. The
+// clamp-and-proceed path is now the kubectl-only defence-in-depth, unit-covered
+// by pkg/k8s/controllers/resource_clamp*_test.go (see the file docstring).
 // ──────────────────────────────────────────────────────────────────────────
 
 func TestResources_ClampedAtAdmission(t *testing.T) {
 	h := registrySkipUnlessReady(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	kb, err := framework.NewK8sBackend(h, runPrefix)
@@ -155,57 +169,26 @@ func TestResources_ClampedAtAdmission(t *testing.T) {
 		t.Fatalf("init K8s backend: %v", err)
 	}
 	defer kb.Cleanup(context.Background())
-	ns := kb.Namespace
 
 	rendered := renderRegistryFixture(t, "resource-clamp.yaml")
-	prName := runPrefix + "-resource-clamp-run"
 
-	type runOutcome struct {
-		result *framework.RunResult
-		err    error
+	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
+	if err == nil {
+		t.Fatalf("expected PUT pre-flight rejection for an over-max resources block, got success=%v", result != nil && result.Success)
 	}
-	resultCh := make(chan runOutcome, 1)
-	go func() {
-		result, runErr := kb.RunPipeline(ctx, rendered, framework.RunOpts{
-			StorageType: "s3",
-			Timeout:     5 * time.Minute,
-		})
-		resultCh <- runOutcome{result, runErr}
-	}()
-
-	// The Job existing proves admission completed and the controller clamp ran.
-	jobName := waitForComponentJob(t, ns, prName, "gen", 90*time.Second)
-
-	// (3, read first) The clamp note is on status.message DURING the run —
-	// the success path (handleTerminal) overwrites it with "All stages
-	// completed successfully", so read it before joining the run goroutine.
-	msg, err := kubectlJSONPath("pipelinerun", prName, ns, "{.status.message}")
-	if err != nil {
-		t.Fatalf("read status.message: %v", err)
+	msg := err.Error()
+	if !strings.Contains(msg, "status=400") {
+		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
 	}
-	if !strings.Contains(msg, "clamped") || !strings.Contains(msg, "gen") {
-		t.Errorf("status.message %q does not note the resource clamp for component %q", msg, "gen")
+	if !strings.Contains(msg, "exceeds registry max") {
+		t.Errorf("rejection does not describe the over-max violation: %v", err)
 	}
-
-	// (1) The Job container carries the clamped-to-max limits; the within-max
-	// requests pass through unchanged.
-	assertJobResource(t, ns, jobName, "limits", "cpu", framework.DataGeneratorMaxCPU)       // 4 -> 2
-	assertJobResource(t, ns, jobName, "limits", "memory", framework.DataGeneratorMaxMemory) // 1Gi -> 512Mi
-	assertJobResource(t, ns, jobName, "requests", "cpu", "100m")
-	assertJobResource(t, ns, jobName, "requests", "memory", "128Mi")
-
-	// (2) The clamp is frozen into status.resolvedSpec (never re-derived).
-	assertResolvedResource(t, ns, prName, "limits", "cpu", framework.DataGeneratorMaxCPU)
-	assertResolvedResource(t, ns, prName, "limits", "memory", framework.DataGeneratorMaxMemory)
-
-	// (4) The clamped run still PROCEEDS to success.
-	outcome := <-resultCh
-	if outcome.err != nil {
-		t.Fatalf("run pipeline: %v", outcome.err)
+	// Both offending limits are named (cpu 4 > 2 and memory 1Gi > 512Mi).
+	if !strings.Contains(msg, "resources.limits.cpu") {
+		t.Errorf("rejection does not name the over-max cpu limit: %v", err)
 	}
-	if !outcome.result.Success {
-		t.Fatalf("clamped run did not succeed (RFC 026 §4.4: clamped run proceeds): failureType=%q message=%q logs=%s",
-			outcome.result.FailureType, outcome.result.StatusMessage, outcome.result.Logs)
+	if !strings.Contains(msg, "resources.limits.memory") {
+		t.Errorf("rejection does not name the over-max memory limit: %v", err)
 	}
 }
 

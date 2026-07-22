@@ -206,6 +206,13 @@ func (k *K8sBackend) RunPipeline(ctx context.Context, pipelinePath string, opts 
 	}
 	k.runIDs = append(k.runIDs, runID)
 
+	// Surface the run id to a caller that needs to observe the run's
+	// Jobs/Pods/PipelineRun (all labelled datuplet.io/run-id=<id>) mid-flight,
+	// before this call polls to a terminal phase (freeze / clamp scenarios).
+	if opts.OnRunID != nil {
+		opts.OnRunID(runID)
+	}
+
 	var lastPhase, lastMessage string
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
