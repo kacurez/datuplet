@@ -75,6 +75,27 @@ func ParseAndValidate(cfg *Config) error {
 	return nil
 }
 
+// commitAndStatus commits all outputs, logs per-table results, and emits the
+// status message. Iterates result.Buckets (no [0] indexing).
+func commitAndStatus(ctx context.Context, client *sdk.Client, sourceURL string) error {
+	result, err := client.Commit(ctx)
+	if err != nil {
+		return fmt.Errorf("commit failed: %w", err)
+	}
+	if !result.Success {
+		return fmt.Errorf("commit returned failure")
+	}
+	var rows int64
+	for _, b := range result.Buckets {
+		for _, t := range b.Tables {
+			client.Log(ctx, "INFO", fmt.Sprintf("Committed %s.%s: files=%d, rows=%d", t.Bucket, t.Table, t.FilesAdded, t.RowsAdded))
+			rows += t.RowsAdded
+		}
+	}
+	sdk.StatusMessage(fmt.Sprintf("extracted %d records from %s", rows, sourceURL))
+	return nil
+}
+
 func main() {
 	// Check for sample mode
 	if os.Getenv("DATUPLET_MODE") == "sample" {
@@ -94,114 +115,72 @@ func main() {
 	}
 	defer client.Close()
 
-	// Get config
+	// Log SDK build info first (rebuild diagnostics), then the started line.
+	client.Log(ctx, "INFO", sdk.BuildInfo().String())
+
 	cfg := client.Config()
 	client.Log(ctx, "INFO", fmt.Sprintf("HTTP JSON Extractor started: execution=%s", cfg.ExecutionID))
 
-	// Parse component config
-	var compCfg struct {
-		URL        string            `json:"url"`
-		ArrayPath  string            `json:"array_path"`
-		TableName  string            `json:"table_name"`
-		Headers    map[string]string `json:"headers"`
-		Pagination *PaginationConfig `json:"pagination"`
-	}
+	// Parse + validate component config before any network or writer work.
+	var compCfg Config
 	if err := client.ParseConfig(&compCfg); err != nil {
 		sdk.ExitUserError(fmt.Sprintf("failed to parse config: %v", err))
 	}
-
-	if compCfg.URL == "" {
-		sdk.ExitUserError("config.url is required")
+	if err := ParseAndValidate(&compCfg); err != nil {
+		sdk.ExitUserError(err.Error())
 	}
 
-	// Check if pagination is enabled
+	outputTable := resolveOutputTable(compCfg.TableName, compCfg.ArrayPath)
+
+	// Paginated mode - stream data incrementally, page by page.
 	if compCfg.Pagination != nil && compCfg.Pagination.Type != "" {
-		// Paginated mode - stream data incrementally. runPaginatedExtraction
-		// opens its own writer and commits inline, so we must return here
-		// rather than fall through to the single-request commit block below
-		// (a second Commit returns zero buckets and the status line panics).
-		if err := runPaginatedExtraction(ctx, client, compCfg.URL, compCfg.ArrayPath, compCfg.TableName, compCfg.Headers, compCfg.Pagination); err != nil {
+		if err := runPaginatedExtraction(ctx, client, &compCfg, outputTable); err != nil {
 			sdk.ExitUserError(fmt.Sprintf("paginated extraction failed: %v", err))
 		}
 		return
-	} else {
-		// Single request mode - original behavior
-		client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
-
-		records, err := fetchJSON(ctx, compCfg.URL, compCfg.ArrayPath, compCfg.Headers)
-		if err != nil {
-			sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
-		}
-
-		client.Log(ctx, "INFO", fmt.Sprintf("Fetched %d records", len(records)))
-
-		if len(records) == 0 {
-			client.Log(ctx, "WARN", "No records found")
-			if _, err := client.Commit(ctx); err != nil {
-				sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
-			}
-			sdk.StatusMessage("extracted 0 records (empty response)")
-			return
-		}
-
-		// Determine output table name: explicit config > array_path > "data"
-		outputTable := "data"
-		if compCfg.TableName != "" {
-			outputTable = compCfg.TableName
-		} else if compCfg.ArrayPath != "" {
-			outputTable = compCfg.ArrayPath
-		}
-
-		client.Log(ctx, "INFO", fmt.Sprintf("Writing to output table: %s (bucket: %s)", outputTable, cfg.DefaultBucket))
-
-		writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSON))
-		if err != nil {
-			sdk.ExitAppError(fmt.Sprintf("failed to open writer: %v", err))
-		}
-
-		jsonData, err := json.Marshal(records)
-		if err != nil {
-			sdk.ExitAppError(fmt.Sprintf("failed to marshal JSON: %v", err))
-		}
-
-		if err := writer.Write(ctx, jsonData); err != nil {
-			sdk.ExitAppError(fmt.Sprintf("failed to write JSON: %v", err))
-		}
-
-		closeResult, err := writer.Close(ctx)
-		if err != nil {
-			sdk.ExitAppError(fmt.Sprintf("failed to close writer: %v", err))
-		}
-
-		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
 	}
 
-	// Commit all outputs
-	result, err := client.Commit(ctx)
+	// Single-request mode.
+	client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
+	records, err := fetchJSON(ctx, compCfg.URL, compCfg.ArrayPath, compCfg.Headers)
 	if err != nil {
-		sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
+		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
 	}
+	client.Log(ctx, "INFO", fmt.Sprintf("Fetched %d records", len(records)))
 
-	if !result.Success {
-		sdk.ExitAppError("commit returned failure")
-	}
-
-	for _, b := range result.Buckets {
-		for _, t := range b.Tables {
-			client.Log(ctx, "INFO", fmt.Sprintf("Committed %s.%s: files=%d, rows=%d", t.Bucket, t.Table, t.FilesAdded, t.RowsAdded))
+	if len(records) == 0 {
+		client.Log(ctx, "WARN", "No records found")
+		if _, err := client.Commit(ctx); err != nil {
+			sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
 		}
+		sdk.StatusMessage("extracted 0 records (empty response)")
+		return
 	}
 
-	client.Log(ctx, "INFO", "HTTP JSON extraction completed successfully")
-	var rowsAdded int64
-	if len(result.Buckets) > 0 && len(result.Buckets[0].Tables) > 0 {
-		rowsAdded = result.Buckets[0].Tables[0].RowsAdded
+	records = projectRecords(records, compCfg.Fields)
+
+	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
+	if err != nil {
+		sdk.ExitAppError(fmt.Sprintf("failed to open writer: %v", err))
 	}
-	sdk.StatusMessage(fmt.Sprintf("extracted %d records from %s", rowsAdded, compCfg.URL))
+	if err := writeJSONL(ctx, writer, records); err != nil {
+		sdk.ExitAppError(fmt.Sprintf("failed to write JSONL: %v", err))
+	}
+	closeResult, err := writer.Close(ctx)
+	if err != nil {
+		sdk.ExitAppError(fmt.Sprintf("failed to close writer: %v", err))
+	}
+	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
+
+	if err := commitAndStatus(ctx, client, compCfg.URL); err != nil {
+		sdk.ExitAppError(err.Error())
+	}
+	client.Log(ctx, "INFO", "HTTP JSON extraction completed successfully")
 }
 
 // runPaginatedExtraction handles paginated API extraction with streaming writes.
-func runPaginatedExtraction(ctx context.Context, client *sdk.Client, baseURL, arrayPath, tableName string, headers map[string]string, pagination *PaginationConfig) error {
+func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config, outputTable string) error {
+	pagination := cfg.Pagination
 	// Set defaults
 	if pagination.StopWhenEmpty == false && pagination.MaxPages == 0 && pagination.MaxRecords == 0 {
 		// Default to stop on empty if no other limits set
@@ -224,22 +203,14 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, baseURL, ar
 		}
 	}
 
-	// Determine output table name: explicit config > array_path > "data"
-	outputTable := "data"
-	if tableName != "" {
-		outputTable = tableName
-	} else if arrayPath != "" {
-		outputTable = arrayPath
-	}
-
 	// Open writer for output (uses defaultBucket from config)
-	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSON))
+	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
 	if err != nil {
 		return fmt.Errorf("failed to open writer: %w", err)
 	}
 
 	client.Log(ctx, "INFO", fmt.Sprintf("Starting paginated extraction from: %s (type=%s, param=%s, page_size=%d)",
-		baseURL, pagination.Type, pagination.Param, pagination.PageSize))
+		cfg.URL, pagination.Type, pagination.Param, pagination.PageSize))
 
 	totalRecords := 0
 	pageCount := 0
@@ -252,7 +223,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, baseURL, ar
 		}
 
 		// Build paginated URL
-		pageURL, err := buildPaginatedURL(baseURL, pagination, currentValue)
+		pageURL, err := buildPaginatedURL(cfg.URL, pagination, currentValue)
 		if err != nil {
 			return fmt.Errorf("failed to build paginated URL: %w", err)
 		}
@@ -260,7 +231,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, baseURL, ar
 		client.Log(ctx, "INFO", fmt.Sprintf("Fetching page %d: %s", pageCount+1, pageURL))
 
 		// Fetch page
-		records, err := fetchJSON(ctx, pageURL, arrayPath, headers)
+		records, err := fetchJSON(ctx, pageURL, cfg.ArrayPath, cfg.Headers)
 		if err != nil {
 			return fmt.Errorf("failed to fetch page %d: %w", pageCount+1, err)
 		}
@@ -283,12 +254,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, baseURL, ar
 
 		// Write records to output
 		if len(recordsToWrite) > 0 {
-			jsonData, err := json.Marshal(recordsToWrite)
-			if err != nil {
-				return fmt.Errorf("failed to marshal JSON: %w", err)
-			}
-
-			if err := writer.Write(ctx, jsonData); err != nil {
+			if err := writeJSONL(ctx, writer, projectRecords(recordsToWrite, cfg.Fields)); err != nil {
 				return fmt.Errorf("failed to write: %w", err)
 			}
 		}
@@ -321,22 +287,9 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, baseURL, ar
 	}
 	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
 
-	// Commit
-	result, err := client.Commit(ctx)
-	if err != nil {
-		return fmt.Errorf("commit failed: %w", err)
+	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {
+		return err
 	}
-
-	if !result.Success {
-		return fmt.Errorf("commit returned failure")
-	}
-
-	for _, b := range result.Buckets {
-		for _, t := range b.Tables {
-			client.Log(ctx, "INFO", fmt.Sprintf("Committed %s.%s: files=%d, rows=%d", t.Bucket, t.Table, t.FilesAdded, t.RowsAdded))
-		}
-	}
-
 	client.Log(ctx, "INFO", fmt.Sprintf("Paginated extraction completed: %d pages, %d total records", pageCount, totalRecords))
 	return nil
 }
