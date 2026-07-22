@@ -186,6 +186,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "runs":
+		if err := runRuns(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "version":
 		fmt.Println("datuplet version 0.1.0-poc")
 
@@ -218,6 +224,7 @@ Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
   pipeline               CRUD for pipeline specs (list, get, put, delete, validate)
+  runs                   List runs (filter by pipeline/phase) and get run detail + timeline
   components             Browse the component catalog (list, get --schema)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
