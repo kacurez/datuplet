@@ -19,15 +19,19 @@ import (
 // it reflects the user's CURRENT email and may differ from what they
 // had when the commit landed. UI prefers ActorEmail for display when
 // non-empty and falls back to a truncated Actor UUID otherwise.
+// AddedFilesSize is the on-storage byte size added by this snapshot,
+// read straight from the Iceberg summary's `added-files-size` total
+// (nil = absent, e.g. a foreign writer that didn't populate it → the
+// UI renders "—").
 type snapshotHistoryEntry struct {
-	SnapshotID   int64     `json:"snapshot_id"`
-	CommittedAt  time.Time `json:"committed_at"`
-	Actor        string    `json:"actor"`
-	ActorEmail   string    `json:"actor_email,omitempty"`
-	RunID        string    `json:"run_id"`
-	RunMode      string    `json:"run_mode"`
-	PipelineAPI  string    `json:"pipeline_api"`
-	AddedRecords *int64    `json:"added_records,omitempty"`
+	SnapshotID     int64     `json:"snapshot_id"`
+	CommittedAt    time.Time `json:"committed_at"`
+	Actor          string    `json:"actor"`
+	ActorEmail     string    `json:"actor_email,omitempty"`
+	RunID          string    `json:"run_id"`
+	PipelineAPI    string    `json:"pipeline_api"`
+	AddedRecords   *int64    `json:"added_records,omitempty"`
+	AddedFilesSize *int64    `json:"added_files_size,omitempty"`
 }
 
 // Snapshots handles GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/snapshots.
@@ -50,11 +54,15 @@ func (h *HTTPHandlers) Snapshots(w http.ResponseWriter, r *http.Request) {
 		if s.Summary != nil && s.Summary.Properties != nil {
 			e.Actor = s.Summary.Properties["datuplet.actor"]
 			e.RunID = s.Summary.Properties["datuplet.run-id"]
-			e.RunMode = s.Summary.Properties["datuplet.run-mode"]
 			e.PipelineAPI = s.Summary.Properties["datuplet.pipeline-api"]
 			if v, ok := s.Summary.Properties["added-records"]; ok && v != "" {
 				if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 					e.AddedRecords = &n
+				}
+			}
+			if v, ok := s.Summary.Properties["added-files-size"]; ok && v != "" {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+					e.AddedFilesSize = &n
 				}
 			}
 		}

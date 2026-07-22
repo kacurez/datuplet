@@ -9,7 +9,7 @@
 
 import { esc, getTableInfo, getTableSchema, getTablePreview } from '/ui/api.js';
 import { skeletonRows } from '/ui/components.js';
-import { timeTag } from '/ui/format.js';
+import { timeTag, formatBytes, storageFolderURI, gcsConsoleHref } from '/ui/format.js';
 import * as icons from '/ui/icons.js';
 import { renderSnapshotHistory } from '/ui/storage-snapshots.js';
 
@@ -104,13 +104,32 @@ async function renderInfo(gen, app, projectId, ns, name) {
     return;
   }
   if (_aborted() || gen !== _tabGen) return; // stale — superseded fetch or route change
+  // Reduce the metadata-file location to the table's storage folder and,
+  // for gs:// warehouses, offer a clickable Google Cloud console link.
+  // Non-gs:// backends (S3/MinIO/local) have no universal console URL, so
+  // the folder shows as plain text.
+  const folderURI = storageFolderURI(info.metadata_location || '');
+  const consoleHref = gcsConsoleHref(folderURI);
+  let folderCell;
+  if (!folderURI) {
+    folderCell = '<span style="color:var(--fg-2);">—</span>';
+  } else if (consoleHref) {
+    folderCell = `<a href="${esc(consoleHref)}" target="_blank" rel="noopener noreferrer">${esc(folderURI)}</a>`;
+  } else {
+    folderCell = `<code class="mono">${esc(folderURI)}</code>`;
+  }
+  const totalSize = info.total_files_size == null
+    ? '—'
+    : `<span title="${esc(String(info.total_files_size))} bytes">${esc(formatBytes(info.total_files_size))}</span>`;
   const kv = `
     <dl class="kv">
       <dt>Metadata location</dt><dd>${esc(info.metadata_location || '')}</dd>
+      <dt>Storage folder</dt><dd>${folderCell}</dd>
       <dt>Current snapshot</dt><dd>${esc(String(info.current_snapshot_id ?? ''))}</dd>
       <dt>Snapshot count</dt><dd>${(info.snapshots || []).length}</dd>
       <dt>Data files</dt><dd>${info.data_file_count == null ? '—' : esc(String(info.data_file_count))}</dd>
       <dt>Row count</dt><dd>${info.row_count == null ? '—' : esc(String(info.row_count))}</dd>
+      <dt>Total size</dt><dd>${totalSize}</dd>
     </dl>
   `;
 

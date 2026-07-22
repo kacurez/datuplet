@@ -201,13 +201,13 @@ queryWorker:
       # memory: must match limits. Helm template arithmetic derives
       # DATUPLET_QUERY_WORKER_MEMORY_LIMIT from this value minus headroom.
       #   formula: floor((memLimitBytes * (100 - memoryHeadroomPct) / 100) / concurrency)
-      #   example: 2Gi, 25% headroom, concurrency 2
-      #            → 2048 * 75% / 2 = 768 MiB per DuckDB slot.
-      memory: 2Gi
-      cpu: 500m
+      #   example: 1Gi, 25% headroom, concurrency 2
+      #            → 1024 * 75% / 2 = 384 MiB per DuckDB slot.
+      memory: 1Gi
+      cpu: 200m
       ephemeral-storage: 2Gi
     limits:
-      memory: 2Gi
+      memory: 1Gi
       cpu: 2
       ephemeral-storage: 2Gi
 

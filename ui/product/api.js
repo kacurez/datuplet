@@ -157,8 +157,8 @@ export async function getTablePreview(projectId, namespace, name) {
 
 /**
  * Snapshot history for the table, sorted newest-first.
- * Returns [{snapshot_id, committed_at, actor, run_id, run_mode,
- *           pipeline_api, added_records}, ...].
+ * Returns [{snapshot_id, committed_at, actor, run_id, pipeline_api,
+ *           added_records, added_files_size}, ...].
  * Pre-RFC-013 snapshots have empty audit fields.
  */
 export async function getTableSnapshots(projectId, namespace, name) {

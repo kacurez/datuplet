@@ -743,7 +743,8 @@ code.inline {
 }
 .snapshot-history__table td { vertical-align: middle; }
 
-/* Run-mode badges */
+/* Badges (component catalog: default / prerelease / required / secret /
+ * deprecated). The base .badge sets the pill shape; modifiers below tint. */
 .badge {
   display: inline-block;
   padding: 2px var(--s-2);
@@ -752,21 +753,6 @@ code.inline {
   font-family: var(--font-mono);
   font-weight: 600;
   white-space: nowrap;
-}
-.badge--cluster {
-  background: color-mix(in srgb, var(--status-ok-bg) 15%, var(--bg-2));
-  color: var(--status-ok-fg);
-  border: 1px solid color-mix(in srgb, var(--status-ok-bg) 30%, var(--border));
-}
-.badge--cli {
-  background: color-mix(in srgb, var(--status-running-bg) 15%, var(--bg-2));
-  color: var(--status-running-fg);
-  border: 1px solid color-mix(in srgb, var(--status-running-bg) 30%, var(--border));
-}
-.badge--unknown {
-  background: var(--bg-2);
-  color: var(--fg-2);
-  border: 1px solid var(--border);
 }
 
 /* ---------- Run-detail rail timeline (RFC 023 Task 15) ----------
