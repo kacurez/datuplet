@@ -1,15 +1,17 @@
-# RFC 026 P3 Task T10: controller resource clamp on the admission path.
-# The data-generator@v0.0.1 component requests limits ABOVE the registry max
-# (cpu 4 > 2, memory 1Gi > 512Mi). At admission the controller clamps every
-# entry to the registry max, freezes the clamped values into
-# status.resolvedSpec, notes the clamp on status.message, and the run still
-# PROCEEDS to success.
+# Over-max resources fixture. The data-generator@v0.0.1 component sets limits
+# ABOVE the registry max (cpu 4 > 2, memory 1Gi > 512Mi).
 #
-# NOTE (RFC 027 E2): the PipelineDoc resources shape expresses only flat
-# limits (memory/cpu). The explicit requests block (cpu 100m / memory 128Mi)
-# is dropped — those values now come from the registry resources.default,
-# which register the same 100m/128Mi (framework/components_bootstrap.go), so
-# the "requests pass through unchanged" assertion stays green. E5 confirms.
+# RFC 027 E2: the e2e harness now submits pipelines through pipeline-api's doc
+# PUT, which enforces the resource ceiling up front — so
+# TestResources_ClampedAtAdmission asserts a 400 PRE-FLIGHT REJECTION naming
+# resources.limits.cpu/memory ("exceeds registry max"), NOT the old
+# controller clamp-and-proceed-to-success. The controller's admission-time
+# clamp (RFC 026 §4.4 Layer 2 — defense-in-depth for the removed direct-kubectl
+# path) is no longer reachable through this API-driven harness; it is covered
+# by pkg/k8s/controllers unit tests instead.
+#
+# NOTE (RFC 027 E2): the PipelineDoc resources shape expresses only flat limits
+# (memory/cpu); the old explicit requests block is not represented here.
 #
 # The generator is throttled (rowInsertSpeed) against a large rowsCount with
 # a short timeoutInSeconds so it stays Running long enough for the test to
