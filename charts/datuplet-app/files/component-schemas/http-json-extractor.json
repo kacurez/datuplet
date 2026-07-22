@@ -33,6 +33,26 @@
         "description": "The header value."
       }
     },
+    "fields": {
+      "type": "array",
+      "description": "Optional projection: select and rename fields (including nested ones via dot-path). When omitted, all fields are emitted.",
+      "x-datuplet-advanced": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "name"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Dot-path to the source value, e.g. country.value for a nested object. Unresolved paths yield null."
+          },
+          "name": {
+            "type": "string",
+            "description": "Output column name. Must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$ and be unique."
+          }
+        }
+      }
+    },
     "pagination": {
       "type": "object",
       "additionalProperties": false,
