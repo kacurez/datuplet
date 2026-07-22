@@ -3,8 +3,8 @@ apiVersion: v2
 name: datuplet-infra
 description: Datuplet infrastructure layer — CNPG Postgres Cluster, OpenFGA, MinIO, NetworkPolicies, and FGA model bootstrap. Requires datuplet-operators to be installed first.
 type: application
-version: 0.10.2
-appVersion: "0.10.2"
+version: 0.11.0
+appVersion: "0.11.0"
 home: https://github.com/kacurez/datuplet
 sources:
   - https://github.com/kacurez/datuplet

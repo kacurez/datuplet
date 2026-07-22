@@ -2,8 +2,8 @@ apiVersion: v2
 name: datuplet-lakekeeper
 description: Datuplet Lakekeeper Iceberg REST catalog (Phase 4 of the 5-phase install). Requires datuplet-infra (Phase 2) + datuplet-app (Phase 3) installed first.
 type: application
-version: 0.10.2
-appVersion: "0.10.2"
+version: 0.11.0
+appVersion: "0.11.0"
 home: https://github.com/kacurez/datuplet
 sources:
   - https://github.com/kacurez/datuplet

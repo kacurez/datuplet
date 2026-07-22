@@ -16,7 +16,7 @@ container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
 Image registry: `ghcr.io/kacurez/<name>:<components.tag>` — the tag tracks the
-chart's `components.tag` (the release version; `v0.9.1` in this release).
+chart's `components.tag` (the release version; `v0.11.0` in this release).
 
 ---
 
@@ -172,7 +172,7 @@ seeded from SHA-256 of the pair).
 Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports
 single-request and paginated modes.
 
-**Image:** `ghcr.io/kacurez/http-json-extractor:v0.9.1` · **Registry name:**
+**Image:** `ghcr.io/kacurez/http-json-extractor:v0.11.0` · **Registry name:**
 `http-json-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/http-json-extractor/schema.json`](../components/http-json-extractor/schema.json)
@@ -180,6 +180,31 @@ single-request and paginated modes.
 
 For API keys, use `$[name]` in the `headers` map and set the value in the
 project's managed secrets. See [docs/secrets.md](secrets.md).
+
+**Field projection:** the optional `fields` config is an array of
+`{path, name}` objects. `path` is a dot-path into the (possibly nested) source
+record, e.g. `country.value`; `name` is the output column name. When `fields`
+is set, only the listed fields are emitted, renamed to `name` — anything not
+listed is dropped. Omit `fields` entirely to emit every field of the source
+record unchanged.
+
+```yaml
+config:
+  url: https://api.example.com/users
+  array_path: results
+  fields:
+    - path: id
+      name: user_id
+    - path: address.country.value
+      name: country
+```
+
+**Output format:** the component writes rows as JSONL to the Data Gateway.
+Each record's serialized JSON must be **under 64 KiB** — the gateway's JSONL
+adapter infers the schema from a writer's first chunk using a scanner with a
+64 KiB per-line limit, so a wider single record fails schema inference on
+that first chunk. (Later chunks, once the schema is cached, stream with a much
+larger per-line limit — but the first chunk is what sets the constraint.)
 
 ---
 
