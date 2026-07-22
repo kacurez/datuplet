@@ -16,7 +16,7 @@ container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
 Image registry: `ghcr.io/kacurez/<name>:<components.tag>` — the tag tracks the
-chart's `components.tag` (the release version; `v0.8.0` in this release).
+chart's `components.tag` (the release version; `v0.9.1` in this release).
 
 ---
 
@@ -146,7 +146,7 @@ These stay component-enforced: the component fails fast at start with exit 1
 Generates random or literal rows inline from pipeline YAML — useful for
 testing pipelines without an external data source.
 
-**Image:** `ghcr.io/kacurez/data-generator:v0.8.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/data-generator:v0.9.1` · **Registry name:**
 `data-generator` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/data-generator/schema.json`](../components/data-generator/schema.json)
@@ -172,7 +172,7 @@ seeded from SHA-256 of the pair).
 Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports
 single-request and paginated modes.
 
-**Image:** `ghcr.io/kacurez/http-json-extractor:v0.8.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/http-json-extractor:v0.9.1` · **Registry name:**
 `http-json-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/http-json-extractor/schema.json`](../components/http-json-extractor/schema.json)
@@ -188,7 +188,7 @@ project's managed secrets. See [docs/secrets.md](secrets.md).
 Fetches market data from the [Finnhub](https://finnhub.io/) API. Requires a
 Finnhub API key.
 
-**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.8.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.9.1` · **Registry name:**
 `finnhub-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/finnhub-extractor/schema.json`](../components/finnhub-extractor/schema.json).
@@ -220,7 +220,7 @@ Data Gateway via Arrow IPC and are materialized into DuckDB tables before the SQ
 runs. Outputs are written back through the Data Gateway; no S3 credentials touch
 the component.
 
-**Image:** `ghcr.io/kacurez/sql-transform:v0.8.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/sql-transform:v0.9.1` · **Registry name:**
 `sql-transform` · **IO:** `{inputs: required, outputs: required}`
 
 **Config schema:** [`components/sql-transform/schema.json`](../components/sql-transform/schema.json)
@@ -259,7 +259,7 @@ Applies a sequence of pandas operations to input data. Reads the input table as
 CSV from the Data Gateway, applies the operations in order, and writes the
 result back as CSV — no S3 or Lakekeeper credentials touch the component.
 
-**Image:** `ghcr.io/kacurez/pandas-transform:v0.8.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/pandas-transform:v0.9.1` · **Registry name:**
 `pandas-transform` · **IO:** `{inputs: required, outputs: required}`
 
 **Config schema:** [`components/pandas-transform/schema.json`](../components/pandas-transform/schema.json)
@@ -280,7 +280,7 @@ skipped rather than failing the run.
 Reads input tables and prints them to stdout. For debugging only — no Iceberg
 output.
 
-**Image:** `ghcr.io/kacurez/stdout-writer:v0.8.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/stdout-writer:v0.9.1` · **Registry name:**
 `stdout-writer` · **IO:** `{inputs: required, outputs: none}`
 
 **Config schema:** [`components/stdout-writer/schema.json`](../components/stdout-writer/schema.json)
