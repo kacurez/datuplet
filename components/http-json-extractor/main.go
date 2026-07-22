@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,47 @@ type PaginationConfig struct {
 	MaxPages      int    `json:"max_pages"`       // max pages to fetch (0 = unlimited)
 	MaxRecords    int    `json:"max_records"`     // max total records to fetch (0 = unlimited)
 	StopWhenEmpty bool   `json:"stop_when_empty"` // stop when empty page received (default: true)
+}
+
+// FieldMapping selects a source value (by dot-path) and renames it to an
+// output column. Used by the optional `fields` projection.
+type FieldMapping struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+}
+
+// Config is the http-json-extractor component config.
+type Config struct {
+	URL        string            `json:"url"`
+	ArrayPath  string            `json:"array_path"`
+	TableName  string            `json:"table_name"`
+	Headers    map[string]string `json:"headers"`
+	Pagination *PaginationConfig `json:"pagination"`
+	Fields     []FieldMapping    `json:"fields"`
+}
+
+// columnNameRe validates author-controlled projected output-column names.
+var columnNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+
+// ParseAndValidate checks the config before any network or writer work.
+func ParseAndValidate(cfg *Config) error {
+	if cfg.URL == "" {
+		return fmt.Errorf("config.url is required")
+	}
+	seen := make(map[string]bool, len(cfg.Fields))
+	for i, f := range cfg.Fields {
+		if f.Path == "" {
+			return fmt.Errorf("fields[%d].path is required", i)
+		}
+		if !columnNameRe.MatchString(f.Name) {
+			return fmt.Errorf("fields[%d].name %q must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$", i, f.Name)
+		}
+		if seen[f.Name] {
+			return fmt.Errorf("fields[%d].name %q is duplicated", i, f.Name)
+		}
+		seen[f.Name] = true
+	}
+	return nil
 }
 
 func main() {
