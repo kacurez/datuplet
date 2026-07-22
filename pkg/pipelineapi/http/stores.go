@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -40,36 +41,40 @@ type ProjectView struct {
 	LakekeeperProjectID string // used as the FGA `project:<uuid>` Check object
 }
 
-// PipelineStore serves the pipeline endpoints. Local mode is backed by
-// localstore.DirPipelineStore (reads/writes YAML files). Cluster mode
-// wraps the pgx store.Pipeline* functions.
+// PipelineStore serves the pipeline endpoints. Cluster mode wraps the pgx
+// store.Pipeline* functions; the doc is stored canonically as JSON
+// (RFC 027 §5.1) — YAML request bodies are canonicalized to JSON by the
+// handler before Put is called.
 //
-// Put semantics: upsert. GetByName + errStoreNotFound signals "insert";
-// any other error bubbles. Delete returns errStoreNotFound when the
-// pipeline doesn't exist.
+// Put semantics: upsert. Get + errStoreNotFound signals "insert"; any
+// other error bubbles. Delete returns errStoreNotFound when the pipeline
+// doesn't exist.
 type PipelineStore interface {
 	List(ctx context.Context, projectID uuid.UUID) ([]PipelineRef, error)
-	GetByName(ctx context.Context, projectID uuid.UUID, name string) (*PipelineDetail, error)
-	GetYAMLByID(ctx context.Context, pipelineID uuid.UUID) (string, error)
-	Put(ctx context.Context, projectID uuid.UUID, name string, yaml []byte) error
+	Get(ctx context.Context, projectID uuid.UUID, name string) (*PipelineDetail, error)
+	GetDocByID(ctx context.Context, id string) ([]byte, error)
+	Put(ctx context.Context, projectID uuid.UUID, name string, doc []byte, description string) error
 	Delete(ctx context.Context, projectID uuid.UUID, name string) error
 }
 
-// PipelineRef is the summary row returned by List.
+// PipelineRef is the summary row returned by List. Description is carried
+// on the struct (RFC 027 §5.1) and serialized in the List response JSON (S6).
 type PipelineRef struct {
-	Name      string
-	CreatedAt time.Time // empty in local mode (filesystem stat not surfaced in list)
-	UpdatedAt time.Time
+	Name        string
+	Description string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
-// PipelineDetail is the full row returned by GetByName.
+// PipelineDetail is the full row returned by Get. ID/CreatedAt/UpdatedAt
+// are pre-formatted strings so the handler layer can serialize them
+// directly without reaching back into store types.
 type PipelineDetail struct {
-	ID        uuid.UUID // zero in local mode
-	ProjectID uuid.UUID // zero in local mode
+	ID        string
 	Name      string
-	YAML      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Doc       json.RawMessage
+	CreatedAt string
+	UpdatedAt string
 }
 
 // RunReader serves read-only run endpoints. Trigger/Cancel go through

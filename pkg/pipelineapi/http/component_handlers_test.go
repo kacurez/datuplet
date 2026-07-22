@@ -51,6 +51,14 @@ func componentDefFixture(name string) datupletv1.ComponentDefinition {
 	}
 }
 
+// componentDefFixtureWithIO is componentDefFixture plus an explicit io
+// declaration (RFC 027 §4.3).
+func componentDefFixtureWithIO(name string, io *datupletv1.ComponentIO) datupletv1.ComponentDefinition {
+	d := componentDefFixture(name)
+	d.Spec.IO = io
+	return d
+}
+
 func newComponentsServer(reg apihttp.ComponentRegistry) (*httptest.Server, func()) {
 	srv := apihttp.NewServer(nil).
 		WithUserResolver(stubResolver{}).
@@ -179,6 +187,89 @@ func TestHandleGetComponent_Detail(t *testing.T) {
 	}
 	if !gotSchema {
 		t.Fatalf("v1.0.0 not found in versions: %+v", body.Versions)
+	}
+}
+
+func TestHandleListComponents_IODefaultsOptional(t *testing.T) {
+	ts, cleanup := newComponentsServer(newFakeComponentRegistry(componentDefFixture("http-fetch")))
+	defer cleanup()
+
+	resp, err := stdhttp.Get(ts.URL + "/api/v1/components")
+	if err != nil {
+		t.Fatalf("GET /api/v1/components: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body []struct {
+		Name string `json:"name"`
+		IO   struct {
+			Inputs  string `json:"inputs"`
+			Outputs string `json:"outputs"`
+		} `json:"io"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body) != 1 {
+		t.Fatalf("len(body) = %d, want 1", len(body))
+	}
+	if body[0].IO.Inputs != "optional" || body[0].IO.Outputs != "optional" {
+		t.Errorf("io = %+v, want optional/optional for a component without an io declaration", body[0].IO)
+	}
+}
+
+func TestHandleListComponents_IOExplicit(t *testing.T) {
+	def := componentDefFixtureWithIO("data-generator", &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"})
+	ts, cleanup := newComponentsServer(newFakeComponentRegistry(def))
+	defer cleanup()
+
+	resp, err := stdhttp.Get(ts.URL + "/api/v1/components")
+	if err != nil {
+		t.Fatalf("GET /api/v1/components: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body []struct {
+		Name string `json:"name"`
+		IO   struct {
+			Inputs  string `json:"inputs"`
+			Outputs string `json:"outputs"`
+		} `json:"io"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body) != 1 {
+		t.Fatalf("len(body) = %d, want 1", len(body))
+	}
+	if body[0].IO.Inputs != "none" || body[0].IO.Outputs != "required" {
+		t.Errorf("io = %+v, want none/required", body[0].IO)
+	}
+}
+
+func TestHandleGetComponent_IO(t *testing.T) {
+	def := componentDefFixtureWithIO("data-generator", &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"})
+	ts, cleanup := newComponentsServer(newFakeComponentRegistry(def))
+	defer cleanup()
+
+	resp, err := stdhttp.Get(ts.URL + "/api/v1/components/data-generator")
+	if err != nil {
+		t.Fatalf("GET /api/v1/components/data-generator: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Name string `json:"name"`
+		IO   struct {
+			Inputs  string `json:"inputs"`
+			Outputs string `json:"outputs"`
+		} `json:"io"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.IO.Inputs != "none" || body.IO.Outputs != "required" {
+		t.Errorf("io = %+v, want none/required", body.IO)
 	}
 }
 

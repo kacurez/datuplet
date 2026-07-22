@@ -60,3 +60,39 @@ export function durationFrom(startIso, endIso) {
   const end = endIso ? new Date(endIso).getTime() : Date.now();
   return Math.max(0, end - start);
 }
+
+// formatBytes renders a byte count in IEC units (KiB/MiB/GiB…) with one
+// decimal for values ≥ 1 KiB. Returns "—" for null/undefined/negative so
+// a possibly-absent size can be passed straight through.
+export function formatBytes(n) {
+  if (n == null || n < 0) return '—';
+  if (n < 1024) return `${n} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  let v = n / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u += 1; }
+  return `${v.toFixed(1)} ${units[u]}`;
+}
+
+// storageFolderURI reduces a table's metadata-file location to the table's
+// storage folder — the directory holding metadata/ + data. For example
+// gs://bucket/a/b/metadata/00002-…metadata.json → gs://bucket/a/b. Falls
+// back to the parent directory when there's no /metadata/ segment. Returns
+// "" for empty input.
+export function storageFolderURI(metadataLocation) {
+  if (!metadataLocation) return '';
+  const i = metadataLocation.lastIndexOf('/metadata/');
+  if (i >= 0) return metadataLocation.slice(0, i);
+  const j = metadataLocation.lastIndexOf('/');
+  return j >= 0 ? metadataLocation.slice(0, j) : metadataLocation;
+}
+
+// gcsConsoleHref maps a gs:// folder URI to a Google Cloud console
+// object-browser URL. Returns "" for non-gs:// URIs (S3/MinIO/local have no
+// universal console URL — the caller shows the plain URI instead).
+export function gcsConsoleHref(gsURI) {
+  if (!gsURI || !gsURI.startsWith('gs://')) return '';
+  const path = gsURI.slice('gs://'.length); // bucket/prefix…
+  if (!path) return '';
+  return `https://console.cloud.google.com/storage/browser/${path}`;
+}

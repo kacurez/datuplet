@@ -532,6 +532,7 @@ func TestTableInfo_Success(t *testing.T) {
 		Snapshots         []snapshotBrief `json:"snapshots"`
 		RowCount          *int64          `json:"row_count"`
 		DataFileCount     *int64          `json:"data_file_count"`
+		TotalFilesSize    *int64          `json:"total_files_size"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -550,6 +551,11 @@ func TestTableInfo_Success(t *testing.T) {
 	}
 	if body.DataFileCount == nil || *body.DataFileCount != 1 {
 		t.Errorf("data_file_count = %v, want 1 (from total-data-files summary)", body.DataFileCount)
+	}
+	// total_files_size is the real parquet byte size (dynamic), so assert
+	// only that it's present and positive (from the total-files-size summary).
+	if body.TotalFilesSize == nil || *body.TotalFilesSize <= 0 {
+		t.Errorf("total_files_size = %v, want a positive size (from total-files-size summary)", body.TotalFilesSize)
 	}
 
 	// data_files must be gone from the wire shape entirely (not just
@@ -601,6 +607,9 @@ func TestTableInfo_NoSummary(t *testing.T) {
 	}
 	if body.DataFileCount != nil {
 		t.Errorf("data_file_count = %v, want nil (no total-data-files in summary)", *body.DataFileCount)
+	}
+	if body.TotalFilesSize != nil {
+		t.Errorf("total_files_size = %v, want nil (no total-files-size in summary)", *body.TotalFilesSize)
 	}
 }
 

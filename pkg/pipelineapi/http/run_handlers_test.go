@@ -152,7 +152,7 @@ func TestTriggerRun_HappyPath(t *testing.T) {
 	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", validPipelineYAML)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl/runs", map[string]any{}, cookie)
 	defer resp.Body.Close()
@@ -186,7 +186,7 @@ func TestTriggerRun_ViewerForbidden(t *testing.T) {
 	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "viewer")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", validPipelineYAML)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl/runs", map[string]any{}, cookie)
 	defer resp.Body.Close()
@@ -219,7 +219,7 @@ func TestListAndGetRun(t *testing.T) {
 	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", validPipelineYAML)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl/runs", map[string]any{}, cookie).Body.Close()
 
@@ -263,7 +263,7 @@ func TestCancelRun(t *testing.T) {
 	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", validPipelineYAML)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	trg := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl/runs", map[string]any{}, cookie)
 	var body map[string]string
@@ -291,8 +291,8 @@ func TestListRuns_EnvelopeAndFilters(t *testing.T) {
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
 
-	daily, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", validPipelineYAML)
-	sync, _ := store.CreatePipeline(ctx, pool, proj.ID, "customer-sync", validPipelineYAML)
+	daily, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", "", []byte(validPipelineYAML))
+	sync, _ := store.CreatePipeline(ctx, pool, proj.ID, "customer-sync", "", []byte(validPipelineYAML))
 	rA, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: daily.ID})
 	_, _ = store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: sync.ID})
 	_, _ = store.UpdateRunPhase(ctx, pool, rA.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded"})
@@ -350,20 +350,22 @@ func TestListRuns_EnvelopeAndFilters(t *testing.T) {
 	}
 }
 
-const tlYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: daily-orders
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: api
-          component: x
-          inputs: {buckets: [api]}
-          outputs:
-            tables: [{name: orders, bucket: raw, writeMode: FULL_LOAD}]
-`
+const tlYAML = `{
+  "name": "daily-orders",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "api",
+          "component": "x",
+          "inputs": {"buckets": ["api"]},
+          "outputs": {"tables": [{"name": "orders", "bucket": "raw", "writeMode": "FULL_LOAD"}]}
+        }
+      ]
+    }
+  ]
+}`
 
 func TestGetRun_AssemblesTimeline(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
@@ -374,7 +376,7 @@ func TestGetRun_AssemblesTimeline(t *testing.T) {
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
 
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", tlYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", "", []byte(tlYAML))
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
 	snap := []byte(`[{"name":"extract","phase":"Succeeded","startTime":"2026-06-16T14:02:12Z","completionTime":"2026-06-16T14:03:40Z"}]`)
 	_, _ = store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded", StageStatuses: snap})
@@ -444,7 +446,7 @@ func TestTriggerRun_UnknownSecretKey_Returns400(t *testing.T) {
 	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", pipelineYAMLWithSecretRef)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", "", []byte(pipelineYAMLWithSecretRef))
 
 	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
 	defer resp.Body.Close()
@@ -475,7 +477,7 @@ func TestTriggerRun_KnownSecretKey_Returns201(t *testing.T) {
 	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", pipelineYAMLWithSecretRef)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", "", []byte(pipelineYAMLWithSecretRef))
 
 	putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/api_token", "shh", cookie).Body.Close()
 
@@ -503,7 +505,7 @@ func TestTriggerRun_FreshProjectForbiddenSecretRead_Returns400(t *testing.T) {
 	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
 	proj, _ := store.CreateProject(ctx, pool, "proj")
 	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", pipelineYAMLWithSecretRef)
+	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", "", []byte(pipelineYAMLWithSecretRef))
 
 	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
 	defer resp.Body.Close()

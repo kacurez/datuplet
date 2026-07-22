@@ -58,8 +58,14 @@ for img in \
 open http://localhost:8080/ui/
 # Login: admin@datuplet.local / changeme  (change these in production)
 
-# 6. Trigger a pipeline
-kubectl apply -f examples/pipelines/simple-http-extract.yaml
+# 6. Trigger a pipeline (via the CLI — pipelines are envelope-free
+#    PipelineDocs now, not `kubectl apply`-able CRs; see docs/pipeline-api.md)
+make build   # builds bin/datuplet
+export DATUPLET_REMOTE=http://localhost:8080
+echo changeme | ./bin/datuplet login --remote $DATUPLET_REMOTE \
+  --email admin@datuplet.local --password-stdin
+./bin/datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
+./bin/datuplet trigger simple-pipeline
 kubectl get pipelineruns -n datuplet -w
 ```
 
@@ -116,9 +122,10 @@ Full diagram and component descriptions: [docs/architecture.md](docs/architectur
 | [docs/quickstart-gke.md](docs/quickstart-gke.md) | GKE + GCS deployment |
 | [docs/install.md](docs/install.md) | Full install guide (all clusters) |
 | [docs/architecture.md](docs/architecture.md) | System overview, data flow, auth |
-| [docs/components.md](docs/components.md) | Built-in component catalog |
+| [docs/components.md](docs/components.md) | Built-in component catalog + config-schema authoring guide |
 | [docs/warehouse-setup.md](docs/warehouse-setup.md) | S3 / GCS / MinIO warehouse prep |
-| [docs/pipeline-api.md](docs/pipeline-api.md) | pipeline-api REST reference |
+| [docs/pipeline-api.md](docs/pipeline-api.md) | pipeline-api REST reference + PipelineDoc format |
+| [docs/agent-quickstart.md](docs/agent-quickstart.md) | CLI loop for agents/scripts: components → validate → put → trigger → storage sample |
 | [docs/ad-hoc-query.md](docs/ad-hoc-query.md) | Ad-hoc SQL query (browser console, REST, CLI) |
 | [docs/auth-flow.md](docs/auth-flow.md) | Token lifecycle (session → run JWT → FGA) |
 | [docs/secrets.md](docs/secrets.md) | Secret references in pipeline YAML |

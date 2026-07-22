@@ -1,60 +1,46 @@
----
 # ETL DuckDB — extract JSON posts, then aggregate by userId with an embedded DuckDB SQL transform
 #
 # Components: http-json-extractor, sql-transform
 # Prerequisites: running Datuplet install (lakekeeper + pipeline-api), see docs/install.md
 #
 # Run it:
-#   UI:      Pipelines → New → paste this YAML → Save → Trigger
-#   REST:    see docs/pipeline-api.md "Upload a pipeline" + "Trigger a run"
-#   kubectl: kubectl apply -f examples/pipelines/etl-duckdb.yaml   (applies Pipeline + PipelineRun)
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: duckdb-transform
-  namespace: datuplet
-spec:
-  stages:
-    # Stage 1: Extract JSON posts from public API
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          config:
-            url: "https://jsonplaceholder.typicode.com/posts"
-          outputs:
-            defaultBucket: "raw"
-            defaultWriteMode: FULL_LOAD
+#   CLI:   datuplet pipeline put -f examples/pipelines/etl-duckdb.yaml
+#          datuplet trigger duckdb-transform
+#   UI:    Pipelines → New → paste this YAML → Save → Trigger
+#   REST:  PUT /api/v1/projects/{pid}/pipelines/duckdb-transform (see docs/pipeline-api.md)
+name: duckdb-transform
+stages:
+  # Stage 1: Extract JSON posts from public API
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        config:
+          url: "https://jsonplaceholder.typicode.com/posts"
+        outputs:
+          defaultBucket: "raw"
+          defaultWriteMode: FULL_LOAD
 
-    # Stage 2: SQL transform — aggregate posts by userId
-    - name: transform
-      components:
-        - name: sql-transform
-          component: sql-transform
-          inputs:
-            tables:
-              - bucket: "raw"
-                table: data
-          outputs:
-            tables:
-              - name: user_summary
-                bucket: "etl"
-                writeMode: FULL_LOAD
-          config:
-            sql: |
-              CREATE TABLE user_summary AS
-              SELECT
-                "userId",
-                COUNT(*) AS post_count
-              FROM data
-              GROUP BY "userId"
-              ORDER BY "userId";
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "duckdb-transform-run-1"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: duckdb-transform
+  # Stage 2: SQL transform — aggregate posts by userId
+  - name: transform
+    components:
+      - name: sql-transform
+        component: sql-transform
+        inputs:
+          tables:
+            - bucket: "raw"
+              table: data
+        outputs:
+          tables:
+            - name: user_summary
+              bucket: "etl"
+              writeMode: FULL_LOAD
+        config:
+          sql: |
+            CREATE TABLE user_summary AS
+            SELECT
+              "userId",
+              COUNT(*) AS post_count
+            FROM data
+            GROUP BY "userId"
+            ORDER BY "userId";

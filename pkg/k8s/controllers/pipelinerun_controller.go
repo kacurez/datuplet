@@ -159,6 +159,15 @@ type PipelineRunReconciler struct {
 	// that would otherwise have succeeded.
 	transientRetries   map[types.NamespacedName]int
 	transientRetriesMu sync.Mutex
+
+	// notFoundRetries tracks CONSECUTIVE Pipeline-not-found misses in
+	// handlePending — the informer-cache lag between the Pipeline CR being
+	// created at trigger time and the operator's cache observing it. Kept in a
+	// SEPARATE counter from transientRetries so cache-lag misses never consume
+	// the admission transient-error budget (and vice versa). Same in-memory
+	// rationale as transientRetries.
+	notFoundRetries   map[types.NamespacedName]int
+	notFoundRetriesMu sync.Mutex
 }
 
 // ComponentRegistry adapts a cached, cluster-scoped client.Reader into a
@@ -331,7 +340,13 @@ func (r *PipelineRunReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Continue execution
 		return r.handleRunning(ctx, pipelineRun)
 	case datupletv1.PipelineRunPhaseSucceeded, datupletv1.PipelineRunPhaseFailedUser, datupletv1.PipelineRunPhaseFailedApplication:
-		// Terminal state - nothing to do
+		// Terminal state - nothing to do. Drop any lingering retry-budget
+		// entries for this run so terminal paths that returned without
+		// clearing (e.g. FailedUser on missing secrets/validation) do not
+		// leak map entries over the operator's lifetime.
+		key := types.NamespacedName{Namespace: pipelineRun.Namespace, Name: pipelineRun.Name}
+		r.clearTransientRetries(key)
+		r.clearNotFoundRetry(key)
 		return ctrl.Result{}, nil
 	default:
 		logger.Info("Unknown phase", "phase", pipelineRun.Status.Phase)
@@ -350,6 +365,23 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		Namespace: pr.Namespace,
 	}, pipeline); err != nil {
 		if errors.IsNotFound(err) {
+			// RFC 027 materializes the Pipeline CR at trigger time, immediately
+			// before the PipelineRun. The operator's cached client can reconcile
+			// the PipelineRun before it observes the just-created Pipeline CR, so
+			// a NotFound here is usually a transient informer-cache lag, not a
+			// genuinely absent pipeline. Requeue with backoff for a bounded number
+			// of CONSECUTIVE misses (its own notFoundRetries budget, independent of
+			// the admission transient-retry budget, sized by admissionTransientRetryBudget);
+			// only once that is exhausted is the pipeline really gone → FailedUser.
+			key := types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name}
+			attempt := r.noteNotFoundRetry(key)
+			if attempt < admissionTransientRetryBudget {
+				logger.Info("Referenced Pipeline not yet observed (cache lag?), requeueing",
+					"attempt", attempt, "budget", admissionTransientRetryBudget,
+					"pipeline", pr.Spec.PipelineRef.Name)
+				return ctrl.Result{RequeueAfter: admissionTransientRetryInterval}, nil
+			}
+			r.clearNotFoundRetry(key)
 			pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
 			pr.Status.Message = fmt.Sprintf("Pipeline '%s' not found", pr.Spec.PipelineRef.Name)
 			if err := r.Status().Update(ctx, pr); err != nil {
@@ -361,6 +393,9 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		logger.Error(err, "Failed to get Pipeline")
 		return ctrl.Result{}, err
 	}
+	// Pipeline observed — reset its not-found retry count (separate from the
+	// admission budget, so this never disturbs transientRetries).
+	r.clearNotFoundRetry(types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name})
 
 	// Determine run ID: use spec value if provided, otherwise generate
 	runID := pr.Spec.RunID
@@ -578,6 +613,27 @@ func (r *PipelineRunReconciler) clearTransientRetries(key types.NamespacedName) 
 	delete(r.transientRetries, key)
 }
 
+// noteNotFoundRetry increments and returns the CONSECUTIVE Pipeline-not-found
+// count for key (informer-cache lag on the just-created Pipeline CR).
+func (r *PipelineRunReconciler) noteNotFoundRetry(key types.NamespacedName) int {
+	r.notFoundRetriesMu.Lock()
+	defer r.notFoundRetriesMu.Unlock()
+	if r.notFoundRetries == nil {
+		r.notFoundRetries = make(map[types.NamespacedName]int)
+	}
+	r.notFoundRetries[key]++
+	return r.notFoundRetries[key]
+}
+
+// clearNotFoundRetry resets the CONSECUTIVE Pipeline-not-found count for key,
+// called once the Pipeline is observed, the budget is exhausted, or the run
+// reaches a terminal phase.
+func (r *PipelineRunReconciler) clearNotFoundRetry(key types.NamespacedName) {
+	r.notFoundRetriesMu.Lock()
+	defer r.notFoundRetriesMu.Unlock()
+	delete(r.notFoundRetries, key)
+}
+
 // snapshotRunSecrets copies the exact set of $[name] keys the pipeline
 // references from the managed project Secret into a per-run snapshot Secret
 // owned by the run. It is the admission gate for secret resolution:
@@ -654,7 +710,6 @@ func (r *PipelineRunReconciler) snapshotRunSecrets(ctx context.Context, pr *datu
 			Labels: map[string]string{
 				"app.kubernetes.io/component": "run-secrets",
 				"app.kubernetes.io/part-of":   "datuplet",
-				"datuplet.io/pipelinerun":     pr.Name,
 				"datuplet.io/run-id":          pr.Status.RunID,
 			},
 		},

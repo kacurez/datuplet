@@ -19,25 +19,15 @@ spec:
   displayName: Stdout Writer
   description: Reads input tables and prints them to stdout. For debugging only — no Iceberg output.
   maintainer: datuplet
+  io:
+    inputs: required
+    outputs: none
   defaultVersion: {{ .Values.components.tag }}
   versions:
     - version: {{ .Values.components.tag }}
       image: "{{ .Values.components.registry }}/stdout-writer:{{ .Values.components.tag }}"
       configSchema: |
-        {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "format": {
-              "type": "string",
-              "enum": [
-                "csv",
-                "json"
-              ]
-            }
-          }
-        }
+{{ .Files.Get (printf "files/component-schemas/%s.json" "stdout-writer") | indent 8 }}
       resources:
         default:
           requests:

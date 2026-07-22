@@ -12,14 +12,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Pipeline is the in-memory view of a pipelines row.
+// Pipeline is the in-memory view of a pipelines row. Doc is the
+// envelope-free PipelineDoc, stored canonically as JSON in the jsonb
+// `doc` column (RFC 027 §5.1).
 type Pipeline struct {
-	ID        uuid.UUID
-	ProjectID uuid.UUID
-	Name      string
-	YAML      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID          uuid.UUID
+	ProjectID   uuid.UUID
+	Name        string
+	Description string
+	Doc         []byte
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // ErrPipelineAlreadyExists is returned by CreatePipeline on unique-constraint
@@ -29,15 +32,16 @@ var ErrPipelineAlreadyExists = errors.New("pipeline already exists")
 // ErrPipelineNotFound is returned when no pipeline matches the lookup.
 var ErrPipelineNotFound = errors.New("pipeline not found")
 
-// CreatePipeline inserts a new pipeline. The yaml string must already have
-// been validated by the caller (pipeline-api handlers run it through
-// pkg/pipeline/config.Parse before calling this).
-func CreatePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name, yaml string) (*Pipeline, error) {
-	p := &Pipeline{ProjectID: projectID, Name: name, YAML: yaml}
+// CreatePipeline inserts a new pipeline. doc must already have been
+// validated by the caller (pipeline-api handlers run it through
+// validate.ValidatePipelineDoc before calling this) and must be valid
+// JSON — the `doc` column is jsonb.
+func CreatePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name, description string, doc []byte) (*Pipeline, error) {
+	p := &Pipeline{ProjectID: projectID, Name: name, Description: description, Doc: doc}
 	err := pool.QueryRow(ctx,
-		`INSERT INTO pipelines(project_id, name, yaml) VALUES ($1, $2, $3)
+		`INSERT INTO pipelines(project_id, name, description, doc) VALUES ($1, $2, $3, $4)
 		 RETURNING id, created_at, updated_at`,
-		projectID, name, yaml,
+		projectID, name, description, doc,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "pipelines_project_id_name_key") {
@@ -53,10 +57,10 @@ func CreatePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID
 func GetPipelineByName(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name string) (*Pipeline, error) {
 	p := &Pipeline{}
 	err := pool.QueryRow(ctx,
-		`SELECT id, project_id, name, yaml, created_at, updated_at
+		`SELECT id, project_id, name, description, doc, created_at, updated_at
 		   FROM pipelines WHERE project_id = $1 AND name = $2`,
 		projectID, name,
-	).Scan(&p.ID, &p.ProjectID, &p.Name, &p.YAML, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.ProjectID, &p.Name, &p.Description, &p.Doc, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrPipelineNotFound
@@ -81,23 +85,24 @@ func GetPipelineNameByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) 
 	return name, nil
 }
 
-// GetPipelineYAMLByID returns the stored YAML for a pipeline, or ErrPipelineNotFound.
-func GetPipelineYAMLByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (string, error) {
-	var yaml string
-	err := pool.QueryRow(ctx, `SELECT yaml FROM pipelines WHERE id = $1`, id).Scan(&yaml)
+// GetDocByID returns the stored doc (canonical JSON) for a pipeline, or
+// ErrPipelineNotFound.
+func GetDocByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) ([]byte, error) {
+	var doc []byte
+	err := pool.QueryRow(ctx, `SELECT doc FROM pipelines WHERE id = $1`, id).Scan(&doc)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrPipelineNotFound
+		return nil, ErrPipelineNotFound
 	}
 	if err != nil {
-		return "", fmt.Errorf("select pipeline yaml: %w", err)
+		return nil, fmt.Errorf("select pipeline doc: %w", err)
 	}
-	return yaml, nil
+	return doc, nil
 }
 
 // ListPipelines returns every pipeline in the project sorted by name.
 func ListPipelines(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID) ([]*Pipeline, error) {
 	rows, err := pool.Query(ctx,
-		`SELECT id, project_id, name, yaml, created_at, updated_at
+		`SELECT id, project_id, name, description, doc, created_at, updated_at
 		   FROM pipelines WHERE project_id = $1 ORDER BY name`, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("query pipelines: %w", err)
@@ -106,7 +111,7 @@ func ListPipelines(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID)
 	var out []*Pipeline
 	for rows.Next() {
 		p := &Pipeline{}
-		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.YAML, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.Description, &p.Doc, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 		out = append(out, p)
@@ -114,11 +119,11 @@ func ListPipelines(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID)
 	return out, rows.Err()
 }
 
-// UpdatePipelineYAML replaces the YAML of an existing pipeline.
-func UpdatePipelineYAML(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name, yaml string) error {
+// UpdatePipeline replaces the doc + description of an existing pipeline.
+func UpdatePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name, description string, doc []byte) error {
 	tag, err := pool.Exec(ctx,
-		`UPDATE pipelines SET yaml = $3, updated_at = now()
-		  WHERE project_id = $1 AND name = $2`, projectID, name, yaml)
+		`UPDATE pipelines SET description = $3, doc = $4, updated_at = now()
+		  WHERE project_id = $1 AND name = $2`, projectID, name, description, doc)
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
 	}

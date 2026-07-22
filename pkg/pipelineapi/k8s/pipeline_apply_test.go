@@ -9,27 +9,39 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
 )
 
-const testPipelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: etl
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-`
+// testPipelineDoc is envelope-free PipelineDoc content (RFC 027 §3); ApplyPipelineCRD
+// renders it into a datupletv1.Pipeline via config.DocToCR.
+const testPipelineDoc = `{
+  "name": "etl",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "raw"}}
+      ]
+    }
+  ]
+}`
+
+func mustParseDoc(t *testing.T, raw string) *config.Pipeline {
+	t.Helper()
+	doc, err := config.Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse doc: %v", err)
+	}
+	return doc
+}
 
 func TestApplyPipelineCRD_CreatesWhenMissing(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
 	pid := uuid.New()
 	ns := pkg8s.NamespaceForProject(pid)
 
-	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, ns, testPipelineYAML); err != nil {
+	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, ns, mustParseDoc(t, testPipelineDoc)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -53,7 +65,7 @@ func TestApplyPipelineCRD_UpdatesWhenPresent(t *testing.T) {
 	existing.Spec.Stages = []datupletv1.StageSpec{{Name: "old", Components: []datupletv1.ComponentSpec{{Name: "c", Component: "old"}}}}
 
 	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(existing).Build()
-	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, ns, testPipelineYAML); err != nil {
+	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, ns, mustParseDoc(t, testPipelineDoc)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	got := &datupletv1.Pipeline{}
@@ -63,9 +75,16 @@ func TestApplyPipelineCRD_UpdatesWhenPresent(t *testing.T) {
 	}
 }
 
-func TestApplyPipelineCRD_RejectsInvalidYAML(t *testing.T) {
+func TestApplyPipelineCRD_RejectsNilDoc(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, "ns", "not: [yaml"); err == nil {
-		t.Error("expected error for invalid YAML")
+	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, "ns", nil); err == nil {
+		t.Error("expected error for nil doc")
+	}
+}
+
+func TestApplyPipelineCRD_RejectsUnnamedDoc(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
+	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, "ns", &config.Pipeline{}); err == nil {
+		t.Error("expected error for doc with no name")
 	}
 }

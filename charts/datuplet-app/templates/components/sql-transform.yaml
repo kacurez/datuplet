@@ -25,37 +25,15 @@ spec:
   displayName: SQL Transform
   description: Runs user-supplied SQL inside an embedded DuckDB engine. Credentials-clean — no S3, GCS, or Lakekeeper credentials touch the component.
   maintainer: datuplet
+  io:
+    inputs: required
+    outputs: required
   defaultVersion: {{ .Values.components.tag }}
   versions:
     - version: {{ .Values.components.tag }}
       image: "{{ .Values.components.registry }}/sql-transform:{{ .Values.components.tag }}"
       configSchema: |
-        {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "sql"
-          ],
-          "properties": {
-            "sql": {
-              "type": "string"
-            },
-            "threads": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "temp_directory": {
-              "type": "string"
-            },
-            "memory": {
-              "type": "string"
-            },
-            "max_temp_size": {
-              "type": "string"
-            }
-          }
-        }
+{{ .Files.Get (printf "files/component-schemas/%s.json" "sql-transform") | indent 8 }}
       resources:
         default:
           requests:

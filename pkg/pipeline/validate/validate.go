@@ -13,6 +13,8 @@ import (
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/secrets"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 )
 
@@ -72,6 +74,62 @@ func ValidatePipeline(data []byte, reg RegistryView, pol *Policy) (*datupletv1.P
 		return nil, []Finding{{Path: "", Message: err.Error(), Severity: severityError}}, nil
 	}
 	return &p, ValidateTyped(&p, reg, pol), nil
+}
+
+// ValidatePipelineDoc is the doc-shaped front door for pipeline validation
+// (RFC 027 §5.4). It strict-decodes an envelope-free PipelineDoc, checks the
+// pipeline name against the caller's routing context, converts to the CRD
+// shape via config.DocToCR, and runs the shared semantic rules through
+// ValidateTyped. The returned *datupletv1.Pipeline is the converted CR (nil
+// only when the doc fails to decode at all).
+//
+// contextName is the name the pipeline is being saved/routed under (e.g. the
+// URL path name on a PUT). The effective name — contextName when set, else the
+// doc's own name — must be a DNS-1123 subdomain because it becomes a K8s
+// resource name. When both a contextName and a doc name are present and
+// disagree, that is an error: the doc would be stored under one name but
+// referenced under another. An empty contextName (POST /validate, no routing
+// name) skips the equality check.
+//
+// reg and pol behave exactly as in ValidateTyped: a nil reg skips registry
+// resolution and config-schema checks; a nil pol disables gateway-bound checks.
+func ValidatePipelineDoc(raw []byte, contextName string, reg RegistryView, pol *Policy) (*datupletv1.Pipeline, []Finding) {
+	doc, err := config.Parse(raw)
+	if err != nil {
+		return nil, []Finding{{Path: "", Message: err.Error(), Severity: severityError}}
+	}
+
+	var findings []Finding
+
+	effectiveName := contextName
+	if effectiveName == "" {
+		effectiveName = doc.Name
+	}
+	if effectiveName != "" {
+		for _, msg := range validation.IsDNS1123Subdomain(effectiveName) {
+			findings = append(findings, Finding{
+				Path:     "name",
+				Message:  fmt.Sprintf("invalid pipeline name %q: %s", effectiveName, msg),
+				Severity: severityError,
+			})
+		}
+	}
+	if contextName != "" && doc.Name != "" && doc.Name != contextName {
+		findings = append(findings, Finding{
+			Path:     "name",
+			Message:  fmt.Sprintf("name %q does not match the pipeline name %q it is being saved under", doc.Name, contextName),
+			Severity: severityError,
+		})
+	}
+
+	// Both checks above have run against the original body-supplied doc.Name;
+	// only now do we apply the effective name so the converted CR (and the
+	// metadata.name-required check in ValidateTyped) sees it, per spec §3
+	// ("name" is optional in the body when the route/CLI supplies contextName).
+	doc.Name = effectiveName
+	cr := config.DocToCR(doc)
+	findings = append(findings, ValidateTyped(cr, reg, pol)...)
+	return cr, findings
 }
 
 // ValidateTyped runs the semantic checks on an already-decoded Pipeline.
@@ -233,8 +291,8 @@ func validateComponent(c *datupletv1.ComponentSpec, stageIdx, compIdx int, avail
 		findings = append(findings, validateOutputs(c.Name, c.Outputs, stageIdx, compIdx)...)
 	}
 
-	hasInputs := c.Inputs != nil && (len(c.Inputs.Buckets) > 0 || len(c.Inputs.Tables) > 0)
-	hasOutputs := c.Outputs != nil && (c.Outputs.DefaultBucket != "" || len(c.Outputs.Buckets) > 0 || len(c.Outputs.Tables) > 0)
+	hasInputs := componentHasInputs(c)
+	hasOutputs := componentHasOutputs(c)
 	if !hasInputs && !hasOutputs {
 		findings = append(findings, Finding{
 			Path:     base,
@@ -244,6 +302,16 @@ func validateComponent(c *datupletv1.ComponentSpec, stageIdx, compIdx int, avail
 	}
 
 	return findings
+}
+
+// componentHasInputs reports whether a component instance declares any input.
+func componentHasInputs(c *datupletv1.ComponentSpec) bool {
+	return c.Inputs != nil && (len(c.Inputs.Buckets) > 0 || len(c.Inputs.Tables) > 0)
+}
+
+// componentHasOutputs reports whether a component instance declares any output.
+func componentHasOutputs(c *datupletv1.ComponentSpec) bool {
+	return c.Outputs != nil && (c.Outputs.DefaultBucket != "" || len(c.Outputs.Buckets) > 0 || len(c.Outputs.Tables) > 0)
 }
 
 // validateInputs validates component input configuration.
@@ -323,14 +391,17 @@ func validateInputs(compName string, in *datupletv1.InputSpec, stageIdx, compIdx
 				Severity: severityError,
 			})
 		}
-		// Check table or bucket is available from previous stages (skip for stage 0).
+		// Cross-stage input check: an input table that no earlier stage
+		// produces is a warning, not an error — it is assumed to pre-exist in
+		// storage (an external table seeded outside this pipeline). The run
+		// fails at read time if it turns out not to exist. (skip for stage 0).
 		if stageIdx > 0 {
 			tableKey := t.Bucket + "." + t.Table
 			if !availableTables[tableKey] && !availableBuckets[t.Bucket] {
 				findings = append(findings, Finding{
 					Path:     tablePath,
-					Message:  fmt.Sprintf("component %s: input table %q not available from previous stages", compName, tableKey),
-					Severity: severityError,
+					Message:  fmt.Sprintf("component %s: input table %q not produced by an earlier stage — assumed to pre-exist in storage; the run fails at read time if it doesn't", compName, tableKey),
+					Severity: severityWarning,
 				})
 			}
 		}
@@ -566,6 +637,54 @@ func validateSecretRefs(c *datupletv1.ComponentSpec, stageIdx, compIdx int) []Fi
 	return findings
 }
 
+// checkIOCapability enforces the resolved definition's IO declaration (RFC 027
+// §4.3) against the pipeline instance's declared inputs/outputs: "none"
+// rejects any declaration, "required" rejects an absent one; "optional" (the
+// nil-io default) never fires. io is nil-safe via InputsMode/OutputsMode.
+func checkIOCapability(c *datupletv1.ComponentSpec, io *datupletv1.ComponentIO, base string) []Finding {
+	var findings []Finding
+
+	switch io.InputsMode() {
+	case "none":
+		if componentHasInputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".inputs",
+				Message:  fmt.Sprintf("component %s takes no inputs", c.Name),
+				Severity: severityError,
+			})
+		}
+	case "required":
+		if !componentHasInputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".inputs",
+				Message:  fmt.Sprintf("component %s requires at least one input", c.Name),
+				Severity: severityError,
+			})
+		}
+	}
+
+	switch io.OutputsMode() {
+	case "none":
+		if componentHasOutputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".outputs",
+				Message:  fmt.Sprintf("component %s takes no outputs", c.Name),
+				Severity: severityError,
+			})
+		}
+	case "required":
+		if !componentHasOutputs(c) {
+			findings = append(findings, Finding{
+				Path:     base + ".outputs",
+				Message:  fmt.Sprintf("component %s requires at least one output", c.Name),
+				Severity: severityError,
+			})
+		}
+	}
+
+	return findings
+}
+
 // validateRegistry resolves a component against reg and validates its config
 // against the resolved version's JSON Schema. A nil reg skips both (Phase-1
 // callers during the R5 cutover; R6/R9 pass a real view). Resolution findings
@@ -591,6 +710,11 @@ func validateRegistry(c *datupletv1.ComponentSpec, stageIdx, compIdx int, reg Re
 	if rc == nil {
 		return findings
 	}
+
+	// RFC 027 §4.3: enforce the resolved definition's IO capability against
+	// this instance's declared inputs/outputs. Checked whenever the component
+	// resolves, independent of any config schema.
+	findings = append(findings, checkIOCapability(c, rc.IO, base)...)
 
 	// Phase 3: reject resource requests/limits that exceed the resolved
 	// version's registry Max, or name a resource not listed in Max. Checked

@@ -1,53 +1,38 @@
----
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-duckdb-etl"
-  namespace: datuplet
-spec:
-  stages:
-    # Stage 1: Extract JSON posts from public API
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-raw"
-            defaultWriteMode: FULL_LOAD
+name: "{{.RunPrefix}}-duckdb-etl"
+stages:
+  # Stage 1: Extract JSON posts from public API
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-raw"
+          defaultWriteMode: FULL_LOAD
 
-    # Stage 2: SQL transform — aggregate posts by userId
-    - name: transform
-      components:
-        - name: sql-transform
-          component: sql-transform
-          version: dev
-          inputs:
-            tables:
-              - bucket: "{{.RunPrefix}}-raw"
-                table: data
-          outputs:
-            tables:
-              - name: user_summary
-                bucket: "{{.RunPrefix}}-etl"
-                writeMode: FULL_LOAD
-          config:
-            sql: |
-              CREATE TABLE user_summary AS
-              SELECT
-                "userId",
-                COUNT(*) AS post_count
-              FROM data
-              GROUP BY "userId"
-              ORDER BY "userId";
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-duckdb-etl-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-duckdb-etl"
+  # Stage 2: SQL transform — aggregate posts by userId
+  - name: transform
+    components:
+      - name: sql-transform
+        component: sql-transform
+        version: dev
+        inputs:
+          tables:
+            - bucket: "{{.RunPrefix}}-raw"
+              table: data
+        outputs:
+          tables:
+            - name: user_summary
+              bucket: "{{.RunPrefix}}-etl"
+              writeMode: FULL_LOAD
+        config:
+          sql: |
+            CREATE TABLE user_summary AS
+            SELECT
+              "userId",
+              COUNT(*) AS post_count
+            FROM data
+            GROUP BY "userId"
+            ORDER BY "userId";

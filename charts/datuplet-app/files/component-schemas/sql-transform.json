@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SQL Transform",
+  "description": "Runs user-supplied SQL inside an embedded DuckDB engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sql"
+  ],
+  "properties": {
+    "sql": {
+      "type": "string",
+      "x-datuplet-multiline": "sql",
+      "description": "The SQL to execute inside the embedded DuckDB engine.",
+      "x-datuplet-doc": "Reference input tables by their logical names (e.g. FROM orders) and produce outputs with CREATE TABLE <output-logical-name> AS SELECT .... No bucket templating or storage paths — the Data Gateway mediates all reads and writes, so the SQL stays environment-agnostic. This component is credentials-clean: no S3, GCS, or Lakekeeper credentials are ever passed to it."
+    },
+    "threads": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 2,
+      "x-datuplet-advanced": true,
+      "description": "DuckDB worker-thread count (query parallelism).",
+      "x-datuplet-doc": "Each thread keeps its own per-pipeline hash-aggregate state and decode buffers, so raising this multiplies both in-memory state and concurrent spill-writer pressure. The default of 2 balances using a typical 1-2 vCPU pod allotment against per-thread arena cost. Bump to 4+ only when the host has dedicated CPU and memory headroom and wall-clock matters more than peak memory."
+    },
+    "memory": {
+      "type": "string",
+      "default": "1GB",
+      "x-datuplet-advanced": true,
+      "description": "DuckDB buffer-managed memory limit (e.g. \"512MB\", \"1.5GB\").",
+      "x-datuplet-doc": "DuckDB spills to temp_directory when an operator exceeds this. It is NOT a hard RSS cap — parquet decode buffers, page cache, and go-duckdb FFI state bypass it. The default of 1GB is deliberately conservative for shared single-node clusters where even a brief overshoot can trigger kubelet eviction. Raise it per-pipeline when a workload genuinely needs more in-memory hash-table room than spill can absorb (e.g. a JOIN of two large tables)."
+    },
+    "max_temp_size": {
+      "type": "string",
+      "default": "6GB",
+      "x-datuplet-advanced": true,
+      "description": "Hard cap on DuckDB spill-to-disk usage; the query errors when it is reached.",
+      "x-datuplet-doc": "This is the real guardrail against node-killing spill. The kubelet's ephemeral-storage limit is soft (sampled roughly every 10s and can be outrun by a fast spiller), whereas DuckDB's internal cap is synchronous. Set it below the pod's ephemeral-storage limit so DuckDB fails the query before the kubelet evicts the pod, and well below the node's free boot disk so a runaway spill cannot crater the node."
+    },
+    "temp_directory": {
+      "type": "string",
+      "default": "/tmp/duckdb-spill",
+      "x-datuplet-advanced": true,
+      "description": "Directory DuckDB spills large aggregates to.",
+      "x-datuplet-doc": "The component creates this directory at start if it does not exist. It should live on the pod's ephemeral storage; DuckDB's max_temp_size caps how much it may fill here."
+    }
+  }
+}

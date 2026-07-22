@@ -513,3 +513,109 @@ func TestValidateTyped_Direct(t *testing.T) {
 		}
 	})
 }
+
+func TestValidatePipelineDocEnvelopeRejected(t *testing.T) {
+	_, fs := ValidatePipelineDoc([]byte("apiVersion: v1\nkind: Pipeline\n"), "x", nil, nil)
+	requireFinding(t, fs, "error", "legacy Kubernetes CR format")
+}
+
+func TestValidatePipelineDocNameContext(t *testing.T) {
+	body := []byte("name: other\nstages: []\n")
+	_, fs := ValidatePipelineDoc(body, "route-name", nil, nil)
+	requireFinding(t, fs, "error", `name "other" does not match`)
+	// Empty context (POST /validate, no name): equality check skipped.
+	_, fs = ValidatePipelineDoc(body, "", nil, nil)
+	forbidFinding(t, fs, "does not match")
+}
+
+// TestValidatePipelineDocEffectiveName is a regression test for the bug where
+// effectiveName (contextName when the body omits name) was used only for the
+// DNS-1123 check and never written back onto doc.Name before config.DocToCR,
+// so a body-omits-name PUT/validate/trigger request produced a CR with an
+// empty ObjectMeta.Name and spuriously failed the "metadata.name is required"
+// check in ValidateTyped.
+func TestValidatePipelineDocEffectiveName(t *testing.T) {
+	validBody := func(nameLine string) []byte {
+		return []byte(nameLine + `stages:
+  - name: a
+    components:
+      - {name: c1, component: x, outputs: {defaultBucket: raw}}
+`)
+	}
+
+	t.Run("name absent, contextName supplies it", func(t *testing.T) {
+		cr, fs := ValidatePipelineDoc(validBody(""), "my-pipeline", nil, nil)
+		forbidFinding(t, fs, "metadata.name is required")
+		if cr == nil || cr.Name != "my-pipeline" {
+			t.Fatalf("want cr.Name == %q, got %+v", "my-pipeline", cr)
+		}
+	})
+
+	t.Run("name present and matches contextName", func(t *testing.T) {
+		cr, fs := ValidatePipelineDoc(validBody("name: my-pipeline\n"), "my-pipeline", nil, nil)
+		forbidFinding(t, fs, "metadata.name is required")
+		forbidFinding(t, fs, "does not match")
+		if cr == nil || cr.Name != "my-pipeline" {
+			t.Fatalf("want cr.Name == %q, got %+v", "my-pipeline", cr)
+		}
+	})
+
+	t.Run("name present and mismatches contextName still flagged", func(t *testing.T) {
+		_, fs := ValidatePipelineDoc(validBody("name: other\n"), "my-pipeline", nil, nil)
+		requireFinding(t, fs, "error", `name "other" does not match`)
+	})
+}
+
+func TestUpstreamInputDemotedToWarning(t *testing.T) {
+	body := []byte(`name: p
+stages:
+  - name: a
+    components:
+      - {name: c1, component: x, outputs: {defaultBucket: raw}}
+  - name: b
+    components:
+      - name: c2
+        component: y
+        inputs: {tables: [{bucket: staging, table: preexisting}]}
+        outputs: {defaultBucket: out}
+`)
+	_, fs := ValidatePipelineDoc(body, "p", nil, nil)
+	f := findByPath(t, fs, "stages[1].components[0].inputs.tables[0]")
+	if f.Severity != "warning" || !strings.Contains(f.Message, "assumed to pre-exist in storage") {
+		t.Fatalf("want warning about pre-existing storage table, got %+v", f)
+	}
+}
+
+// requireFinding fails unless fs contains a finding with the given severity
+// whose message contains substr.
+func requireFinding(t *testing.T, fs []Finding, severity, substr string) {
+	t.Helper()
+	for _, f := range fs {
+		if f.Severity == severity && strings.Contains(f.Message, substr) {
+			return
+		}
+	}
+	t.Fatalf("want %s finding containing %q, got %+v", severity, substr, fs)
+}
+
+// forbidFinding fails if any finding's message contains substr.
+func forbidFinding(t *testing.T, fs []Finding, substr string) {
+	t.Helper()
+	for _, f := range fs {
+		if strings.Contains(f.Message, substr) {
+			t.Fatalf("did not want a finding containing %q, got %+v", substr, f)
+		}
+	}
+}
+
+// findByPath returns the first finding at the exact path, failing if none.
+func findByPath(t *testing.T, fs []Finding, path string) Finding {
+	t.Helper()
+	for _, f := range fs {
+		if f.Path == path {
+			return f
+		}
+	}
+	t.Fatalf("no finding at path %q, got %+v", path, fs)
+	return Finding{}
+}

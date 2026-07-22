@@ -16,9 +16,17 @@ import (
 // and Stderr are injectable for test-friendliness — real CLI passes os.*.
 type loginArgs struct {
 	Remote string
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+	// Email, when non-empty, is used directly instead of prompting on
+	// Stdin. Required when PasswordStdin is set (there is otherwise no
+	// non-interactive source for it).
+	Email string
+	// PasswordStdin, when true, reads exactly one line from Stdin as the
+	// password and skips every interactive prompt (mirrors `docker login
+	// --password-stdin`). Requires Email to be set.
+	PasswordStdin bool
+	Stdin         io.Reader
+	Stdout        io.Writer
+	Stderr        io.Writer
 }
 
 // loginResponse mirrors the JSON shape returned by
@@ -28,11 +36,11 @@ type loginArgs struct {
 // user's project list is a top-level field. The CLI merges them into
 // the on-disk clusterMeta when writing ~/.datuplet/cluster.json.
 type loginResponse struct {
-	Token        string               `json:"token"`
-	ExpiresAt    string               `json:"expires_at"`
-	UserID       string               `json:"user_id"`
-	Cluster      loginResponseCluster `json:"cluster"`
-	Projects     []clusterMetaProject `json:"projects"`
+	Token     string               `json:"token"`
+	ExpiresAt string               `json:"expires_at"`
+	UserID    string               `json:"user_id"`
+	Cluster   loginResponseCluster `json:"cluster"`
+	Projects  []clusterMetaProject `json:"projects"`
 	// APIToken is the pipeline-api bearer token (aud=datuplet-api,
 	// token_kind=cli-api). Used by trigger + storage subcommands.
 	// Older server versions that don't emit this field leave it empty;
@@ -49,7 +57,10 @@ type loginResponseCluster struct {
 // runLogin implements `datuplet login --remote <url>`.
 //
 // Flow:
-//  1. Prompt for email + password (password hidden if stdin is a terminal).
+//  1. Prompt for email + password (password hidden if stdin is a terminal),
+//     or — with PasswordStdin — use Email verbatim and read exactly one line
+//     from Stdin as the password with no prompt at all (headless/CI mode,
+//     mirrors `docker login --password-stdin`).
 //  2. POST {email, password} to <remote>/api/v1/auth/token.
 //  3. On 200: write ~/.datuplet/token (raw JWT, 0600) and
 //     ~/.datuplet/cluster.json (metadata, 0600).
@@ -62,33 +73,50 @@ type loginResponseCluster struct {
 //   - The JWT is NEVER written to stdout or stderr (bash-history exfil).
 //   - The password is NEVER written to stdout, stderr, or any file.
 func runLogin(args loginArgs) error {
-	// Prompt for email.
-	fmt.Fprint(args.Stdout, "Email: ")
-	email, err := readLine(args.Stdin)
-	if err != nil {
-		return fmt.Errorf("read email: %w", err)
+	if args.PasswordStdin && args.Email == "" {
+		return fmt.Errorf("--email is required when --password-stdin is set")
 	}
-	email = strings.TrimSpace(email)
 
-	// Prompt for password. Use term.ReadPassword when stdin is a real
-	// terminal (suppresses echo); fall back to plain line-read for piped
-	// input (test path, CI, scripts).
-	fmt.Fprint(args.Stdout, "Password: ")
-	var password string
-	if f, ok := args.Stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
-		pw, err := term.ReadPassword(int(f.Fd()))
-		if err != nil {
-			return fmt.Errorf("read password: %w", err)
-		}
-		// The terminal won't echo a newline after term.ReadPassword.
-		fmt.Fprintln(args.Stdout)
-		password = string(pw)
+	var email string
+	if args.PasswordStdin {
+		email = strings.TrimSpace(args.Email)
 	} else {
+		fmt.Fprint(args.Stdout, "Email: ")
+		e, err := readLine(args.Stdin)
+		if err != nil {
+			return fmt.Errorf("read email: %w", err)
+		}
+		email = strings.TrimSpace(e)
+	}
+
+	// Read the password. --password-stdin reads exactly one line with no
+	// prompt (headless/CI mode). Otherwise, prompt interactively: use
+	// term.ReadPassword when stdin is a real terminal (suppresses echo);
+	// fall back to plain line-read for piped input (test path, scripts).
+	var password string
+	if args.PasswordStdin {
 		line, err := readLine(args.Stdin)
 		if err != nil {
 			return fmt.Errorf("read password: %w", err)
 		}
 		password = strings.TrimSpace(line)
+	} else {
+		fmt.Fprint(args.Stdout, "Password: ")
+		if f, ok := args.Stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+			pw, err := term.ReadPassword(int(f.Fd()))
+			if err != nil {
+				return fmt.Errorf("read password: %w", err)
+			}
+			// The terminal won't echo a newline after term.ReadPassword.
+			fmt.Fprintln(args.Stdout)
+			password = string(pw)
+		} else {
+			line, err := readLine(args.Stdin)
+			if err != nil {
+				return fmt.Errorf("read password: %w", err)
+			}
+			password = strings.TrimSpace(line)
+		}
 	}
 
 	// POST credentials to the pipeline-api token endpoint.

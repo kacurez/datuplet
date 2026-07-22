@@ -1,32 +1,17 @@
----
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-drop-processor"
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-raw"
-            defaultWriteMode: FULL_LOAD
-            processors:
-              - type: drop
-                columns:
-                  - title
-                  - body
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-drop-processor-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-drop-processor"
+name: "{{.RunPrefix}}-drop-processor"
+stages:
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-raw"
+          defaultWriteMode: FULL_LOAD
+          processors:
+            - type: drop
+              columns:
+                - title
+                - body

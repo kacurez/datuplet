@@ -8,27 +8,25 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/yaml"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
 )
 
-// ApplyPipelineCRD unmarshals pipelineYAML into a datupletv1.Pipeline,
+// ApplyPipelineCRD renders doc into a datupletv1.Pipeline via config.DocToCR,
 // forces the namespace, and Creates or Updates the object in K8s.
 // Uses a Get+Create/Update rather than server-side-apply because the
 // latter requires a FieldManager string and interacts awkwardly with
 // the fake client in tests — for MVP, Get+Create/Update is equivalent.
-func ApplyPipelineCRD(ctx context.Context, c client.Client, namespace, pipelineYAML string) error {
-	pl := &datupletv1.Pipeline{}
-	if err := yaml.Unmarshal([]byte(pipelineYAML), pl); err != nil {
-		return fmt.Errorf("unmarshal pipeline YAML: %w", err)
+func ApplyPipelineCRD(ctx context.Context, c client.Client, namespace string, doc *config.Pipeline) error {
+	if doc == nil {
+		return errors.New("pipeline doc is nil")
 	}
+	pl := config.DocToCR(doc) // sets TypeMeta (datuplet.io/v1, Pipeline) and ObjectMeta.Name.
 	if pl.Name == "" {
-		return errors.New("pipeline YAML has no metadata.name")
+		return errors.New("pipeline doc has no name")
 	}
 	pl.Namespace = namespace
-	pl.TypeMeta.APIVersion = "datuplet.io/v1"
-	pl.TypeMeta.Kind = "Pipeline"
 	pl.ResourceVersion = "" // Client.Create will reject a set RV.
 
 	existing := &datupletv1.Pipeline{}

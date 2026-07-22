@@ -3,14 +3,17 @@ package runbackend_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
+	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/pipeline/config"
+	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
@@ -30,27 +33,11 @@ func TestK8sBackendTriggerRunReturnsRunIDAndNamespace(t *testing.T) {
 		Audience:    "test-aud",
 	})
 
-	// Use a pipeline YAML with explicit table refs so
+	// Use a pipeline doc with explicit table refs so
 	// TableCapabilitiesFromPipeline produces at least one cap and the
 	// Minter is exercised. Bucket-level defaults don't generate per-table
 	// grants — only explicit table outputs do.
-	yaml := []byte(`apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: p
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          outputs:
-            tables:
-              - bucket: events
-                name: users
-                writeMode: APPEND
-`)
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -58,8 +45,7 @@ spec:
 	resp, err := be.TriggerRun(context.Background(), runbackend.TriggerRequest{
 		ProjectID:    projectID,
 		PipelineName: "p",
-		PipelineYAML: yaml,
-		Parsed:       parsed,
+		Doc:          parsed,
 	})
 	if err != nil {
 		t.Fatalf("TriggerRun: %v", err)
@@ -72,6 +58,51 @@ spec:
 	}
 	if resp.Namespace != expectedNS {
 		t.Errorf("Namespace = %q, want %q", resp.Namespace, expectedNS)
+	}
+}
+
+// TestK8sBackendTriggerRunAppliesDocAsCR asserts TriggerRun renders the
+// TriggerRequest.Doc into a Pipeline CR via config.DocToCR: the applied
+// object's ObjectMeta.Name and Spec match DocToCR(doc), living in the
+// project namespace.
+func TestK8sBackendTriggerRunAppliesDocAsCR(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
+	projectID := uuid.New()
+	expectedNS := "datuplet-" + projectID.String()
+
+	be := runbackend.NewK8sBackend(runbackend.K8sOpts{
+		Client:      c,
+		RunInserter: stubInserter{},
+		ProjectNS:   stubProjectNS{},
+		Minter:      stubMinter{},
+		Audience:    "test-aud",
+	})
+
+	parsed, err := config.Parse(minimalPipelineDoc())
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := be.TriggerRun(context.Background(), runbackend.TriggerRequest{
+		ProjectID:    projectID,
+		PipelineName: "p",
+		Doc:          parsed,
+	}); err != nil {
+		t.Fatalf("TriggerRun: %v", err)
+	}
+
+	got := &datupletv1.Pipeline{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "p", Namespace: expectedNS}, got); err != nil {
+		t.Fatalf("Get Pipeline CR: %v", err)
+	}
+	want := config.DocToCR(parsed)
+	if got.Name != want.Name {
+		t.Errorf("CR name = %q, want %q", got.Name, want.Name)
+	}
+	if got.Namespace != expectedNS {
+		t.Errorf("CR namespace = %q, want %q", got.Namespace, expectedNS)
+	}
+	if !reflect.DeepEqual(got.Spec, want.Spec) {
+		t.Errorf("CR spec = %+v, want %+v", got.Spec, want.Spec)
 	}
 }
 
@@ -95,16 +126,14 @@ func TestK8sBackend_WarehouseResolver_PopulatesSpec(t *testing.T) {
 		},
 	})
 
-	yaml := minimalPipelineYAML()
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	_, err = be.TriggerRun(context.Background(), runbackend.TriggerRequest{
 		ProjectID:    uuid.New(),
 		PipelineName: "p",
-		PipelineYAML: yaml,
-		Parsed:       parsed,
+		Doc:          parsed,
 	})
 	if err != nil {
 		t.Fatalf("TriggerRun: %v", err)
@@ -130,16 +159,14 @@ func TestK8sBackend_WarehouseResolver_ErrorPropagates(t *testing.T) {
 		},
 	})
 
-	yaml := minimalPipelineYAML()
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	_, err = be.TriggerRun(context.Background(), runbackend.TriggerRequest{
 		ProjectID:    uuid.New(),
 		PipelineName: "p",
-		PipelineYAML: yaml,
-		Parsed:       parsed,
+		Doc:          parsed,
 	})
 	if err == nil {
 		t.Fatal("expected error from WarehouseResolver, got nil")
@@ -164,16 +191,14 @@ func TestK8sBackend_WarehouseResolver_NilDegrades(t *testing.T) {
 		WarehouseResolver: nil, // intentionally nil
 	})
 
-	yaml := minimalPipelineYAML()
-	parsed, err := config.Parse(yaml)
+	parsed, err := config.Parse(minimalPipelineDoc())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	_, err = be.TriggerRun(context.Background(), runbackend.TriggerRequest{
 		ProjectID:    uuid.New(),
 		PipelineName: "p",
-		PipelineYAML: yaml,
-		Parsed:       parsed,
+		Doc:          parsed,
 	})
 	if err != nil {
 		t.Fatalf("TriggerRun with nil resolver: %v", err)
@@ -183,25 +208,25 @@ func TestK8sBackend_WarehouseResolver_NilDegrades(t *testing.T) {
 	}
 }
 
-// minimalPipelineYAML returns a minimal pipeline YAML with one output table
-// so the Minter is exercised inside TriggerRun.
-func minimalPipelineYAML() []byte {
-	return []byte(`apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: p
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: datuplet/test:latest
-          outputs:
-            tables:
-              - bucket: events
-                name: users
-                writeMode: APPEND
-`)
+// minimalPipelineDoc is the envelope-free doc-shape (RFC 027 §3) fed to
+// config.Parse to derive TriggerRequest.Doc. It declares one output table so
+// TableCapabilitiesFromPipeline produces a cap and the Minter is exercised.
+func minimalPipelineDoc() []byte {
+	return []byte(`{
+  "name": "p",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "outputs": {"tables": [{"bucket": "events", "name": "users", "writeMode": "APPEND"}]}
+        }
+      ]
+    }
+  ]
+}`)
 }
 
 // --- stubs ---

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Stdout Writer",
+  "description": "Reads input tables and prints them to stdout. For debugging only — no Iceberg output is produced.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "type": "string",
+      "enum": [
+        "csv",
+        "json"
+      ],
+      "default": "csv",
+      "description": "Format to print input tables in.",
+      "x-datuplet-doc": "Requested directly from the Data Gateway, so no client-side conversion happens. Any value other than \"csv\"/\"json\" (or an unparseable config) is not a validation error at the component level — it silently falls back to a raw passthrough of whatever bytes the gateway returns, requested in CSV form."
+    }
+  }
+}

@@ -1,4 +1,3 @@
----
 # Incremental Reads — stdout-writer reads only the rows written to
 # raw.products in the last minute, using the "since" duration filter
 #
@@ -7,33 +6,20 @@
 # Prerequisites: run processors-drop first to create raw.products
 #
 # Run it:
-#   UI:      Pipelines → New → paste this YAML → Save → Trigger
-#   REST:    see docs/pipeline-api.md "Upload a pipeline" + "Trigger a run"
-#   kubectl: kubectl apply -f examples/pipelines/incremental-reads.yaml   (applies Pipeline + PipelineRun)
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: incremental-reads
-  namespace: datuplet
-spec:
-  stages:
-    - name: read
-      components:
-        - name: stdout-writer
-          component: stdout-writer
-          inputs:
-            tables:
-              - bucket: raw
-                table: products
-                since: 1m
-          config:
-            format: csv
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: incremental-reads-run-1
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: incremental-reads
+#   CLI:   datuplet pipeline put -f examples/pipelines/incremental-reads.yaml
+#          datuplet trigger incremental-reads
+#   UI:    Pipelines → New → paste this YAML → Save → Trigger
+#   REST:  PUT /api/v1/projects/{pid}/pipelines/incremental-reads (see docs/pipeline-api.md)
+name: incremental-reads
+stages:
+  - name: read
+    components:
+      - name: stdout-writer
+        component: stdout-writer
+        inputs:
+          tables:
+            - bucket: raw
+              table: products
+              since: 1m
+        config:
+          format: csv

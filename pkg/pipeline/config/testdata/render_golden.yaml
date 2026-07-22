@@ -1,0 +1,43 @@
+name: events-etl
+description: Generate demo events and aggregate revenue per country.
+gateway:
+  chunkSize: 33554432
+stages:
+  - name: generate
+    components:
+      - name: gen
+        component: data-generator
+        version: 0.9.1
+        config:
+          tables:
+            - name: events
+              random:
+                limit:
+                  rowsCount: 100000
+                schema:
+                  amount: double
+                  country: string
+                  created: timestamp
+                  id: uuid
+              rowInsertSpeed: 1000
+        outputs:
+          defaultBucket: raw
+          defaultWriteMode: APPEND
+  - name: transform
+    components:
+      - name: daily-summary
+        component: sql-transform
+        config:
+          sql: |
+            CREATE TABLE daily_summary AS
+            SELECT country, count(*) AS events, sum(amount) AS revenue
+            FROM events GROUP BY country;
+        inputs:
+          tables:
+            - bucket: raw
+              table: events
+        outputs:
+          tables:
+            - name: daily_summary
+              bucket: curated
+              writeMode: FULL_LOAD

@@ -2,45 +2,53 @@ package http
 
 import (
 	"testing"
+
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
 )
 
-const timelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: daily-orders
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: api
-          component: x
-          inputs:
-            buckets: [api]
-          outputs:
-            tables:
-              - name: orders
-                bucket: raw
-                writeMode: FULL_LOAD
-    - name: transform
-      components:
-        - name: sql
-          component: y
-          inputs:
-            tables:
-              - {bucket: raw, table: orders}
-          outputs:
-            tables:
-              - name: orders_enriched
-                bucket: processed
-                writeMode: FULL_LOAD
-`
+const timelineDoc = `{
+  "name": "daily-orders",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "api",
+          "component": "x",
+          "inputs": {"buckets": ["api"]},
+          "outputs": {"tables": [{"name": "orders", "bucket": "raw", "writeMode": "FULL_LOAD"}]}
+        }
+      ]
+    },
+    {
+      "name": "transform",
+      "components": [
+        {
+          "name": "sql",
+          "component": "y",
+          "inputs": {"tables": [{"bucket": "raw", "table": "orders"}]},
+          "outputs": {"tables": [{"name": "orders_enriched", "bucket": "processed", "writeMode": "FULL_LOAD"}]}
+        }
+      ]
+    }
+  ]
+}`
+
+func mustParseTimelineDoc(t *testing.T) *config.Pipeline {
+	t.Helper()
+	doc, err := config.Parse([]byte(timelineDoc))
+	if err != nil {
+		t.Fatalf("parse timeline doc: %v", err)
+	}
+	return doc
+}
 
 func TestBuildTimeline_StagesImportsExports(t *testing.T) {
 	snap := []byte(`[
 	  {"name":"extract","phase":"Succeeded","startTime":"2026-06-16T14:02:12Z","completionTime":"2026-06-16T14:03:40Z"},
 	  {"name":"transform","phase":"Running","startTime":"2026-06-16T14:03:41Z"}
 	]`)
-	stages, err := buildTimeline(snap, timelineYAML)
+	stages, err := buildTimeline(snap, mustParseTimelineDoc(t))
 	if err != nil {
 		t.Fatalf("buildTimeline: %v", err)
 	}
@@ -70,13 +78,31 @@ func TestBuildTimeline_StagesImportsExports(t *testing.T) {
 }
 
 func TestBuildTimeline_EmptyOrNull(t *testing.T) {
+	doc := mustParseTimelineDoc(t)
 	for _, in := range [][]byte{nil, []byte("null"), []byte(""), []byte("[]")} {
-		stages, err := buildTimeline(in, timelineYAML)
+		stages, err := buildTimeline(in, doc)
 		if err != nil {
 			t.Fatalf("buildTimeline(%q): %v", in, err)
 		}
 		if stages != nil {
 			t.Errorf("buildTimeline(%q) = %v, want nil", in, stages)
 		}
+	}
+}
+
+// TestBuildTimeline_NilDoc confirms a nil doc is non-fatal: stages still render
+// from the snapshot, just with empty imported/exported sets.
+func TestBuildTimeline_NilDoc(t *testing.T) {
+	snap := []byte(`[{"name":"extract","phase":"Succeeded"}]`)
+	stages, err := buildTimeline(snap, nil)
+	if err != nil {
+		t.Fatalf("buildTimeline: %v", err)
+	}
+	if len(stages) != 1 || stages[0].Name != "extract" {
+		t.Fatalf("stages = %+v, want 1 extract stage", stages)
+	}
+	if len(stages[0].Imported) != 0 || len(stages[0].Exported) != 0 {
+		t.Errorf("nil doc must yield empty imported/exported, got imported=%+v exported=%+v",
+			stages[0].Imported, stages[0].Exported)
 	}
 }

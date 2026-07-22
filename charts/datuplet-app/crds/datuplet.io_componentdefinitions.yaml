@@ -70,6 +70,29 @@ spec:
                 description: DisplayName is the human-readable component name.
                 maxLength: 256
                 type: string
+              io:
+                description: |-
+                  IO declares this component's input/output capability. Nil means
+                  optional/optional (the component may or may not read/write tables).
+                  IO lives at the definition level, not per-version, by design.
+                properties:
+                  inputs:
+                    description: Inputs is the component's input capability mode.
+                    enum:
+                    - ""
+                    - none
+                    - optional
+                    - required
+                    type: string
+                  outputs:
+                    description: Outputs is the component's output capability mode.
+                    enum:
+                    - ""
+                    - none
+                    - optional
+                    - required
+                    type: string
+                type: object
               maintainer:
                 description: Maintainer identifies who owns this component definition.
                 maxLength: 256

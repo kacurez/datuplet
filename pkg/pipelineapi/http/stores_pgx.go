@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -94,7 +95,7 @@ func (r *pgxProjectReader) GetByID(ctx context.Context, id uuid.UUID) (*ProjectV
 // --- Pipelines ---
 
 // pgxPipelineStore adapts the pgx store's pipeline functions. Put is an
-// upsert: try GetByName first, UPDATE on hit, INSERT on miss; on a
+// upsert: try Get first, UPDATE on hit, INSERT on miss; on a
 // concurrent-PUT conflict (losing the insert race), retry as UPDATE.
 type pgxPipelineStore struct {
 	pool *pgxpool.Pool
@@ -113,15 +114,16 @@ func (s *pgxPipelineStore) List(ctx context.Context, projectID uuid.UUID) ([]Pip
 	out := make([]PipelineRef, 0, len(ps))
 	for _, p := range ps {
 		out = append(out, PipelineRef{
-			Name:      p.Name,
-			CreatedAt: p.CreatedAt,
-			UpdatedAt: p.UpdatedAt,
+			Name:        p.Name,
+			Description: p.Description,
+			CreatedAt:   p.CreatedAt,
+			UpdatedAt:   p.UpdatedAt,
 		})
 	}
 	return out, nil
 }
 
-func (s *pgxPipelineStore) GetByName(ctx context.Context, projectID uuid.UUID, name string) (*PipelineDetail, error) {
+func (s *pgxPipelineStore) Get(ctx context.Context, projectID uuid.UUID, name string) (*PipelineDetail, error) {
 	p, err := store.GetPipelineByName(ctx, s.pool, projectID, name)
 	if errors.Is(err, store.ErrPipelineNotFound) {
 		return nil, errStoreNotFound
@@ -130,36 +132,42 @@ func (s *pgxPipelineStore) GetByName(ctx context.Context, projectID uuid.UUID, n
 		return nil, err
 	}
 	return &PipelineDetail{
-		ID:        p.ID,
-		ProjectID: p.ProjectID,
+		ID:        p.ID.String(),
 		Name:      p.Name,
-		YAML:      p.YAML,
-		CreatedAt: p.CreatedAt,
-		UpdatedAt: p.UpdatedAt,
+		Doc:       json.RawMessage(p.Doc),
+		CreatedAt: p.CreatedAt.Format(pipelineTimeLayout),
+		UpdatedAt: p.UpdatedAt.Format(pipelineTimeLayout),
 	}, nil
 }
 
-func (s *pgxPipelineStore) GetYAMLByID(ctx context.Context, pipelineID uuid.UUID) (string, error) {
-	return store.GetPipelineYAMLByID(ctx, s.pool, pipelineID)
+func (s *pgxPipelineStore) GetDocByID(ctx context.Context, id string) ([]byte, error) {
+	pipelineID, err := uuid.Parse(id)
+	if err != nil {
+		return nil, fmt.Errorf("invalid pipeline id: %w", err)
+	}
+	doc, err := store.GetDocByID(ctx, s.pool, pipelineID)
+	if errors.Is(err, store.ErrPipelineNotFound) {
+		return nil, errStoreNotFound
+	}
+	return doc, err
 }
 
-func (s *pgxPipelineStore) Put(ctx context.Context, projectID uuid.UUID, name string, yaml []byte) error {
-	yamlStr := string(yaml)
+func (s *pgxPipelineStore) Put(ctx context.Context, projectID uuid.UUID, name string, doc []byte, description string) error {
 	// Upsert: update if exists, insert otherwise. Concurrent PUTs can
-	// race between the GetByName miss and the Create; on a
-	// unique-conflict fall through to Update rather than surfacing 500.
+	// race between the Get miss and the Create; on a unique-conflict
+	// fall through to Update rather than surfacing 500.
 	if _, err := store.GetPipelineByName(ctx, s.pool, projectID, name); err == nil {
-		if err := store.UpdatePipelineYAML(ctx, s.pool, projectID, name, yamlStr); err != nil {
+		if err := store.UpdatePipeline(ctx, s.pool, projectID, name, description, doc); err != nil {
 			return fmt.Errorf("update pipeline: %w", err)
 		}
 		return nil
 	} else if !errors.Is(err, store.ErrPipelineNotFound) {
 		return fmt.Errorf("lookup pipeline: %w", err)
 	}
-	if _, err := store.CreatePipeline(ctx, s.pool, projectID, name, yamlStr); err != nil {
+	if _, err := store.CreatePipeline(ctx, s.pool, projectID, name, description, doc); err != nil {
 		if errors.Is(err, store.ErrPipelineAlreadyExists) {
 			// Lost the race against a concurrent PUT — retry as update.
-			if err := store.UpdatePipelineYAML(ctx, s.pool, projectID, name, yamlStr); err != nil {
+			if err := store.UpdatePipeline(ctx, s.pool, projectID, name, description, doc); err != nil {
 				return fmt.Errorf("update pipeline after conflict: %w", err)
 			}
 			return nil

@@ -384,12 +384,13 @@ type infoResp struct {
 	MetadataLocation  string          `json:"metadata_location"`
 	CurrentSnapshotID int64           `json:"current_snapshot_id"`
 	Snapshots         []snapshotBrief `json:"snapshots"`
-	// RowCount/DataFileCount come from the current snapshot's summary
-	// (total-records / total-data-files). nil = summary absent (foreign
-	// writer); the UI renders "—". RFC 025 §4.2 replaced the manifest
-	// walk this used to do.
-	RowCount      *int64 `json:"row_count"`
-	DataFileCount *int64 `json:"data_file_count"`
+	// RowCount/DataFileCount/TotalFilesSize come from the current
+	// snapshot's summary (total-records / total-data-files /
+	// total-files-size). nil = summary absent (foreign writer); the UI
+	// renders "—". RFC 025 §4.2 replaced the manifest walk this used to do.
+	RowCount       *int64 `json:"row_count"`
+	DataFileCount  *int64 `json:"data_file_count"`
+	TotalFilesSize *int64 `json:"total_files_size"`
 }
 
 // parseSummaryInt parses an Iceberg summary property value ("" = absent).
@@ -440,6 +441,9 @@ func (h *HTTPHandlers) TableInfo(w http.ResponseWriter, r *http.Request) {
 		}
 		if n, ok := parseSummaryInt(cur.Summary.Properties["total-data-files"]); ok {
 			resp.DataFileCount = &n
+		}
+		if n, ok := parseSummaryInt(cur.Summary.Properties["total-files-size"]); ok {
+			resp.TotalFilesSize = &n
 		}
 	}
 

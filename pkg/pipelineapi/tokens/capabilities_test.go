@@ -28,7 +28,7 @@ func TestPipelineIntentFromPipeline(t *testing.T) {
 		},
 		{
 			name: "explicit input + output → both",
-			pipeline: &config.Pipeline{Spec: config.Spec{Stages: []config.Stage{{
+			pipeline: &config.Pipeline{Stages: []config.Stage{{
 				Components: []config.Component{{
 					Inputs: &config.InputSpec{Tables: []config.InputTableSpec{
 						{Bucket: "raw", Table: "events"},
@@ -37,34 +37,34 @@ func TestPipelineIntentFromPipeline(t *testing.T) {
 						{Bucket: "curated", Name: "summary", WriteMode: "FULL_LOAD"},
 					}},
 				}},
-			}}}},
+			}}},
 			want: tokens.PipelineIntent{HasReads: true, HasWrites: true},
 		},
 		{
 			name: "bucket-only inputs count as reads",
-			pipeline: &config.Pipeline{Spec: config.Spec{Stages: []config.Stage{{
+			pipeline: &config.Pipeline{Stages: []config.Stage{{
 				Components: []config.Component{{
 					Inputs: &config.InputSpec{Buckets: []string{"raw"}},
 				}},
-			}}}},
+			}}},
 			want: tokens.PipelineIntent{HasReads: true},
 		},
 		{
 			name: "defaultBucket counts as a write",
-			pipeline: &config.Pipeline{Spec: config.Spec{Stages: []config.Stage{{
+			pipeline: &config.Pipeline{Stages: []config.Stage{{
 				Components: []config.Component{{
 					Outputs: &config.OutputSpec{DefaultBucket: "raw"},
 				}},
-			}}}},
+			}}},
 			want: tokens.PipelineIntent{HasWrites: true},
 		},
 		{
 			name: "outputs.buckets[] counts as a write",
-			pipeline: &config.Pipeline{Spec: config.Spec{Stages: []config.Stage{{
+			pipeline: &config.Pipeline{Stages: []config.Stage{{
 				Components: []config.Component{{
 					Outputs: &config.OutputSpec{Buckets: []config.OutputBucketSpec{{Name: "raw"}}},
 				}},
-			}}}},
+			}}},
 			want: tokens.PipelineIntent{HasWrites: true},
 		},
 	}

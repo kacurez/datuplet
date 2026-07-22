@@ -1,35 +1,20 @@
----
 # RFC 026 P2 Task R11: unknown-component scenario. "does-not-exist" was
 # never registered — ComponentRegistry.Resolve (pkg/k8s/controllers/
 # pipelinerun_controller.go) returns an "unknown component" finding at
 # admission, before any Job is built: FailedUser, zero pods.
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: "{{.RunPrefix}}-unknown-component"
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: ghost
-          component: does-not-exist
-          version: dev
-          config:
-            tables:
-              - name: ghost
-                random:
-                  schema: {id: int}
-                  limit: {rowsCount: 10}
-          outputs:
-            defaultBucket: "{{.RunPrefix}}-unknown"
-            defaultWriteMode: APPEND
----
-apiVersion: datuplet.io/v1
-kind: PipelineRun
-metadata:
-  name: "{{.RunPrefix}}-unknown-component-run"
-  namespace: datuplet
-spec:
-  pipelineRef:
-    name: "{{.RunPrefix}}-unknown-component"
+name: "{{.RunPrefix}}-unknown-component"
+stages:
+  - name: extract
+    components:
+      - name: ghost
+        component: does-not-exist
+        version: dev
+        config:
+          tables:
+            - name: ghost
+              random:
+                schema: {id: int}
+                limit: {rowsCount: 10}
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-unknown"
+          defaultWriteMode: APPEND

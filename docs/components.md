@@ -1,77 +1,169 @@
-# Built-in Components
+# Component schemas
 
-Datuplet ships five published component images, plus a sixth (pandas-transform)
-that exists as a ComponentDefinition template but has no published image yet —
-see its section below. Each runs as an ordinary container alongside the Data
-Gateway sidecar; the component communicates with the sidecar via gRPC and HTTP —
-it never touches S3 directly.
+RFC 027 made each built-in component's config shape a first-class, versioned
+artifact instead of a shape hand-copied into the Helm chart. This page
+documents the authoring rules; for the config shape of a specific component,
+read its `schema.json` directly (pointers below) or fetch it live:
+
+```bash
+datuplet components get <name> --schema
+```
+
+Datuplet ships six built-in components — five with published images, plus
+`pandas-transform`, which exists as a ComponentDefinition template but has no
+published image yet (see its section below). Each runs as an ordinary
+container alongside the Data Gateway sidecar; the component communicates with
+the sidecar via gRPC and HTTP — it never touches S3 directly.
 
 Image registry: `ghcr.io/kacurez/<name>:<components.tag>` — the tag tracks the
-chart's `components.tag` (the release version; `v0.8.0` in this release). The
-per-component `Image:` lines below show the current release's tag.
+chart's `components.tag` (the release version; `v0.9.1` in this release).
+
+---
+
+## Source of truth + sync
+
+- `components/<name>/schema.json` — JSON Schema draft 2020-12, one per
+  component, next to the code that parses the config. Schema and parser are
+  authored and updated together, in the same commit — a plain file works
+  identically for Go components and for `pandas-transform` (Python).
+- `make sync-component-schemas` copies each into
+  `charts/datuplet-app/files/component-schemas/<name>.json`; the
+  ComponentDefinition templates read them via `.Files.Get` rather than
+  embedding an inline blob (Helm can only read files inside the chart
+  directory, hence the synced copy). CI runs the sync target and
+  `git diff --exit-code charts/` to catch drift.
+
+## The Form Subset (normative)
+
+The browser UI's pipeline builder renders component config as a **form**,
+recursively, at any depth — no separate "advanced mode" needed for a
+schema that stays within this subset:
+
+| Construct | Control |
+|---|---|
+| `object` + `properties`/`required` | field group (nested groups collapsible) |
+| `array` of objects | repeater cards with add/remove |
+| `array` of scalars | list editor |
+| `additionalProperties: {type: string [enum: …]}` | key→value map rows (e.g. data-generator's `random.schema: column→type`) |
+| scalar `string`/`integer`/`number` | input (numeric where typed) |
+| `boolean` | checkbox; tri-state select when `default` is present (unset / true / false) |
+| `enum` | select |
+| `x-datuplet-secret: true` | secret picker (`$[key]` reference, RFC 026 semantics unchanged) |
+| `x-datuplet-multiline: "<lang>"` | code textarea (e.g. `"sql"`) |
+| `x-datuplet-advanced: true` | property grouped into one collapsed **Advanced** section |
+| `x-datuplet-produces` (schema root only) | dynamic-output table-name resolution for the inputs picker |
+| `title`, `description`, `default`, `examples` | display metadata (below) |
+| `minimum`/`maximum`/`minLength`/`minItems`/`pattern` | advisory client-side checks; server + component stay authoritative |
+
+**Out of subset:** `oneOf`, `anyOf`, `allOf`, `not`, `$ref`, `$defs`, `if`,
+`then`, `else`, `patternProperties`, `const`. A node using one of these
+renders as a JSON sub-editor for that node only — never a whole-form
+fallback. This fallback path exists for **third-party / operator-registered**
+component schemas only; built-ins must lint clean and never exercise it.
+
+### Schema lint
+
+`pkg/pipeline/schemalint` walks every `components/*/schema.json` (enforced in
+CI via `pkg/pipeline/schemalint/schemalint_test.go`) and fails on:
+
+1. **Invalid or out-of-subset schema** — every node must be valid JSON with a
+   `type`, and must not use any of the forbidden keywords above.
+2. **Missing description** — every property must have a non-empty
+   `description`.
+3. **`required` + `default` contradiction** — a property cannot be both
+   required and carry a `default` (see below for why).
+4. **Unknown or misplaced annotation** — every `x-datuplet-*` key must be one
+   of the five below, and `x-datuplet-produces` is only allowed at the schema
+   root.
+
+### The five `x-datuplet-*` annotations
+
+| Annotation | Effect |
+|---|---|
+| `x-datuplet-secret: true` | Property renders as a `$[key]` secret picker instead of a plain text input. A plaintext secret can never be entered through the form. |
+| `x-datuplet-multiline: "<lang>"` | Property renders as a code textarea (e.g. `"sql"` for `sql-transform`'s `sql` field). |
+| `x-datuplet-advanced: true` | Property is grouped into one collapsed **Advanced** section instead of appearing inline. |
+| `x-datuplet-doc` | Optional long-form help, shown on hover. Ships to agents alongside `description` via `datuplet components get --schema`, since both live in the schema itself. |
+| `x-datuplet-produces` | **Schema root only.** A dot/wildcard path into the component's own config that yields its runtime output table names (e.g. data-generator's `"tables[*].name"`). Lets the pipeline builder's inputs picker resolve "produced upstream" tables automatically. UI-only sugar — the server never resolves it; a dynamic-bucket output whose names can't be resolved this way shows as `<bucket> (dynamic)` and isn't selectable. |
+
+### Descriptions and defaults
+
+- `description` is the always-visible one-line hint and is lint-mandatory.
+- `default` is **display metadata only** — rendered as placeholder text or an
+  empty-option label (e.g. `— default (FULL_LOAD) —`). An untouched field
+  stores nothing in the saved doc; the component applies its own default at
+  runtime. This is also why `required` + `default` on the same property is a
+  lint error: a required field can never be left unfilled, so a display-only
+  default on it is a contradiction. Dynamic defaults ("all CPUs granted to
+  the container") belong in `description` or `x-datuplet-doc`, never in
+  `default`.
+
+## IO capability
+
+Each component definition declares whether it consumes and/or produces
+tables, via `spec.io` on the `ComponentDefinition` CRD
+(`pkg/k8s/api/v1/component_types.go`):
+
+```go
+IO *ComponentIO `json:"io,omitempty"`
+
+type ComponentIO struct {
+    Inputs  string `json:"inputs,omitempty"`  // none | optional | required (default optional)
+    Outputs string `json:"outputs,omitempty"` // none | optional | required (default optional)
+}
+```
+
+- `inputs`/`outputs`, each one of `none`, `optional`, or `required` (empty
+  string / omitted defaults to `optional`).
+- The catalog API (`GET /api/v1/components(/{name})`) always returns a
+  resolved, never-empty `io: {inputs, outputs}` object per component.
+- UI gating: `inputs: none` hides the Inputs section entirely (extractors,
+  data-generator); `outputs: none` hides the Outputs section (stdout-writer).
+- Validation: declaring `inputs` on an `inputs: none` component is an error;
+  omitting inputs on an `inputs: required` component is an error; symmetric
+  for outputs.
+- `io` lives at the **definition** level, not per version — it declares what
+  kind of component this is (extractor / transform / writer), which is
+  identity, not per-version behavior.
+- Built-in IO declarations: data-generator / http-json-extractor /
+  finnhub-extractor are `{none, required}`; sql-transform / pandas-transform
+  are `{required, required}`; stdout-writer is `{required, none}`.
+
+## What schema validation cannot catch
+
+The Form Subset deliberately excludes `oneOf`/`if`-`then`-`else`, so
+component-internal semantic invariants — e.g. data-generator's "exactly one
+of `random`/`literal`, and `random.limit` must be non-empty" — cannot be
+expressed in `schema.json` and are **not** caught by `validate` or `PUT`.
+These stay component-enforced: the component fails fast at start with exit 1
+(`FailedUser`) and a `DUPLET_STATUS_MESSAGE:`-prefixed explanation. See
+[docs/known-limitations.md](known-limitations.md).
 
 ---
 
 ## data-generator
 
-Generates random or literal rows inline from pipeline YAML — useful for testing
-pipelines without an external data source.
+Generates random or literal rows inline from pipeline YAML — useful for
+testing pipelines without an external data source.
 
-**Image:** `ghcr.io/kacurez/data-generator:v0.8.0`
+**Image:** `ghcr.io/kacurez/data-generator:v0.9.1` · **Registry name:**
+`data-generator` · **IO:** `{inputs: none, outputs: required}`
 
-**Registry name:** `data-generator` · default version from the chart
-
-**Config schema (random mode):**
-
-```yaml
-- name: gen
-  component: data-generator
-  config:
-    tables:
-      - name: events
-        random:
-          schema:
-            id: int
-            ts: timestamp
-            value: double
-            label: string
-          limit:
-            rowsCount: 1000       # stop after 1000 rows
-            # sizeInBytes: 1048576  # OR stop after ~1 MiB
-            # timeoutInSeconds: 30  # OR stop after 30 s
-  outputs:
-    defaultBucket: raw
-    defaultWriteMode: APPEND
-```
-
-**Config schema (literal mode):**
-
-```yaml
-- name: seed
-  component: data-generator
-  config:
-    tables:
-      - name: lookup
-        literal:
-          columns: [id, country, code]
-          rows:
-            - [1, "US", "USD"]
-            - [2, "DE", "EUR"]
-  outputs:
-    defaultBucket: raw
-    defaultWriteMode: FULL_LOAD
-```
+**Config schema:** [`components/data-generator/schema.json`](../components/data-generator/schema.json)
+(`x-datuplet-produces: "tables[*].name"`). Two mutually-exclusive generation
+modes per table — `random` (column-to-type schema + stop limit) or `literal`
+(explicit columns + rows) — enforced by the component at start, not by the
+schema (see "What schema validation cannot catch" above).
 
 **Supported column types (random mode):** `string`, `int`, `long`, `float`,
 `double`, `boolean`, `date`, `timestamp`, `now`, `uuid`.
 
-**Limit semantics:** OR — the first limit to trip wins.
+**Fault injection:** `random.userErrorMessage` simulates a user-error exit at
+a random row — a first-class platform-test tool for exercising pipeline
+failure paths.
 
-**Fault injection:** Set `random.userErrorMessage` to simulate a user-error exit
-at a random point during generation. Useful for testing pipeline failure paths.
-
-**Reproducibility:** Same `run_id` + `table_name` → same row sequence (PCG seeded
-from SHA-256 of the pair).
+**Reproducibility:** Same `run_id` + `table_name` → same row sequence (PCG
+seeded from SHA-256 of the pair).
 
 ---
 
@@ -80,51 +172,11 @@ from SHA-256 of the pair).
 Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports
 single-request and paginated modes.
 
-**Image:** `ghcr.io/kacurez/http-json-extractor:v0.8.0`
+**Image:** `ghcr.io/kacurez/http-json-extractor:v0.9.1` · **Registry name:**
+`http-json-extractor` · **IO:** `{inputs: none, outputs: required}`
 
-**Registry name:** `http-json-extractor` · default version from the chart
-
-**Config schema (single request):**
-
-```yaml
-- name: fetch
-  component: http-json-extractor
-  config:
-    url: "https://api.example.com/items"
-    array_path: "items"     # key of the JSON array in the response object
-                            # omit if the response is a top-level array
-    table_name: "items"     # output table name (defaults to array_path or "data")
-    headers:
-      # $[name] refs must be a whole scalar, so the Secret value carries the
-      # full header, "Bearer " prefix included (see docs/secrets.md).
-      Authorization: "$[api_token]"
-  outputs:
-    defaultBucket: raw
-    defaultWriteMode: APPEND
-```
-
-**Config schema (paginated):**
-
-```yaml
-- name: fetch-paged
-  component: http-json-extractor
-  config:
-    url: "https://api.example.com/records"
-    array_path: "records"
-    pagination:
-      type: page            # "page" or "offset"
-      param: page           # query parameter name
-      start: 1              # starting value (default 1 for page, 0 for offset)
-      increment: 1
-      page_size: 100
-      size_param: per_page  # query param for page size (optional)
-      max_pages: 50         # 0 = unlimited
-      max_records: 5000     # 0 = unlimited
-      stop_when_empty: true # stop on empty page (default true)
-  outputs:
-    defaultBucket: raw
-    defaultWriteMode: APPEND
-```
+**Config schema:** [`components/http-json-extractor/schema.json`](../components/http-json-extractor/schema.json)
+(`x-datuplet-produces: "table_name"`).
 
 For API keys, use `$[name]` in the `headers` map and set the value in the
 project's managed secrets. See [docs/secrets.md](secrets.md).
@@ -136,48 +188,19 @@ project's managed secrets. See [docs/secrets.md](secrets.md).
 Fetches market data from the [Finnhub](https://finnhub.io/) API. Requires a
 Finnhub API key.
 
-**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.8.0`
+**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.9.1` · **Registry name:**
+`finnhub-extractor` · **IO:** `{inputs: none, outputs: required}`
 
-**Registry name:** `finnhub-extractor` · default version from the chart
+**Config schema:** [`components/finnhub-extractor/schema.json`](../components/finnhub-extractor/schema.json).
+`mode` selects the extraction (`quote`, `news`, `company-news`,
+`basic-financials`, `earnings`, `recommendations`, `insider-transactions`);
+each mode writes to a fixed, component-internal output table name (documented
+in the schema's `x-datuplet-doc` on `mode` — these names are not resolvable
+via `x-datuplet-produces`, so reference them directly when wiring a
+downstream stage's input).
 
-**Config schema:**
-
-```yaml
-- name: market
-  component: finnhub-extractor
-  config:
-    mode: quote             # see modes below
-    symbols: [AAPL, MSFT, GOOG]
-    apiKey: $[finnhub_key]  # use secret reference
-  outputs:
-    defaultBucket: raw
-    defaultWriteMode: APPEND
-```
-
-**Supported modes:**
-
-| Mode | Output table | Description |
-|---|---|---|
-| `quote` | `market_data` | OHLC + change for each symbol |
-| `news` | `news_raw` | General market news (filtered by `lookback_days`) |
-| `company-news` | `company_news` | Per-symbol news with date-range filter |
-| `basic-financials` | `basic_financials` | P/E, P/B, market cap, 52w high/low |
-| `earnings` | `earnings` | Earnings surprises (last N quarters, `limit: 4`) |
-| `recommendations` | `recommendations` | Analyst consensus per symbol |
-| `insider-transactions` | `insider_tx` | SEC insider trades, filtered by `lookback_days` |
-
-**Additional config fields:**
-
-```yaml
-config:
-  mode: company-news
-  symbols: [TSLA]
-  lookback_days: 7    # filter news/transactions to last N days
-  limit: 8            # quarters for earnings mode (default 4)
-  apiKey: $[finnhub_key]
-```
-
-Set the key in the project's managed secrets (UI: Settings → Secrets, or the API):
+Set the key in the project's managed secrets (UI: Settings → Secrets, or the
+API):
 
 ```bash
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
@@ -197,40 +220,12 @@ Data Gateway via Arrow IPC and are materialized into DuckDB tables before the SQ
 runs. Outputs are written back through the Data Gateway; no S3 credentials touch
 the component.
 
-**Image:** `ghcr.io/kacurez/sql-transform:v0.8.0`
+**Image:** `ghcr.io/kacurez/sql-transform:v0.9.1` · **Registry name:**
+`sql-transform` · **IO:** `{inputs: required, outputs: required}`
 
-**Registry name:** `sql-transform` · default version from the chart
-
-**Config schema:**
-
-```yaml
-- name: transform
-  component: sql-transform
-  inputs:
-    tables:
-      - bucket: raw
-        table: orders
-      - bucket: raw
-        table: customers
-        logicalName: cust     # name to use in SQL (overrides "customers")
-  outputs:
-    tables:
-      - name: order_summary
-        bucket: curated
-        writeMode: FULL_LOAD
-  config:
-    sql: |
-      CREATE TABLE order_summary AS
-      SELECT
-        cust.country,
-        SUM(o.total)  AS total_revenue,
-        COUNT(*)      AS order_count
-      FROM orders o
-      JOIN cust ON o.customer_id = cust.id
-      GROUP BY cust.country;
-    threads: 4                # DuckDB thread count (default 4)
-    temp_directory: /tmp/spill  # spill-to-disk path
-```
+**Config schema:** [`components/sql-transform/schema.json`](../components/sql-transform/schema.json)
+(`sql` is `x-datuplet-multiline: "sql"`; `threads`/`memory`/`max_temp_size`/
+`temp_directory` are `x-datuplet-advanced`).
 
 **Key points:**
 
@@ -238,10 +233,7 @@ the component.
   DuckDB in-memory tables before the user SQL runs. This is load-bearing: DuckDB's
   `arrow_scan` extension does not support multi-pass reads on a streaming source.
 - The SQL `CREATE TABLE <name>` must match the `outputs.tables[].name` (or its
-  `logicalName` if set).
-- `logicalName` on inputs overrides the view name used in SQL.
-- `logicalName` on outputs overrides the DuckDB table name the user writes
-  `CREATE TABLE` against.
+  `logicalName` if set); `logicalName` on inputs overrides the view name used in SQL.
 - `writeMode: FULL_LOAD` replaces the entire Iceberg table; `APPEND` adds rows.
 - The component is credentials-clean: it holds no S3 or Lakekeeper credentials.
 
@@ -251,7 +243,7 @@ the component.
 - `sinceDays` time-filter is wired through the CRD but the column-predicate push
   is not yet honoured by the Lakekeeper read path; full-snapshot reads are used.
 - Schema evolution: if your SQL creates an output table with a different schema than
-  the existing Iceberg target, the TableCommit Job will fail with `FailedUser`.
+  the existing Iceberg target, the commit fails with `FailedUser`.
 
 ---
 
@@ -267,52 +259,15 @@ Applies a sequence of pandas operations to input data. Reads the input table as
 CSV from the Data Gateway, applies the operations in order, and writes the
 result back as CSV — no S3 or Lakekeeper credentials touch the component.
 
-**Image:** `ghcr.io/kacurez/pandas-transform:v0.8.0`
+**Image:** `ghcr.io/kacurez/pandas-transform:v0.9.1` · **Registry name:**
+`pandas-transform` · **IO:** `{inputs: required, outputs: required}`
 
-**Registry name:** `pandas-transform` · default version from the chart
+**Config schema:** [`components/pandas-transform/schema.json`](../components/pandas-transform/schema.json)
+(`x-datuplet-produces: "output_table"`).
 
-**Config schema:**
-
-```yaml
-- name: clean
-  component: pandas-transform
-  inputs:
-    tables:
-      - bucket: raw
-        table: events
-  outputs:
-    defaultBucket: curated
-    defaultWriteMode: FULL_LOAD
-  config:
-    output_table: events_clean   # optional, defaults to the input table name
-    operations:
-      - type: filter
-        column: value
-        op: ">"                  # ">", ">=", "<", "<=", "==", "!=", "in", "contains"
-        value: 0
-      - type: select
-        columns: [id, value, label]
-      - type: rename
-        columns:
-          value: amount
-      - type: sort
-        by: [id]                 # string or list
-        ascending: true
-      - type: fillna
-        column: amount           # omit to fill all columns
-        value: 0
-```
-
-**Supported operations (applied in order):**
-
-| Type | Fields | Description |
-|---|---|---|
-| `filter` | `column`, `op`, `value` | Keep rows matching the condition |
-| `select` | `columns` | Keep only the listed columns |
-| `sort` | `by`, `ascending` (default `true`) | Sort rows |
-| `rename` | `columns` (map of old name → new name) | Rename columns |
-| `drop` | `columns` (string or list) | Drop columns |
-| `fillna` | `column` (optional), `value` | Fill missing values |
+**Supported operations (applied in order):** `filter`, `select`, `sort`,
+`rename`, `drop`, `fillna` — see the schema's `operations[].type` enum and
+per-type `x-datuplet-doc` for fields.
 
 Only one input table is read (the first entry under `inputs.tables`). Unknown
 operation types and references to missing columns are logged as warnings and
@@ -325,56 +280,41 @@ skipped rather than failing the run.
 Reads input tables and prints them to stdout. For debugging only — no Iceberg
 output.
 
-**Image:** `ghcr.io/kacurez/stdout-writer:v0.8.0`
+**Image:** `ghcr.io/kacurez/stdout-writer:v0.9.1` · **Registry name:**
+`stdout-writer` · **IO:** `{inputs: required, outputs: none}`
 
-**Registry name:** `stdout-writer` · default version from the chart
+**Config schema:** [`components/stdout-writer/schema.json`](../components/stdout-writer/schema.json)
+(`format`: `csv` (default) or `json`).
 
-**Config schema:**
-
-```yaml
-- name: print
-  component: stdout-writer
-  inputs:
-    tables:
-      - bucket: raw
-        table: events
-  config:
-    format: csv     # "csv" (default) or "json"
-```
-
-**Example pipeline:**
+**Example pipeline** (PipelineDoc format, RFC 027 — see
+[docs/pipeline-api.md](pipeline-api.md)):
 
 ```yaml
-apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: debug-pipeline
-  namespace: datuplet
-spec:
-  stages:
-    - name: generate
-      components:
-        - name: gen
-          component: data-generator
-          config:
-            tables:
-              - name: events
-                random:
-                  schema: { id: int, value: double }
-                  limit: { rowsCount: 10 }
-          outputs:
-            defaultBucket: raw
-            defaultWriteMode: APPEND
-    - name: print
-      components:
-        - name: printer
-          component: stdout-writer
-          inputs:
-            tables:
-              - bucket: raw
-                table: events
-          config:
-            format: json
+name: debug-pipeline
+stages:
+  - name: generate
+    components:
+      - name: gen
+        component: data-generator
+        config:
+          tables:
+            - name: events
+              random:
+                schema: { id: int, value: double }
+                limit: { rowsCount: 10 }
+        outputs:
+          defaultBucket: raw
+          defaultWriteMode: APPEND
+  - name: print
+    components:
+      - name: printer
+        component: stdout-writer
+        inputs:
+          tables:
+            - bucket: raw
+              table: events
+        config:
+          format: json
 ```
 
 View output in component logs:
@@ -391,6 +331,11 @@ Use the Go SDK (`sdk/go/`) or Python SDK (`sdk/python/`) to build a component.
 Both SDKs are ~200–300 LOC and expose three operations: `OpenWriter`,
 `WriteChunk` / `Write`, and `Close`. The SDKs handle gRPC connection, config
 resolution, and secret delivery from the Data Gateway sidecar.
+
+Write a `schema.json` next to your parser, following the Form Subset rules
+above, and register it as a `ComponentDefinition` with the appropriate `io`
+capability — see any built-in's chart template under
+`charts/datuplet-app/templates/components/` for the shape.
 
 See [`sdk/go/client.go`](../sdk/go/client.go) and
 [`sdk/python/client.py`](../sdk/python/client.py) for the entry points.

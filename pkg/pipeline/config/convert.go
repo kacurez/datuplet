@@ -1,94 +1,165 @@
 package config
 
 import (
+	"encoding/json"
+
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 )
 
-// FromCRD converts the typed CRD pipeline (the single validated
-// representation) into the runtime view used by the runner, capability
-// derivation, and gateway-config generation. It is the ONLY bridge
-// between the two shapes (RFC 026 §4.3: no third dialect survives).
+// DocToCR and CRToDoc are the ONLY bridge between the flat, envelope-free
+// PipelineDoc (RFC 027 §3) and the typed CRD-shaped datupletv1.Pipeline.
+// They are pure structural conversions (no defaulting, no validation) and
+// own the two field-name renames the CRD and the doc disagree on:
+//   - InputTableSpec: doc "as"            <-> CRD "logicalName"
+//   - PartitionFieldSpec: doc "source_column" <-> CRD "sourceColumn"
 //
-// Defaulting is applied here so the runtime view is identical to what the
-// old YAML-decode parser produced: kubebuilder defaults are not applied by
-// Go decode (only by the API server), so FromCRD reproduces them.
-func FromCRD(p *datupletv1.Pipeline) (*Pipeline, error) {
-	out := &Pipeline{
-		APIVersion: p.APIVersion,
-		Kind:       p.Kind,
-		Metadata: Metadata{
-			Name:   p.Name,
-			Labels: p.Labels,
+// PipelineSpec has no Description field (the CRD is unchanged by RFC 027 -
+// see spec §3): Description does NOT round-trip through the CR at all.
+// Its canonical home is the DB (store.Pipeline.Description, wired in a
+// later task); a Pipeline produced by CRToDoc always has Description == ""
+// because the CR never carried it in the first place, by spec design.
+//
+// Both directions are plain field-by-field struct copies (no reflection) so
+// the round-trip test (convert_test.go) is a meaningful tripwire against
+// silently dropped fields.
+
+// DocToCR converts a PipelineDoc into the typed CRD representation, e.g. for
+// admission or storage as a Pipeline custom resource.
+func DocToCR(p *Pipeline) *datupletv1.Pipeline {
+	cr := &datupletv1.Pipeline{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "datuplet.io/v1", Kind: "Pipeline"},
+		ObjectMeta: metav1.ObjectMeta{Name: p.Name},
+		Spec: datupletv1.PipelineSpec{
+			Gateway: gatewayToCRD(p.Gateway),
 		},
-		Spec: Spec{
-			Gateway: gatewayFromCRD(p.Spec.Gateway),
-		},
 	}
-
-	// Defaults for identity fields (old applyDefaults).
-	if out.APIVersion == "" {
-		out.APIVersion = DefaultAPIVersion
+	for _, s := range p.Stages {
+		cr.Spec.Stages = append(cr.Spec.Stages, stageToCRD(s))
 	}
-	if out.Kind == "" {
-		out.Kind = DefaultKind
-	}
-
-	for i := range p.Spec.Stages {
-		stage := &p.Spec.Stages[i]
-		s := Stage{Name: stage.Name}
-		for j := range stage.Components {
-			comp, err := componentFromCRD(&stage.Components[j])
-			if err != nil {
-				return nil, err
-			}
-			s.Components = append(s.Components, comp)
-		}
-		out.Spec.Stages = append(out.Spec.Stages, s)
-	}
-
-	return out, nil
+	return cr
 }
 
-// gatewayFromCRD copies gateway settings and reproduces the old
-// applyDefaults gateway defaulting.
-func gatewayFromCRD(g datupletv1.GatewaySpec) GatewayConfig {
-	out := GatewayConfig{
+// CRToDoc converts the typed CRD representation back into a PipelineDoc.
+func CRToDoc(cr *datupletv1.Pipeline) *Pipeline {
+	out := &Pipeline{
+		Name:    cr.Name,
+		Gateway: gatewayFromCRD(cr.Spec.Gateway),
+	}
+	for _, s := range cr.Spec.Stages {
+		out.Stages = append(out.Stages, stageFromCRD(s))
+	}
+	return out
+}
+
+func gatewayToCRD(g GatewayConfig) datupletv1.GatewaySpec {
+	return datupletv1.GatewaySpec{
 		ChunkSize:      g.ChunkSize,
 		BufferSize:     g.BufferSize,
 		RowGroupSize:   g.RowGroupSize,
 		TargetFileSize: g.TargetFileSize,
 	}
-	if out.ChunkSize == 0 {
-		out.ChunkSize = DefaultChunkSize
+}
+
+func gatewayFromCRD(g datupletv1.GatewaySpec) GatewayConfig {
+	return GatewayConfig{
+		ChunkSize:      g.ChunkSize,
+		BufferSize:     g.BufferSize,
+		RowGroupSize:   g.RowGroupSize,
+		TargetFileSize: g.TargetFileSize,
 	}
-	if out.BufferSize == 0 {
-		out.BufferSize = DefaultBufferSize
-	}
-	if out.RowGroupSize == 0 {
-		out.RowGroupSize = out.BufferSize // Default to buffer size.
-	}
-	if out.TargetFileSize == 0 {
-		out.TargetFileSize = DefaultTargetFileSize
+}
+
+func stageToCRD(s Stage) datupletv1.StageSpec {
+	out := datupletv1.StageSpec{Name: s.Name}
+	for _, c := range s.Components {
+		out.Components = append(out.Components, componentToCRD(c))
 	}
 	return out
 }
 
-func componentFromCRD(c *datupletv1.ComponentSpec) (Component, error) {
-	cfg, err := c.ConfigMap()
-	if err != nil {
-		return Component{}, err
+func stageFromCRD(s datupletv1.StageSpec) Stage {
+	out := Stage{Name: s.Name}
+	for _, c := range s.Components {
+		out.Components = append(out.Components, componentFromCRD(c))
 	}
+	return out
+}
+
+func componentToCRD(c Component) datupletv1.ComponentSpec {
+	return datupletv1.ComponentSpec{
+		Name:      c.Name,
+		Component: c.Component,
+		Version:   c.Version,
+		Config:    configToCRD(c.Config),
+		Inputs:    inputsToCRD(c.Inputs),
+		Outputs:   outputsToCRD(c.Outputs),
+		Resources: resourcesToCRD(c.Resources),
+	}
+}
+
+func componentFromCRD(c datupletv1.ComponentSpec) Component {
 	return Component{
 		Name:      c.Name,
 		Component: c.Component,
 		Version:   c.Version,
-		Config:    cfg,
+		Config:    configFromCRD(c.Config),
 		Inputs:    inputsFromCRD(c.Inputs),
 		Outputs:   outputsFromCRD(c.Outputs),
 		Resources: resourcesFromCRD(c.Resources),
-	}, nil
+	}
+}
+
+// configToCRD marshals the runtime config map into the CRD's raw JSON blob.
+// A nil/empty map yields a zero-value apiextensionsv1.JSON (no Raw bytes),
+// mirroring configFromCRD's nil-safe unmarshal.
+func configToCRD(m map[string]any) apiextensionsv1.JSON {
+	if len(m) == 0 {
+		return apiextensionsv1.JSON{}
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		// Config is arbitrary user data validated elsewhere; a plain
+		// map[string]any built from JSON/YAML decode always marshals.
+		panic(err)
+	}
+	return apiextensionsv1.JSON{Raw: raw}
+}
+
+func configFromCRD(j apiextensionsv1.JSON) map[string]any {
+	if len(j.Raw) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(j.Raw, &m); err != nil {
+		// Same reasoning as configToCRD: Raw only ever came from a prior
+		// marshal of a plain map[string]any.
+		panic(err)
+	}
+	return m
+}
+
+func inputsToCRD(in *InputSpec) *datupletv1.InputSpec {
+	if in == nil {
+		return nil
+	}
+	out := &datupletv1.InputSpec{Buckets: in.Buckets}
+	for _, t := range in.Tables {
+		out.Tables = append(out.Tables, datupletv1.InputTableSpec{
+			Bucket:          t.Bucket,
+			Table:           t.Table,
+			LogicalName:     t.As, // runtime "as" is the CRD logicalName.
+			Since:           t.Since,
+			SinceSnapshot:   t.SinceSnapshot,
+			SinceDays:       t.SinceDays,
+			TimestampColumn: t.TimestampColumn,
+		})
+	}
+	return out
 }
 
 func inputsFromCRD(in *datupletv1.InputSpec) *InputSpec {
@@ -110,8 +181,44 @@ func inputsFromCRD(in *datupletv1.InputSpec) *InputSpec {
 	return out
 }
 
-// outputsFromCRD maps outputs and reproduces the old applyOutputDefaults
-// write-mode defaulting (empty -> FULL_LOAD).
+func outputsToCRD(o *OutputSpec) *datupletv1.OutputSpec {
+	if o == nil {
+		return nil
+	}
+	out := &datupletv1.OutputSpec{
+		DefaultBucket:    o.DefaultBucket,
+		DefaultWriteMode: o.DefaultWriteMode,
+	}
+	for _, b := range o.Buckets {
+		out.Buckets = append(out.Buckets, datupletv1.OutputBucketSpec{
+			Name:      b.Name,
+			WriteMode: b.WriteMode,
+		})
+	}
+	for _, t := range o.Tables {
+		ot := datupletv1.OutputTableSpec{
+			Name:        t.Name,
+			Bucket:      t.Bucket,
+			WriteMode:   t.WriteMode,
+			LogicalName: t.LogicalName,
+		}
+		for _, pf := range t.PartitionSpec {
+			ot.PartitionFields = append(ot.PartitionFields, datupletv1.PartitionFieldSpec{
+				SourceColumn: pf.SourceColumn,
+				Transform:    pf.Transform,
+			})
+		}
+		out.Tables = append(out.Tables, ot)
+	}
+	for _, p := range o.Processors {
+		out.Processors = append(out.Processors, datupletv1.ProcessorSpec{
+			Type:    p.Type,
+			Columns: p.Columns,
+		})
+	}
+	return out
+}
+
 func outputsFromCRD(o *datupletv1.OutputSpec) *OutputSpec {
 	if o == nil {
 		return nil
@@ -120,30 +227,17 @@ func outputsFromCRD(o *datupletv1.OutputSpec) *OutputSpec {
 		DefaultBucket:    o.DefaultBucket,
 		DefaultWriteMode: o.DefaultWriteMode,
 	}
-	if out.DefaultBucket != "" && out.DefaultWriteMode == "" {
-		out.DefaultWriteMode = DefaultWriteMode
-	}
-
 	for _, b := range o.Buckets {
-		mode := b.WriteMode
-		if mode == "" {
-			mode = DefaultWriteMode
-		}
 		out.Buckets = append(out.Buckets, OutputBucketSpec{
 			Name:      b.Name,
-			WriteMode: mode,
+			WriteMode: b.WriteMode,
 		})
 	}
-
 	for _, t := range o.Tables {
-		mode := t.WriteMode
-		if mode == "" {
-			mode = DefaultWriteMode
-		}
 		ot := OutputTableSpec{
 			Name:        t.Name,
 			Bucket:      t.Bucket,
-			WriteMode:   mode,
+			WriteMode:   t.WriteMode,
 			LogicalName: t.LogicalName,
 		}
 		for _, pf := range t.PartitionFields {
@@ -154,15 +248,42 @@ func outputsFromCRD(o *datupletv1.OutputSpec) *OutputSpec {
 		}
 		out.Tables = append(out.Tables, ot)
 	}
-
 	for _, p := range o.Processors {
 		out.Processors = append(out.Processors, Processor{
 			Type:    p.Type,
 			Columns: p.Columns,
 		})
 	}
-
 	return out
+}
+
+// resourcesToCRD expands the runtime's flat memory/cpu strings into the
+// CRD's corev1.ResourceRequirements limits, only where set.
+//
+// A malformed quantity string is silently dropped (left absent from the
+// resulting ResourceList) rather than panicking, since DocToCR's signature
+// has no error return. There is currently no resource-quantity-syntax check
+// upstream of DocToCR (ValidatePipelineDoc runs shared validation rules
+// AFTER DocToCR, per spec §5.4) — carried forward as an S3 TODO: S3 owns
+// re-pointing validation and should add resource-quantity-syntax validation
+// BEFORE conversion so malformed values become clean findings instead of
+// silently-dropped resources.
+func resourcesToCRD(r *ResourceSpec) *corev1.ResourceRequirements {
+	if r == nil || (r.Memory == "" && r.CPU == "") {
+		return nil
+	}
+	limits := corev1.ResourceList{}
+	if r.Memory != "" {
+		if q, err := resource.ParseQuantity(r.Memory); err == nil {
+			limits[corev1.ResourceMemory] = q
+		}
+	}
+	if r.CPU != "" {
+		if q, err := resource.ParseQuantity(r.CPU); err == nil {
+			limits[corev1.ResourceCPU] = q
+		}
+	}
+	return &corev1.ResourceRequirements{Limits: limits}
 }
 
 // resourcesFromCRD flattens the CRD's corev1.ResourceRequirements limits into

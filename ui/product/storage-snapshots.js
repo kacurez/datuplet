@@ -9,7 +9,7 @@
 // placeholder dashes so history is always contiguous.
 
 import { esc, getTableSnapshots } from '/ui/api.js';
-import { timeTag } from '/ui/format.js';
+import { timeTag, formatBytes } from '/ui/format.js';
 
 /**
  * Fetch and render the snapshot history table into `root`.
@@ -50,7 +50,6 @@ export async function renderSnapshotHistory(root, projectId, namespace, tableNam
   }
 
   const tbody = rows.map((s) => {
-    const badge = runModeBadge(s.run_mode);
     // Prefer the human-readable email when the server resolved the
     // actor UUID against the users table; fall back to the UUID for
     // pre-RFC-013 snapshots, deleted users, or DB-resolution failures.
@@ -62,19 +61,25 @@ export async function renderSnapshotHistory(root, projectId, namespace, tableNam
     } else {
       actor = '<span style="color:var(--fg-2);">—</span>';
     }
+    // The snapshot's run_id is the run UUID — deep-link to its run detail
+    // page (the SPA router intercepts /ui/ links). Empty for foreign /
+    // pre-RFC-013 writers.
     const runId = s.run_id
-      ? `<code class="mono">${esc(s.run_id)}</code>`
+      ? `<a href="/ui/runs/${encodeURIComponent(s.run_id)}"><code class="mono">${esc(s.run_id)}</code></a>`
       : '<span style="color:var(--fg-2);">—</span>';
     const records = typeof s.added_records === 'number'
       ? esc(String(s.added_records))
       : '<span style="color:var(--fg-2);">—</span>';
+    const size = typeof s.added_files_size === 'number'
+      ? `<span title="${esc(String(s.added_files_size))} bytes">${esc(formatBytes(s.added_files_size))}</span>`
+      : '<span style="color:var(--fg-2);">—</span>';
     return `<tr>
       <td><code class="mono">${esc(String(s.snapshot_id))}</code></td>
       <td>${timeTag(s.committed_at)}</td>
-      <td>${badge}</td>
       <td>${actor}</td>
       <td>${runId}</td>
       <td>${records}</td>
+      <td>${size}</td>
     </tr>`;
   }).join('');
 
@@ -84,34 +89,11 @@ export async function renderSnapshotHistory(root, projectId, namespace, tableNam
     '<thead><tr>' +
     '<th>Snapshot ID</th>' +
     '<th>Committed at</th>' +
-    '<th>Mode</th>' +
     '<th>Actor</th>' +
     '<th>Run ID</th>' +
     '<th>Added records</th>' +
+    '<th>File size</th>' +
     '</tr></thead>' +
     `<tbody>${tbody}</tbody>` +
     '</table>';
-}
-
-/**
- * Returns an HTML badge element for the given run_mode string.
- * run_mode values:
- *   "cluster"   → green badge
- *   "local-cli" → amber badge
- *   ""          → grey "pre-RFC-013" badge
- *   other       → grey "unknown" badge
- */
-function runModeBadge(runMode) {
-  switch (runMode) {
-    case 'cluster':
-      return '<span class="badge badge--cluster">cluster</span>';
-    case 'local-cli':
-      return '<span class="badge badge--cli">local-cli</span>';
-    case '':
-    case null:
-    case undefined:
-      return '<span class="badge badge--unknown">—</span>';
-    default:
-      return `<span class="badge badge--unknown">${esc(runMode)}</span>`;
-  }
 }

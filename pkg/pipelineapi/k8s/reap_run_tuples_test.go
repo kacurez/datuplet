@@ -51,7 +51,7 @@ func seedProjectPipeline(t *testing.T, pool *pgxpool.Pool) (projectID, pipelineI
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	pp, err := store.CreatePipeline(ctx, pool, p.ID, "p", "spec: {}")
+	pp, err := store.CreatePipeline(ctx, pool, p.ID, "p", "", []byte(`{}`))
 	if err != nil {
 		t.Fatalf("create pipeline: %v", err)
 	}

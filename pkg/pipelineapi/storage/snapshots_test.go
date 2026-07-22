@@ -159,6 +159,7 @@ func generateAuditedTable(warehouse string) error {
 			Operation: table.OpAppend,
 			Properties: map[string]string{
 				"added-records":         "3",
+				"added-files-size":      "4096",
 				"datuplet.actor":        "user-uuid-abc",
 				"datuplet.run-id":       "run-001",
 				"datuplet.run-mode":     "cluster",
@@ -258,9 +259,6 @@ func TestSnapshots_LegacySnapshot(t *testing.T) {
 	if rows[0].Actor != "" {
 		t.Errorf("Actor = %q, want empty (no datuplet.actor key)", rows[0].Actor)
 	}
-	if rows[0].RunMode != "" {
-		t.Errorf("RunMode = %q, want empty (no datuplet.run-mode key)", rows[0].RunMode)
-	}
 	// added-records is present in the simple fixture summary ("3").
 	if rows[0].AddedRecords == nil {
 		t.Error("AddedRecords should be non-nil for the simple fixture snapshot (has added-records key)")
@@ -302,11 +300,13 @@ func TestSnapshots_WithAuditKeys(t *testing.T) {
 	if newer.Actor != "user-uuid-abc" {
 		t.Errorf("Actor = %q, want %q", newer.Actor, "user-uuid-abc")
 	}
-	if newer.RunMode != "cluster" {
-		t.Errorf("RunMode = %q, want %q", newer.RunMode, "cluster")
-	}
 	if newer.RunID != "run-001" {
 		t.Errorf("RunID = %q, want %q", newer.RunID, "run-001")
+	}
+	if newer.AddedFilesSize == nil {
+		t.Error("AddedFilesSize should be non-nil for audited newer snapshot (has added-files-size key)")
+	} else if *newer.AddedFilesSize != 4096 {
+		t.Errorf("AddedFilesSize = %d, want 4096", *newer.AddedFilesSize)
 	}
 	if newer.PipelineAPI != "datuplet-api" {
 		t.Errorf("PipelineAPI = %q, want %q", newer.PipelineAPI, "datuplet-api")

@@ -44,7 +44,7 @@ func PipelineIntentFromPipeline(p *config.Pipeline) PipelineIntent {
 		return PipelineIntent{}
 	}
 	out := PipelineIntent{}
-	for _, stage := range p.Spec.Stages {
+	for _, stage := range p.Stages {
 		for _, comp := range stage.Components {
 			if in := comp.Inputs; in != nil {
 				if len(in.Buckets) > 0 || len(in.Tables) > 0 {

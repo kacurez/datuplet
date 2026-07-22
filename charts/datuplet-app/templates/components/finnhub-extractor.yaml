@@ -22,51 +22,15 @@ spec:
   displayName: Finnhub Extractor
   description: Fetches market data from the Finnhub API (quotes, news, financials, earnings, recommendations, insider transactions).
   maintainer: datuplet
+  io:
+    inputs: none
+    outputs: required
   defaultVersion: {{ .Values.components.tag }}
   versions:
     - version: {{ .Values.components.tag }}
       image: "{{ .Values.components.registry }}/finnhub-extractor:{{ .Values.components.tag }}"
       configSchema: |
-        {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "mode"
-          ],
-          "properties": {
-            "mode": {
-              "type": "string",
-              "enum": [
-                "quote",
-                "news",
-                "company-news",
-                "basic-financials",
-                "earnings",
-                "recommendations",
-                "insider-transactions"
-              ]
-            },
-            "symbols": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "apiKey": {
-              "type": "string",
-              "x-datuplet-secret": true
-            },
-            "lookback_days": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "limit": {
-              "type": "integer",
-              "minimum": 1
-            }
-          }
-        }
+{{ .Files.Get (printf "files/component-schemas/%s.json" "finnhub-extractor") | indent 8 }}
       resources:
         default:
           requests:

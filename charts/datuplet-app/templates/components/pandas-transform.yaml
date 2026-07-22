@@ -35,96 +35,15 @@ spec:
   displayName: Pandas Transform
   description: Applies a sequence of pandas operations (filter, select, sort, rename, drop, fillna) to input data.
   maintainer: datuplet
+  io:
+    inputs: required
+    outputs: required
   defaultVersion: {{ .Values.components.tag }}
   versions:
     - version: {{ .Values.components.tag }}
       image: "{{ .Values.components.registry }}/pandas-transform:{{ .Values.components.tag }}"
       configSchema: |
-        {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "output_table": {
-              "type": "string"
-            },
-            "operations": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "type"
-                ],
-                "properties": {
-                  "type": {
-                    "type": "string",
-                    "enum": [
-                      "filter",
-                      "select",
-                      "sort",
-                      "rename",
-                      "drop",
-                      "fillna"
-                    ]
-                  },
-                  "column": {
-                    "type": "string"
-                  },
-                  "op": {
-                    "type": "string",
-                    "enum": [
-                      ">",
-                      ">=",
-                      "<",
-                      "<=",
-                      "==",
-                      "!=",
-                      "in",
-                      "contains"
-                    ]
-                  },
-                  "value": {},
-                  "columns": {
-                    "oneOf": [
-                      {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
-                        }
-                      },
-                      {
-                        "type": "object",
-                        "additionalProperties": {
-                          "type": "string"
-                        }
-                      },
-                      {
-                        "type": "string"
-                      }
-                    ]
-                  },
-                  "by": {
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
-                        }
-                      }
-                    ]
-                  },
-                  "ascending": {
-                    "type": "boolean"
-                  }
-                }
-              }
-            }
-          }
-        }
+{{ .Files.Get (printf "files/component-schemas/%s.json" "pandas-transform") | indent 8 }}
       resources:
         default:
           requests:

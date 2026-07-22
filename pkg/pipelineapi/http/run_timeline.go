@@ -28,10 +28,10 @@ type timelineStage struct {
 
 // buildTimeline reconstructs the per-stage timeline from the persisted
 // StageStatuses JSON snapshot, annotating each stage with the imported/exported
-// tables/buckets DECLARED in the (current) pipeline YAML. A nil/empty/"null"/"[]"
-// snapshot returns (nil, nil) — "no timeline recorded". A YAML parse failure is
-// non-fatal: stages render with empty imported/exported.
-func buildTimeline(stageStatusesJSON []byte, pipelineYAML string) ([]timelineStage, error) {
+// tables/buckets DECLARED in the (current) pipeline doc. A nil/empty/"null"/"[]"
+// snapshot returns (nil, nil) — "no timeline recorded". A nil doc is non-fatal:
+// stages render with empty imported/exported.
+func buildTimeline(stageStatusesJSON []byte, doc *config.Pipeline) ([]timelineStage, error) {
 	if len(stageStatusesJSON) == 0 || string(stageStatusesJSON) == "null" {
 		return nil, nil
 	}
@@ -45,9 +45,9 @@ func buildTimeline(stageStatusesJSON []byte, pipelineYAML string) ([]timelineSta
 
 	imp := map[string][]timelineTable{}
 	exp := map[string][]timelineTable{}
-	if parsed, err := config.Parse([]byte(pipelineYAML)); err == nil {
-		for i := range parsed.Spec.Stages {
-			st := &parsed.Spec.Stages[i]
+	if doc != nil {
+		for i := range doc.Stages {
+			st := &doc.Stages[i]
 			for j := range st.Components {
 				c := &st.Components[j]
 				if c.Inputs != nil {

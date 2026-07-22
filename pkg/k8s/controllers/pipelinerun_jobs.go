@@ -94,10 +94,9 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 			Name:      configMapName,
 			Namespace: pr.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/component":  "gateway-config",
-				"app.kubernetes.io/part-of":    "datuplet",
-				"datuplet.io/pipelinerun":      pr.Name,
-				"datuplet.io/run-id": pr.Status.RunID,
+				"app.kubernetes.io/component": "gateway-config",
+				"app.kubernetes.io/part-of":   "datuplet",
+				"datuplet.io/run-id":          pr.Status.RunID,
 			},
 		},
 		Data: map[string]string{
@@ -176,11 +175,10 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 			Name:      jobName,
 			Namespace: pr.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/component":  "component",
-				"app.kubernetes.io/part-of":    "datuplet",
-				"datuplet.io/pipelinerun":      pr.Name,
-				"datuplet.io/component":        comp.Name,
-				"datuplet.io/run-id": pr.Status.RunID,
+				"app.kubernetes.io/component": "component",
+				"app.kubernetes.io/part-of":   "datuplet",
+				"datuplet.io/component":       comp.Name,
+				"datuplet.io/run-id":          pr.Status.RunID,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -189,10 +187,9 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app.kubernetes.io/component":  "component",
-						"datuplet.io/pipelinerun":      pr.Name,
-						"datuplet.io/component":        comp.Name,
-						"datuplet.io/run-id": pr.Status.RunID,
+						"app.kubernetes.io/component": "component",
+						"datuplet.io/component":       comp.Name,
+						"datuplet.io/run-id":          pr.Status.RunID,
 					},
 				},
 				Spec: corev1.PodSpec{

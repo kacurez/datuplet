@@ -19,7 +19,7 @@ func TestCreateRun_AndGet(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 
 	run, err := store.CreateRun(ctx, pool, store.CreateRunOpts{
 		ID:          uuid.New(),
@@ -54,7 +54,7 @@ func TestListRunsForProject_OrderedDesc(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 
 	// Insert in deterministic order. CreatedAt resolution may tie within
 	// the same microsecond, so we can't assert strict order — just count.
@@ -80,7 +80,7 @@ func TestUpdateRunPhase(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
 		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
 	})
@@ -107,7 +107,7 @@ func TestUpdateRunPhase_FirstWriteAppliesAndReturnsApplied(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
 		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
 	})
@@ -133,7 +133,7 @@ func TestUpdateRunPhase_StaleRVDropsWrite(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
 		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
 	})
@@ -164,7 +164,7 @@ func TestUpdateRunPhase_CancelPathIgnoresRVGuard(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
 		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
 	})
@@ -214,7 +214,7 @@ func TestUpdateRunPhase_LargeObservedRV(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
 		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
 	})
@@ -264,7 +264,7 @@ func TestGetRunByID_ReturnsPipelineNameAndNilSnapshot(t *testing.T) {
 	ctx := context.Background()
 
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
 		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
 	})
@@ -286,7 +286,7 @@ func TestUpdateRunPhase_PersistsSnapshotAndCoalesceNilPreserves(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
 
 	snap := []byte(`[{"name":"extract","phase":"Running"}]`)
@@ -319,7 +319,7 @@ func TestUpdateRunPhase_GuardTerminalBlocksResurrection(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
 
 	// Out-of-band cancel (rv=0, no guard) — like runbackend.CancelRun.
@@ -347,7 +347,7 @@ func TestListRunsPage_KeysetNoSkipNoDupe(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", minimalYAML)
+	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
 	for i := 0; i < 5; i++ {
 		_, _ = store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID})
 	}
@@ -384,8 +384,8 @@ func TestListRunsPage_FiltersByPhaseAndPipelineName(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	proj, _ := store.CreateProject(ctx, pool, "proj")
-	daily, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", minimalYAML)
-	sync, _ := store.CreatePipeline(ctx, pool, proj.ID, "customer-sync", minimalYAML)
+	daily, _ := store.CreatePipeline(ctx, pool, proj.ID, "daily-orders", "d", minimalDoc)
+	sync, _ := store.CreatePipeline(ctx, pool, proj.ID, "customer-sync", "d", minimalDoc)
 	rA, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: daily.ID})
 	_, _ = store.CreateRun(ctx, pool, store.CreateRunOpts{ID: uuid.New(), ProjectID: proj.ID, PipelineID: sync.ID})
 	_, _ = store.UpdateRunPhase(ctx, pool, rA.ID, store.UpdateRunPhaseOpts{Phase: "Succeeded"})

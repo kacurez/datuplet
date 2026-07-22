@@ -138,8 +138,32 @@ These are conventions a new contributor wouldn't infer from the code:
   Pipeline-api serves it at `/ui/*` when `PIPELINE_API_UI_DIR` is set; the
   K8s Deployment sets this to `/app/ui/product`. On 401 the fetch wrapper
   redirects to `/ui/login`. Includes a registry-driven component catalog
-  (`/ui/components`) and a schema-form pipeline builder (`/ui/pipelines/:name`,
-  one-way "Edit as YAML"; `$[key]` secret + storage-catalog pickers).
+  (`/ui/components`) and a form-first pipeline builder (`/ui/pipelines/:name`,
+  RFC 027 §6) over the full stored PipelineDoc, with a two-way `[Form | YAML]`
+  mode toggle (both directions parse/serialize the same in-memory doc — not a
+  one-way emitter); `$[key]` secret + storage-catalog pickers; unrendered
+  subtrees (notably `resources`) ride along untouched (hidden-subtree
+  preservation).
+- **Pipeline config is envelope-free (RFC 027).** No `apiVersion`/`kind`/
+  `metadata` — a PipelineDoc is `{name, description, gateway, stages}` at the
+  top level (`pkg/pipeline/config.Pipeline`). The legacy Kubernetes-CR
+  envelope is rejected outright (POC greenfield, no migration shim); the
+  `Pipeline`/`PipelineRun` CRDs and operator contract are unchanged — only the
+  user-facing authoring format changed. `docs/pipeline-api.md` documents the
+  format and the `PUT`/`GET`/`validate` API contracts.
+- **Component config schemas are authored files, not chart blobs
+  (RFC 027).** Each component's config shape lives at
+  `components/<name>/schema.json` (JSON Schema draft 2020-12), next to the
+  parser it validates against, and is synced into
+  `charts/datuplet-app/files/component-schemas/<name>.json` via
+  `make sync-component-schemas` (CI enforces no drift). Schemas must stay
+  within the "Form Subset" — no `oneOf`/`anyOf`/`allOf`/`not`/`$ref`/`$defs`/
+  `if`/`then`/`else`/`patternProperties`/`const` — so the UI can render them
+  as a form, never falling back to a raw JSON editor; `pkg/pipeline/schemalint`
+  enforces this plus mandatory `description`s and the five `x-datuplet-*`
+  annotations (`x-datuplet-secret`, `x-datuplet-multiline`,
+  `x-datuplet-advanced`, `x-datuplet-doc`, `x-datuplet-produces` — root only).
+  See `docs/components.md`.
 - **`pipeline-observer` runs in its own Deployment** (single replica,
   single-writer to the `runs` table). Pipeline-api defaults to 2 replicas
   (HTTP-only). The 24h reaper lives in a separate CronJob with a narrower
@@ -206,7 +230,8 @@ These are conventions a new contributor wouldn't infer from the code:
 
 | Directory | Purpose |
 |-----------|---------|
-| `pkg/pipeline/config/` | Pipeline YAML spec parser (shared by operator + pipeline-api). |
+| `pkg/pipeline/config/` | Envelope-free PipelineDoc parser (shared by operator + pipeline-api; RFC 027). |
+| `pkg/pipeline/schemalint/` | Form-Subset linter for `components/*/schema.json` (RFC 027). |
 | `pkg/datagateway/` | Data Gateway service (format conversion, processors, buffering). |
 | `pkg/datagateway/backend/` | Storage backends (MinIO/S3, GCS, local FS). |
 | `pkg/datagateway/lakekeeper/` | Data Gateway's lakekeeper resolver. |
@@ -226,4 +251,4 @@ These are conventions a new contributor wouldn't infer from the code:
 | `ui/product/` | Browser SPA (vanilla ES modules). |
 | `charts/` | Four Helm charts: `datuplet-operators`, `-infra`, `-app`, `-lakekeeper`. |
 | `utils/docker/` | Dockerfiles for all services. |
-| `examples/pipelines/` | Example K8s pipeline manifests (CI-guarded). |
+| `examples/pipelines/` | Example PipelineDocs, envelope-free (CI-guarded; RFC 027). |

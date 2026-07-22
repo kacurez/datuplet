@@ -21,15 +21,14 @@ type Backend interface {
 
 // TriggerRequest carries the inputs a handler has gathered for a trigger
 // call. The handler is responsible for auth, project membership, pipeline
-// lookup, and YAML parsing; the backend owns everything from DB insert
+// lookup, and doc parsing; the backend owns everything from DB insert
 // onward.
 type TriggerRequest struct {
 	ProjectID    uuid.UUID        // zero for system triggers
 	UserID       uuid.UUID        // zero for system triggers
 	PipelineName string           // matches pipelines.name and Pipeline CRD name
 	PipelineID   uuid.UUID        // pipelines.id from GetPipelineByName
-	PipelineYAML []byte           // raw YAML, needed by K8sBackend for CRD apply
-	Parsed       *config.Pipeline // parsed once, reused for capability derivation
+	Doc          *config.Pipeline // parsed pipeline doc: K8sBackend renders the CR via config.DocToCR for CRD apply and derives run capabilities from it
 }
 
 // TriggerResponse is what the backend returns to the handler.

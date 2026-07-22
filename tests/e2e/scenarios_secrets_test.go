@@ -33,38 +33,32 @@ import (
 const secretsLadderPipelineName = "secrets-ladder-pipeline"
 
 // secretsLadderPipelineYAML references $[api_token] exactly like
-// pipelines/k8s/secrets-happy.yaml, but as a bare Pipeline doc (no
-// PipelineRun) suitable for PUT /api/v1/projects/{pid}/pipelines/{name}.
-const secretsLadderPipelineYAML = `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: secrets-ladder-pipeline
-  namespace: datuplet
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: json-extractor
-          component: http-json-extractor
-          version: dev
-          config:
-            url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
-            api_token: "$[api_token]"
-          outputs:
-            defaultBucket: secrets-ladder-bucket
-            defaultWriteMode: FULL_LOAD
+// pipelines/k8s/secrets-happy.yaml, as an envelope-free PipelineDoc (RFC 027)
+// suitable for PUT /api/v1/projects/{pid}/pipelines/{name}.
+const secretsLadderPipelineYAML = `name: secrets-ladder-pipeline
+stages:
+  - name: extract
+    components:
+      - name: json-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+          api_token: "$[api_token]"
+        outputs:
+          defaultBucket: secrets-ladder-bucket
+          defaultWriteMode: FULL_LOAD
 `
 
-// TestSecretsLadder exercises RFC 026 P1.5's full secrets lifecycle:
+// TestSecretsLadder exercises RFC 026 P1.5's secrets lifecycle over the RFC 027
+// HTTP run path:
 //
 //	(a) PUT /pipelines with a missing $[api_token] key -> 200 + warning finding.
-//	(b) POST .../runs with the key still missing -> 400.
-//	(c) kubectl-path run (bypassing the HTTP pre-flight) with the key still
-//	    missing -> FailedUser, zero pods, zero Jobs.
-//	(d) PUT /secrets/api_token, then the SAME kubectl-path run -> succeeds.
-//	(e) the per-run snapshot Secret exists while the run's PipelineRun is
+//	(b) POST .../runs with the key still missing -> 400 (the S7 pre-flight gate).
+//	(c) PUT /secrets/api_token, then run the pipeline (via pipeline-api) -> succeeds.
+//	(d) the per-run snapshot Secret exists while the run's PipelineRun is
 //	    still around, and is garbage-collected when the PipelineRun is deleted.
-//	(f) rotating api_token's value after the run was admitted does NOT change
+//	(e) rotating api_token's value after the run was admitted does NOT change
 //	    the already-created snapshot (immutability).
 //
 // # Why a dedicated project instead of the shared per-suite one
@@ -85,20 +79,20 @@ spec:
 // and the "datuplet" warehouse SetupFGABootstrap already attached to it —
 // instead of provisioning a second, warehouse-less Project. The result is a
 // Datuplet Postgres project row whose K8s namespace (datuplet-<postgres-id>)
-// is a stable target for BOTH the managed-secrets HTTP API and a
-// kubectl-applied PipelineRun, so a literal PUT /secrets/{key} write is
-// visible to the exact namespace the controller admits the run into.
+// is a stable target for BOTH the managed-secrets HTTP API and the run
+// pipeline-api creates, so a literal PUT /secrets/{key} write is visible to the
+// exact namespace the controller admits the run into.
 //
-// # Two code paths, deliberately both exercised
+// # Why the old kubectl-admission "missing key" case was dropped (RFC 027 E2)
 //
-// (a)/(b) go through pipeline-api's HTTP endpoints (PUT /pipelines,
-// POST /runs) — the S7 *pre-flight* ladder, which rejects before any
-// PipelineRun is ever created. (c)/(d) kubectl-apply the PipelineRun CRD
-// directly via K8sBackend (the same mechanism every other K8s-tier scenario
-// in this suite uses), bypassing the HTTP pre-flight entirely. That's the
-// only way, in this harness, to reach the S3 admission-time defense-in-depth
-// check inside the operator with a key that is genuinely missing — POST
-// /runs would otherwise always intercept first.
+// Pre-RFC-027 this test also kubectl-applied a PipelineRun with a genuinely
+// missing key to reach the controller's admission-time defense-in-depth
+// (FailedUser, zero pods). The migrated K8sBackend now drives runs through
+// pipeline-api's POST /runs, whose S7 pre-flight rejects a missing $[api_token]
+// with 400 (case (b)) BEFORE any PipelineRun / pod is created — so that
+// admission path is unreachable from the API surface this harness now uses. It
+// is covered by the controller's own unit tests; here (b) proves the gate and
+// (c) proves the happy path once the secret is set.
 func TestSecretsLadder(t *testing.T) {
 	if os.Getenv("E2E_K8S") != "1" {
 		t.Skip("E2E_K8S=1 required")
@@ -194,17 +188,17 @@ func TestSecretsLadder(t *testing.T) {
 	}
 
 	// ------------------------------------------------------------------
-	// (c) kubectl-path run with the key still missing -> FailedUser, zero
-	// pods, zero Jobs. Constructed directly (not via NewK8sBackend) so its
-	// Namespace can target the secrets-ladder project's namespace instead
-	// of the shared per-suite one; every other field mirrors what
-	// NewK8sBackend sets up.
+	// Backend targeting the secrets-ladder project. Constructed as a literal
+	// (not NewK8sBackend) so it targets THIS project's {pid} + namespace
+	// directly: DatupletProjectID is the Postgres project UUID (the {pid} the
+	// PUT/trigger use), Namespace the matching datuplet-<pid>.
 	// ------------------------------------------------------------------
 	kb := &framework.K8sBackend{
-		Harness:   h,
-		Namespace: namespace,
-		RunPrefix: runPrefix,
-		RunAsUser: framework.AliceID,
+		Harness:           h,
+		Namespace:         namespace,
+		RunPrefix:         runPrefix,
+		RunAsUser:         framework.AliceID,
+		DatupletProjectID: projectID,
 	}
 	defer kb.Cleanup(context.Background())
 
@@ -220,68 +214,9 @@ func TestSecretsLadder(t *testing.T) {
 	}
 	defer os.Remove(rendered)
 
-	prName := runPrefix + "-secrets-happy-run"
-
-	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
-	if err != nil {
-		t.Fatalf("kubectl-path run (missing key): %v", err)
-	}
-	if result.Success || result.FailureType != "FailedUser" {
-		t.Fatalf("kubectl-path run (missing key): got success=%v failureType=%q message=%q, want FailedUser",
-			result.Success, result.FailureType, result.StatusMessage)
-	}
-	if !strings.Contains(result.StatusMessage, "api_token") {
-		t.Errorf("kubectl-path run (missing key) status message does not name api_token: %q", result.StatusMessage)
-	}
-	assertNoPodsForRun(t, namespace, prName)
-	assertNoJobsForRun(t, namespace, prName)
-
-	// The per-run snapshot Secret is created at admission time
-	// (snapshotRunSecrets, called from handlePending — see
-	// pkg/k8s/controllers/pipelinerun_controller.go), independently of
-	// Job/Pod creation. So "no pods/Jobs" does NOT by itself imply "no
-	// snapshot" — the missing-key rejection must happen before/without
-	// ever writing a snapshot, and that has to be checked explicitly.
-	// Name derived exactly as runSecretsName does
-	// (pkg/k8s/controllers/pipelinerun_jobs.go):
-	// "datuplet-runsecrets-" + first 8 chars of the run UUID (shortID,
-	// pkg/k8s/controllers/pipelinerun_controller.go).
-	missingKeySnapshotName := "datuplet-runsecrets-" + result.RunID.String()[:8]
-	if secretExists(t, namespace, missingKeySnapshotName) {
-		t.Errorf("snapshot Secret %q exists after a missing-key run that never reached admission-time success; want none",
-			missingKeySnapshotName)
-	}
-
 	// ------------------------------------------------------------------
-	// Delete the terminal PipelineRun left behind by the missing-key
-	// attempt and wait for it to be fully gone before re-running.
-	//
-	// The controller's Reconcile switches on pipelineRun.Status.Phase
-	// and no-ops once that phase is terminal (FailedUser / Succeeded /
-	// FailedApplication) — see pkg/k8s/controllers/pipelinerun_controller.go's
-	// phase switch — regardless of what spec.runId says. Re-applying the
-	// SAME object with a new spec.runId (as attachRunToken does on every
-	// kb.RunPipeline call) would NOT re-admit it: kubectl apply only
-	// mutates spec, the reconcile loop would see the still-terminal
-	// FailedUser status and return immediately, and RunPipeline's poll
-	// loop below would report that stale status as if it were a fresh
-	// run. Deleting the object first forces the next kubectl apply to
-	// create a brand-new PipelineRun (phase ""), which handlePending
-	// actually admits — so (d)/(e)/(f) below exercise a genuinely fresh
-	// run rather than reading back the first attempt's cached status.
-	// The snapshot-Secret non-existence was already asserted explicitly
-	// above, so there is nothing left to garbage-collect for this object.
-	// ------------------------------------------------------------------
-	if out, err := exec.CommandContext(ctx, "kubectl", "delete", "pipelinerun", prName,
-		"-n", namespace, "--ignore-not-found").CombinedOutput(); err != nil {
-		t.Fatalf("kubectl delete pipelinerun (missing-key attempt): %v\n%s", err, out)
-	}
-	waitForPipelineRunGone(t, namespace, prName, 20*time.Second)
-
-	// ------------------------------------------------------------------
-	// (d) PUT the key via the managed API, then apply a fresh PipelineRun
-	// under the same name (now genuinely absent, so kubectl apply creates
-	// rather than no-ops) -> succeeds.
+	// (c) PUT the key via the managed API, then run the pipeline through
+	// pipeline-api -> the pre-flight now passes and the run succeeds.
 	// ------------------------------------------------------------------
 	const firstValue = "e2e-ladder-secret-v1"
 	status, body, err = putSecretHTTP(ctx, session, projectID, "api_token", firstValue)
@@ -292,17 +227,17 @@ func TestSecretsLadder(t *testing.T) {
 		t.Fatalf("PUT /secrets/api_token: status=%d, want 204; body=%s", status, body)
 	}
 
-	result, err = kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
+	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
 	if err != nil {
-		t.Fatalf("kubectl-path run (key present): %v", err)
+		t.Fatalf("run (key present): %v", err)
 	}
 	if !result.Success {
-		t.Fatalf("kubectl-path run (key present): expected success, got failureType=%q message=%q logs=%s",
+		t.Fatalf("run (key present): expected success, got failureType=%q message=%q logs=%s",
 			result.FailureType, result.StatusMessage, result.Logs)
 	}
 
 	// ------------------------------------------------------------------
-	// (e, part 1) The per-run snapshot Secret exists while the run's
+	// (d, part 1) The per-run snapshot Secret exists while the run's
 	// PipelineRun object is still around. Name derived exactly as
 	// runSecretsName does (pkg/k8s/controllers/pipelinerun_jobs.go):
 	// "datuplet-runsecrets-" + first 8 chars of the run UUID.
@@ -313,7 +248,7 @@ func TestSecretsLadder(t *testing.T) {
 	}
 
 	// ------------------------------------------------------------------
-	// (f) Rotating the project secret's value after the run was admitted
+	// (e) Rotating the project secret's value after the run was admitted
 	// must NOT change the already-created snapshot (immutability).
 	// ------------------------------------------------------------------
 	const secondValue = "e2e-ladder-secret-v2-rotated"
@@ -331,12 +266,15 @@ func TestSecretsLadder(t *testing.T) {
 	}
 
 	// ------------------------------------------------------------------
-	// (e, part 2) Deleting the PipelineRun garbage-collects the snapshot
-	// (ownerRef).
+	// (d, part 2) Deleting the PipelineRun garbage-collects the snapshot
+	// (ownerRef). The run's CR name is generated by pipeline-api, so select
+	// by the datuplet.io/run-id label the controller stamps on every
+	// PipelineRun / Pod (not a harness-chosen name).
 	// ------------------------------------------------------------------
-	if out, err := exec.CommandContext(ctx, "kubectl", "delete", "pipelinerun", prName,
+	if out, err := exec.CommandContext(ctx, "kubectl", "delete", "pipelinerun",
+		"-l", "datuplet.io/run-id="+result.RunID.String(),
 		"-n", namespace, "--ignore-not-found").CombinedOutput(); err != nil {
-		t.Fatalf("kubectl delete pipelinerun: %v\n%s", err, out)
+		t.Fatalf("kubectl delete pipelinerun (run-id=%s): %v\n%s", result.RunID, err, out)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -344,7 +282,8 @@ func TestSecretsLadder(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("snapshot Secret %q was not garbage-collected within 20s of deleting PipelineRun %q", snapshotName, prName)
+			t.Errorf("snapshot Secret %q was not garbage-collected within 20s of deleting the run's PipelineRun (run-id=%s)",
+				snapshotName, result.RunID)
 			break
 		}
 		time.Sleep(1 * time.Second)
@@ -453,52 +392,6 @@ func doSessionRequest(ctx context.Context, method, url, cookie, contentType stri
 }
 
 // --- kubectl assertion helpers ---
-
-func assertNoPodsForRun(t *testing.T, namespace, prName string) {
-	t.Helper()
-	out, err := exec.Command("kubectl", "get", "pods", "-n", namespace,
-		"-l", "datuplet.io/pipelinerun="+prName,
-		"-o", "jsonpath={.items[*].metadata.name}").Output()
-	if err != nil {
-		t.Fatalf("kubectl get pods: %v", err)
-	}
-	if names := strings.TrimSpace(string(out)); names != "" {
-		t.Errorf("expected zero pods for PipelineRun %q, found: %s", prName, names)
-	}
-}
-
-func assertNoJobsForRun(t *testing.T, namespace, prName string) {
-	t.Helper()
-	out, err := exec.Command("kubectl", "get", "jobs", "-n", namespace,
-		"-l", "datuplet.io/pipelinerun="+prName,
-		"-o", "jsonpath={.items[*].metadata.name}").Output()
-	if err != nil {
-		t.Fatalf("kubectl get jobs: %v", err)
-	}
-	if names := strings.TrimSpace(string(out)); names != "" {
-		t.Errorf("expected zero Jobs for PipelineRun %q, found: %s", prName, names)
-	}
-}
-
-// waitForPipelineRunGone polls until `kubectl get pipelinerun <name>`
-// reports NotFound, or fails the test if that doesn't happen within
-// timeout. Used to make sure a terminal PipelineRun from a prior
-// attempt is fully removed before re-applying the same name, since the
-// controller no-ops Reconcile for objects already in a terminal phase.
-func waitForPipelineRunGone(t *testing.T, namespace, name string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		err := exec.Command("kubectl", "get", "pipelinerun", name, "-n", namespace).Run()
-		if err != nil {
-			return // kubectl get exits non-zero once the object is gone.
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("PipelineRun %q was not deleted within %s", name, timeout)
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
 
 func secretExists(t *testing.T, namespace, name string) bool {
 	t.Helper()

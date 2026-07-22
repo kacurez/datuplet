@@ -14,6 +14,7 @@ export DOCKER_BUILDKIT=1
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
 	prune-images prune-docker-cache \
+	sync-component-schemas \
 	lint chart-render-check tidy all help
 
 # =============================================================================
@@ -345,6 +346,17 @@ tidy: ## Run go mod tidy across every go.mod in the monorepo
 	  (cd $$dir && go mod tidy) || exit 1; \
 	done
 	@echo "✓ all modules tidy (tests/integration intentionally skipped)"
+
+# RFC 027 §4.1: components/<name>/schema.json is the source of truth for
+# each built-in's configSchema; the chart templates read the synced copy via
+# .Files.Get (Helm can only read files inside the chart directory). CI runs
+# this target then `git diff --exit-code charts/` to catch drift.
+sync-component-schemas: ## Copy components/*/schema.json into the app chart
+	@mkdir -p charts/datuplet-app/files/component-schemas
+	@for f in components/*/schema.json; do \
+		name=$$(basename $$(dirname $$f)); \
+		cp "$$f" "charts/datuplet-app/files/component-schemas/$$name.json"; \
+	done
 
 # Static analysis and dead code detection. RFC 019 §4.10 bearer-redaction
 # is enforced via Stringer methods on the owned types (S3Creds, GCSCreds,

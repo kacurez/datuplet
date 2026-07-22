@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HTTP JSON Extractor",
+  "description": "Fetches JSON from an HTTP endpoint and writes it as a table. Supports a single request or incremental pagination.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "url"
+  ],
+  "x-datuplet-produces": "table_name",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "The HTTP endpoint to fetch JSON from.",
+      "x-datuplet-doc": "Required. Fetched with a plain GET request (no query-string templating beyond what pagination adds). Include any static query parameters directly in the URL."
+    },
+    "array_path": {
+      "type": "string",
+      "description": "Key of the response's top-level field holding the record array (omit for a bare JSON array response).",
+      "x-datuplet-doc": "Only needed when the response is an object wrapping the array (e.g. {\"results\": [...]}) rather than a bare JSON array. If omitted and the response is an object, the component auto-detects the first array-valued field. Also used, in the fallback case below, as part of the output table name."
+    },
+    "table_name": {
+      "type": "string",
+      "description": "Output table name. Falls back to array_path, then \"data\", when omitted.",
+      "x-datuplet-doc": "Resolution order applied by the component: table_name (if set) > array_path (if set) > the literal \"data\". Because that fallback is computed from two other fields, only the case where table_name is set directly can be resolved as a known upstream output by the pipeline builder's input picker (x-datuplet-produces points at this property); leaving it unset still works at runtime but the output table will show as an unresolvable dynamic name in the UI."
+    },
+    "headers": {
+      "type": "object",
+      "description": "HTTP request headers to send with the request(s).",
+      "x-datuplet-doc": "Plain string values — sent verbatim on every request, including every paginated page fetch. Use the $[name] secret-reference syntax for values that must not be stored in plaintext (e.g. an Authorization header).",
+      "additionalProperties": {
+        "type": "string",
+        "description": "The header value."
+      }
+    },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Enables incremental, streaming pagination instead of a single request.",
+      "x-datuplet-doc": "Pagination only activates when 'type' is set to a non-empty value; a pagination block present in config with 'type' omitted or empty is silently ignored in its entirety (the component falls back to a single-request fetch, discarding param/page_size/etc.) rather than failing — there is no config-validation error for this case.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "page",
+            "offset"
+          ],
+          "description": "Pagination style: incrementing page numbers, or incrementing row offsets.",
+          "x-datuplet-doc": "Required to activate pagination at all (see the pagination-level note). \"page\" starts at 1 by default and increments by 1 per fetch; \"offset\" starts at 0 by default and increments by page_size per fetch, unless overridden by 'start'/'increment'."
+        },
+        "param": {
+          "type": "string",
+          "description": "Query parameter name carrying the current page/offset value."
+        },
+        "start": {
+          "type": "integer",
+          "description": "Starting page/offset value.",
+          "x-datuplet-doc": "When omitted (0), the component substitutes a type-dependent starting point: 1 for \"page\", 0 for \"offset\" (0 is already the zero-value for \"offset\", so this only visibly changes behaviour for \"page\")."
+        },
+        "increment": {
+          "type": "integer",
+          "description": "Amount added to the page/offset value after each fetch.",
+          "x-datuplet-doc": "When omitted (0), the component substitutes a type-dependent increment: page_size for \"offset\", 1 for \"page\" (and for any other/unrecognized type)."
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Expected number of results per page.",
+          "x-datuplet-doc": "Used both as the default 'increment' for offset-style pagination and as a stop signal: a page returning fewer records than page_size is treated as the last page and pagination stops."
+        },
+        "size_param": {
+          "type": "string",
+          "description": "Query parameter name for the page-size value, if the API needs one sent explicitly.",
+          "x-datuplet-doc": "Only sent when both size_param and page_size are set."
+        },
+        "max_pages": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Stop after fetching this many pages (0 = unlimited).",
+          "x-datuplet-doc": "Setting this to a non-zero value also disables the implicit stop_when_empty default (see stop_when_empty)."
+        },
+        "max_records": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Stop after this many total records have been fetched (0 = unlimited).",
+          "x-datuplet-doc": "The last page's records are truncated, not the whole run rejected, when this limit falls mid-page. Setting this to a non-zero value also disables the implicit stop_when_empty default (see stop_when_empty)."
+        },
+        "stop_when_empty": {
+          "type": "boolean",
+          "description": "Stop pagination when a fetched page has zero records.",
+          "x-datuplet-doc": "The runtime default is not a plain literal: if this is left false (the omitted/zero value) AND both max_pages and max_records are also left at 0 (unlimited), the component forces this on internally so pagination has some way to terminate. If either max_pages or max_records is set, an omitted stop_when_empty stays false — an empty page is not by itself a stop signal in that case."
+        }
+      }
+    }
+  }
+}

@@ -11,6 +11,97 @@ The pipeline-api is Datuplet's central product REST service. It owns:
 
 For the end-to-end token lifecycle (session cookie → run JWT → impersonation JWT → FGA legs), see [`docs/auth-flow.md`](auth-flow.md).
 
+For the `datuplet` CLI's agent-facing loop over this API (components → validate → put → trigger → storage sample, headless auth included), see [`docs/agent-quickstart.md`](agent-quickstart.md).
+
+## PipelineDoc format
+
+RFC 027 replaced the Kubernetes-CR envelope (`apiVersion`/`kind`/`metadata`/`spec`)
+with an envelope-free document: everything that used to live under `spec:` is
+hoisted to the top level. The validated example from the RFC 027 design spec, §3:
+
+```yaml
+name: events-etl          # optional in body; must equal the URL/CLI name when present
+description: Generate demo events and aggregate revenue per country.  # optional
+gateway:                  # optional, GatewayConfig unchanged (chunkSize, bufferSize, …)
+  chunkSize: 33554432
+stages:                   # sequential; components within a stage run in parallel
+  - name: generate
+    components:
+      - name: gen                     # instance name, unique across the pipeline
+        component: data-generator     # registry reference
+        # version: v0.9.1             # optional; omit to use the registry default
+        config:                       # validated against the version's configSchema
+          tables:
+            - name: events
+              rowInsertSpeed: 1000
+              random:
+                schema: { id: uuid, created: timestamp, amount: double, country: string }
+                limit: { rowsCount: 100000 }
+        outputs:
+          defaultBucket: raw          # dynamic mode: component names tables at runtime
+          defaultWriteMode: APPEND
+  - name: transform
+    components:
+      - name: daily-summary
+        component: sql-transform
+        inputs:
+          tables:
+            - { bucket: raw, table: events }
+        config:
+          sql: |
+            CREATE TABLE daily_summary AS
+            SELECT country, count(*) AS events, sum(amount) AS revenue
+            FROM events GROUP BY country;
+        outputs:
+          tables:                     # explicit mode: one mapping per table
+            - { name: daily_summary, bucket: curated, writeMode: FULL_LOAD }
+```
+
+`stages`, `inputs`, `outputs`, and `resources` (superadmin diff-gate, RFC 026 §4.4)
+keep their existing shapes and semantics. Parsing is **strict**: unknown fields
+are findings (error), and a top-level `apiVersion`, `kind`, or `metadata` key
+yields a single pointed finding — **the legacy Kubernetes CR envelope is
+rejected outright, with no conversion shim.** The CRD types (`Pipeline`,
+`PipelineRun`) and the operator contract are unchanged; the CR simply stops
+being a user-facing format — `kubectl apply` is no longer how you author a
+pipeline (see the [PUT example](#upload-a-pipeline) below).
+
+### API contract
+
+| Endpoint | Behavior |
+|---|---|
+| `PUT /api/v1/projects/{pid}/pipelines/{name}` | Body is the doc, as `application/json` or YAML (any other Content-Type, or none, parsed as YAML). 1 MiB cap. `204` clean save / `200` + warning findings / `400` + error findings. |
+| `GET /api/v1/projects/{pid}/pipelines/{name}` | Returns `{"id", "name", "doc", "created_at", "updated_at"}` — `doc` is the canonical-JSON PipelineDoc. `?format=yaml` returns `text/yaml` instead, deterministically rendered (struct field order; sorted map keys). |
+| `GET /api/v1/projects/{pid}/pipelines` | List items are `{"name", "description", "created_at", "updated_at"}` (timestamps omitted when zero). |
+| `POST /api/v1/projects/{pid}/pipelines/validate` | **New.** Body = doc (JSON or YAML); `?name=` optional — when given, diffs against the stored doc for the resources/gateway gate (mirrors PUT's update semantics); when absent, validates with create semantics. Runs the full PUT-time validation (structure, registry resolution, configSchema, secret refs, IO capability, resource gate) without persisting. |
+| `DELETE`, admin endpoints | Unchanged. |
+
+`POST …/validate` status contract: `200 {"findings": [...]}` for **any**
+readable body — validation outcomes, both errors and warnings, are findings,
+never HTTP errors. `400`/`413` are reserved for a body that can't be read or
+decoded as a PipelineDoc at all (including the legacy envelope) or exceeds the
+size cap. `5xx` is reserved for infrastructure failures (e.g. the store read
+backing the resource gate). Same authz as PUT (`data_admin` on the project).
+
+A finding looks like:
+
+```json
+{"findings":[{"path":"stages[0].components[0].config.tables[0].random","message":"missing property 'limit'","severity":"error"}]}
+```
+
+`path` is a dotted/indexed pointer into the doc, `message` is human-readable,
+`severity` is `"error"` or `"warning"`. `PUT` and `validate` share the exact
+same finding shape.
+
+A legacy envelope body (`apiVersion`/`kind`/`metadata`/`spec`) fails strict
+decoding — both `PUT` and `validate` return `400` with a pointed finding
+naming the offending key ("legacy Kubernetes CR format — Datuplet pipelines
+are envelope-free now; see docs/pipeline-api.md").
+
+**Concurrency:** `PUT` is last-write-wins — there is no optimistic locking
+(no ETag / version check). A concurrent editor's save silently overwrites
+yours. See [docs/known-limitations.md](known-limitations.md).
+
 ## Run locally
 
 ### 1. Start Postgres
@@ -151,11 +242,9 @@ Project provisioning creates the `datuplet-<uuid>` K8s namespace (labelled `datu
 
 ### Upload a pipeline
 
-> The example files under `examples/pipelines/` bundle a `Pipeline` document
-> followed by a `PipelineRun` document (the `PipelineRun` is there so
-> `kubectl apply -f ...` works standalone). `PUT` parses only the first YAML
-> document, so it stores the `Pipeline` and silently ignores the bundled
-> `PipelineRun`; runs are triggered via the `POST .../runs` call below.
+The example files under `examples/pipelines/` are plain PipelineDocs (no
+envelope, no bundled `PipelineRun`) — `PUT` stores the doc as-is; runs are
+triggered separately via the `POST .../runs` call below.
 
 ```bash
 PID=<project-uuid>
@@ -165,13 +254,21 @@ curl -sS -b /tmp/cookies -X PUT \
   http://127.0.0.1:8081/api/v1/projects/$PID/pipelines/simple-pipeline -i
 ```
 
+Or, using the CLI (see [docs/agent-quickstart.md](agent-quickstart.md) for the
+full loop):
+
+```bash
+datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
+datuplet trigger simple-pipeline
+```
+
 ### Trigger a run
 
 ```bash
 curl -sS -b /tmp/cookies -X POST \
   http://127.0.0.1:8081/api/v1/projects/$PID/pipelines/simple-pipeline/runs \
   -H 'Content-Type: application/json' -d '{}'
-# → 202 {"id":"…","status":"Pending"}
+# → 201 {"id":"…","status":"Pending","k8s_ns":"…"}
 ```
 
 What happens behind the scenes (see `K8sBackend.TriggerRun`):
@@ -288,29 +385,47 @@ The catalog and the pipeline builder are driven by the component registry
   prerelease flag) and the rendered config-schema documentation for one
   version — the `defaultVersion` if set, else the first non-prerelease version,
   else the first listed.
-- **Pipeline builder** (`/ui/pipelines/:name`): pick a component and either
-  fill a **schema-generated form** — one control per config field, derived
-  from that version's `configSchema` — or **edit the YAML** directly. The form
-  is a one-way emitter: **Insert as YAML** splices the generated block into the
-  editor. **Two-way form↔YAML sync is intentionally not provided** — the
-  **Edit as YAML…** toggle is one-way and confirm-guarded; a hand-edited block
-  cannot be pulled back into the form.
+- **Pipeline builder** (`/ui/pipelines/:name` and `/ui/pipelines/_new`,
+  RFC 027 §6) is a **form-first builder over the full stored PipelineDoc** —
+  left outline (stages → component cards), a main editor panel for the
+  selected component, and a topbar mode toggle `[Form | YAML]`. The form is a
+  recursive renderer over the component's `configSchema` (the "Form Subset",
+  see [docs/components.md](components.md)); an out-of-subset node (third-party
+  schemas only — built-ins always lint clean) falls back to a JSON sub-editor
+  for that node alone, never the whole form.
+- **YAML mode is two-way**, over the same in-memory doc — not a one-way
+  emitter. `[Form → YAML]` serializes the live doc via a vendored `js-yaml`;
+  `[YAML → Form]` parses the textarea back onto the doc. A parse error keeps
+  you in YAML mode with the message shown inline; nothing is lost or silently
+  dropped. Save sends JSON from form mode and the raw YAML text from YAML mode
+  (the server validates either way).
+- **Hidden-subtree preservation**: the form renders and mutates only the paths
+  it has controls for. Anything else — notably each component's `resources`
+  block, and any config subtree shown as a JSON fallback — rides along
+  untouched and survives a form-mode save byte-for-byte.
 - **Secret fields** — config properties flagged `x-datuplet-secret` — render as
   a picker of `$[<key>]` references. The key names come from the project's
   write-only secrets API (`GET /api/v1/projects/{pid}/secrets`); a **manage
   secrets** link points to `/ui/settings/secrets`. A plaintext secret cannot be
   entered.
-- **Inputs / outputs pickers** — **input** tables are chosen from the storage
-  catalog (existing lake tables); **outputs** are new tables the run creates, so
-  they are entered as a bucket / optional table name / write-mode select (not
-  picked from existing tables). Both fold into the emitted component block.
+- **Inputs section** (hidden entirely when the component declares `io.inputs:
+  none`, e.g. extractors) — current inputs show as chips; "+ Add input
+  table…" opens a modal picker with two groups: tables **produced upstream**
+  (earlier stages' `outputs.tables`, plus names resolved via the
+  `x-datuplet-produces` schema-root annotation) and tables **in storage**
+  (`GET /api/v1/storage/projects/{pid}/tables`), searchable and multi-select.
+- **Outputs section** (hidden when `io.outputs: none`, e.g. stdout-writer) —
+  a segmented toggle between **Dynamic** (`defaultBucket` +
+  `defaultWriteMode` — the component names tables at runtime) and
+  **Explicit** (`tables[]` mapping rows: bucket + table name + per-table
+  write mode, with "+ New table" / "Select existing…"). Switching modes
+  carries the bucket over.
 - The **`resources` field is YAML-only** — the builder never renders a control
-  for it and never emits it. Changing any component's `resources` requires
-  superadmin: on save, the diff-gate rejects (403) a non-superadmin whose save
-  *adds or modifies* a `resources` block (an unchanged resubmission passes), and
-  any value over the registry `resources.max` is rejected (400). (On the direct
-  `kubectl apply` path the controller instead clamps over-max values to that
-  ceiling — the two enforcement layers of RFC 026 §4.4.)
+  for it and never emits a change to it via the form. Changing any component's
+  `resources` requires superadmin: on save, the diff-gate rejects (403) a
+  non-superadmin whose save *adds or modifies* a `resources` block (an
+  unchanged resubmission passes), and any value over the registry
+  `resources.max` is rejected (400).
 
 ### Architecture notes
 
@@ -335,7 +450,7 @@ make deploy-local
 
 What it does (see the `deploy-local` / `deploy-local-helm` Makefile targets):
 
-1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.8.0`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
+1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.9.1`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
 2. Helm-installs the four charts in phase order, each waited on before the next: `datuplet-operators` (CRDs, RBAC, the CNPG operator), `datuplet-infra` (Postgres cluster, OpenFGA, MinIO), `datuplet-app` (pipeline-api, pipeline-operator, pipeline-observer — with `image.pullPolicy=IfNotPresent` and `components.registry=datuplet` so the built-in ComponentDefinitions point at the locally-built images), then `datuplet-lakekeeper`.
 3. Runs `./scripts/register.sh --namespace datuplet`, which `kubectl exec`s into the `pipeline-api` Pod and runs five idempotent `pipeline-api admin` steps: `lakekeeper-bootstrap` (creates the warehouse + server-admin FGA tuple), `create-user` (default admin `admin@datuplet.local` / `changeme`), `create-project` (default project `default`), `attach-warehouse`, and `grant --role admin`.
 
@@ -378,12 +493,18 @@ Returns the registered components (deprecated ones stay listed, flagged):
     "description": "Run user SQL in an embedded DuckDB engine.",
     "deprecated": false,
     "defaultVersion": "1.2.0",
+    "io": { "inputs": "required", "outputs": "required" },
     "versions": [
       { "version": "1.2.0", "prerelease": false, "image": "ghcr.io/datuplet/sql-transform:1.2.0" }
     ]
   }
 ]
 ```
+
+`io` (RFC 027 §4.3) is always present with resolved mode strings — `"none"`,
+`"optional"`, or `"required"` for `inputs`/`outputs` — and drives the UI's
+section gating (a component declaring `inputs: none` gets no Inputs section
+at all). It lives at the component-definition level, not per version.
 
 ### Get one component
 
@@ -400,6 +521,7 @@ schema-generated builder form:
   "description": "Run user SQL in an embedded DuckDB engine.",
   "deprecated": false,
   "defaultVersion": "1.2.0",
+  "io": { "inputs": "required", "outputs": "required" },
   "versions": [
     {
       "version": "1.2.0",

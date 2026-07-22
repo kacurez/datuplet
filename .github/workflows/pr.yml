@@ -103,3 +103,14 @@ jobs:
           version: 'v3.14.4'
       - name: verify-versions
         run: scripts/verify-versions.sh
+
+  component-schemas:
+    name: component schema sync check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Component schema sync check
+        run: |
+          make sync-component-schemas
+          git diff --exit-code charts/datuplet-app/files/component-schemas charts/datuplet-app/templates/components

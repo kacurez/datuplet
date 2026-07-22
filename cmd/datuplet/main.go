@@ -2,6 +2,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +18,8 @@ import (
 func main() {
 	loginCmd := flag.NewFlagSet("login", flag.ExitOnError)
 	loginRemote := loginCmd.String("remote", "", "pipeline-api URL (required)")
+	loginEmail := loginCmd.String("email", "", "Email address (required with --password-stdin)")
+	loginPasswordStdin := loginCmd.Bool("password-stdin", false, "Read the password from stdin (one line, no prompt); requires --email")
 
 	triggerCmd := flag.NewFlagSet("trigger", flag.ExitOnError)
 	triggerRemote := triggerCmd.String("remote", "", "pipeline-api URL (required)")
@@ -81,10 +84,12 @@ func main() {
 			os.Exit(1)
 		}
 		if err := runLogin(loginArgs{
-			Remote: *loginRemote,
-			Stdin:  os.Stdin,
-			Stdout: os.Stdout,
-			Stderr: os.Stderr,
+			Remote:        *loginRemote,
+			Email:         *loginEmail,
+			PasswordStdin: *loginPasswordStdin,
+			Stdin:         os.Stdin,
+			Stdout:        os.Stdout,
+			Stderr:        os.Stderr,
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -92,8 +97,8 @@ func main() {
 
 	case "trigger":
 		triggerCmd.Parse(os.Args[2:])
-		if *triggerRemote == "" {
-			fmt.Fprintln(os.Stderr, "Error: --remote is required")
+		if *triggerRemote == "" && os.Getenv(envRemote) == "" {
+			fmt.Fprintln(os.Stderr, "Error: --remote is required (or set $DATUPLET_REMOTE)")
 			fmt.Fprintln(os.Stderr, "Usage: datuplet trigger --remote <pipeline-api-url> [--wait --timeout 1h --json --project <name>] <pipeline-name>")
 			os.Exit(1)
 		}
@@ -108,8 +113,8 @@ func main() {
 
 	case "storage":
 		storageCmd.Parse(os.Args[2:])
-		if *storageRemote == "" {
-			fmt.Fprintln(os.Stderr, "Error: --remote is required")
+		if *storageRemote == "" && os.Getenv(envRemote) == "" {
+			fmt.Fprintln(os.Stderr, "Error: --remote is required (or set $DATUPLET_REMOTE)")
 			fmt.Fprintln(os.Stderr, "Usage: datuplet storage --remote <url> [--project N] [--rows N] <tables|info|schema|sample|history> [<ns>.<table>]")
 			os.Exit(1)
 		}
@@ -151,8 +156,8 @@ func main() {
 		queryCmd.Parse(os.Args[2:])
 		// --local does not need --remote: it routes nowhere (the root binary
 		// is duckdb-free and errors clearly). The server-routing path does.
-		if !*queryLocal && *queryRemote == "" {
-			fmt.Fprintln(os.Stderr, "Error: --remote is required (omit it only with --local)")
+		if !*queryLocal && *queryRemote == "" && os.Getenv(envRemote) == "" {
+			fmt.Fprintln(os.Stderr, "Error: --remote is required (omit it only with --local, or set $DATUPLET_REMOTE)")
 			fmt.Fprintln(os.Stderr, `Usage: datuplet query --remote <url> [--project N] [--format table|csv|json] (--sql "..." | -f FILE | stdin)`)
 			os.Exit(1)
 		}
@@ -163,6 +168,26 @@ func main() {
 
 	case "pipeline":
 		if err := runPipeline(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			// `validate` uses exitCodeErr to distinguish a transport/HTTP
+			// failure (>=2) from "the pipeline is invalid" (plain error,
+			// default exit 1) — spec §7.
+			code := 1
+			var ece *exitCodeErr
+			if errors.As(err, &ece) {
+				code = ece.code
+			}
+			os.Exit(code)
+		}
+
+	case "components":
+		if err := runComponents(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "runs":
+		if err := runRuns(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -198,7 +223,9 @@ Usage:
 Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
-  pipeline               CRUD for pipeline specs (list, get, put, delete)
+  pipeline               CRUD for pipeline specs (list, get, put, delete, validate)
+  runs                   List runs (filter by pipeline/phase) and get run detail + timeline
+  components             Browse the component catalog (list, get --schema)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
   gateway                Start the data gateway server (container entrypoint)
@@ -207,32 +234,51 @@ Commands:
 
 Options for 'login':
   -remote string         pipeline-api URL (required)
+  -email string          Email address (required with --password-stdin)
+  -password-stdin        Read the password from stdin (one line, no prompt); requires -email
 
 Options for 'trigger':
-  -remote string         pipeline-api URL (required)
-  -project string        Project name (auto-defaulted if you have exactly one)
-  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
+  -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
+  -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one)
+  -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   -wait                  Block until the run reaches a terminal phase
   -timeout duration      Hard cap on --wait; cancels the run cluster-side on expiry (default 1h)
   -json                  Structured JSON output
   <pipeline-name>        Pipeline name (positional, AFTER flags - flag package stops at first non-flag)
 
 Options for 'storage':
-  -remote string         pipeline-api URL (required)
-  -project string        Project name (auto-defaulted if you have exactly one)
-  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
+  -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
+  -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one)
+  -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   -rows int              Max preview rows for 'sample' subcommand (0 = server default)
   <subcommand>           One of: tables | info | schema | sample | history
   <ns>.<table>           Namespace.table reference (required for info/schema/sample/history)
 
+Options for 'components':
+  -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
+  -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
+  <subcommand>           One of: list | get
+  list -json             Emit the catalog as JSON (table: NAME, DISPLAY, DEFAULT, IO, DEPRECATED)
+  get <name>             Show one component's detail (always resolves the detail endpoint)
+  get -version <v>       Resolve a specific version (default: registry defaultVersion, else highest stable)
+  get -schema            Print the resolved version's configSchema verbatim (mutually exclusive with -json)
+  Not project-scoped: no -project flag (spec RFC 027 §4.7 — shared catalog).
+
 Options for 'query':
-  -remote string         pipeline-api URL (required unless --local)
-  -project string        Project name (auto-defaulted if you have exactly one)
-  -token-file string     Path to JWT token file (default: ~/.datuplet/token)
+  -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
+  -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one)
+  -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   -sql string            Inline SQL (takes precedence over -f and stdin)
   -f string              Path to a .sql file (used when --sql is empty; else stdin)
   -format string         Output format: table | csv | json (default: table)
   -local                 Force local execution (requires the separate duckdb-enabled datuplet-query binary)
+
+Headless / agent auth (RFC 027 §7):
+  DATUPLET_API_TOKEN     pipeline-api bearer token; precedence: -token-file > $DATUPLET_API_TOKEN > ~/.datuplet/api-token
+  DATUPLET_REMOTE        pipeline-api URL; precedence: -remote > $DATUPLET_REMOTE > ~/.datuplet/cluster.json
+  DATUPLET_PROJECT       Project name (resolved like -project) or UUID (fully-headless fast path only); precedence: -project > $DATUPLET_PROJECT > on-disk project resolution
+  With all set, no ~/.datuplet state is needed. Use 'datuplet login -email <e> -password-stdin'
+  for explicit non-interactive login instead.
 
 Options for 'gateway':
   -local                 Run in local mode (filesystem backend)

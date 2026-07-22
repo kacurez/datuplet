@@ -172,12 +172,25 @@ kubectl get svc -n datuplet pipeline-api
 ## 6. Trigger a pipeline
 
 The repo ships a simple example pipeline that fetches JSON from a public API and
-writes it as an Iceberg table.
+writes it as an Iceberg table. Pipelines are envelope-free PipelineDocs (RFC
+027) — upserted through the API/CLI/UI, not applied as Kubernetes manifests.
+Build the CLI and use it directly:
 
 ```bash
-kubectl apply -f examples/pipelines/simple-http-extract.yaml
+make build   # builds bin/datuplet
+
+export DATUPLET_REMOTE=http://localhost:8080
+echo changeme | ./bin/datuplet login --remote $DATUPLET_REMOTE \
+  --email admin@datuplet.local --password-stdin
+
+./bin/datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
+./bin/datuplet trigger simple-pipeline
+
 kubectl get pipelineruns -n datuplet -w
 ```
+
+(The UI at `http://localhost:8080/ui/` works too — Pipelines → paste the
+example YAML → Save → Trigger.)
 
 The run moves through `Pending → Running → Succeeded` in about 30–60 seconds.
 In the UI, go to the "Runs" page to see live status.

@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Datuplet — pipeline builder UX mockup (RFC 027)</title>
+<style>
+  :root {
+    --font-sans: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+    --text-xs: 11px; --text-sm: 12px; --text-md: 13px; --text-lg: 15px; --text-xl: 18px;
+    --bg-0: #0a0a0b; --bg-1: #111214; --bg-2: #1a1c1f; --bg-3: #22252a;
+    --border: #26282d; --border-hi: #3a3e45;
+    --fg-0: #e7e9ea; --fg-1: #9ea3a8; --fg-2: #5c6066;
+    --accent: #3ecf8e; --accent-dim: #14352a;
+    --warn: #eab308; --warn-fg: #fde68a; --fail: #ef4444; --fail-fg: #fca5a5;
+    --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 24px;
+    --radius: 4px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--font-sans); font-size: var(--text-md);
+    color: var(--fg-0); background: var(--bg-0); min-height: 100vh;
+  }
+  .rail {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 52px;
+    background: var(--bg-1); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center; gap: var(--s-4); padding-top: var(--s-4);
+  }
+  .rail span { width: 28px; height: 28px; border-radius: var(--radius); display: flex; align-items: center; justify-content: center; color: var(--fg-2); font-size: 14px; }
+  .rail span.on { background: var(--bg-2); color: var(--fg-0); box-shadow: inset 2px 0 0 var(--accent); }
+  .wrap { margin-left: 52px; }
+  .topbar {
+    display: flex; align-items: center; gap: var(--s-3); padding: var(--s-3) var(--s-5);
+    border-bottom: 1px solid var(--border); background: var(--bg-0);
+    position: sticky; top: 0; z-index: 30; flex-wrap: wrap;
+  }
+  .crumb { color: var(--fg-2); font-size: var(--text-sm); }
+  .pname {
+    font-family: var(--font-mono); font-size: var(--text-lg); font-weight: 500;
+    background: var(--bg-2); border: 1px solid var(--border); color: var(--fg-0);
+    border-radius: var(--radius); padding: 5px 10px; width: 200px;
+  }
+  .seg { display: inline-flex; border: 1px solid var(--border-hi); border-radius: var(--radius); overflow: hidden; }
+  .seg button {
+    all: unset; cursor: pointer; padding: 5px 14px; font-size: var(--text-sm); color: var(--fg-1); font-family: var(--font-sans);
+  }
+  .seg button.on { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+  .sp { flex: 1; }
+  .btn {
+    all: unset; cursor: pointer; font-family: var(--font-sans); font-size: var(--text-sm); font-weight: 500;
+    border-radius: var(--radius); padding: 6px 14px; border: 1px solid var(--border-hi); color: var(--fg-0);
+  }
+  .btn:hover { background: var(--bg-2); }
+  .btn--primary { background: var(--accent); border-color: var(--accent); color: #06281b; }
+  .btn--primary:hover { background: #5adf9f; }
+  .btn--ghost { border-color: transparent; color: var(--accent); padding: 4px 8px; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .stamp { color: var(--fg-2); font-size: var(--text-xs); }
+  .main { display: grid; grid-template-columns: 250px minmax(0,1fr); min-height: calc(100vh - 54px); }
+  .outline { border-right: 1px solid var(--border); background: var(--bg-1); padding: var(--s-4); }
+  .stage { margin-bottom: var(--s-4); }
+  .stage-h { display: flex; align-items: center; gap: 6px; color: var(--fg-2); font-size: var(--text-xs); letter-spacing: .06em; margin-bottom: var(--s-2); }
+  .stage-h input {
+    all: unset; font-family: var(--font-mono); color: var(--fg-1); font-size: var(--text-xs); width: 90px;
+    border-bottom: 1px dashed transparent;
+  }
+  .stage-h input:focus { border-bottom-color: var(--accent); }
+  .ccard {
+    border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-2);
+    padding: 8px 10px; margin-bottom: 6px; cursor: pointer; display: flex; align-items: center; gap: 8px;
+  }
+  .ccard:hover { border-color: var(--border-hi); }
+  .ccard.sel { border-color: var(--accent); }
+  .ccard .cn { font-weight: 600; font-size: var(--text-sm); font-family: var(--font-mono); }
+  .ccard .ct { color: var(--fg-1); font-size: var(--text-xs); }
+  .ccard .x { margin-left: auto; color: var(--fg-2); font-size: 13px; padding: 0 3px; }
+  .ccard .x:hover { color: var(--fail-fg); }
+  .editor { padding: var(--s-5); max-width: 860px; }
+  .ed-head { display: flex; align-items: baseline; gap: var(--s-3); flex-wrap: wrap; margin-bottom: 4px; }
+  .ed-head h2 { margin: 0; font-size: var(--text-xl); font-weight: 600; }
+  .vchip { font-size: var(--text-xs); color: var(--fg-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 2px 8px; background: var(--bg-1); }
+  .desc { color: var(--fg-1); font-size: var(--text-sm); margin: 0 0 var(--s-4); }
+  .field { display: block; margin-bottom: var(--s-3); font-size: var(--text-sm); color: var(--fg-1); }
+  .field b { color: var(--fg-0); font-weight: 500; }
+  .req { color: var(--warn-fg); }
+  .doci { color: var(--fg-2); cursor: help; font-size: 12px; border-bottom: 1px dotted var(--fg-2); }
+  .doci:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  .hint { color: var(--fg-2); font-size: var(--text-xs); }
+  .input, select.input, textarea.input {
+    display: block; width: 100%; margin-top: 4px; background: var(--bg-2); color: var(--fg-0);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 9px;
+    font-family: var(--font-sans); font-size: var(--text-md);
+  }
+  .input:focus { outline: none; border-color: var(--accent); }
+  .input--mono, textarea.input { font-family: var(--font-mono); font-size: var(--text-sm); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 34px; gap: 6px; align-items: center; }
+  .repeater { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-1); padding: var(--s-4); margin: var(--s-2) 0; position: relative; }
+  .repeater .ri { position: absolute; top: 8px; right: 10px; color: var(--fg-2); font-size: var(--text-xs); }
+  .group { margin: var(--s-3) 0; border-left: 2px solid var(--border); padding-left: var(--s-3); }
+  .group > summary { cursor: pointer; color: var(--fg-0); font-weight: 500; font-size: var(--text-sm); margin-left: -2px; list-style-position: inside; }
+  .group > summary .hint { font-weight: 400; }
+  .maprow input, .maprow select { margin-top: 0; }
+  .maprow { margin-bottom: 6px; }
+  .rm { all: unset; cursor: pointer; color: var(--fg-2); text-align: center; font-size: 13px; }
+  .rm:hover { color: var(--fail-fg); }
+  .sec-h { font-size: var(--text-sm); font-weight: 600; color: var(--fg-0); margin: var(--s-5) 0 var(--s-2); border-top: 1px solid var(--border); padding-top: var(--s-4); }
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: var(--text-xs); background: var(--bg-2); border: 1px solid var(--border); border-radius: 2px; padding: 2px 7px; margin-right: 6px; }
+  .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .chip--up { border-color: #2b4a3c; }
+  .findings { margin: var(--s-4) var(--s-5); }
+  .finding { display: flex; gap: 10px; align-items: baseline; border: 1px solid var(--border); border-left: 3px solid var(--fail); border-radius: var(--radius); background: var(--bg-1); padding: 8px 12px; margin-bottom: 6px; font-size: var(--text-sm); }
+  .finding.warn { border-left-color: var(--warn); }
+  .finding .fp { font-family: var(--font-mono); color: var(--fg-1); font-size: var(--text-xs); white-space: nowrap; }
+  .finding .sev { font-size: var(--text-xs); font-weight: 700; }
+  .finding .sev.e { color: var(--fail-fg); } .finding .sev.w { color: var(--warn-fg); }
+  .ok-callout { border: 1px solid #2b4a3c; border-radius: var(--radius); background: var(--accent-dim); color: var(--accent); padding: 8px 12px; font-size: var(--text-sm); margin-bottom: 6px; }
+  .yamlwrap { padding: var(--s-5); }
+  .yamlnote { color: var(--fg-1); font-size: var(--text-sm); margin-bottom: var(--s-3); }
+  .yamlnote code { font-family: var(--font-mono); color: var(--accent); }
+  textarea.yaml { width: 100%; min-height: 460px; line-height: 1.55; }
+  .catalog-back { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding-top: 9vh; }
+  .catalog { width: 560px; max-height: 70vh; overflow: auto; background: var(--bg-1); border: 1px solid var(--border-hi); border-radius: 6px; padding: var(--s-4); }
+  .catalog h3 { margin: 0 0 var(--s-3); font-size: var(--text-lg); }
+  .cat-item { display: flex; gap: 12px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 8px; cursor: pointer; align-items: baseline; }
+  .cat-item:hover { border-color: var(--accent); background: var(--bg-2); }
+  .cat-item .cin { font-family: var(--font-mono); font-weight: 600; font-size: var(--text-sm); white-space: nowrap; }
+  .cat-item .cid { color: var(--fg-1); font-size: var(--text-sm); }
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--bg-3); border: 1px solid var(--border-hi); color: var(--fg-0);
+    border-radius: 6px; padding: 10px 18px; font-size: var(--text-sm); z-index: 90; box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+  .runchip { font-size: var(--text-xs); font-family: var(--font-mono); color: var(--warn-fg); border: 1px solid var(--border-hi); border-radius: 2px; padding: 3px 8px; }
+  .tour {
+    position: fixed; right: 20px; bottom: 20px; width: 330px; z-index: 80;
+    background: var(--bg-1); border: 1px solid var(--accent); border-radius: 6px; padding: var(--s-4);
+    box-shadow: 0 8px 30px rgba(0,0,0,.6);
+  }
+  .tour .tn { color: var(--accent); font-size: var(--text-xs); font-weight: 700; letter-spacing: .08em; }
+  .tour h4 { margin: 6px 0; font-size: var(--text-lg); }
+  .tour p { margin: 0 0 var(--s-3); color: var(--fg-1); font-size: var(--text-sm); line-height: 1.5; }
+  .tour code { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--fg-0); background: var(--bg-2); padding: 1px 5px; border-radius: 2px; }
+  .tour .tbtns { display: flex; gap: 8px; align-items: center; }
+  .glow { animation: glow 1.4s ease-in-out infinite; border-radius: var(--radius); }
+  @keyframes glow { 0%,100% { box-shadow: 0 0 0 2px rgba(62,207,142,.9); } 50% { box-shadow: 0 0 0 6px rgba(62,207,142,.15); } }
+  .empty { color: var(--fg-2); font-size: var(--text-sm); padding: var(--s-5); }
+  pre.cli { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--fg-1); overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="rail" aria-hidden="true">
+  <span class="on">▶</span><span>〜</span><span>🗄</span><span>&gt;_</span><span>◫</span><span>⚿</span>
+</div>
+<div class="wrap">
+  <div class="topbar" id="topbar">
+    <span class="crumb">Pipelines /</span>
+    <input class="pname" id="pname" placeholder="pipeline-name" spellcheck="false">
+    <span class="seg" id="modeseg">
+      <button id="mode-form" class="on">Form</button>
+      <button id="mode-yaml">YAML</button>
+    </span>
+    <span class="sp"></span>
+    <span class="stamp" id="stamp">draft — not saved</span>
+    <span class="runchip" id="runchip" style="display:none;"></span>
+    <button class="btn" id="btn-tour" title="Reset the demo and replay the guided walkthrough">↻ Walkthrough</button>
+    <button class="btn" id="btn-validate">Validate</button>
+    <button class="btn" id="btn-save">Save</button>
+    <button class="btn btn--primary" id="btn-trigger">Trigger run</button>
+  </div>
+  <div id="findings" class="findings" style="display:none;"></div>
+  <div class="main" id="view-form">
+    <div class="outline" id="outline"></div>
+    <div class="editor" id="editor"></div>
+  </div>
+  <div class="yamlwrap" id="view-yaml" style="display:none;">
+    <p class="yamlnote">Raw mode — the same document, serialized. No <code>apiVersion</code>, no <code>kind</code>, no <code>metadata</code>. Switching back to Form parses it (round-trip); YAML comments don’t survive a form-side save. <span class="hint">(mockup: edits here are simulated, not parsed)</span></p>
+    <textarea class="input input--mono yaml" id="yamlta" spellcheck="false"></textarea>
+  </div>
+</div>
+<div id="catalog-host"></div>
+<div id="toast-host"></div>
+<div class="tour" id="tour" style="display:none;"></div>
+
+<script>
+'use strict';
+/* ---------- component registry (as served by GET /api/v1/components) ---------- */
+/* io capability comes from the ComponentDefinition (inputs/outputs: none|optional|required):
+   the UI hides sections a component can't use at all. */
+const CATALOG = [
+  { name: 'data-generator', displayName: 'Data Generator', version: '0.9.1',
+    io: { inputs: 'none', outputs: 'required' },
+    desc: 'Generates random or literal rows — test pipelines without an external source.' },
+  { name: 'sql-transform', displayName: 'SQL Transform', version: '0.9.1',
+    io: { inputs: 'required', outputs: 'required' },
+    desc: 'Runs user SQL inside an embedded DuckDB engine. Credentials-clean.' },
+  { name: 'http-json-extractor', displayName: 'HTTP JSON Extractor', version: '0.9.1',
+    io: { inputs: 'none', outputs: 'required' },
+    desc: 'Extracts JSON documents from an HTTP API into a table.' },
+  { name: 'pandas-transform', displayName: 'Pandas Transform', version: '0.9.1',
+    io: { inputs: 'required', outputs: 'required' },
+    desc: 'Python/pandas transformation over input tables.' },
+  { name: 'stdout-writer', displayName: 'Stdout Writer', version: '0.9.1',
+    io: { inputs: 'required', outputs: 'none' },
+    desc: 'Writes rows to stdout — debugging sink.' },
+];
+/* pre-existing tables in project storage (the real UI lists the storage catalog) */
+const EXISTING_TABLES = [
+  { bucket: 'staging', table: 'customers' },
+  { bucket: 'staging', table: 'orders' },
+];
+/* config schemas (JSON Schema 2020-12, Form Subset) — in the real system these come
+   from components/<name>/schema.json via the registry */
+const SCHEMAS = {
+  'data-generator': {
+    type: 'object', required: ['tables'],
+    properties: {
+      tables: { type: 'array', minItems: 1, title: 'tables',
+        description: 'One entry per generated table.',
+        items: { type: 'object', required: ['name'],
+          properties: {
+            name: { type: 'string', description: 'Output table name.' },
+            rowInsertSpeed: { type: 'integer', description: 'Rows per second.', default: 1000,
+              'x-datuplet-doc': 'Throttles the generator to this many rows per second. Set 0 to disable throttling and emit as fast as the Data Gateway accepts chunks.' },
+            random: { type: 'object', title: 'random', description: 'Random row generator.',
+              properties: {
+                schema: { type: 'map', valueEnum: ['string','int','long','float','double','boolean','date','timestamp','now','uuid'],
+                  description: 'column → type' },
+                limit: { type: 'object', title: 'limit',
+                  properties: {
+                    rowsCount: { type: 'integer', minimum: 0 },
+                    sizeInBytes: { type: 'integer', minimum: 0 },
+                    timeoutInSeconds: { type: 'integer', minimum: 0 },
+                  } },
+              } },
+            literal: { type: 'object', title: 'literal', collapsed: true, description: 'Fixed rows (columns + rows). Out of the demo path.',
+              properties: { columns: { type: 'array', items: { type: 'string' } } } },
+          } } },
+    },
+  },
+  'sql-transform': {
+    type: 'object', required: ['sql'],
+    properties: {
+      sql: { type: 'string', 'x-datuplet-multiline': 'sql', description: 'Input tables are visible under their logical names.',
+        'x-datuplet-doc': 'Standard DuckDB SQL. Every declared input table is materialized under its logical name before your SQL runs. Create output tables with CREATE TABLE <name> AS SELECT …; each must match a declared output.' },
+      threads: { type: 'integer', minimum: 1, 'x-datuplet-advanced': true,
+        description: 'DuckDB worker threads.',
+        'x-datuplet-doc': 'When unset, DuckDB uses all CPUs granted to the component container. Lower it to reduce memory pressure on wide aggregations.' },
+      memory: { type: 'string', 'x-datuplet-advanced': true,
+        description: 'DuckDB memory limit (e.g. 512MB).',
+        'x-datuplet-doc': 'When unset, DuckDB sizes itself from the container limit. Queries exceeding it spill to temp_directory instead of failing.' },
+      temp_directory: { type: 'string', 'x-datuplet-advanced': true,
+        description: 'Directory for DuckDB spill files.',
+        'x-datuplet-doc': 'Defaults to the component scratch volume. Point it at a larger mount for big out-of-core joins.' },
+      max_temp_size: { type: 'string', 'x-datuplet-advanced': true,
+        description: 'Cap on spill-file size (e.g. 2GB).',
+        'x-datuplet-doc': 'The query fails once spill files exceed this cap — a guard against runaway disk usage on limited-disk nodes.' },
+    },
+  },
+  'http-json-extractor': { type: 'object', required: ['url'], properties: { url: { type: 'string' } } },
+  'pandas-transform': { type: 'object', required: ['code'], properties: { code: { type: 'string', 'x-datuplet-multiline': 'python' } } },
+  'stdout-writer': { type: 'object', properties: { limit: { type: 'integer' } } },
+};
+
+/* ---------- state: THE pipeline document (what PUT sends as JSON) ---------- */
+const doc = { name: '', stages: [ { name: 'stage-1', components: [] } ] };
+let sel = null;            // {s, c} selected component
+let savedYAML = null;      // last saved serialization
+let mode = 'form';
+
+/* ---------- helpers ---------- */
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+function toast(msg, ms = 2600) {
+  const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
+  $('toast-host').appendChild(t); setTimeout(() => t.remove(), ms);
+}
+function defaultConfig(cname) {
+  if (cname === 'data-generator') return { tables: [ { name: '', random: { schema: {}, limit: {} } } ] };
+  if (cname === 'sql-transform') return { sql: '' };
+  return {};
+}
+/* tables produced by stages BEFORE stage index si (drives the inputs picker) */
+function upstreamTables(si) {
+  const out = [];
+  for (let i = 0; i < si; i++) {
+    for (const comp of doc.stages[i].components) {
+      const o = comp.outputs || {};
+      for (const t of (o.tables || [])) out.push({ bucket: t.bucket, table: t.name, from: doc.stages[i].name });
+      if (o.defaultBucket && comp.component === 'data-generator') {
+        for (const t of ((comp.config || {}).tables || [])) {
+          if (t.name) out.push({ bucket: o.defaultBucket, table: t.name, from: doc.stages[i].name });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/* ---------- outline ---------- */
+function renderOutline() {
+  const el = $('outline');
+  let h = '';
+  doc.stages.forEach((st, si) => {
+    h += `<div class="stage" data-si="${si}">
+      <div class="stage-h">STAGE · <input value="${esc(st.name)}" data-stname="${si}" spellcheck="false"><button class="rm" data-delstage="${si}" title="Delete stage">✕</button></div>`;
+    st.components.forEach((c, ci) => {
+      const s = sel && sel.s === si && sel.c === ci ? ' sel' : '';
+      h += `<div class="ccard${s}" data-sel="${si}:${ci}">
+        <span><span class="cn">${esc(c.name || '·')}</span><br><span class="ct">${esc(c.component)}</span></span>
+        <span class="x" data-del="${si}:${ci}" title="Remove">✕</span></div>`;
+    });
+    h += `<button class="btn btn--ghost" data-add="${si}" id="addc-${si}">+ Add component</button></div>`;
+  });
+  h += `<button class="btn btn--ghost" id="addstage">+ Add stage</button>`;
+  el.innerHTML = h;
+  el.querySelectorAll('[data-sel]').forEach((n) => n.addEventListener('click', (e) => {
+    if (e.target.dataset.del) return;
+    const [s, c] = n.dataset.sel.split(':').map(Number); sel = { s, c }; renderOutline(); renderEditor();
+  }));
+  el.querySelectorAll('[data-del]').forEach((n) => n.addEventListener('click', () => {
+    const [s, c] = n.dataset.del.split(':').map(Number);
+    doc.stages[s].components.splice(c, 1); sel = null; renderOutline(); renderEditor();
+  }));
+  el.querySelectorAll('[data-add]').forEach((n) => n.addEventListener('click', () => openCatalog(Number(n.dataset.add))));
+  el.querySelectorAll('[data-delstage]').forEach((n) => n.addEventListener('click', () => {
+    const si = Number(n.dataset.delstage);
+    const st = doc.stages[si];
+    if (st.components.length && !confirm(`Delete stage "${st.name}" and its ${st.components.length} component(s)?`)) return;
+    doc.stages.splice(si, 1);
+    if (!doc.stages.length) doc.stages.push({ name: 'stage-1', components: [] });
+    sel = null; renderOutline(); renderEditor();
+  }));
+  el.querySelectorAll('[data-stname]').forEach((n) => n.addEventListener('input', () => {
+    doc.stages[Number(n.dataset.stname)].name = n.value;
+  }));
+  $('addstage').addEventListener('click', () => {
+    doc.stages.push({ name: `stage-${doc.stages.length + 1}`, components: [] });
+    renderOutline();
+  });
+}
+
+/* ---------- catalog picker ---------- */
+function openCatalog(si, autoPick) {
+  const host = $('catalog-host');
+  host.innerHTML = `<div class="catalog-back" id="catback"><div class="catalog">
+    <h3>Add component <span class="hint">— registry catalog, schema-backed</span></h3>
+    ${CATALOG.map((c) => `<div class="cat-item" data-pick="${c.name}">
+      <span class="cin">${esc(c.name)}</span><span class="cid">${esc(c.desc)}</span></div>`).join('')}
+  </div></div>`;
+  host.querySelector('#catback').addEventListener('click', (e) => { if (e.target.id === 'catback') host.innerHTML = ''; });
+  host.querySelectorAll('[data-pick]').forEach((n) => n.addEventListener('click', () => pick(n.dataset.pick)));
+  function pick(cname) {
+    const meta = CATALOG.find((x) => x.name === cname);
+    const comp = { name: cname.split('-')[0], component: cname, version: meta.version, config: defaultConfig(cname) };
+    doc.stages[si].components.push(comp);
+    sel = { s: si, c: doc.stages[si].components.length - 1 };
+    host.innerHTML = ''; renderOutline(); renderEditor();
+  }
+  if (autoPick) setTimeout(() => pick(autoPick), 450);
+}
+
+/* ---------- schema-driven form renderer (Form Subset) ---------- */
+function renderSchemaNode(node, value, path, onChange) {
+  const wrap = document.createElement('div');
+  if (!node || !node.type) return wrap;
+  if (node.type === 'object') {
+    const emit = (into, k, child) => {
+      const req = (node.required || []).includes(k);
+      const v = (value || {})[k];
+      if (child.type === 'object') {
+        const d = document.createElement('details'); d.className = 'group'; d.open = !child.collapsed;
+        d.innerHTML = `<summary>${esc(child.title || k)} <span class="hint">${esc(child.description || '')}</span></summary>`;
+        d.appendChild(renderSchemaNode(child, v || {}, path.concat(k), (nv) => onChange(setKey(value, k, nv))));
+        into.appendChild(d);
+      } else if (child.type === 'array' && child.items && child.items.type === 'object') {
+        into.appendChild(renderRepeater(k, child, v || [], path, (nv) => onChange(setKey(value, k, nv)), req));
+      } else if (child.type === 'map') {
+        into.appendChild(renderMap(k, child, v || {}, (nv) => onChange(setKey(value, k, nv))));
+      } else {
+        into.appendChild(renderScalar(k, child, v, req, (nv) => onChange(setKey(value, k, nv))));
+      }
+    };
+    const entries = Object.entries(node.properties || {});
+    for (const [k, child] of entries.filter(([, c]) => !c['x-datuplet-advanced'])) emit(wrap, k, child);
+    const adv = entries.filter(([, c]) => c['x-datuplet-advanced']);
+    if (adv.length) {
+      const d = document.createElement('details'); d.className = 'group';
+      d.innerHTML = `<summary>Advanced <span class="hint">tuning — safe to leave empty</span></summary>`;
+      for (const [k, child] of adv) emit(d, k, child);
+      wrap.appendChild(d);
+    }
+  }
+  return wrap;
+}
+function setKey(obj, k, v) { const o = { ...(obj || {}) }; o[k] = v; return o; }
+function renderScalar(k, node, v, req, set) {
+  const l = document.createElement('label'); l.className = 'field';
+  /* description = short inline hint (lint-mandatory in the real system);
+     x-datuplet-doc = long-form help on hover; default = placeholder only,
+     NEVER copied into the stored config. */
+  const docIcon = node['x-datuplet-doc'] ? ` <span class="doci" title="${esc(node['x-datuplet-doc'])}">ⓘ</span>` : '';
+  const label = `<b>${esc(k)}</b>${req ? ' <span class="req">*</span>' : ''}${docIcon} <span class="hint">${esc(node.description || '')}</span>`;
+  if (node['x-datuplet-multiline']) {
+    l.innerHTML = label;
+    const ta = document.createElement('textarea'); ta.className = 'input'; ta.rows = 7; ta.spellcheck = false;
+    ta.value = v ?? ''; ta.dataset.lang = node['x-datuplet-multiline'];
+    if (node.default !== undefined) ta.placeholder = `default: ${node.default}`;
+    ta.addEventListener('input', () => set(ta.value)); l.appendChild(ta); return l;
+  }
+  if (Array.isArray(node.enum)) {
+    l.innerHTML = label;
+    const s = document.createElement('select'); s.className = 'input';
+    const emptyLabel = node.default !== undefined ? `— default (${esc(String(node.default))}) —` : '—';
+    s.innerHTML = `<option value="">${emptyLabel}</option>` + node.enum.map((e) => `<option${e === v ? ' selected' : ''}>${esc(e)}</option>`).join('');
+    s.addEventListener('change', () => set(s.value || undefined)); l.appendChild(s); return l;
+  }
+  l.innerHTML = label;
+  const i = document.createElement('input'); i.className = 'input'; i.spellcheck = false;
+  if (node.type === 'integer' || node.type === 'number') { i.type = 'number'; if (node.minimum != null) i.min = node.minimum; }
+  if (node.default !== undefined) i.placeholder = `default: ${node.default}`;
+  i.value = v ?? '';
+  i.addEventListener('input', () => {
+    if (i.value === '') return set(undefined);
+    set(node.type === 'integer' ? parseInt(i.value, 10) : node.type === 'number' ? Number(i.value) : i.value);
+  });
+  l.appendChild(i); return l;
+}
+function renderRepeater(k, node, arr, path, set, req) {
+  const box = document.createElement('div');
+  box.innerHTML = `<p class="field" style="margin-bottom:2px;"><b>${esc(k)}</b>${req ? ' <span class="req">*</span>' : ''} <span class="hint">${esc(node.description || '')} (${arr.length} item${arr.length === 1 ? '' : 's'})</span></p>`;
+  arr.forEach((item, i) => {
+    const card = document.createElement('div'); card.className = 'repeater';
+    card.innerHTML = `<span class="ri">${esc(k)}[${i}] <button class="rm" title="Remove item">✕</button></span>`;
+    card.querySelector('.rm').addEventListener('click', () => { const na = arr.slice(); na.splice(i, 1); set(na); renderEditor(); });
+    card.appendChild(renderSchemaNode(node.items, item, path.concat(k, i), (nv) => { const na = arr.slice(); na[i] = nv; set(na); }));
+    box.appendChild(card);
+  });
+  const add = document.createElement('button'); add.className = 'btn btn--ghost'; add.textContent = `+ Add ${k} item`;
+  add.addEventListener('click', () => { set(arr.concat([{}])); renderEditor(); });
+  box.appendChild(add);
+  return box;
+}
+function renderMap(k, node, obj, set) {
+  const box = document.createElement('div');
+  box.innerHTML = `<p class="field" style="margin-bottom:4px;"><b>${esc(k)}</b> <span class="hint">${esc(node.description || '')}</span></p>`;
+  const rows = document.createElement('div');
+  const entries = Object.entries(obj);
+  entries.forEach(([key, val], i) => {
+    const r = document.createElement('div'); r.className = 'grid3 maprow';
+    const ki = document.createElement('input'); ki.className = 'input'; ki.value = key; ki.placeholder = 'column'; ki.spellcheck = false;
+    const vs = document.createElement('select'); vs.className = 'input';
+    vs.innerHTML = node.valueEnum.map((e) => `<option${e === val ? ' selected' : ''}>${esc(e)}</option>`).join('');
+    const rm = document.createElement('button'); rm.className = 'rm'; rm.textContent = '✕';
+    ki.addEventListener('change', () => { const es = Object.entries(obj); es[i] = [ki.value, vs.value]; set(Object.fromEntries(es.filter(([a]) => a))); renderEditor(); });
+    vs.addEventListener('change', () => { obj[key] = vs.value; set({ ...obj }); });
+    rm.addEventListener('click', () => { const o = { ...obj }; delete o[key]; set(o); renderEditor(); });
+    r.append(ki, vs, rm); rows.appendChild(r);
+  });
+  box.appendChild(rows);
+  const add = document.createElement('button'); add.className = 'btn btn--ghost'; add.textContent = '+ Add column';
+  add.addEventListener('click', () => {
+    let n = 1; while (obj[`col_${n}`] !== undefined) n++;
+    set({ ...obj, [`col_${n}`]: node.valueEnum[0] }); renderEditor();
+  });
+  box.appendChild(add);
+  return box;
+}
+
+/* ---------- component editor (schema form + inputs/outputs) ---------- */
+function renderEditor() {
+  const el = $('editor');
+  if (!sel || !doc.stages[sel.s] || !doc.stages[sel.s].components[sel.c]) {
+    el.innerHTML = `<div class="empty">Pick a component on the left — or add one from the catalog.<br><br>
+      The form is generated from the component’s <span class="chip">schema.json</span>; YAML stays one toggle away.</div>`;
+    return;
+  }
+  const comp = doc.stages[sel.s].components[sel.c];
+  const meta = CATALOG.find((x) => x.name === comp.component) || { displayName: comp.component, desc: '' };
+  el.innerHTML = '';
+  const head = document.createElement('div');
+  head.innerHTML = `<div class="ed-head"><h2>${esc(meta.displayName)}</h2>
+      <span class="vchip">version ${esc(comp.version)} ▾</span></div>
+    <p class="desc">${esc(meta.desc)}</p>
+    <label class="field" style="max-width:320px;"><b>name</b> <span class="hint">instance name in this pipeline</span>
+      <input class="input input--mono" id="ed-name" value="${esc(comp.name)}" spellcheck="false"></label>
+    <div class="sec-h">Config <span class="hint">— generated from schema.json</span></div>`;
+  el.appendChild(head);
+  $('ed-name').addEventListener('input', (e) => { comp.name = e.target.value; renderOutlineSoft(); });
+  const form = document.createElement('div'); form.id = 'cfg-form';
+  form.appendChild(renderSchemaNode(SCHEMAS[comp.component], comp.config, [], (nv) => { comp.config = nv; }));
+  el.appendChild(form);
+
+  /* inputs — hidden entirely when the component can't consume tables */
+  const io = meta.io || { inputs: 'optional', outputs: 'optional' };
+  if (io.inputs !== 'none') {
+    const ins = document.createElement('div');
+    const cur = ((comp.inputs || {}).tables) || [];
+    ins.innerHTML = `<div class="sec-h">Inputs <span class="hint">— tables this component reads${io.inputs === 'required' ? ' (required)' : ''}</span></div>`;
+    const rows = document.createElement('div');
+    cur.forEach((t, i) => {
+      const r = document.createElement('p'); r.className = 'field';
+      r.innerHTML = `<span class="chip"><span class="dot"></span>${esc(t.bucket)}.${esc(t.table)}</span>
+        <button class="rm" title="Remove input">✕</button>`;
+      r.querySelector('.rm').addEventListener('click', () => { cur.splice(i, 1); if (!cur.length) delete comp.inputs; renderEditor(); });
+      rows.appendChild(r);
+    });
+    ins.appendChild(rows);
+    const add = document.createElement('button'); add.className = 'btn'; add.textContent = '+ Add input table…';
+    add.addEventListener('click', () => openTablePicker(sel.s, cur, (list) => {
+      comp.inputs = comp.inputs || { tables: [] };
+      comp.inputs.tables = comp.inputs.tables || [];
+      for (const x of list) comp.inputs.tables.push({ bucket: x.bucket, table: x.table });
+      renderEditor();
+    }));
+    ins.appendChild(add);
+    el.appendChild(ins);
+  }
+
+  /* outputs — hidden entirely when the component writes nothing */
+  if (io.outputs === 'none') return;
+  const outs = document.createElement('div');
+  el.appendChild(outs);
+  renderOutputs(outs, comp);
+}
+
+/* outputs editor: explicit two-mode UI.
+   Dynamic  → outputs.defaultBucket (+ defaultWriteMode): component names tables at runtime.
+   Explicit → outputs.tables[]: one mapping per table (bucket + name + writeMode);
+              "Select existing…" picks a storage/upstream table to write into. */
+function renderOutputs(box, comp) {
+  const o = comp.outputs || {};
+  if (!comp.__outMode) comp.__outMode = (Array.isArray(o.tables) && o.tables.length) ? 'explicit' : 'dynamic';
+  const mode = comp.__outMode;
+  box.innerHTML = `<div class="sec-h">Outputs <span class="hint">— tables this component writes</span></div>
+    <div class="seg" style="margin-bottom:var(--s-3);">
+      <button id="om-dyn" class="${mode === 'dynamic' ? 'on' : ''}">Dynamic — bucket only</button>
+      <button id="om-exp" class="${mode === 'explicit' ? 'on' : ''}">Explicit tables</button>
+    </div>
+    <div id="out-body"></div>`;
+  box.querySelector('#om-dyn').addEventListener('click', () => {
+    if (comp.__outMode === 'dynamic') return;
+    comp.__outMode = 'dynamic';
+    const first = ((comp.outputs || {}).tables || [])[0];
+    if (first && first.bucket) comp.outputs = { defaultBucket: first.bucket, ...(first.writeMode ? { defaultWriteMode: first.writeMode } : {}) };
+    else delete comp.outputs;
+    renderOutputs(box, comp);
+  });
+  box.querySelector('#om-exp').addEventListener('click', () => {
+    if (comp.__outMode === 'explicit') return;
+    comp.__outMode = 'explicit';
+    const b = (comp.outputs || {}).defaultBucket, m = (comp.outputs || {}).defaultWriteMode;
+    comp.outputs = { tables: b ? [ { name: '', bucket: b, ...(m ? { writeMode: m } : {}) } ] : [] };
+    renderOutputs(box, comp);
+  });
+  const body = box.querySelector('#out-body');
+  if (mode === 'dynamic') {
+    body.innerHTML = `<p class="hint" style="margin:0 0 8px;">The component decides table names at runtime (e.g. from its config); they all land in this bucket.</p>
+      <div class="grid2" style="max-width:560px;">
+        <label class="field"><b>bucket</b><input class="input input--mono" id="ob" value="${esc(o.defaultBucket || '')}" placeholder="raw" spellcheck="false"></label>
+        <label class="field"><b>writeMode</b><select class="input" id="omw">
+          <option value=""${!o.defaultWriteMode ? ' selected' : ''}>— default (FULL_LOAD) —</option>
+          <option${o.defaultWriteMode === 'APPEND' ? ' selected' : ''}>APPEND</option>
+          <option${o.defaultWriteMode === 'FULL_LOAD' ? ' selected' : ''}>FULL_LOAD</option></select></label>
+      </div><p class="field" id="ochips"></p>`;
+    const sync = () => {
+      const b = body.querySelector('#ob').value.trim(), m = body.querySelector('#omw').value;
+      if (!b && !m) delete comp.outputs;
+      else comp.outputs = { ...(b ? { defaultBucket: b } : {}), ...(m ? { defaultWriteMode: m } : {}) };
+      body.querySelector('#ochips').innerHTML = b ? `<span class="chip"><span class="dot"></span>${esc(b)} (dynamic)</span>` : '';
+    };
+    body.querySelector('#ob').addEventListener('input', sync);
+    body.querySelector('#omw').addEventListener('change', sync);
+    sync();
+  } else {
+    const tables = (comp.outputs && Array.isArray(comp.outputs.tables)) ? comp.outputs.tables : [];
+    comp.outputs = { tables };
+    body.innerHTML = `<p class="hint" style="margin:0 0 8px;">One mapping per table — bucket + table name. Name a new table, or select an existing one to write into.</p>
+      <div id="orows"></div>
+      <div style="display:flex; gap:8px; margin-top:6px;">
+        <button class="btn" id="o-new">+ New table</button>
+        <button class="btn" id="o-exist">Select existing…</button>
+      </div>`;
+    const orows = body.querySelector('#orows');
+    tables.forEach((t, i) => {
+      const r = document.createElement('div'); r.className = 'maprow';
+      r.style.cssText = 'display:grid; grid-template-columns:1fr 1fr 170px 30px; gap:6px; align-items:center; max-width:640px;';
+      const bi = document.createElement('input'); bi.className = 'input input--mono'; bi.placeholder = 'bucket'; bi.value = t.bucket || ''; bi.spellcheck = false;
+      const ti = document.createElement('input'); ti.className = 'input input--mono'; ti.placeholder = 'table name'; ti.value = t.name || ''; ti.spellcheck = false;
+      const ws = document.createElement('select'); ws.className = 'input';
+      ws.innerHTML = `<option value=""${!t.writeMode ? ' selected' : ''}>— default (FULL_LOAD) —</option>
+        <option${t.writeMode === 'APPEND' ? ' selected' : ''}>APPEND</option>
+        <option${t.writeMode === 'FULL_LOAD' ? ' selected' : ''}>FULL_LOAD</option>`;
+      const rm = document.createElement('button'); rm.className = 'rm'; rm.title = 'Remove mapping'; rm.textContent = '✕';
+      bi.addEventListener('input', () => { t.bucket = bi.value.trim(); });
+      ti.addEventListener('input', () => { t.name = ti.value.trim(); });
+      ws.addEventListener('change', () => { if (ws.value) t.writeMode = ws.value; else delete t.writeMode; });
+      rm.addEventListener('click', () => { tables.splice(i, 1); renderOutputs(box, comp); });
+      r.append(bi, ti, ws, rm); orows.appendChild(r);
+    });
+    body.querySelector('#o-new').addEventListener('click', () => { tables.push({ name: '', bucket: '' }); renderOutputs(box, comp); });
+    body.querySelector('#o-exist').addEventListener('click', () => {
+      openTablePicker(sel.s, tables.map((t) => ({ bucket: t.bucket, table: t.name })), (list) => {
+        for (const x of list) tables.push({ name: x.table, bucket: x.bucket });
+        renderOutputs(box, comp);
+      });
+    });
+  }
+}
+/* modal table picker: upstream-produced tables + existing storage catalog.
+   have = [{bucket, table}] already wired; onAdd receives the picked list. */
+function openTablePicker(si, have, onAdd) {
+  const hasIt = (b, t) => have.some((x) => x.bucket === b && x.table === t);
+  const ups = upstreamTables(si).filter((u) => !hasIt(u.bucket, u.table));
+  const ex = EXISTING_TABLES.filter((u) => !hasIt(u.bucket, u.table));
+  const picked = new Set();
+  const host = $('catalog-host');
+  const row = (u) => `<div class="cat-item" data-t="${esc(u.bucket)}.${esc(u.table)}">
+      <span class="cin">${esc(u.bucket)}.${esc(u.table)}</span>
+      <span class="cid">${u.from ? 'produced by stage ' + esc(u.from) : 'in storage'}</span></div>`;
+  host.innerHTML = `<div class="catalog-back" id="pickback"><div class="catalog">
+    <h3>Add input tables</h3>
+    <input class="input" id="pick-search" placeholder="Filter tables…" style="margin-bottom:10px;" spellcheck="false">
+    ${ups.length ? `<p class="hint" style="margin:4px 0;">PRODUCED UPSTREAM</p>` + ups.map(row).join('') : ''}
+    ${ex.length ? `<p class="hint" style="margin:8px 0 4px;">IN STORAGE</p>` + ex.map(row).join('') : ''}
+    ${!ups.length && !ex.length ? '<p class="hint">No tables available yet.</p>' : ''}
+    <div style="display:flex; gap:8px; margin-top:12px;">
+      <button class="btn btn--primary" id="pick-add" disabled>Add selected</button>
+      <button class="btn" id="pick-cancel">Cancel</button></div>
+  </div></div>`;
+  const sync = () => {
+    const b = $('pick-add'); b.disabled = picked.size === 0;
+    b.textContent = picked.size ? `Add ${picked.size} table${picked.size > 1 ? 's' : ''}` : 'Add selected';
+  };
+  host.querySelectorAll('[data-t]').forEach((n) => n.addEventListener('click', () => {
+    const k = n.dataset.t;
+    if (picked.has(k)) { picked.delete(k); n.style.borderColor = ''; }
+    else { picked.add(k); n.style.borderColor = 'var(--accent)'; }
+    sync();
+  }));
+  $('pick-search').addEventListener('input', () => {
+    const q2 = $('pick-search').value.toLowerCase();
+    host.querySelectorAll('[data-t]').forEach((n) => { n.style.display = n.dataset.t.toLowerCase().includes(q2) ? '' : 'none'; });
+  });
+  $('pick-cancel').addEventListener('click', () => { host.innerHTML = ''; });
+  host.querySelector('#pickback').addEventListener('click', (e) => { if (e.target.id === 'pickback') host.innerHTML = ''; });
+  $('pick-add').addEventListener('click', () => {
+    const list = [];
+    for (const k of picked) {
+      const dot = k.indexOf('.');
+      list.push({ bucket: k.slice(0, dot), table: k.slice(dot + 1) });
+    }
+    host.innerHTML = '';
+    onAdd(list);
+  });
+}
+function renderOutlineSoft() {
+  const c = document.querySelector('.ccard.sel .cn');
+  if (c && sel) c.textContent = doc.stages[sel.s].components[sel.c].name || '·';
+}
+
+/* ---------- YAML serialization (deterministic) ---------- */
+function q(s) { s = String(s); return /[:#{}\[\],&*!|>'"%@`\n]|^\s|\s$|^$/.test(s) ? JSON.stringify(s) : s; }
+function yval(v, ind) {
+  const pad = ' '.repeat(ind);
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof v === 'string') {
+    if (v.includes('\n')) return '|\n' + v.split('\n').map((l) => pad + '  ' + l).join('\n');
+    return q(v);
+  }
+  return JSON.stringify(v);
+}
+function ymap(obj, ind) {
+  const pad = ' '.repeat(ind); let out = '';
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined || v === null || (typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0)) continue;
+    if (Array.isArray(v)) {
+      if (!v.length) continue;
+      out += `${pad}${q(k)}:\n`;
+      for (const item of v) {
+        if (typeof item === 'object' && item !== null) {
+          const lines = ymap(item, 0).trimEnd().split('\n');
+          out += `${pad}  - ${lines[0]}\n`;
+          for (let j = 1; j < lines.length; j++) out += `${pad}    ${lines[j]}\n`;
+        } else out += `${pad}  - ${yval(item, ind + 2)}\n`;
+      }
+    } else if (typeof v === 'object') {
+      out += `${pad}${q(k)}:\n` + ymap(v, ind + 2);
+    } else {
+      out += `${pad}${q(k)}: ${yval(v, ind)}\n`;
+    }
+  }
+  return out;
+}
+function serialize() {
+  const d = { name: doc.name || undefined, stages: doc.stages.map((s) => ({
+    name: s.name,
+    components: s.components.map((c) => ({ name: c.name, component: c.component, version: c.version, config: c.config, inputs: c.inputs, outputs: c.outputs })),
+  })) };
+  return ymap(d, 0);
+}
+
+/* ---------- validation (mirror of server-side findings) ---------- */
+function validate() {
+  const f = [];
+  if (!/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(doc.name || '')) f.push({ sev: 'error', path: 'name', msg: 'Pipeline name must be a lowercase DNS-1123 subdomain.' });
+  const seen = new Set();
+  doc.stages.forEach((st, si) => {
+    if (!st.components.length) f.push({ sev: 'warning', path: `stages[${si}]`, msg: `Stage "${st.name}" has no components.` });
+    st.components.forEach((c, ci) => {
+      const p = `stages[${si}].components[${ci}]`;
+      if (!c.name) f.push({ sev: 'error', path: `${p}.name`, msg: 'Component instance name is required.' });
+      if (seen.has(c.name)) f.push({ sev: 'error', path: `${p}.name`, msg: `Duplicate component name "${c.name}".` });
+      seen.add(c.name);
+      const ot = (c.outputs && Array.isArray(c.outputs.tables)) ? c.outputs.tables : [];
+      ot.forEach((t, ti) => {
+        if (!t.name || !t.bucket) f.push({ sev: 'error', path: `${p}.outputs.tables[${ti}]`, msg: 'Explicit output mappings need both bucket and table name.' });
+      });
+      if (c.component === 'data-generator') {
+        const ts = (c.config || {}).tables || [];
+        if (!ts.length) f.push({ sev: 'error', path: `${p}.config.tables`, msg: 'tables is required (minItems 1).' });
+        ts.forEach((t, ti) => {
+          if (!t.name) f.push({ sev: 'error', path: `${p}.config.tables[${ti}].name`, msg: 'name is required.' });
+          const cols = ((t.random || {}).schema) || {};
+          if (t.random && !Object.keys(cols).length && !t.literal) f.push({ sev: 'warning', path: `${p}.config.tables[${ti}].random.schema`, msg: 'random.schema is empty — the generator emits zero columns.' });
+        });
+        if (!c.outputs) f.push({ sev: 'error', path: `${p}.outputs`, msg: 'data-generator writes tables — declare an output bucket.' });
+      }
+      if (c.component === 'sql-transform') {
+        if (!((c.config || {}).sql || '').trim()) f.push({ sev: 'error', path: `${p}.config.sql`, msg: 'sql is required.' });
+        if (!((c.inputs || {}).tables || []).length) f.push({ sev: 'warning', path: `${p}.inputs`, msg: 'No inputs declared — the SQL will see no tables.' });
+      }
+    });
+  });
+  return f;
+}
+function showFindings(f, okMsg) {
+  const el = $('findings'); el.style.display = 'block';
+  if (!f.length) { el.innerHTML = `<div class="ok-callout">✓ ${esc(okMsg || 'Valid. 0 errors, 0 warnings.')}</div>`; return; }
+  el.innerHTML = f.map((x) => `<div class="finding ${x.sev === 'warning' ? 'warn' : ''}">
+    <span class="sev ${x.sev === 'warning' ? 'w' : 'e'}">${x.sev === 'warning' ? 'WARN' : 'ERROR'}</span>
+    <span class="fp">${esc(x.path)}</span><span>${esc(x.msg)}</span></div>`).join('');
+}
+
+/* ---------- topbar actions ---------- */
+$('pname').addEventListener('input', (e) => { doc.name = e.target.value.trim(); });
+$('mode-form').addEventListener('click', () => setMode('form'));
+$('mode-yaml').addEventListener('click', () => setMode('yaml'));
+function setMode(m) {
+  mode = m;
+  $('mode-form').classList.toggle('on', m === 'form');
+  $('mode-yaml').classList.toggle('on', m === 'yaml');
+  $('view-form').style.display = m === 'form' ? 'grid' : 'none';
+  $('view-yaml').style.display = m === 'yaml' ? 'block' : 'none';
+  if (m === 'yaml') $('yamlta').value = serialize();
+  else { renderOutline(); renderEditor(); }
+}
+$('btn-validate').addEventListener('click', () => {
+  const f = validate(); showFindings(f);
+  toast(f.some((x) => x.sev === 'error') ? 'Validation failed — findings below' : 'Valid ✓');
+});
+$('btn-save').addEventListener('click', () => {
+  const f = validate();
+  if (f.some((x) => x.sev === 'error')) { showFindings(f); toast('Not saved — fix the errors first'); return; }
+  showFindings(f, f.length ? null : 'Saved. 0 errors, 0 warnings.');
+  savedYAML = serialize();
+  $('stamp').textContent = 'saved just now';
+  toast(f.length ? 'Saved with warnings' : 'Saved ✓');
+});
+$('btn-trigger').addEventListener('click', () => {
+  if (savedYAML == null) { toast('Save the pipeline first'); return; }
+  $('runchip').style.display = 'inline'; $('runchip').textContent = 'run 0198f2ab · Running';
+  toast('Run started — streaming via Data Gateway');
+  setTimeout(() => { $('runchip').textContent = 'run 0198f2ab · Succeeded'; $('runchip').style.color = 'var(--accent)'; }, 3200);
+});
+
+/* ---------- guided tour ---------- */
+const SQL_DEMO = `CREATE TABLE daily_summary AS
+SELECT country,
+       count(*)    AS events,
+       sum(amount) AS revenue
+FROM events
+GROUP BY country;`;
+const steps = [
+  { t: 'The form-first editor', target: 'modeseg',
+    b: 'This is the redesigned pipeline page. <b>Form</b> is the default surface; the schema drives everything. YAML still exists — one explicit toggle away, same document.',
+    apply() {} },
+  { t: 'Name the pipeline', target: 'pname',
+    b: 'Just a name. No <code>apiVersion</code>, no <code>kind</code>, no <code>metadata</code> envelope anywhere in this flow.',
+    apply() { doc.name = 'events-etl'; $('pname').value = 'events-etl'; } },
+  { t: 'Add the generator', target: 'addc-0',
+    b: 'Click <i>+ Add component</i> and the registry catalog opens — every entry is schema-backed. We pick <code>data-generator</code>.',
+    apply() { doc.stages[0].name = 'generate'; openCatalog(0, 'data-generator'); } },
+  { t: 'A form, generated from schema.json', target: 'cfg-form',
+    b: '<code>tables</code> is an array-of-objects → the renderer makes a repeater card. Required fields are marked <span style="color:var(--warn-fg)">*</span>; hover ⓘ for the long-form doc. Defaults show as placeholders (see <code>rowInsertSpeed</code>) — an empty field stores <i>nothing</i>, the component applies its own default at runtime.',
+    apply() { const c = comp0(); c.config.tables[0].name = 'events'; c.config.tables[0].rowInsertSpeed = 1000; renderEditor(); } },
+  { t: 'Nested config: the column map', target: 'cfg-form',
+    b: '<code>random.schema</code> is a JSON-Schema map (<code>additionalProperties</code> with an enum) → key/value rows with a type dropdown. This exact schema falls back to a raw JSON textarea in today’s UI.',
+    apply() { const c = comp0(); c.config.tables[0].random.schema = { id: 'uuid', created: 'timestamp', amount: 'double', country: 'string' }; c.config.tables[0].random.limit = { rowsCount: 100000 }; renderEditor(); } },
+  { t: 'Outputs: dynamic mode', target: 'editor',
+    b: 'The generator names its tables at runtime (from <code>tables[].name</code> in its config), so outputs stay in <b>Dynamic — bucket only</b> mode: bucket <code>raw</code>, mode <code>APPEND</code>. No table names repeated here.',
+    apply() { const c = comp0(); c.__outMode = 'dynamic'; c.outputs = { defaultBucket: 'raw', defaultWriteMode: 'APPEND' }; renderEditor(); } },
+  { t: 'Second stage: SQL transform', target: 'addstage',
+    b: 'Stages run sequentially; components inside a stage run in parallel. We add stage <code>transform</code> with a <code>sql-transform</code>.',
+    apply() {
+      if (doc.stages.length < 2) doc.stages.push({ name: 'transform', components: [] });
+      doc.stages[1].name = 'transform';
+      openCatalog(1, 'sql-transform');
+      setTimeout(() => { const c = doc.stages[1].components[0]; if (c) c.name = 'daily-summary'; renderOutline(); renderEditor(); }, 600);
+    } },
+  { t: 'Inputs: a modal, upstream-aware', target: 'editor',
+    b: 'Only components that consume tables get an Inputs section — the generator shows none at all. <i>+ Add input table…</i> opens a modal listing tables <b>produced upstream</b> (<code>raw.events</code>, declared by stage <i>generate</i>) plus what already sits in storage. Search, tick, add.',
+    apply() { const c = doc.stages[1].components[0]; c.inputs = { tables: [ { bucket: 'raw', table: 'events' } ] }; renderEditor(); } },
+  { t: 'Multiline where it matters', target: 'cfg-form',
+    b: 'The schema marks <code>sql</code> with <code>x-datuplet-multiline: "sql"</code> → a proper code area, not a one-line input. Tuning knobs (<code>threads</code>, <code>memory</code>, spill settings) sit collapsed under <b>Advanced</b>. Outputs here use <b>Explicit tables</b> mode — one bucket + table mapping per output (<code>curated.daily_summary</code>, FULL_LOAD); “Select existing…” would let you write into a table that already exists.',
+    apply() { const c = doc.stages[1].components[0]; c.config.sql = SQL_DEMO; c.__outMode = 'explicit'; c.outputs = { tables: [ { name: 'daily_summary', bucket: 'curated', writeMode: 'FULL_LOAD' } ] }; renderEditor(); } },
+  { t: 'Same document, raw view', target: 'modeseg',
+    b: 'The YAML toggle shows the <i>entire</i> pipeline — this is exactly what <code>datuplet pipeline get</code> prints and what an agent PUTs as JSON. Switching back loses nothing.',
+    apply() { setMode('yaml'); } },
+  { t: 'Validate → save → trigger', target: 'topbar',
+    b: 'Validate runs the same server-side checks agents get from <code>POST …/pipelines/validate</code>. Then save and trigger.<pre class="cli">datuplet components get data-generator --schema\ndatuplet pipeline validate -f events-etl.yaml --json\ndatuplet pipeline put -f events-etl.yaml\ndatuplet trigger events-etl --wait --json</pre>',
+    apply() { setMode('form'); $('btn-validate').click(); setTimeout(() => $('btn-save').click(), 500); setTimeout(() => $('btn-trigger').click(), 1000); } },
+  { t: 'That’s the redesign', target: null,
+    b: 'Schema-driven form by default · raw YAML on request · one envelope-free document · identical surface for humans (UI), agents (CLI/JSON) and CI. Close this card and click around freely.',
+    apply() {} },
+];
+let stepIdx = -1;
+function comp0() { return doc.stages[0].components[0]; }
+function glow(id) {
+  document.querySelectorAll('.glow').forEach((n) => n.classList.remove('glow'));
+  if (id) { const n = $(id); if (n) { n.classList.add('glow'); n.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } }
+}
+function showStep(i) {
+  stepIdx = i;
+  const s = steps[i];
+  const el = $('tour'); el.style.display = 'block';
+  el.innerHTML = `<div class="tn">WALKTHROUGH · ${i + 1} / ${steps.length}</div>
+    <h4>${s.t}</h4><p>${s.b}</p>
+    <div class="tbtns">
+      ${i > 0 ? '<button class="btn" id="t-back">Back</button>' : ''}
+      <button class="btn btn--primary" id="t-next">${i === steps.length - 1 ? 'Finish' : 'Next — do it'}</button>
+      <span class="sp"></span><button class="btn btn--ghost" id="t-skip">Skip tour</button>
+    </div>
+    <p class="hint" style="margin:8px 0 0;">This walkthrough is a mockup aid — the real UI ships without it.</p>`;
+  $('t-next').addEventListener('click', () => {
+    s.apply();
+    setTimeout(() => { if (i === steps.length - 1) { $('tour').style.display = 'none'; glow(null); } else { showStep(i + 1); } }, s.t.includes('generator') || s.t.includes('SQL transform') ? 1100 : 250);
+  });
+  const back = $('t-back'); if (back) back.addEventListener('click', () => showStep(i - 1));
+  $('t-skip').addEventListener('click', () => { $('tour').style.display = 'none'; glow(null); });
+  glow(s.target);
+}
+
+/* ---------- boot ---------- */
+function resetDemo() {
+  doc.name = ''; $('pname').value = '';
+  doc.stages.length = 0; doc.stages.push({ name: 'stage-1', components: [] });
+  sel = null; savedYAML = null;
+  $('stamp').textContent = 'draft — not saved';
+  $('runchip').style.display = 'none'; $('runchip').style.color = 'var(--warn-fg)';
+  $('findings').style.display = 'none';
+  setMode('form');
+}
+$('btn-tour').addEventListener('click', () => { resetDemo(); showStep(0); });
+renderOutline(); renderEditor(); showStep(0);
+</script>
+</body>
+</html>

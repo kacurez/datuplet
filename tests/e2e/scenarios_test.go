@@ -198,15 +198,12 @@ var scenarios = []framework.Scenario{
 			{Type: "failure_type", ExpectedFailure: "FailedUser"},
 		},
 	},
-	{
-		Name:        "error-missing-table",
-		Description: "Reading non-existent table fails",
-		K8sPipeline: "k8s/error-missing-table.yaml",
-		ExpectError: true,
-		Assertions: []framework.Assertion{
-			{Type: "failure_type", ExpectedFailure: "FailedUser"},
-		},
-	},
+	// error-missing-table is no longer a run scenario: under RFC 027 the
+	// pipeline-api validator rejects its invalid input-table reference at PUT
+	// (HTTP 400) before any run is created, so it cannot reach a terminal
+	// failure phase the declarative Scenario{} shape asserts on. It is covered
+	// as a PUT pre-flight rejection by TestErrorMissingTableRejected in
+	// scenarios_registry_test.go (RFC 027 E5).
 
 	// Secret handling ($[name] resolution via the managed write-only secrets
 	// API) is exercised by TestSecretsLadder in scenarios_secrets_test.go —
