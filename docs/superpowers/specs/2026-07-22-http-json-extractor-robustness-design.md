@@ -80,6 +80,29 @@ removes all dependence on flush timing and fixes problem (1) in both modes.
 This mirrors the proven pattern in `components/data-generator/literal.go`,
 which already writes with `FORMAT_JSONL`.
 
+**Known limitation introduced by this switch (accepted).** JSONL is *not*
+strictly more robust than the old `FORMAT_JSON` path. The gateway's JSONL
+first-chunk / schema-inference path (`pkg/datagateway/format/json.go`, the
+`s == nil` branch) uses `bufio.NewScanner` with the **default 64 KiB
+line-token limit**; only the later known-schema fast path raises it to 16 MiB
+(`scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)`). The old
+`json.Unmarshal(data, &objects)` had no per-line limit. Consequence: a single
+record whose JSON serialization exceeds 64 KiB, landing in the first flushed
+chunk, will fail schema inference. This is acceptable for our sources (World
+Bank, GBIF, and typical REST/JSON records are far under 64 KiB) and we take it
+knowingly rather than change the gateway. It **must** be called out in
+`docs/components.md` as a constraint of the component. (Fixing the gateway
+slow-path buffer would remove the limit but was explicitly out of scope for
+this PR.)
+
+**Invariant the component must uphold.** Each `writer.Write()` payload must
+contain only complete, newline-terminated JSON records. The SDK writer appends
+a whole `Write()` payload to its batch buffer before deciding to flush
+(`sdk/go/client.go`), so it never splits a payload mid-record across POSTs —
+JSONL parsing per POST body is therefore safe *as long as* `writeJSONL` emits
+whole records terminated by `\n`. This invariant is tested with a deliberately
+tiny batch threshold (see Testing).
+
 ### 2. Field mapping (projection)
 
 New optional config key `fields`, an array of `{path, name}` objects:
@@ -104,11 +127,23 @@ Semantics:
   else is emitted.
 - **Dot-path resolution:** `path` is split on `.`; each segment indexes into a
   nested `map[string]any`. `country.value` reads `record["country"]["value"]`.
-- **Missing paths are lenient:** an unresolved `path` yields JSON `null` for
-  that field on that record (the run does not fail). This keeps one sparse
-  field from killing an otherwise-good extract.
+  Reuse the existing live helper `getValueRaw` (`main.go:664`), which already
+  does dot-path traversal returning `any`.
+- **Non-resolving paths yield `null` (lenient), covering every non-hit case
+  explicitly:** the key is absent; an intermediate segment is a scalar, array,
+  or `null` (not a `map[string]any`) so traversal cannot continue; or the final
+  value is `null`. In all of these the projected field is JSON `null` for that
+  record and the run does not fail. This keeps one sparse or oddly-shaped field
+  from killing an otherwise-good extract.
 - **Backward compatible:** when `fields` is omitted or empty, every field of
   each record is emitted verbatim (today's behavior).
+- **Output-column-name rule:** each `name` must match
+  `^[A-Za-z_][A-Za-z0-9_]{0,127}$` and be unique across `fields` (the same rule
+  data-generator enforces on column names, `components/data-generator/config.go`).
+  This rejects spaces, dots, empty/whitespace, and SQL-hostile names in
+  author-controlled output columns. Note this rule applies only to *projected*
+  `name`s; when `fields` is omitted, raw JSON keys pass through unchanged as
+  today (we do not retroactively police source-defined columns).
 
 Implemented as a pure helper `projectRecords(records, fields) []map[string]any`
 applied in both modes immediately before `writeJSONL`.
@@ -128,12 +163,20 @@ same helpers, and the paginated arm still `return`s (kept from PR #33). The
 final commit + status-message block iterates `result.Buckets` (no `[0]`
 indexing) and lives in one place.
 
-### 4. Delete dead CSV code
+### 4. Delete only the genuinely-dead CSV emitters
 
-Remove `getColumns`, `collectColumns`, `recordToCSV`, `getValue`,
-`formatValue`, `escapeCSV`, `inferJSONSchema`, `inferColumnTypeFromJSON`, and
-`ColumnSchema`, plus now-unused imports (`sort`, `strconv`, `strings` if no
-longer referenced). Confirm zero references before deleting.
+**Correction (from review):** most of the "CSV" code is NOT dead — it is used
+by `DATUPLET_MODE=sample` (`runSampleMode` → `inferJSONSchema` → `getColumns` →
+`collectColumns` → `inferColumnTypeFromJSON`; `SampleOutput` carries
+`[]ColumnSchema`). Those all stay.
+
+Reference-checked truly-dead set (safe to remove): `recordToCSV` (`main.go:462`,
+never called) and its exclusive helpers `getValue` (`main.go:472`), `escapeCSV`,
+and `formatValue` — all reachable only from `recordToCSV`. Verify zero
+references again at implementation time before deleting, and drop only imports
+that become unused as a result. **Do not** delete `getColumns`,
+`collectColumns`, `inferJSONSchema`, `inferColumnTypeFromJSON`, `ColumnSchema`,
+or `getValueRaw` (the latter is reused by §2 projection).
 
 ### 5. Config cleanup adopting data-generator patterns
 
@@ -191,6 +234,22 @@ fetchJSON(pageURL) --> parseJSON (bare | positional | object-wrapped)
     --> client.Commit()  --> iterate result.Buckets for status
 ```
 
+## Compatibility & schema inference (caveat from review)
+
+"Omitting `fields` yields the same columns as today" holds for the data and
+column set inferred from the objects, but is **not unconditional** across the
+JSON→JSONL switch. The gateway infers a table's schema from the objects in the
+**first flushed chunk** (`schema.InferSchemaFromJSONWithConfig`). Under
+batching, the first chunk of a paginated extract may now contain *several
+coalesced pages* rather than just page 1, so a column that only appears on
+later pages could be inferred into the schema differently than in the old
+large-page behavior (where each page tended to flush on its own). This is a
+behavioral nuance, not a regression for our sources (World Bank / GBIF pages
+are homogeneous), but the spec records it: schema is inferred from whatever
+records are in the first flushed chunk, and that set depends on batch timing.
+Projection (`fields`) makes the output schema deterministic regardless of
+batching, which is the recommended path when a stable schema matters.
+
 ## Error handling
 
 - Config invalid (empty `url`, malformed `fields`) → `ExitUserError` (exit 1)
@@ -212,7 +271,15 @@ committed, not throwaway):
   null, projection drops unlisted fields, empty `fields` → identity.
 - `writeJSONL`: N records → N newline-delimited JSON objects, each a valid
   standalone object; concatenating two calls' output is still valid JSONL.
-- `ParseAndValidate`: empty url, empty path/name, duplicate names rejected.
+- **Batching invariant:** with a deliberately tiny batch threshold
+  (`WithBatchSize`), a multi-page paginated write still parses — proving pages
+  coalesced into one POST are valid JSONL and no record is split mid-line.
+- `ParseAndValidate`: empty url rejected; `fields[i]` with empty `path`,
+  empty/whitespace `name`, a `name` violating `^[A-Za-z_][A-Za-z0-9_]{0,127}$`,
+  or duplicate `name`s all rejected.
+- `projectRecords` non-object intermediate: `path` whose intermediate segment
+  is a scalar/array/`null` → projected field is `null` (matches the dot-path
+  semantics above).
 
 End-to-end proof after release: rewrite the World Bank pipeline to use `fields`
 (dropping the `json_extract_string` SQL) and confirm `Succeeded` with a clean
@@ -228,8 +295,19 @@ End-to-end proof after release: rewrite the World Bank pipeline to use `fields`
       the same objects).
 - [ ] Single-request and paginated paths share `resolveOutputTable`,
       `projectRecords`, `writeJSONL`; no `result.Buckets[0]` indexing.
-- [ ] Dead CSV code removed; `go build` + `go vet` clean.
-- [ ] `schema.json` passes Form-Subset lint; `make sync-component-schemas` run,
-      no CI drift; `docs/components.md` updated.
-- [ ] Unit tests pass.
-- [ ] World Bank + GBIF pipelines proven green post-release.
+- [ ] Only the confirmed-dead CSV emitters removed (`recordToCSV`, `getValue`,
+      `escapeCSV`, `formatValue`); sample-mode code untouched; `DATUPLET_MODE=sample`
+      still works.
+- [ ] `schema.json` passes Form-Subset lint
+      (`go test ./pkg/pipeline/schemalint/...`); `make sync-component-schemas`
+      run, no CI drift.
+- [ ] `docs/components.md` updated: `fields` documented, JSONL write format and
+      the 64 KiB first-chunk record limit noted, and the hardcoded component
+      tag / shared release-version text refreshed for `v0.11.0`.
+- [ ] `go build ./...` + `go vet ./...` clean for the component module; unit
+      tests pass; `make tidy` run (monorepo module parity — CI enforces it).
+- [ ] `make bump-version VERSION=0.11.0` applied (updates all four charts,
+      `charts/datuplet-app/values.yaml` `components.tag`, and `COMPONENT_TAG`);
+      PR-vs-separate-bump decided with the maintainer.
+- [ ] World Bank pipeline rewritten to use `fields` (no `json_extract_string`)
+      and GBIF re-run — both proven green post-release.
