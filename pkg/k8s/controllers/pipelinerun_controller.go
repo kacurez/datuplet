@@ -654,7 +654,6 @@ func (r *PipelineRunReconciler) snapshotRunSecrets(ctx context.Context, pr *datu
 			Labels: map[string]string{
 				"app.kubernetes.io/component": "run-secrets",
 				"app.kubernetes.io/part-of":   "datuplet",
-				"datuplet.io/pipelinerun":     pr.Name,
 				"datuplet.io/run-id":          pr.Status.RunID,
 			},
 		},
