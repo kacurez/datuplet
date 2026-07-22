@@ -44,10 +44,14 @@
         "properties": {
           "path": {
             "type": "string",
+            "minLength": 1,
             "description": "Dot-path to the source value, e.g. country.value for a nested object. Unresolved paths yield null."
           },
           "name": {
             "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$",
             "description": "Output column name. Must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$ and be unique."
           }
         }
