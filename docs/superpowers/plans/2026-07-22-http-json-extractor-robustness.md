@@ -489,36 +489,47 @@ func commitAndStatus(ctx context.Context, client *sdk.Client, sourceURL string) 
 }
 ```
 
-- [ ] **Step 2: Replace the body of `main()` from the config-parse point down**
+- [ ] **Step 2: Replace the body of `main()` from `// Get config` down**
 
-Replace the current block from `// Parse component config` (`main.go:58`) through
-the end of `main()` (the closing `}` at `main.go:158`) with:
+**Naming note (from review):** `main()` already declares `cfg := client.Config()`
+(the SDK exec config, used for `cfg.ExecutionID`) at `main.go:55`. Do NOT reuse
+`cfg` for the component config — that redeclares it and won't compile. The
+component config is named **`compCfg`** (matching data-generator).
+
+Replace the current block from `// Get config` (`main.go:54`) through the end of
+`main()` (the closing `}` at `main.go:158`) with the following. This makes
+`sdk.BuildInfo()` the first log line, keeps `cfg := client.Config()` for the
+existing "started" log, and uses `compCfg` for the component config:
 
 ```go
-	// Parse + validate config before any network or writer work.
+	// Log SDK build info first (rebuild diagnostics), then the started line.
 	client.Log(ctx, "INFO", sdk.BuildInfo().String())
 
-	var cfg Config
-	if err := client.ParseConfig(&cfg); err != nil {
+	cfg := client.Config()
+	client.Log(ctx, "INFO", fmt.Sprintf("HTTP JSON Extractor started: execution=%s", cfg.ExecutionID))
+
+	// Parse + validate component config before any network or writer work.
+	var compCfg Config
+	if err := client.ParseConfig(&compCfg); err != nil {
 		sdk.ExitUserError(fmt.Sprintf("failed to parse config: %v", err))
 	}
-	if err := ParseAndValidate(&cfg); err != nil {
+	if err := ParseAndValidate(&compCfg); err != nil {
 		sdk.ExitUserError(err.Error())
 	}
 
-	outputTable := resolveOutputTable(cfg.TableName, cfg.ArrayPath)
+	outputTable := resolveOutputTable(compCfg.TableName, compCfg.ArrayPath)
 
 	// Paginated mode - stream data incrementally, page by page.
-	if cfg.Pagination != nil && cfg.Pagination.Type != "" {
-		if err := runPaginatedExtraction(ctx, client, &cfg, outputTable); err != nil {
+	if compCfg.Pagination != nil && compCfg.Pagination.Type != "" {
+		if err := runPaginatedExtraction(ctx, client, &compCfg, outputTable); err != nil {
 			sdk.ExitUserError(fmt.Sprintf("paginated extraction failed: %v", err))
 		}
 		return
 	}
 
 	// Single-request mode.
-	client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", cfg.URL))
-	records, err := fetchJSON(ctx, cfg.URL, cfg.ArrayPath, cfg.Headers)
+	client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
+	records, err := fetchJSON(ctx, compCfg.URL, compCfg.ArrayPath, compCfg.Headers)
 	if err != nil {
 		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
 	}
@@ -533,7 +544,7 @@ the end of `main()` (the closing `}` at `main.go:158`) with:
 		return
 	}
 
-	records = projectRecords(records, cfg.Fields)
+	records = projectRecords(records, compCfg.Fields)
 
 	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
 	if err != nil {
@@ -548,12 +559,16 @@ the end of `main()` (the closing `}` at `main.go:158`) with:
 	}
 	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
 
-	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {
+	if err := commitAndStatus(ctx, client, compCfg.URL); err != nil {
 		sdk.ExitAppError(err.Error())
 	}
 	client.Log(ctx, "INFO", "HTTP JSON extraction completed successfully")
 }
 ```
+
+Note: the removed `cfg.DefaultBucket` log line (old `main.go:108`) is
+intentionally dropped — the writer resolves the default bucket internally; it
+was only ever logged.
 
 - [ ] **Step 3: Change `runPaginatedExtraction` signature + body to use `cfg`, JSONL, projection, and `commitAndStatus`**
 
@@ -630,15 +645,25 @@ git commit -m "feat(http-json-extractor): write JSONL in both paths, apply proje
 **Interfaces:**
 - Removes: `recordToCSV` (`main.go:462`), `getValue` (`main.go:472`), `formatValue` (`main.go:488`), `escapeCSV` (`main.go:512`). Nothing consumes these after Task 5.
 
-- [ ] **Step 1: Verify they are unreferenced**
+- [ ] **Step 1: Verify no *live* path references them**
 
-Run:
+These four form a closed cluster: `recordToCSV` calls `getValue` + `escapeCSV`;
+`getValue` calls `formatValue`. So raw `grep -c` counts are >1 (doc comment +
+def + mutual calls) — that is expected, not a red flag. What matters is that
+**nothing outside the cluster** calls them. Inspect every call site:
+
 ```bash
 cd components/http-json-extractor
-for fn in recordToCSV getValue formatValue escapeCSV; do echo "$fn: $(grep -c "\b$fn\b" main.go) refs"; done
+grep -n 'recordToCSV\|escapeCSV\|formatValue\|[^R]getValue(' main.go
 ```
-Expected: each prints exactly `1 refs` (definition only). If any prints >1, stop
-and inspect — do not delete a referenced function.
+Expected: the only references are (a) the four `func`/comment lines and (b)
+`getValue`/`escapeCSV` called inside `recordToCSV`, and `formatValue` called
+inside `getValue`. Confirm NO reference appears inside `main`,
+`runPaginatedExtraction`, `runSampleMode`, `inferJSONSchema`,
+`inferColumnTypeFromJSON`, or any other retained function. (`getValueRaw` is a
+*different* function and stays — the `[^R]getValue(` pattern excludes it.) The
+authoritative safety net is Step 3: after deleting all four together,
+`go build` fails if any live reference remained.
 
 - [ ] **Step 2: Delete the four functions**
 
@@ -747,14 +772,22 @@ that:
 
 - [ ] **Step 2: Refresh the hardcoded component tag for the release**
 
-Search the file for the current tag and bump the http-json-extractor references
-(and any shared "release version" line) to the new version:
+Note (from review): `docs/components.md` currently says **`v0.9.1`** everywhere
+(line ~19 shared "release version", line ~175 the http-json-extractor image) —
+the v0.10.2 release never updated it, so it is already stale. Find the real
+occurrences:
 ```bash
-grep -n "v0.10.2" docs/components.md
+grep -n "v0.9.1" docs/components.md
 ```
-Update those occurrences to `v0.11.0` (done here so the docs match the release
-cut in Task 9; if a reference is genuinely shared across all components, update
-it consciously).
+For THIS PR, update to `v0.11.0`:
+- the **http-json-extractor** image line (`ghcr.io/kacurez/http-json-extractor:v0.9.1` → `:v0.11.0`);
+- the shared release-version line (~line 19, "…the release version; `v0.9.1` in this release").
+
+Leave the other components' image tags (`data-generator`, `finnhub-extractor`,
+`sql-transform`, `pandas-transform`, `stdout-writer`) as-is: they are stale
+independently of this change (pre-existing drift from the v0.10.2 release). Do
+NOT bulk-rewrite them here — flag that drift in the PR description as a
+maintainer follow-up rather than expanding this PR's scope.
 
 - [ ] **Step 3: Commit**
 
@@ -857,4 +890,6 @@ maintainer cuts the `v0.11.0` tag.
 
 **Placeholder scan:** No TBD/TODO; every code step has complete code. ✓
 
-**Type consistency:** `Config`, `FieldMapping`, `ParseAndValidate`, `resolveOutputTable`, `encodeJSONL`, `writeJSONL`, `projectRecords`, `commitAndStatus`, and the `runPaginatedExtraction(ctx, client, *Config, outputTable)` signature are used identically across Tasks 2–9. `getValueRaw` reused by `projectRecords` matches its existing signature. ✓
+**Type consistency:** `Config`, `FieldMapping`, `ParseAndValidate`, `resolveOutputTable`, `encodeJSONL`, `writeJSONL`, `projectRecords`, `commitAndStatus`, and the `runPaginatedExtraction(ctx, client, *Config, outputTable)` signature are used identically across Tasks 2–9. `getValueRaw` reused by `projectRecords` matches its existing signature. The component config is named `compCfg` in `main()` to avoid colliding with the existing `cfg := client.Config()` (SDK exec config); `runPaginatedExtraction`'s parameter is `cfg *Config` (separate scope, no collision). ✓
+
+**Post-Codex-review revisions:** Blocker (cfg redeclaration) → Task 5 renames to `compCfg` and reorders BuildInfo first. Major (docs tag) → Task 8 targets the real `v0.9.1` strings. Major (dead-code ref check) → Task 6 checks live callers, not raw counts, with `go build` as the net. ✓
