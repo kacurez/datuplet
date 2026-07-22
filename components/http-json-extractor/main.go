@@ -496,64 +496,6 @@ func collectColumns(prefix string, data map[string]any, columns map[string]bool)
 	}
 }
 
-// recordToCSV converts a record to a CSV line.
-func recordToCSV(record map[string]any, columns []string) string {
-	values := make([]string, len(columns))
-	for i, col := range columns {
-		val := getValue(record, col)
-		values[i] = escapeCSV(val)
-	}
-	return strings.Join(values, ",") + "\n"
-}
-
-// getValue gets a value from a record, supporting dot notation for nested fields.
-func getValue(record map[string]any, path string) string {
-	parts := strings.Split(path, ".")
-	var current any = record
-
-	for _, part := range parts {
-		if m, ok := current.(map[string]any); ok {
-			current = m[part]
-		} else {
-			return ""
-		}
-	}
-
-	return formatValue(current)
-}
-
-// formatValue converts a value to string for CSV output.
-func formatValue(v any) string {
-	if v == nil {
-		return ""
-	}
-	switch val := v.(type) {
-	case string:
-		return val
-	case float64:
-		if val == float64(int64(val)) {
-			return fmt.Sprintf("%d", int64(val))
-		}
-		return fmt.Sprintf("%g", val)
-	case bool:
-		return fmt.Sprintf("%t", val)
-	case []any:
-		// Serialize array as JSON
-		b, _ := json.Marshal(val)
-		return string(b)
-	default:
-		return fmt.Sprintf("%v", val)
-	}
-}
-
-// escapeCSV escapes a value for CSV output.
-func escapeCSV(s string) string {
-	if strings.ContainsAny(s, ",\"\n\r") {
-		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-	}
-	return s
-}
-
 // SampleOutput is the JSON output structure for sample mode.
 type SampleOutput struct {
 	Schema   []ColumnSchema   `json:"schema"`
