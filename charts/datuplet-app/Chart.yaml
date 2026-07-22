@@ -3,8 +3,8 @@ apiVersion: v2
 name: datuplet-app
 description: Datuplet control plane — pipeline-api, pipeline-operator, CRDs, pipeline-observer, and reaper (Phase 3 of the 5-phase install). Requires datuplet-infra (Phase 2) installed first. Lakekeeper is Phase 4 (charts/datuplet-lakekeeper).
 type: application
-version: 0.10.1
-appVersion: "0.10.1"
+version: 0.10.2
+appVersion: "0.10.2"
 home: https://github.com/kacurez/datuplet
 sources:
   - https://github.com/kacurez/datuplet
