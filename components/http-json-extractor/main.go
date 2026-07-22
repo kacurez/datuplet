@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -461,6 +462,48 @@ func recordsFromSlice(items []any) []map[string]any {
 		}
 	}
 	return records
+}
+
+// resolveOutputTable applies the table_name > array_path > "data" precedence.
+func resolveOutputTable(tableName, arrayPath string) string {
+	switch {
+	case tableName != "":
+		return tableName
+	case arrayPath != "":
+		return arrayPath
+	default:
+		return "data"
+	}
+}
+
+// encodeJSONL serializes records as newline-delimited JSON (one object per
+// line). Concatenation-safe: appending two encodeJSONL outputs is still valid
+// JSONL, so coalesced gateway batches parse correctly. HTML escaping is off so
+// values like URLs with & are preserved verbatim.
+func encodeJSONL(records []map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	for _, rec := range records {
+		if err := enc.Encode(rec); err != nil { // Encode appends a trailing '\n'
+			return nil, fmt.Errorf("marshal record: %w", err)
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// writeJSONL writes records to the gateway as one JSONL blob. Each Write()
+// payload contains only whole, newline-terminated records (the SDK never
+// splits a payload mid-record), keeping per-POST JSONL parsing safe.
+func writeJSONL(ctx context.Context, w *sdk.Writer, records []map[string]any) error {
+	if len(records) == 0 {
+		return nil
+	}
+	data, err := encodeJSONL(records)
+	if err != nil {
+		return err
+	}
+	return w.Write(ctx, data)
 }
 
 // getColumns extracts sorted column names from records, flattening nested objects.
