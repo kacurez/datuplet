@@ -350,6 +350,22 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		Namespace: pr.Namespace,
 	}, pipeline); err != nil {
 		if errors.IsNotFound(err) {
+			// RFC 027 materializes the Pipeline CR at trigger time, immediately
+			// before the PipelineRun. The operator's cached client can reconcile
+			// the PipelineRun before it observes the just-created Pipeline CR, so
+			// a NotFound here is usually a transient informer-cache lag, not a
+			// genuinely absent pipeline. Requeue with backoff for a bounded number
+			// of CONSECUTIVE misses (reusing the admission transient-retry budget);
+			// only once that is exhausted is the pipeline really gone → FailedUser.
+			key := types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name}
+			attempt := r.noteTransientRetry(key)
+			if attempt < admissionTransientRetryBudget {
+				logger.Info("Referenced Pipeline not yet observed (cache lag?), requeueing",
+					"attempt", attempt, "budget", admissionTransientRetryBudget,
+					"pipeline", pr.Spec.PipelineRef.Name)
+				return ctrl.Result{RequeueAfter: admissionTransientRetryInterval}, nil
+			}
+			r.clearTransientRetries(key)
 			pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
 			pr.Status.Message = fmt.Sprintf("Pipeline '%s' not found", pr.Spec.PipelineRef.Name)
 			if err := r.Status().Update(ctx, pr); err != nil {
