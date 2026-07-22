@@ -67,12 +67,15 @@ node_modules/
 ._*
 Thumbs.db
 
-# Claude Code — local state and personal/plugin skills stay ignored; only the
-# platform's shared datuplet-operator skill is versioned in-repo.
-.claude/*
-!.claude/skills/
-.claude/skills/*
-!.claude/skills/datuplet-operator/
+# Claude Code — ignore all .claude state everywhere (incl. nested module dirs),
+# then re-include ONLY the repo-root platform skills so they are versioned.
+.claude/
+!/.claude/
+/.claude/*
+!/.claude/skills/
+/.claude/skills/*
+!/.claude/skills/datuplet-operator/
+!/.claude/skills/datuplet-component-author/
 
 # Working files
 initprompt.txt

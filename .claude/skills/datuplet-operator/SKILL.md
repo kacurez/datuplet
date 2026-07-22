@@ -149,6 +149,25 @@ datuplet query --sql 'SELECT count(*) FROM "<bucket>"."<table>"'   # ad-hoc SQL 
 Check row counts and shape against the goal. If the numbers are wrong, the fix
 is almost always in the transform SQL or the input selection — back to step 2.
 
+## When no existing component fits
+
+Sometimes the goal needs a data source, transform, or destination that **no
+catalog component can do** — a database, a SOAP/gRPC API, a proprietary format, a
+transform SQL can't express. When you hit this, first make sure it's real:
+re-check `datuplet components list --json` and the near-matches (`http-json-
+extractor` handles most REST/JSON sources incl. pagination; `sql-transform`
+covers most transforms/joins/aggregations).
+
+If nothing genuinely fits, **do not hack around it** — don't abuse
+`sql-transform` to make network calls, don't ask the user to hand-load data,
+don't silently drop the requirement. The correct move is to **propose creating a
+new component** and say so plainly: name the missing capability, why the existing
+components don't cover it, and the shape of the component you'd build (its `io`
+and config). Then hand off to the **`datuplet-component-author`** skill, which
+covers building, registering, and proving a new component. Building a component
+is a bounded, well-patterned task — treat a missing connector as "build the
+connector," not "give up" or "improvise."
+
 ## Guardrails and principles
 
 - **Validate before you save; confirm `Succeeded` after you run.** These two
