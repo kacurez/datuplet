@@ -136,6 +136,28 @@ func TestDecodeRecords_ErrorText(t *testing.T) {
 	}
 }
 
+// parseJSON unmarshalled the whole body, so a document that turns malformed
+// AFTER the record array must still fail on the streaming path (drainToEOF).
+func TestDecodeRecords_MalformedRemainder(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		arrayPath string
+	}{
+		{"wrapped_truncated_after_array", `{"results":[{"x":1}],`, "results"},
+		{"positional_unclosed_outer", `[{"meta":1},[{"x":1}]`, ""},
+		{"bare_unclosed", `[{"x":1}`, ""},
+		{"bare_trailing_garbage", `[{"x":1}] garbage`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := collect(t, tc.body, tc.arrayPath); err == nil {
+				t.Fatal("expected parse error for malformed document remainder")
+			}
+		})
+	}
+}
+
 func TestDecodeRecords_FnErrorPropagates(t *testing.T) {
 	sentinel := errors.New("boom")
 	_, err := decodeRecords(strings.NewReader(`[{"id":1},{"id":2}]`), "", func(map[string]any) error {
@@ -312,10 +334,22 @@ func decodeTopLevelArray(dec *json.Decoder, fn func(map[string]any) error) (int,
 			if _, err := dec.Token(); err != nil { // consume the inner ']'
 				return count, fmt.Errorf("failed to parse JSON: %w", err)
 			}
+			// Validate the remainder (trailing elements, outer ']', EOF) so
+			// a malformed document still fails, as parseJSON's whole-body
+			// Unmarshal did.
+			if err := drainToEOF(dec); err != nil {
+				return count, err
+			}
 			return count, nil
 		default:
 			// scalar element: fully consumed by Token(); skip
 		}
+	}
+	// Validate the remainder FIRST (closing ']', EOF): for bodies within the
+	// scan window nothing has been delivered yet, so a malformed document
+	// errors before any record reaches fn — exactly parseJSON's semantics.
+	if err := drainToEOF(dec); err != nil {
+		return count, err
 	}
 	// End of array with no nested record array: pending are the records.
 	if err := flushPending(); err != nil {
@@ -403,6 +437,12 @@ func decodeWrappedObject(dec *json.Decoder, arrayPath string, fn func(map[string
 			if _, err := dec.Token(); err != nil { // consume ']'
 				return count, fmt.Errorf("failed to parse JSON: %w", err)
 			}
+			// Validate the remainder (later wrapper fields, closing '}',
+			// EOF) so a malformed document still fails, as parseJSON's
+			// whole-body Unmarshal did.
+			if err := drainToEOF(dec); err != nil {
+				return count, err
+			}
 			return count, nil
 		}
 
@@ -445,6 +485,26 @@ func skipBalanced(dec *json.Decoder) error {
 		}
 	}
 	return nil
+}
+
+// drainToEOF walks the decoder's remaining tokens to the end of input,
+// validating the rest of the document — closing delimiters, trailing wrapper
+// fields, ignored trailing elements — in O(1) memory. parseJSON unmarshalled
+// the WHOLE body and rejected malformed documents even when the record array
+// itself was fine (e.g. a truncated `{"results":[...],`); this preserves that
+// strictness on the streaming path. Note the inherent streaming caveat: for
+// bodies larger than the scan window, records are delivered to fn before a
+// corrupt tail is discovered — the run still fails, and nothing is committed
+// (Commit is the barrier), so the end state matches the old behavior.
+func drainToEOF(dec *json.Decoder) error {
+	for {
+		if _, err := dec.Token(); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("failed to parse JSON: %w", err)
+		}
+	}
 }
 
 ```
@@ -1241,6 +1301,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
@@ -1256,7 +1317,8 @@ type writerState struct {
 	rows          int64
 	batches       int64
 	bytes         int64
-	schema        string
+	schema        string   // "name:type, ..." label of the first payload (logging)
+	schemaNames   []string // first payload's column names — later payloads must match
 }
 
 type mockGateway struct {
@@ -1400,19 +1462,28 @@ func (g *mockGateway) ingest(writerID string, data []byte) (int64, error) {
 		return 0, fmt.Errorf("ipc read: %w", rd.Err())
 	}
 
+	names := make([]string, 0, rd.Schema().NumFields())
+	labeled := make([]string, 0, rd.Schema().NumFields())
+	for _, f := range rd.Schema().Fields() {
+		names = append(names, f.Name)
+		labeled = append(labeled, f.Name+":"+f.Type.String())
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	ws, ok := g.writers[writerID]
 	if !ok {
 		return 0, fmt.Errorf("unknown writer: %s", writerID)
 	}
-	if ws.schema == "" {
-		names := make([]string, 0, rd.Schema().NumFields())
-		for _, f := range rd.Schema().Fields() {
-			names = append(names, f.Name+":"+f.Type.String())
-		}
-		ws.schema = strings.Join(names, ", ")
+	if ws.schemaNames == nil {
+		// First payload for this writer: lock its schema. Later payloads
+		// must match exactly — catches cross-batch schema drift even for
+		// no-`fields` configs (where expectCols is empty).
+		ws.schemaNames = names
+		ws.schema = strings.Join(labeled, ", ")
 		log.Printf("mock-dg: writer %s schema: [%s]", writerID, ws.schema)
+	} else if !slices.Equal(ws.schemaNames, names) {
+		return 0, fmt.Errorf("schema violation: writer %s column drift: first %v, now %v", writerID, ws.schemaNames, names)
 	}
 	ws.rows += rows
 	ws.batches++
@@ -1692,3 +1763,17 @@ The PR's CI e2e (fail-closed since RFC 024) exercises ~13 extractor fixtures. Au
   exact strings.
 - Minor (`io` import) → folded into the mock's import block.
 - Nit → `extractor-local` added to `.PHONY`. ✓
+
+**Post-Codex-review revisions (round 2):**
+- Major (early-return token consumption) → new `drainToEOF` helper walks the
+  document remainder to EOF (O(1) memory) on every success path: positional
+  early-return, bare-array end (drain BEFORE delivering pending — parseJSON
+  parity for sub-window bodies), and wrapped-object return. Malformed
+  remainders (`{"results":[...],`, unclosed outer array, trailing garbage) now
+  fail, matching parseJSON's whole-body strictness;
+  `TestDecodeRecords_MalformedRemainder` covers all four cases. The inherent
+  streaming caveat (large-body records reach fn before a corrupt tail is
+  found; run still fails, Commit never runs) is documented on the helper.
+- Minor (mock no-`fields` drift) → `writerState.schemaNames` locks the first
+  payload's column names per writer; every later payload must match exactly
+  (`slices.Equal`), independent of `expectCols`. ✓
