@@ -113,14 +113,26 @@ func TestDecodeRecords_UseNumber(t *testing.T) {
 }
 
 func TestDecodeRecords_Errors(t *testing.T) {
-	if _, _, err := collect(t, `{"no":"array here"}`, ""); err == nil {
-		t.Fatal("expected error for object with no array field")
-	}
-	if _, _, err := collect(t, `{"results":"not-an-array"}`, "results"); err == nil {
-		t.Fatal("expected error for non-array array_path value")
-	}
 	if _, _, err := collect(t, `not json`, ""); err == nil {
 		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+// Exact error-text compatibility with parseJSON (main.go): a set array_path
+// that is missing or non-array must say "field '<k>' is not an array"; the
+// generic message is reserved for auto-detect finding nothing.
+func TestDecodeRecords_ErrorText(t *testing.T) {
+	_, _, err := collect(t, `{"results":"not-an-array"}`, "results")
+	if err == nil || err.Error() != "field 'results' is not an array" {
+		t.Fatalf("non-array array_path: got %v", err)
+	}
+	_, _, err = collect(t, `{"other":[{"x":1}]}`, "results") // key absent entirely
+	if err == nil || err.Error() != "field 'results' is not an array" {
+		t.Fatalf("absent array_path key: got %v", err)
+	}
+	_, _, err = collect(t, `{"no":"array here"}`, "")
+	if err == nil || err.Error() != "no array found in JSON response, specify array_path in config" {
+		t.Fatalf("auto-detect no array: got %v", err)
 	}
 }
 
@@ -146,7 +158,6 @@ Expected: FAIL — `undefined: decodeRecords`.
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -154,10 +165,11 @@ import (
 	"net/http"
 )
 
-// positionalScanWindow bounds how many leading top-level array elements are
-// buffered while looking for a positional nested record array (the World Bank
-// [ {meta}, [records] ] shape). Real positional APIs put the array at index
-// 0-1; past this window we commit to bare-array mode so memory stays bounded.
+// positionalScanWindow bounds how many leading top-level objects are buffered
+// (as decoded records) while looking for a positional nested record array (the
+// World Bank [ {meta}, [records] ] shape). Real positional APIs put the array
+// at index 0-1; past this window we commit to bare-array mode so memory stays
+// bounded to this many records.
 const positionalScanWindow = 8192
 
 // fetchStream issues the GET and returns the response body for streaming.
@@ -207,20 +219,16 @@ func decodeRecords(r io.Reader, arrayPath string, fn func(map[string]any) error)
 	return 0, fmt.Errorf("failed to parse JSON: unexpected top-level token %v", tok)
 }
 
-// decodeTopLevelArray handles bare arrays and the positional shape. Leading
-// objects are buffered (up to positionalScanWindow); if an array element
-// appears first, the buffer is metadata and the nested array holds the
-// records. Otherwise the buffered + remaining objects are the records.
+// decodeTopLevelArray handles bare arrays and the positional shape, fully
+// token-streaming (no element is ever materialized as raw bytes). Leading
+// object elements are buffered as decoded records (up to
+// positionalScanWindow); if an array element appears first, the buffer was
+// metadata and the nested array's objects stream straight to fn. Otherwise
+// the buffered + remaining objects are the records. Scalar and (in bare mode)
+// array elements are skipped, matching recordsFromSlice semantics.
 func decodeTopLevelArray(dec *json.Decoder, fn func(map[string]any) error) (int, error) {
 	count := 0
-	deliver := func(raw json.RawMessage) error {
-		rec, ok, err := unmarshalRecord(raw)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return nil // non-object element: skip (recordsFromSlice semantics)
-		}
+	deliver := func(rec map[string]any) error {
 		if err := fn(rec); err != nil {
 			return err
 		}
@@ -228,62 +236,126 @@ func decodeTopLevelArray(dec *json.Decoder, fn func(map[string]any) error) (int,
 		return nil
 	}
 
-	var pending []json.RawMessage
+	var pending []map[string]any
 	committedBare := false
+	flushPending := func() error {
+		for _, p := range pending {
+			if err := deliver(p); err != nil {
+				return err
+			}
+		}
+		pending = nil
+		return nil
+	}
+
 	for dec.More() {
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
+		tok, err := dec.Token()
+		if err != nil {
 			return count, fmt.Errorf("failed to parse JSON: %w", err)
 		}
-		first := firstByte(raw)
-		if !committedBare && first == '[' {
-			// Positional shape: pending elements were metadata; the records
-			// live in this nested array. Elements after it are ignored
-			// (matches parseJSON's first-array-element behavior).
-			inner := json.NewDecoder(bytes.NewReader(raw))
-			inner.UseNumber()
-			if _, err := inner.Token(); err != nil { // consume '['
-				return count, fmt.Errorf("failed to parse JSON: %w", err)
-			}
-			for inner.More() {
-				var el json.RawMessage
-				if err := inner.Decode(&el); err != nil {
-					return count, fmt.Errorf("failed to parse JSON: %w", err)
-				}
-				if err := deliver(el); err != nil {
-					return count, err
-				}
-			}
-			return count, nil
-		}
-		if committedBare {
-			if err := deliver(raw); err != nil {
+		d, isDelim := tok.(json.Delim)
+		switch {
+		case isDelim && d == '{':
+			rec, err := decodeObjectBody(dec)
+			if err != nil {
 				return count, err
 			}
-			continue
-		}
-		pending = append(pending, raw)
-		if len(pending) >= positionalScanWindow {
-			committedBare = true
-			for _, p := range pending {
-				if err := deliver(p); err != nil {
+			if committedBare {
+				if err := deliver(rec); err != nil {
+					return count, err
+				}
+				continue
+			}
+			pending = append(pending, rec)
+			if len(pending) >= positionalScanWindow {
+				committedBare = true
+				if err := flushPending(); err != nil {
 					return count, err
 				}
 			}
+		case isDelim && d == '[':
+			if committedBare {
+				// Non-object element in bare mode: skip it wholesale.
+				if err := skipBalanced(dec); err != nil {
+					return count, fmt.Errorf("failed to parse JSON: %w", err)
+				}
+				continue
+			}
+			// Positional shape: pending elements were metadata; the records
+			// stream directly out of this nested array, one object at a
+			// time. Elements after it are ignored (parseJSON's
+			// first-array-element behavior).
 			pending = nil
+			for dec.More() {
+				elTok, err := dec.Token()
+				if err != nil {
+					return count, fmt.Errorf("failed to parse JSON: %w", err)
+				}
+				ed, eIsDelim := elTok.(json.Delim)
+				switch {
+				case eIsDelim && ed == '{':
+					rec, err := decodeObjectBody(dec)
+					if err != nil {
+						return count, err
+					}
+					if err := deliver(rec); err != nil {
+						return count, err
+					}
+				case eIsDelim && ed == '[':
+					if err := skipBalanced(dec); err != nil {
+						return count, fmt.Errorf("failed to parse JSON: %w", err)
+					}
+				default:
+					// scalar element: fully consumed by Token(); skip
+				}
+			}
+			if _, err := dec.Token(); err != nil { // consume the inner ']'
+				return count, fmt.Errorf("failed to parse JSON: %w", err)
+			}
+			return count, nil
+		default:
+			// scalar element: fully consumed by Token(); skip
 		}
 	}
 	// End of array with no nested record array: pending are the records.
-	for _, p := range pending {
-		if err := deliver(p); err != nil {
-			return count, err
-		}
+	if err := flushPending(); err != nil {
+		return count, err
 	}
 	return count, nil
 }
 
+// decodeObjectBody reads the remainder of a JSON object whose opening '{' has
+// already been consumed, returning it as a record map. Values decode through
+// the same decoder, so UseNumber applies to every nested numeric value.
+func decodeObjectBody(dec *json.Decoder) (map[string]any, error) {
+	rec := make(map[string]any)
+	for dec.More() {
+		kTok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		}
+		k, ok := kTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse JSON: unexpected object key token %v", kTok)
+		}
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		}
+		rec[k] = v
+	}
+	if _, err := dec.Token(); err != nil { // consume '}'
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+	return rec, nil
+}
+
 // decodeWrappedObject handles { "key": [ ... ] }: with arrayPath it selects
-// that key; otherwise the first array-valued key in document order.
+// that key; otherwise the first array-valued key in document order. Skipped
+// values are token-walked (O(1) memory), never buffered. Error-text parity
+// with parseJSON: a set arrayPath that is missing OR holds a non-array both
+// yield "field '<k>' is not an array"; the generic "no array found" message
+// is auto-detect-only.
 func decodeWrappedObject(dec *json.Decoder, arrayPath string, fn func(map[string]any) error) (int, error) {
 	count := 0
 	for dec.More() {
@@ -293,56 +365,63 @@ func decodeWrappedObject(dec *json.Decoder, arrayPath string, fn func(map[string
 		}
 		key, _ := keyTok.(string)
 
-		if arrayPath != "" && key != arrayPath {
-			var skip json.RawMessage
-			if err := dec.Decode(&skip); err != nil {
-				return count, fmt.Errorf("failed to parse JSON: %w", err)
-			}
-			continue
-		}
-
-		// Peek the value's first token.
+		// Consume the value's first token to learn its kind.
 		valTok, err := dec.Token()
 		if err != nil {
 			return count, fmt.Errorf("failed to parse JSON: %w", err)
 		}
 		delim, isDelim := valTok.(json.Delim)
+		isTarget := arrayPath != "" && key == arrayPath
 
-		if !isDelim || delim != '[' {
-			if arrayPath != "" {
-				return count, fmt.Errorf("field '%s' is not an array", arrayPath)
-			}
-			// Not our array: skip the remainder of this value and move on.
-			if isDelim { // '{' — skip balanced
-				if err := skipBalanced(dec); err != nil {
+		if isDelim && delim == '[' && (isTarget || arrayPath == "") {
+			// Found the record array (explicit key, or first array-valued
+			// key in document order): stream its elements one at a time.
+			for dec.More() {
+				elTok, err := dec.Token()
+				if err != nil {
 					return count, fmt.Errorf("failed to parse JSON: %w", err)
 				}
+				ed, eIsDelim := elTok.(json.Delim)
+				switch {
+				case eIsDelim && ed == '{':
+					rec, err := decodeObjectBody(dec)
+					if err != nil {
+						return count, err
+					}
+					if err := fn(rec); err != nil {
+						return count, err
+					}
+					count++
+				case eIsDelim && ed == '[':
+					if err := skipBalanced(dec); err != nil {
+						return count, fmt.Errorf("failed to parse JSON: %w", err)
+					}
+				default:
+					// scalar element: fully consumed by Token(); skip
+				}
 			}
-			continue
-		}
-
-		// Found the record array: stream its elements.
-		for dec.More() {
-			var el json.RawMessage
-			if err := dec.Decode(&el); err != nil {
+			if _, err := dec.Token(); err != nil { // consume ']'
 				return count, fmt.Errorf("failed to parse JSON: %w", err)
 			}
-			rec, ok, err := unmarshalRecord(el)
-			if err != nil {
-				return count, err
-			}
-			if !ok {
-				continue
-			}
-			if err := fn(rec); err != nil {
-				return count, err
-			}
-			count++
+			return count, nil
 		}
-		if _, err := dec.Token(); err != nil { // consume ']'
-			return count, fmt.Errorf("failed to parse JSON: %w", err)
+
+		if isTarget {
+			// Explicit array_path key holds a non-array value.
+			return count, fmt.Errorf("field '%s' is not an array", arrayPath)
 		}
-		return count, nil
+
+		// Not our value: token-skip its remainder (composites); scalars are
+		// already fully consumed by Token().
+		if isDelim && (delim == '{' || delim == '[') {
+			if err := skipBalanced(dec); err != nil {
+				return count, fmt.Errorf("failed to parse JSON: %w", err)
+			}
+		}
+	}
+	if arrayPath != "" {
+		// Key absent entirely: same error text parseJSON produces today.
+		return count, fmt.Errorf("field '%s' is not an array", arrayPath)
 	}
 	return count, fmt.Errorf("no array found in JSON response, specify array_path in config")
 }
@@ -368,33 +447,6 @@ func skipBalanced(dec *json.Decoder) error {
 	return nil
 }
 
-// unmarshalRecord decodes raw into a record map when it is a JSON object;
-// ok=false for any other value. Uses a Number-enabled decoder so nested
-// numeric values also keep their exact source text.
-func unmarshalRecord(raw json.RawMessage) (map[string]any, bool, error) {
-	if firstByte(raw) != '{' {
-		return nil, false, nil
-	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.UseNumber()
-	var rec map[string]any
-	if err := d.Decode(&rec); err != nil {
-		return nil, false, fmt.Errorf("failed to parse JSON: %w", err)
-	}
-	return rec, true, nil
-}
-
-// firstByte returns the first non-whitespace byte of raw (0 when empty).
-func firstByte(raw json.RawMessage) byte {
-	for _, b := range raw {
-		switch b {
-		case ' ', '\t', '\n', '\r':
-			continue
-		}
-		return b
-	}
-	return 0
-}
 ```
 
 - [ ] **Step 4: Run to verify pass**
@@ -933,7 +985,10 @@ func (s *arrowSink) Finish() (int64, *sdk.CloseResult, error) {
 func (s *arrowSink) Writer() ipcChunkWriter { return s.writer }
 ```
 
-Then: `go mod tidy -C components/http-json-extractor` (pulls `github.com/apache/arrow-go/v18 v18.6.0` — same version as root/data-generator).
+Then run `make tidy` (the repo rule — never bare `go mod tidy`; `-C` after the
+subcommand is not even valid Go flag syntax). It tidies every module and pulls
+`github.com/apache/arrow-go/v18 v18.6.0` into the extractor module — same
+version as root/data-generator.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -962,9 +1017,28 @@ git commit -m "feat(http-json-extractor): all-String Arrow-IPC sink with per-bat
 - Consumes: `fetchStream`, `decodeRecords` (Task 1); `newArrowSink`, `sinkWriteError`, `arrowBatchRows` (Task 3).
 - Produces: no new symbols; `main()`/`runPaginatedExtraction` behavior per spec.
 
-- [ ] **Step 1: Replace the single-request block in `main()`**
+- [ ] **Step 1: Replace the single-request block in `main()` and fix the paginated dispatch's exit-code classification**
 
-Replace the block from `// Single-request mode.` (main.go:143) through the end of `main()` (main.go:179, the closing `}`) with:
+First, replace the paginated dispatch (main.go:136-141) so infrastructure
+failures exit as FailedApplication instead of FailedUser (the exit-code
+contract in Global Constraints; today every paginated error is wrapped in
+`ExitUserError`):
+
+```go
+	// Paginated mode - stream data incrementally, page by page.
+	if compCfg.Pagination != nil && compCfg.Pagination.Type != "" {
+		if err := runPaginatedExtraction(ctx, client, &compCfg, outputTable); err != nil {
+			var swe *sinkWriteError
+			if errors.As(err, &swe) {
+				sdk.ExitAppError(fmt.Sprintf("paginated extraction failed: %v", err))
+			}
+			sdk.ExitUserError(fmt.Sprintf("paginated extraction failed: %v", err))
+		}
+		return
+	}
+```
+
+Then replace the block from `// Single-request mode.` (main.go:143) through the end of `main()` (main.go:179, the closing `}`) with:
 
 ```go
 	// Single-request mode.
@@ -1089,10 +1163,19 @@ instead of `len(records)`:
 	// Flush + close (no-op writer when zero records; commit still runs).
 	rows, closeResult, err := sink.Finish()
 	if err != nil {
-		return err
+		return err // already a *sinkWriteError → main exits FailedApplication
 	}
 	if rows > 0 {
 		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
+	}
+```
+
+(c2) In the same tail, wrap the existing `commitAndStatus` call's error so a
+commit failure (infrastructure) also classifies as FailedApplication:
+
+```go
+	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {
+		return &sinkWriteError{Err: err}
 	}
 ```
 
@@ -1153,6 +1236,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -1160,6 +1244,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"google.golang.org/grpc"
 
@@ -1177,13 +1262,14 @@ type writerState struct {
 type mockGateway struct {
 	pb.UnimplementedDataGatewayServer
 
-	mu        sync.Mutex
-	cfgBytes  []byte
-	bucket    string
-	writeMode string
-	httpBase  string
-	nextID    int
-	writers   map[string]*writerState
+	mu         sync.Mutex
+	cfgBytes   []byte
+	bucket     string
+	writeMode  string
+	httpBase   string
+	nextID     int
+	writers    map[string]*writerState
+	expectCols []string // from the config's fields[].name; empty = names not enforced
 }
 
 func (g *mockGateway) GetConfig(ctx context.Context, _ *pb.GetConfigRequest) (*pb.ComponentConfig, error) {
@@ -1270,14 +1356,42 @@ func (g *mockGateway) Log(ctx context.Context, req *pb.LogRequest) (*pb.LogRespo
 	return &pb.LogResponse{}, nil
 }
 
-// ingest parses one payload as a complete Arrow IPC stream, counts its rows,
-// and records the schema on first sight.
+// validateSchema enforces the extractor's output contract on every payload:
+// all columns Arrow String (utf8), and — when the component config declares a
+// fields projection — exactly the declared column names, in order. A
+// violation fails the write (HTTP 500 / gRPC error), so the local proof
+// cannot silently pass with wrong output.
+func (g *mockGateway) validateSchema(sch *arrow.Schema) error {
+	for _, f := range sch.Fields() {
+		if f.Type.ID() != arrow.STRING {
+			return fmt.Errorf("schema violation: column %q is %s, want utf8 (all-String contract)", f.Name, f.Type)
+		}
+	}
+	if len(g.expectCols) > 0 {
+		if sch.NumFields() != len(g.expectCols) {
+			return fmt.Errorf("schema violation: %d columns, want %d %v", sch.NumFields(), len(g.expectCols), g.expectCols)
+		}
+		for i, want := range g.expectCols {
+			if sch.Field(i).Name != want {
+				return fmt.Errorf("schema violation: column %d is %q, want %q", i, sch.Field(i).Name, want)
+			}
+		}
+	}
+	return nil
+}
+
+// ingest parses one payload as a complete Arrow IPC stream, validates its
+// schema against the contract, counts its rows, and records the schema on
+// first sight.
 func (g *mockGateway) ingest(writerID string, data []byte) (int64, error) {
 	rd, err := ipc.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return 0, fmt.Errorf("payload is not a valid Arrow IPC stream: %w", err)
 	}
 	defer rd.Release()
+	if err := g.validateSchema(rd.Schema()); err != nil {
+		return 0, err
+	}
 	var rows int64
 	for rd.Next() {
 		rows += rd.Record().NumRows()
@@ -1343,12 +1457,33 @@ func main() {
 		log.Fatalf("read config: %v", err)
 	}
 
+	// When the config declares a fields projection, enforce exactly those
+	// column names (in order) on every received batch.
+	var cfgFields struct {
+		Fields []struct {
+			Name string `json:"name"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal(cfgBytes, &cfgFields); err != nil {
+		log.Fatalf("parse config: %v", err)
+	}
+	expectCols := make([]string, 0, len(cfgFields.Fields))
+	for _, f := range cfgFields.Fields {
+		expectCols = append(expectCols, f.Name)
+	}
+
 	g := &mockGateway{
-		cfgBytes:  cfgBytes,
-		bucket:    *bucket,
-		writeMode: *writeMode,
-		httpBase:  "http://" + *httpAddr,
-		writers:   map[string]*writerState{},
+		cfgBytes:   cfgBytes,
+		bucket:     *bucket,
+		writeMode:  *writeMode,
+		httpBase:   "http://" + *httpAddr,
+		writers:    map[string]*writerState{},
+		expectCols: expectCols,
+	}
+	if len(expectCols) > 0 {
+		log.Printf("mock-dg: enforcing projected columns %v (all utf8)", expectCols)
+	} else {
+		log.Printf("mock-dg: enforcing all-utf8 columns (no fields projection in config)")
 	}
 
 	lis, err := net.Listen("tcp", *grpcAddr)
@@ -1370,8 +1505,6 @@ func main() {
 	}
 }
 ```
-
-(Add `"io"` to the import block — used by `handleHTTPWrite`.)
 
 - [ ] **Step 2: Create the example config**
 
@@ -1403,7 +1536,10 @@ func main() {
 
 - [ ] **Step 3: Add the Makefile target**
 
-Add next to the other developer-loop targets (e.g. after `build-components-local`):
+Add `extractor-local` to the `.PHONY` list at the top of the Makefile (the
+list is explicit; a missing entry breaks if a file of that name ever exists).
+Then add the target next to the other developer-loop targets (e.g. after
+`build-components-local`):
 
 ```make
 extractor-local: ## Run http-json-extractor locally against the mock gateway (CONFIG=<component-config.json> [BUCKET=raw]); reports rows + peak RSS (macOS /usr/bin/time -l; on Linux use `command time -v`)
@@ -1430,7 +1566,7 @@ Smoke (bounded, small — 500 rows to keep it quick): create a scratch config th
 make extractor-local CONFIG=/tmp/nyc311-500.json
 ```
 
-Expected: component logs stream through the mock (`[component] [INFO] ...`), mock prints `schema: [request_id:utf8, ...]` (all `utf8`), per-writer `COMMIT ... rows=500`, extractor exits 0, `/usr/bin/time -l` prints peak RSS. Record the observed rows + peak RSS in the report.
+Expected: mock startup prints `enforcing projected columns [request_id ...] (all utf8)`; component logs stream through the mock (`[component] [INFO] ...`); mock prints `schema: [request_id:utf8, ...]` (validation would 500 the write on any non-utf8 or wrong/missing column, failing the run visibly); per-writer `COMMIT ... rows=500`; extractor exits 0; `/usr/bin/time -l` prints peak RSS. Record the observed rows + peak RSS in the report.
 
 - [ ] **Step 5: Commit**
 
@@ -1535,3 +1671,24 @@ The PR's CI e2e (fail-closed since RFC 024) exercises ~13 extractor fixtures. Au
 **Placeholder scan:** no TBD/TODO; every code step carries complete code. The `--dump` flag from the spec was dropped (YAGNI — the mock's schema log + row counts cover the debugging need; noted here as a conscious cut). ✓
 
 **Type consistency:** `decodeRecords(io.Reader, string, func(map[string]any) error) (int, error)`; `fetchStream(ctx, string, map[string]string) (io.ReadCloser, error)`; `stringifyValue(any) (string, bool)`; `columnPlan{names, extract}`; `newArrowSink(ctx, func() (ipcChunkWriter, error), []FieldMapping, int)`; `Add(map[string]any) error`; `Finish() (int64, *sdk.CloseResult, error)`; `Writer() ipcChunkWriter`; `sinkWriteError{Err}` — used identically in Tasks 1–5. `*sdk.Writer` satisfies `ipcChunkWriter` (`Write(ctx,[]byte) error` / `Close(ctx) (*sdk.CloseResult, error)` / `Bucket()` / `Table()` all exist, `sdk/go/client.go`). ✓
+
+**Post-Codex-review revisions (round 1):**
+- Blocker → Task 1 decoder rewritten to full token-walking: records are built
+  key-by-key via `decodeObjectBody` (Token + Decode-per-value, UseNumber
+  preserved), the positional inner array streams record-at-a-time after its
+  `[` token, and skipped wrapper values are token-skipped via `skipBalanced` —
+  no `json.RawMessage` buffering anywhere (`unmarshalRecord`/`firstByte`
+  dropped; `bytes` import dropped).
+- Major (exit codes) → Task 4 Step 1 classifies `sinkWriteError` in the
+  paginated dispatch (`ExitAppError`); Step 2(c2) wraps the paginated
+  `commitAndStatus` error as `sinkWriteError`.
+- Major (tidy syntax) → Task 3 uses `make tidy` (repo rule), not
+  `go mod tidy -C`.
+- Major (mock validation) → the mock derives `expectCols` from the config's
+  `fields[].name` and `validateSchema` enforces all-utf8 + exact names/order on
+  every payload (violation → write fails visibly).
+- Minor (error-text parity) → decoder returns `field '<k>' is not an array`
+  for missing OR non-array `array_path`; `TestDecodeRecords_ErrorText` asserts
+  exact strings.
+- Minor (`io` import) → folded into the mock's import block.
+- Nit → `extractor-local` added to `.PHONY`. ✓
