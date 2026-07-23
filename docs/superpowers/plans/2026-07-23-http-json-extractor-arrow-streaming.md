@@ -26,6 +26,38 @@
 - `make tidy` (never bare `go mod tidy`) after go.mod changes; version bump `0.12.0` via `make bump-version` (behavior change: all-String output).
 - Never push `main`, never tag; feature branch `feat/http-json-extractor-arrow-streaming` + draft PR.
 
+## Execution Protocol (models + review gates)
+
+Execute via superpowers:subagent-driven-development with the hybrid review
+protocol. Model per dispatch (an omitted model silently inherits the most
+expensive one — always pass it explicitly):
+
+| Task | Implementer | Task reviewer | Rationale |
+|---|---|---|---|
+| 1 `stream.go` | haiku | haiku | complete code in plan → transcription + run tests |
+| 2 stringify + plan | haiku | haiku | complete code, small, pure helpers |
+| 3 `arrowSink` | haiku | **sonnet** | code is complete but batching/lazy-open is load-bearing — stronger reviewer |
+| 4 wire `main()` | **sonnet** | **sonnet** | multi-block surgery, line-drift risk, behavior parity |
+| 5 mock-DG + Makefile | **sonnet** | **sonnet** | new binary, Makefile, live smoke may need debugging |
+| 6 docs | sonnet | haiku | prose accuracy vs code behavior |
+| 7 proof + bump + PR | controller (no subagent) | — | explicit staging rules (never `git add -A`), push/PR mechanics |
+| 8 post-release 5M proof | controller (operator loop) | — | cluster workflow, not a code task |
+
+**Review gates:**
+
+- **Per-task:** fast Claude reviewer after every task (spec compliance + code
+  quality, per the SDD templates). Controller auto-fixes Critical/Important
+  findings and re-reviews; Minor findings roll up to the final gate.
+  Continuous execution — no maintainer check-ins between tasks.
+- **Final gate — Codex whole-branch review (MANDATORY, blocks push/PR):**
+  after Task 7's bump commit and BEFORE `git push`/`gh pr create`, run ONE
+  Codex review of the whole branch diff. Dispatch it directly in-session via
+  the codex-companion `task` command (background + log-mtime stall watcher) —
+  NOT through the rescue subagent. On findings: STOP and present them to the
+  maintainer with severities; dispatch no fix without explicit approval. Push
+  and open the draft PR only after this gate (plus any approved fixes and
+  their re-review) passes.
+
 ---
 
 ### Task 1: Streaming JSON decoder (`stream.go`)
@@ -1698,11 +1730,18 @@ Expected output lists all four charts at `0.12.0`, `values.yaml tag: v0.12.0`, `
 Run: `go build ./... && go vet ./cmd/mock-datagateway && go test -C components/http-json-extractor ./...`
 Expected: clean + PASS.
 
-- [ ] **Step 5: Commit the bump, push, open draft PR**
+- [ ] **Step 5: Commit the bump; run the final Codex gate; then push + draft PR**
 
 ```bash
 git add charts/datuplet-app/Chart.yaml charts/datuplet-infra/Chart.yaml charts/datuplet-lakekeeper/Chart.yaml charts/datuplet-operators/Chart.yaml charts/datuplet-app/values.yaml Makefile
 git commit -m "chore(release): bump version to 0.12.0"
+```
+
+**GATE — do not push yet.** Run the final whole-branch Codex review per the
+Execution Protocol section (in-session codex-companion `task`, diff = branch
+base → the bump commit; stop-and-ask on findings). Only after it passes:
+
+```bash
 git push -u public feat/http-json-extractor-arrow-streaming
 gh pr create --draft --repo kacurez/datuplet --base main \
   --title "feat(http-json-extractor): streaming Arrow-IPC output + mock-DG local rig — release v0.12.0" \
