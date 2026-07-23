@@ -28,35 +28,40 @@
 
 ## Execution Protocol (models + review gates)
 
-Execute via superpowers:subagent-driven-development with the hybrid review
-protocol. Model per dispatch (an omitted model silently inherits the most
+Execute via superpowers:subagent-driven-development. **Every review is a
+Codex review** (maintainer's standing rule) — no Claude reviewer subagents.
+Implementer model per dispatch (an omitted model silently inherits the most
 expensive one — always pass it explicitly):
 
 | Task | Implementer | Task reviewer | Rationale |
 |---|---|---|---|
-| 1 `stream.go` | haiku | haiku | complete code in plan → transcription + run tests |
-| 2 stringify + plan | haiku | haiku | complete code, small, pure helpers |
-| 3 `arrowSink` | haiku | **sonnet** | code is complete but batching/lazy-open is load-bearing — stronger reviewer |
-| 4 wire `main()` | **sonnet** | **sonnet** | multi-block surgery, line-drift risk, behavior parity |
-| 5 mock-DG + Makefile | **sonnet** | **sonnet** | new binary, Makefile, live smoke may need debugging |
-| 6 docs | sonnet | haiku | prose accuracy vs code behavior |
-| 7 proof + bump + PR | controller (no subagent) | — | explicit staging rules (never `git add -A`), push/PR mechanics |
+| 1 `stream.go` | haiku | **Codex** | complete code in plan → transcription + run tests |
+| 2 stringify + plan | haiku | **Codex** | complete code, small, pure helpers |
+| 3 `arrowSink` | haiku | **Codex** | batching/lazy-open is load-bearing |
+| 4 wire `main()` | **sonnet** | **Codex** | multi-block surgery, line-drift risk, behavior parity |
+| 5 mock-DG + Makefile | **sonnet** | **Codex** | new binary, Makefile, live smoke may need debugging |
+| 6 docs | sonnet | **Codex** | prose accuracy vs code behavior |
+| 7 proof + bump + PR | controller (no subagent) | — (final gate below) | explicit staging rules (never `git add -A`), push/PR mechanics |
 | 8 post-release 5M proof | controller (operator loop) | — | cluster workflow, not a code task |
 
-**Review gates:**
+**How Codex reviews are dispatched:** directly in-session via the
+codex-companion `task` command (`--background` + a log-mtime stall watcher;
+cancel + re-dispatch on stall) — NOT through the `codex:codex-rescue`
+subagent. Each per-task review gets the task's brief, the implementer's
+report, and the task diff (`scripts/review-package BASE HEAD` file), and
+returns findings by severity plus a spec-compliance + quality verdict.
 
-- **Per-task:** fast Claude reviewer after every task (spec compliance + code
-  quality, per the SDD templates). Controller auto-fixes Critical/Important
-  findings and re-reviews; Minor findings roll up to the final gate.
-  Continuous execution — no maintainer check-ins between tasks.
-- **Final gate — Codex whole-branch review (MANDATORY, blocks push/PR):**
-  after Task 7's bump commit and BEFORE `git push`/`gh pr create`, run ONE
-  Codex review of the whole branch diff. Dispatch it directly in-session via
-  the codex-companion `task` command (background + log-mtime stall watcher) —
-  NOT through the rescue subagent. On findings: STOP and present them to the
-  maintainer with severities; dispatch no fix without explicit approval. Push
-  and open the draft PR only after this gate (plus any approved fixes and
-  their re-review) passes.
+**Finding protocol (maintainer's standing rule):** on any Critical/Important
+finding, STOP and present it to the maintainer — no fix is dispatched without
+explicit approval; after an approved fix, Codex re-reviews the task. A clean
+review needs no check-in — proceed straight to the next task. Minor findings
+are recorded in the ledger and rolled up to the final gate.
+
+**Final gate — Codex whole-branch review (MANDATORY, blocks push/PR):** after
+Task 7's bump commit and BEFORE `git push`/`gh pr create`, run ONE Codex
+review of the whole branch diff (same dispatch mechanics). On findings: STOP
+and present with severities; push and open the draft PR only after this gate
+(plus any approved fixes and their re-review) passes.
 
 ---
 
