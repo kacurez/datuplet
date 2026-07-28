@@ -985,10 +985,12 @@ type StringSink struct {
 type SinkOption func(*StringSink)
 
 // WithColumns fixes the output columns explicitly: names in declared order,
-// each row's value for column i pulled by extract(rec, i).
+// each row's value for column i pulled by extract(rec, i). names is copied,
+// so later caller mutation cannot desynchronize the plan from the built
+// schema (public API defensiveness).
 func WithColumns(names []string, extract func(rec map[string]any, i int) any) SinkOption {
 	return func(s *StringSink) {
-		s.plan = &columnPlan{names: names, extract: extract}
+		s.plan = &columnPlan{names: append([]string(nil), names...), extract: extract}
 	}
 }
 

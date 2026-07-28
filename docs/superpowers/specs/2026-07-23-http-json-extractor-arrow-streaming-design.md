@@ -79,7 +79,7 @@ Replace the read-all/unmarshal/JSONL path with a streaming pipeline:
 - **Stringify** a value: JSON string → as-is; number/bool → its canonical Go
   string; `null`/absent → Arrow null; nested object/array → compact JSON string
   (`json.Marshal`).
-- **Flush every `arrowBatchRows` (default 8192) records**: build the record,
+- **Flush every `DefaultBatchRows` (8192) records**: build the record,
   serialize a **self-contained IPC stream** (schema + record + EOS, like
   data-generator's `serializeRecordToIPC`), and ship it.
 
@@ -195,10 +195,10 @@ types. Consequences and mitigations:
 
 ```
 HTTP resp.Body --> json.Decoder (stream, one object at a time)
-    --> stringify + project (fields | first-record keys)  [per record]
+    --> stringify + project (fields | first-batch key union)  [per record]
     --> array.RecordBuilder (all-String)                   [accumulate]
     --> every 8192 rows: NewRecord -> serialize IPC stream
-    --> writer.WriteChunk(ipc)   [ONE POST PER BATCH]
+    --> writer.Write(ipc)   [ONE POST PER BATCH]
     --> (paginated: repeat per page; single: one pass)
     --> writer.Close -> client.Commit -> commitAndStatus
 ```
@@ -233,14 +233,14 @@ HTTP resp.Body --> json.Decoder (stream, one object at a time)
 
 ## Phasing
 
-- **Phase 1 (this spec):** streaming Arrow-IPC rewrite + WriteChunk-per-batch +
+- **Phase 1 (this spec):** streaming Arrow-IPC rewrite + one-IPC-stream-per-`Write` +
   mock-DG rig + local proof + e2e re-verify + 5M cluster proof.
 - **Phase 2 (optional, later):** bounded-concurrency parallel page fetches to
   cut the Socrata-bound download wall-clock.
 
 ## Definition of done
 
-- [ ] Extractor streams Arrow IPC in ≤8192-row batches via `WriteChunk`; peak
+- [ ] Extractor streams Arrow IPC in ≤8192-row batches via `writer.Write`; peak
       RSS bounded and independent of `page_size`; component OOM cannot recur.
 - [ ] A test proves each batch is an independently-parseable IPC stream (no
       concatenation reliance).
