@@ -1,8 +1,14 @@
 package arrow
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	sdk "github.com/datuplet/datuplet/sdk/go"
 )
 
 func TestStringifyValue(t *testing.T) {
@@ -45,5 +51,140 @@ func TestPlanFromBatch(t *testing.T) {
 	}
 	if v := p.extract(batch[1], 0); v != nil {
 		t.Fatalf("absent key should be nil, got %v", v)
+	}
+}
+
+// --- appended in Task 3 ---
+
+type fakeWriter struct {
+	payloads [][]byte
+	closed   bool
+	rows     int64
+}
+
+func (f *fakeWriter) Write(_ context.Context, data []byte) error {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	f.payloads = append(f.payloads, cp)
+	return nil
+}
+func (f *fakeWriter) Close(context.Context) (*sdk.CloseResult, error) {
+	f.closed = true
+	return &sdk.CloseResult{TotalRows: f.rows}, nil
+}
+func (f *fakeWriter) Bucket() string { return "raw" }
+func (f *fakeWriter) Table() string  { return "t" }
+
+// ipcRows parses one payload as a complete standalone IPC stream and returns
+// (rows, columnNames). Fails the test if the payload is not self-contained.
+func ipcRows(t *testing.T, payload []byte) (int64, []string) {
+	t.Helper()
+	rd, err := ipc.NewReader(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("payload is not a valid IPC stream: %v", err)
+	}
+	defer rd.Release()
+	var rows int64
+	for rd.Next() {
+		rows += rd.Record().NumRows()
+	}
+	if rd.Err() != nil {
+		t.Fatalf("ipc read: %v", rd.Err())
+	}
+	names := make([]string, 0)
+	for _, f := range rd.Schema().Fields() {
+		names = append(names, f.Name)
+	}
+	return rows, names
+}
+
+func TestStringSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
+		WithBatchRows(4) /* tiny batch */)
+	for i := 0; i < 10; i++ {
+		if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, _, err := sink.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows != 10 {
+		t.Fatalf("rows = %d, want 10", rows)
+	}
+	if len(fw.payloads) != 3 { // 4+4+2
+		t.Fatalf("payloads = %d, want 3 (4+4+2)", len(fw.payloads))
+	}
+	var total int64
+	for _, p := range fw.payloads {
+		n, names := ipcRows(t, p) // each independently parseable = no-concat invariant
+		total += n
+		if len(names) != 1 || names[0] != "id" {
+			t.Fatalf("schema = %v", names)
+		}
+	}
+	if total != 10 {
+		t.Fatalf("ipc total rows = %d, want 10", total)
+	}
+	if !fw.closed {
+		t.Fatal("writer not closed")
+	}
+}
+
+func TestStringSink_NoColumnsDerivesPlanFromFirstBatch(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(3))
+	// key "c" appears only in the 2nd record — union must include it.
+	recs := []map[string]any{
+		{"b": json.Number("1")},
+		{"a": "x", "c": true},
+		{"a": "y"},
+		{"a": "z"}, // second batch
+	}
+	for _, r := range recs {
+		if err := sink.Add(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, _, err := sink.Finish()
+	if err != nil || rows != 4 {
+		t.Fatalf("rows=%d err=%v", rows, err)
+	}
+	_, names := ipcRows(t, fw.payloads[0])
+	want := []string{"a", "b", "c"}
+	if len(names) != 3 || names[0] != want[0] || names[1] != want[1] || names[2] != want[2] {
+		t.Fatalf("schema = %v, want %v (sorted union of first batch)", names, want)
+	}
+}
+
+func TestStringSink_ZeroRecordsNeverOpensWriter(t *testing.T) {
+	opened := false
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) {
+		opened = true
+		return &fakeWriter{}, nil
+	}, WithBatchRows(4))
+	rows, cr, err := sink.Finish()
+	if err != nil || rows != 0 || cr != nil {
+		t.Fatalf("rows=%d cr=%v err=%v", rows, cr, err)
+	}
+	if opened {
+		t.Fatal("writer must not be opened for zero records")
+	}
+	if sink.Writer() != nil {
+		t.Fatal("Writer() must be nil for zero records")
+	}
+}
+
+func TestStringSink_OpenFailureIsWriteError(t *testing.T) {
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) {
+		return nil, errors.New("open boom")
+	}, WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }), WithBatchRows(1))
+	err := sink.Add(map[string]any{"id": "1"})
+	var we *WriteError
+	if !errors.As(err, &we) {
+		t.Fatalf("want WriteError, got %v", err)
 	}
 }
