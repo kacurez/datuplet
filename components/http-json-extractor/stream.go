@@ -313,17 +313,42 @@ func skipBalanced(dec *json.Decoder) error {
 // fields, ignored trailing elements — in O(1) memory. parseJSON unmarshalled
 // the WHOLE body and rejected malformed documents even when the record array
 // itself was fine (e.g. a truncated `{"results":[...],`); this preserves that
-// strictness on the streaming path. Note the inherent streaming caveat: for
-// bodies larger than the scan window, records are delivered to fn before a
-// corrupt tail is discovered — the run still fails, and nothing is committed
-// (Commit is the barrier), so the end state matches the old behavior.
+// strictness on the streaming path.
+//
+// json.Decoder.Token does NOT validate bracket balance at EOF (it returns
+// plain io.EOF mid-container), so balance is tracked here: every call site
+// invokes drainToEOF with exactly ONE container still open (the outer array
+// or the wrapper object), hence depth starts at 1. EOF with depth != 0 is a
+// truncated document; any token after depth reaches 0 is trailing data
+// (Unmarshal rejected both).
+//
+// Note the inherent streaming caveat: for bodies larger than the scan
+// window, records are delivered to fn before a corrupt tail is discovered —
+// the run still fails, and nothing is committed (Commit is the barrier), so
+// the end state matches the old behavior.
 func drainToEOF(dec *json.Decoder) error {
+	depth := 1
 	for {
-		if _, err := dec.Token(); err != nil {
+		tok, err := dec.Token()
+		if err != nil {
 			if err == io.EOF {
+				if depth != 0 {
+					return fmt.Errorf("failed to parse JSON: %w", io.ErrUnexpectedEOF)
+				}
 				return nil
 			}
 			return fmt.Errorf("failed to parse JSON: %w", err)
+		}
+		if depth == 0 {
+			return fmt.Errorf("failed to parse JSON: unexpected trailing data %v", tok)
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
 		}
 	}
 }

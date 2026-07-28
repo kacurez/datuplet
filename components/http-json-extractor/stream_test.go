@@ -102,6 +102,7 @@ func TestDecodeRecords_MalformedRemainder(t *testing.T) {
 		{"positional_unclosed_outer", `[{"meta":1},[{"x":1}]`, ""},
 		{"bare_unclosed", `[{"x":1}`, ""},
 		{"bare_trailing_garbage", `[{"x":1}] garbage`, ""},
+		{"trailing_second_json_value", `[{"x":1}] 42`, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
