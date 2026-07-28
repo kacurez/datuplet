@@ -4,18 +4,19 @@
 
 **Goal:** Rewrite `http-json-extractor`'s write path to stream-decode JSON and emit all-String Arrow-IPC batches (bounding component memory and removing the gateway's JSON-parse load), and add a standalone mock Data Gateway so the real extractor binary can be run and profiled locally.
 
-**Architecture:** The component gains two new focused files: `stream.go` (token-streaming JSON decode of the three supported response shapes, one record at a time) and `arrow_sink.go` (all-String Arrow `RecordBuilder` that flushes a self-contained IPC stream per 8192 rows via one `writer.Write` call each — the SDK force-disables batching for `FORMAT_ARROW_IPC`, so each `Write` is one POST). `main.go` wires both paths (single-request + paginated) through the sink and drops the now-dead JSONL/projection code. A new root-module binary `cmd/mock-datagateway/` implements the handful of DataGateway RPCs + the HTTP write endpoint the SDK uses, validating and counting the received Arrow batches.
+**Architecture:** The component gains `stream.go` (token-streaming JSON decode of the three supported response shapes, one record at a time). The all-String Arrow sink lives in the SDK's opt-in Arrow module as **`sdk/go/arrow.StringSink`** — the writer-side counterpart of that module's existing `NewReader` — an all-String Arrow `RecordBuilder` that flushes a self-contained IPC stream per 8192 rows via one `writer.Write` call each (the SDK force-disables batching for `FORMAT_ARROW_IPC`, so each `Write` is one POST), with **optional first-batch schema inference** when no explicit columns are given. The component keeps a thin `columns.go` adapter (`FieldMapping` → column names + `getValueRaw` extractor). `main.go` wires both paths (single-request + paginated) through the SDK sink and drops the now-dead JSONL/projection code. A new root-module binary `cmd/mock-datagateway/` implements the handful of DataGateway RPCs + the HTTP write endpoint the SDK uses, validating and counting the received Arrow batches. *(Revised 2026-07-28: sink moved from component-local `arrow_sink.go` into `sdk/go/arrow` so any component can opt in; base `sdk/go` stays arrow-free.)*
 
-**Tech Stack:** Go 1.25, `github.com/apache/arrow-go/v18 v18.6.0` (already used by root + data-generator), DataGateway Go SDK (`sdk/go`), gRPC (`pkg/datagateway/proto/v2` generated stubs).
+**Tech Stack:** Go 1.25, `github.com/apache/arrow-go/v18 v18.6.0` (already used by root + data-generator + `sdk/go/arrow`), DataGateway Go SDK (`sdk/go`) + its opt-in Arrow module (`sdk/go/arrow`), gRPC (`pkg/datagateway/proto/v2` generated stubs).
 
 **Spec:** `docs/superpowers/specs/2026-07-23-http-json-extractor-arrow-streaming-design.md`
 
 ## Global Constraints
 
-- Component module is its own Go module: run Go commands with `-C components/http-json-extractor`. The mock lives in the ROOT module (`cmd/mock-datagateway/`), covered by plain `go build ./...` at repo root.
+- Component module is its own Go module: run Go commands with `-C components/http-json-extractor`. The sink lives in the existing opt-in Arrow SDK module (`-C sdk/go/arrow`) — base `sdk/go` stays arrow-free. The mock lives in the ROOT module (`cmd/mock-datagateway/`), covered by plain `go build ./...` at repo root.
 - **One IPC stream per `writer.Write` call — never pre-concatenate batches.** The gateway reads exactly one IPC stream per POST (`pkg/datagateway/format/arrow_ipc.go:74`); the SDK guarantees one POST per `Write` for Arrow because `OpenWriter` force-disables batching for `FORMAT_ARROW_IPC` (`sdk/go/client.go:378-380`, immediate send at `:576-579`).
-- Batch size: `const arrowBatchRows = 8192` (matches data-generator).
+- Batch size: `const DefaultBatchRows = 8192` in `sdk/go/arrow` (matches data-generator's empirical sweet spot); the component uses the default.
 - All emitted columns are `arrow.BinaryTypes.String`, `Nullable: true`.
+- The component must NOT import `arrow-go` directly — all Arrow usage goes through `sdk/go/arrow` (arrow-go lands in the component's `go.mod` only as an indirect). The component `go.mod` mirrors sql-transform's pattern: `require github.com/datuplet/datuplet/sdk/go/arrow v0.0.0` + `replace github.com/datuplet/datuplet/sdk/go/arrow => ../../sdk/go/arrow`. **No Dockerfile change**: the component image builds from the whole-repo context (`COPY . .`), so the replace directive resolves as-is.
 - The streaming decoder MUST use `dec.UseNumber()` so numeric JSON arrives as `json.Number` and stringifies to its exact source text (no float64 round-trip like `5.9e+09`).
 - Preserve current decode semantics: three shapes (bare array / positional `[meta,[records]]` / object-wrapped), non-object array elements skipped, empty array = 0 records (not an error), `array_path` selects the wrapper key, missing-array error text `"no array found in JSON response, specify array_path in config"`, non-array key error text `"field '%s' is not an array"`.
 - No-`fields` column set = **sorted union of top-level keys across the first batch** (up to 8192 records), fixed for the run. `fields` set = declared order, values via `getValueRaw` dot-paths.
@@ -36,9 +37,9 @@ expensive one — always pass it explicitly):
 | Task | Implementer | Task reviewer | Rationale |
 |---|---|---|---|
 | 1 `stream.go` | haiku | **Codex** | complete code in plan → transcription + run tests |
-| 2 stringify + plan | haiku | **Codex** | complete code, small, pure helpers |
-| 3 `arrowSink` | haiku | **Codex** | batching/lazy-open is load-bearing |
-| 4 wire `main()` | **sonnet** | **Codex** | multi-block surgery, line-drift risk, behavior parity |
+| 2 sdk/go/arrow stringify + plan | haiku | **Codex** | complete code, small, pure helpers |
+| 3 sdk/go/arrow `StringSink` | haiku | **Codex** | batching/lazy-open is load-bearing |
+| 4 wire `main()` + fields adapter + go.mod | **sonnet** | **Codex** | multi-block surgery, cross-module dep, behavior parity |
 | 5 mock-DG + Makefile | **sonnet** | **Codex** | new binary, Makefile, live smoke may need debugging |
 | 6 docs | sonnet | **Codex** | prose accuracy vs code behavior |
 | 7 proof + bump + PR | controller (no subagent) | — (final gate below) | explicit staging rules (never `git add -A`), push/PR mechanics |
@@ -185,6 +186,7 @@ func TestDecodeRecords_MalformedRemainder(t *testing.T) {
 		{"positional_unclosed_outer", `[{"meta":1},[{"x":1}]`, ""},
 		{"bare_unclosed", `[{"x":1}`, ""},
 		{"bare_trailing_garbage", `[{"x":1}] garbage`, ""},
+		{"trailing_second_json_value", `[{"x":1}] 42`, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -529,17 +531,42 @@ func skipBalanced(dec *json.Decoder) error {
 // fields, ignored trailing elements — in O(1) memory. parseJSON unmarshalled
 // the WHOLE body and rejected malformed documents even when the record array
 // itself was fine (e.g. a truncated `{"results":[...],`); this preserves that
-// strictness on the streaming path. Note the inherent streaming caveat: for
-// bodies larger than the scan window, records are delivered to fn before a
-// corrupt tail is discovered — the run still fails, and nothing is committed
-// (Commit is the barrier), so the end state matches the old behavior.
+// strictness on the streaming path.
+//
+// json.Decoder.Token does NOT validate bracket balance at EOF (it returns
+// plain io.EOF mid-container), so balance is tracked here: every call site
+// invokes drainToEOF with exactly ONE container still open (the outer array
+// or the wrapper object), hence depth starts at 1. EOF with depth != 0 is a
+// truncated document; any token after depth reaches 0 is trailing data
+// (Unmarshal rejected both).
+//
+// Note the inherent streaming caveat: for bodies larger than the scan
+// window, records are delivered to fn before a corrupt tail is discovered —
+// the run still fails, and nothing is committed (Commit is the barrier), so
+// the end state matches the old behavior.
 func drainToEOF(dec *json.Decoder) error {
+	depth := 1
 	for {
-		if _, err := dec.Token(); err != nil {
+		tok, err := dec.Token()
+		if err != nil {
 			if err == io.EOF {
+				if depth != 0 {
+					return fmt.Errorf("failed to parse JSON: %w", io.ErrUnexpectedEOF)
+				}
 				return nil
 			}
 			return fmt.Errorf("failed to parse JSON: %w", err)
+		}
+		if depth == 0 {
+			return fmt.Errorf("failed to parse JSON: unexpected trailing data %v", tok)
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
 		}
 	}
 }
@@ -561,26 +588,46 @@ git add components/http-json-extractor/stream.go components/http-json-extractor/
 git commit -m "feat(http-json-extractor): streaming JSON record decoder"
 ```
 
+- [ ] **Step 6 (added 2026-07-28): fix `drainToEOF` truncation detection**
+
+Task 1's first commit (`8d67677`) transcribed the original Step 3 code, whose
+`drainToEOF` treated `io.EOF` as success even with unclosed containers —
+`json.Decoder.Token` does not validate bracket balance at EOF — so 3 of the 4
+`TestDecodeRecords_MalformedRemainder` subtests fail (implementer-reported,
+controller-verified on HEAD). The depth-tracking `drainToEOF` in Step 3 above
+is the corrected, normative code. Apply it to `stream.go`, add the
+`trailing_second_json_value` test case from Step 1, then run:
+
+`go test -C components/http-json-extractor ./...`
+Expected: PASS (all subtests, including all five malformed-remainder cases).
+
+```bash
+git add components/http-json-extractor/stream.go components/http-json-extractor/stream_test.go
+git commit -m "fix(http-json-extractor): detect truncated/trailing JSON after record array"
+```
+
+The Task 1 Codex review covers both commits (BASE = the commit before `8d67677`).
+
 ---
 
-### Task 2: Stringify + column plan (`arrow_sink.go`, part 1)
+### Task 2: Stringify + column plan (`sdk/go/arrow/sink.go`, part 1)
 
 **Files:**
-- Create: `components/http-json-extractor/arrow_sink.go` (this task adds the pure helpers; Task 3 adds the sink)
-- Test: `components/http-json-extractor/arrow_sink_test.go` (create)
+- Create: `sdk/go/arrow/sink.go` (this task adds the pure helpers; Task 3 adds the sink — the file joins the existing `package arrow` next to `reader.go`)
+- Test: `sdk/go/arrow/sink_test.go` (create)
 
 **Interfaces:**
-- Consumes: `FieldMapping`, `getValueRaw` (existing in main.go).
+- Consumes: nothing new (stdlib only; the `sdk/go/arrow` module already exists with arrow-go v18.6.0).
 - Produces (used by Task 3):
   - `func stringifyValue(v any) (string, bool)` — `(cell, isNull)`.
   - `type columnPlan struct { names []string; extract func(rec map[string]any, i int) any }`
-  - `func planFromFields(fields []FieldMapping) *columnPlan`
-  - `func planFromBatch(batch []map[string]any) *columnPlan`
+  - `func planFromBatch(batch []map[string]any) *columnPlan` — first-batch inference (sorted union of top-level keys).
+- (The old component-local `planFromFields` is superseded: explicit columns arrive via Task 3's `WithColumns` option; the `FieldMapping`→columns adapter is component-side, added in Task 4.)
 
 - [ ] **Step 1: Write the failing tests**
 
 ```go
-package main
+package arrow
 
 import (
 	"encoding/json"
@@ -613,26 +660,6 @@ func TestStringifyValue(t *testing.T) {
 	}
 }
 
-func TestPlanFromFields(t *testing.T) {
-	p := planFromFields([]FieldMapping{
-		{Path: "country.value", Name: "entity"},
-		{Path: "iso", Name: "iso3"},
-	})
-	if len(p.names) != 2 || p.names[0] != "entity" || p.names[1] != "iso3" {
-		t.Fatalf("names = %v (declared order required)", p.names)
-	}
-	rec := map[string]any{"country": map[string]any{"value": "Africa"}, "iso": "AFE"}
-	if v := p.extract(rec, 0); v != "Africa" {
-		t.Fatalf("extract nested = %v", v)
-	}
-	if v := p.extract(rec, 1); v != "AFE" {
-		t.Fatalf("extract flat = %v", v)
-	}
-	if v := p.extract(map[string]any{}, 0); v != nil {
-		t.Fatalf("missing path should be nil, got %v", v)
-	}
-}
-
 func TestPlanFromBatch(t *testing.T) {
 	batch := []map[string]any{
 		{"b": 1, "a": 2},
@@ -653,13 +680,13 @@ func TestPlanFromBatch(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test -C components/http-json-extractor -run 'TestStringifyValue|TestPlanFrom' -v`
-Expected: FAIL — `undefined: stringifyValue` / `planFromFields` / `planFromBatch`.
+Run: `go test -C sdk/go/arrow -run 'TestStringifyValue|TestPlanFromBatch' -v`
+Expected: FAIL — `undefined: stringifyValue` / `planFromBatch`.
 
-- [ ] **Step 3: Implement the helpers in `arrow_sink.go`**
+- [ ] **Step 3: Implement the helpers in `sink.go`**
 
 ```go
-package main
+package arrow
 
 import (
 	"encoding/json"
@@ -698,26 +725,10 @@ type columnPlan struct {
 	extract func(rec map[string]any, i int) any
 }
 
-// planFromFields builds the plan for an explicit `fields` projection:
-// column names in declared order, values resolved via dot-path.
-func planFromFields(fields []FieldMapping) *columnPlan {
-	names := make([]string, len(fields))
-	paths := make([]string, len(fields))
-	for i, f := range fields {
-		names[i] = f.Name
-		paths[i] = f.Path
-	}
-	return &columnPlan{
-		names: names,
-		extract: func(rec map[string]any, i int) any {
-			return getValueRaw(rec, paths[i])
-		},
-	}
-}
-
-// planFromBatch derives the plan when `fields` is unset: the sorted union of
-// top-level keys across the first batch (matching the JSONL path's gateway
-// inference, which collected field names from all objects in the first chunk).
+// planFromBatch derives the plan when no explicit columns are given: the
+// sorted union of top-level keys across the first batch (matching the JSONL
+// path's gateway inference, which collected field names from all objects in
+// the first chunk).
 func planFromBatch(batch []map[string]any) *columnPlan {
 	set := make(map[string]bool)
 	for _, rec := range batch {
@@ -741,35 +752,38 @@ func planFromBatch(batch []map[string]any) *columnPlan {
 
 - [ ] **Step 4: Run to verify pass, then commit**
 
-Run: `go test -C components/http-json-extractor -run 'TestStringifyValue|TestPlanFrom' -v`
+Run: `go test -C sdk/go/arrow -run 'TestStringifyValue|TestPlanFromBatch' -v`
 Expected: PASS.
 
 ```bash
-git add components/http-json-extractor/arrow_sink.go components/http-json-extractor/arrow_sink_test.go
-git commit -m "feat(http-json-extractor): stringify + column plan for all-String Arrow output"
+git add sdk/go/arrow/sink.go sdk/go/arrow/sink_test.go
+git commit -m "feat(sdk/go/arrow): stringify + inferred column plan for all-String sink"
 ```
 
 ---
 
-### Task 3: `arrowSink` — batched all-String IPC writer with lazy open
+### Task 3: `StringSink` — batched all-String IPC writer with lazy open (`sdk/go/arrow`)
 
 **Files:**
-- Modify: `components/http-json-extractor/arrow_sink.go` (append)
-- Modify: `components/http-json-extractor/go.mod` (arrow dep, via tidy)
-- Test: `components/http-json-extractor/arrow_sink_test.go` (append)
+- Modify: `sdk/go/arrow/sink.go` (append)
+- Test: `sdk/go/arrow/sink_test.go` (append)
+- Possibly `sdk/go/arrow/go.sum` via `make tidy` (the module already requires arrow-go v18.6.0 + sdk/go — expect little or no drift)
 
 **Interfaces:**
-- Consumes: `columnPlan`, `stringifyValue` (Task 2); `sdk.CloseResult`.
-- Produces (used by Task 4):
-  - `const arrowBatchRows = 8192`
-  - `type ipcChunkWriter interface { Write(ctx context.Context, data []byte) error; Close(ctx context.Context) (*sdk.CloseResult, error); Bucket() string; Table() string }` — satisfied by `*sdk.Writer`.
-  - `func newArrowSink(ctx context.Context, open func() (ipcChunkWriter, error), fields []FieldMapping, batchRows int) *arrowSink`
-  - `(s *arrowSink) Add(rec map[string]any) error`
-  - `(s *arrowSink) Finish() (rows int64, close *sdk.CloseResult, err error)` — flushes the partial batch, closes the writer if one was opened; `(0, nil, nil)` when no records were ever added (writer never opened).
-  - `(s *arrowSink) Writer() ipcChunkWriter` — the opened writer (nil when no rows), for `Bucket()`/`Table()` logging.
-  - `type sinkWriteError struct{ Err error }` with `Error()`/`Unwrap()` — wraps writer-open/Write failures so `main` can map them to `ExitAppError` while decode errors stay `ExitUserError`.
+- Consumes: `columnPlan`, `stringifyValue`, `planFromBatch` (Task 2); `sdk.CloseResult`.
+- Produces (used by Task 4) — all EXPORTED, this is public SDK surface:
+  - `const DefaultBatchRows = 8192`
+  - `type ChunkWriter interface { Write(ctx context.Context, data []byte) error; Close(ctx context.Context) (*sdk.CloseResult, error); Bucket() string; Table() string }` — satisfied by `*sdk.Writer`.
+  - `type WriteError struct{ Err error }` with `Error()`/`Unwrap()` — wraps writer-open/Write/Close failures so callers can map them to infrastructure exits (`ExitAppError`) while decode errors stay user errors.
+  - `type SinkOption func(*StringSink)`
+  - `func WithColumns(names []string, extract func(rec map[string]any, i int) any) SinkOption` — explicit column plan (declared order); without it the sink infers via `planFromBatch`.
+  - `func WithBatchRows(n int) SinkOption` — overrides `DefaultBatchRows` (n <= 0 ignored; tests use tiny batches).
+  - `func NewStringSink(ctx context.Context, open func() (ChunkWriter, error), opts ...SinkOption) *StringSink`
+  - `(s *StringSink) Add(rec map[string]any) error`
+  - `(s *StringSink) Finish() (rows int64, close *sdk.CloseResult, err error)` — flushes the partial batch, closes the writer if one was opened; `(0, nil, nil)` when no records were ever added (writer never opened).
+  - `(s *StringSink) Writer() ChunkWriter` — the opened writer (nil when no rows), for `Bucket()`/`Table()` logging.
 
-- [ ] **Step 1: Write the failing tests (append to arrow_sink_test.go)**
+- [ ] **Step 1: Write the failing tests (append to sink_test.go)**
 
 First extend the test file's import block with: `"bytes"`, `"context"`, `"errors"`, `"github.com/apache/arrow-go/v18/arrow/ipc"`, and `sdk "github.com/datuplet/datuplet/sdk/go"`. Then append:
 
@@ -818,10 +832,11 @@ func ipcRows(t *testing.T, payload []byte) (int64, []string) {
 	return rows, names
 }
 
-func TestArrowSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
+func TestStringSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
 	fw := &fakeWriter{}
-	sink := newArrowSink(context.Background(), func() (ipcChunkWriter, error) { return fw, nil },
-		[]FieldMapping{{Path: "id", Name: "id"}}, 4 /* tiny batch */)
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
+		WithBatchRows(4) /* tiny batch */)
 	for i := 0; i < 10; i++ {
 		if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
 			t.Fatal(err)
@@ -853,9 +868,9 @@ func TestArrowSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
 	}
 }
 
-func TestArrowSink_NoFieldsDerivesPlanFromFirstBatch(t *testing.T) {
+func TestStringSink_NoColumnsDerivesPlanFromFirstBatch(t *testing.T) {
 	fw := &fakeWriter{}
-	sink := newArrowSink(context.Background(), func() (ipcChunkWriter, error) { return fw, nil }, nil, 3)
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(3))
 	// key "c" appears only in the 2nd record — union must include it.
 	recs := []map[string]any{
 		{"b": json.Number("1")},
@@ -879,12 +894,12 @@ func TestArrowSink_NoFieldsDerivesPlanFromFirstBatch(t *testing.T) {
 	}
 }
 
-func TestArrowSink_ZeroRecordsNeverOpensWriter(t *testing.T) {
+func TestStringSink_ZeroRecordsNeverOpensWriter(t *testing.T) {
 	opened := false
-	sink := newArrowSink(context.Background(), func() (ipcChunkWriter, error) {
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) {
 		opened = true
 		return &fakeWriter{}, nil
-	}, nil, 4)
+	}, WithBatchRows(4))
 	rows, cr, err := sink.Finish()
 	if err != nil || rows != 0 || cr != nil {
 		t.Fatalf("rows=%d cr=%v err=%v", rows, cr, err)
@@ -897,61 +912,66 @@ func TestArrowSink_ZeroRecordsNeverOpensWriter(t *testing.T) {
 	}
 }
 
-func TestArrowSink_WriteErrorIsSinkWriteError(t *testing.T) {
-	sink := newArrowSink(context.Background(), func() (ipcChunkWriter, error) {
+func TestStringSink_OpenFailureIsWriteError(t *testing.T) {
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) {
 		return nil, errors.New("open boom")
-	}, []FieldMapping{{Path: "id", Name: "id"}}, 1)
+	}, WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }), WithBatchRows(1))
 	err := sink.Add(map[string]any{"id": "1"})
-	var swe *sinkWriteError
-	if !errors.As(err, &swe) {
-		t.Fatalf("want sinkWriteError, got %v", err)
+	var we *WriteError
+	if !errors.As(err, &we) {
+		t.Fatalf("want WriteError, got %v", err)
 	}
 }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test -C components/http-json-extractor -run TestArrowSink -v`
-Expected: FAIL — `undefined: newArrowSink` (and the arrow import will need `go mod tidy`, done in Step 3).
+Run: `go test -C sdk/go/arrow -run TestStringSink -v`
+Expected: FAIL — `undefined: NewStringSink`.
 
-- [ ] **Step 3: Implement the sink (append to arrow_sink.go) + tidy**
+- [ ] **Step 3: Implement the sink (append to sink.go) + tidy**
 
-Add to the import block: `"context"`, `"fmt"`, `"github.com/apache/arrow-go/v18/arrow"`, `"github.com/apache/arrow-go/v18/arrow/array"`, `"github.com/apache/arrow-go/v18/arrow/ipc"`, `"github.com/apache/arrow-go/v18/arrow/memory"`, `"bytes"`, `sdk "github.com/datuplet/datuplet/sdk/go"`.
+Add to sink.go's import block: `"context"`, `"fmt"`, `"github.com/apache/arrow-go/v18/arrow"`, `"github.com/apache/arrow-go/v18/arrow/array"`, `"github.com/apache/arrow-go/v18/arrow/ipc"`, `"github.com/apache/arrow-go/v18/arrow/memory"`, `"bytes"`, `sdk "github.com/datuplet/datuplet/sdk/go"`. (reader.go already imports most of these — imports are per-file, declare them again.)
 
 ```go
-// arrowBatchRows is the per-batch row count accumulated before flushing a
-// self-contained Arrow IPC stream. Same empirical sweet spot data-generator
-// uses (components/data-generator/arrow_writer.go).
-const arrowBatchRows = 8192
+// DefaultBatchRows is the per-batch row count a StringSink accumulates
+// before flushing a self-contained Arrow IPC stream. Same empirical sweet
+// spot data-generator uses (components/data-generator/arrow_writer.go).
+const DefaultBatchRows = 8192
 
-// ipcChunkWriter is the slice of *sdk.Writer the sink needs; narrowed for
+// ChunkWriter is the slice of *sdk.Writer a StringSink needs; narrowed for
 // testability with a fake.
-type ipcChunkWriter interface {
+type ChunkWriter interface {
 	Write(ctx context.Context, data []byte) error
 	Close(ctx context.Context) (*sdk.CloseResult, error)
 	Bucket() string
 	Table() string
 }
 
-// sinkWriteError marks writer-open/Write/Close failures (infrastructure) so
-// main can map them to ExitAppError while decode errors stay ExitUserError.
-type sinkWriteError struct{ Err error }
+// WriteError marks writer-open/Write/Close failures (infrastructure) so
+// callers can map them to application-error exits (sdk.ExitAppError) while
+// their decode errors stay user errors.
+type WriteError struct{ Err error }
 
-func (e *sinkWriteError) Error() string { return e.Err.Error() }
-func (e *sinkWriteError) Unwrap() error { return e.Err }
+func (e *WriteError) Error() string { return e.Err.Error() }
+func (e *WriteError) Unwrap() error { return e.Err }
 
-// arrowSink accumulates records into an all-String Arrow RecordBuilder and
+// StringSink accumulates records into an all-String Arrow RecordBuilder and
 // flushes a self-contained IPC stream per batch via ONE writer.Write call
 // each (the SDK sends Arrow-IPC writes immediately — one POST per call — so
 // the gateway never sees concatenated IPC streams).
 //
+// Columns: WithColumns fixes them explicitly; otherwise the sink infers them
+// as the sorted union of top-level keys across the first batch, fixed for
+// the run (later records project onto that set: missing key → null, unseen
+// key → ignored).
+//
 // The writer is opened lazily on the first flush: zero records = no writer,
-// letting callers preserve the commit-empty path.
-type arrowSink struct {
+// letting callers preserve their commit-empty path.
+type StringSink struct {
 	ctx       context.Context
-	open      func() (ipcChunkWriter, error)
-	writer    ipcChunkWriter
-	fields    []FieldMapping
+	open      func() (ChunkWriter, error)
+	writer    ChunkWriter
 	plan      *columnPlan
 	pending   []map[string]any // buffered records while plan is unknown
 	alloc     memory.Allocator
@@ -961,19 +981,41 @@ type arrowSink struct {
 	rows      int64
 }
 
-func newArrowSink(ctx context.Context, open func() (ipcChunkWriter, error), fields []FieldMapping, batchRows int) *arrowSink {
-	if batchRows <= 0 {
-		batchRows = arrowBatchRows
+// SinkOption configures a StringSink at construction.
+type SinkOption func(*StringSink)
+
+// WithColumns fixes the output columns explicitly: names in declared order,
+// each row's value for column i pulled by extract(rec, i).
+func WithColumns(names []string, extract func(rec map[string]any, i int) any) SinkOption {
+	return func(s *StringSink) {
+		s.plan = &columnPlan{names: names, extract: extract}
 	}
-	s := &arrowSink{ctx: ctx, open: open, fields: fields, alloc: memory.NewGoAllocator(), batchRows: batchRows}
-	if len(fields) > 0 {
-		s.adoptPlan(planFromFields(fields))
+}
+
+// WithBatchRows overrides DefaultBatchRows (values <= 0 are ignored).
+func WithBatchRows(n int) SinkOption {
+	return func(s *StringSink) {
+		if n > 0 {
+			s.batchRows = n
+		}
+	}
+}
+
+// NewStringSink builds a sink whose writer is opened lazily via open on the
+// first flush.
+func NewStringSink(ctx context.Context, open func() (ChunkWriter, error), opts ...SinkOption) *StringSink {
+	s := &StringSink{ctx: ctx, open: open, alloc: memory.NewGoAllocator(), batchRows: DefaultBatchRows}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.plan != nil {
+		s.adoptPlan(s.plan)
 	}
 	return s
 }
 
 // adoptPlan fixes the schema and creates the builder.
-func (s *arrowSink) adoptPlan(p *columnPlan) {
+func (s *StringSink) adoptPlan(p *columnPlan) {
 	s.plan = p
 	fieldsArr := make([]arrow.Field, len(p.names))
 	for i, n := range p.names {
@@ -983,7 +1025,7 @@ func (s *arrowSink) adoptPlan(p *columnPlan) {
 }
 
 // Add appends one record, flushing a batch when full.
-func (s *arrowSink) Add(rec map[string]any) error {
+func (s *StringSink) Add(rec map[string]any) error {
 	if s.plan == nil {
 		s.pending = append(s.pending, rec)
 		if len(s.pending) < s.batchRows {
@@ -1003,7 +1045,7 @@ func (s *arrowSink) Add(rec map[string]any) error {
 	return nil
 }
 
-func (s *arrowSink) appendRow(rec map[string]any) {
+func (s *StringSink) appendRow(rec map[string]any) {
 	for i := range s.plan.names {
 		cell, isNull := stringifyValue(s.plan.extract(rec, i))
 		b := s.builder.Field(i).(*array.StringBuilder)
@@ -1019,7 +1061,7 @@ func (s *arrowSink) appendRow(rec map[string]any) {
 
 // flush serializes the current batch as a complete IPC stream (schema +
 // record + EOS) and ships it with one Write call.
-func (s *arrowSink) flush() error {
+func (s *StringSink) flush() error {
 	if s.inBatch == 0 {
 		return nil
 	}
@@ -1030,21 +1072,21 @@ func (s *arrowSink) flush() error {
 	w := ipc.NewWriter(&buf, ipc.WithSchema(rec.Schema()), ipc.WithAllocator(s.alloc))
 	if err := w.Write(rec); err != nil {
 		w.Close() //nolint:errcheck
-		return &sinkWriteError{Err: fmt.Errorf("ipc write record: %w", err)}
+		return &WriteError{Err: fmt.Errorf("ipc write record: %w", err)}
 	}
 	if err := w.Close(); err != nil {
-		return &sinkWriteError{Err: fmt.Errorf("ipc close writer: %w", err)}
+		return &WriteError{Err: fmt.Errorf("ipc close writer: %w", err)}
 	}
 
 	if s.writer == nil {
 		wr, err := s.open()
 		if err != nil {
-			return &sinkWriteError{Err: fmt.Errorf("failed to open writer: %w", err)}
+			return &WriteError{Err: fmt.Errorf("failed to open writer: %w", err)}
 		}
 		s.writer = wr
 	}
 	if err := s.writer.Write(s.ctx, buf.Bytes()); err != nil {
-		return &sinkWriteError{Err: fmt.Errorf("failed to write IPC batch: %w", err)}
+		return &WriteError{Err: fmt.Errorf("failed to write IPC batch: %w", err)}
 	}
 	s.inBatch = 0
 	return nil
@@ -1053,7 +1095,7 @@ func (s *arrowSink) flush() error {
 // Finish flushes the partial batch (deriving the plan first if it is still
 // pending) and closes the writer when one was opened. Zero records: no
 // writer was opened and (0, nil, nil) is returned.
-func (s *arrowSink) Finish() (int64, *sdk.CloseResult, error) {
+func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
 	if s.plan == nil && len(s.pending) > 0 {
 		s.adoptPlan(planFromBatch(s.pending))
 		for _, p := range s.pending {
@@ -1073,46 +1115,132 @@ func (s *arrowSink) Finish() (int64, *sdk.CloseResult, error) {
 	}
 	cr, err := s.writer.Close(s.ctx)
 	if err != nil {
-		return s.rows, nil, &sinkWriteError{Err: fmt.Errorf("failed to close writer: %w", err)}
+		return s.rows, nil, &WriteError{Err: fmt.Errorf("failed to close writer: %w", err)}
 	}
 	return s.rows, cr, nil
 }
 
 // Writer exposes the opened writer (nil when no rows were written).
-func (s *arrowSink) Writer() ipcChunkWriter { return s.writer }
+func (s *StringSink) Writer() ChunkWriter { return s.writer }
 ```
 
 Then run `make tidy` (the repo rule — never bare `go mod tidy`; `-C` after the
-subcommand is not even valid Go flag syntax). It tidies every module and pulls
-`github.com/apache/arrow-go/v18 v18.6.0` into the extractor module — same
-version as root/data-generator.
+subcommand is not even valid Go flag syntax). The `sdk/go/arrow` module already
+requires arrow-go v18.6.0 and sdk/go, so expect little or no drift; commit
+`go.mod`/`go.sum` only if tidy actually changed them.
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `go test -C components/http-json-extractor -run TestArrowSink -v`
+Run: `go test -C sdk/go/arrow -run TestStringSink -v`
 Expected: PASS (all four).
 
-- [ ] **Step 5: Full package test + commit**
+- [ ] **Step 5: Full module test + commit**
 
-Run: `go build -C components/http-json-extractor ./... && go vet -C components/http-json-extractor ./... && go test -C components/http-json-extractor ./...`
-Expected: clean + PASS.
+Run: `go build -C sdk/go/arrow ./... && go vet -C sdk/go/arrow ./... && go test -C sdk/go/arrow ./...`
+Expected: clean + PASS (including the pre-existing reader tests).
 
 ```bash
-git add components/http-json-extractor/arrow_sink.go components/http-json-extractor/arrow_sink_test.go components/http-json-extractor/go.mod components/http-json-extractor/go.sum
-git commit -m "feat(http-json-extractor): all-String Arrow-IPC sink with per-batch streams"
+git add sdk/go/arrow/sink.go sdk/go/arrow/sink_test.go
+git commit -m "feat(sdk/go/arrow): StringSink — batched all-String Arrow-IPC writer with lazy open"
 ```
 
 ---
 
-### Task 4: Wire both paths through the sink; delete dead JSONL/projection code
+### Task 4: Wire both paths through the SDK sink; delete dead JSONL/projection code
 
 **Files:**
+- Modify: `components/http-json-extractor/go.mod` + `go.sum` (add the `sdk/go/arrow` dep; via edit + `make tidy`)
+- Create: `components/http-json-extractor/columns.go` (fields→columns adapter + shared sink constructor)
+- Create: `components/http-json-extractor/columns_test.go`
 - Modify: `components/http-json-extractor/main.go`
 - Modify: `components/http-json-extractor/transform_test.go` (remove dead-code tests)
 
 **Interfaces:**
-- Consumes: `fetchStream`, `decodeRecords` (Task 1); `newArrowSink`, `sinkWriteError`, `arrowBatchRows` (Task 3).
-- Produces: no new symbols; `main()`/`runPaginatedExtraction` behavior per spec.
+- Consumes: `fetchStream`, `decodeRecords` (Task 1); `dgarrow.NewStringSink`, `dgarrow.WithColumns`, `dgarrow.ChunkWriter`, `dgarrow.WriteError` (Task 3); existing `FieldMapping`, `getValueRaw`.
+- Produces: `fieldColumns([]FieldMapping) ([]string, func(map[string]any, int) any)`; `newExtractorSink(ctx, client, outputTable, fields) *dgarrow.StringSink`; `main()`/`runPaginatedExtraction` behavior per spec.
+
+- [ ] **Step 0: Add the `sdk/go/arrow` dependency + the component-side adapter**
+
+(a) `components/http-json-extractor/go.mod` — add the module dep, mirroring
+sql-transform's exact pattern: `github.com/datuplet/datuplet/sdk/go/arrow v0.0.0`
+in the `require` block, and a matching
+`replace github.com/datuplet/datuplet/sdk/go/arrow => ../../sdk/go/arrow`.
+Then run `make tidy` (never bare `go mod tidy`) — arrow-go v18.6.0 and friends
+land as indirects. The component must NOT import arrow-go directly. No
+Dockerfile change (the image builds from the whole-repo `COPY . .` context, so
+the replace directive resolves).
+
+(b) Create `components/http-json-extractor/columns.go`:
+
+```go
+package main
+
+import (
+	"context"
+
+	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
+	sdk "github.com/datuplet/datuplet/sdk/go"
+	dgarrow "github.com/datuplet/datuplet/sdk/go/arrow"
+)
+
+// fieldColumns adapts the config's `fields` projection to the SDK sink's
+// explicit-columns form: names in declared order, values resolved via
+// getValueRaw dot-paths.
+func fieldColumns(fields []FieldMapping) ([]string, func(rec map[string]any, i int) any) {
+	names := make([]string, len(fields))
+	paths := make([]string, len(fields))
+	for i, f := range fields {
+		names[i] = f.Name
+		paths[i] = f.Path
+	}
+	return names, func(rec map[string]any, i int) any {
+		return getValueRaw(rec, paths[i])
+	}
+}
+
+// newExtractorSink builds the StringSink both extraction paths write to:
+// lazy Arrow-IPC writer open, explicit columns when a fields projection is
+// configured, first-batch inference otherwise.
+func newExtractorSink(ctx context.Context, client *sdk.Client, outputTable string, fields []FieldMapping) *dgarrow.StringSink {
+	var opts []dgarrow.SinkOption
+	if len(fields) > 0 {
+		names, extract := fieldColumns(fields)
+		opts = append(opts, dgarrow.WithColumns(names, extract))
+	}
+	return dgarrow.NewStringSink(ctx, func() (dgarrow.ChunkWriter, error) {
+		return client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
+	}, opts...)
+}
+```
+
+(c) Create `components/http-json-extractor/columns_test.go` (the old
+`TestPlanFromFields` coverage, retargeted at the adapter):
+
+```go
+package main
+
+import "testing"
+
+func TestFieldColumns(t *testing.T) {
+	names, extract := fieldColumns([]FieldMapping{
+		{Path: "country.value", Name: "entity"},
+		{Path: "iso", Name: "iso3"},
+	})
+	if len(names) != 2 || names[0] != "entity" || names[1] != "iso3" {
+		t.Fatalf("names = %v (declared order required)", names)
+	}
+	rec := map[string]any{"country": map[string]any{"value": "Africa"}, "iso": "AFE"}
+	if v := extract(rec, 0); v != "Africa" {
+		t.Fatalf("extract nested = %v", v)
+	}
+	if v := extract(rec, 1); v != "AFE" {
+		t.Fatalf("extract flat = %v", v)
+	}
+	if v := extract(map[string]any{}, 0); v != nil {
+		t.Fatalf("missing path should be nil, got %v", v)
+	}
+}
+```
 
 - [ ] **Step 1: Replace the single-request block in `main()` and fix the paginated dispatch's exit-code classification**
 
@@ -1125,8 +1253,8 @@ contract in Global Constraints; today every paginated error is wrapped in
 	// Paginated mode - stream data incrementally, page by page.
 	if compCfg.Pagination != nil && compCfg.Pagination.Type != "" {
 		if err := runPaginatedExtraction(ctx, client, &compCfg, outputTable); err != nil {
-			var swe *sinkWriteError
-			if errors.As(err, &swe) {
+			var we *dgarrow.WriteError
+			if errors.As(err, &we) {
 				sdk.ExitAppError(fmt.Sprintf("paginated extraction failed: %v", err))
 			}
 			sdk.ExitUserError(fmt.Sprintf("paginated extraction failed: %v", err))
@@ -1141,9 +1269,7 @@ Then replace the block from `// Single-request mode.` (main.go:143) through the 
 	// Single-request mode.
 	client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
 
-	sink := newArrowSink(ctx, func() (ipcChunkWriter, error) {
-		return client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
-	}, compCfg.Fields, arrowBatchRows)
+	sink := newExtractorSink(ctx, client, outputTable, compCfg.Fields)
 
 	body, err := fetchStream(ctx, compCfg.URL, compCfg.Headers)
 	if err != nil {
@@ -1152,8 +1278,8 @@ Then replace the block from `// Single-request mode.` (main.go:143) through the 
 	n, err := decodeRecords(body, compCfg.ArrayPath, sink.Add)
 	body.Close()
 	if err != nil {
-		var swe *sinkWriteError
-		if errors.As(err, &swe) {
+		var we *dgarrow.WriteError
+		if errors.As(err, &we) {
 			sdk.ExitAppError(err.Error())
 		}
 		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
@@ -1181,7 +1307,9 @@ Then replace the block from `// Single-request mode.` (main.go:143) through the 
 }
 ```
 
-Add `"errors"` to main.go's import block.
+Add `"errors"` and `dgarrow "github.com/datuplet/datuplet/sdk/go/arrow"` to
+main.go's import block (main.go references `dgarrow.WriteError`; the sink
+construction itself lives in columns.go's `newExtractorSink`).
 
 - [ ] **Step 2: Rewrite `runPaginatedExtraction`'s writer/loop plumbing**
 
@@ -1190,9 +1318,7 @@ Add `"errors"` to main.go's import block.
 ```go
 	// One sink across all pages: the schema is fixed after the first batch
 	// and every batch ships as its own IPC stream/POST.
-	sink := newArrowSink(ctx, func() (ipcChunkWriter, error) {
-		return client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
-	}, cfg.Fields, arrowBatchRows)
+	sink := newExtractorSink(ctx, client, outputTable, cfg.Fields)
 ```
 
 (b) Replace the per-page fetch/truncate/write block (main.go:233-265, from `// Fetch page` through the `client.Log(... "Page %d: fetched ...")` line) with:
@@ -1260,7 +1386,7 @@ instead of `len(records)`:
 	// Flush + close (no-op writer when zero records; commit still runs).
 	rows, closeResult, err := sink.Finish()
 	if err != nil {
-		return err // already a *sinkWriteError → main exits FailedApplication
+		return err // already a *dgarrow.WriteError → main exits FailedApplication
 	}
 	if rows > 0 {
 		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
@@ -1272,7 +1398,7 @@ commit failure (infrastructure) also classifies as FailedApplication:
 
 ```go
 	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {
-		return &sinkWriteError{Err: err}
+		return &dgarrow.WriteError{Err: err}
 	}
 ```
 
@@ -1288,13 +1414,14 @@ commit failure (infrastructure) also classifies as FailedApplication:
 - [ ] **Step 4: Build, vet, full test**
 
 Run: `go build -C components/http-json-extractor ./... && go vet -C components/http-json-extractor ./... && go test -C components/http-json-extractor ./...`
-Expected: clean + PASS (parse/stream/sink/config/resolve tests all green).
+Expected: clean + PASS (parse/stream/columns/config/resolve tests all green).
+Also re-run `make tidy` and confirm no further drift beyond Step 0's go.mod/go.sum change.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add components/http-json-extractor/main.go components/http-json-extractor/transform_test.go
-git commit -m "feat(http-json-extractor): stream all-String Arrow IPC in both paths"
+git add components/http-json-extractor/go.mod components/http-json-extractor/go.sum components/http-json-extractor/columns.go components/http-json-extractor/columns_test.go components/http-json-extractor/main.go components/http-json-extractor/transform_test.go
+git commit -m "feat(http-json-extractor): stream all-String Arrow IPC via sdk/go/arrow StringSink"
 ```
 
 ---
@@ -1697,6 +1824,7 @@ git commit -m "feat(dev): mock Data Gateway + make extractor-local for local com
 - Document the schema rule: with `fields` — the projected names in declared order; without — the sorted union of top-level keys across the first 8192 records.
 - Add the compatibility caveat: writing into a **pre-existing table with typed (non-string) columns** fails iceberg's schema check — for both APPEND and FULL_LOAD (`ReplaceDataFiles` does not replace the catalog schema). Use a fresh table name or drop the old table.
 - Add a short **Local debugging** note: `make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json` runs the real binary against the mock gateway and reports rows + peak RSS.
+- Add one line to the component-authoring guidance in `docs/components.md`: writer-side Arrow output is available to any Go component via the opt-in `sdk/go/arrow` module's `StringSink` (all-String columns, batched self-contained IPC streams, optional first-batch schema inference) — the writer-side counterpart of that module's existing Arrow reader.
 
 - [ ] **Step 2: Commit**
 
@@ -1723,7 +1851,7 @@ Expected: 4 pages × 50k, mock `COMMIT ... rows=200000`, all-`utf8` schema, exit
 - [ ] **Step 2: Monorepo hygiene**
 
 Run: `make tidy`
-Expected: completes; only expected `go.mod`/`go.sum` churn (the extractor module gained arrow-go in Task 3; other modules unchanged).
+Expected: completes; no drift (the extractor module gained sdk/go/arrow + arrow-go indirects in Task 4, already tidied there; sdk/go/arrow itself needed no go.mod change; other modules unchanged).
 
 - [ ] **Step 3: Bump version**
 
@@ -1785,7 +1913,7 @@ The PR's CI e2e (fail-closed since RFC 024) exercises ~13 extractor fixtures. Au
 
 **Placeholder scan:** no TBD/TODO; every code step carries complete code. The `--dump` flag from the spec was dropped (YAGNI — the mock's schema log + row counts cover the debugging need; noted here as a conscious cut). ✓
 
-**Type consistency:** `decodeRecords(io.Reader, string, func(map[string]any) error) (int, error)`; `fetchStream(ctx, string, map[string]string) (io.ReadCloser, error)`; `stringifyValue(any) (string, bool)`; `columnPlan{names, extract}`; `newArrowSink(ctx, func() (ipcChunkWriter, error), []FieldMapping, int)`; `Add(map[string]any) error`; `Finish() (int64, *sdk.CloseResult, error)`; `Writer() ipcChunkWriter`; `sinkWriteError{Err}` — used identically in Tasks 1–5. `*sdk.Writer` satisfies `ipcChunkWriter` (`Write(ctx,[]byte) error` / `Close(ctx) (*sdk.CloseResult, error)` / `Bucket()` / `Table()` all exist, `sdk/go/client.go`). ✓
+**Type consistency:** `decodeRecords(io.Reader, string, func(map[string]any) error) (int, error)`; `fetchStream(ctx, string, map[string]string) (io.ReadCloser, error)`; SDK side: `stringifyValue(any) (string, bool)`, `columnPlan{names, extract}`, `planFromBatch([]map[string]any) *columnPlan`, `NewStringSink(ctx, func() (ChunkWriter, error), ...SinkOption) *StringSink`, `WithColumns([]string, func(map[string]any, int) any)`, `WithBatchRows(int)`, `Add(map[string]any) error`, `Finish() (int64, *sdk.CloseResult, error)`, `Writer() ChunkWriter`, `WriteError{Err}`; component side: `fieldColumns([]FieldMapping) ([]string, func(map[string]any, int) any)`, `newExtractorSink(ctx, *sdk.Client, string, []FieldMapping) *dgarrow.StringSink` — used identically in Tasks 1–5. `*sdk.Writer` satisfies `ChunkWriter` (`Write(ctx,[]byte) error` / `Close(ctx) (*sdk.CloseResult, error)` / `Bucket()` / `Table()` all exist, `sdk/go/client.go`). ✓
 
 **Post-Codex-review revisions (round 1):**
 - Blocker → Task 1 decoder rewritten to full token-walking: records are built
@@ -1796,7 +1924,8 @@ The PR's CI e2e (fail-closed since RFC 024) exercises ~13 extractor fixtures. Au
   dropped; `bytes` import dropped).
 - Major (exit codes) → Task 4 Step 1 classifies `sinkWriteError` in the
   paginated dispatch (`ExitAppError`); Step 2(c2) wraps the paginated
-  `commitAndStatus` error as `sinkWriteError`.
+  `commitAndStatus` error as `sinkWriteError`. (Renamed `dgarrow.WriteError`
+  in the 2026-07-28 restructure below; the classification is unchanged.)
 - Major (tidy syntax) → Task 3 uses `make tidy` (repo rule), not
   `go mod tidy -C`.
 - Major (mock validation) → the mock derives `expectCols` from the config's
@@ -1821,3 +1950,25 @@ The PR's CI e2e (fail-closed since RFC 024) exercises ~13 extractor fixtures. Au
 - Minor (mock no-`fields` drift) → `writerState.schemaNames` locks the first
   payload's column names per writer; every later payload must match exactly
   (`slices.Equal`), independent of `expectCols`. ✓
+
+**Post-gate revision (2026-07-28, maintainer-requested restructure + Task 1 fix):**
+- **Sink relocated to `sdk/go/arrow`** (maintainer request): the all-String
+  batched Arrow-IPC writer + optional first-batch schema inference become a
+  reusable SDK capability (`StringSink`, `WithColumns`, `WithBatchRows`,
+  `ChunkWriter`, `WriteError`), running in the component container — the
+  writer-side counterpart of the module's existing `NewReader` (opt-in module
+  precedent; base `sdk/go` stays arrow-free). The component keeps the
+  config-specific `FieldMapping`→columns adapter (`columns.go`: `fieldColumns`
+  + `newExtractorSink`). Tasks 2–3 now target `sdk/go/arrow`; Task 4 adds the
+  component's module dep (mirroring sql-transform's require+replace pattern)
+  and the adapter. No Dockerfile change (whole-repo `COPY . .` build context).
+  Verified before revising: `sdk/go/arrow` exists with arrow-go v18.6.0 + sdk/go
+  deps and no symbol collisions with `reader.go`/`reader_test.go`.
+- **Task 1 `drainToEOF` corrected** (Step 6 added): the original code treated
+  `io.EOF` as success even with unclosed containers — `json.Decoder.Token`
+  does not validate bracket balance at EOF — so 3 of 4 malformed-remainder
+  subtests fail on Task 1's first commit (`8d67677`), exactly as the
+  implementer reported. The normative version tracks depth (all call sites
+  have exactly one open container → depth starts at 1), errors on EOF with
+  depth != 0, and rejects any token after depth 0 (trailing-data Unmarshal
+  parity, new `trailing_second_json_value` test case). ✓

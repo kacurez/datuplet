@@ -83,6 +83,16 @@ Replace the read-all/unmarshal/JSONL path with a streaming pipeline:
   serialize a **self-contained IPC stream** (schema + record + EOS, like
   data-generator's `serializeRecordToIPC`), and ship it.
 
+The accumulate/stringify/flush machinery is packaged as
+**`sdk/go/arrow.StringSink`** *(revised 2026-07-28)* — the writer-side
+counterpart of that opt-in SDK module's existing Arrow reader — so any Go
+component can reuse the all-String batched writer and its optional
+first-batch schema inference from the component container. Explicit columns
+are supplied via a `WithColumns(names, extract)` option; the
+http-json-extractor keeps only a thin component-side adapter mapping its
+`fields[]` config (`FieldMapping` + `getValueRaw` dot-paths) onto that
+option. Base `sdk/go` stays arrow-free (same opt-in split as the reader).
+
 Open the writer with `sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC)`. Peak
 component memory ≈ one 8192-row batch, independent of `page_size` and of the
 total row count.
