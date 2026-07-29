@@ -14,7 +14,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -143,6 +145,7 @@ func (p *CommitPool) run(sid uint64, j CommitJob) {
 	cr.Duration = time.Since(start)
 	if err != nil {
 		cr.Err = err
+		logCatalogSchemaOnMismatch(p.parentCtx, cat, j.Namespace, j.Table, err)
 	} else if res != nil {
 		cr.SnapshotIDBefore = res.SnapshotIDBefore
 		cr.SnapshotIDAfter = res.SnapshotIDAfter
@@ -161,6 +164,73 @@ func (p *CommitPool) run(sid uint64, j CommitJob) {
 		commitDuration.WithLabelValues(mode, "ok").Observe(cr.Duration.Seconds())
 	}
 	p.record(sid, cr)
+}
+
+// looksLikeSchemaMismatch reports whether a commit error is plausibly an
+// Iceberg schema-compatibility rejection, so the extra catalog round-trip in
+// logCatalogSchemaOnMismatch is only paid when it can actually help. Kept a
+// text heuristic deliberately: iceberg-go returns these as plain errors with
+// no distinguishable type, and being wrong here costs one logged line, not
+// correctness.
+func looksLikeSchemaMismatch(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{"schema", "field", "incompatible", "type mismatch"} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// logCatalogSchemaOnMismatch logs the table's CURRENT catalog schema when a
+// commit fails in a way that looks like a schema conflict. Paired with the
+// gateway's "writer schema:" line, this puts the emitted schema and the
+// existing one in the same log stream — the two facts needed to diagnose the
+// mismatch, which previously required pulling iceberg metadata out of object
+// storage by hand.
+//
+// Strictly best-effort: every failure to fetch is swallowed, and the original
+// commit error is never modified.
+func logCatalogSchemaOnMismatch(ctx context.Context, cat catalog.Catalog, ns, table string, commitErr error) {
+	if cat == nil || !looksLikeSchemaMismatch(commitErr) {
+		return
+	}
+	// Bounded: this runs on a failure path, possibly during shutdown.
+	lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	tbl, err := cat.LoadTable(lookupCtx, icebergtable.Identifier{ns, table})
+	if err != nil {
+		log.Printf("commit failed for %s.%s and the existing schema could not be read for comparison: %v", ns, table, err)
+		return
+	}
+	sch := tbl.Schema()
+	if sch == nil {
+		return
+	}
+	fields := sch.Fields()
+	shown := fields
+	if len(shown) > maxLoggedSchemaColumns {
+		shown = shown[:maxLoggedSchemaColumns]
+	}
+	parts := make([]string, 0, len(shown))
+	for _, f := range shown {
+		null := "?"
+		if f.Required {
+			null = ""
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s%s", f.Name, f.Type, null))
+	}
+	truncated := ""
+	if len(fields) > len(shown) {
+		truncated = fmt.Sprintf(", +%d more", len(fields)-len(shown))
+	}
+	log.Printf("existing catalog schema for %s.%s: columns=%d [%s%s] "+
+		"(compare with the \"writer schema:\" line above; a type or required/nullable difference fails the commit)",
+		ns, table, len(fields), strings.Join(parts, ", "), truncated)
 }
 
 func (p *CommitPool) record(sid uint64, cr CommitResult) {

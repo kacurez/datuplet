@@ -273,9 +273,10 @@ data files, not its catalog schema. Use a fresh table name, declare
 `outputs.tables[].columns` to pin a stable schema across runs, or drop the
 old table first.
 
-**Tables created before 0.12.0 cannot be written by this component at all.**
-Pre-0.12.0, schema decisions were made gateway-side from untyped JSONL, and
-that path did things the component-side path deliberately does not:
+**Tables created before 0.12.0 may carry a schema this component can no
+longer produce.** Pre-0.12.0, schema decisions were made gateway-side from
+untyped JSONL, and that path did things the component-side path deliberately
+does not:
 
 | pre-0.12.0 (gateway inference) | 0.12.0+ (component/SDK) |
 |---|---|
@@ -284,12 +285,24 @@ that path did things the component-side path deliberately does not:
 | integers could land as `double` | integral values are always `Int64` |
 | most columns `required` (non-nullable) | every column is nullable |
 
-Because the declared-column vocabulary has no timestamp/date type and no way
-to mark a column `required`, **no `columns` mapping or `schema_inference`
-setting reproduces a pre-0.12.0 schema.** The only options for such a table
-are to write to a new table name or drop and recreate it. A run that hits
-this fails at commit with an Iceberg schema error naming the table (visible
-in the component's status message and the gateway sidecar log).
+Whether a given legacy table is still writable depends on what the old
+inference produced for it. Check its current schema first —
+`datuplet storage schema <ns>.<table>`:
+
+- **All columns `string` and nullable** → still writable: set
+  `schema_inference: strings` (or declare every column as `string`) to emit a
+  matching schema. Gateway-side inference marked a column nullable whenever
+  its sample contained a null, so this case is real, not hypothetical.
+- **Any `timestamptz` / `date` column, any `required` (non-nullable) column,
+  or a numeric column whose values arrive as JSON strings** → not
+  reproducible. The declared-column vocabulary has no timestamp/date type and
+  no way to mark a column `required`, so neither a `columns` mapping nor
+  `schema_inference` can match it. Write to a new table name, or drop and
+  recreate the table.
+
+A run that hits the unreproducible case fails at commit with an Iceberg schema
+error naming the table (visible in the component's status message and the
+gateway sidecar log).
 
 **Local debugging.** `make extractor-local
 CONFIG=cmd/mock-datagateway/example-nyc311.json` builds and runs the real

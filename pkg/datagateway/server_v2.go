@@ -552,7 +552,15 @@ func (s *ServerV2) GetConfig(ctx context.Context, req *pb.GetConfigRequest) (*pb
 		var err error
 		storageBootstrap, err = s.buildStorageBootstrap(ctx)
 		if err != nil {
-			log.Printf("Warning: failed to build storage bootstrap: %v", err)
+			// A not-yet-created output table is the normal case, not a
+			// problem: the table is created on first write once the schema is
+			// known. Logging that as a Warning reads like the cause of a later
+			// failure and sends people chasing it.
+			if isSchemaDeferred(err) {
+				log.Printf("storage bootstrap skipped (expected): output table not created yet — it is created on first write once the schema is known: %v", err)
+			} else {
+				log.Printf("Warning: failed to build storage bootstrap: %v", err)
+			}
 			// Don't fail the whole request - component may not need it
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/backend"
@@ -92,12 +93,27 @@ func (s *ServerV2) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Commi
 				r.Namespace, r.Table, r.WriterID, r.Err)
 		case r.DataFilesAdded == 0 && r.SnapshotIDAfter == "":
 			tcr.Status = pb.TableCommitResult_STATUS_SKIPPED
+			// A skipped table is indistinguishable from a committed one in an
+			// unlogged run, which reads as "data was written" when none was.
+			log.Printf("commit skipped for %s.%s (writer=%s): no data files to commit",
+				r.Namespace, r.Table, r.WriterID)
 		default:
 			tcr.Status = pb.TableCommitResult_STATUS_COMMITTED
 			tcr.FilesAdded = int32(r.DataFilesAdded)
 			if ws, ok := expected[r.WriterID]; ok {
 				tcr.RowsAdded = writerRowsWritten(ws)
 			}
+			// Close the lifecycle that "dispatched inline commit" opens.
+			// Without this, committed / skipped / still-in-flight are
+			// indistinguishable in the gateway log.
+			idem := ""
+			if r.IdempotencyHit {
+				idem = " (idempotency hit — already committed)"
+			}
+			log.Printf("commit ok for %s.%s (writer=%s): files=%d rows=%d snapshot=%s→%s duration=%s%s",
+				r.Namespace, r.Table, r.WriterID, r.DataFilesAdded, tcr.RowsAdded,
+				snapshotOrNone(r.SnapshotIDBefore), snapshotOrNone(r.SnapshotIDAfter),
+				r.Duration.Round(time.Millisecond), idem)
 		}
 		bucketTables[r.Namespace] = append(bucketTables[r.Namespace], tcr)
 	}
@@ -165,6 +181,16 @@ func (s *ServerV2) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Commi
 		resp.Error = sweepErr.Error()
 	}
 	return resp, nil
+}
+
+// snapshotOrNone renders an empty snapshot id as "none" so the
+// before→after transition in the commit log reads unambiguously on a
+// first-ever commit (where "before" is legitimately absent).
+func snapshotOrNone(id string) string {
+	if id == "" {
+		return "none"
+	}
+	return id
 }
 
 // writerProducedFiles reports whether the writer wrote any parquet files.

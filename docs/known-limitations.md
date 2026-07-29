@@ -340,22 +340,29 @@ reliably one JSON kind, or set `schema_inference: strings` so every column
 is a string unconditionally and no value can ever violate a numeric/boolean
 type. See [docs/components.md](components.md#http-json-extractor).
 
-**Tables created before 0.12.0 cannot be written by this component.** Before
-0.12.0 the component emitted untyped JSONL and the **gateway** decided the
-schema, coercing date-like and numeric-looking *strings* into `timestamptz` /
-`long` / `double` and marking most columns `required`. From 0.12.0 the
-component sends an explicit Arrow schema, so no coercion happens: a JSON
-string stays a `string`, integral numbers are always `Int64`, and every
-column is nullable. Any pre-0.12.0 table therefore has a schema the component
-can no longer produce, and the commit fails Iceberg's schema check under both
-`APPEND` and `FULL_LOAD`.
+**Tables created before 0.12.0 may carry a schema this component can no
+longer produce.** Before 0.12.0 the component emitted untyped JSONL and the
+**gateway** decided the schema, coercing date-like and numeric-looking
+*strings* into `timestamptz` / `long` / `double` and marking a column
+`required` whenever its sample contained no nulls
+(`pkg/datagateway/schema/inference.go`). From 0.12.0 the component sends an
+explicit Arrow schema, so no coercion happens: a JSON string stays a
+`string`, integral numbers are always `Int64`, and every column is nullable.
 
-Neither escape hatch closes this gap: `schema_inference: strings` reproduces
-the component's old *wire* output but not the coerced *table* schema, and the
-`outputs.tables[].columns` vocabulary has no timestamp/date type and no way
-to mark a column `required`. **Mitigation: write to a new table name, or drop
-and recreate the table.** The failure surfaces as an Iceberg schema error in
-the component's status message and in the gateway sidecar log.
+Whether a legacy table is still writable depends on what that old inference
+produced. Check with `datuplet storage schema <ns>.<table>`:
+
+- **All columns `string` and nullable** → still writable via
+  `schema_inference: strings`, or by declaring every column as `string`.
+- **Any `timestamptz`/`date` column, any `required` column, or a numeric
+  column fed from JSON strings** → not reproducible. `schema_inference:
+  strings` reproduces the component's old *wire* output but not the coerced
+  *table* schema, and the `outputs.tables[].columns` vocabulary has no
+  timestamp/date type and no way to mark a column `required`. **Mitigation:
+  write to a new table name, or drop and recreate the table.**
+
+The failure surfaces as an Iceberg schema error under both `APPEND` and
+`FULL_LOAD`, in the component's status message and the gateway sidecar log.
 
 ---
 

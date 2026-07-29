@@ -18,6 +18,51 @@ import (
 	"github.com/datuplet/datuplet/pkg/lib/controlfile"
 )
 
+// isSchemaDeferred reports whether a lakekeeper resolve failure is the
+// EXPECTED "table doesn't exist yet and we have no schema for it" case, which
+// is not an error at all: the table is created on first write once the first
+// chunk's schema is known. Matches the message raised by
+// pkg/datagateway/lakekeeper.
+func isSchemaDeferred(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "missing and no schema available")
+}
+
+// maxLoggedSchemaColumns caps how many columns logWriterSchema prints. Wide
+// tables exist (a live GBIF occurrence table has 100 columns); the point of
+// the line is to make a schema mismatch legible, and the leading columns plus
+// an exact total achieve that without emitting a 4 KB log line.
+const maxLoggedSchemaColumns = 30
+
+// logWriterSchema records the schema a writer will actually emit, once per
+// writer. Without this, a commit rejected on an Iceberg schema mismatch left
+// NO record anywhere of what schema was sent — diagnosing one meant reading
+// table metadata straight out of object storage. `source` distinguishes a
+// component-supplied schema from one the gateway inferred from the first chunk.
+func logWriterSchema(ws *writerState, source string) {
+	if ws.schema == nil {
+		return
+	}
+	cols := ws.schema.Columns()
+	shown := cols
+	if len(shown) > maxLoggedSchemaColumns {
+		shown = shown[:maxLoggedSchemaColumns]
+	}
+	parts := make([]string, 0, len(shown))
+	for _, c := range shown {
+		null := ""
+		if c.Nullable {
+			null = "?"
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s%s", c.Name, c.Type, null))
+	}
+	truncated := ""
+	if len(cols) > len(shown) {
+		truncated = fmt.Sprintf(", +%d more", len(cols)-len(shown))
+	}
+	log.Printf("writer schema: writer=%s table=%s.%s source=%s columns=%d [%s%s]",
+		ws.writerID, ws.bucket, ws.table, source, len(cols), strings.Join(parts, ", "), truncated)
+}
+
 func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*pb.OpenWriterResponse, error) {
 	// Determine bucket and table from request
 	bucket := req.Bucket
@@ -88,7 +133,7 @@ func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 		}
 		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, bucket, table, sp)
 		if lkErr != nil {
-			if sp == nil && strings.Contains(lkErr.Error(), "missing and no schema available") {
+			if sp == nil && isSchemaDeferred(lkErr) {
 				// Schema-deferred: nothing to do at OpenWriter time;
 				// processWriteChunk re-runs LoadOrCreate once the first
 				// chunk's inferred schema is in hand.
@@ -207,7 +252,12 @@ func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 		partitionFieldDefs: partFieldDefs,
 		tableExists:        tableExists,
 	}
+	ws := s.writers[writerID]
 	s.mu.Unlock()
+
+	// A component-supplied schema is known now; an inferred one is logged by
+	// processParsedRecord once the first chunk resolves it.
+	logWriterSchema(ws, "component")
 
 	// Build HTTP endpoint URL
 	httpEndpoint := s.getHTTPEndpoint(fmt.Sprintf("/data/write/%s", writerID))
