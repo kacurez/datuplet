@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	sdk "github.com/datuplet/datuplet/sdk/go"
 )
@@ -57,12 +59,19 @@ func TestPlanFromBatch(t *testing.T) {
 // --- appended in Task 3 ---
 
 type fakeWriter struct {
-	payloads [][]byte
-	closed   bool
-	rows     int64
+	payloads    [][]byte
+	closed      bool
+	rows        int64
+	closeCount  int
+	failWriteOn int // fail on the Nth Write call (0 = never fail)
+	writeCount  int
 }
 
 func (f *fakeWriter) Write(_ context.Context, data []byte) error {
+	f.writeCount++
+	if f.failWriteOn > 0 && f.writeCount == f.failWriteOn {
+		return errors.New("write failed")
+	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	f.payloads = append(f.payloads, cp)
@@ -70,16 +79,19 @@ func (f *fakeWriter) Write(_ context.Context, data []byte) error {
 }
 func (f *fakeWriter) Close(context.Context) (*sdk.CloseResult, error) {
 	f.closed = true
+	f.closeCount++
 	return &sdk.CloseResult{TotalRows: f.rows}, nil
 }
 func (f *fakeWriter) Bucket() string { return "raw" }
 func (f *fakeWriter) Table() string  { return "t" }
 
 // ipcRows parses one payload as a complete standalone IPC stream and returns
-// (rows, columnNames). Fails the test if the payload is not self-contained.
-func ipcRows(t *testing.T, payload []byte) (int64, []string) {
+// (rows, columnNames, fields). Fails the test if the payload is not self-contained
+// or if trailing bytes exist after the stream.
+func ipcRows(t *testing.T, payload []byte) (int64, []string, []arrow.Field) {
 	t.Helper()
-	rd, err := ipc.NewReader(bytes.NewReader(payload))
+	br := bytes.NewReader(payload)
+	rd, err := ipc.NewReader(br)
 	if err != nil {
 		t.Fatalf("payload is not a valid IPC stream: %v", err)
 	}
@@ -92,10 +104,19 @@ func ipcRows(t *testing.T, payload []byte) (int64, []string) {
 		t.Fatalf("ipc read: %v", rd.Err())
 	}
 	names := make([]string, 0)
-	for _, f := range rd.Schema().Fields() {
+	fields := rd.Schema().Fields()
+	for _, f := range fields {
 		names = append(names, f.Name)
 	}
-	return rows, names
+	// Verify no trailing bytes after the stream
+	remaining, err := br.ReadByte()
+	if err == nil {
+		t.Fatalf("trailing byte after IPC stream: %d", remaining)
+	}
+	if err.Error() != "EOF" {
+		t.Fatalf("reading after IPC stream: %v", err)
+	}
+	return rows, names, fields
 }
 
 func TestStringSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
@@ -120,10 +141,20 @@ func TestStringSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
 	}
 	var total int64
 	for _, p := range fw.payloads {
-		n, names := ipcRows(t, p) // each independently parseable = no-concat invariant
+		n, names, fields := ipcRows(t, p) // each independently parseable = no-concat invariant
 		total += n
 		if len(names) != 1 || names[0] != "id" {
 			t.Fatalf("schema = %v", names)
+		}
+		// Verify all fields are String and Nullable
+		if len(fields) != 1 {
+			t.Fatalf("expected 1 field, got %d", len(fields))
+		}
+		if fields[0].Type.ID() != arrow.STRING {
+			t.Fatalf("field type = %v, want String", fields[0].Type)
+		}
+		if !fields[0].Nullable {
+			t.Fatalf("field should be Nullable")
 		}
 	}
 	if total != 10 {
@@ -153,10 +184,19 @@ func TestStringSink_NoColumnsDerivesPlanFromFirstBatch(t *testing.T) {
 	if err != nil || rows != 4 {
 		t.Fatalf("rows=%d err=%v", rows, err)
 	}
-	_, names := ipcRows(t, fw.payloads[0])
+	_, names, fields := ipcRows(t, fw.payloads[0])
 	want := []string{"a", "b", "c"}
 	if len(names) != 3 || names[0] != want[0] || names[1] != want[1] || names[2] != want[2] {
 		t.Fatalf("schema = %v, want %v (sorted union of first batch)", names, want)
+	}
+	// Verify all fields are String and Nullable
+	for i, f := range fields {
+		if f.Type.ID() != arrow.STRING {
+			t.Fatalf("field %d (%s) type = %v, want String", i, f.Name, f.Type)
+		}
+		if !f.Nullable {
+			t.Fatalf("field %d (%s) should be Nullable", i, f.Name)
+		}
 	}
 }
 
@@ -186,5 +226,138 @@ func TestStringSink_OpenFailureIsWriteError(t *testing.T) {
 	var we *WriteError
 	if !errors.As(err, &we) {
 		t.Fatalf("want WriteError, got %v", err)
+	}
+}
+
+func TestStringSink_FinishIsIdempotent(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
+		WithBatchRows(4))
+	if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
+		t.Fatal(err)
+	}
+	rows1, cr1, err1 := sink.Finish()
+	rows2, cr2, err2 := sink.Finish()
+	if err1 != nil || err2 != nil {
+		t.Fatalf("Finish errors: %v, %v", err1, err2)
+	}
+	if rows1 != 1 || rows2 != 1 {
+		t.Fatalf("rows mismatch: %d vs %d", rows1, rows2)
+	}
+	if cr1 != cr2 {
+		t.Fatalf("closeResult mismatch")
+	}
+	if fw.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (not double-closed)", fw.closeCount)
+	}
+}
+
+func TestStringSink_AddAfterFinishErrors(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
+		WithBatchRows(4))
+	if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := sink.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Add after Finish should error, not panic
+	err = sink.Add(map[string]any{"id": json.Number("2")})
+	if err == nil {
+		t.Fatal("Add after Finish should error")
+	}
+	if err.Error() != "arrow: StringSink.Add called after Finish" {
+		t.Fatalf("wrong error: %v", err)
+	}
+}
+
+func TestStringSink_WriteFailureIsStickyAndDropsNoRowsSilently(t *testing.T) {
+	fw := &fakeWriter{failWriteOn: 2} // fail on second Write
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
+		WithBatchRows(2))
+	// Add 5 records: 2 flush (success), 2 flush (fail), 1 pending
+	var failureErr error
+	for i := 0; i < 5; i++ {
+		err := sink.Add(map[string]any{"id": json.Number(fmt.Sprintf("%d", i))})
+		if i < 3 && err != nil {
+			t.Fatalf("Add %d should succeed, got: %v", i, err)
+		}
+		if i == 3 { // second flush fails
+			if err == nil {
+				t.Fatalf("Add 3 (second flush) should fail")
+			}
+			var we *WriteError
+			if !errors.As(err, &we) {
+				t.Fatalf("Add 3 (second flush) want WriteError, got %v", err)
+			}
+			failureErr = err
+		}
+		if i == 4 { // after failure, Add should return the sticky error
+			if err != failureErr {
+				t.Fatalf("Add 4 should return same sticky error, got different error: %v vs %v", err, failureErr)
+			}
+		}
+	}
+	// The sticky error is now set; Finish should return it without further writes
+	_, _, err := sink.Finish()
+	if err != failureErr {
+		t.Fatalf("Finish should return sticky error, got: %v", err)
+	}
+	// Verify: 1 successful write, then the failure; no further writes
+	if len(fw.payloads) != 1 {
+		t.Fatalf("payloads = %d, want 1 (second batch never sent after write failed)", len(fw.payloads))
+	}
+	if fw.closeCount != 0 {
+		t.Fatalf("closeCount = %d, want 0 (writer never successfully closed after failure)", fw.closeCount)
+	}
+}
+
+func TestStringSink_CellValuesAndNullability(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"a", "b"}, func(rec map[string]any, i int) any {
+			if i == 0 {
+				return rec["a"]
+			}
+			return rec["b"]
+		}),
+		WithBatchRows(2))
+	// Add records with a missing key to verify null handling
+	recs := []map[string]any{
+		{"a": json.Number("1"), "b": "x"},
+		{"a": "y"}, // b is missing => null
+	}
+	for _, r := range recs {
+		if err := sink.Add(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, err := sink.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fw.payloads) != 1 {
+		t.Fatalf("payloads = %d, want 1", len(fw.payloads))
+	}
+	n, names, fields := ipcRows(t, fw.payloads[0])
+	if n != 2 {
+		t.Fatalf("rows = %d, want 2", n)
+	}
+	if len(names) != 2 || names[0] != "a" || names[1] != "b" {
+		t.Fatalf("schema = %v, want [a b]", names)
+	}
+	// Verify field types and nullability
+	for i, f := range fields {
+		if f.Type.ID() != arrow.STRING {
+			t.Fatalf("field %d type = %v, want String", i, f.Type)
+		}
+		if !f.Nullable {
+			t.Fatalf("field %d should be Nullable", i)
+		}
 	}
 }

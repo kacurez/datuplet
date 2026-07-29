@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -105,16 +106,19 @@ func (e *WriteError) Unwrap() error { return e.Err }
 // The writer is opened lazily on the first flush: zero records = no writer,
 // letting callers preserve their commit-empty path.
 type StringSink struct {
-	ctx       context.Context
-	open      func() (ChunkWriter, error)
-	writer    ChunkWriter
-	plan      *columnPlan
-	pending   []map[string]any // buffered records while plan is unknown
-	alloc     memory.Allocator
-	builder   *array.RecordBuilder
-	batchRows int
-	inBatch   int
-	rows      int64
+	ctx         context.Context
+	open        func() (ChunkWriter, error)
+	writer      ChunkWriter
+	plan        *columnPlan
+	pending     []map[string]any // buffered records while plan is unknown
+	alloc       memory.Allocator
+	builder     *array.RecordBuilder
+	batchRows   int
+	inBatch     int
+	rows        int64
+	finished    bool
+	failed      error
+	closeResult *sdk.CloseResult
 }
 
 // SinkOption configures a StringSink at construction.
@@ -162,8 +166,33 @@ func (s *StringSink) adoptPlan(p *columnPlan) {
 	s.builder = array.NewRecordBuilder(s.alloc, arrow.NewSchema(fieldsArr, nil))
 }
 
+// releaseBuilder idempotently releases the builder (nil-safe).
+func (s *StringSink) releaseBuilder() {
+	if s.builder != nil {
+		s.builder.Release()
+		s.builder = nil
+	}
+}
+
+// fail marks the sink as failed (sticky), releases the builder, and returns err.
+// Once failed, the sink remains failed and any subsequent Add or Finish will
+// return the same error.
+func (s *StringSink) fail(err error) error {
+	if s.failed == nil {
+		s.failed = err
+	}
+	s.releaseBuilder()
+	return err
+}
+
 // Add appends one record, flushing a batch when full.
 func (s *StringSink) Add(rec map[string]any) error {
+	if s.failed != nil {
+		return s.failed
+	}
+	if s.finished {
+		return errors.New("arrow: StringSink.Add called after Finish")
+	}
 	if s.plan == nil {
 		s.pending = append(s.pending, rec)
 		if len(s.pending) < s.batchRows {
@@ -203,6 +232,15 @@ func (s *StringSink) flush() error {
 	if s.inBatch == 0 {
 		return nil
 	}
+	// Open the writer before NewRecord() so that an open failure leaves the
+	// batch intact in the builder.
+	if s.writer == nil {
+		wr, err := s.open()
+		if err != nil {
+			return s.fail(&WriteError{Err: fmt.Errorf("failed to open writer: %w", err)})
+		}
+		s.writer = wr
+	}
 	rec := s.builder.NewRecord() // builds + resets internal builders
 	defer rec.Release()
 
@@ -210,21 +248,14 @@ func (s *StringSink) flush() error {
 	w := ipc.NewWriter(&buf, ipc.WithSchema(rec.Schema()), ipc.WithAllocator(s.alloc))
 	if err := w.Write(rec); err != nil {
 		w.Close() //nolint:errcheck
-		return &WriteError{Err: fmt.Errorf("ipc write record: %w", err)}
+		return s.fail(&WriteError{Err: fmt.Errorf("ipc write record: %w", err)})
 	}
 	if err := w.Close(); err != nil {
-		return &WriteError{Err: fmt.Errorf("ipc close writer: %w", err)}
+		return s.fail(&WriteError{Err: fmt.Errorf("ipc close writer: %w", err)})
 	}
 
-	if s.writer == nil {
-		wr, err := s.open()
-		if err != nil {
-			return &WriteError{Err: fmt.Errorf("failed to open writer: %w", err)}
-		}
-		s.writer = wr
-	}
 	if err := s.writer.Write(s.ctx, buf.Bytes()); err != nil {
-		return &WriteError{Err: fmt.Errorf("failed to write IPC batch: %w", err)}
+		return s.fail(&WriteError{Err: fmt.Errorf("failed to write IPC batch: %w", err)})
 	}
 	s.inBatch = 0
 	return nil
@@ -232,8 +263,17 @@ func (s *StringSink) flush() error {
 
 // Finish flushes the partial batch (deriving the plan first if it is still
 // pending) and closes the writer when one was opened. Zero records: no
-// writer was opened and (0, nil, nil) is returned.
+// writer was opened and (0, nil, nil) is returned. Idempotent: the second
+// call returns the same result without double-closing.
 func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
+	if s.failed != nil {
+		return s.rows, nil, s.failed
+	}
+	if s.finished {
+		return s.rows, s.closeResult, nil
+	}
+	defer s.releaseBuilder()
+
 	if s.plan == nil && len(s.pending) > 0 {
 		s.adoptPlan(planFromBatch(s.pending))
 		for _, p := range s.pending {
@@ -244,17 +284,15 @@ func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
 	if err := s.flush(); err != nil {
 		return s.rows, nil, err
 	}
-	if s.builder != nil {
-		s.builder.Release()
-		s.builder = nil
-	}
+	s.finished = true
 	if s.writer == nil {
 		return 0, nil, nil
 	}
 	cr, err := s.writer.Close(s.ctx)
 	if err != nil {
-		return s.rows, nil, &WriteError{Err: fmt.Errorf("failed to close writer: %w", err)}
+		return s.rows, nil, s.fail(&WriteError{Err: fmt.Errorf("failed to close writer: %w", err)})
 	}
+	s.closeResult = cr
 	return s.rows, cr, nil
 }
 
