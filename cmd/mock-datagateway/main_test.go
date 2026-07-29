@@ -170,6 +170,12 @@ func newTestGateway() *mockGateway {
 func intField(name string) arrow.Field {
 	return arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Int64, Nullable: true}
 }
+
+// int32Field builds the Arrow type a DECLARED `int` column emits (Iceberg's
+// 32-bit int). Inference never produces this — only WithTypedColumns does.
+func int32Field(name string) arrow.Field {
+	return arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+}
 func floatField(name string) arrow.Field {
 	return arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Float64, Nullable: true}
 }
@@ -190,6 +196,8 @@ func buildSchemaOnlyStream(t *testing.T, fields []arrow.Field) []byte {
 	defer b.Release()
 	for i, f := range fields {
 		switch f.Type.ID() {
+		case arrow.INT32:
+			b.Field(i).(*array.Int32Builder).Append(0)
 		case arrow.INT64:
 			b.Field(i).(*array.Int64Builder).Append(0)
 		case arrow.FLOAT64:
@@ -245,7 +253,7 @@ func newTestGatewayWithMapping(table string, mapping []*pb.ColumnConfig) *mockGa
 // rig silently (the mapping was served via GetConfig but never checked at
 // ingest time).
 func TestIngest_DeclaredColumnsMapping(t *testing.T) {
-	declared := mappingCols([2]string{"id", "int"}, [2]string{"userId", "int"}, [2]string{"title", "string"})
+	declared := mappingCols([2]string{"id", "long"}, [2]string{"userId", "long"}, [2]string{"title", "string"})
 
 	tests := []struct {
 		name    string
@@ -264,7 +272,7 @@ func TestIngest_DeclaredColumnsMapping(t *testing.T) {
 		{
 			name:    "wrong type",
 			fields:  []arrow.Field{intField("id"), floatField("userId"), strField("title")},
-			wantErr: `column "userId" is float64, want int64 (declared type "int")`,
+			wantErr: `column "userId" is float64, want int64 (declared type "long")`,
 		},
 		{
 			name:    "wrong order",
@@ -304,6 +312,45 @@ func TestIngest_DeclaredColumnsMapping(t *testing.T) {
 	}
 }
 
+// TestIngest_DeclaredIntIs32Bit proves the mock holds `int` and `long` to
+// DIFFERENT Arrow widths, so the local rig catches a component that emits the
+// wrong one. Before int/long were split these were interchangeable, meaning a
+// component emitting int64 for a declared `int` column would have passed here
+// and only failed on the real cluster at commit time.
+func TestIngest_DeclaredIntIs32Bit(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared string
+		emitted  arrow.Field
+		wantErr  string
+	}{
+		{"declared int, emits int32", "int", int32Field("id"), ""},
+		{"declared long, emits int64", "long", intField("id"), ""},
+		{"declared int but emits int64 is rejected", "int", intField("id"),
+			`column "id" is int64, want int32 (declared type "int")`},
+		{"declared long but emits int32 is rejected", "long", int32Field("id"),
+			`column "id" is int32, want int64 (declared type "long")`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newTestGatewayWithMapping("posts", mappingCols([2]string{"id", tc.declared}))
+			_, err := g.ingest("w1", buildSchemaOnlyStream(t, []arrow.Field{tc.emitted}))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ingest() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ingest() = nil error, want a width mismatch for declared %q", tc.declared)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ingest() error = %q, want substring %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestIngest_DeclaredColumnsMapping_OverridesExpectCols proves the stated
 // precedence: when BOTH a declared output_columns mapping and a `fields`
 // projection (g.expectCols) apply to the same table, the mapping governs
@@ -311,7 +358,7 @@ func TestIngest_DeclaredColumnsMapping(t *testing.T) {
 // different columns than the mapping — if expectCols were still checked,
 // this would fail; it must not.
 func TestIngest_DeclaredColumnsMapping_OverridesExpectCols(t *testing.T) {
-	g := newTestGatewayWithMapping("posts", mappingCols([2]string{"id", "int"}, [2]string{"userId", "int"}, [2]string{"title", "string"}))
+	g := newTestGatewayWithMapping("posts", mappingCols([2]string{"id", "long"}, [2]string{"userId", "long"}, [2]string{"title", "string"}))
 	g.expectCols = []string{"totally", "different", "names"}
 
 	data := buildSchemaOnlyStream(t, []arrow.Field{intField("id"), intField("userId"), strField("title")})
@@ -382,7 +429,7 @@ func TestIngest_Validation(t *testing.T) {
 			payload: func(t *testing.T) []byte {
 				return buildOutOfVocabStream(t)
 			},
-			wantErr: "want one of utf8/int64/float64/bool",
+			wantErr: "want one of utf8/int32/int64/float64/bool",
 		},
 		{
 			name: "non-nullable utf8 column rejected",

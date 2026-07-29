@@ -39,7 +39,7 @@ func fieldByName(fields []arrow.Field, name string) (arrow.Field, bool) {
 }
 
 // decodeInferredPayload parses one IPC payload against an ARBITRARY mix of
-// Int64/Float64/Boolean/String columns — InferringSink's typed output can mix
+// Int32/Int64/Float64/Boolean/String columns — InferringSink's typed output can mix
 // column types within a single schema, unlike typed_sink_test.go's fixed
 // 4-column decodeTypedPayload or sink_test.go's all-String ipcCells — and
 // returns one map per row keyed by column name, plus the schema's fields. A
@@ -68,6 +68,8 @@ func decodeInferredPayload(t *testing.T, payload []byte) (rows []map[string]any,
 					continue
 				}
 				switch arr := col.(type) {
+				case *array.Int32:
+					row[f.Name] = arr.Value(r)
 				case *array.Int64:
 					row[f.Name] = arr.Value(r)
 				case *array.Float64:
@@ -544,7 +546,7 @@ func TestArrowTypeFor_VocabularyTableDriven(t *testing.T) {
 		wantID  arrow.Type
 		wantErr bool
 	}{
-		{"int", arrow.INT64, false},
+		{"int", arrow.INT32, false}, // 32-bit, matching Iceberg's `int`
 		{"long", arrow.INT64, false},
 		{"float", arrow.FLOAT64, false},
 		{"double", arrow.FLOAT64, false},
@@ -658,13 +660,15 @@ func TestInferringSink_DeclaredMissingKeyIsNull(t *testing.T) {
 	}
 }
 
-// TestInferringSink_DeclaredIntFromJSONNumberExact proves declared "int"
+// TestInferringSink_DeclaredLongFromJSONNumberExact proves declared "long"
 // resolves json.Number via its exact text (ParseInt), matching inference
-// mode's own numeric-fidelity guarantee.
-func TestInferringSink_DeclaredIntFromJSONNumberExact(t *testing.T) {
+// mode's own numeric-fidelity guarantee. The value deliberately exceeds
+// int32, which is why it declares "long" rather than "int" — see
+// TestInferringSink_DeclaredIntIs32Bit for the narrow case.
+func TestInferringSink_DeclaredLongFromJSONNumberExact(t *testing.T) {
 	fw := &fakeWriter{}
 	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithTypedColumns([]TypedColumn{{Name: "n", Type: "int"}}), WithBatchRows(1))
+		WithTypedColumns([]TypedColumn{{Name: "n", Type: "long"}}), WithBatchRows(1))
 	if err := sink.Add(map[string]any{"n": json.Number("5938028332")}); err != nil {
 		t.Fatal(err)
 	}
@@ -677,6 +681,66 @@ func TestInferringSink_DeclaredIntFromJSONNumberExact(t *testing.T) {
 	}
 	if rows[0]["n"] != int64(5938028332) {
 		t.Fatalf("value = %v, want 5938028332 exactly", rows[0]["n"])
+	}
+}
+
+// TestInferringSink_DeclaredIntIs32Bit proves a declared "int" column really
+// is 32-bit on the wire (Iceberg's `int`), not silently widened to Int64, and
+// that values across the int32 boundary round-trip exactly.
+func TestInferringSink_DeclaredIntIs32Bit(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithTypedColumns([]TypedColumn{{Name: "n", Type: "int"}}), WithBatchRows(3))
+	for _, v := range []string{"0", "2147483647", "-2147483648"} { // MaxInt32, MinInt32
+		if err := sink.Add(map[string]any{"n": json.Number(v)}); err != nil {
+			t.Fatalf("Add(%s): %v", v, err)
+		}
+	}
+	if _, _, err := sink.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	rows, fields := decodeInferredPayload(t, fw.payloads[0])
+	if fields[0].Type.ID() != arrow.INT32 {
+		t.Fatalf("type = %v, want Int32 — declared `int` must not widen to Int64", fields[0].Type)
+	}
+	for i, want := range []int32{0, 2147483647, -2147483648} {
+		if rows[i]["n"] != want {
+			t.Errorf("row%d n = %v (%T), want %d", i, rows[i]["n"], rows[i]["n"], want)
+		}
+	}
+}
+
+// TestInferringSink_DeclaredIntOverflowIsTypeViolation proves a value beyond
+// int32 in a declared "int" column FAILS rather than wrapping or truncating.
+// Narrowing is only defensible because this is loud: silent truncation would
+// corrupt every downstream aggregate, which is the whole reason inference
+// still refuses to choose Int32 on its own.
+func TestInferringSink_DeclaredIntOverflowIsTypeViolation(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"just above MaxInt32", "2147483648"},
+		{"just below MinInt32", "-2147483649"},
+		{"far beyond", "5938028332"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fw := &fakeWriter{}
+			sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
+				WithTypedColumns([]TypedColumn{{Name: "n", Type: "int"}}), WithBatchRows(4))
+			err := sink.Add(map[string]any{"n": json.Number(tc.value)})
+			if err == nil {
+				t.Fatalf("Add(%s) into a declared int column: got nil, want a type violation", tc.value)
+			}
+			var tv *TypeViolationError
+			if !errors.As(err, &tv) {
+				t.Fatalf("want *TypeViolationError, got %T: %v", err, err)
+			}
+			if tv.Column != "n" {
+				t.Errorf("Column = %q, want %q", tv.Column, "n")
+			}
+			var we *WriteError
+			if errors.As(err, &we) {
+				t.Error("an out-of-range declared value is a user error, never a *WriteError")
+			}
+		})
 	}
 }
 
@@ -829,8 +893,8 @@ func TestInferringSink_DeclaredBatchBoundariesAndSelfContainedStreams(t *testing
 	for _, p := range fw.payloads {
 		n, names, fields := ipcRows(t, p)
 		total += n
-		if len(names) != 1 || names[0] != "id" || fields[0].Type.ID() != arrow.INT64 {
-			t.Fatalf("schema = %v", names)
+		if len(names) != 1 || names[0] != "id" || fields[0].Type.ID() != arrow.INT32 {
+			t.Fatalf("schema = %v type = %v, want [id] as Int32 (declared `int`)", names, fields[0].Type)
 		}
 	}
 	if total != 10 {

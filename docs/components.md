@@ -235,6 +235,14 @@ no sampling, no inference for that table. `fields` still composes with a
 declared mapping: `fields` selects/renames from the source record first, and
 the mapping then types the resulting (already-renamed) columns by name.
 
+Note `int` is **32-bit** (Iceberg's `int`) and `long` is 64-bit — declare
+`long` for anything that may exceed ±2³¹, such as an epoch-millis timestamp
+or a large surrogate key. A value that doesn't fit a declared `int` fails the
+run as a user error rather than being truncated. Inference, by contrast,
+always chooses Int64 for integers: it cannot know from the first batch that a
+later value will still fit 32 bits, so narrowing there would turn a
+late large value into a failed run.
+
 **Schema:** with a declared `outputs.tables[].columns` mapping, the output
 columns are exactly the mapped names, in mapped order and type — regardless
 of `fields`/`schema_inference`. Otherwise, with `fields` set, the output

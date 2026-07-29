@@ -155,7 +155,7 @@ func (g *mockGateway) Log(ctx context.Context, req *pb.LogRequest) (*pb.LogRespo
 }
 
 // mockArrowTypeFor mirrors sdk/go/arrow.ArrowTypeFor's canonical
-// config-type-string -> Arrow-type vocabulary (int/long -> Int64,
+// config-type-string -> Arrow-type vocabulary (int -> Int32, long -> Int64,
 // float/double -> Float64, boolean -> Boolean, string -> String), so
 // validateAgainstMapping can check a declared output_columns mapping's
 // types against what a real writer actually emits. Duplicated rather than
@@ -165,7 +165,9 @@ func (g *mockGateway) Log(ctx context.Context, req *pb.LogRequest) (*pb.LogRespo
 // separate Go modules). An unrecognized string returns (nil, false).
 func mockArrowTypeFor(t string) (arrow.DataType, bool) {
 	switch t {
-	case "int", "long":
+	case "int":
+		return arrow.PrimitiveTypes.Int32, true
+	case "long":
 		return arrow.PrimitiveTypes.Int64, true
 	case "float", "double":
 		return arrow.PrimitiveTypes.Float64, true
@@ -226,9 +228,11 @@ func validateAgainstMapping(sch *arrow.Schema, mapping []*pb.ColumnConfig) error
 }
 
 // validateSchema enforces the extractor's output contract on every payload:
-// every column must be one of the sink type vocabulary's four Arrow types
-// (utf8, int64, float64, bool — dgarrow.ArrowTypeFor's canonical mapping;
-// StringSink emits utf8 only, InferringSink emits any mix of the four) and
+// every column must be one of the sink type vocabulary's Arrow types
+// (utf8, int32, int64, float64, bool — dgarrow.ArrowTypeFor's canonical
+// mapping, where int32 only ever comes from a DECLARED `int` column since
+// inference never narrows; StringSink emits utf8 only, InferringSink emits
+// any mix) and
 // Nullable:true always (both extractor sinks guarantee every field
 // nullable, typed or not). A violation fails the write (HTTP 500 / gRPC
 // error), so the local proof cannot silently pass with wrong output.
@@ -255,10 +259,10 @@ func validateAgainstMapping(sch *arrow.Schema, mapping []*pb.ColumnConfig) error
 func (g *mockGateway) validateSchema(sch *arrow.Schema, table string) error {
 	for _, f := range sch.Fields() {
 		switch f.Type.ID() {
-		case arrow.STRING, arrow.INT64, arrow.FLOAT64, arrow.BOOL:
+		case arrow.STRING, arrow.INT32, arrow.INT64, arrow.FLOAT64, arrow.BOOL:
 			// allowed — the full sink type vocabulary.
 		default:
-			return fmt.Errorf("schema violation: column %q is %s, want one of utf8/int64/float64/bool (the sink type vocabulary)", f.Name, f.Type)
+			return fmt.Errorf("schema violation: column %q is %s, want one of utf8/int32/int64/float64/bool (the sink type vocabulary)", f.Name, f.Type)
 		}
 		if !f.Nullable {
 			return fmt.Errorf("schema violation: column %q is not nullable, want Nullable:true (every sink column is nullable)", f.Name)
@@ -478,7 +482,7 @@ func main() {
 	} else {
 		log.Printf("mock-dg: no fields projection in config — column set not enforced by name")
 	}
-	log.Printf("mock-dg: accepting sink type vocabulary (utf8/int64/float64/bool, all Nullable:true)")
+	log.Printf("mock-dg: accepting sink type vocabulary (utf8/int32/int64/float64/bool, all Nullable:true)")
 
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {

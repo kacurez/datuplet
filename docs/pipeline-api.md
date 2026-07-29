@@ -87,9 +87,22 @@ outputs:
 `columns` is `[]{name, type}` (`pkg/pipeline/config.ColumnSpec`, carried
 through the CRD and the Data Gateway's `ComponentConfig.OutputConfig` to the
 SDK as `sdk.OutputTableRef.Columns`); `type` is one of `int`, `long`,
-`float`, `double`, `boolean`, `string` — the same vocabulary
-`sdk/go/arrow.ArrowTypeFor` resolves to Int64/Float64/Boolean/String
-(all nullable). When set, the producing component writes **exactly these
+`float`, `double`, `boolean`, `string` — the vocabulary
+`sdk/go/arrow.ArrowTypeFor` resolves as follows (all nullable):
+
+| declared | Arrow / Iceberg | notes |
+|---|---|---|
+| `int` | Int32 | 32-bit. A value beyond ±2³¹ fails the run as a user error (never truncated) |
+| `long` | Int64 | 64-bit — use this when values may exceed int32 |
+| `float`, `double` | Float64 | |
+| `boolean` | Boolean | |
+| `string` | String (utf8) | keeps the value's exact source text |
+
+Narrowing to 32-bit is only offered for a **declared** `int` because the
+declaration is your assertion about the range; type *inference* never chooses
+Int32, since it cannot know from a sample that a later value will still fit.
+
+When set, the producing component writes **exactly these
 columns, with these types, for this table, and infers nothing** — a source
 field not in the list is silently excluded, and a mapped column missing
 from a given record is written as null. When omitted (the default), the
