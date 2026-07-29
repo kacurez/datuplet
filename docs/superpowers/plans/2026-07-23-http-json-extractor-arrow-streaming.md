@@ -785,6 +785,23 @@ git commit -m "feat(sdk/go/arrow): stringify + inferred column plan for all-Stri
 
 - [ ] **Step 1: Write the failing tests (append to sink_test.go)**
 
+> **Revised 2026-07-29 (Codex Task-3 review, fix round 1 — commit `b35367d`).**
+> The four tests below are the required minimum but are NOT sufficient: the
+> review found three Important robustness defects in this task's original code
+> (all now corrected in the Step 3 code above — sticky `failed`, `finished`
+> state, `releaseBuilder`/`fail`, and opening the writer before `NewRecord`).
+> Four more tests plus a strengthened `ipcRows` are therefore also required:
+> `TestStringSink_FinishIsIdempotent` (second `Finish` must not double-`Close`),
+> `TestStringSink_AddAfterFinishErrors` (must error, not panic),
+> `TestStringSink_WriteFailureIsStickyAndDropsNoRowsSilently` (a failed flush
+> must not later emit a short batch, and the error must stay sticky across a
+> subsequent `Add`/`Finish`), and `TestStringSink_CellValuesAndNullability`.
+> `ipcRows` must additionally assert each field is `arrow.BinaryTypes.String`
+> with `Nullable == true`, verify cell values (including a null for a missing
+> key), and assert the reader reaches EOF with no trailing bytes after the
+> single stream. See `sdk/go/arrow/sink_test.go` at `b35367d` for the landed
+> versions.
+
 First extend the test file's import block with: `"bytes"`, `"context"`, `"errors"`, `"github.com/apache/arrow-go/v18/arrow/ipc"`, and `sdk "github.com/datuplet/datuplet/sdk/go"`. Then append:
 
 ```go
@@ -931,7 +948,7 @@ Expected: FAIL — `undefined: NewStringSink`.
 
 - [ ] **Step 3: Implement the sink (append to sink.go) + tidy**
 
-Add to sink.go's import block: `"context"`, `"fmt"`, `"github.com/apache/arrow-go/v18/arrow"`, `"github.com/apache/arrow-go/v18/arrow/array"`, `"github.com/apache/arrow-go/v18/arrow/ipc"`, `"github.com/apache/arrow-go/v18/arrow/memory"`, `"bytes"`, `sdk "github.com/datuplet/datuplet/sdk/go"`. (reader.go already imports most of these — imports are per-file, declare them again.)
+Add to sink.go's import block: `"context"`, `"errors"`, `"fmt"`, `"github.com/apache/arrow-go/v18/arrow"`, `"github.com/apache/arrow-go/v18/arrow/array"`, `"github.com/apache/arrow-go/v18/arrow/ipc"`, `"github.com/apache/arrow-go/v18/arrow/memory"`, `"bytes"`, `sdk "github.com/datuplet/datuplet/sdk/go"`. (reader.go already imports most of these — imports are per-file, declare them again.)
 
 ```go
 // DefaultBatchRows is the per-batch row count a StringSink accumulates
@@ -968,17 +985,23 @@ func (e *WriteError) Unwrap() error { return e.Err }
 //
 // The writer is opened lazily on the first flush: zero records = no writer,
 // letting callers preserve their commit-empty path.
+// Failure is sticky (see fail): once a flush fails, the batch it consumed is
+// unrecoverable, so every later Add/Finish returns that same error rather than
+// emitting a short batch. Finish is idempotent.
 type StringSink struct {
-	ctx       context.Context
-	open      func() (ChunkWriter, error)
-	writer    ChunkWriter
-	plan      *columnPlan
-	pending   []map[string]any // buffered records while plan is unknown
-	alloc     memory.Allocator
-	builder   *array.RecordBuilder
-	batchRows int
-	inBatch   int
-	rows      int64
+	ctx         context.Context
+	open        func() (ChunkWriter, error)
+	writer      ChunkWriter
+	plan        *columnPlan
+	pending     []map[string]any // buffered records while plan is unknown
+	alloc       memory.Allocator
+	builder     *array.RecordBuilder
+	batchRows   int
+	inBatch     int
+	rows        int64
+	finished    bool
+	failed      error
+	closeResult *sdk.CloseResult
 }
 
 // SinkOption configures a StringSink at construction.
@@ -1026,8 +1049,33 @@ func (s *StringSink) adoptPlan(p *columnPlan) {
 	s.builder = array.NewRecordBuilder(s.alloc, arrow.NewSchema(fieldsArr, nil))
 }
 
+// releaseBuilder idempotently releases the builder (nil-safe).
+func (s *StringSink) releaseBuilder() {
+	if s.builder != nil {
+		s.builder.Release()
+		s.builder = nil
+	}
+}
+
+// fail marks the sink as failed (sticky), releases the builder, and returns err.
+// Once failed, the sink remains failed and any subsequent Add or Finish will
+// return the same error.
+func (s *StringSink) fail(err error) error {
+	if s.failed == nil {
+		s.failed = err
+	}
+	s.releaseBuilder()
+	return err
+}
+
 // Add appends one record, flushing a batch when full.
 func (s *StringSink) Add(rec map[string]any) error {
+	if s.failed != nil {
+		return s.failed
+	}
+	if s.finished {
+		return errors.New("arrow: StringSink.Add called after Finish")
+	}
 	if s.plan == nil {
 		s.pending = append(s.pending, rec)
 		if len(s.pending) < s.batchRows {
@@ -1067,6 +1115,15 @@ func (s *StringSink) flush() error {
 	if s.inBatch == 0 {
 		return nil
 	}
+	// Open the writer before NewRecord() so that an open failure leaves the
+	// batch intact in the builder.
+	if s.writer == nil {
+		wr, err := s.open()
+		if err != nil {
+			return s.fail(&WriteError{Err: fmt.Errorf("failed to open writer: %w", err)})
+		}
+		s.writer = wr
+	}
 	rec := s.builder.NewRecord() // builds + resets internal builders
 	defer rec.Release()
 
@@ -1074,21 +1131,14 @@ func (s *StringSink) flush() error {
 	w := ipc.NewWriter(&buf, ipc.WithSchema(rec.Schema()), ipc.WithAllocator(s.alloc))
 	if err := w.Write(rec); err != nil {
 		w.Close() //nolint:errcheck
-		return &WriteError{Err: fmt.Errorf("ipc write record: %w", err)}
+		return s.fail(&WriteError{Err: fmt.Errorf("ipc write record: %w", err)})
 	}
 	if err := w.Close(); err != nil {
-		return &WriteError{Err: fmt.Errorf("ipc close writer: %w", err)}
+		return s.fail(&WriteError{Err: fmt.Errorf("ipc close writer: %w", err)})
 	}
 
-	if s.writer == nil {
-		wr, err := s.open()
-		if err != nil {
-			return &WriteError{Err: fmt.Errorf("failed to open writer: %w", err)}
-		}
-		s.writer = wr
-	}
 	if err := s.writer.Write(s.ctx, buf.Bytes()); err != nil {
-		return &WriteError{Err: fmt.Errorf("failed to write IPC batch: %w", err)}
+		return s.fail(&WriteError{Err: fmt.Errorf("failed to write IPC batch: %w", err)})
 	}
 	s.inBatch = 0
 	return nil
@@ -1096,8 +1146,17 @@ func (s *StringSink) flush() error {
 
 // Finish flushes the partial batch (deriving the plan first if it is still
 // pending) and closes the writer when one was opened. Zero records: no
-// writer was opened and (0, nil, nil) is returned.
+// writer was opened and (0, nil, nil) is returned. Idempotent: the second
+// call returns the same result without double-closing.
 func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
+	if s.failed != nil {
+		return s.rows, nil, s.failed
+	}
+	if s.finished {
+		return s.rows, s.closeResult, nil
+	}
+	defer s.releaseBuilder()
+
 	if s.plan == nil && len(s.pending) > 0 {
 		s.adoptPlan(planFromBatch(s.pending))
 		for _, p := range s.pending {
@@ -1108,17 +1167,15 @@ func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
 	if err := s.flush(); err != nil {
 		return s.rows, nil, err
 	}
-	if s.builder != nil {
-		s.builder.Release()
-		s.builder = nil
-	}
+	s.finished = true
 	if s.writer == nil {
 		return 0, nil, nil
 	}
 	cr, err := s.writer.Close(s.ctx)
 	if err != nil {
-		return s.rows, nil, &WriteError{Err: fmt.Errorf("failed to close writer: %w", err)}
+		return s.rows, nil, s.fail(&WriteError{Err: fmt.Errorf("failed to close writer: %w", err)})
 	}
+	s.closeResult = cr
 	return s.rows, cr, nil
 }
 
