@@ -4,9 +4,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,8 +17,8 @@ import (
 	"strconv"
 	"strings"
 
-	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	sdk "github.com/datuplet/datuplet/sdk/go"
+	dgarrow "github.com/datuplet/datuplet/sdk/go/arrow"
 )
 
 // PaginationConfig defines how to paginate through API results.
@@ -135,6 +135,10 @@ func main() {
 	// Paginated mode - stream data incrementally, page by page.
 	if compCfg.Pagination != nil && compCfg.Pagination.Type != "" {
 		if err := runPaginatedExtraction(ctx, client, &compCfg, outputTable); err != nil {
+			var we *dgarrow.WriteError
+			if errors.As(err, &we) {
+				sdk.ExitAppError(fmt.Sprintf("paginated extraction failed: %v", err))
+			}
 			sdk.ExitUserError(fmt.Sprintf("paginated extraction failed: %v", err))
 		}
 		return
@@ -142,13 +146,29 @@ func main() {
 
 	// Single-request mode.
 	client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
-	records, err := fetchJSON(ctx, compCfg.URL, compCfg.ArrayPath, compCfg.Headers)
+
+	sink := newExtractorSink(ctx, client, outputTable, compCfg.Fields)
+
+	body, err := fetchStream(ctx, compCfg.URL, compCfg.Headers)
 	if err != nil {
 		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
 	}
-	client.Log(ctx, "INFO", fmt.Sprintf("Fetched %d records", len(records)))
+	n, err := decodeRecords(body, compCfg.ArrayPath, sink.Add)
+	body.Close()
+	if err != nil {
+		var we *dgarrow.WriteError
+		if errors.As(err, &we) {
+			sdk.ExitAppError(err.Error())
+		}
+		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
+	}
+	client.Log(ctx, "INFO", fmt.Sprintf("Fetched %d records", n))
 
-	if len(records) == 0 {
+	rows, closeResult, err := sink.Finish()
+	if err != nil {
+		sdk.ExitAppError(err.Error())
+	}
+	if rows == 0 {
 		client.Log(ctx, "WARN", "No records found")
 		if _, err := client.Commit(ctx); err != nil {
 			sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
@@ -156,21 +176,7 @@ func main() {
 		sdk.StatusMessage("extracted 0 records (empty response)")
 		return
 	}
-
-	records = projectRecords(records, compCfg.Fields)
-
-	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
-	if err != nil {
-		sdk.ExitAppError(fmt.Sprintf("failed to open writer: %v", err))
-	}
-	if err := writeJSONL(ctx, writer, records); err != nil {
-		sdk.ExitAppError(fmt.Sprintf("failed to write JSONL: %v", err))
-	}
-	closeResult, err := writer.Close(ctx)
-	if err != nil {
-		sdk.ExitAppError(fmt.Sprintf("failed to close writer: %v", err))
-	}
-	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
+	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
 
 	if err := commitAndStatus(ctx, client, compCfg.URL); err != nil {
 		sdk.ExitAppError(err.Error())
@@ -203,11 +209,9 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		}
 	}
 
-	// Open writer for output (uses defaultBucket from config)
-	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
-	if err != nil {
-		return fmt.Errorf("failed to open writer: %w", err)
-	}
+	// One sink across all pages: the schema is fixed after the first batch
+	// and every batch ships as its own IPC stream/POST.
+	sink := newExtractorSink(ctx, client, outputTable, cfg.Fields)
 
 	client.Log(ctx, "INFO", fmt.Sprintf("Starting paginated extraction from: %s (type=%s, param=%s, page_size=%d)",
 		cfg.URL, pagination.Type, pagination.Param, pagination.PageSize))
@@ -230,39 +234,43 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 
 		client.Log(ctx, "INFO", fmt.Sprintf("Fetching page %d: %s", pageCount+1, pageURL))
 
-		// Fetch page
-		records, err := fetchJSON(ctx, pageURL, cfg.ArrayPath, cfg.Headers)
+		// Fetch + stream-decode the page, feeding the sink. Every decoded
+		// object counts toward pageObjects (for empty/partial-page detection)
+		// but only records under the max_records cap are written.
+		body, err := fetchStream(ctx, pageURL, cfg.Headers)
 		if err != nil {
 			return fmt.Errorf("failed to fetch page %d: %w", pageCount+1, err)
 		}
+		truncated := false
+		pageObjects, err := decodeRecords(body, cfg.ArrayPath, func(rec map[string]any) error {
+			if pagination.MaxRecords > 0 && totalRecords >= pagination.MaxRecords {
+				truncated = true
+				return nil // keep counting the page; stop writing
+			}
+			if err := sink.Add(rec); err != nil {
+				return err
+			}
+			totalRecords++
+			return nil
+		})
+		body.Close()
+		if err != nil {
+			return fmt.Errorf("failed to fetch page %d: %w", pageCount+1, err)
+		}
+		if truncated {
+			client.Log(ctx, "INFO", fmt.Sprintf("Truncating to max records limit: %d", pagination.MaxRecords))
+		}
 
 		// Check if we should stop
-		if len(records) == 0 {
+		if pageObjects == 0 {
 			if pagination.StopWhenEmpty {
 				client.Log(ctx, "INFO", "Received empty page, stopping pagination")
 				break
 			}
 		}
 
-		// Check max records limit
-		recordsToWrite := records
-		if pagination.MaxRecords > 0 && totalRecords+len(records) > pagination.MaxRecords {
-			remaining := pagination.MaxRecords - totalRecords
-			recordsToWrite = records[:remaining]
-			client.Log(ctx, "INFO", fmt.Sprintf("Truncating to max records limit: %d", pagination.MaxRecords))
-		}
-
-		// Write records to output
-		if len(recordsToWrite) > 0 {
-			if err := writeJSONL(ctx, writer, projectRecords(recordsToWrite, cfg.Fields)); err != nil {
-				return fmt.Errorf("failed to write: %w", err)
-			}
-		}
-
-		totalRecords += len(recordsToWrite)
 		pageCount++
-
-		client.Log(ctx, "INFO", fmt.Sprintf("Page %d: fetched %d records (total: %d)", pageCount, len(records), totalRecords))
+		client.Log(ctx, "INFO", fmt.Sprintf("Page %d: fetched %d records (total: %d)", pageCount, pageObjects, totalRecords))
 
 		// Check if we've hit max records
 		if pagination.MaxRecords > 0 && totalRecords >= pagination.MaxRecords {
@@ -271,7 +279,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		}
 
 		// Stop if this page had fewer records than page_size (likely last page)
-		if pagination.PageSize > 0 && len(records) < pagination.PageSize {
+		if pagination.PageSize > 0 && pageObjects < pagination.PageSize {
 			client.Log(ctx, "INFO", "Received partial page, stopping pagination")
 			break
 		}
@@ -280,15 +288,17 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		currentValue += increment
 	}
 
-	// Close writer
-	closeResult, err := writer.Close(ctx)
+	// Flush + close (no-op writer when zero records; commit still runs).
+	rows, closeResult, err := sink.Finish()
 	if err != nil {
-		return fmt.Errorf("failed to close writer: %w", err)
+		return err // already a *dgarrow.WriteError → main exits FailedApplication
 	}
-	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
+	if rows > 0 {
+		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
+	}
 
 	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {
-		return err
+		return &dgarrow.WriteError{Err: err}
 	}
 	client.Log(ctx, "INFO", fmt.Sprintf("Paginated extraction completed: %d pages, %d total records", pageCount, totalRecords))
 	return nil
@@ -427,36 +437,6 @@ func resolveOutputTable(tableName, arrayPath string) string {
 	default:
 		return "data"
 	}
-}
-
-// encodeJSONL serializes records as newline-delimited JSON (one object per
-// line). Concatenation-safe: appending two encodeJSONL outputs is still valid
-// JSONL, so coalesced gateway batches parse correctly. HTML escaping is off so
-// values like URLs with & are preserved verbatim.
-func encodeJSONL(records []map[string]any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	for _, rec := range records {
-		if err := enc.Encode(rec); err != nil { // Encode appends a trailing '\n'
-			return nil, fmt.Errorf("marshal record: %w", err)
-		}
-	}
-	return buf.Bytes(), nil
-}
-
-// writeJSONL writes records to the gateway as one JSONL blob. Each Write()
-// payload contains only whole, newline-terminated records (the SDK never
-// splits a payload mid-record), keeping per-POST JSONL parsing safe.
-func writeJSONL(ctx context.Context, w *sdk.Writer, records []map[string]any) error {
-	if len(records) == 0 {
-		return nil
-	}
-	data, err := encodeJSONL(records)
-	if err != nil {
-		return err
-	}
-	return w.Write(ctx, data)
 }
 
 // getColumns extracts sorted column names from records, flattening nested objects.
@@ -654,23 +634,4 @@ func getValueRaw(record map[string]any, path string) any {
 	}
 
 	return current
-}
-
-// projectRecords reshapes each record into a flat object containing only the
-// mapped fields (renamed). An unresolved path (missing key, or an intermediate
-// segment that is a scalar/array/null) yields nil for that field. With no
-// fields, records are returned unchanged.
-func projectRecords(records []map[string]any, fields []FieldMapping) []map[string]any {
-	if len(fields) == 0 {
-		return records
-	}
-	out := make([]map[string]any, len(records))
-	for i, rec := range records {
-		projected := make(map[string]any, len(fields))
-		for _, f := range fields {
-			projected[f.Name] = getValueRaw(rec, f.Path)
-		}
-		out[i] = projected
-	}
-	return out
 }
