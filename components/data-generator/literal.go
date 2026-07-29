@@ -34,6 +34,24 @@ func runLiteral(ctx context.Context, client *sdk.Client, t *Table) (int, error) 
 		return 0, fmt.Errorf("table %q: failed to open writer: %w", t.Name, err)
 	}
 
+	// Best-effort close on every early return below. sdk.Writer has no
+	// double-close guard (no `closed` field on the struct in
+	// sdk/go/client.go — every Close call re-issues the CloseWriter RPC),
+	// and the gateway's CloseWriter handler is not safe to call twice for
+	// the same writer either: it unconditionally re-runs
+	// bufferMgr.Close()/partitionRouter.Close() on every call, and that
+	// code's own comment says a second buffer/router Close "is not
+	// guaranteed idempotent" (pkg/datagateway/server_v2_writing.go). So the
+	// `closed` guard here is load-bearing, not defensive boilerplate: it
+	// stops this defer from re-closing after the success path's explicit
+	// Close below already did.
+	closed := false
+	defer func() {
+		if !closed {
+			_, _ = writer.Close(ctx)
+		}
+	}()
+
 	var buf bytes.Buffer
 	rowsWritten := 0
 
@@ -65,8 +83,8 @@ func runLiteral(ctx context.Context, client *sdk.Client, t *Table) (int, error) 
 		}
 	}
 
-	// See runRandom for rationale: writer.Stats() before Close so the
-	// batching state is visible in pod logs regardless of Close outcome.
+	// Capture writer stats BEFORE Close so batching state (batch threshold,
+	// underlying POST count) is visible in pod logs even if Close fails.
 	stats := writer.Stats()
 	client.Log(ctx, "INFO", fmt.Sprintf( //nolint:errcheck
 		"table %q: writer stats rows=%d writes=%d posts=%d batch_threshold=%d bytes_in=%d bytes_shipped=%d",
@@ -74,7 +92,9 @@ func runLiteral(ctx context.Context, client *sdk.Client, t *Table) (int, error) 
 		stats.BatchThreshold, stats.BytesAccepted, stats.BytesShipped,
 	))
 
-	if _, err := writer.Close(ctx); err != nil {
+	_, err = writer.Close(ctx)
+	closed = true // set before checking err: the RPC was already sent either way
+	if err != nil {
 		return rowsWritten, fmt.Errorf("table %q: failed to close writer: %w", t.Name, err)
 	}
 

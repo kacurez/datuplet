@@ -6,6 +6,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.6.0
 	github.com/datuplet/datuplet v0.0.0
 	github.com/datuplet/datuplet/sdk/go v0.0.0
+	github.com/datuplet/datuplet/sdk/go/arrow v0.0.0
 	github.com/google/uuid v1.6.0
 )
 
@@ -26,5 +27,7 @@ require (
 )
 
 replace github.com/datuplet/datuplet/sdk/go => ../../sdk/go
+
+replace github.com/datuplet/datuplet/sdk/go/arrow => ../../sdk/go/arrow
 
 replace github.com/datuplet/datuplet => ../..
