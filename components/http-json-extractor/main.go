@@ -75,6 +75,20 @@ func ParseAndValidate(cfg *Config) error {
 	return nil
 }
 
+// unknownKeysWarning formats the "late field dropped" WARN log for both
+// runExtraction and runPaginatedExtraction. keys is the (possibly capped)
+// distinct name list and dropped is the exact affected-record count from
+// sink.UnknownKeys(). The cap disclosure is only appended when the name list
+// is actually at dgarrow.MaxTrackedUnknownKeys — otherwise it's already
+// complete and an unconditional caveat would just be noise.
+func unknownKeysWarning(dropped int64, keys []string) string {
+	msg := fmt.Sprintf("output schema was fixed from the first %d records; %d later record(s) carried field(s) missing from that schema and those values were NOT written: %v", dgarrow.DefaultBatchRows, dropped, keys)
+	if len(keys) == dgarrow.MaxTrackedUnknownKeys {
+		msg += fmt.Sprintf(" (name list capped at %d distinct names; more may be affected)", dgarrow.MaxTrackedUnknownKeys)
+	}
+	return msg
+}
+
 // commitAndStatus commits all outputs, logs per-table results, and emits the
 // status message. Iterates result.Buckets (no [0] indexing).
 func commitAndStatus(ctx context.Context, client *sdk.Client, sourceURL string) error {
@@ -180,7 +194,7 @@ func main() {
 	}
 	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
 	if keys, dropped := sink.UnknownKeys(); dropped > 0 {
-		client.Log(ctx, "WARN", fmt.Sprintf("output schema was fixed from the first %d records; %d later record(s) carried field(s) missing from that schema and those values were NOT written: %v", dgarrow.DefaultBatchRows, dropped, keys))
+		client.Log(ctx, "WARN", unknownKeysWarning(dropped, keys))
 	}
 
 	if err := commitAndStatus(ctx, client, compCfg.URL); err != nil {
@@ -313,7 +327,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s: 0 rows", outputTable))
 	}
 	if keys, dropped := sink.UnknownKeys(); dropped > 0 {
-		client.Log(ctx, "WARN", fmt.Sprintf("output schema was fixed from the first %d records; %d later record(s) carried field(s) missing from that schema and those values were NOT written: %v", dgarrow.DefaultBatchRows, dropped, keys))
+		client.Log(ctx, "WARN", unknownKeysWarning(dropped, keys))
 	}
 
 	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {

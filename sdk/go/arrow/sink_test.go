@@ -560,7 +560,41 @@ func TestStringSink_UnknownKeysCapHoldsRecordCountExact(t *testing.T) {
 	if n != extra {
 		t.Fatalf("unknown records = %d, want %d (exact, uncapped)", n, extra)
 	}
-	if len(keys) != maxTrackedUnknownKeys {
-		t.Fatalf("tracked unknown keys = %d, want capped at %d", len(keys), maxTrackedUnknownKeys)
+	if len(keys) != MaxTrackedUnknownKeys {
+		t.Fatalf("tracked unknown keys = %d, want capped at %d", len(keys), MaxTrackedUnknownKeys)
+	}
+}
+
+// TestStringSink_UnknownKeysUnderCapNotAtCap guards the boolean signal that
+// callers (e.g. http-json-extractor's WARN log) use to decide whether the
+// name list UnknownKeys returns is complete or was truncated: "at cap" is
+// exactly len(keys) == MaxTrackedUnknownKeys. Below the cap, that must be
+// false, or an accurate caller-side disclosure would misfire on a run that
+// never actually hit the limit.
+func TestStringSink_UnknownKeysUnderCapNotAtCap(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(1))
+	if err := sink.Add(map[string]any{"a": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	const extra = 10 // well under MaxTrackedUnknownKeys
+	for i := 0; i < extra; i++ {
+		key := fmt.Sprintf("unknown_%03d", i)
+		if err := sink.Add(map[string]any{"a": "x", key: "y"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := sink.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	keys, n := sink.UnknownKeys()
+	if n != extra {
+		t.Fatalf("unknown records = %d, want %d (exact, uncapped)", n, extra)
+	}
+	if len(keys) != extra {
+		t.Fatalf("tracked unknown keys = %d, want %d (below the cap)", len(keys), extra)
+	}
+	if len(keys) == MaxTrackedUnknownKeys {
+		t.Fatalf("under-cap key count unexpectedly equals MaxTrackedUnknownKeys; the at-cap disclosure signal would misfire")
 	}
 }

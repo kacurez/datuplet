@@ -128,14 +128,16 @@ type StringSink struct {
 	closeResult *sdk.CloseResult
 
 	inferredNames  map[string]struct{} // non-nil only when the plan was inferred (planFromBatch)
-	unknownKeys    map[string]struct{} // distinct unknown key names, capped at maxTrackedUnknownKeys
+	unknownKeys    map[string]struct{} // distinct unknown key names, capped at MaxTrackedUnknownKeys
 	unknownRecords int64               // records carrying >=1 unknown key (exact, never capped)
 }
 
-// maxTrackedUnknownKeys bounds memory for StringSink.unknownKeys: a
+// MaxTrackedUnknownKeys bounds memory for StringSink.unknownKeys: a
 // pathological feed with many distinct unexpected keys cannot grow the
 // tracked-name set without bound. unknownRecords stays exact regardless.
-const maxTrackedUnknownKeys = 64
+// Exported so callers of UnknownKeys can tell whether the returned name list
+// is the complete set or was truncated at the cap (len(keys) == MaxTrackedUnknownKeys).
+const MaxTrackedUnknownKeys = 64
 
 // SinkOption configures a StringSink at construction.
 type SinkOption func(*StringSink)
@@ -272,7 +274,7 @@ func (s *StringSink) trackUnknownKeys(rec map[string]any) {
 		if _, seen := s.unknownKeys[k]; seen {
 			continue
 		}
-		if len(s.unknownKeys) >= maxTrackedUnknownKeys {
+		if len(s.unknownKeys) >= MaxTrackedUnknownKeys {
 			continue
 		}
 		if s.unknownKeys == nil {
@@ -286,7 +288,7 @@ func (s *StringSink) trackUnknownKeys(rec map[string]any) {
 }
 
 // UnknownKeys returns the distinct key names (sorted, capped at
-// maxTrackedUnknownKeys) seen outside an INFERRED schema, plus the exact
+// MaxTrackedUnknownKeys) seen outside an INFERRED schema, plus the exact
 // count of records that carried at least one such key. Always (nil, 0) for
 // an explicit WithColumns plan: there the caller chose the projection
 // deliberately, so extra keys are not a data-loss defect.

@@ -16,7 +16,7 @@ container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
 Image registry: `ghcr.io/kacurez/<name>:<components.tag>` — the tag tracks the
-chart's `components.tag` (the release version; `v0.11.0` in this release).
+chart's `components.tag` (the release version; `v0.12.0` in this release).
 
 ---
 
@@ -172,7 +172,7 @@ seeded from SHA-256 of the pair).
 Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports
 single-request and paginated modes.
 
-**Image:** `ghcr.io/kacurez/http-json-extractor:v0.11.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/http-json-extractor:v0.12.0` · **Registry name:**
 `http-json-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/http-json-extractor/schema.json`](../components/http-json-extractor/schema.json)

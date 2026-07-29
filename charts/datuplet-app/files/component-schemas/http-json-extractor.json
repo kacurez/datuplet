@@ -35,7 +35,7 @@
     },
     "fields": {
       "type": "array",
-      "description": "Optional projection: select and rename fields (including nested ones via dot-path). When omitted, all fields are emitted.",
+      "description": "Optional projection: select and rename fields (including nested ones via dot-path). When omitted, columns are inferred from the first 8192 records; a field first appearing later is not written. Set fields explicitly to guarantee a column is captured.",
       "x-datuplet-advanced": true,
       "items": {
         "type": "object",
