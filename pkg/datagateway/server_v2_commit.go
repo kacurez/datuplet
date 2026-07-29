@@ -84,6 +84,12 @@ func (s *ServerV2) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Commi
 			tcr.Status = pb.TableCommitResult_STATUS_FAILED
 			tcr.Error = r.Err.Error()
 			allSuccess = false
+			// Log gateway-side as well as returning it. The RPC response
+			// is the component's only copy, and a component that drops it
+			// (or dies before printing it) would otherwise leave no trace
+			// of WHY the commit failed anywhere in the pod's logs.
+			log.Printf("ERROR: commit failed for %s.%s (writer=%s): %v",
+				r.Namespace, r.Table, r.WriterID, r.Err)
 		case r.DataFilesAdded == 0 && r.SnapshotIDAfter == "":
 			tcr.Status = pb.TableCommitResult_STATUS_SKIPPED
 		default:
@@ -150,10 +156,15 @@ func (s *ServerV2) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Commi
 		buckets = append(buckets, &pb.BucketCommitResult{Bucket: bucket, Status: st, Tables: tables})
 	}
 
+	// Surface sweepErr to the caller as well as logging it. It sets
+	// allSuccess=false, so without it in the response the component sees a
+	// failed commit carrying no per-table error to explain it.
+	resp := &pb.CommitResponse{Success: allSuccess, Buckets: buckets}
 	if sweepErr != nil {
 		log.Printf("ERROR: commit sweep error: %v", sweepErr)
+		resp.Error = sweepErr.Error()
 	}
-	return &pb.CommitResponse{Success: allSuccess, Buckets: buckets}, nil
+	return resp, nil
 }
 
 // writerProducedFiles reports whether the writer wrote any parquet files.

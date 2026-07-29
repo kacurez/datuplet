@@ -155,8 +155,19 @@ func run(ctx context.Context) error {
 	}
 
 	// Commit (DG runs the inline iceberg transaction; files.json is a breadcrumb only).
-	if _, err := client.Commit(ctx); err != nil {
+	// result.Success must be checked: a per-table commit failure (e.g. an
+	// iceberg schema conflict) comes back as a successful RPC carrying
+	// Success=false, so discarding the result would report this component as
+	// having completed while its outputs were never committed.
+	result, err := client.Commit(ctx)
+	if err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+	if !result.Success {
+		if detail := result.FailureDetail(); detail != "" {
+			return fmt.Errorf("commit returned failure: %s", detail)
+		}
+		return fmt.Errorf("commit returned failure (gateway reported no error detail; check the gateway sidecar log)")
 	}
 
 	sdk.StatusMessage(fmt.Sprintf("sql-transform completed (%d inputs, %d outputs)",

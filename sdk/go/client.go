@@ -987,6 +987,40 @@ type TableResult struct {
 	Error      string
 }
 
+// FailureDetail renders every error the gateway reported for a failed commit
+// into one actionable line, so a component never has to say just "commit
+// returned failure" and leave the operator with nothing to act on.
+//
+// Why this walks all three levels: today the gateway populates ONLY the
+// per-table error (TableCommitResult.Error) — the top-level and per-bucket
+// Error fields exist in the wire type but are left empty for per-table commit
+// failures, so reading r.Error alone yields "" and the real reason (an iceberg
+// schema conflict, a 409, a credential error) is lost. Checking all three
+// keeps this honest if the gateway starts populating the outer fields.
+//
+// Returns "" only when nothing failed and nothing was reported; callers should
+// treat an empty string as "no detail available" rather than "no failure".
+func (r *CommitResult) FailureDetail() string {
+	if r == nil {
+		return ""
+	}
+	var parts []string
+	if r.Error != "" {
+		parts = append(parts, r.Error)
+	}
+	for _, b := range r.Buckets {
+		if b.Error != "" {
+			parts = append(parts, fmt.Sprintf("bucket %s: %s", b.Bucket, b.Error))
+		}
+		for _, t := range b.Tables {
+			if t.Error != "" {
+				parts = append(parts, fmt.Sprintf("%s.%s: %s", t.Bucket, t.Table, t.Error))
+			}
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
 // CommitOption configures a commit operation.
 type CommitOption func(*commitOptions)
 

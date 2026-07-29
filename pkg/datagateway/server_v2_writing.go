@@ -41,7 +41,22 @@ func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 		}
 	}
 	if bucket == "" {
-		return nil, fmt.Errorf("bucket is required (either in request, via output_tables config for table '%s', or via defaultBucket config)", table)
+		// Distinguish the two ways to land here. The common one by far is a
+		// component writing a table name that isn't declared in
+		// outputs.tables — typically because the pipeline's component
+		// config and its outputs.tables list drifted apart. Naming the
+		// declared tables turns a confusing "bucket is required" into an
+		// obvious diff.
+		if len(s.config.OutputTables) > 0 {
+			declared := make([]string, 0, len(s.config.OutputTables))
+			for _, t := range s.config.OutputTables {
+				declared = append(declared, t.Name)
+			}
+			return nil, fmt.Errorf("table '%s' is not declared in outputs.tables (declared: %s) and no defaultBucket is configured; "+
+				"either add '%s' to outputs.tables, set outputs.defaultBucket, or make the component write one of the declared tables",
+				table, strings.Join(declared, ", "), table)
+		}
+		return nil, fmt.Errorf("cannot determine a bucket for table '%s': no bucket in the request, no outputs.tables entries, and no outputs.defaultBucket configured", table)
 	}
 
 	// Resolve the per-table write target. Two paths only:

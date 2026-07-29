@@ -107,7 +107,10 @@ func main() {
 		sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
 	}
 	if !result.Success {
-		sdk.ExitAppError(fmt.Sprintf("commit returned failure: %s", result.Error))
+		if detail := result.FailureDetail(); detail != "" {
+			sdk.ExitAppError(fmt.Sprintf("commit returned failure: %s", detail))
+		}
+		sdk.ExitAppError("commit returned failure (gateway reported no error detail; check the gateway sidecar log)")
 	}
 
 	// Log per-table stats and build status message.

@@ -137,7 +137,10 @@ func main() {
 		sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
 	}
 	if !result.Success {
-		sdk.ExitAppError("commit returned failure")
+		if detail := result.FailureDetail(); detail != "" {
+			sdk.ExitAppError(fmt.Sprintf("commit returned failure: %s", detail))
+		}
+		sdk.ExitAppError("commit returned failure (gateway reported no error detail; check the gateway sidecar log)")
 	}
 
 	sdk.StatusMessage(fmt.Sprintf("extracted %d records (mode=%s, table=%s)", len(records), compCfg.Mode, tableName))

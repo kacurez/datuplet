@@ -111,7 +111,10 @@ func commitAndStatus(ctx context.Context, client *sdk.Client, sourceURL string) 
 		return fmt.Errorf("commit failed: %w", err)
 	}
 	if !result.Success {
-		return fmt.Errorf("commit returned failure")
+		if detail := result.FailureDetail(); detail != "" {
+			return fmt.Errorf("commit returned failure: %s", detail)
+		}
+		return fmt.Errorf("commit returned failure (gateway reported no error detail; check the gateway sidecar log)")
 	}
 	var rows int64
 	for _, b := range result.Buckets {
