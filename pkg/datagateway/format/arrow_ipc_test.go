@@ -1,14 +1,42 @@
 package format
 
 import (
+	"bytes"
+	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
+
+// serializeIPCStream writes one or more record batches into a SINGLE Arrow
+// IPC stream (one schema message, N record-batch messages, one EOS) — the
+// legitimate multi-batch case, as opposed to concatenating the output of
+// multiple Serialize() calls (which produces N independent streams back to
+// back and is the defect this file's guard tests exercise).
+func serializeIPCStream(t *testing.T, allocator memory.Allocator, records ...arrow.Record) []byte {
+	t.Helper()
+	if len(records) == 0 {
+		t.Fatal("serializeIPCStream: need at least one record")
+	}
+
+	var buf bytes.Buffer
+	writer := ipc.NewWriter(&buf, ipc.WithSchema(records[0].Schema()), ipc.WithAllocator(allocator))
+	for _, rec := range records {
+		if err := writer.Write(rec); err != nil {
+			t.Fatalf("ipc writer.Write() error: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("ipc writer.Close() error: %v", err)
+	}
+	return buf.Bytes()
+}
 
 func TestArrowIPCAdapterFormat(t *testing.T) {
 	adapter := NewArrowIPCAdapter(nil)
@@ -330,5 +358,162 @@ func TestArrowIPCAdapterWithDifferentTypes(t *testing.T) {
 	}
 	if parsed.Column(3).(*array.Boolean).Value(0) != true {
 		t.Error("bool_col value incorrect")
+	}
+}
+
+// wantTrailingByteError asserts err is non-nil and mentions the trailing-byte
+// guard specifically, so a test failure can't be masked by some unrelated
+// error (e.g. a schema-conversion bug) that also happens to be non-nil.
+func wantTrailingByteError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "trailing byte") {
+		t.Errorf("error = %q, want it to mention trailing bytes", err.Error())
+	}
+}
+
+// TestArrowIPCAdapterParseSingleStreamNoGuardFalsePositive is a regression
+// guard against the trailing-bytes check misfiring on ordinary, valid
+// single-stream input — every Arrow write today is exactly one stream (see
+// sdk/go/client.go forcing batchThreshold=0 for FORMAT_ARROW_IPC), so a
+// false positive here would break every Arrow producer.
+func TestArrowIPCAdapterParseSingleStreamNoGuardFalsePositive(t *testing.T) {
+	allocator := memory.NewGoAllocator()
+	adapter := NewArrowIPCAdapter(allocator)
+
+	rec := makeTestRecord(allocator)
+	defer rec.Release()
+
+	stream := serializeIPCStream(t, allocator, rec)
+
+	// Parse (in-memory *bytes.Reader path).
+	parsed, _, err := adapter.Parse(stream, nil)
+	if err != nil {
+		t.Fatalf("Parse() on a single valid IPC stream should succeed: %v", err)
+	}
+	defer parsed.Release()
+	if parsed.NumRows() != rec.NumRows() {
+		t.Errorf("NumRows() = %d, want %d", parsed.NumRows(), rec.NumRows())
+	}
+
+	// ParseReader over a non-seekable reader (the streaming/HTTP-body path).
+	parsed2, _, err := adapter.ParseReader(iotest.OneByteReader(bytes.NewReader(stream)), nil)
+	if err != nil {
+		t.Fatalf("ParseReader() on a single valid IPC stream (non-seekable) should succeed: %v", err)
+	}
+	defer parsed2.Release()
+	if parsed2.NumRows() != rec.NumRows() {
+		t.Errorf("NumRows() = %d, want %d", parsed2.NumRows(), rec.NumRows())
+	}
+}
+
+// TestArrowIPCAdapterParsesMultiBatchSingleStream proves the guard doesn't
+// confuse a single stream carrying multiple record batches (legitimate) with
+// concatenated streams (rejected below). Both Read this many bytes past the
+// first record batch's end, but only one of them is a second EOS-terminated
+// stream.
+func TestArrowIPCAdapterParsesMultiBatchSingleStream(t *testing.T) {
+	allocator := memory.NewGoAllocator()
+	adapter := NewArrowIPCAdapter(allocator)
+
+	rec1 := makeTestRecord(allocator)
+	defer rec1.Release()
+	rec2 := makeTestRecord(allocator)
+	defer rec2.Release()
+
+	stream := serializeIPCStream(t, allocator, rec1, rec2)
+
+	parsed, _, err := adapter.Parse(stream, nil)
+	if err != nil {
+		t.Fatalf("Parse() should accept a single stream with multiple record batches: %v", err)
+	}
+	defer parsed.Release()
+
+	wantRows := rec1.NumRows() + rec2.NumRows()
+	if parsed.NumRows() != wantRows {
+		t.Errorf("NumRows() = %d, want %d", parsed.NumRows(), wantRows)
+	}
+}
+
+// TestArrowIPCAdapterRejectsConcatenatedStreams covers the core defect: a
+// payload that is a valid IPC stream followed by a second, independent IPC
+// stream. Without the guard, parseFromReader silently stops at the first
+// stream's EOS and reports only its row count — this must instead be a hard
+// error, via both entry points (Parse and the streaming ParseReader).
+func TestArrowIPCAdapterRejectsConcatenatedStreams(t *testing.T) {
+	allocator := memory.NewGoAllocator()
+	adapter := NewArrowIPCAdapter(allocator)
+
+	rec := makeTestRecord(allocator)
+	defer rec.Release()
+
+	stream := serializeIPCStream(t, allocator, rec)
+	payload := append(append([]byte{}, stream...), stream...)
+
+	t.Run("Parse", func(t *testing.T) {
+		_, _, err := adapter.Parse(payload, nil)
+		wantTrailingByteError(t, err)
+	})
+
+	t.Run("ParseReader", func(t *testing.T) {
+		_, _, err := adapter.ParseReader(bytes.NewReader(payload), nil)
+		wantTrailingByteError(t, err)
+	})
+}
+
+// TestArrowIPCAdapterRejectsTrailingGarbage covers a valid stream followed by
+// bytes that aren't a second IPC stream at all (e.g. a caller bug that
+// appends unrelated data after the write).
+func TestArrowIPCAdapterRejectsTrailingGarbage(t *testing.T) {
+	allocator := memory.NewGoAllocator()
+	adapter := NewArrowIPCAdapter(allocator)
+
+	rec := makeTestRecord(allocator)
+	defer rec.Release()
+
+	stream := serializeIPCStream(t, allocator, rec)
+	payload := append(append([]byte{}, stream...), []byte("garbage-not-arrow-ipc")...)
+
+	_, _, err := adapter.Parse(payload, nil)
+	wantTrailingByteError(t, err)
+}
+
+// TestArrowIPCAdapterRejectsConcatenatedStreamsOnNonSeekableReader is the
+// correctness-critical case: parseFromReader is called on two paths, and the
+// real gateway path (ParseReader, fed the HTTP request body) is a streaming,
+// non-seekable io.Reader — not a *bytes.Reader. If arrow-go's ipc.Reader
+// buffered ahead past the stream's EOS marker internally, a post-EOS read on
+// the same reader variable would find nothing (already drained) and the
+// guard would silently never fire.
+//
+// iotest.OneByteReader wraps the payload in a type that exposes nothing but
+// Read (no io.ByteReader/io.ReaderAt/io.Seeker to shortcut through, and it is
+// not a *bytes.Reader) and forces exactly one byte per underlying Read call,
+// which defeats any buffering shortcut a naive implementation might rely on.
+func TestArrowIPCAdapterRejectsConcatenatedStreamsOnNonSeekableReader(t *testing.T) {
+	allocator := memory.NewGoAllocator()
+	adapter := NewArrowIPCAdapter(allocator)
+
+	rec := makeTestRecord(allocator)
+	defer rec.Release()
+
+	stream := serializeIPCStream(t, allocator, rec)
+
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{"stream||stream", append(append([]byte{}, stream...), stream...)},
+		{"stream||garbage", append(append([]byte{}, stream...), []byte("garbage-not-arrow-ipc")...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := iotest.OneByteReader(bytes.NewReader(tt.payload))
+			_, _, err := adapter.ParseReader(r, nil)
+			wantTrailingByteError(t, err)
+		})
 	}
 }

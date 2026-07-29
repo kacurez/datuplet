@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,24 +10,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/google/uuid"
 )
-
-// arrowBatchRows is the per-batch row count we accumulate in the
-// array.RecordBuilder before flushing as a self-contained Arrow IPC
-// stream to the SDK writer. Tuning:
-//
-//   - Too small (< 1k): more HTTP POSTs / more schema-repeats per
-//     IPC stream / less amortisation of pqarrow row-group costs.
-//   - Too large (> 128k): per-batch RecordBuilder memory peaks; the
-//     final NewRecord -> IPC.Write pair holds the whole batch live in
-//     two places briefly.
-//   - 8192 is the empirical sweet spot for the 5M-row products
-//     workload: ~610 batches, each ~80-200 KB on the wire, sub-MB
-//     RecordBuilder peak per batch.
-const arrowBatchRows = 8192
 
 // arrowFieldFor returns the Arrow Field for a given column declared in
 // the data-generator's user schema. Mapping:
@@ -173,31 +156,6 @@ func appendGeneratedValue(rb *array.RecordBuilder, colIdx int, colType string, r
 		// JSONL path's `nil` fallback).
 		b.AppendNull()
 	}
-}
-
-// serializeRecordToIPC turns one arrow.Record into a complete,
-// self-contained Arrow IPC stream (schema + record + EOS). Each chunk
-// sent to the DG must be a complete IPC stream because the gateway's
-// ArrowIPCAdapter.Parse processes one []byte at a time — it can't
-// re-use a schema header across chunks.
-//
-// Schema-repeat overhead is small (~50-500 bytes per batch for typical
-// 5-50 column schemas), negligible compared to the per-batch row data
-// (tens of KB to MBs). Caller's record is NOT released by this function.
-func serializeRecordToIPC(rec arrow.Record, alloc memory.Allocator) ([]byte, error) {
-	var buf bytes.Buffer
-	w := ipc.NewWriter(&buf,
-		ipc.WithSchema(rec.Schema()),
-		ipc.WithAllocator(alloc),
-	)
-	if err := w.Write(rec); err != nil {
-		w.Close() //nolint:errcheck
-		return nil, fmt.Errorf("ipc write record: %w", err)
-	}
-	if err := w.Close(); err != nil {
-		return nil, fmt.Errorf("ipc close writer: %w", err)
-	}
-	return buf.Bytes(), nil
 }
 
 // arrowRowSeed re-derives the same row-key bytes used previously by

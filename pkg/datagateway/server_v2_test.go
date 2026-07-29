@@ -279,6 +279,66 @@ func TestServerV2_GetConfig(t *testing.T) {
 	}
 }
 
+// TestServerV2_GetConfig_OutputTableColumns proves an output table's
+// explicit column mapping (config-side OutputTableConfig.Columns) survives
+// the trip into the proto ComponentConfig response.
+func TestServerV2_GetConfig_OutputTableColumns(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gateway-v2-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &Config{
+		RunID:         "test-exec",
+		ComponentName: "test-component",
+		OutputTables: []OutputTableConfig{
+			{
+				Name:      "summary",
+				Bucket:    "curated",
+				WriteMode: "APPEND",
+				Columns: []ColumnConfig{
+					{Name: "id", Type: "int"},
+					{Name: "note", Type: "string"},
+				},
+			},
+			{
+				Name:      "no_mapping",
+				Bucket:    "curated",
+				WriteMode: "APPEND",
+			},
+		},
+		Backend: newMockBackend(),
+	}
+	server := NewServerV2(cfg)
+
+	ctx := context.Background()
+	resp, err := server.GetConfig(ctx, &pb.GetConfigRequest{})
+	if err != nil {
+		t.Fatalf("GetConfig error: %v", err)
+	}
+
+	if len(resp.OutputConfig.Tables) != 2 {
+		t.Fatalf("want 2 output tables, got %d", len(resp.OutputConfig.Tables))
+	}
+
+	withCols := resp.OutputConfig.Tables[0]
+	if len(withCols.Columns) != 2 {
+		t.Fatalf("want 2 columns on %q, got %d", withCols.Name, len(withCols.Columns))
+	}
+	if withCols.Columns[0].Name != "id" || withCols.Columns[0].Type != "int" {
+		t.Errorf("columns[0] = %+v, want {id int}", withCols.Columns[0])
+	}
+	if withCols.Columns[1].Name != "note" || withCols.Columns[1].Type != "string" {
+		t.Errorf("columns[1] = %+v, want {note string}", withCols.Columns[1])
+	}
+
+	noMapping := resp.OutputConfig.Tables[1]
+	if len(noMapping.Columns) != 0 {
+		t.Errorf("want 0 columns on %q, got %d", noMapping.Name, len(noMapping.Columns))
+	}
+}
+
 func TestServerV2_OpenWriter(t *testing.T) {
 	server, tmpDir := createTestServerV2(t)
 	defer os.RemoveAll(tmpDir)

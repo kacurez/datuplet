@@ -2,6 +2,7 @@ package format
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 
@@ -109,6 +110,32 @@ func (a *ArrowIPCAdapter) parseFromReader(r io.Reader, s *schema.Schema) (arrow.
 			rec.Release()
 		}
 		return nil, nil, fmt.Errorf("error reading Arrow IPC: %w", err)
+	}
+
+	// The ipc.Reader stops exactly at the stream's EOS marker: arrow-go's
+	// messageReader only ever io.ReadFull's the exact byte counts each
+	// message frame declares (see arrow/ipc/message.go), with no read-ahead
+	// buffering — so r is positioned exactly one byte past EOS here, for
+	// both in-memory (*bytes.Reader, via Parse) and streaming, non-seekable
+	// readers alike (the HTTP request body, via ParseReader). Anything r
+	// still yields past that point is trailing data — a second concatenated
+	// IPC stream, or garbage — that must fail the parse rather than being
+	// silently discarded: today only the row count of the FIRST stream
+	// would be reported, with no error (see cmd/mock-datagateway/main.go's
+	// ingest for the equivalent dev-mock check this mirrors).
+	var trailing [1]byte
+	n, trailingErr := r.Read(trailing[:])
+	if n > 0 {
+		for _, rec := range records {
+			rec.Release()
+		}
+		return nil, nil, fmt.Errorf("Arrow IPC payload is not a single self-contained stream: found trailing byte(s) after the stream's EOS marker (concatenated streams are not supported — exactly one IPC stream per payload)")
+	}
+	if trailingErr != nil && !errors.Is(trailingErr, io.EOF) {
+		for _, rec := range records {
+			rec.Release()
+		}
+		return nil, nil, fmt.Errorf("checking Arrow IPC payload for trailing bytes: %w", trailingErr)
 	}
 
 	if len(records) == 0 {

@@ -665,6 +665,7 @@ type TableOutputConfig struct {
 	Bucket        string                 `protobuf:"bytes,2,opt,name=bucket,proto3" json:"bucket,omitempty"`                              // Bucket name
 	WriteMode     string                 `protobuf:"bytes,3,opt,name=write_mode,json=writeMode,proto3" json:"write_mode,omitempty"`       // APPEND or FULL_LOAD
 	LogicalName   string                 `protobuf:"bytes,4,opt,name=logical_name,json=logicalName,proto3" json:"logical_name,omitempty"` // SDK-facing identifier (defaults to name when empty)
+	Columns       []*ColumnConfig        `protobuf:"bytes,5,rep,name=columns,proto3" json:"columns,omitempty"`                            // Optional explicit column mapping; empty = producer infers
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -725,6 +726,13 @@ func (x *TableOutputConfig) GetLogicalName() string {
 		return x.LogicalName
 	}
 	return ""
+}
+
+func (x *TableOutputConfig) GetColumns() []*ColumnConfig {
+	if x != nil {
+		return x.Columns
+	}
+	return nil
 }
 
 // ProcessorConfig defines a data processor operation.
@@ -3325,6 +3333,62 @@ func (x *S3Credentials) GetExpiresAtUnix() int64 {
 	return 0
 }
 
+// ColumnConfig defines a single column's name and type in an explicit output
+// column mapping (TableOutputConfig.columns). When a table has columns set,
+// the producer writes exactly these columns with these types and infers
+// nothing; when absent, it infers.
+type ColumnConfig struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Type          string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"` // int, long, float, double, boolean, string
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ColumnConfig) Reset() {
+	*x = ColumnConfig{}
+	mi := &file_api_proto_gateway_v2_gateway_proto_msgTypes[49]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ColumnConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ColumnConfig) ProtoMessage() {}
+
+func (x *ColumnConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_gateway_v2_gateway_proto_msgTypes[49]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ColumnConfig.ProtoReflect.Descriptor instead.
+func (*ColumnConfig) Descriptor() ([]byte, []int) {
+	return file_api_proto_gateway_v2_gateway_proto_rawDescGZIP(), []int{49}
+}
+
+func (x *ColumnConfig) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ColumnConfig) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
 var File_api_proto_gateway_v2_gateway_proto protoreflect.FileDescriptor
 
 const file_api_proto_gateway_v2_gateway_proto_rawDesc = "" +
@@ -3373,13 +3437,14 @@ const file_api_proto_gateway_v2_gateway_proto_rawDesc = "" +
 	"\x12BucketOutputConfig\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
-	"write_mode\x18\x02 \x01(\tR\twriteMode\"\x81\x01\n" +
+	"write_mode\x18\x02 \x01(\tR\twriteMode\"\xbe\x01\n" +
 	"\x11TableOutputConfig\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06bucket\x18\x02 \x01(\tR\x06bucket\x12\x1d\n" +
 	"\n" +
 	"write_mode\x18\x03 \x01(\tR\twriteMode\x12!\n" +
-	"\flogical_name\x18\x04 \x01(\tR\vlogicalName\"?\n" +
+	"\flogical_name\x18\x04 \x01(\tR\vlogicalName\x12;\n" +
+	"\acolumns\x18\x05 \x03(\v2!.datuplet.gateway.v2.ColumnConfigR\acolumns\"?\n" +
 	"\x0fProcessorConfig\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x18\n" +
 	"\acolumns\x18\x02 \x03(\tR\acolumns\"\x9f\x02\n" +
@@ -3598,7 +3663,10 @@ const file_api_proto_gateway_v2_gateway_proto_rawDesc = "" +
 	"\rsession_token\x18\b \x01(\tR\fsessionToken\x12\x14\n" +
 	"\x05scope\x18\t \x01(\tR\x05scope\x12&\n" +
 	"\x0fexpires_at_unix\x18\n" +
-	" \x01(\x03R\rexpiresAtUnix*\x81\x01\n" +
+	" \x01(\x03R\rexpiresAtUnix\"6\n" +
+	"\fColumnConfig\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04type\x18\x02 \x01(\tR\x04type*\x81\x01\n" +
 	"\n" +
 	"DataFormat\x12\x16\n" +
 	"\x12FORMAT_UNSPECIFIED\x10\x00\x12\x0e\n" +
@@ -3638,7 +3706,7 @@ func file_api_proto_gateway_v2_gateway_proto_rawDescGZIP() []byte {
 }
 
 var file_api_proto_gateway_v2_gateway_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_api_proto_gateway_v2_gateway_proto_msgTypes = make([]protoimpl.MessageInfo, 55)
+var file_api_proto_gateway_v2_gateway_proto_msgTypes = make([]protoimpl.MessageInfo, 56)
 var file_api_proto_gateway_v2_gateway_proto_goTypes = []any{
 	(DataFormat)(0),                // 0: datuplet.gateway.v2.DataFormat
 	(BucketCommitResult_Status)(0), // 1: datuplet.gateway.v2.BucketCommitResult.Status
@@ -3692,86 +3760,88 @@ var file_api_proto_gateway_v2_gateway_proto_goTypes = []any{
 	(*ResolvedInput)(nil),          // 49: datuplet.gateway.v2.ResolvedInput
 	(*ResolvedOutput)(nil),         // 50: datuplet.gateway.v2.ResolvedOutput
 	(*S3Credentials)(nil),          // 51: datuplet.gateway.v2.S3Credentials
-	nil,                            // 52: datuplet.gateway.v2.ComponentConfig.InputsEntry
-	nil,                            // 53: datuplet.gateway.v2.ComponentConfig.OutputsEntry
-	nil,                            // 54: datuplet.gateway.v2.DataChunk.MetadataEntry
-	nil,                            // 55: datuplet.gateway.v2.RenameOp.MappingEntry
-	nil,                            // 56: datuplet.gateway.v2.LogRequest.FieldsEntry
-	nil,                            // 57: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
+	(*ColumnConfig)(nil),           // 52: datuplet.gateway.v2.ColumnConfig
+	nil,                            // 53: datuplet.gateway.v2.ComponentConfig.InputsEntry
+	nil,                            // 54: datuplet.gateway.v2.ComponentConfig.OutputsEntry
+	nil,                            // 55: datuplet.gateway.v2.DataChunk.MetadataEntry
+	nil,                            // 56: datuplet.gateway.v2.RenameOp.MappingEntry
+	nil,                            // 57: datuplet.gateway.v2.LogRequest.FieldsEntry
+	nil,                            // 58: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
 }
 var file_api_proto_gateway_v2_gateway_proto_depIdxs = []int32{
 	4,  // 0: datuplet.gateway.v2.Schema.columns:type_name -> datuplet.gateway.v2.ColumnDef
 	7,  // 1: datuplet.gateway.v2.ComponentConfig.input_tables:type_name -> datuplet.gateway.v2.InputTableConfig
 	8,  // 2: datuplet.gateway.v2.ComponentConfig.output_config:type_name -> datuplet.gateway.v2.OutputConfig
 	48, // 3: datuplet.gateway.v2.ComponentConfig.storage_bootstrap:type_name -> datuplet.gateway.v2.StorageBootstrap
-	52, // 4: datuplet.gateway.v2.ComponentConfig.inputs:type_name -> datuplet.gateway.v2.ComponentConfig.InputsEntry
-	53, // 5: datuplet.gateway.v2.ComponentConfig.outputs:type_name -> datuplet.gateway.v2.ComponentConfig.OutputsEntry
+	53, // 4: datuplet.gateway.v2.ComponentConfig.inputs:type_name -> datuplet.gateway.v2.ComponentConfig.InputsEntry
+	54, // 5: datuplet.gateway.v2.ComponentConfig.outputs:type_name -> datuplet.gateway.v2.ComponentConfig.OutputsEntry
 	9,  // 6: datuplet.gateway.v2.OutputConfig.buckets:type_name -> datuplet.gateway.v2.BucketOutputConfig
 	10, // 7: datuplet.gateway.v2.OutputConfig.tables:type_name -> datuplet.gateway.v2.TableOutputConfig
 	11, // 8: datuplet.gateway.v2.OutputConfig.processors:type_name -> datuplet.gateway.v2.ProcessorConfig
-	0,  // 9: datuplet.gateway.v2.OpenWriterRequest.input_format:type_name -> datuplet.gateway.v2.DataFormat
-	3,  // 10: datuplet.gateway.v2.OpenWriterRequest.schema:type_name -> datuplet.gateway.v2.Schema
-	27, // 11: datuplet.gateway.v2.OpenWriterRequest.transforms:type_name -> datuplet.gateway.v2.TransformSpec
-	3,  // 12: datuplet.gateway.v2.OpenWriterResponse.inferred_schema:type_name -> datuplet.gateway.v2.Schema
-	3,  // 13: datuplet.gateway.v2.WriteChunkResponse.inferred_schema:type_name -> datuplet.gateway.v2.Schema
-	18, // 14: datuplet.gateway.v2.CloseWriterRequest.external_files:type_name -> datuplet.gateway.v2.ExternalDataFile
-	0,  // 15: datuplet.gateway.v2.OpenReaderRequest.output_format:type_name -> datuplet.gateway.v2.DataFormat
-	27, // 16: datuplet.gateway.v2.OpenReaderRequest.transforms:type_name -> datuplet.gateway.v2.TransformSpec
-	20, // 17: datuplet.gateway.v2.OpenReaderRequest.incremental:type_name -> datuplet.gateway.v2.IncrementalReadSpec
-	3,  // 18: datuplet.gateway.v2.OpenReaderResponse.schema:type_name -> datuplet.gateway.v2.Schema
-	21, // 19: datuplet.gateway.v2.OpenReaderResponse.delta_info:type_name -> datuplet.gateway.v2.DeltaInfo
-	0,  // 20: datuplet.gateway.v2.DataChunk.format:type_name -> datuplet.gateway.v2.DataFormat
-	54, // 21: datuplet.gateway.v2.DataChunk.metadata:type_name -> datuplet.gateway.v2.DataChunk.MetadataEntry
-	28, // 22: datuplet.gateway.v2.TransformSpec.operations:type_name -> datuplet.gateway.v2.TransformOp
-	29, // 23: datuplet.gateway.v2.TransformOp.filter:type_name -> datuplet.gateway.v2.FilterOp
-	30, // 24: datuplet.gateway.v2.TransformOp.select:type_name -> datuplet.gateway.v2.SelectOp
-	31, // 25: datuplet.gateway.v2.TransformOp.drop:type_name -> datuplet.gateway.v2.DropOp
-	32, // 26: datuplet.gateway.v2.TransformOp.rename:type_name -> datuplet.gateway.v2.RenameOp
-	33, // 27: datuplet.gateway.v2.TransformOp.compute:type_name -> datuplet.gateway.v2.ComputeOp
-	34, // 28: datuplet.gateway.v2.TransformOp.cast:type_name -> datuplet.gateway.v2.CastOp
-	35, // 29: datuplet.gateway.v2.TransformOp.reorder:type_name -> datuplet.gateway.v2.ReorderOp
-	55, // 30: datuplet.gateway.v2.RenameOp.mapping:type_name -> datuplet.gateway.v2.RenameOp.MappingEntry
-	38, // 31: datuplet.gateway.v2.CommitResponse.buckets:type_name -> datuplet.gateway.v2.BucketCommitResult
-	1,  // 32: datuplet.gateway.v2.BucketCommitResult.status:type_name -> datuplet.gateway.v2.BucketCommitResult.Status
-	39, // 33: datuplet.gateway.v2.BucketCommitResult.tables:type_name -> datuplet.gateway.v2.TableCommitResult
-	2,  // 34: datuplet.gateway.v2.TableCommitResult.status:type_name -> datuplet.gateway.v2.TableCommitResult.Status
-	3,  // 35: datuplet.gateway.v2.SchemaResponse.schema:type_name -> datuplet.gateway.v2.Schema
-	0,  // 36: datuplet.gateway.v2.GetSampleRequest.format:type_name -> datuplet.gateway.v2.DataFormat
-	3,  // 37: datuplet.gateway.v2.SampleResponse.schema:type_name -> datuplet.gateway.v2.Schema
-	56, // 38: datuplet.gateway.v2.LogRequest.fields:type_name -> datuplet.gateway.v2.LogRequest.FieldsEntry
-	49, // 39: datuplet.gateway.v2.StorageBootstrap.inputs:type_name -> datuplet.gateway.v2.ResolvedInput
-	50, // 40: datuplet.gateway.v2.StorageBootstrap.outputs:type_name -> datuplet.gateway.v2.ResolvedOutput
-	57, // 41: datuplet.gateway.v2.StorageBootstrap.bucket_credentials:type_name -> datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
-	51, // 42: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry.value:type_name -> datuplet.gateway.v2.S3Credentials
-	5,  // 43: datuplet.gateway.v2.DataGateway.GetConfig:input_type -> datuplet.gateway.v2.GetConfigRequest
-	46, // 44: datuplet.gateway.v2.DataGateway.Shutdown:input_type -> datuplet.gateway.v2.ShutdownRequest
-	12, // 45: datuplet.gateway.v2.DataGateway.OpenWriter:input_type -> datuplet.gateway.v2.OpenWriterRequest
-	14, // 46: datuplet.gateway.v2.DataGateway.WriteChunk:input_type -> datuplet.gateway.v2.WriteChunkRequest
-	16, // 47: datuplet.gateway.v2.DataGateway.CloseWriter:input_type -> datuplet.gateway.v2.CloseWriterRequest
-	19, // 48: datuplet.gateway.v2.DataGateway.OpenReader:input_type -> datuplet.gateway.v2.OpenReaderRequest
-	23, // 49: datuplet.gateway.v2.DataGateway.ReadChunk:input_type -> datuplet.gateway.v2.ReadChunkRequest
-	25, // 50: datuplet.gateway.v2.DataGateway.CloseReader:input_type -> datuplet.gateway.v2.CloseReaderRequest
-	36, // 51: datuplet.gateway.v2.DataGateway.Commit:input_type -> datuplet.gateway.v2.CommitRequest
-	40, // 52: datuplet.gateway.v2.DataGateway.GetSchema:input_type -> datuplet.gateway.v2.GetSchemaRequest
-	42, // 53: datuplet.gateway.v2.DataGateway.GetSample:input_type -> datuplet.gateway.v2.GetSampleRequest
-	44, // 54: datuplet.gateway.v2.DataGateway.Log:input_type -> datuplet.gateway.v2.LogRequest
-	6,  // 55: datuplet.gateway.v2.DataGateway.GetConfig:output_type -> datuplet.gateway.v2.ComponentConfig
-	47, // 56: datuplet.gateway.v2.DataGateway.Shutdown:output_type -> datuplet.gateway.v2.ShutdownResponse
-	13, // 57: datuplet.gateway.v2.DataGateway.OpenWriter:output_type -> datuplet.gateway.v2.OpenWriterResponse
-	15, // 58: datuplet.gateway.v2.DataGateway.WriteChunk:output_type -> datuplet.gateway.v2.WriteChunkResponse
-	17, // 59: datuplet.gateway.v2.DataGateway.CloseWriter:output_type -> datuplet.gateway.v2.CloseWriterResponse
-	22, // 60: datuplet.gateway.v2.DataGateway.OpenReader:output_type -> datuplet.gateway.v2.OpenReaderResponse
-	24, // 61: datuplet.gateway.v2.DataGateway.ReadChunk:output_type -> datuplet.gateway.v2.DataChunk
-	26, // 62: datuplet.gateway.v2.DataGateway.CloseReader:output_type -> datuplet.gateway.v2.CloseReaderResponse
-	37, // 63: datuplet.gateway.v2.DataGateway.Commit:output_type -> datuplet.gateway.v2.CommitResponse
-	41, // 64: datuplet.gateway.v2.DataGateway.GetSchema:output_type -> datuplet.gateway.v2.SchemaResponse
-	43, // 65: datuplet.gateway.v2.DataGateway.GetSample:output_type -> datuplet.gateway.v2.SampleResponse
-	45, // 66: datuplet.gateway.v2.DataGateway.Log:output_type -> datuplet.gateway.v2.LogResponse
-	55, // [55:67] is the sub-list for method output_type
-	43, // [43:55] is the sub-list for method input_type
-	43, // [43:43] is the sub-list for extension type_name
-	43, // [43:43] is the sub-list for extension extendee
-	0,  // [0:43] is the sub-list for field type_name
+	52, // 9: datuplet.gateway.v2.TableOutputConfig.columns:type_name -> datuplet.gateway.v2.ColumnConfig
+	0,  // 10: datuplet.gateway.v2.OpenWriterRequest.input_format:type_name -> datuplet.gateway.v2.DataFormat
+	3,  // 11: datuplet.gateway.v2.OpenWriterRequest.schema:type_name -> datuplet.gateway.v2.Schema
+	27, // 12: datuplet.gateway.v2.OpenWriterRequest.transforms:type_name -> datuplet.gateway.v2.TransformSpec
+	3,  // 13: datuplet.gateway.v2.OpenWriterResponse.inferred_schema:type_name -> datuplet.gateway.v2.Schema
+	3,  // 14: datuplet.gateway.v2.WriteChunkResponse.inferred_schema:type_name -> datuplet.gateway.v2.Schema
+	18, // 15: datuplet.gateway.v2.CloseWriterRequest.external_files:type_name -> datuplet.gateway.v2.ExternalDataFile
+	0,  // 16: datuplet.gateway.v2.OpenReaderRequest.output_format:type_name -> datuplet.gateway.v2.DataFormat
+	27, // 17: datuplet.gateway.v2.OpenReaderRequest.transforms:type_name -> datuplet.gateway.v2.TransformSpec
+	20, // 18: datuplet.gateway.v2.OpenReaderRequest.incremental:type_name -> datuplet.gateway.v2.IncrementalReadSpec
+	3,  // 19: datuplet.gateway.v2.OpenReaderResponse.schema:type_name -> datuplet.gateway.v2.Schema
+	21, // 20: datuplet.gateway.v2.OpenReaderResponse.delta_info:type_name -> datuplet.gateway.v2.DeltaInfo
+	0,  // 21: datuplet.gateway.v2.DataChunk.format:type_name -> datuplet.gateway.v2.DataFormat
+	55, // 22: datuplet.gateway.v2.DataChunk.metadata:type_name -> datuplet.gateway.v2.DataChunk.MetadataEntry
+	28, // 23: datuplet.gateway.v2.TransformSpec.operations:type_name -> datuplet.gateway.v2.TransformOp
+	29, // 24: datuplet.gateway.v2.TransformOp.filter:type_name -> datuplet.gateway.v2.FilterOp
+	30, // 25: datuplet.gateway.v2.TransformOp.select:type_name -> datuplet.gateway.v2.SelectOp
+	31, // 26: datuplet.gateway.v2.TransformOp.drop:type_name -> datuplet.gateway.v2.DropOp
+	32, // 27: datuplet.gateway.v2.TransformOp.rename:type_name -> datuplet.gateway.v2.RenameOp
+	33, // 28: datuplet.gateway.v2.TransformOp.compute:type_name -> datuplet.gateway.v2.ComputeOp
+	34, // 29: datuplet.gateway.v2.TransformOp.cast:type_name -> datuplet.gateway.v2.CastOp
+	35, // 30: datuplet.gateway.v2.TransformOp.reorder:type_name -> datuplet.gateway.v2.ReorderOp
+	56, // 31: datuplet.gateway.v2.RenameOp.mapping:type_name -> datuplet.gateway.v2.RenameOp.MappingEntry
+	38, // 32: datuplet.gateway.v2.CommitResponse.buckets:type_name -> datuplet.gateway.v2.BucketCommitResult
+	1,  // 33: datuplet.gateway.v2.BucketCommitResult.status:type_name -> datuplet.gateway.v2.BucketCommitResult.Status
+	39, // 34: datuplet.gateway.v2.BucketCommitResult.tables:type_name -> datuplet.gateway.v2.TableCommitResult
+	2,  // 35: datuplet.gateway.v2.TableCommitResult.status:type_name -> datuplet.gateway.v2.TableCommitResult.Status
+	3,  // 36: datuplet.gateway.v2.SchemaResponse.schema:type_name -> datuplet.gateway.v2.Schema
+	0,  // 37: datuplet.gateway.v2.GetSampleRequest.format:type_name -> datuplet.gateway.v2.DataFormat
+	3,  // 38: datuplet.gateway.v2.SampleResponse.schema:type_name -> datuplet.gateway.v2.Schema
+	57, // 39: datuplet.gateway.v2.LogRequest.fields:type_name -> datuplet.gateway.v2.LogRequest.FieldsEntry
+	49, // 40: datuplet.gateway.v2.StorageBootstrap.inputs:type_name -> datuplet.gateway.v2.ResolvedInput
+	50, // 41: datuplet.gateway.v2.StorageBootstrap.outputs:type_name -> datuplet.gateway.v2.ResolvedOutput
+	58, // 42: datuplet.gateway.v2.StorageBootstrap.bucket_credentials:type_name -> datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
+	51, // 43: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry.value:type_name -> datuplet.gateway.v2.S3Credentials
+	5,  // 44: datuplet.gateway.v2.DataGateway.GetConfig:input_type -> datuplet.gateway.v2.GetConfigRequest
+	46, // 45: datuplet.gateway.v2.DataGateway.Shutdown:input_type -> datuplet.gateway.v2.ShutdownRequest
+	12, // 46: datuplet.gateway.v2.DataGateway.OpenWriter:input_type -> datuplet.gateway.v2.OpenWriterRequest
+	14, // 47: datuplet.gateway.v2.DataGateway.WriteChunk:input_type -> datuplet.gateway.v2.WriteChunkRequest
+	16, // 48: datuplet.gateway.v2.DataGateway.CloseWriter:input_type -> datuplet.gateway.v2.CloseWriterRequest
+	19, // 49: datuplet.gateway.v2.DataGateway.OpenReader:input_type -> datuplet.gateway.v2.OpenReaderRequest
+	23, // 50: datuplet.gateway.v2.DataGateway.ReadChunk:input_type -> datuplet.gateway.v2.ReadChunkRequest
+	25, // 51: datuplet.gateway.v2.DataGateway.CloseReader:input_type -> datuplet.gateway.v2.CloseReaderRequest
+	36, // 52: datuplet.gateway.v2.DataGateway.Commit:input_type -> datuplet.gateway.v2.CommitRequest
+	40, // 53: datuplet.gateway.v2.DataGateway.GetSchema:input_type -> datuplet.gateway.v2.GetSchemaRequest
+	42, // 54: datuplet.gateway.v2.DataGateway.GetSample:input_type -> datuplet.gateway.v2.GetSampleRequest
+	44, // 55: datuplet.gateway.v2.DataGateway.Log:input_type -> datuplet.gateway.v2.LogRequest
+	6,  // 56: datuplet.gateway.v2.DataGateway.GetConfig:output_type -> datuplet.gateway.v2.ComponentConfig
+	47, // 57: datuplet.gateway.v2.DataGateway.Shutdown:output_type -> datuplet.gateway.v2.ShutdownResponse
+	13, // 58: datuplet.gateway.v2.DataGateway.OpenWriter:output_type -> datuplet.gateway.v2.OpenWriterResponse
+	15, // 59: datuplet.gateway.v2.DataGateway.WriteChunk:output_type -> datuplet.gateway.v2.WriteChunkResponse
+	17, // 60: datuplet.gateway.v2.DataGateway.CloseWriter:output_type -> datuplet.gateway.v2.CloseWriterResponse
+	22, // 61: datuplet.gateway.v2.DataGateway.OpenReader:output_type -> datuplet.gateway.v2.OpenReaderResponse
+	24, // 62: datuplet.gateway.v2.DataGateway.ReadChunk:output_type -> datuplet.gateway.v2.DataChunk
+	26, // 63: datuplet.gateway.v2.DataGateway.CloseReader:output_type -> datuplet.gateway.v2.CloseReaderResponse
+	37, // 64: datuplet.gateway.v2.DataGateway.Commit:output_type -> datuplet.gateway.v2.CommitResponse
+	41, // 65: datuplet.gateway.v2.DataGateway.GetSchema:output_type -> datuplet.gateway.v2.SchemaResponse
+	43, // 66: datuplet.gateway.v2.DataGateway.GetSample:output_type -> datuplet.gateway.v2.SampleResponse
+	45, // 67: datuplet.gateway.v2.DataGateway.Log:output_type -> datuplet.gateway.v2.LogResponse
+	56, // [56:68] is the sub-list for method output_type
+	44, // [44:56] is the sub-list for method input_type
+	44, // [44:44] is the sub-list for extension type_name
+	44, // [44:44] is the sub-list for extension extendee
+	0,  // [0:44] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_gateway_v2_gateway_proto_init() }
@@ -3798,7 +3868,7 @@ func file_api_proto_gateway_v2_gateway_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_gateway_v2_gateway_proto_rawDesc), len(file_api_proto_gateway_v2_gateway_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   55,
+			NumMessages:   56,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

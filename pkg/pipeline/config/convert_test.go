@@ -18,7 +18,8 @@ func TestDocCRDocRoundTripLossless(t *testing.T) {
 			Config: map[string]any{"sql": "SELECT 1"},
 			Inputs: &InputSpec{Tables: []InputTableSpec{{Bucket: "raw", Table: "t", As: "alias", Since: "3d", TimestampColumn: "ts"}}},
 			Outputs: &OutputSpec{Tables: []OutputTableSpec{{Name: "o", Bucket: "cur", WriteMode: "APPEND",
-				PartitionSpec: []PartitionFieldSpec{{SourceColumn: "day", Transform: "day"}}}}},
+				PartitionSpec: []PartitionFieldSpec{{SourceColumn: "day", Transform: "day"}},
+				Columns:       []ColumnSpec{{Name: "id", Type: "int"}, {Name: "note", Type: "string"}}}}},
 			Resources: &ResourceSpec{Memory: "1Gi", CPU: "500m"},
 		}}}},
 	}

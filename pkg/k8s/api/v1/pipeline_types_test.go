@@ -45,3 +45,27 @@ func TestComponentSpecEmptyConfig(t *testing.T) {
 		t.Fatalf("want (nil,nil), got (%v,%v)", m, err)
 	}
 }
+
+// TestOutputTableSpec_DeepCopy_ColumnsIsolation proves DeepCopy gives the
+// Columns slice its own backing array — mutating the copy must not leak
+// back into the original.
+func TestOutputTableSpec_DeepCopy_ColumnsIsolation(t *testing.T) {
+	orig := &OutputTableSpec{
+		Name:   "t",
+		Bucket: "b",
+		Columns: []ColumnSpec{
+			{Name: "id", Type: "int"},
+		},
+	}
+
+	cp := orig.DeepCopy()
+	cp.Columns[0].Name = "mutated"
+	cp.Columns[0].Type = "string"
+
+	if orig.Columns[0].Name != "id" || orig.Columns[0].Type != "int" {
+		t.Errorf("mutation on copy leaked into original: %+v", orig.Columns[0])
+	}
+	if &cp.Columns[0] == &orig.Columns[0] {
+		t.Error("cp.Columns aliases orig.Columns; expected distinct backing array")
+	}
+}

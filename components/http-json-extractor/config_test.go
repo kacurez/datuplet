@@ -10,6 +10,10 @@ func TestParseAndValidate(t *testing.T) {
 	}{
 		{"ok_no_fields", Config{URL: "https://x"}, false},
 		{"ok_fields", Config{URL: "https://x", Fields: []FieldMapping{{Path: "a.b", Name: "ab"}, {Path: "c", Name: "c_1"}}}, false},
+		{"ok_schema_inference_empty_defaults_typed", Config{URL: "https://x", SchemaInference: ""}, false},
+		{"ok_schema_inference_typed", Config{URL: "https://x", SchemaInference: "typed"}, false},
+		{"ok_schema_inference_strings", Config{URL: "https://x", SchemaInference: "strings"}, false},
+		{"bad_schema_inference", Config{URL: "https://x", SchemaInference: "bogus"}, true},
 		{"empty_url", Config{}, true},
 		{"empty_path", Config{URL: "https://x", Fields: []FieldMapping{{Path: "", Name: "n"}}}, true},
 		{"bad_name_dot", Config{URL: "https://x", Fields: []FieldMapping{{Path: "a", Name: "a.b"}}}, true},

@@ -9,12 +9,11 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/google/uuid"
 
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	sdk "github.com/datuplet/datuplet/sdk/go"
+	dgarrow "github.com/datuplet/datuplet/sdk/go/arrow"
 )
 
 // seedForTable derives a deterministic uint64 seed from runID + tableName.
@@ -120,14 +119,39 @@ func shouldStop(limit *Limit, rowsWritten int, bytesWritten int, startTime time.
 	return false
 }
 
-// runRandom runs the random-mode write loop for a single table.
+// finishRandomQuietly calls sink.Finish() and discards the result. It
+// exists because sdk.ExitUserError/ExitAppError call os.Exit, which skips
+// all of runRandom's deferred cleanup — so an already-opened gateway writer
+// (e.g. a run that flushed one or more batches before hitting the injected
+// user error) would otherwise be left open. Call this immediately before
+// any sdk.Exit* that can run after the sink was constructed. Finish is
+// idempotent, so a later real Finish call (or another finishRandomQuietly
+// call, e.g. via the deferred cleanup in runRandom) is a harmless no-op.
+func finishRandomQuietly(sink *dgarrow.Sink) {
+	_, _, _ = sink.Finish()
+}
+
+// runRandom runs the random-mode write loop for a single table via the
+// dgarrow.Sink core (sdk/go/arrow/typed_sink.go): rows are appended
+// directly into the sink's RecordBuilder (one typed value per column, via
+// appendGeneratedValue) and RowDone() flushes a self-contained Arrow IPC
+// stream every dgarrow.DefaultBatchRows rows.
 //
-// Wire format: Arrow IPC. Each batch is a self-contained IPC stream
-// (schema header + one record batch + EOS) of up to arrowBatchRows
-// rows. The gateway decodes via ArrowIPCAdapter (zero-copy where
-// possible) and accumulates batches in the BufferManager for parquet
-// flush — see RFC 020 Phase 2b. This replaces the per-row JSONL +
-// json.Marshal path which was the dominant CPU consumer (~65% of
+// Batch-size tuning (established for this component before dgarrow.Sink
+// existed; carried forward unchanged as dgarrow.DefaultBatchRows = 8192):
+//   - Too small (< 1k): more HTTP POSTs / more schema-repeats per IPC
+//     stream / less amortisation of pqarrow row-group costs.
+//   - Too large (> 128k): per-batch RecordBuilder memory peaks; the final
+//     NewRecord -> IPC.Write pair holds the whole batch live in two
+//     places briefly.
+//   - 8192 is the empirical sweet spot for the 5M-row products workload:
+//     ~610 batches, each ~80-200 KB on the wire, sub-MB RecordBuilder
+//     peak per batch.
+//
+// Wire format: Arrow IPC. The gateway decodes via ArrowIPCAdapter
+// (zero-copy where possible) and accumulates batches in the BufferManager
+// for parquet flush — see RFC 020 Phase 2b. This replaces the per-row
+// JSONL + json.Marshal path which was the dominant CPU consumer (~65% of
 // gateway-side write CPU per Pyroscope of run 07a2ddec).
 //
 // Behaviour preserved from the JSONL path:
@@ -136,7 +160,10 @@ func shouldStop(limit *Limit, rowsWritten int, bytesWritten int, startTime time.
 //     stop-limit check, so a userErrorMessage with rowsCount=N still
 //     fires somewhere in [0, N-1].
 //   - Limits: rowsCount, sizeInBytes (bytes accounted from the IPC
-//     stream actually sent), timeoutInSeconds.
+//     stream actually sent — sourced from sink.BytesShipped(), which
+//     like the old counter only advances when a batch actually flushes,
+//     so the limit still trips at batch granularity, not per row),
+//     timeoutInSeconds.
 //   - Per-row throttle via RowInsertSpeed milliseconds.
 //
 // Behaviour differences from the JSONL path:
@@ -145,10 +172,16 @@ func shouldStop(limit *Limit, rowsWritten int, bytesWritten int, startTime time.
 //     numeric columns and similar for strings; users tuning this knob
 //     against the previous JSONL baseline may need to adjust.
 //   - Column ORDER is the same (sortStrings(colNames)) and column
-//     types map to native Arrow types (int->Int32, double->Float64,
+//     types map to native Arrow types (int->Int64, double->Float64,
 //     etc.) where applicable. string/uuid/date/timestamp/now stay
 //     STRING so the iceberg table schema matches what the JSONL path
 //     produced via gateway-side inference.
+//   - The writer now opens lazily on the first flush (a dgarrow.Sink
+//     guarantee) rather than eagerly before the loop starts. In
+//     practice every valid config (validateRandom requires at least one
+//     non-zero limit) generates at least one row before any limit can
+//     trip, so this is unobservable outside of that theoretical
+//     zero-row edge case.
 func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Table) (int, error) {
 	r := t.Random
 	rng := newRNG(cfg.ExecutionID, t.Name)
@@ -164,78 +197,63 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 	sortStrings(colNames)
 	arrowSchema := buildArrowSchema(colNames, r.Schema)
 
-	// Open writer in Arrow IPC mode. We don't pass WithSchema — every
-	// IPC chunk we send carries its own schema header, and the gateway
-	// uses that to load-or-create the iceberg table on the first chunk.
-	writer, err := client.OpenWriter(ctx, t.Name, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
-	if err != nil {
-		return 0, fmt.Errorf("table %q: failed to open writer: %w", t.Name, err)
-	}
-
-	pool := memory.NewGoAllocator()
-	// arrowBatch builds rows into typed arrow array builders. We
-	// allocate one RecordBuilder for the lifetime of the table — it's
-	// reset implicitly each NewRecord() call (which builds the current
-	// rows into a Record and clears the internal builders for the next
-	// batch). No per-row allocator churn.
-	rb := array.NewRecordBuilder(pool, arrowSchema)
-	defer rb.Release()
+	// Open writer in Arrow IPC mode lazily, on the sink's first flush. We
+	// don't pass WithSchema — every IPC chunk we send carries its own
+	// schema header, and the gateway uses that to load-or-create the
+	// iceberg table on the first chunk.
+	sink := dgarrow.NewSink(ctx, func() (dgarrow.ChunkWriter, error) {
+		return client.OpenWriter(ctx, t.Name, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
+	}, arrowSchema)
+	// Every return path below must close any writer the sink opened.
+	// Finish is idempotent, so calling it again after the explicit call in
+	// the normal-completion path (or after finishRandomQuietly, below) is a
+	// harmless no-op. This is what fixes the sibling-goroutine leak:
+	// main.go cancels the shared run context when any one table's
+	// goroutine fails, and every other table's goroutine then observes
+	// that cancellation as a RowDone/Finish WriteError and returns early —
+	// previously with its writer left open.
+	defer finishRandomQuietly(sink)
 
 	startTime := time.Now()
-	rowsWritten := 0
-	rowsInBatch := 0
-	bytesWritten := 0
-
-	// flushBatch builds the accumulated rows into an Arrow record,
-	// serialises as a complete IPC stream, ships via the SDK, and
-	// updates bytesWritten. No-op when rowsInBatch == 0.
-	flushBatch := func() error {
-		if rowsInBatch == 0 {
-			return nil
-		}
-		rec := rb.NewRecord() // builds + resets internal builders
-		defer rec.Release()
-		data, err := serializeRecordToIPC(rec, pool)
-		if err != nil {
-			return fmt.Errorf("table %q: serialise IPC batch: %w", t.Name, err)
-		}
-		if err := writer.Write(ctx, data); err != nil {
-			return fmt.Errorf("table %q: write IPC batch (rows %d-%d): %w",
-				t.Name, rowsWritten-rowsInBatch, rowsWritten-1, err)
-		}
-		bytesWritten += len(data)
-		rowsInBatch = 0
-		return nil
-	}
+	rowsWritten := 0 // total rows appended so far; drives the injection point + limit checks
+	pendingRows := 0 // rows appended since the last successful flush
 
 	for {
 		// User-error injection check FIRST — must always fire when set.
 		// errInjectionPoint guarantees errAt is strictly less than the stop
 		// boundary, so this check fires before shouldStop ever does.
 		if r.UserErrorMessage != "" && errAt != nil && *errAt == rowsWritten {
+			// os.Exit (inside ExitUserError) skips the defer above, so
+			// finish explicitly first — the sink may already own an open
+			// writer from an earlier flushed batch.
+			finishRandomQuietly(sink)
 			sdk.ExitUserError(r.UserErrorMessage)
 		}
 
 		// Check stop AFTER err check (so limit=0 still emits 0 rows
 		// AND a userErrorMessage with rowsCount=N fires within [0,N-1]).
-		if shouldStop(r.Limit, rowsWritten, bytesWritten, startTime) {
+		if shouldStop(r.Limit, rowsWritten, int(sink.BytesShipped()), startTime) {
 			break
 		}
 
-		// Append one row's typed values into the per-column builders.
+		// Append one row's typed values directly into the sink's builder.
 		now := time.Now().UTC()
+		rb := sink.Builder()
 		for colIdx, name := range colNames {
 			appendGeneratedValue(rb, colIdx, r.Schema[name], rng, now)
 		}
 		rowsWritten++
-		rowsInBatch++
+		pendingRows++
 
-		// Flush batch boundary. arrowBatchRows is the per-batch row
-		// count (see arrow_writer.go for the tuning rationale).
-		if rowsInBatch >= arrowBatchRows {
-			if err := flushBatch(); err != nil {
-				return rowsWritten, err
-			}
+		if err := sink.RowDone(); err != nil {
+			// The batch containing pendingRows never landed — don't count
+			// those rows as written (fixes a pre-port bug where a failed
+			// flush's rows were still included in the returned count).
+			return rowsWritten - pendingRows, fmt.Errorf("table %q: %w", t.Name, err)
+		}
+		if pendingRows == dgarrow.DefaultBatchRows {
+			// RowDone crossed the batch boundary and its flush succeeded.
+			pendingRows = 0
 		}
 
 		if t.RowInsertSpeed > 0 {
@@ -243,28 +261,35 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 		}
 	}
 
-	// Flush the final partial batch (rowsInBatch may be 0).
-	if err := flushBatch(); err != nil {
-		return rowsWritten, err
+	// Flush the final partial batch and close the writer.
+	rows, _, err := sink.Finish()
+
+	// Writer stats: Sink.Writer() stays populated after Finish (even on
+	// failure) as long as a writer was ever opened, so SDK-side batching
+	// activity is still visible here. dgarrow.ChunkWriter intentionally
+	// narrows away Stats() (it's only meaningful for the concrete SDK
+	// writer, not the interface the core Sink deals in) — but the writer
+	// our own `open` closure above returns is always *sdk.Writer, so the
+	// type assertion is safe. Unlike the pre-port code, this can run
+	// whether or not Finish's internal flush succeeded (Sink doesn't
+	// distinguish a flush failure from a close failure), so this may log
+	// even when the pre-port code would have skipped the log entirely.
+	if w, ok := sink.Writer().(*sdk.Writer); ok {
+		stats := w.Stats()
+		elapsed := time.Since(startTime)
+		client.Log(ctx, "INFO", fmt.Sprintf( //nolint:errcheck
+			"table %q: writer stats rows=%d elapsed=%s writes=%d posts=%d batch_threshold=%d bytes_in=%d bytes_shipped=%d",
+			t.Name, rowsWritten, elapsed.Round(time.Millisecond),
+			stats.WriteCalls, stats.UnderlyingPosts, stats.BatchThreshold,
+			stats.BytesAccepted, stats.BytesShipped,
+		))
 	}
 
-	// Capture writer stats BEFORE Close so we can report SDK-side activity
-	// (batch threshold, underlying POST count) even if Close fails. These
-	// numbers are the cheapest way to verify SDK batching is active.
-	stats := writer.Stats()
-	elapsed := time.Since(startTime)
-	client.Log(ctx, "INFO", fmt.Sprintf( //nolint:errcheck
-		"table %q: writer stats rows=%d elapsed=%s writes=%d posts=%d batch_threshold=%d bytes_in=%d bytes_shipped=%d",
-		t.Name, rowsWritten, elapsed.Round(time.Millisecond),
-		stats.WriteCalls, stats.UnderlyingPosts, stats.BatchThreshold,
-		stats.BytesAccepted, stats.BytesShipped,
-	))
-
-	if _, err := writer.Close(ctx); err != nil {
-		return rowsWritten, fmt.Errorf("table %q: failed to close writer: %w", t.Name, err)
+	if err != nil {
+		return rowsWritten - pendingRows, fmt.Errorf("table %q: %w", t.Name, err)
 	}
 
-	return rowsWritten, nil
+	return int(rows), nil
 }
 
 // sortStrings is a simple in-place sort for a small slice of strings without

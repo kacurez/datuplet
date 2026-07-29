@@ -115,12 +115,25 @@ type OutputTableSpec struct {
 	WriteMode     string               `yaml:"writeMode" json:"writeMode"`                             // APPEND or FULL_LOAD
 	LogicalName   string               `yaml:"logicalName,omitempty" json:"logicalName,omitempty"`     // SDK identifier (defaults to Name when empty)
 	PartitionSpec []PartitionFieldSpec `yaml:"partitionSpec,omitempty" json:"partitionSpec,omitempty"` // Optional partition specification
+
+	// Columns is an optional explicit column mapping. When set, the
+	// producing component writes exactly these columns with these types and
+	// infers nothing; when absent, it infers columns from the data.
+	// Enforced by the component/SDK, not by the gateway.
+	Columns []ColumnSpec `yaml:"columns,omitempty" json:"columns,omitempty"`
 }
 
 // PartitionFieldSpec defines a single partition field.
 type PartitionFieldSpec struct {
 	SourceColumn string `yaml:"source_column" json:"source_column"` // Column name in the data
 	Transform    string `yaml:"transform" json:"transform"`         // Transform: identity, day, month, year, hour
+}
+
+// ColumnSpec defines a single column's name and type in an explicit output
+// column mapping (see OutputTableSpec.Columns).
+type ColumnSpec struct {
+	Name string `yaml:"name" json:"name"` // Column name
+	Type string `yaml:"type" json:"type"` // int, long, float, double, boolean, string
 }
 
 // Processor defines a data processor operation applied by the gateway.

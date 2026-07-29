@@ -4,9 +4,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,8 +17,8 @@ import (
 	"strconv"
 	"strings"
 
-	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	sdk "github.com/datuplet/datuplet/sdk/go"
+	dgarrow "github.com/datuplet/datuplet/sdk/go/arrow"
 )
 
 // PaginationConfig defines how to paginate through API results.
@@ -49,6 +49,14 @@ type Config struct {
 	Headers    map[string]string `json:"headers"`
 	Pagination *PaginationConfig `json:"pagination"`
 	Fields     []FieldMapping    `json:"fields"`
+
+	// SchemaInference selects the output column typing when no
+	// outputs.tables[].columns mapping applies (see columns.go's
+	// newExtractorSink): "typed" (default, including "") infers a per-column
+	// Arrow type from the first batch; "strings" is the compatibility
+	// escape hatch restoring the pre-typed-inference all-String behavior. A
+	// declared mapping overrides this entirely, in either case.
+	SchemaInference string `json:"schema_inference"`
 }
 
 // columnNameRe validates author-controlled projected output-column names.
@@ -58,6 +66,12 @@ var columnNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 func ParseAndValidate(cfg *Config) error {
 	if cfg.URL == "" {
 		return fmt.Errorf("config.url is required")
+	}
+	switch cfg.SchemaInference {
+	case "", schemaInferenceTyped, schemaInferenceStrings:
+		// ok — "" defaults to schemaInferenceTyped at sink-construction time.
+	default:
+		return fmt.Errorf("config.schema_inference %q must be %q or %q", cfg.SchemaInference, schemaInferenceTyped, schemaInferenceStrings)
 	}
 	seen := make(map[string]bool, len(cfg.Fields))
 	for i, f := range cfg.Fields {
@@ -73,6 +87,20 @@ func ParseAndValidate(cfg *Config) error {
 		seen[f.Name] = true
 	}
 	return nil
+}
+
+// unknownKeysWarning formats the "late field dropped" WARN log for both
+// runExtraction and runPaginatedExtraction. keys is the (possibly capped)
+// distinct name list and dropped is the exact affected-record count from
+// sink.UnknownKeys(). The cap disclosure is only appended when the name list
+// is actually at dgarrow.MaxTrackedUnknownKeys — otherwise it's already
+// complete and an unconditional caveat would just be noise.
+func unknownKeysWarning(dropped int64, keys []string) string {
+	msg := fmt.Sprintf("output schema was fixed from the first %d records; %d later record(s) carried field(s) missing from that schema and those values were NOT written: %v", dgarrow.DefaultBatchRows, dropped, keys)
+	if len(keys) == dgarrow.MaxTrackedUnknownKeys {
+		msg += fmt.Sprintf(" (name list capped at %d distinct names; more may be affected)", dgarrow.MaxTrackedUnknownKeys)
+	}
+	return msg
 }
 
 // commitAndStatus commits all outputs, logs per-table results, and emits the
@@ -135,6 +163,10 @@ func main() {
 	// Paginated mode - stream data incrementally, page by page.
 	if compCfg.Pagination != nil && compCfg.Pagination.Type != "" {
 		if err := runPaginatedExtraction(ctx, client, &compCfg, outputTable); err != nil {
+			var we *dgarrow.WriteError
+			if errors.As(err, &we) {
+				sdk.ExitAppError(fmt.Sprintf("paginated extraction failed: %v", err))
+			}
 			sdk.ExitUserError(fmt.Sprintf("paginated extraction failed: %v", err))
 		}
 		return
@@ -142,13 +174,48 @@ func main() {
 
 	// Single-request mode.
 	client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
-	records, err := fetchJSON(ctx, compCfg.URL, compCfg.ArrayPath, compCfg.Headers)
+
+	sink, err := newExtractorSink(ctx, client, outputTable, compCfg.Fields, &cfg, compCfg.SchemaInference)
 	if err != nil {
+		// Always a construction-time config problem (e.g. an unrecognized
+		// declared column type) — never infrastructure. See newExtractorSink.
+		sdk.ExitUserError(err.Error())
+	}
+
+	body, err := fetchStream(ctx, compCfg.URL, compCfg.Headers)
+	if err != nil {
+		finishQuietly(sink) // sink may already own an open writer; os.Exit skips defers
 		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
 	}
-	client.Log(ctx, "INFO", fmt.Sprintf("Fetched %d records", len(records)))
+	n, err := decodeRecords(body, compCfg.ArrayPath, sink.Add)
+	body.Close()
+	if err != nil {
+		finishQuietly(sink)
+		var we *dgarrow.WriteError
+		if errors.As(err, &we) {
+			sdk.ExitAppError(err.Error())
+		}
+		// Everything else, including a *dgarrow.TypeViolationError bubbled up
+		// from sink.Add (via decodeRecords' fn callback) and plain JSON
+		// decode errors, is a user data-shape problem.
+		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
+	}
+	client.Log(ctx, "INFO", fmt.Sprintf("Fetched %d records", n))
 
-	if len(records) == 0 {
+	rows, closeResult, err := sink.Finish()
+	if err != nil {
+		// Finish() can replay a buffered pending batch (inference modes) and
+		// discover a *dgarrow.TypeViolationError there for the first time —
+		// that is a user data-shape problem (exit 1), not infrastructure, so
+		// it must NOT fall through to ExitAppError unconditionally. Same
+		// WriteError-first classification as the decode-path above.
+		var we *dgarrow.WriteError
+		if errors.As(err, &we) {
+			sdk.ExitAppError(err.Error())
+		}
+		sdk.ExitUserError(fmt.Sprintf("output table %q: %v", outputTable, err))
+	}
+	if rows == 0 {
 		client.Log(ctx, "WARN", "No records found")
 		if _, err := client.Commit(ctx); err != nil {
 			sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
@@ -156,21 +223,10 @@ func main() {
 		sdk.StatusMessage("extracted 0 records (empty response)")
 		return
 	}
-
-	records = projectRecords(records, compCfg.Fields)
-
-	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
-	if err != nil {
-		sdk.ExitAppError(fmt.Sprintf("failed to open writer: %v", err))
+	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
+	if keys, dropped := sink.UnknownKeys(); dropped > 0 {
+		client.Log(ctx, "WARN", unknownKeysWarning(dropped, keys))
 	}
-	if err := writeJSONL(ctx, writer, records); err != nil {
-		sdk.ExitAppError(fmt.Sprintf("failed to write JSONL: %v", err))
-	}
-	closeResult, err := writer.Close(ctx)
-	if err != nil {
-		sdk.ExitAppError(fmt.Sprintf("failed to close writer: %v", err))
-	}
-	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
 
 	if err := commitAndStatus(ctx, client, compCfg.URL); err != nil {
 		sdk.ExitAppError(err.Error())
@@ -203,11 +259,22 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		}
 	}
 
-	// Open writer for output (uses defaultBucket from config)
-	writer, err := client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_JSONL))
+	// One sink across all pages: the schema is fixed after the first batch
+	// and every batch ships as its own IPC stream/POST.
+	sdkCfg := client.Config() // cheap: rebuilds from the already-fetched proto config, no RPC
+	sink, err := newExtractorSink(ctx, client, outputTable, cfg.Fields, &sdkCfg, cfg.SchemaInference)
 	if err != nil {
-		return fmt.Errorf("failed to open writer: %w", err)
+		// Always a construction-time config problem (e.g. an unrecognized
+		// declared column type), never infrastructure — classified correctly
+		// by main's caller below since it is not a *dgarrow.WriteError.
+		return err
 	}
+	// Unlike main (which os.Exit's and thus skips defers), this function
+	// returns errors, so this defer genuinely runs on every early return —
+	// closing any writer an earlier page already opened before a later
+	// page's failure aborts the run. Finish is idempotent, so this is a
+	// no-op once the normal tail below has already called it.
+	defer finishQuietly(sink)
 
 	client.Log(ctx, "INFO", fmt.Sprintf("Starting paginated extraction from: %s (type=%s, param=%s, page_size=%d)",
 		cfg.URL, pagination.Type, pagination.Param, pagination.PageSize))
@@ -230,39 +297,43 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 
 		client.Log(ctx, "INFO", fmt.Sprintf("Fetching page %d: %s", pageCount+1, pageURL))
 
-		// Fetch page
-		records, err := fetchJSON(ctx, pageURL, cfg.ArrayPath, cfg.Headers)
+		// Fetch + stream-decode the page, feeding the sink. Every decoded
+		// object counts toward pageObjects (for empty/partial-page detection)
+		// but only records under the max_records cap are written.
+		body, err := fetchStream(ctx, pageURL, cfg.Headers)
 		if err != nil {
 			return fmt.Errorf("failed to fetch page %d: %w", pageCount+1, err)
 		}
+		truncated := false
+		pageObjects, err := decodeRecords(body, cfg.ArrayPath, func(rec map[string]any) error {
+			if pagination.MaxRecords > 0 && totalRecords >= pagination.MaxRecords {
+				truncated = true
+				return nil // keep counting the page; stop writing
+			}
+			if err := sink.Add(rec); err != nil {
+				return err
+			}
+			totalRecords++
+			return nil
+		})
+		body.Close()
+		if err != nil {
+			return fmt.Errorf("failed to fetch page %d: %w", pageCount+1, err)
+		}
+		if truncated {
+			client.Log(ctx, "INFO", fmt.Sprintf("Truncating to max records limit: %d", pagination.MaxRecords))
+		}
 
 		// Check if we should stop
-		if len(records) == 0 {
+		if pageObjects == 0 {
 			if pagination.StopWhenEmpty {
 				client.Log(ctx, "INFO", "Received empty page, stopping pagination")
 				break
 			}
 		}
 
-		// Check max records limit
-		recordsToWrite := records
-		if pagination.MaxRecords > 0 && totalRecords+len(records) > pagination.MaxRecords {
-			remaining := pagination.MaxRecords - totalRecords
-			recordsToWrite = records[:remaining]
-			client.Log(ctx, "INFO", fmt.Sprintf("Truncating to max records limit: %d", pagination.MaxRecords))
-		}
-
-		// Write records to output
-		if len(recordsToWrite) > 0 {
-			if err := writeJSONL(ctx, writer, projectRecords(recordsToWrite, cfg.Fields)); err != nil {
-				return fmt.Errorf("failed to write: %w", err)
-			}
-		}
-
-		totalRecords += len(recordsToWrite)
 		pageCount++
-
-		client.Log(ctx, "INFO", fmt.Sprintf("Page %d: fetched %d records (total: %d)", pageCount, len(records), totalRecords))
+		client.Log(ctx, "INFO", fmt.Sprintf("Page %d: fetched %d records (total: %d)", pageCount, pageObjects, totalRecords))
 
 		// Check if we've hit max records
 		if pagination.MaxRecords > 0 && totalRecords >= pagination.MaxRecords {
@@ -271,7 +342,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		}
 
 		// Stop if this page had fewer records than page_size (likely last page)
-		if pagination.PageSize > 0 && len(records) < pagination.PageSize {
+		if pagination.PageSize > 0 && pageObjects < pagination.PageSize {
 			client.Log(ctx, "INFO", "Received partial page, stopping pagination")
 			break
 		}
@@ -280,15 +351,31 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		currentValue += increment
 	}
 
-	// Close writer
-	closeResult, err := writer.Close(ctx)
+	// Flush + close (no-op writer when zero records; commit still runs).
+	rows, closeResult, err := sink.Finish()
 	if err != nil {
-		return fmt.Errorf("failed to close writer: %w", err)
+		// Returned unwrapped: main's pagination-branch classifier (in main())
+		// does the same errors.As(*dgarrow.WriteError) check as the
+		// single-request tail, so a *dgarrow.WriteError still exits
+		// FailedApplication while a *dgarrow.TypeViolationError — discovered
+		// here for the first time if it surfaced while Finish replayed a
+		// buffered pending batch — correctly falls through to FailedUser.
+		return err
 	}
-	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", writer.Bucket(), writer.Table(), closeResult.TotalRows))
+	if rows > 0 {
+		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
+	} else {
+		// Lazy open means zero rows never opened a writer, so there is no
+		// bucket.table to name; log completion against the configured
+		// output table instead of fabricating a bucket.
+		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s: 0 rows", outputTable))
+	}
+	if keys, dropped := sink.UnknownKeys(); dropped > 0 {
+		client.Log(ctx, "WARN", unknownKeysWarning(dropped, keys))
+	}
 
 	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {
-		return err
+		return &dgarrow.WriteError{Err: err}
 	}
 	client.Log(ctx, "INFO", fmt.Sprintf("Paginated extraction completed: %d pages, %d total records", pageCount, totalRecords))
 	return nil
@@ -427,36 +514,6 @@ func resolveOutputTable(tableName, arrayPath string) string {
 	default:
 		return "data"
 	}
-}
-
-// encodeJSONL serializes records as newline-delimited JSON (one object per
-// line). Concatenation-safe: appending two encodeJSONL outputs is still valid
-// JSONL, so coalesced gateway batches parse correctly. HTML escaping is off so
-// values like URLs with & are preserved verbatim.
-func encodeJSONL(records []map[string]any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	for _, rec := range records {
-		if err := enc.Encode(rec); err != nil { // Encode appends a trailing '\n'
-			return nil, fmt.Errorf("marshal record: %w", err)
-		}
-	}
-	return buf.Bytes(), nil
-}
-
-// writeJSONL writes records to the gateway as one JSONL blob. Each Write()
-// payload contains only whole, newline-terminated records (the SDK never
-// splits a payload mid-record), keeping per-POST JSONL parsing safe.
-func writeJSONL(ctx context.Context, w *sdk.Writer, records []map[string]any) error {
-	if len(records) == 0 {
-		return nil
-	}
-	data, err := encodeJSONL(records)
-	if err != nil {
-		return err
-	}
-	return w.Write(ctx, data)
 }
 
 // getColumns extracts sorted column names from records, flattening nested objects.
@@ -654,23 +711,4 @@ func getValueRaw(record map[string]any, path string) any {
 	}
 
 	return current
-}
-
-// projectRecords reshapes each record into a flat object containing only the
-// mapped fields (renamed). An unresolved path (missing key, or an intermediate
-// segment that is a scalar/array/null) yields nil for that field. With no
-// fields, records are returned unchanged.
-func projectRecords(records []map[string]any, fields []FieldMapping) []map[string]any {
-	if len(fields) == 0 {
-		return records
-	}
-	out := make([]map[string]any, len(records))
-	for i, rec := range records {
-		projected := make(map[string]any, len(fields))
-		for _, f := range fields {
-			projected[f.Name] = getValueRaw(rec, f.Path)
-		}
-		out[i] = projected
-	}
-	return out
 }

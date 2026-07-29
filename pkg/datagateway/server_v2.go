@@ -522,11 +522,19 @@ func (s *ServerV2) GetConfig(ctx context.Context, req *pb.GetConfigRequest) (*pb
 
 	// Add explicit output tables
 	for _, t := range s.config.OutputTables {
+		var columns []*pb.ColumnConfig
+		for _, c := range t.Columns {
+			columns = append(columns, &pb.ColumnConfig{
+				Name: c.Name,
+				Type: c.Type,
+			})
+		}
 		outputConfig.Tables = append(outputConfig.Tables, &pb.TableOutputConfig{
 			Name:        t.Name,
 			Bucket:      t.Bucket,
 			WriteMode:   t.WriteMode,
 			LogicalName: t.LogicalName,
+			Columns:     columns,
 		})
 	}
 

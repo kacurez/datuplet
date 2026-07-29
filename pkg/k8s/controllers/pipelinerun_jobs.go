@@ -649,6 +649,16 @@ func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun
 					}
 					entry["partition_fields"] = pfs
 				}
+				if len(tableSpec.Columns) > 0 {
+					cols := make([]map[string]string, len(tableSpec.Columns))
+					for i, cs := range tableSpec.Columns {
+						cols[i] = map[string]string{
+							"name": cs.Name,
+							"type": cs.Type,
+						}
+					}
+					entry["columns"] = cols
+				}
 				outputTables = append(outputTables, entry)
 			}
 		}

@@ -29,7 +29,7 @@ stages:                   # sequential; components within a stage run in paralle
     components:
       - name: gen                     # instance name, unique across the pipeline
         component: data-generator     # registry reference
-        # version: v0.9.1             # optional; omit to use the registry default
+        # version: v0.12.0            # optional; omit to use the registry default
         config:                       # validated against the version's configSchema
           tables:
             - name: events
@@ -65,6 +65,53 @@ rejected outright, with no conversion shim.** The CRD types (`Pipeline`,
 `PipelineRun`) and the operator contract are unchanged; the CR simply stops
 being a user-facing format — `kubectl apply` is no longer how you author a
 pipeline (see the [PUT example](#upload-a-pipeline) below).
+
+### Output column mapping (`outputs.tables[].columns`)
+
+An explicit output table entry (`outputs.tables[]`, as opposed to
+`defaultBucket` dynamic mode) can optionally declare its column set up
+front instead of leaving the producing component to infer one:
+
+```yaml
+outputs:
+  tables:
+    - name: nyc_311_requests
+      bucket: raw
+      writeMode: FULL_LOAD
+      columns:                        # optional; omit to let the producer infer columns from the data
+        - { name: request_id, type: string }
+        - { name: latitude, type: double }
+        - { name: longitude, type: double }
+```
+
+`columns` is `[]{name, type}` (`pkg/pipeline/config.ColumnSpec`, carried
+through the CRD and the Data Gateway's `ComponentConfig.OutputConfig` to the
+SDK as `sdk.OutputTableRef.Columns`); `type` is one of `int`, `long`,
+`float`, `double`, `boolean`, `string` — the same vocabulary
+`sdk/go/arrow.ArrowTypeFor` resolves to Int64/Float64/Boolean/String
+(all nullable). When set, the producing component writes **exactly these
+columns, with these types, for this table, and infers nothing** — a source
+field not in the list is silently excluded, and a mapped column missing
+from a given record is written as null. When omitted (the default), the
+producer infers its own output schema from the data — see each producing
+component's docs, e.g.
+[http-json-extractor](components.md#http-json-extractor).
+
+`columns`' **shape** is validated at `PUT`/`validate` time by the pipeline-doc
+layer (`validateColumnSpec` in `pkg/pipeline/validate/validate.go`): an empty
+or duplicate `name`, or a `type` outside the six-value vocabulary, is a
+`severity: "error"` finding — the same 400-blocks-the-save contract as any
+other PUT-time validation failure (see [API contract](#api-contract) above).
+The CRD's own OpenAPI schema carries the identical `type` enum as a second
+gate for anything applied directly via `kubectl` rather than through the
+API. What the doc layer does **not**, and cannot, check is the mapping
+against actual **data** — that is the producing **component/SDK**'s job, at
+run time: it writes exactly the mapped columns (a source field not in the
+list is silently excluded), writes null for a mapped column missing from a
+given record, and fails the run (exit code 1, `TypeViolationError` naming
+the offending column) when a value does not fit its declared type — a
+class of problem no doc-time check could ever catch, since it depends on
+the data the run actually sees.
 
 ### API contract
 
@@ -450,7 +497,7 @@ make deploy-local
 
 What it does (see the `deploy-local` / `deploy-local-helm` Makefile targets):
 
-1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.9.1`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
+1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.12.0`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
 2. Helm-installs the four charts in phase order, each waited on before the next: `datuplet-operators` (CRDs, RBAC, the CNPG operator), `datuplet-infra` (Postgres cluster, OpenFGA, MinIO), `datuplet-app` (pipeline-api, pipeline-operator, pipeline-observer — with `image.pullPolicy=IfNotPresent` and `components.registry=datuplet` so the built-in ComponentDefinitions point at the locally-built images), then `datuplet-lakekeeper`.
 3. Runs `./scripts/register.sh --namespace datuplet`, which `kubectl exec`s into the `pipeline-api` Pod and runs five idempotent `pipeline-api admin` steps: `lakekeeper-bootstrap` (creates the warehouse + server-admin FGA tuple), `create-user` (default admin `admin@datuplet.local` / `changeme`), `create-project` (default project `default`), `attach-warehouse`, and `grant --role admin`.
 

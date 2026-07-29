@@ -5,6 +5,7 @@ export DOCKER_BUILDKIT=1
 	build build-pipeline-api build-gateway \
 	build-components build-components-e2e build-components-local build-component-data-generator build-operators \
 	build-component-sql-transform build-component-datuplet-query \
+	extractor-local \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
 	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
@@ -90,7 +91,7 @@ build-component-data-generator: ## Build data-generator component image
 # daemon, no GHCR pull. Runtime pull policy is IfNotPresent (the operator's
 # DATUPLET_RUNTIME_PULL_POLICY, wired from image.pullPolicy), so a local tag is
 # all K8s needs. Skips pandas-transform (no build wired anywhere yet).
-COMPONENT_TAG ?= v0.11.0
+COMPONENT_TAG ?= v0.12.0
 
 # Namespace for the k8s-* developer-loop targets (deploy-local installs
 # into `datuplet`; override for e2e clusters: make k8s-reload-crds K8S_NS=datuplet-e2e).
@@ -103,6 +104,25 @@ build-components-local: build-components ## Build + tag built-in component image
 	for c in data-generator sql-transform stdout-writer http-json-extractor finnhub-extractor; do \
 	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
 	done
+
+extractor-local: ## Run http-json-extractor locally against the mock gateway (CONFIG=<component-config.json> [BUCKET=raw] [GRPC_ADDR=localhost:50051] [HTTP_ADDR=localhost:50052]); reports rows + peak RSS (macOS /usr/bin/time -l; on Linux use `command time -v`); aborts fast (no ~20s hang) if GRPC_ADDR is already bound
+ifndef CONFIG
+	$(error CONFIG is required, e.g. make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json)
+endif
+	go build -o bin/mock-datagateway ./cmd/mock-datagateway
+	go build -C components/http-json-extractor -o $(CURDIR)/bin/http-json-extractor-local .
+	@GRPC_ADDR=$(or $(GRPC_ADDR),localhost:50051); \
+	HTTP_ADDR=$(or $(HTTP_ADDR),localhost:50052); \
+	./bin/mock-datagateway -grpc-addr $$GRPC_ADDR -http-addr $$HTTP_ADDR -config $(CONFIG) -bucket $(or $(BUCKET),raw) & \
+	MOCK_PID=$$!; \
+	trap "kill $$MOCK_PID 2>/dev/null" EXIT; \
+	sleep 1; \
+	if ! kill -0 $$MOCK_PID 2>/dev/null; then \
+	  echo "extractor-local: mock-datagateway failed to start on grpc-addr=$$GRPC_ADDR (port already in use?). Retry on free ports, e.g.:" >&2; \
+	  echo "  make extractor-local CONFIG=$(CONFIG) GRPC_ADDR=localhost:51051 HTTP_ADDR=localhost:51052" >&2; \
+	  exit 1; \
+	fi; \
+	DATUPLET_GATEWAY_ADDR=$$GRPC_ADDR /usr/bin/time -l ./bin/http-json-extractor-local
 
 docker-build-operators: ## Build pipeline-operator Docker image
 	docker build -t datuplet/pipeline-operator:latest -f utils/docker/Dockerfile.pipeline-operator .

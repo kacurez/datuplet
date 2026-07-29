@@ -249,6 +249,14 @@ type OutputTableSpec struct {
 	// PartitionFields defines the partition specification for this table.
 	// +optional
 	PartitionFields []PartitionFieldSpec `json:"partitionFields,omitempty"`
+
+	// Columns is an optional explicit column mapping for this output
+	// table. When set, the producing component writes exactly these
+	// columns with these types and infers nothing; when absent, it
+	// infers columns from the data. Enforced by the component/SDK, not
+	// by the gateway.
+	// +optional
+	Columns []ColumnSpec `json:"columns,omitempty"`
 }
 
 // PartitionFieldSpec defines a single partition field.
@@ -260,6 +268,18 @@ type PartitionFieldSpec struct {
 	// Transform is the partition transform to apply.
 	// +kubebuilder:validation:Enum=identity;day;month;year;hour
 	Transform string `json:"transform"`
+}
+
+// ColumnSpec defines a single column's name and type in an explicit
+// output column mapping (see OutputTableSpec.Columns).
+type ColumnSpec struct {
+	// Name is the column name.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Type is the column's data type.
+	// +kubebuilder:validation:Enum=int;long;float;double;boolean;string
+	Type string `json:"type"`
 }
 
 // ProcessorSpec defines a data processor operation
@@ -537,6 +557,11 @@ func (in *OutputTableSpec) DeepCopyInto(out *OutputTableSpec) {
 	if in.PartitionFields != nil {
 		in, out := &in.PartitionFields, &out.PartitionFields
 		*out = make([]PartitionFieldSpec, len(*in))
+		copy(*out, *in)
+	}
+	if in.Columns != nil {
+		in, out := &in.Columns, &out.Columns
+		*out = make([]ColumnSpec, len(*in))
 		copy(*out, *in)
 	}
 }

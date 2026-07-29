@@ -16,7 +16,7 @@ container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
 Image registry: `ghcr.io/kacurez/<name>:<components.tag>` — the tag tracks the
-chart's `components.tag` (the release version; `v0.11.0` in this release).
+chart's `components.tag` (the release version; `v0.12.0` in this release).
 
 ---
 
@@ -146,7 +146,7 @@ These stay component-enforced: the component fails fast at start with exit 1
 Generates random or literal rows inline from pipeline YAML — useful for
 testing pipelines without an external data source.
 
-**Image:** `ghcr.io/kacurez/data-generator:v0.9.1` · **Registry name:**
+**Image:** `ghcr.io/kacurez/data-generator:v0.12.0` · **Registry name:**
 `data-generator` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/data-generator/schema.json`](../components/data-generator/schema.json)
@@ -172,7 +172,7 @@ seeded from SHA-256 of the pair).
 Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports
 single-request and paginated modes.
 
-**Image:** `ghcr.io/kacurez/http-json-extractor:v0.11.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/http-json-extractor:v0.12.0` · **Registry name:**
 `http-json-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/http-json-extractor/schema.json`](../components/http-json-extractor/schema.json)
@@ -199,12 +199,87 @@ config:
       name: country
 ```
 
-**Output format:** the component writes rows as JSONL to the Data Gateway.
-Each record's serialized JSON must be **under 64 KiB** — the gateway's JSONL
-adapter infers the schema from a writer's first chunk using a scanner with a
-64 KiB per-line limit, so a wider single record fails schema inference on
-that first chunk. (Later chunks, once the schema is cached, stream with a much
-larger per-line limit — but the first chunk is what sets the constraint.)
+**Output format:** the component streams **Arrow IPC** to the Data Gateway —
+not JSONL. The 64 KiB JSONL per-line limit from earlier releases no longer
+applies to this component.
+
+**Column typing — typed inference by default.** Each output column gets its
+own Arrow type: joining the kind (integer / float / boolean / string /
+nested) of every value sampled across the first 8192 records, per column,
+resolves it to Int64, Float64, Boolean, or String — an all-integer column
+infers Int64, mixing in a float widens the column to Float64, and any other
+mismatch (or a nested object/array) degrades it to String. A `string`
+column — declared or inferred — keeps a value's **exact source text**
+rather than re-parsing it (`5938028332` stays `5938028332`, `1.50` stays
+`1.50` — no float round-tripping); downstream consumers that need numeric
+operations on a string column (e.g. `sql-transform`) must `CAST` it
+explicitly. Set `schema_inference: strings` to fall back to the
+pre-typed-inference behavior — every column unconditionally a string — the
+escape hatch for a feed too irregular for typed inference to fit reliably.
+
+**Declared output columns.** A pipeline doc can declare, for this
+component's output table, an explicit `{name, type}` column mapping under
+`outputs.tables[].columns` (`int`/`long`/`float`/`double`/`boolean`/`string`
+— see [docs/pipeline-api.md](pipeline-api.md#output-column-mapping-outputstablescolumns)). When
+present it overrides `schema_inference` and column inference entirely: only
+the mapped columns are written, with the mapped types, from every record —
+no sampling, no inference for that table. `fields` still composes with a
+declared mapping: `fields` selects/renames from the source record first, and
+the mapping then types the resulting (already-renamed) columns by name.
+
+**Schema:** with a declared `outputs.tables[].columns` mapping, the output
+columns are exactly the mapped names, in mapped order and type — regardless
+of `fields`/`schema_inference`. Otherwise, with `fields` set, the output
+columns are the projected names, in declared order (typed per
+`schema_inference`). Without either, the schema is the sorted union of
+top-level keys seen across the first 8192 records, fixed for the rest of the
+run (also typed per `schema_inference`).
+
+**Late-column limitation.** Without `fields` or a declared column mapping,
+because the schema is fixed after the first 8192 records, a field that first
+appears later in the response is **not written** — the old buffer-everything
+path did include it. This is the deliberate cost of bounded memory: the
+component never buffers the whole response, only up to one batch's worth of
+records while it infers columns. Mitigation: the run logs one `WARN` naming
+the dropped field(s) (capped at 64 distinct names — the affected-record
+count itself is always exact) and the number of affected records. If the
+response's shape is not uniform within its first 8192 records, set `fields`
+explicitly (or declare `outputs.tables[].columns`) so every column you need
+is guaranteed from record one. See
+[docs/known-limitations.md](known-limitations.md).
+
+**Late-type-violation limitation (typed inference and declared columns
+only).** A later value that no longer fits its column's already-fixed Arrow
+type — e.g. a column of `1, 2, 3` followed later by `"n/a"` — fails the run
+(exit code 1) naming the offending column, rather than being coerced or
+silently dropped. Mitigation: declare that column as `string` in
+`outputs.tables[].columns`, or set `schema_inference: strings` to sidestep
+type-fit failures entirely. See [docs/known-limitations.md](known-limitations.md).
+
+**Compatibility caveat.** Writing into a **pre-existing table whose emitted
+schema does not match it** — a different column set, or the same column
+name now inferred/declared with a different Arrow type than the table
+already has — fails Iceberg's schema check, for both `APPEND` and
+`FULL_LOAD` — `ReplaceDataFiles` (used by `FULL_LOAD`) replaces the table's
+data files, not its catalog schema. Use a fresh table name, declare
+`outputs.tables[].columns` to pin a stable schema across runs, or drop the
+old table first.
+
+**Local debugging.** `make extractor-local
+CONFIG=cmd/mock-datagateway/example-nyc311.json` builds and runs the real
+binary against a mock Data Gateway, reporting rows written and peak RSS. The
+target's default ports (`GRPC_ADDR=localhost:50051`, `HTTP_ADDR=localhost:50052`)
+can already be bound by something else — on macOS, Canonical Multipass commonly
+holds port 50051 via launchd. The target detects this and aborts fast (rather
+than hanging) with a suggested override; pass your own, e.g.:
+
+```bash
+make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json \
+  GRPC_ADDR=localhost:51051 HTTP_ADDR=localhost:51052
+```
+
+Real measured example: 200,000 rows streamed in 25 batches at roughly 94 MB
+peak RSS.
 
 ---
 
@@ -213,7 +288,7 @@ larger per-line limit — but the first chunk is what sets the constraint.)
 Fetches market data from the [Finnhub](https://finnhub.io/) API. Requires a
 Finnhub API key.
 
-**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.9.1` · **Registry name:**
+**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.12.0` · **Registry name:**
 `finnhub-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/finnhub-extractor/schema.json`](../components/finnhub-extractor/schema.json).
@@ -245,7 +320,7 @@ Data Gateway via Arrow IPC and are materialized into DuckDB tables before the SQ
 runs. Outputs are written back through the Data Gateway; no S3 credentials touch
 the component.
 
-**Image:** `ghcr.io/kacurez/sql-transform:v0.9.1` · **Registry name:**
+**Image:** `ghcr.io/kacurez/sql-transform:v0.12.0` · **Registry name:**
 `sql-transform` · **IO:** `{inputs: required, outputs: required}`
 
 **Config schema:** [`components/sql-transform/schema.json`](../components/sql-transform/schema.json)
@@ -284,7 +359,7 @@ Applies a sequence of pandas operations to input data. Reads the input table as
 CSV from the Data Gateway, applies the operations in order, and writes the
 result back as CSV — no S3 or Lakekeeper credentials touch the component.
 
-**Image:** `ghcr.io/kacurez/pandas-transform:v0.9.1` · **Registry name:**
+**Image:** `ghcr.io/kacurez/pandas-transform:v0.12.0` · **Registry name:**
 `pandas-transform` · **IO:** `{inputs: required, outputs: required}`
 
 **Config schema:** [`components/pandas-transform/schema.json`](../components/pandas-transform/schema.json)
@@ -305,7 +380,7 @@ skipped rather than failing the run.
 Reads input tables and prints them to stdout. For debugging only — no Iceberg
 output.
 
-**Image:** `ghcr.io/kacurez/stdout-writer:v0.9.1` · **Registry name:**
+**Image:** `ghcr.io/kacurez/stdout-writer:v0.12.0` · **Registry name:**
 `stdout-writer` · **IO:** `{inputs: required, outputs: none}`
 
 **Config schema:** [`components/stdout-writer/schema.json`](../components/stdout-writer/schema.json)
@@ -356,6 +431,19 @@ Use the Go SDK (`sdk/go/`) or Python SDK (`sdk/python/`) to build a component.
 Both SDKs are ~200–300 LOC and expose three operations: `OpenWriter`,
 `WriteChunk` / `Write`, and `Close`. The SDKs handle gRPC connection, config
 resolution, and secret delivery from the Data Gateway sidecar.
+
+Go components can opt into writer-side Arrow output via the `sdk/go/arrow`
+module: `StringSink` batches records into self-contained IPC streams as an
+all-String `RecordBuilder`, with optional first-batch schema inference when
+you don't supply explicit columns. `InferringSink` is the typed sibling —
+it infers one Arrow type per column from the first batch, or writes an
+exact declared column set (name + type, via the module's `ArrowTypeFor`
+vocabulary) with `WithTypedColumns`. Either sink's `Add`/`Finish` can return
+a `TypeViolationError` for a value that no longer fits its column's type —
+a user-error condition (map it to `sdk.ExitUserError`, not `ExitAppError`).
+Both are the writer-side counterpart of that module's existing Arrow reader
+(used by `sql-transform` to stream Arrow-IPC inputs); base `sdk/go` stays
+Arrow-free.
 
 Write a `schema.json` next to your parser, following the Form Subset rules
 above, and register it as a `ComponentDefinition` with the appropriate `io`

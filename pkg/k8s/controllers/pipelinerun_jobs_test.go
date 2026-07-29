@@ -335,6 +335,108 @@ func TestGenerateGatewayConfig_NestedConfig(t *testing.T) {
 	}
 }
 
+// TestGenerateGatewayConfig_OutputTableColumns proves the operator carries
+// each output table's explicit column mapping (name+type) into the gateway
+// sidecar's output_tables[].columns entries, and — just as importantly —
+// omits the "columns" key entirely for a table that declares no mapping
+// (the absence is the producer's signal to infer, so a present-but-empty
+// key would be a different, wrong thing to emit). The sibling
+// partition_fields hop is exercised by the same fixture/assertions since
+// it is a trivial addition to the same table-driven shape.
+func TestGenerateGatewayConfig_OutputTableColumns(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+	pr := minimalPipelineRun()
+
+	comp := &datupletv1.ComponentSpec{
+		Name:      "c1",
+		Component: "comp-a",
+		Outputs: &datupletv1.OutputSpec{
+			Tables: []datupletv1.OutputTableSpec{
+				{
+					Name: "with_columns", Bucket: "curated", WriteMode: "APPEND",
+					Columns: []datupletv1.ColumnSpec{
+						{Name: "id", Type: "int"},
+						{Name: "note", Type: "string"},
+					},
+				},
+				{
+					Name: "no_columns", Bucket: "curated", WriteMode: "APPEND",
+				},
+				{
+					Name: "with_partition", Bucket: "curated", WriteMode: "APPEND",
+					PartitionFields: []datupletv1.PartitionFieldSpec{
+						{SourceColumn: "created", Transform: "day"},
+					},
+				},
+			},
+		},
+	}
+
+	y, err := r.generateGatewayConfig(pr, pipeline, comp)
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(y), &doc); err != nil {
+		t.Fatalf("generated YAML did not parse: %v\ngot:\n%s", err, y)
+	}
+	rawTables, ok := doc["output_tables"].([]any)
+	if !ok || len(rawTables) != 3 {
+		t.Fatalf("output_tables missing or wrong length; got %T (%v)\ndoc:\n%s", doc["output_tables"], doc["output_tables"], y)
+	}
+	byName := make(map[string]map[string]any, len(rawTables))
+	for _, rt := range rawTables {
+		tbl, ok := rt.(map[string]any)
+		if !ok {
+			t.Fatalf("output_tables entry is not a map[string]any; got %T\ndoc:\n%s", rt, y)
+		}
+		name, _ := tbl["name"].(string)
+		byName[name] = tbl
+	}
+
+	// WITH columns: name+type carried through, in declared order.
+	withCols, ok := byName["with_columns"]
+	if !ok {
+		t.Fatalf("output_tables missing entry %q\ndoc:\n%s", "with_columns", y)
+	}
+	cols, ok := withCols["columns"].([]any)
+	if !ok || len(cols) != 2 {
+		t.Fatalf("with_columns.columns missing or wrong length; got %T (%v)\ndoc:\n%s", withCols["columns"], withCols["columns"], y)
+	}
+	if first, _ := cols[0].(map[string]any); first["name"] != "id" || first["type"] != "int" {
+		t.Errorf("columns[0] = %v, want {name: id, type: int}\ndoc:\n%s", first, y)
+	}
+	if second, _ := cols[1].(map[string]any); second["name"] != "note" || second["type"] != "string" {
+		t.Errorf("columns[1] = %v, want {name: note, type: string}\ndoc:\n%s", second, y)
+	}
+
+	// WITHOUT columns: the "columns" key must be absent entirely (not
+	// present-but-empty) so the gateway/SDK sees "no explicit mapping".
+	noCols, ok := byName["no_columns"]
+	if !ok {
+		t.Fatalf("output_tables missing entry %q\ndoc:\n%s", "no_columns", y)
+	}
+	if v, present := noCols["columns"]; present {
+		t.Errorf("no_columns table should omit the \"columns\" key entirely; got %v\ndoc:\n%s", v, y)
+	}
+
+	// Sibling hop, included because it's trivially covered by the same
+	// fixture/assertion shape: partition_fields carried through the same way.
+	withPart, ok := byName["with_partition"]
+	if !ok {
+		t.Fatalf("output_tables missing entry %q\ndoc:\n%s", "with_partition", y)
+	}
+	pfs, ok := withPart["partition_fields"].([]any)
+	if !ok || len(pfs) != 1 {
+		t.Fatalf("with_partition.partition_fields missing or wrong length; got %T (%v)\ndoc:\n%s", withPart["partition_fields"], withPart["partition_fields"], y)
+	}
+	if pf, _ := pfs[0].(map[string]any); pf["source_column"] != "created" || pf["transform"] != "day" {
+		t.Errorf("partition_fields[0] = %v, want {source_column: created, transform: day}\ndoc:\n%s", pf, y)
+	}
+}
+
 // TestGenerateGatewayConfig_PipelineAPIJWKSURL: when both LakekeeperURL
 // and PipelineAPIURL are set, the operator injects pipeline_api_jwks_url
 // into the DG sidecar configMap. The path is trimmed of any trailing slash
