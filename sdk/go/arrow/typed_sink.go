@@ -36,19 +36,31 @@ type WriteError struct{ Err error }
 func (e *WriteError) Error() string { return e.Err.Error() }
 func (e *WriteError) Unwrap() error { return e.Err }
 
-// sinkSettings collects the effect of every SinkOption. NewSink and
-// NewStringSink each start from their own DefaultBatchRows-seeded
-// sinkSettings and apply the given opts: NewSink only ever reads batchRows
-// back (it has no use for columns), NewStringSink is the sole consumer of
-// columns.
+// sinkSettings collects the effect of every SinkOption. NewSink,
+// NewStringSink, and NewInferringSink (inferring_sink.go) each start from
+// their own DefaultBatchRows-seeded sinkSettings and apply the given opts:
+// NewSink only ever reads batchRows back (it has no use for columns or
+// typedColumns), NewStringSink reads columns, and NewInferringSink reads
+// both columns (WithColumns: explicit names, inferred types) and
+// typedColumns (WithTypedColumns: declared names AND types) — the two are
+// mutually exclusive there.
 type sinkSettings struct {
 	batchRows int
 	columns   *columnPlan
+	// typedColumns holds WithTypedColumns' argument for InferringSink's
+	// declared-columns mode (inferring_sink.go). A pointer so a
+	// caller-supplied EMPTY slice still counts as "the option was given",
+	// distinguishable from "not given" (nil) — the same reason columns
+	// above is itself a pointer rather than a plain slice/value.
+	typedColumns *[]TypedColumn
 }
 
-// SinkOption configures a Sink or StringSink at construction. The two share
-// one option type so WithBatchRows behaves identically for both; WithColumns
-// (declared alongside StringSink) is meaningful only to NewStringSink.
+// SinkOption configures a Sink, StringSink, or InferringSink at
+// construction. They share one option type so WithBatchRows behaves
+// identically for all three; WithColumns (declared alongside StringSink) is
+// meaningful to NewStringSink and NewInferringSink; WithTypedColumns
+// (declared alongside InferringSink, inferring_sink.go) is meaningful only
+// to NewInferringSink.
 type SinkOption func(*sinkSettings)
 
 // WithBatchRows overrides DefaultBatchRows (values <= 0 are ignored).

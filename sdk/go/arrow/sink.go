@@ -70,8 +70,10 @@ func planFromBatch(batch []map[string]any) *columnPlan {
 // WithColumns fixes the output columns explicitly: names in declared order,
 // each row's value for column i pulled by extract(rec, i). names is copied,
 // so later caller mutation cannot desynchronize the plan from the built
-// schema (public API defensiveness). Meaningful only to NewStringSink —
-// NewSink's schema is supplied directly and ignores this option.
+// schema (public API defensiveness). Meaningful to NewStringSink and to
+// NewInferringSink's explicit-names/inferred-types mode
+// (inferring_sink.go); NewSink's schema is supplied directly and ignores
+// this option.
 func WithColumns(names []string, extract func(rec map[string]any, i int) any) SinkOption {
 	return func(s *sinkSettings) {
 		s.columns = &columnPlan{names: append([]string(nil), names...), extract: extract}
