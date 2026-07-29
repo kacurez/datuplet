@@ -105,6 +105,13 @@ func (e *WriteError) Unwrap() error { return e.Err }
 //
 // The writer is opened lazily on the first flush: zero records = no writer,
 // letting callers preserve their commit-empty path.
+//
+// Unknown keys: for an INFERRED plan (schema fixed from the first batch, no
+// WithColumns), a later record carrying a key outside that fixed schema has
+// that value silently dropped. UnknownKeys reports the (capped) distinct
+// names and the exact affected-record count so callers can warn instead of
+// losing data silently. Explicit WithColumns plans never track this — an
+// extra key there is a deliberate projection choice, not a defect.
 type StringSink struct {
 	ctx         context.Context
 	open        func() (ChunkWriter, error)
@@ -119,7 +126,16 @@ type StringSink struct {
 	finished    bool
 	failed      error
 	closeResult *sdk.CloseResult
+
+	inferredNames  map[string]struct{} // non-nil only when the plan was inferred (planFromBatch)
+	unknownKeys    map[string]struct{} // distinct unknown key names, capped at maxTrackedUnknownKeys
+	unknownRecords int64               // records carrying >=1 unknown key (exact, never capped)
 }
+
+// maxTrackedUnknownKeys bounds memory for StringSink.unknownKeys: a
+// pathological feed with many distinct unexpected keys cannot grow the
+// tracked-name set without bound. unknownRecords stays exact regardless.
+const maxTrackedUnknownKeys = 64
 
 // SinkOption configures a StringSink at construction.
 type SinkOption func(*StringSink)
@@ -151,19 +167,31 @@ func NewStringSink(ctx context.Context, open func() (ChunkWriter, error), opts .
 		opt(s)
 	}
 	if s.plan != nil {
-		s.adoptPlan(s.plan)
+		// WithColumns already set s.plan: an explicit projection, not inferred.
+		s.adoptPlan(s.plan, false)
 	}
 	return s
 }
 
-// adoptPlan fixes the schema and creates the builder.
-func (s *StringSink) adoptPlan(p *columnPlan) {
+// adoptPlan fixes the schema and creates the builder. inferred marks a plan
+// derived from planFromBatch (as opposed to an explicit WithColumns plan);
+// only then does the sink track unknown-key drops (trackUnknownKeys /
+// UnknownKeys) — an explicit plan's extra keys are a deliberate projection,
+// not a defect worth warning about.
+func (s *StringSink) adoptPlan(p *columnPlan, inferred bool) {
 	s.plan = p
 	fieldsArr := make([]arrow.Field, len(p.names))
 	for i, n := range p.names {
 		fieldsArr[i] = arrow.Field{Name: n, Type: arrow.BinaryTypes.String, Nullable: true}
 	}
 	s.builder = array.NewRecordBuilder(s.alloc, arrow.NewSchema(fieldsArr, nil))
+	if inferred {
+		names := make(map[string]struct{}, len(p.names))
+		for _, n := range p.names {
+			names[n] = struct{}{}
+		}
+		s.inferredNames = names
+	}
 }
 
 // releaseBuilder idempotently releases the builder (nil-safe).
@@ -198,7 +226,7 @@ func (s *StringSink) Add(rec map[string]any) error {
 		if len(s.pending) < s.batchRows {
 			return nil
 		}
-		s.adoptPlan(planFromBatch(s.pending))
+		s.adoptPlan(planFromBatch(s.pending), true)
 		for _, p := range s.pending {
 			s.appendRow(p)
 		}
@@ -222,8 +250,56 @@ func (s *StringSink) appendRow(rec map[string]any) {
 			b.Append(cell)
 		}
 	}
+	if s.inferredNames != nil {
+		s.trackUnknownKeys(rec)
+	}
 	s.inBatch++
 	s.rows++
+}
+
+// trackUnknownKeys records, for an inferred plan only, any of rec's keys
+// that fall outside the fixed schema — those values were just silently
+// dropped by appendRow (the schema was fixed from an earlier batch), and
+// this is how callers learn about it via UnknownKeys. Allocation-free when
+// every key is already known.
+func (s *StringSink) trackUnknownKeys(rec map[string]any) {
+	sawUnknown := false
+	for k := range rec {
+		if _, ok := s.inferredNames[k]; ok {
+			continue
+		}
+		sawUnknown = true
+		if _, seen := s.unknownKeys[k]; seen {
+			continue
+		}
+		if len(s.unknownKeys) >= maxTrackedUnknownKeys {
+			continue
+		}
+		if s.unknownKeys == nil {
+			s.unknownKeys = make(map[string]struct{})
+		}
+		s.unknownKeys[k] = struct{}{}
+	}
+	if sawUnknown {
+		s.unknownRecords++
+	}
+}
+
+// UnknownKeys returns the distinct key names (sorted, capped at
+// maxTrackedUnknownKeys) seen outside an INFERRED schema, plus the exact
+// count of records that carried at least one such key. Always (nil, 0) for
+// an explicit WithColumns plan: there the caller chose the projection
+// deliberately, so extra keys are not a data-loss defect.
+func (s *StringSink) UnknownKeys() (keys []string, records int64) {
+	if len(s.unknownKeys) == 0 {
+		return nil, s.unknownRecords
+	}
+	keys = make([]string, 0, len(s.unknownKeys))
+	for k := range s.unknownKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, s.unknownRecords
 }
 
 // flush serializes the current batch as a complete IPC stream (schema +
@@ -275,7 +351,7 @@ func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
 	defer s.releaseBuilder()
 
 	if s.plan == nil && len(s.pending) > 0 {
-		s.adoptPlan(planFromBatch(s.pending))
+		s.adoptPlan(planFromBatch(s.pending), true)
 		for _, p := range s.pending {
 			s.appendRow(p)
 		}

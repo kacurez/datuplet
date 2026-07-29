@@ -36,3 +36,15 @@ func newExtractorSink(ctx context.Context, client *sdk.Client, outputTable strin
 		return client.OpenWriter(ctx, outputTable, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
 	}, opts...)
 }
+
+// finishQuietly calls sink.Finish() and discards the result. It exists
+// because sdk.ExitUserError/ExitAppError call os.Exit, which skips all of
+// main's deferred cleanup — so an already-opened gateway writer (e.g. a
+// single-request fetch that streamed past the first batch, flushed once,
+// then hit a decode error in the malformed tail) would otherwise be left
+// open. Call this immediately before any sdk.Exit* that can run after the
+// sink was constructed. Finish is idempotent, so a later real Finish call
+// (or another finishQuietly call) is a harmless no-op.
+func finishQuietly(sink *dgarrow.StringSink) {
+	_, _, _ = sink.Finish()
+}

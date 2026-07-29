@@ -151,11 +151,13 @@ func main() {
 
 	body, err := fetchStream(ctx, compCfg.URL, compCfg.Headers)
 	if err != nil {
+		finishQuietly(sink) // sink may already own an open writer; os.Exit skips defers
 		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
 	}
 	n, err := decodeRecords(body, compCfg.ArrayPath, sink.Add)
 	body.Close()
 	if err != nil {
+		finishQuietly(sink)
 		var we *dgarrow.WriteError
 		if errors.As(err, &we) {
 			sdk.ExitAppError(err.Error())
@@ -177,6 +179,9 @@ func main() {
 		return
 	}
 	client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
+	if keys, dropped := sink.UnknownKeys(); dropped > 0 {
+		client.Log(ctx, "WARN", fmt.Sprintf("output schema was fixed from the first %d records; %d later record(s) carried field(s) missing from that schema and those values were NOT written: %v", dgarrow.DefaultBatchRows, dropped, keys))
+	}
 
 	if err := commitAndStatus(ctx, client, compCfg.URL); err != nil {
 		sdk.ExitAppError(err.Error())
@@ -212,6 +217,12 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 	// One sink across all pages: the schema is fixed after the first batch
 	// and every batch ships as its own IPC stream/POST.
 	sink := newExtractorSink(ctx, client, outputTable, cfg.Fields)
+	// Unlike main (which os.Exit's and thus skips defers), this function
+	// returns errors, so this defer genuinely runs on every early return —
+	// closing any writer an earlier page already opened before a later
+	// page's failure aborts the run. Finish is idempotent, so this is a
+	// no-op once the normal tail below has already called it.
+	defer finishQuietly(sink)
 
 	client.Log(ctx, "INFO", fmt.Sprintf("Starting paginated extraction from: %s (type=%s, param=%s, page_size=%d)",
 		cfg.URL, pagination.Type, pagination.Param, pagination.PageSize))
@@ -295,6 +306,14 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 	}
 	if rows > 0 {
 		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))
+	} else {
+		// Lazy open means zero rows never opened a writer, so there is no
+		// bucket.table to name; log completion against the configured
+		// output table instead of fabricating a bucket.
+		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s: 0 rows", outputTable))
+	}
+	if keys, dropped := sink.UnknownKeys(); dropped > 0 {
+		client.Log(ctx, "WARN", fmt.Sprintf("output schema was fixed from the first %d records; %d later record(s) carried field(s) missing from that schema and those values were NOT written: %v", dgarrow.DefaultBatchRows, dropped, keys))
 	}
 
 	if err := commitAndStatus(ctx, client, cfg.URL); err != nil {

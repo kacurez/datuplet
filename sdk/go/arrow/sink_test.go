@@ -479,3 +479,88 @@ func TestStringSink_CellValuesAndNullability(t *testing.T) {
 		t.Fatalf("row 1 col 4 (missing): want null, got non-null '%v'", *row1[4])
 	}
 }
+
+// --- appended in Fix Round 1 (Finding I2: unknown-key tracking) ---
+
+func TestStringSink_InferredPlanReportsUnknownKeys(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(2))
+	// First batch (2 records) fixes the schema to {a, b}.
+	if err := sink.Add(map[string]any{"a": "1", "b": "2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Add(map[string]any{"a": "3", "b": "4"}); err != nil {
+		t.Fatal(err)
+	}
+	// Third record introduces key "c", outside the fixed schema.
+	if err := sink.Add(map[string]any{"a": "5", "c": "unexpected"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sink.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	keys, n := sink.UnknownKeys()
+	if n != 1 {
+		t.Fatalf("unknown records = %d, want 1", n)
+	}
+	if len(keys) != 1 || keys[0] != "c" {
+		t.Fatalf("unknown keys = %v, want [c]", keys)
+	}
+	// The emitted payload(s) must still only carry the fixed schema
+	// columns — "c"'s value was dropped, not appended as a new column.
+	for _, p := range fw.payloads {
+		_, names, _ := ipcRows(t, p)
+		if len(names) != 2 || names[0] != "a" || names[1] != "b" {
+			t.Fatalf("schema leaked unknown column: %v", names)
+		}
+	}
+}
+
+func TestStringSink_ExplicitColumnsNeverReportsUnknownKeys(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
+		WithBatchRows(4))
+	// Records carry an extra "extra" key never requested by WithColumns —
+	// this is a deliberate projection, not a data-loss defect, so it must
+	// never surface as an unknown-key warning.
+	if err := sink.Add(map[string]any{"id": "1", "extra": "ignored"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sink.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	keys, n := sink.UnknownKeys()
+	if n != 0 || len(keys) != 0 {
+		t.Fatalf("explicit-columns plan must never report unknown keys, got keys=%v n=%d", keys, n)
+	}
+}
+
+func TestStringSink_UnknownKeysCapHoldsRecordCountExact(t *testing.T) {
+	fw := &fakeWriter{}
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(1))
+	// First record alone fixes the schema to {"a"} (batchRows=1).
+	if err := sink.Add(map[string]any{"a": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	// Feed more records than the 64-name cap, each introducing a distinct
+	// unknown key, so every one of them counts toward unknownRecords even
+	// though the tracked-name set is capped.
+	const extra = 100
+	for i := 0; i < extra; i++ {
+		key := fmt.Sprintf("unknown_%03d", i)
+		if err := sink.Add(map[string]any{"a": "x", key: "y"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := sink.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	keys, n := sink.UnknownKeys()
+	if n != extra {
+		t.Fatalf("unknown records = %d, want %d (exact, uncapped)", n, extra)
+	}
+	if len(keys) != maxTrackedUnknownKeys {
+		t.Fatalf("tracked unknown keys = %d, want capped at %d", len(keys), maxTrackedUnknownKeys)
+	}
+}
