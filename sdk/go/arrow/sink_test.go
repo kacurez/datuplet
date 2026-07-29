@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	sdk "github.com/datuplet/datuplet/sdk/go"
 )
@@ -113,10 +115,60 @@ func ipcRows(t *testing.T, payload []byte) (int64, []string, []arrow.Field) {
 	if err == nil {
 		t.Fatalf("trailing byte after IPC stream: %d", remaining)
 	}
-	if err.Error() != "EOF" {
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("reading after IPC stream: %v", err)
 	}
 	return rows, names, fields
+}
+
+// ipcCells parses one IPC payload and returns the decoded cell values.
+// Returns a 2D grid: rows[rowIndex][colIndex] where each cell is a *string:
+// - nil means the Arrow value is null
+// - non-nil pointer contains the exact string value
+func ipcCells(t *testing.T, payload []byte, colNames []string) [][]*string {
+	t.Helper()
+	br := bytes.NewReader(payload)
+	rd, err := ipc.NewReader(br)
+	if err != nil {
+		t.Fatalf("payload is not a valid IPC stream: %v", err)
+	}
+	defer rd.Release()
+
+	var allCells [][]*string
+	for rd.Next() {
+		rec := rd.Record()
+		numCols := int(rec.NumCols())
+		numRows := rec.NumRows()
+
+		// Build a row for each record row
+		for rowIdx := int64(0); rowIdx < numRows; rowIdx++ {
+			rowCells := make([]*string, numCols)
+			for colIdx := 0; colIdx < numCols; colIdx++ {
+				col := rec.Column(colIdx)
+				strCol := col.(*array.String)
+				if strCol.IsNull(int(rowIdx)) {
+					rowCells[colIdx] = nil
+				} else {
+					val := strCol.Value(int(rowIdx))
+					rowCells[colIdx] = &val
+				}
+			}
+			allCells = append(allCells, rowCells)
+		}
+		rec.Release()
+	}
+	if rd.Err() != nil {
+		t.Fatalf("ipc read: %v", rd.Err())
+	}
+	// Verify no trailing bytes
+	remaining, err := br.ReadByte()
+	if err == nil {
+		t.Fatalf("trailing byte after IPC stream: %d", remaining)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("reading after IPC stream: %v", err)
+	}
+	return allCells
 }
 
 func TestStringSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
@@ -320,17 +372,34 @@ func TestStringSink_WriteFailureIsStickyAndDropsNoRowsSilently(t *testing.T) {
 func TestStringSink_CellValuesAndNullability(t *testing.T) {
 	fw := &fakeWriter{}
 	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithColumns([]string{"a", "b"}, func(rec map[string]any, i int) any {
-			if i == 0 {
-				return rec["a"]
-			}
-			return rec["b"]
-		}),
-		WithBatchRows(2))
-	// Add records with a missing key to verify null handling
+		WithColumns([]string{"num", "str", "bool", "empty", "missing"},
+			func(rec map[string]any, i int) any {
+				colNames := []string{"num", "str", "bool", "empty", "missing"}
+				return rec[colNames[i]]
+			}),
+		WithBatchRows(10))
+
+	// Carefully crafted records to verify:
+	// 1. json.Number with exact source text (not normalized)
+	// 2. Plain strings
+	// 3. Bool as true/false
+	// 4. Null for missing key (not empty string)
+	// 5. Distinction between null and empty string
 	recs := []map[string]any{
-		{"a": json.Number("1"), "b": "x"},
-		{"a": "y"}, // b is missing => null
+		{
+			"num": json.Number("5938028332"),
+			"str": "hello",
+			"bool": true,
+			"empty": "",
+			"missing": nil, // explicitly null
+		},
+		{
+			"num": json.Number("1.50"),
+			"str": "world",
+			"bool": false,
+			"empty": "", // empty string
+			// "missing" key absent => null
+		},
 	}
 	for _, r := range recs {
 		if err := sink.Add(r); err != nil {
@@ -344,20 +413,69 @@ func TestStringSink_CellValuesAndNullability(t *testing.T) {
 	if len(fw.payloads) != 1 {
 		t.Fatalf("payloads = %d, want 1", len(fw.payloads))
 	}
+
+	// Verify schema
 	n, names, fields := ipcRows(t, fw.payloads[0])
 	if n != 2 {
 		t.Fatalf("rows = %d, want 2", n)
 	}
-	if len(names) != 2 || names[0] != "a" || names[1] != "b" {
-		t.Fatalf("schema = %v, want [a b]", names)
+	wantNames := []string{"num", "str", "bool", "empty", "missing"}
+	if len(names) != 5 || names[0] != "num" || names[1] != "str" || names[2] != "bool" ||
+	   names[3] != "empty" || names[4] != "missing" {
+		t.Fatalf("schema = %v, want %v", names, wantNames)
 	}
-	// Verify field types and nullability
+	// Verify all fields are String and Nullable
 	for i, f := range fields {
 		if f.Type.ID() != arrow.STRING {
-			t.Fatalf("field %d type = %v, want String", i, f.Type)
+			t.Fatalf("field %d (%s) type = %v, want String", i, f.Name, f.Type)
 		}
 		if !f.Nullable {
-			t.Fatalf("field %d should be Nullable", i)
+			t.Fatalf("field %d (%s) should be Nullable", i, f.Name)
 		}
+	}
+
+	// Verify cell values and nullability
+	cells := ipcCells(t, fw.payloads[0], names)
+	if len(cells) != 2 {
+		t.Fatalf("parsed rows = %d, want 2", len(cells))
+	}
+
+	// Row 0: all values present (including explicitly null)
+	row0 := cells[0]
+	if row0[0] == nil || *row0[0] != "5938028332" {
+		t.Fatalf("row 0 col 0 (num): want non-null '5938028332', got %v", row0[0])
+	}
+	if row0[1] == nil || *row0[1] != "hello" {
+		t.Fatalf("row 0 col 1 (str): want non-null 'hello', got %v", row0[1])
+	}
+	if row0[2] == nil || *row0[2] != "true" {
+		t.Fatalf("row 0 col 2 (bool): want non-null 'true', got %v", row0[2])
+	}
+	// Distinguish: empty string is not null
+	if row0[3] == nil || *row0[3] != "" {
+		t.Fatalf("row 0 col 3 (empty): want non-null empty string, got %v", row0[3])
+	}
+	// Explicitly null value
+	if row0[4] != nil {
+		t.Fatalf("row 0 col 4 (missing explicit null): want null, got %v", *row0[4])
+	}
+
+	// Row 1: missing key should be null (not empty string)
+	row1 := cells[1]
+	if row1[0] == nil || *row1[0] != "1.50" {
+		t.Fatalf("row 1 col 0 (num): want non-null '1.50' (exact source text), got %v", row1[0])
+	}
+	if row1[1] == nil || *row1[1] != "world" {
+		t.Fatalf("row 1 col 1 (str): want non-null 'world', got %v", row1[1])
+	}
+	if row1[2] == nil || *row1[2] != "false" {
+		t.Fatalf("row 1 col 2 (bool): want non-null 'false', got %v", row1[2])
+	}
+	if row1[3] == nil || *row1[3] != "" {
+		t.Fatalf("row 1 col 3 (empty): want non-null empty string, got %v", row1[3])
+	}
+	// Missing key => null (not empty string)
+	if row1[4] != nil {
+		t.Fatalf("row 1 col 4 (missing): want null, got non-null '%v'", *row1[4])
 	}
 }
