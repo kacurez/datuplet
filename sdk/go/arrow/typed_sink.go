@@ -214,8 +214,16 @@ func (s *Sink) flush() error {
 // opened. Zero rows ever added means the writer is never opened, and Finish
 // returns (0, nil, nil). Idempotent: a second call returns the same result
 // without double-closing the writer.
+//
+// Sticky failure: the failure is usually raised by a failed
+// ChunkWriter.Write inside flush(), which means the writer had already been
+// opened successfully. So Finish makes a best-effort attempt to close it
+// exactly once — see closeAfterFailure — and then returns the original
+// sticky error unchanged: a close error on an already-broken writer is
+// noise next to the first, diagnostically useful failure.
 func (s *Sink) Finish() (int64, *sdk.CloseResult, error) {
 	if s.failed != nil {
+		s.closeAfterFailure()
 		return s.rows, nil, s.failed
 	}
 	if s.finished {
@@ -236,6 +244,23 @@ func (s *Sink) Finish() (int64, *sdk.CloseResult, error) {
 	}
 	s.closeResult = cr
 	return s.rows, cr, nil
+}
+
+// closeAfterFailure makes a best-effort attempt to close the writer exactly
+// once after a sticky failure, discarding any close error: the original
+// sticky failure returned by Finish is the diagnostically useful one, and a
+// close error on an already-broken writer would only be noise in its place.
+// No-op if no writer was ever opened (the lazy-open guarantee: a sink that
+// failed before its first flush must not open or close anything) or if this
+// has already run once (guarded by the same finished flag Finish otherwise
+// uses to mark its own terminal state — reachable only here once s.failed
+// is set, since Finish's normal success path is unreachable afterward).
+func (s *Sink) closeAfterFailure() {
+	if s.finished || s.writer == nil {
+		return
+	}
+	s.finished = true
+	_, _ = s.writer.Close(s.ctx)
 }
 
 // Writer exposes the opened writer (nil until the first successful flush

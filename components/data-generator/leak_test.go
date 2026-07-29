@@ -105,24 +105,21 @@ func TestFinishRandomQuietly_ClosesWriterBeforeExit(t *testing.T) {
 	}
 }
 
-// TestFinishRandomQuietly_SafeAfterFailedFlush documents (rather than
-// "fixes", see report) the behavior of runRandom's `defer
-// finishRandomQuietly(sink)` for the other leak scenario in scope: a
-// sibling table's failure cancels the shared run context (main.go:90), and
-// this table's own next flush then fails too — which is how every one of
-// runRandom's own non-injection error returns arises, since both of its
-// error-return sites are dgarrow.Sink failures. dgarrow.Sink.Finish()
-// short-circuits on a prior failure (sdk/go/arrow/typed_sink.go:217-220)
-// WITHOUT calling the underlying writer's Close — by design (see the
-// Sink's sticky-failure doc comment), and http-json-extractor's identical
-// finishQuietly/defer adoption of the same core has the same property. So
-// for this path, our fix guarantees Finish is at least *called* (matching
-// the reviewed, established pattern; before this change nothing was called
-// on any error return) and that repeated calls stay safe — not that the
-// gateway-side writer resource gets an explicit Close RPC once a flush has
-// already failed. This test proves both are true: after a failed flush, a
-// subsequent finishRandomQuietly does not close the writer and is safe to
-// call more than once.
+// TestFinishRandomQuietly_SafeAfterFailedFlush proves the behavior of
+// runRandom's `defer finishRandomQuietly(sink)` for the other leak scenario
+// in scope: a sibling table's failure cancels the shared run context
+// (main.go:90), and this table's own next flush then fails too — which is
+// how every one of runRandom's own non-injection error returns arises,
+// since both of its error-return sites are dgarrow.Sink failures.
+// dgarrow.Sink.Finish() makes a single best-effort attempt to close the
+// writer once a prior failure is sticky (the failure normally comes from a
+// failed writer.Write, so the writer was already open, and leaving it
+// unclosed would dangle the gateway-side writer session), while still
+// returning the original sticky write error to the caller unchanged.
+// http-json-extractor's identical finishQuietly/defer adoption of the same
+// core shares this property. This test proves: after a failed flush, a
+// subsequent finishRandomQuietly closes the writer exactly once, and
+// repeated calls stay safe (no double-close).
 func TestFinishRandomQuietly_SafeAfterFailedFlush(t *testing.T) {
 	fw := &fakeChunkWriter{}
 	sink := dgarrow.NewSink(context.Background(), func() (dgarrow.ChunkWriter, error) {
@@ -149,14 +146,14 @@ func TestFinishRandomQuietly_SafeAfterFailedFlush(t *testing.T) {
 	// makes on this return path.
 	finishRandomQuietly(sink)
 
-	if fw.closeCalls != 0 {
-		t.Fatalf("dgarrow.Sink does not close the writer once sticky-failed (documented core behavior); got closeCalls=%d", fw.closeCalls)
+	if fw.closeCalls != 1 {
+		t.Fatalf("dgarrow.Sink makes a best-effort close of the already-opened writer after a sticky failure; got closeCalls=%d, want 1", fw.closeCalls)
 	}
 
 	// Still must be safe to call again (e.g. if runRandom's own explicit
-	// call site and its defer both run).
+	// call site and its defer both run) — exactly one close, not two.
 	finishRandomQuietly(sink)
-	if fw.closeCalls != 0 {
-		t.Fatalf("repeated finishRandomQuietly after failure must stay a no-op, got closeCalls=%d", fw.closeCalls)
+	if fw.closeCalls != 1 {
+		t.Fatalf("repeated finishRandomQuietly after failure must not double-close, got closeCalls=%d, want 1", fw.closeCalls)
 	}
 }

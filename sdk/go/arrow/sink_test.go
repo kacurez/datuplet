@@ -364,8 +364,46 @@ func TestStringSink_WriteFailureIsStickyAndDropsNoRowsSilently(t *testing.T) {
 	if len(fw.payloads) != 1 {
 		t.Fatalf("payloads = %d, want 1 (second batch never sent after write failed)", len(fw.payloads))
 	}
-	if fw.closeCount != 0 {
-		t.Fatalf("closeCount = %d, want 0 (writer never successfully closed after failure)", fw.closeCount)
+	// The sticky failure came from a failed writer.Write, so the writer was
+	// already open; Finish makes one best-effort attempt to close it so the
+	// gateway-side writer session doesn't dangle, while still returning the
+	// original write error (asserted above) to the caller unchanged.
+	if fw.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (best-effort close of the already-opened writer after a sticky failure)", fw.closeCount)
+	}
+}
+
+// --- appended in Fix Round 1 (close writer on sticky-failure Finish) ---
+
+// TestStringSink_FinishClosesWriterOnStickyWriteFailure proves the same
+// close-after-failure fix has teeth through the StringSink façade, which
+// http-json-extractor actually uses: StringSink.Finish used to short-circuit
+// on a sticky failure by returning core.rows/core.failed directly, bypassing
+// core.Finish() (and therefore its close-after-failure) entirely.
+func TestStringSink_FinishClosesWriterOnStickyWriteFailure(t *testing.T) {
+	fw := &fakeWriter{failWriteOn: 2} // fail on the second flush's Write call
+	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
+		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
+		WithBatchRows(2))
+
+	var writeErr error
+	for i := 0; i < 4; i++ {
+		err := sink.Add(map[string]any{"id": fmt.Sprintf("%d", i)})
+		if i == 3 {
+			writeErr = err
+		}
+	}
+	var we *WriteError
+	if !errors.As(writeErr, &we) {
+		t.Fatalf("Add(3) want WriteError, got %v", writeErr)
+	}
+
+	_, _, finishErr := sink.Finish()
+	if finishErr != writeErr {
+		t.Fatalf("Finish error = %v, want the original sticky write error %v unchanged", finishErr, writeErr)
+	}
+	if fw.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (writer was opened, so Finish must close it best-effort after the sticky failure)", fw.closeCount)
 	}
 }
 

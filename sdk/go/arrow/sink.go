@@ -259,7 +259,12 @@ func (s *StringSink) UnknownKeys() (keys []string, records int64) {
 // call returns the same result without double-closing.
 func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
 	if s.core != nil && s.core.failed != nil {
-		return s.core.rows, nil, s.core.failed
+		// Route through the core's own Finish rather than returning its
+		// failed/rows fields directly: that is what makes the core's
+		// best-effort close-on-sticky-failure (Sink.closeAfterFailure)
+		// actually run for this façade, instead of only for direct Sink
+		// callers.
+		return s.core.Finish()
 	}
 	if s.finished {
 		if s.core == nil {
@@ -274,7 +279,10 @@ func (s *StringSink) Finish() (int64, *sdk.CloseResult, error) {
 		for _, p := range pending {
 			s.appendRow(p)
 			if err := s.core.RowDone(); err != nil {
-				return s.core.rows, nil, err
+				// Same reasoning as above: go through Finish so a failure
+				// discovered while replaying pending rows still gets the
+				// best-effort close.
+				return s.core.Finish()
 			}
 		}
 	}

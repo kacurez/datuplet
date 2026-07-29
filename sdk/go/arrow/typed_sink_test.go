@@ -265,8 +265,12 @@ func TestSink_WriteFailureIsStickyAndDropsNoRowsSilently(t *testing.T) {
 	if len(fw.payloads) != 1 {
 		t.Fatalf("payloads = %d, want 1 (second batch never sent after write failed)", len(fw.payloads))
 	}
-	if fw.closeCount != 0 {
-		t.Fatalf("closeCount = %d, want 0 (writer never successfully closed after failure)", fw.closeCount)
+	// The sticky failure came from a failed writer.Write, so the writer was
+	// already open; Finish makes one best-effort attempt to close it so the
+	// gateway-side writer session doesn't dangle, while still returning the
+	// original write error (asserted above) to the caller unchanged.
+	if fw.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (best-effort close of the already-opened writer after a sticky failure)", fw.closeCount)
 	}
 }
 
@@ -293,6 +297,101 @@ func TestSink_BytesShippedAgreesWithWriterReceipts(t *testing.T) {
 	}
 	if got := sink.BytesShipped(); got != want {
 		t.Fatalf("BytesShipped() = %d, want %d (sum of fake writer's received payload lengths)", got, want)
+	}
+}
+
+// --- appended in Fix Round 1 (close writer on sticky-failure Finish) ---
+
+// TestSink_FinishClosesWriterOnStickyWriteFailure proves Finish's
+// close-after-failure fix has teeth: the common failure path is a Write
+// call failing mid-run inside flush() (not a Close failure), which means
+// the writer was already opened successfully. Finish must still return the
+// original write error unchanged, but must also make a best-effort attempt
+// to close that already-opened writer instead of leaving it dangling.
+func TestSink_FinishClosesWriterOnStickyWriteFailure(t *testing.T) {
+	fw := &fakeWriter{failWriteOn: 2} // fail on the second flush's Write call
+	sink := NewSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, typedTestSchema(), WithBatchRows(2))
+
+	// First batch: flush succeeds (first Write call), opening the writer.
+	appendTypedRow(sink.Builder(), 0, 0, true, "x")
+	if err := sink.RowDone(); err != nil {
+		t.Fatalf("RowDone(0): %v", err)
+	}
+	appendTypedRow(sink.Builder(), 1, 1, true, "x")
+	if err := sink.RowDone(); err != nil {
+		t.Fatalf("RowDone(1): %v", err)
+	}
+
+	// Second batch: flush's Write call fails -> sticky failure.
+	appendTypedRow(sink.Builder(), 2, 2, true, "x")
+	if err := sink.RowDone(); err != nil {
+		t.Fatalf("RowDone(2) should succeed (batch not full yet), got: %v", err)
+	}
+	appendTypedRow(sink.Builder(), 3, 3, true, "x")
+	writeErr := sink.RowDone()
+	var we *WriteError
+	if !errors.As(writeErr, &we) {
+		t.Fatalf("RowDone(3) want WriteError, got %v", writeErr)
+	}
+
+	_, _, finishErr := sink.Finish()
+	if finishErr != writeErr {
+		t.Fatalf("Finish error = %v, want the original sticky write error %v unchanged", finishErr, writeErr)
+	}
+	if fw.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (writer was opened, so Finish must close it best-effort after the sticky failure)", fw.closeCount)
+	}
+}
+
+// TestSink_FinishTwiceAfterFailureClosesOnlyOnce proves the close-once
+// guard: the maintainer's own code calls Finish twice on the failure path
+// (a deferred best-effort finish, plus an explicit one), and the gateway's
+// own writer is not guaranteed idempotent under a second Close, so double
+// closing on repeated Finish calls is a real hazard, not a theoretical one.
+func TestSink_FinishTwiceAfterFailureClosesOnlyOnce(t *testing.T) {
+	fw := &fakeWriter{failWriteOn: 1} // fail on the very first Write call
+	sink := NewSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, typedTestSchema(), WithBatchRows(1))
+
+	appendTypedRow(sink.Builder(), 0, 0, true, "x")
+	writeErr := sink.RowDone()
+	if writeErr == nil {
+		t.Fatal("RowDone should fail on the first Write call")
+	}
+
+	_, _, err1 := sink.Finish()
+	_, _, err2 := sink.Finish()
+	if err1 != writeErr || err2 != writeErr {
+		t.Fatalf("Finish errors = %v, %v, want both = original sticky error %v", err1, err2, writeErr)
+	}
+	if fw.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (two Finish calls after failure must not double-close)", fw.closeCount)
+	}
+}
+
+// TestSink_FinishAfterOpenFailureNeverAttemptsClose proves the lazy-open
+// guarantee holds even in the failure-close path: a sink that fails before
+// its first flush (writer-open itself fails, so s.writer is nil) must not
+// call Close on anything — there is nothing to close, and doing so would
+// either panic (nil ChunkWriter) or spuriously touch an unrelated writer.
+func TestSink_FinishAfterOpenFailureNeverAttemptsClose(t *testing.T) {
+	fw := &fakeWriter{} // never handed to the sink; any Close on it would be a bug
+	sink := NewSink(context.Background(), func() (ChunkWriter, error) {
+		return nil, errors.New("open boom")
+	}, typedTestSchema(), WithBatchRows(1))
+
+	appendTypedRow(sink.Builder(), 1, 1.0, true, "x")
+	if err := sink.RowDone(); err == nil {
+		t.Fatal("RowDone should fail on open error")
+	}
+	if sink.Writer() != nil {
+		t.Fatal("writer must stay nil after an open failure")
+	}
+
+	if _, _, err := sink.Finish(); err == nil {
+		t.Fatal("Finish should return the sticky open error")
+	}
+	if fw.closeCount != 0 {
+		t.Fatalf("closeCount = %d, want 0 (writer was never opened, so Finish must never attempt a close)", fw.closeCount)
 	}
 }
 
