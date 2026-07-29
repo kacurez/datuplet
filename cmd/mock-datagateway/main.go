@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -39,8 +40,8 @@ type writerState struct {
 	rows          int64
 	batches       int64
 	bytes         int64
-	schema        string   // "name:type, ..." label of the first payload (logging)
-	schemaNames   []string // first payload's column names — later payloads must match
+	schema        string   // "name:type[?], ..." label of the first payload (logging)
+	schemaFields  []string // first payload's per-column "name:type[?]" signature (name+type+nullability) — later payloads must match exactly
 }
 
 type mockGateway struct {
@@ -141,14 +142,17 @@ func (g *mockGateway) Log(ctx context.Context, req *pb.LogRequest) (*pb.LogRespo
 }
 
 // validateSchema enforces the extractor's output contract on every payload:
-// all columns Arrow String (utf8), and — when the component config declares a
-// fields projection — exactly the declared column names, in order. A
-// violation fails the write (HTTP 500 / gRPC error), so the local proof
-// cannot silently pass with wrong output.
+// all columns Arrow String (utf8) and Nullable:true, and — when the
+// component config declares a fields projection — exactly the declared
+// column names, in order. A violation fails the write (HTTP 500 / gRPC
+// error), so the local proof cannot silently pass with wrong output.
 func (g *mockGateway) validateSchema(sch *arrow.Schema) error {
 	for _, f := range sch.Fields() {
 		if f.Type.ID() != arrow.STRING {
 			return fmt.Errorf("schema violation: column %q is %s, want utf8 (all-String contract)", f.Name, f.Type)
+		}
+		if !f.Nullable {
+			return fmt.Errorf("schema violation: column %q is not nullable, want Nullable:true (all-String contract)", f.Name)
 		}
 	}
 	if len(g.expectCols) > 0 {
@@ -164,11 +168,23 @@ func (g *mockGateway) validateSchema(sch *arrow.Schema) error {
 	return nil
 }
 
-// ingest parses one payload as a complete Arrow IPC stream, validates its
-// schema against the contract, counts its rows, and records the schema on
-// first sight.
+// ingest parses one payload as a complete, standalone Arrow IPC stream —
+// exactly one schema message + record batch(es) + EOS, with nothing after
+// it — validates its schema against the contract, counts its rows, and
+// records the schema on first sight.
+//
+// Two defects this must catch (both silent data loss in the real gateway if
+// unnoticed): (1) a payload that is a valid IPC stream followed by MORE
+// bytes (a second concatenated stream, or garbage) — the ipc reader treats
+// its own EOS marker as a clean end-of-input and never looks past it, so
+// this can only be caught by explicitly checking the underlying reader for
+// leftover bytes; (2) a payload that parses fine but carries zero rows —
+// the sink is designed to never flush an empty batch (flush() returns early
+// at inBatch == 0), so a zero-row POST always indicates a caller bug, never
+// legitimate output.
 func (g *mockGateway) ingest(writerID string, data []byte) (int64, error) {
-	rd, err := ipc.NewReader(bytes.NewReader(data))
+	br := bytes.NewReader(data)
+	rd, err := ipc.NewReader(br)
 	if err != nil {
 		return 0, fmt.Errorf("payload is not a valid Arrow IPC stream: %w", err)
 	}
@@ -183,12 +199,34 @@ func (g *mockGateway) ingest(writerID string, data []byte) (int64, error) {
 	if rd.Err() != nil {
 		return 0, fmt.Errorf("ipc read: %w", rd.Err())
 	}
+	// The ipc reader stops exactly at the stream's EOS marker; anything br
+	// still has unread past that point is trailing data — a second
+	// concatenated IPC stream or garbage — which must fail the write rather
+	// than silently counting only the first stream's rows (this is the
+	// exact concatenated-stream defect the mock exists to catch; see
+	// sdk/go/client.go's OpenWriterToBucket comment on the gen-big-pipeline
+	// regression, and the equivalent check in sdk/go/arrow/sink_test.go's
+	// ipcRows helper).
+	if _, err := br.ReadByte(); err == nil {
+		return 0, fmt.Errorf("payload is not a single self-contained Arrow IPC stream: %d trailing byte(s) after EOS (concatenated streams are invalid — exactly one IPC stream per POST)", br.Len()+1)
+	} else if !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("checking payload for trailing bytes: %w", err)
+	}
+	if rows == 0 {
+		return 0, fmt.Errorf("payload carries zero rows (empty IPC stream or zero-row record batch) — the sink never flushes an empty batch, so this indicates a component bug")
+	}
 
-	names := make([]string, 0, rd.Schema().NumFields())
+	// labeled is this payload's full per-column signature — name, type, and
+	// nullability — used both for the first-sight schema log line and as
+	// the per-writer drift lock (below): later payloads on the same writer
+	// must match it exactly, not just column names.
 	labeled := make([]string, 0, rd.Schema().NumFields())
 	for _, f := range rd.Schema().Fields() {
-		names = append(names, f.Name)
-		labeled = append(labeled, f.Name+":"+f.Type.String())
+		label := f.Name + ":" + f.Type.String()
+		if f.Nullable {
+			label += "?"
+		}
+		labeled = append(labeled, label)
 	}
 
 	g.mu.Lock()
@@ -197,15 +235,16 @@ func (g *mockGateway) ingest(writerID string, data []byte) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("unknown writer: %s", writerID)
 	}
-	if ws.schemaNames == nil {
+	if ws.schemaFields == nil {
 		// First payload for this writer: lock its schema. Later payloads
-		// must match exactly — catches cross-batch schema drift even for
-		// no-`fields` configs (where expectCols is empty).
-		ws.schemaNames = names
+		// must match exactly (name, type, AND nullability) — catches
+		// cross-batch schema drift even for no-`fields` configs (where
+		// expectCols is empty).
+		ws.schemaFields = labeled
 		ws.schema = strings.Join(labeled, ", ")
 		log.Printf("mock-dg: writer %s schema: [%s]", writerID, ws.schema)
-	} else if !slices.Equal(ws.schemaNames, names) {
-		return 0, fmt.Errorf("schema violation: writer %s column drift: first %v, now %v", writerID, ws.schemaNames, names)
+	} else if !slices.Equal(ws.schemaFields, labeled) {
+		return 0, fmt.Errorf("schema violation: writer %s column drift: first [%s], now [%s]", writerID, strings.Join(ws.schemaFields, ", "), strings.Join(labeled, ", "))
 	}
 	ws.rows += rows
 	ws.batches++
