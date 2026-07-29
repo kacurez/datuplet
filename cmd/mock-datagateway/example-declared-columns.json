@@ -1,0 +1,9 @@
+{
+  "url": "https://jsonplaceholder.typicode.com/posts",
+  "table_name": "posts_declared",
+  "output_columns": [
+    {"name": "id", "type": "int"},
+    {"name": "userId", "type": "int"},
+    {"name": "title", "type": "string"}
+  ]
+}

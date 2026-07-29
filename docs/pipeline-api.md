@@ -66,6 +66,42 @@ rejected outright, with no conversion shim.** The CRD types (`Pipeline`,
 being a user-facing format — `kubectl apply` is no longer how you author a
 pipeline (see the [PUT example](#upload-a-pipeline) below).
 
+### Output column mapping (`outputs.tables[].columns`)
+
+An explicit output table entry (`outputs.tables[]`, as opposed to
+`defaultBucket` dynamic mode) can optionally declare its column set up
+front instead of leaving the producing component to infer one:
+
+```yaml
+outputs:
+  tables:
+    - name: nyc_311_requests
+      bucket: raw
+      writeMode: FULL_LOAD
+      columns:                        # optional; omit to let the producer infer columns from the data
+        - { name: request_id, type: string }
+        - { name: latitude, type: double }
+        - { name: longitude, type: double }
+```
+
+`columns` is `[]{name, type}` (`pkg/pipeline/config.ColumnSpec`, carried
+through the CRD and the Data Gateway's `ComponentConfig.OutputConfig` to the
+SDK as `sdk.OutputTableRef.Columns`); `type` is one of `int`, `long`,
+`float`, `double`, `boolean`, `string` — the same vocabulary
+`sdk/go/arrow.ArrowTypeFor` resolves to Int64/Float64/Boolean/String
+(all nullable). When set, the producing component writes **exactly these
+columns, with these types, for this table, and infers nothing** — a source
+field not in the list is silently excluded, and a mapped column missing
+from a given record is written as null. When omitted (the default), the
+producer infers its own output schema from the data — see each producing
+component's docs, e.g.
+[http-json-extractor](components.md#http-json-extractor).
+
+`columns` is validated and enforced by the **producing component/SDK**, not
+by the Data Gateway or the pipeline-doc schema layer — an unrecognized
+`type` string is a component-level config error at run start (exit code 1),
+not a `PUT`/`validate` finding.
+
 ### API contract
 
 | Endpoint | Behavior |

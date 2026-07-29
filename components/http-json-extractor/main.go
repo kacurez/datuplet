@@ -49,6 +49,14 @@ type Config struct {
 	Headers    map[string]string `json:"headers"`
 	Pagination *PaginationConfig `json:"pagination"`
 	Fields     []FieldMapping    `json:"fields"`
+
+	// SchemaInference selects the output column typing when no
+	// outputs.tables[].columns mapping applies (see columns.go's
+	// newExtractorSink): "typed" (default, including "") infers a per-column
+	// Arrow type from the first batch; "strings" is the compatibility
+	// escape hatch restoring the pre-typed-inference all-String behavior. A
+	// declared mapping overrides this entirely, in either case.
+	SchemaInference string `json:"schema_inference"`
 }
 
 // columnNameRe validates author-controlled projected output-column names.
@@ -58,6 +66,12 @@ var columnNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 func ParseAndValidate(cfg *Config) error {
 	if cfg.URL == "" {
 		return fmt.Errorf("config.url is required")
+	}
+	switch cfg.SchemaInference {
+	case "", schemaInferenceTyped, schemaInferenceStrings:
+		// ok — "" defaults to schemaInferenceTyped at sink-construction time.
+	default:
+		return fmt.Errorf("config.schema_inference %q must be %q or %q", cfg.SchemaInference, schemaInferenceTyped, schemaInferenceStrings)
 	}
 	seen := make(map[string]bool, len(cfg.Fields))
 	for i, f := range cfg.Fields {
@@ -161,7 +175,12 @@ func main() {
 	// Single-request mode.
 	client.Log(ctx, "INFO", fmt.Sprintf("Fetching JSON from: %s", compCfg.URL))
 
-	sink := newExtractorSink(ctx, client, outputTable, compCfg.Fields)
+	sink, err := newExtractorSink(ctx, client, outputTable, compCfg.Fields, &cfg, compCfg.SchemaInference)
+	if err != nil {
+		// Always a construction-time config problem (e.g. an unrecognized
+		// declared column type) — never infrastructure. See newExtractorSink.
+		sdk.ExitUserError(err.Error())
+	}
 
 	body, err := fetchStream(ctx, compCfg.URL, compCfg.Headers)
 	if err != nil {
@@ -176,13 +195,25 @@ func main() {
 		if errors.As(err, &we) {
 			sdk.ExitAppError(err.Error())
 		}
+		// Everything else, including a *dgarrow.TypeViolationError bubbled up
+		// from sink.Add (via decodeRecords' fn callback) and plain JSON
+		// decode errors, is a user data-shape problem.
 		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
 	}
 	client.Log(ctx, "INFO", fmt.Sprintf("Fetched %d records", n))
 
 	rows, closeResult, err := sink.Finish()
 	if err != nil {
-		sdk.ExitAppError(err.Error())
+		// Finish() can replay a buffered pending batch (inference modes) and
+		// discover a *dgarrow.TypeViolationError there for the first time —
+		// that is a user data-shape problem (exit 1), not infrastructure, so
+		// it must NOT fall through to ExitAppError unconditionally. Same
+		// WriteError-first classification as the decode-path above.
+		var we *dgarrow.WriteError
+		if errors.As(err, &we) {
+			sdk.ExitAppError(err.Error())
+		}
+		sdk.ExitUserError(fmt.Sprintf("output table %q: %v", outputTable, err))
 	}
 	if rows == 0 {
 		client.Log(ctx, "WARN", "No records found")
@@ -230,7 +261,14 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 
 	// One sink across all pages: the schema is fixed after the first batch
 	// and every batch ships as its own IPC stream/POST.
-	sink := newExtractorSink(ctx, client, outputTable, cfg.Fields)
+	sdkCfg := client.Config() // cheap: rebuilds from the already-fetched proto config, no RPC
+	sink, err := newExtractorSink(ctx, client, outputTable, cfg.Fields, &sdkCfg, cfg.SchemaInference)
+	if err != nil {
+		// Always a construction-time config problem (e.g. an unrecognized
+		// declared column type), never infrastructure — classified correctly
+		// by main's caller below since it is not a *dgarrow.WriteError.
+		return err
+	}
 	// Unlike main (which os.Exit's and thus skips defers), this function
 	// returns errors, so this defer genuinely runs on every early return —
 	// closing any writer an earlier page already opened before a later
@@ -316,7 +354,13 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 	// Flush + close (no-op writer when zero records; commit still runs).
 	rows, closeResult, err := sink.Finish()
 	if err != nil {
-		return err // already a *dgarrow.WriteError → main exits FailedApplication
+		// Returned unwrapped: main's pagination-branch classifier (in main())
+		// does the same errors.As(*dgarrow.WriteError) check as the
+		// single-request tail, so a *dgarrow.WriteError still exits
+		// FailedApplication while a *dgarrow.TypeViolationError — discovered
+		// here for the first time if it surfaced while Finish replayed a
+		// buffered pending batch — correctly falls through to FailedUser.
+		return err
 	}
 	if rows > 0 {
 		client.Log(ctx, "INFO", fmt.Sprintf("Completed output %s.%s: %d rows", sink.Writer().Bucket(), sink.Writer().Table(), closeResult.TotalRows))

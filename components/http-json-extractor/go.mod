@@ -3,13 +3,13 @@ module github.com/datuplet/datuplet/components/http-json-extractor
 go 1.25.7
 
 require (
+	github.com/apache/arrow-go/v18 v18.6.0
 	github.com/datuplet/datuplet v0.0.0
 	github.com/datuplet/datuplet/sdk/go v0.0.0
 	github.com/datuplet/datuplet/sdk/go/arrow v0.0.0
 )
 
 require (
-	github.com/apache/arrow-go/v18 v18.6.0 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/klauspost/compress v1.18.6 // indirect

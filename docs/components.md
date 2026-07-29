@@ -203,33 +203,67 @@ config:
 not JSONL. The 64 KiB JSONL per-line limit from earlier releases no longer
 applies to this component.
 
-Every emitted column is a **string**. Nested objects and arrays are rendered
-as compact JSON text; numbers keep their exact source text rather than being
-re-parsed as floats (`5938028332` stays `5938028332`, `1.50` stays `1.50` — no
-float round-tripping). Downstream consumers that need numeric operations
-(e.g. `sql-transform`) must `CAST` the column explicitly.
+**Column typing — typed inference by default.** Each output column gets its
+own Arrow type: joining the kind (integer / float / boolean / string /
+nested) of every value sampled across the first 8192 records, per column,
+resolves it to Int64, Float64, Boolean, or String — an all-integer column
+infers Int64, mixing in a float widens the column to Float64, and any other
+mismatch (or a nested object/array) degrades it to String. A `string`
+column — declared or inferred — keeps a value's **exact source text**
+rather than re-parsing it (`5938028332` stays `5938028332`, `1.50` stays
+`1.50` — no float round-tripping); downstream consumers that need numeric
+operations on a string column (e.g. `sql-transform`) must `CAST` it
+explicitly. Set `schema_inference: strings` to fall back to the
+pre-typed-inference behavior — every column unconditionally a string — the
+escape hatch for a feed too irregular for typed inference to fit reliably.
 
-**Schema:** with `fields` set, the output columns are the projected names, in
-declared order. Without `fields`, the schema is the sorted union of top-level
-keys seen across the first 8192 records, fixed for the rest of the run.
+**Declared output columns.** A pipeline doc can declare, for this
+component's output table, an explicit `{name, type}` column mapping under
+`outputs.tables[].columns` (`int`/`long`/`float`/`double`/`boolean`/`string`
+— see [docs/pipeline-api.md](pipeline-api.md#output-column-mapping-outputstablescolumns)). When
+present it overrides `schema_inference` and column inference entirely: only
+the mapped columns are written, with the mapped types, from every record —
+no sampling, no inference for that table. `fields` still composes with a
+declared mapping: `fields` selects/renames from the source record first, and
+the mapping then types the resulting (already-renamed) columns by name.
 
-**Late-column limitation.** Without `fields`, because the schema is fixed
-after the first 8192 records, a field that first appears later in the
-response is **not written** — the old buffer-everything path did include it.
-This is the deliberate cost of bounded memory: the component never buffers
-the whole response, only up to one batch's worth of records while it infers
-columns. Mitigation: the run logs one `WARN` naming the dropped field(s)
-(capped at 64 distinct names — the affected-record count itself is always
-exact) and the number of affected records. If the response's shape is not
-uniform within its first 8192 records, set `fields` explicitly so every
-column you need is guaranteed from record one. See
+**Schema:** with a declared `outputs.tables[].columns` mapping, the output
+columns are exactly the mapped names, in mapped order and type — regardless
+of `fields`/`schema_inference`. Otherwise, with `fields` set, the output
+columns are the projected names, in declared order (typed per
+`schema_inference`). Without either, the schema is the sorted union of
+top-level keys seen across the first 8192 records, fixed for the rest of the
+run (also typed per `schema_inference`).
+
+**Late-column limitation.** Without `fields` or a declared column mapping,
+because the schema is fixed after the first 8192 records, a field that first
+appears later in the response is **not written** — the old buffer-everything
+path did include it. This is the deliberate cost of bounded memory: the
+component never buffers the whole response, only up to one batch's worth of
+records while it infers columns. Mitigation: the run logs one `WARN` naming
+the dropped field(s) (capped at 64 distinct names — the affected-record
+count itself is always exact) and the number of affected records. If the
+response's shape is not uniform within its first 8192 records, set `fields`
+explicitly (or declare `outputs.tables[].columns`) so every column you need
+is guaranteed from record one. See
 [docs/known-limitations.md](known-limitations.md).
 
-**Compatibility caveat.** Writing into a **pre-existing table with typed
-(non-string) columns** fails Iceberg's schema check, for both `APPEND` and
+**Late-type-violation limitation (typed inference and declared columns
+only).** A later value that no longer fits its column's already-fixed Arrow
+type — e.g. a column of `1, 2, 3` followed later by `"n/a"` — fails the run
+(exit code 1) naming the offending column, rather than being coerced or
+silently dropped. Mitigation: declare that column as `string` in
+`outputs.tables[].columns`, or set `schema_inference: strings` to sidestep
+type-fit failures entirely. See [docs/known-limitations.md](known-limitations.md).
+
+**Compatibility caveat.** Writing into a **pre-existing table whose emitted
+schema does not match it** — a different column set, or the same column
+name now inferred/declared with a different Arrow type than the table
+already has — fails Iceberg's schema check, for both `APPEND` and
 `FULL_LOAD` — `ReplaceDataFiles` (used by `FULL_LOAD`) replaces the table's
-data files, not its catalog schema. Use a fresh table name, or drop the old
-table first.
+data files, not its catalog schema. Use a fresh table name, declare
+`outputs.tables[].columns` to pin a stable schema across runs, or drop the
+old table first.
 
 **Local debugging.** `make extractor-local
 CONFIG=cmd/mock-datagateway/example-nyc311.json` builds and runs the real

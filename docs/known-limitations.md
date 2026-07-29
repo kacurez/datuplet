@@ -307,22 +307,38 @@ upgrading.
 
 ## http-json-extractor
 
-**Late-arriving fields are dropped when `fields` is not set (Arrow-IPC
-output).** Without an explicit `fields` projection, the output schema is the
-sorted union of top-level keys seen across the first 8192 records, fixed for
-the rest of the run — the component never buffers the whole HTTP response.
-A field that first appears in a later record is outside that fixed schema,
-so its value is **not written** into the Arrow output, with a run-level WARN
-after finish; the old buffer-everything path did include it. This is the
+**Late-arriving fields are dropped when neither `fields` nor a declared
+column mapping is set (Arrow-IPC output).** Still true in both schema-typing
+modes (`schema_inference: typed`, the default, and `schema_inference:
+strings`): without an explicit `fields` projection or an
+`outputs.tables[].columns` mapping, the output schema is the sorted union of
+top-level keys seen across the first 8192 records, fixed for the rest of the
+run — the component never buffers the whole HTTP response. A field that
+first appears in a later record is outside that fixed schema, so its value
+is **not written** into the Arrow output, with a run-level WARN after
+finish; the old buffer-everything path did include it. This is the
 deliberate cost of bounded memory, not a bug.
 
 Mitigation: the run logs one `WARN` naming the dropped field(s) — capped at
 64 distinct names, though the affected-record count is always exact — via
-`StringSink.UnknownKeys()`. If the response's shape is not uniform within its
+the sink's `UnknownKeys()`. If the response's shape is not uniform within its
 first 8192 records (e.g. optional fields that only start appearing later),
-set `fields` explicitly so every column you need is guaranteed from record
-one, instead of relying on schema inference. See
-[docs/components.md](components.md#http-json-extractor).
+set `fields` explicitly (or declare `outputs.tables[].columns`) so every
+column you need is guaranteed from record one, instead of relying on schema
+inference. See [docs/components.md](components.md#http-json-extractor).
+
+**A later type violation fails the run (typed inference and declared
+columns only).** Once a column's Arrow type is fixed — by first-batch
+inference under the default `schema_inference: typed`, or by an
+`outputs.tables[].columns` declaration — a later value that no longer fits
+it (e.g. a numeric column followed later by a non-numeric string) fails the
+run with exit code 1, naming the offending column; it is not coerced,
+truncated, or silently dropped, and it is not the `strings` mode's escape
+hatch working — this is a distinct failure mode. Mitigation: declare
+`outputs.tables[].columns` with `string` for any column whose values are not
+reliably one JSON kind, or set `schema_inference: strings` so every column
+is a string unconditionally and no value can ever violate a numeric/boolean
+type. See [docs/components.md](components.md#http-json-extractor).
 
 ---
 

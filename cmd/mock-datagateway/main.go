@@ -9,6 +9,14 @@
 // the local machine, override with -grpc-addr/-http-addr (the
 // `make extractor-local` target exposes these as GRPC_ADDR/HTTP_ADDR).
 //
+// The component config file (-config) may optionally carry a top-level
+// "output_columns": [{"name":..., "type":...}] array — a mock-only
+// convenience for exercising the extractor's DECLARED output-column-mapping
+// mode locally. When present, GetConfig serves it back as a single
+// OutputConfig.Tables entry (mirroring outputs.tables[].columns from a real
+// pipeline doc) for the table the mock resolves the same way the component
+// does: table_name > array_path > "data".
+//
 // Dev/test tool only — NOT a deployment surface.
 package main
 
@@ -47,14 +55,15 @@ type writerState struct {
 type mockGateway struct {
 	pb.UnimplementedDataGatewayServer
 
-	mu         sync.Mutex
-	cfgBytes   []byte
-	bucket     string
-	writeMode  string
-	httpBase   string
-	nextID     int
-	writers    map[string]*writerState
-	expectCols []string // from the config's fields[].name; empty = names not enforced
+	mu           sync.Mutex
+	cfgBytes     []byte
+	bucket       string
+	writeMode    string
+	httpBase     string
+	nextID       int
+	writers      map[string]*writerState
+	expectCols   []string                // from the config's fields[].name; empty = names not enforced
+	outputTables []*pb.TableOutputConfig // from the config's optional output_columns; empty = no declared mapping served (GetConfig omits OutputConfig.Tables)
 }
 
 func (g *mockGateway) GetConfig(ctx context.Context, _ *pb.GetConfigRequest) (*pb.ComponentConfig, error) {
@@ -66,6 +75,7 @@ func (g *mockGateway) GetConfig(ctx context.Context, _ *pb.GetConfigRequest) (*p
 		OutputConfig: &pb.OutputConfig{
 			DefaultBucket:    g.bucket,
 			DefaultWriteMode: g.writeMode,
+			Tables:           g.outputTables,
 		},
 	}, nil
 }
@@ -142,17 +152,24 @@ func (g *mockGateway) Log(ctx context.Context, req *pb.LogRequest) (*pb.LogRespo
 }
 
 // validateSchema enforces the extractor's output contract on every payload:
-// all columns Arrow String (utf8) and Nullable:true, and — when the
-// component config declares a fields projection — exactly the declared
-// column names, in order. A violation fails the write (HTTP 500 / gRPC
-// error), so the local proof cannot silently pass with wrong output.
+// every column must be one of the sink type vocabulary's four Arrow types
+// (utf8, int64, float64, bool — dgarrow.ArrowTypeFor's canonical mapping;
+// StringSink emits utf8 only, InferringSink emits any mix of the four) and
+// Nullable:true always (both extractor sinks guarantee every field
+// nullable, typed or not), and — when the component config declares a
+// fields projection with no declared output-column mapping — exactly the
+// declared column names, in order. A violation fails the write (HTTP 500 /
+// gRPC error), so the local proof cannot silently pass with wrong output.
 func (g *mockGateway) validateSchema(sch *arrow.Schema) error {
 	for _, f := range sch.Fields() {
-		if f.Type.ID() != arrow.STRING {
-			return fmt.Errorf("schema violation: column %q is %s, want utf8 (all-String contract)", f.Name, f.Type)
+		switch f.Type.ID() {
+		case arrow.STRING, arrow.INT64, arrow.FLOAT64, arrow.BOOL:
+			// allowed — the full sink type vocabulary.
+		default:
+			return fmt.Errorf("schema violation: column %q is %s, want one of utf8/int64/float64/bool (the sink type vocabulary)", f.Name, f.Type)
 		}
 		if !f.Nullable {
-			return fmt.Errorf("schema violation: column %q is not nullable, want Nullable:true (all-String contract)", f.Name)
+			return fmt.Errorf("schema violation: column %q is not nullable, want Nullable:true (every sink column is nullable)", f.Name)
 		}
 	}
 	if len(g.expectCols) > 0 {
@@ -290,11 +307,20 @@ func main() {
 	}
 
 	// When the config declares a fields projection, enforce exactly those
-	// column names (in order) on every received batch.
+	// column names (in order) on every received batch. table_name/array_path
+	// are read so a declared output_columns mapping (mock-only convenience;
+	// see the package doc) can be served for the SAME table the component
+	// itself resolves to — table_name > array_path > "data".
 	var cfgFields struct {
-		Fields []struct {
+		TableName string `json:"table_name"`
+		ArrayPath string `json:"array_path"`
+		Fields    []struct {
 			Name string `json:"name"`
 		} `json:"fields"`
+		OutputColumns []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"output_columns"`
 	}
 	if err := json.Unmarshal(cfgBytes, &cfgFields); err != nil {
 		log.Fatalf("parse config: %v", err)
@@ -304,19 +330,47 @@ func main() {
 		expectCols = append(expectCols, f.Name)
 	}
 
+	// resolveOutputTable mirrors the component's own precedence
+	// (components/http-json-extractor/main.go's resolveOutputTable) so a
+	// declared output_columns mapping is served under the same table name
+	// the component resolves and opens a writer for.
+	outputTable := cfgFields.TableName
+	if outputTable == "" {
+		outputTable = cfgFields.ArrayPath
+	}
+	if outputTable == "" {
+		outputTable = "data"
+	}
+
+	var outputTables []*pb.TableOutputConfig
+	if len(cfgFields.OutputColumns) > 0 {
+		cols := make([]*pb.ColumnConfig, len(cfgFields.OutputColumns))
+		for i, c := range cfgFields.OutputColumns {
+			cols[i] = &pb.ColumnConfig{Name: c.Name, Type: c.Type}
+		}
+		outputTables = []*pb.TableOutputConfig{
+			{Name: outputTable, Bucket: *bucket, WriteMode: *writeMode, Columns: cols},
+		}
+	}
+
 	g := &mockGateway{
-		cfgBytes:   cfgBytes,
-		bucket:     *bucket,
-		writeMode:  *writeMode,
-		httpBase:   "http://" + *httpAddr,
-		writers:    map[string]*writerState{},
-		expectCols: expectCols,
+		cfgBytes:     cfgBytes,
+		bucket:       *bucket,
+		writeMode:    *writeMode,
+		httpBase:     "http://" + *httpAddr,
+		writers:      map[string]*writerState{},
+		expectCols:   expectCols,
+		outputTables: outputTables,
+	}
+	if len(outputTables) > 0 {
+		log.Printf("mock-dg: serving declared output_columns mapping for table %q: %+v", outputTable, cfgFields.OutputColumns)
 	}
 	if len(expectCols) > 0 {
-		log.Printf("mock-dg: enforcing projected columns %v (all utf8)", expectCols)
+		log.Printf("mock-dg: enforcing projected columns %v", expectCols)
 	} else {
-		log.Printf("mock-dg: enforcing all-utf8 columns (no fields projection in config)")
+		log.Printf("mock-dg: no fields projection in config — column set not enforced by name")
 	}
+	log.Printf("mock-dg: accepting sink type vocabulary (utf8/int64/float64/bool, all Nullable:true)")
 
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {

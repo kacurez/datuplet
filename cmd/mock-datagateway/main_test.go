@@ -67,12 +67,74 @@ func buildEmptyIPCStream(t *testing.T, fields []arrow.Field) []byte {
 	return buf.Bytes()
 }
 
-// buildNonUTF8Stream encodes a valid, self-contained IPC stream whose one
-// column is Int64 instead of String — violates the all-String contract.
-func buildNonUTF8Stream(t *testing.T) []byte {
+// buildMixedTypeStream encodes a valid, self-contained IPC stream with one
+// column of each type in the sink type vocabulary (dgarrow.ArrowTypeFor:
+// Int64, Float64, Boolean, String — the mix an InferringSink can legitimately
+// produce across different columns of the same schema), all Nullable:true.
+func buildMixedTypeStream(t *testing.T) []byte {
 	t.Helper()
 	mem := memory.NewGoAllocator()
-	fields := []arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}
+	fields := []arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "amount", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+		{Name: "active", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	b := array.NewRecordBuilder(mem, schema)
+	defer b.Release()
+	b.Field(0).(*array.Int64Builder).Append(1)
+	b.Field(1).(*array.Float64Builder).Append(1.5)
+	b.Field(2).(*array.BooleanBuilder).Append(true)
+	b.Field(3).(*array.StringBuilder).Append("a")
+	rec := b.NewRecord()
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	w := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(mem))
+	if err := w.Write(rec); err != nil {
+		t.Fatalf("ipc write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("ipc close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// buildOutOfVocabStream encodes a valid, self-contained IPC stream whose one
+// column is Timestamp — a real Arrow type, but OUTSIDE the sink type
+// vocabulary (dgarrow.ArrowTypeFor only ever resolves to Int64/Float64/
+// Boolean/String) — must still be rejected by validateSchema.
+func buildOutOfVocabStream(t *testing.T) []byte {
+	t.Helper()
+	mem := memory.NewGoAllocator()
+	fields := []arrow.Field{{Name: "ts", Type: arrow.FixedWidthTypes.Timestamp_ns, Nullable: true}}
+	schema := arrow.NewSchema(fields, nil)
+	b := array.NewRecordBuilder(mem, schema)
+	defer b.Release()
+	b.Field(0).(*array.TimestampBuilder).Append(0)
+	rec := b.NewRecord()
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	w := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(mem))
+	if err := w.Write(rec); err != nil {
+		t.Fatalf("ipc write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("ipc close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// buildNonNullableTypedStream encodes a valid, self-contained IPC stream
+// with one Int64 column that is Nullable:false — an in-vocabulary TYPE but
+// still a nullability violation, proving the Nullable:true requirement holds
+// across the whole vocabulary, not just utf8.
+func buildNonNullableTypedStream(t *testing.T) []byte {
+	t.Helper()
+	mem := memory.NewGoAllocator()
+	fields := []arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false}}
 	schema := arrow.NewSchema(fields, nil)
 	b := array.NewRecordBuilder(mem, schema)
 	defer b.Release()
@@ -149,17 +211,35 @@ func TestIngest_Validation(t *testing.T) {
 			wantErr: "zero rows",
 		},
 		{
-			name: "non-utf8 column",
+			// Relaxed validateSchema (this change): the sink type vocabulary
+			// is no longer utf8-only — InferringSink can legitimately emit
+			// Int64/Float64/Boolean columns alongside String ones.
+			name: "typed schema (int64/float64/bool/utf8 mix) accepted",
 			payload: func(t *testing.T) []byte {
-				return buildNonUTF8Stream(t)
+				return buildMixedTypeStream(t)
 			},
-			wantErr: "utf8",
 		},
 		{
-			name: "non-nullable column",
+			name: "type outside vocabulary (timestamp) rejected",
+			payload: func(t *testing.T) []byte {
+				return buildOutOfVocabStream(t)
+			},
+			wantErr: "want one of utf8/int64/float64/bool",
+		},
+		{
+			name: "non-nullable utf8 column rejected",
 			payload: func(t *testing.T) []byte {
 				fields := []arrow.Field{{Name: "id", Type: arrow.BinaryTypes.String, Nullable: false}}
 				return buildIPCStream(t, fields, [][]*string{{strp("1")}})
+			},
+			wantErr: "nullable",
+		},
+		{
+			// Nullable:true is required across the WHOLE vocabulary, not
+			// just utf8 — an in-vocabulary type is not by itself a pass.
+			name: "non-nullable int64 column rejected",
+			payload: func(t *testing.T) []byte {
+				return buildNonNullableTypedStream(t)
 			},
 			wantErr: "nullable",
 		},

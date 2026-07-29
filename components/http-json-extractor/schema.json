@@ -37,6 +37,7 @@
       "type": "array",
       "description": "Optional projection: select and rename fields (including nested ones via dot-path). When omitted, columns are inferred from the first 8192 records; a field first appearing later is not written. Set fields explicitly to guarantee a column is captured.",
       "x-datuplet-advanced": true,
+      "x-datuplet-doc": "Selects and renames only — it does not by itself decide column TYPES. A projected column's Arrow type still follows schema_inference (typed inference from the projected values, or every column as a string), unless this output table also has an outputs.tables[].columns mapping, which overrides both fields' selection and schema_inference's typing for the mapped columns.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -56,6 +57,14 @@
           }
         }
       }
+    },
+    "schema_inference": {
+      "type": "string",
+      "enum": ["typed", "strings"],
+      "default": "typed",
+      "description": "Output column typing when this table has no outputs.tables[].columns mapping: \"typed\" infers one Arrow type per column from the first batch; \"strings\" makes every column a string.",
+      "x-datuplet-advanced": true,
+      "x-datuplet-doc": "Only takes effect when this output table has no explicit outputs.tables[].columns mapping declared in the pipeline doc — a declared mapping always wins regardless of this setting, writing exactly its mapped columns with its mapped types. Default \"typed\": one Arrow type (int64, float64, boolean, or string) is inferred per column by joining the JSON value kinds sampled across the first 8192 records; a later value that no longer fits its column's now-fixed type fails the run (exit code 1) instead of being coerced or silently dropped — see docs/known-limitations.md. Set \"strings\" to restore the pre-typed-inference behavior (every column emitted as a string, sidestepping type-fit failures entirely) — the escape hatch for feeds whose shape is too irregular for typed inference."
     },
     "pagination": {
       "type": "object",
