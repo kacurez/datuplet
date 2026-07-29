@@ -15,7 +15,10 @@
 // mode locally. When present, GetConfig serves it back as a single
 // OutputConfig.Tables entry (mirroring outputs.tables[].columns from a real
 // pipeline doc) for the table the mock resolves the same way the component
-// does: table_name > array_path > "data".
+// does: table_name > array_path > "data" — AND every payload written to
+// that table is validated against it (validateAgainstMapping): names,
+// types, and order must match exactly, so a broken extractor emitting the
+// wrong schema fails the local run instead of silently passing.
 //
 // Dev/test tool only — NOT a deployment surface.
 package main
@@ -151,16 +154,105 @@ func (g *mockGateway) Log(ctx context.Context, req *pb.LogRequest) (*pb.LogRespo
 	return &pb.LogResponse{}, nil
 }
 
+// mockArrowTypeFor mirrors sdk/go/arrow.ArrowTypeFor's canonical
+// config-type-string -> Arrow-type vocabulary (int/long -> Int64,
+// float/double -> Float64, boolean -> Boolean, string -> String), so
+// validateAgainstMapping can check a declared output_columns mapping's
+// types against what a real writer actually emits. Duplicated rather than
+// imported: this mock deliberately depends on neither sdk/go nor
+// sdk/go/arrow (same reasoning as resolveOutputTable's existing
+// duplication in main(), below — the mock and the SDK/component are
+// separate Go modules). An unrecognized string returns (nil, false).
+func mockArrowTypeFor(t string) (arrow.DataType, bool) {
+	switch t {
+	case "int", "long":
+		return arrow.PrimitiveTypes.Int64, true
+	case "float", "double":
+		return arrow.PrimitiveTypes.Float64, true
+	case "boolean":
+		return arrow.FixedWidthTypes.Boolean, true
+	case "string":
+		return arrow.BinaryTypes.String, true
+	default:
+		return nil, false
+	}
+}
+
+// declaredColumnsFor returns g.outputTables' Columns for table, or nil when
+// no declared output_columns mapping was configured for it. g.outputTables
+// is fixed once at startup and never mutated afterward, so no lock is
+// needed for this read.
+func (g *mockGateway) declaredColumnsFor(table string) []*pb.ColumnConfig {
+	for _, t := range g.outputTables {
+		if t.Name == table {
+			return t.Columns
+		}
+	}
+	return nil
+}
+
+// validateAgainstMapping enforces a declared output_columns mapping
+// EXACTLY: the same number of columns, the same names IN ORDER, and the
+// same Arrow type (via mockArrowTypeFor) at each position. A positional
+// mismatch report doubles as the order check — a column swapped out of
+// place is caught as "column i is X, want Y" at the first position where
+// declared and emitted names diverge, without a separate order pass. Every
+// failure names the position/column and what was actually declared, so the
+// message is actionable on its own.
+func validateAgainstMapping(sch *arrow.Schema, mapping []*pb.ColumnConfig) error {
+	if sch.NumFields() != len(mapping) {
+		names := make([]string, len(mapping))
+		for i, c := range mapping {
+			names[i] = c.Name
+		}
+		return fmt.Errorf("schema violation: declared-columns mismatch: %d columns, want %d %v", sch.NumFields(), len(mapping), names)
+	}
+	for i, want := range mapping {
+		got := sch.Field(i)
+		if got.Name != want.Name {
+			return fmt.Errorf("schema violation: declared-columns mismatch: column %d is %q, want %q (declared order)", i, got.Name, want.Name)
+		}
+		wantType, ok := mockArrowTypeFor(want.Type)
+		if !ok {
+			// A bug in the fixture's own output_columns, not the component's
+			// output — still fail loudly rather than silently accept anything.
+			return fmt.Errorf("schema violation: declared column %q has unrecognized config type %q (want one of int, long, float, double, boolean, string)", want.Name, want.Type)
+		}
+		if got.Type.ID() != wantType.ID() {
+			return fmt.Errorf("schema violation: declared-columns mismatch: column %q is %s, want %s (declared type %q)", want.Name, got.Type, wantType, want.Type)
+		}
+	}
+	return nil
+}
+
 // validateSchema enforces the extractor's output contract on every payload:
 // every column must be one of the sink type vocabulary's four Arrow types
 // (utf8, int64, float64, bool — dgarrow.ArrowTypeFor's canonical mapping;
 // StringSink emits utf8 only, InferringSink emits any mix of the four) and
 // Nullable:true always (both extractor sinks guarantee every field
-// nullable, typed or not), and — when the component config declares a
-// fields projection with no declared output-column mapping — exactly the
-// declared column names, in order. A violation fails the write (HTTP 500 /
-// gRPC error), so the local proof cannot silently pass with wrong output.
-func (g *mockGateway) validateSchema(sch *arrow.Schema) error {
+// nullable, typed or not). A violation fails the write (HTTP 500 / gRPC
+// error), so the local proof cannot silently pass with wrong output.
+//
+// Column-SET enforcement has two sources, and they are mutually exclusive
+// per table:
+//
+//   - A declared output_columns mapping for table (g.declaredColumnsFor)
+//     wins outright when present: the emitted schema must match it EXACTLY
+//     (validateAgainstMapping) — names, types, AND order — regardless of
+//     whether the config also has a `fields` projection. This mirrors the
+//     real component: once a declared outputs.tables[].columns mapping
+//     applies to a table, `fields` (when also set) only reshapes the
+//     record BEFORE the declared (WithTypedColumns) sink types it — the
+//     wire schema is always exactly the mapping's names/types/order, never
+//     `fields`' own output names. So g.expectCols (sourced from
+//     `fields[].name`) is irrelevant whenever a mapping matches this table
+//     and is deliberately NOT consulted in that case (see
+//     TestIngest_DeclaredColumnsMapping_OverridesExpectCols).
+//   - Otherwise (no declared mapping for table), g.expectCols — when set —
+//     is enforced: same names, in order. Type is NOT checked here: the
+//     whole point of inference mode (no mapping) is that the type is
+//     inferred from the data, not declared up front.
+func (g *mockGateway) validateSchema(sch *arrow.Schema, table string) error {
 	for _, f := range sch.Fields() {
 		switch f.Type.ID() {
 		case arrow.STRING, arrow.INT64, arrow.FLOAT64, arrow.BOOL:
@@ -172,6 +264,11 @@ func (g *mockGateway) validateSchema(sch *arrow.Schema) error {
 			return fmt.Errorf("schema violation: column %q is not nullable, want Nullable:true (every sink column is nullable)", f.Name)
 		}
 	}
+
+	if mapping := g.declaredColumnsFor(table); len(mapping) > 0 {
+		return validateAgainstMapping(sch, mapping)
+	}
+
 	if len(g.expectCols) > 0 {
 		if sch.NumFields() != len(g.expectCols) {
 			return fmt.Errorf("schema violation: %d columns, want %d %v", sch.NumFields(), len(g.expectCols), g.expectCols)
@@ -199,14 +296,29 @@ func (g *mockGateway) validateSchema(sch *arrow.Schema) error {
 // the sink is designed to never flush an empty batch (flush() returns early
 // at inBatch == 0), so a zero-row POST always indicates a caller bug, never
 // legitimate output.
+//
+// The writer lookup happens FIRST, before any IPC parsing, for two reasons:
+// there is no point validating a payload for a writer ID that does not
+// exist, and validateSchema needs ws.table to look up a declared
+// output_columns mapping (declaredColumnsFor). g.writers entries are never
+// removed once added (no delete call anywhere in this file), so the *ws
+// pointer obtained here stays valid for the rest of this call without
+// re-fetching it under the later lock.
 func (g *mockGateway) ingest(writerID string, data []byte) (int64, error) {
+	g.mu.Lock()
+	ws, ok := g.writers[writerID]
+	g.mu.Unlock()
+	if !ok {
+		return 0, fmt.Errorf("unknown writer: %s", writerID)
+	}
+
 	br := bytes.NewReader(data)
 	rd, err := ipc.NewReader(br)
 	if err != nil {
 		return 0, fmt.Errorf("payload is not a valid Arrow IPC stream: %w", err)
 	}
 	defer rd.Release()
-	if err := g.validateSchema(rd.Schema()); err != nil {
+	if err := g.validateSchema(rd.Schema(), ws.table); err != nil {
 		return 0, err
 	}
 	var rows int64
@@ -248,10 +360,6 @@ func (g *mockGateway) ingest(writerID string, data []byte) (int64, error) {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	ws, ok := g.writers[writerID]
-	if !ok {
-		return 0, fmt.Errorf("unknown writer: %s", writerID)
-	}
 	if ws.schemaFields == nil {
 		// First payload for this writer: lock its schema. Later payloads
 		// must match exactly (name, type, AND nullability) — catches

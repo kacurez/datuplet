@@ -9,6 +9,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+
+	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 )
 
 // strField builds an all-String Nullable:true field — the sink's contract.
@@ -160,6 +162,162 @@ func strp(s string) *string { return &s }
 // already present in the map in the real flow.
 func newTestGateway() *mockGateway {
 	return &mockGateway{writers: map[string]*writerState{"w1": {bucket: "raw", table: "t"}}}
+}
+
+// intField/floatField/boolField build Nullable:true fields of their
+// respective type — the numeric/boolean counterparts of strField, for
+// declared-columns-mapping tests that need a mix of types.
+func intField(name string) arrow.Field {
+	return arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+}
+func floatField(name string) arrow.Field {
+	return arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+}
+func boolField(name string) arrow.Field {
+	return arrow.Field{Name: name, Type: arrow.FixedWidthTypes.Boolean, Nullable: true}
+}
+
+// buildSchemaOnlyStream encodes a valid, self-contained, ONE-ROW IPC stream
+// for exactly the given fields, with a trivial placeholder value per column
+// (zero/false/empty-string). The declared-columns-mapping tests below only
+// care about the SCHEMA (names, types, order) validateAgainstMapping
+// checks, never the row values.
+func buildSchemaOnlyStream(t *testing.T, fields []arrow.Field) []byte {
+	t.Helper()
+	mem := memory.NewGoAllocator()
+	schema := arrow.NewSchema(fields, nil)
+	b := array.NewRecordBuilder(mem, schema)
+	defer b.Release()
+	for i, f := range fields {
+		switch f.Type.ID() {
+		case arrow.INT64:
+			b.Field(i).(*array.Int64Builder).Append(0)
+		case arrow.FLOAT64:
+			b.Field(i).(*array.Float64Builder).Append(0)
+		case arrow.BOOL:
+			b.Field(i).(*array.BooleanBuilder).Append(false)
+		case arrow.STRING:
+			b.Field(i).(*array.StringBuilder).Append("")
+		default:
+			t.Fatalf("buildSchemaOnlyStream: unsupported field type %s", f.Type)
+		}
+	}
+	rec := b.NewRecord()
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	w := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(mem))
+	if err := w.Write(rec); err != nil {
+		t.Fatalf("ipc write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("ipc close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// mappingCols builds a []*pb.ColumnConfig from (name, type) pairs, in order
+// — a compact literal for declared-columns-mapping test tables.
+func mappingCols(pairs ...[2]string) []*pb.ColumnConfig {
+	cols := make([]*pb.ColumnConfig, len(pairs))
+	for i, p := range pairs {
+		cols[i] = &pb.ColumnConfig{Name: p[0], Type: p[1]}
+	}
+	return cols
+}
+
+// newTestGatewayWithMapping returns a mockGateway with one pre-opened writer
+// "w1" against table, and a declared output_columns mapping for that same
+// table — the shape GetConfig/OpenWriter would leave it in when the config
+// carries output_columns (see main()).
+func newTestGatewayWithMapping(table string, mapping []*pb.ColumnConfig) *mockGateway {
+	return &mockGateway{
+		writers:      map[string]*writerState{"w1": {bucket: "raw", table: table}},
+		outputTables: []*pb.TableOutputConfig{{Name: table, Columns: mapping}},
+	}
+}
+
+// TestIngest_DeclaredColumnsMapping is finding I1's teeth: the mock now
+// consults a declared output_columns mapping (when one is configured for
+// the writer's table) and rejects any emitted schema that doesn't match it
+// EXACTLY — names, types, and order. Before this test existed, a broken
+// extractor emitting the wrong schema for a declared table passed the local
+// rig silently (the mapping was served via GetConfig but never checked at
+// ingest time).
+func TestIngest_DeclaredColumnsMapping(t *testing.T) {
+	declared := mappingCols([2]string{"id", "int"}, [2]string{"userId", "int"}, [2]string{"title", "string"})
+
+	tests := []struct {
+		name    string
+		fields  []arrow.Field
+		wantErr string // substring expected in the error; empty = expect success
+	}{
+		{
+			name:   "matches declared schema exactly",
+			fields: []arrow.Field{intField("id"), intField("userId"), strField("title")},
+		},
+		{
+			name:    "wrong name",
+			fields:  []arrow.Field{intField("id"), intField("userId"), strField("headline")},
+			wantErr: `column 2 is "headline", want "title"`,
+		},
+		{
+			name:    "wrong type",
+			fields:  []arrow.Field{intField("id"), floatField("userId"), strField("title")},
+			wantErr: `column "userId" is float64, want int64 (declared type "int")`,
+		},
+		{
+			name:    "wrong order",
+			fields:  []arrow.Field{intField("userId"), intField("id"), strField("title")},
+			wantErr: `column 0 is "userId", want "id"`,
+		},
+		{
+			name:    "extra column",
+			fields:  []arrow.Field{intField("id"), intField("userId"), strField("title"), strField("body")},
+			wantErr: "4 columns, want 3",
+		},
+		{
+			name:    "missing column",
+			fields:  []arrow.Field{intField("id"), intField("userId")},
+			wantErr: "2 columns, want 3",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newTestGatewayWithMapping("posts", declared)
+			data := buildSchemaOnlyStream(t, tc.fields)
+			_, err := g.ingest("w1", data)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ingest() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ingest() = nil error, want a declared-columns schema violation")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ingest() error = %q, want substring %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestIngest_DeclaredColumnsMapping_OverridesExpectCols proves the stated
+// precedence: when BOTH a declared output_columns mapping and a `fields`
+// projection (g.expectCols) apply to the same table, the mapping governs
+// and expectCols is not consulted at all. expectCols here names completely
+// different columns than the mapping — if expectCols were still checked,
+// this would fail; it must not.
+func TestIngest_DeclaredColumnsMapping_OverridesExpectCols(t *testing.T) {
+	g := newTestGatewayWithMapping("posts", mappingCols([2]string{"id", "int"}, [2]string{"userId", "int"}, [2]string{"title", "string"}))
+	g.expectCols = []string{"totally", "different", "names"}
+
+	data := buildSchemaOnlyStream(t, []arrow.Field{intField("id"), intField("userId"), strField("title")})
+	if _, err := g.ingest("w1", data); err != nil {
+		t.Fatalf("declared mapping should govern over expectCols, got error: %v", err)
+	}
 }
 
 func TestIngest_Validation(t *testing.T) {

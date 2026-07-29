@@ -97,10 +97,21 @@ producer infers its own output schema from the data — see each producing
 component's docs, e.g.
 [http-json-extractor](components.md#http-json-extractor).
 
-`columns` is validated and enforced by the **producing component/SDK**, not
-by the Data Gateway or the pipeline-doc schema layer — an unrecognized
-`type` string is a component-level config error at run start (exit code 1),
-not a `PUT`/`validate` finding.
+`columns`' **shape** is validated at `PUT`/`validate` time by the pipeline-doc
+layer (`validateColumnSpec` in `pkg/pipeline/validate/validate.go`): an empty
+or duplicate `name`, or a `type` outside the six-value vocabulary, is a
+`severity: "error"` finding — the same 400-blocks-the-save contract as any
+other PUT-time validation failure (see [API contract](#api-contract) above).
+The CRD's own OpenAPI schema carries the identical `type` enum as a second
+gate for anything applied directly via `kubectl` rather than through the
+API. What the doc layer does **not**, and cannot, check is the mapping
+against actual **data** — that is the producing **component/SDK**'s job, at
+run time: it writes exactly the mapped columns (a source field not in the
+list is silently excluded), writes null for a mapped column missing from a
+given record, and fails the run (exit code 1, `TypeViolationError` naming
+the offending column) when a value does not fit its declared type — a
+class of problem no doc-time check could ever catch, since it depends on
+the data the run actually sees.
 
 ### API contract
 

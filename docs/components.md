@@ -433,11 +433,17 @@ Both SDKs are ~200–300 LOC and expose three operations: `OpenWriter`,
 resolution, and secret delivery from the Data Gateway sidecar.
 
 Go components can opt into writer-side Arrow output via the `sdk/go/arrow`
-module's `StringSink` — an all-String Arrow `RecordBuilder` that batches
-records into self-contained IPC streams, with optional first-batch schema
-inference when you don't supply explicit columns. It's the writer-side
-counterpart of that module's existing Arrow reader (used by `sql-transform`
-to stream Arrow-IPC inputs); base `sdk/go` stays Arrow-free.
+module: `StringSink` batches records into self-contained IPC streams as an
+all-String `RecordBuilder`, with optional first-batch schema inference when
+you don't supply explicit columns. `InferringSink` is the typed sibling —
+it infers one Arrow type per column from the first batch, or writes an
+exact declared column set (name + type, via the module's `ArrowTypeFor`
+vocabulary) with `WithTypedColumns`. Either sink's `Add`/`Finish` can return
+a `TypeViolationError` for a value that no longer fits its column's type —
+a user-error condition (map it to `sdk.ExitUserError`, not `ExitAppError`).
+Both are the writer-side counterpart of that module's existing Arrow reader
+(used by `sql-transform` to stream Arrow-IPC inputs); base `sdk/go` stays
+Arrow-free.
 
 Write a `schema.json` next to your parser, following the Form Subset rules
 above, and register it as a `ComponentDefinition` with the appropriate `io`
