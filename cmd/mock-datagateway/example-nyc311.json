@@ -1,0 +1,21 @@
+{
+  "url": "https://data.cityofnewyork.us/resource/erm2-nwe9.json?$order=:id",
+  "table_name": "nyc_311_requests",
+  "fields": [
+    {"path": "unique_key", "name": "request_id"},
+    {"path": "created_date", "name": "created_date"},
+    {"path": "agency", "name": "agency"},
+    {"path": "complaint_type", "name": "complaint_type"},
+    {"path": "borough", "name": "borough"},
+    {"path": "status", "name": "status"},
+    {"path": "latitude", "name": "latitude"},
+    {"path": "longitude", "name": "longitude"}
+  ],
+  "pagination": {
+    "type": "offset",
+    "param": "$offset",
+    "size_param": "$limit",
+    "page_size": 50000,
+    "max_records": 200000
+  }
+}

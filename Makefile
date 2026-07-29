@@ -5,6 +5,7 @@ export DOCKER_BUILDKIT=1
 	build build-pipeline-api build-gateway \
 	build-components build-components-e2e build-components-local build-component-data-generator build-operators \
 	build-component-sql-transform build-component-datuplet-query \
+	extractor-local \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
 	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
@@ -103,6 +104,18 @@ build-components-local: build-components ## Build + tag built-in component image
 	for c in data-generator sql-transform stdout-writer http-json-extractor finnhub-extractor; do \
 	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
 	done
+
+extractor-local: ## Run http-json-extractor locally against the mock gateway (CONFIG=<component-config.json> [BUCKET=raw]); reports rows + peak RSS (macOS /usr/bin/time -l; on Linux use `command time -v`)
+ifndef CONFIG
+	$(error CONFIG is required, e.g. make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json)
+endif
+	go build -o bin/mock-datagateway ./cmd/mock-datagateway
+	go build -C components/http-json-extractor -o $(CURDIR)/bin/http-json-extractor-local .
+	@./bin/mock-datagateway -config $(CONFIG) -bucket $(or $(BUCKET),raw) & \
+	MOCK_PID=$$!; \
+	trap "kill $$MOCK_PID 2>/dev/null" EXIT; \
+	sleep 1; \
+	DATUPLET_GATEWAY_ADDR=localhost:50051 /usr/bin/time -l ./bin/http-json-extractor-local
 
 docker-build-operators: ## Build pipeline-operator Docker image
 	docker build -t datuplet/pipeline-operator:latest -f utils/docker/Dockerfile.pipeline-operator .
