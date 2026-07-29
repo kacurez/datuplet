@@ -58,6 +58,17 @@ var validPartitionTransforms = map[string]bool{
 	"hour":     true,
 }
 
+// validColumnTypes lists the allowed types for an output table's explicit
+// column mapping (outputs.tables[].columns).
+var validColumnTypes = map[string]bool{
+	"int":     true,
+	"long":    true,
+	"float":   true,
+	"double":  true,
+	"boolean": true,
+	"string":  true,
+}
+
 // ValidatePipeline strict-decodes YAML into a datupletv1.Pipeline and runs the
 // semantic checks. The returned error is reserved for non-YAML / IO-level
 // problems; strict-decode failures AND semantic violations come back as
@@ -495,6 +506,7 @@ func validateOutputs(compName string, out *datupletv1.OutputSpec, stageIdx, comp
 			})
 		}
 		findings = append(findings, validatePartitionSpec(compName, t.Name, t.PartitionFields, tablePath)...)
+		findings = append(findings, validateColumnSpec(compName, t.Name, t.Columns, tablePath)...)
 	}
 
 	// Validate processors.
@@ -608,6 +620,46 @@ func validatePartitionSpec(compName, tableName string, spec []datupletv1.Partiti
 				})
 			}
 			seen[field.SourceColumn] = true
+		}
+	}
+
+	return findings
+}
+
+// validateColumnSpec validates the explicit column mapping on an output
+// table (outputs.tables[].columns). Absent/empty columns is valid — it means
+// the producer infers columns from the data (enforced by the component/SDK,
+// not here).
+func validateColumnSpec(compName, tableName string, cols []datupletv1.ColumnSpec, tablePath string) []Finding {
+	if len(cols) == 0 {
+		return nil
+	}
+
+	var findings []Finding
+	seen := make(map[string]bool)
+	for i, col := range cols {
+		colPath := fmt.Sprintf("%s.columns[%d]", tablePath, i)
+		if col.Name == "" {
+			findings = append(findings, Finding{
+				Path:     colPath + ".name",
+				Message:  fmt.Sprintf("component %s, output table %s, columns[%d]: name is required", compName, tableName, i),
+				Severity: severityError,
+			})
+		} else if seen[col.Name] {
+			findings = append(findings, Finding{
+				Path:     colPath + ".name",
+				Message:  fmt.Sprintf("component %s, output table %s, columns: duplicate column name %q", compName, tableName, col.Name),
+				Severity: severityError,
+			})
+		} else {
+			seen[col.Name] = true
+		}
+		if !validColumnTypes[col.Type] {
+			findings = append(findings, Finding{
+				Path:     colPath + ".type",
+				Message:  fmt.Sprintf("component %s, output table %s, columns[%d]: invalid type %q (supported: int, long, float, double, boolean, string)", compName, tableName, i, col.Type),
+				Severity: severityError,
+			})
 		}
 	}
 

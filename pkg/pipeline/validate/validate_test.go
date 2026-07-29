@@ -237,6 +237,117 @@ spec:
 			msgContains: "week",
 		},
 		{
+			name: "valid explicit column mapping",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          component: extractor
+          outputs:
+            tables:
+              - name: summary
+                bucket: curated
+                columns:
+                  - name: id
+                    type: int
+                  - name: note
+                    type: string
+`,
+			wantZero: true,
+		},
+		{
+			name: "output table with no columns still valid",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          component: extractor
+          outputs:
+            tables:
+              - name: summary
+                bucket: curated
+`,
+			wantZero: true,
+		},
+		{
+			name: "invalid column type varchar",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          component: extractor
+          outputs:
+            tables:
+              - name: summary
+                bucket: curated
+                columns:
+                  - name: id
+                    type: varchar
+`,
+			msgContains: "invalid type",
+		},
+		{
+			name: "duplicate column name",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          component: extractor
+          outputs:
+            tables:
+              - name: summary
+                bucket: curated
+                columns:
+                  - name: id
+                    type: int
+                  - name: id
+                    type: string
+`,
+			msgContains: "duplicate column name",
+		},
+		{
+			name: "empty column name",
+			yaml: `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          component: extractor
+          outputs:
+            tables:
+              - name: summary
+                bucket: curated
+                columns:
+                  - name: ""
+                    type: int
+`,
+			msgContains: "columns[0]: name is required",
+		},
+		{
 			name: "input since and sinceSnapshot mutually exclusive",
 			yaml: `apiVersion: datuplet.io/v1
 kind: Pipeline

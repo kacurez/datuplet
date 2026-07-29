@@ -208,6 +208,12 @@ func outputsToCRD(o *OutputSpec) *datupletv1.OutputSpec {
 				Transform:    pf.Transform,
 			})
 		}
+		for _, cs := range t.Columns {
+			ot.Columns = append(ot.Columns, datupletv1.ColumnSpec{
+				Name: cs.Name,
+				Type: cs.Type,
+			})
+		}
 		out.Tables = append(out.Tables, ot)
 	}
 	for _, p := range o.Processors {
@@ -244,6 +250,12 @@ func outputsFromCRD(o *datupletv1.OutputSpec) *OutputSpec {
 			ot.PartitionSpec = append(ot.PartitionSpec, PartitionFieldSpec{
 				SourceColumn: pf.SourceColumn,
 				Transform:    pf.Transform,
+			})
+		}
+		for _, cs := range t.Columns {
+			ot.Columns = append(ot.Columns, ColumnSpec{
+				Name: cs.Name,
+				Type: cs.Type,
 			})
 		}
 		out.Tables = append(out.Tables, ot)

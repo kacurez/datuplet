@@ -67,6 +67,18 @@ type OutputTableRef struct {
 	Bucket    string
 	Table     string
 	WriteMode string
+
+	// Columns is the table's explicit column mapping, when declared via
+	// `outputs.tables[].columns` in the pipeline doc. Empty means no explicit
+	// mapping was declared — the producer infers columns from the data.
+	Columns []ColumnRef
+}
+
+// ColumnRef identifies a single column's name and type in an explicit
+// output table column mapping (see OutputTableRef.Columns).
+type ColumnRef struct {
+	Name string
+	Type string
 }
 
 // New creates a new Datuplet client. It connects to the gateway using
@@ -143,11 +155,16 @@ func (c *Client) Config() Config {
 			if sdkName == "" {
 				sdkName = t.Name
 			}
+			var columns []ColumnRef
+			for _, col := range t.Columns {
+				columns = append(columns, ColumnRef{Name: col.Name, Type: col.Type})
+			}
 			outputTables = append(outputTables, OutputTableRef{
 				Name:      sdkName, // SDK identifier — LogicalName when set, otherwise physical Name
 				Bucket:    t.Bucket,
 				Table:     t.Name, // Iceberg target table
 				WriteMode: t.WriteMode,
+				Columns:   columns,
 			})
 		}
 	}

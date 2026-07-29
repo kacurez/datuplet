@@ -243,6 +243,37 @@ spec:
                                       minLength: 1
                                       pattern: ^[a-z][a-z0-9_-]*$
                                       type: string
+                                    columns:
+                                      description: |-
+                                        Columns is an optional explicit column mapping for this output
+                                        table. When set, the producing component writes exactly these
+                                        columns with these types and infers nothing; when absent, it
+                                        infers columns from the data. Enforced by the component/SDK, not
+                                        by the gateway.
+                                      items:
+                                        description: ColumnSpec defines a single column's name and type
+                                          in an explicit output column mapping (see OutputTableSpec.Columns).
+                                        properties:
+                                          name:
+                                            description: Name is the column name.
+                                            minLength: 1
+                                            type: string
+                                          type:
+                                            description: Type is the column's data
+                                              type.
+                                            enum:
+                                            - int
+                                            - long
+                                            - float
+                                            - double
+                                            - boolean
+                                            - string
+                                            type: string
+                                        required:
+                                        - name
+                                        - type
+                                        type: object
+                                      type: array
                                     logicalName:
                                       description: |-
                                         LogicalName is an optional override for the SQL identifier used to

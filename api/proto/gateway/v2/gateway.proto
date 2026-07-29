@@ -135,6 +135,7 @@ message TableOutputConfig {
   string bucket = 2;                      // Bucket name
   string write_mode = 3;                  // APPEND or FULL_LOAD
   string logical_name = 4;                // SDK-facing identifier (defaults to name when empty)
+  repeated ColumnConfig columns = 5;       // Optional explicit column mapping; empty = producer infers
 }
 
 // ProcessorConfig defines a data processor operation.
@@ -469,4 +470,16 @@ message S3Credentials {
   int64 expires_at_unix = 10;            // Unix epoch seconds when the cred expires (0 = no expiry)
 }
 
+// ============================================================================
+// Output Columns
+// ============================================================================
+
+// ColumnConfig defines a single column's name and type in an explicit output
+// column mapping (TableOutputConfig.columns). When a table has columns set,
+// the producer writes exactly these columns with these types and infers
+// nothing; when absent, it infers.
+message ColumnConfig {
+  string name = 1;
+  string type = 2;                        // int, long, float, double, boolean, string
+}
 

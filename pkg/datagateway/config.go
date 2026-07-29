@@ -101,17 +101,29 @@ type InputTableConfig struct {
 
 // OutputTableConfig defines a specific table output.
 type OutputTableConfig struct {
-	Name            string                   `yaml:"name"`                      // Output name (iceberg target table)
-	Bucket          string                   `yaml:"bucket"`                    // Bucket name
-	WriteMode       string                   `yaml:"write_mode"`                // APPEND or FULL_LOAD
-	LogicalName     string                   `yaml:"logical_name,omitempty"`    // SDK-facing identifier (defaults to Name when empty)
-	PartitionFields []PartitionFieldConfig   `yaml:"partition_fields,omitempty"` // Optional partition spec
+	Name            string                 `yaml:"name"`                       // Output name (iceberg target table)
+	Bucket          string                 `yaml:"bucket"`                     // Bucket name
+	WriteMode       string                 `yaml:"write_mode"`                 // APPEND or FULL_LOAD
+	LogicalName     string                 `yaml:"logical_name,omitempty"`     // SDK-facing identifier (defaults to Name when empty)
+	PartitionFields []PartitionFieldConfig `yaml:"partition_fields,omitempty"` // Optional partition spec
+
+	// Columns is an optional explicit column mapping (name+type). When set,
+	// the producer writes exactly these columns and infers nothing; empty =
+	// producer infers columns from the data.
+	Columns []ColumnConfig `yaml:"columns,omitempty"`
 }
 
 // PartitionFieldConfig defines a single partition field.
 type PartitionFieldConfig struct {
 	SourceColumn string `yaml:"source_column"`
 	Transform    string `yaml:"transform"`
+}
+
+// ColumnConfig defines a single column's name and type in an explicit output
+// column mapping.
+type ColumnConfig struct {
+	Name string `yaml:"name"`
+	Type string `yaml:"type"`
 }
 
 // GetRunID returns the run ID.
