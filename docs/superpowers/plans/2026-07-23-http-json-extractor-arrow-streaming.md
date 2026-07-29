@@ -782,6 +782,7 @@ git commit -m "feat(sdk/go/arrow): stringify + inferred column plan for all-Stri
   - `(s *StringSink) Add(rec map[string]any) error`
   - `(s *StringSink) Finish() (rows int64, close *sdk.CloseResult, err error)` — flushes the partial batch, closes the writer if one was opened; `(0, nil, nil)` when no records were ever added (writer never opened).
   - `(s *StringSink) Writer() ChunkWriter` — the opened writer (nil when no rows), for `Bucket()`/`Table()` logging.
+  - `(s *StringSink) UnknownKeys() (keys []string, records int64)` — **added 2026-07-29 in Task 4's fix round** (Codex found that first-batch inference silently dropped late columns; the maintainer ruled "keep the design, warn loudly"). For **inferred plans only**, reports the distinct record keys that fell outside the fixed schema (sorted; capped at `maxTrackedUnknownKeys = 64` names) plus the **exact** count of records carrying at least one. Always empty for `WithColumns` plans — an explicit projection's extra keys are deliberate, so warning there would be a false alarm. Implemented via `inferredNames map[string]struct{}` (non-nil only when inferred), `adoptPlan(p, inferred bool)`, and a `trackUnknownKeys` membership pass in `appendRow` that allocates nothing until the first unknown key. Landed in commit `08c5d34`; both extractor paths log a `WARN` naming the dropped fields and the record count.
 
 - [ ] **Step 1: Write the failing tests (append to sink_test.go)**
 
@@ -1206,6 +1207,27 @@ git commit -m "feat(sdk/go/arrow): StringSink — batched all-String Arrow-IPC w
 ---
 
 ### Task 4: Wire both paths through the SDK sink; delete dead JSONL/projection code
+
+> **Revised 2026-07-29 (Codex Task-4 review, fix round 1 — commit `08c5d34`).**
+> The review found three plan-mandated defects in the code below; the maintainer
+> approved fixing all three, so the landed code deliberately differs from the
+> steps as written:
+> 1. **Writer left open on decode-error exits.** `sdk.Exit*` calls `os.Exit`, so
+>    defers never run in `main`. A component helper
+>    `finishQuietly(sink)` (discards `Finish`'s results so the original error is
+>    never masked) is now called before every `sdk.Exit*` that can follow sink
+>    construction in the single-request path, and
+>    `runPaginatedExtraction` — which returns errors instead of exiting — carries
+>    `defer finishQuietly(sink)` right after constructing the sink, covering every
+>    early return. Safe because `Finish` is idempotent.
+> 2. **Late columns were dropped silently.** First-batch inference stays (bounded
+>    memory is the point), but both paths now log a `WARN` after a successful
+>    `Finish` when `sink.UnknownKeys()` reports a non-zero record count, naming
+>    the dropped fields. See the Task 3 interface note for the tracking design.
+> 3. **Paginated zero-row runs lost the completion log.** The `rows > 0` branch is
+>    unchanged (a real writer supplies `bucket.table`); a new else-branch logs
+>    `Completed output %s: 0 rows` from `outputTable`, because lazy open means
+>    there is no writer to name. Faking a bucket name was explicitly rejected.
 
 **Files:**
 - Modify: `components/http-json-extractor/go.mod` + `go.sum` (add the `sdk/go/arrow` dep; via edit + `make tidy`)
@@ -1881,6 +1903,7 @@ git commit -m "feat(dev): mock Data Gateway + make extractor-local for local com
 - Replace the JSONL + 64 KiB-first-chunk paragraph (added in v0.11.0): the component now writes **Arrow IPC** to the gateway; the 64 KiB JSONL line limit **no longer applies** to this component.
 - Document the output typing: **every emitted column is a string** (nested objects/arrays become compact JSON text; numbers keep their exact source text). Downstream `sql-transform` should `CAST` for numeric work.
 - Document the schema rule: with `fields` — the projected names in declared order; without — the sorted union of top-level keys across the first 8192 records.
+- **Document the late-column limitation (added 2026-07-29 per the Task 4 review + maintainer ruling).** Without `fields`, the schema is fixed after the first 8192 records, so a field that appears for the FIRST time later in the response is **not written** — the old buffer-everything path did include it. This is the deliberate cost of bounded memory. State the mitigation: the run logs a `WARN` naming the dropped fields and the number of affected records (`StringSink.UnknownKeys()`), and the fix is to set `fields` explicitly when the response's shape is not uniform in its first 8192 records. Note the WARN's field list is capped at 64 distinct names while the record count is exact. This belongs in `docs/known-limitations.md` as well as the component section.
 - Add the compatibility caveat: writing into a **pre-existing table with typed (non-string) columns** fails iceberg's schema check — for both APPEND and FULL_LOAD (`ReplaceDataFiles` does not replace the catalog schema). Use a fresh table name or drop the old table.
 - Add a short **Local debugging** note: `make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json` runs the real binary against the mock gateway and reports rows + peak RSS.
 - Add one line to the component-authoring guidance in `docs/components.md`: writer-side Arrow output is available to any Go component via the opt-in `sdk/go/arrow` module's `StringSink` (all-String columns, batched self-contained IPC streams, optional first-batch schema inference) — the writer-side counterpart of that module's existing Arrow reader.
@@ -1972,7 +1995,7 @@ The PR's CI e2e (fail-closed since RFC 024) exercises ~13 extractor fixtures. Au
 
 **Placeholder scan:** no TBD/TODO; every code step carries complete code. The `--dump` flag from the spec was dropped (YAGNI — the mock's schema log + row counts cover the debugging need; noted here as a conscious cut). ✓
 
-**Type consistency:** `decodeRecords(io.Reader, string, func(map[string]any) error) (int, error)`; `fetchStream(ctx, string, map[string]string) (io.ReadCloser, error)`; SDK side: `stringifyValue(any) (string, bool)`, `columnPlan{names, extract}`, `planFromBatch([]map[string]any) *columnPlan`, `NewStringSink(ctx, func() (ChunkWriter, error), ...SinkOption) *StringSink`, `WithColumns([]string, func(map[string]any, int) any)`, `WithBatchRows(int)`, `Add(map[string]any) error`, `Finish() (int64, *sdk.CloseResult, error)`, `Writer() ChunkWriter`, `WriteError{Err}`; component side: `fieldColumns([]FieldMapping) ([]string, func(map[string]any, int) any)`, `newExtractorSink(ctx, *sdk.Client, string, []FieldMapping) *dgarrow.StringSink` — used identically in Tasks 1–5. `*sdk.Writer` satisfies `ChunkWriter` (`Write(ctx,[]byte) error` / `Close(ctx) (*sdk.CloseResult, error)` / `Bucket()` / `Table()` all exist, `sdk/go/client.go`). ✓
+**Type consistency:** `decodeRecords(io.Reader, string, func(map[string]any) error) (int, error)`; `fetchStream(ctx, string, map[string]string) (io.ReadCloser, error)`; SDK side: `stringifyValue(any) (string, bool)`, `columnPlan{names, extract}`, `planFromBatch([]map[string]any) *columnPlan`, `NewStringSink(ctx, func() (ChunkWriter, error), ...SinkOption) *StringSink`, `WithColumns([]string, func(map[string]any, int) any)`, `WithBatchRows(int)`, `Add(map[string]any) error`, `Finish() (int64, *sdk.CloseResult, error)`, `Writer() ChunkWriter`, `UnknownKeys() ([]string, int64)`, `WriteError{Err}`; component side: `finishQuietly(*dgarrow.StringSink)`, `fieldColumns([]FieldMapping) ([]string, func(map[string]any, int) any)`, `newExtractorSink(ctx, *sdk.Client, string, []FieldMapping) *dgarrow.StringSink` — used identically in Tasks 1–5. `*sdk.Writer` satisfies `ChunkWriter` (`Write(ctx,[]byte) error` / `Close(ctx) (*sdk.CloseResult, error)` / `Bucket()` / `Table()` all exist, `sdk/go/client.go`). ✓
 
 **Post-Codex-review revisions (round 1):**
 - Blocker → Task 1 decoder rewritten to full token-walking: records are built
