@@ -109,10 +109,11 @@ type GatewayInputTableConfig struct {
 
 // GatewayTableConfig defines a fixed table output.
 type GatewayTableConfig struct {
-	Name        string `yaml:"name"`
-	Bucket      string `yaml:"bucket"`
-	WriteMode   string `yaml:"write_mode"`
-	LogicalName string `yaml:"logical_name,omitempty"`
+	Name        string                     `yaml:"name"`
+	Bucket      string                     `yaml:"bucket"`
+	WriteMode   string                     `yaml:"write_mode"`
+	LogicalName string                     `yaml:"logical_name,omitempty"`
+	Columns     []datagateway.ColumnConfig `yaml:"columns,omitempty"`
 }
 
 // UnmarshalYAML handles both string and full config formats.
@@ -370,6 +371,7 @@ func runGateway(mode, configPath, dataDir, addr, runTokenPath, podAnnotationsPat
 				Bucket:      t.Bucket,
 				WriteMode:   t.WriteMode,
 				LogicalName: t.LogicalName,
+				Columns:     t.Columns,
 			})
 		}
 
