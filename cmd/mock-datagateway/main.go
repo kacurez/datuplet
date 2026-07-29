@@ -5,6 +5,10 @@
 // http-json-extractor binary run locally (DATUPLET_GATEWAY_ADDR=localhost:50051)
 // against a live URL with no cluster, no Lakekeeper, no object storage.
 //
+// If the default ports (50051/50052) are already bound by something else on
+// the local machine, override with -grpc-addr/-http-addr (the
+// `make extractor-local` target exposes these as GRPC_ADDR/HTTP_ADDR).
+//
 // Dev/test tool only — NOT a deployment surface.
 package main
 
