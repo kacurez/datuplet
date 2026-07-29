@@ -305,6 +305,26 @@ upgrading.
 
 ---
 
+## http-json-extractor
+
+**Late-arriving fields are dropped when `fields` is not set (Arrow-IPC
+output).** Without an explicit `fields` projection, the output schema is the
+sorted union of top-level keys seen across the first 8192 records, fixed for
+the rest of the run — the component never buffers the whole HTTP response.
+A field that first appears in a later record is outside that fixed schema,
+so its value is silently **not written**; the old buffer-everything path did
+include it. This is the deliberate cost of bounded memory, not a bug.
+
+Mitigation: the run logs one `WARN` naming the dropped field(s) — capped at
+64 distinct names, though the affected-record count is always exact — via
+`StringSink.UnknownKeys()`. If the response's shape is not uniform within its
+first 8192 records (e.g. optional fields that only start appearing later),
+set `fields` explicitly so every column you need is guaranteed from record
+one, instead of relying on schema inference. See
+[docs/components.md](components.md#http-json-extractor).
+
+---
+
 ## Validated deployment targets
 
 GKE is the only validated cloud target for v0.1. EKS and AKS quickstarts are

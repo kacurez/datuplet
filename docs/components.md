@@ -199,12 +199,53 @@ config:
       name: country
 ```
 
-**Output format:** the component writes rows as JSONL to the Data Gateway.
-Each record's serialized JSON must be **under 64 KiB** — the gateway's JSONL
-adapter infers the schema from a writer's first chunk using a scanner with a
-64 KiB per-line limit, so a wider single record fails schema inference on
-that first chunk. (Later chunks, once the schema is cached, stream with a much
-larger per-line limit — but the first chunk is what sets the constraint.)
+**Output format:** the component streams **Arrow IPC** to the Data Gateway —
+not JSONL. The 64 KiB JSONL per-line limit from earlier releases no longer
+applies to this component.
+
+Every emitted column is a **string**. Nested objects and arrays are rendered
+as compact JSON text; numbers keep their exact source text rather than being
+re-parsed as floats (`5938028332` stays `5938028332`, `1.50` stays `1.50` — no
+float round-tripping). Downstream consumers that need numeric operations
+(e.g. `sql-transform`) must `CAST` the column explicitly.
+
+**Schema:** with `fields` set, the output columns are the projected names, in
+declared order. Without `fields`, the schema is the sorted union of top-level
+keys seen across the first 8192 records, fixed for the rest of the run.
+
+**Late-column limitation.** Without `fields`, because the schema is fixed
+after the first 8192 records, a field that first appears later in the
+response is **not written** — the old buffer-everything path did include it.
+This is the deliberate cost of bounded memory: the component never buffers
+the whole response, only up to one batch's worth of records while it infers
+columns. Mitigation: the run logs one `WARN` naming the dropped field(s)
+(capped at 64 distinct names — the affected-record count itself is always
+exact) and the number of affected records. If the response's shape is not
+uniform within its first 8192 records, set `fields` explicitly so every
+column you need is guaranteed from record one. See
+[docs/known-limitations.md](known-limitations.md).
+
+**Compatibility caveat.** Writing into a **pre-existing table with typed
+(non-string) columns** fails Iceberg's schema check, for both `APPEND` and
+`FULL_LOAD` — `ReplaceDataFiles` (used by `FULL_LOAD`) replaces the table's
+data files, not its catalog schema. Use a fresh table name, or drop the old
+table first.
+
+**Local debugging.** `make extractor-local
+CONFIG=cmd/mock-datagateway/example-nyc311.json` builds and runs the real
+binary against a mock Data Gateway, reporting rows written and peak RSS. The
+target's default ports (`GRPC_ADDR=localhost:50051`, `HTTP_ADDR=localhost:50052`)
+can already be bound by something else — on macOS, Canonical Multipass commonly
+holds port 50051 via launchd. The target detects this and aborts fast (rather
+than hanging) with a suggested override; pass your own, e.g.:
+
+```bash
+make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json \
+  GRPC_ADDR=localhost:51051 HTTP_ADDR=localhost:51052
+```
+
+Real measured example: 200,000 rows streamed in 25 batches at roughly 94 MB
+peak RSS.
 
 ---
 
@@ -356,6 +397,13 @@ Use the Go SDK (`sdk/go/`) or Python SDK (`sdk/python/`) to build a component.
 Both SDKs are ~200–300 LOC and expose three operations: `OpenWriter`,
 `WriteChunk` / `Write`, and `Close`. The SDKs handle gRPC connection, config
 resolution, and secret delivery from the Data Gateway sidecar.
+
+Go components can opt into writer-side Arrow output via the `sdk/go/arrow`
+module's `StringSink` — an all-String Arrow `RecordBuilder` that batches
+records into self-contained IPC streams, with optional first-batch schema
+inference when you don't supply explicit columns. It's the writer-side
+counterpart of that module's existing Arrow reader (used by `sql-transform`
+to stream Arrow-IPC inputs); base `sdk/go` stays Arrow-free.
 
 Write a `schema.json` next to your parser, following the Form Subset rules
 above, and register it as a `ComponentDefinition` with the appropriate `io`
