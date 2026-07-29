@@ -312,8 +312,9 @@ output).** Without an explicit `fields` projection, the output schema is the
 sorted union of top-level keys seen across the first 8192 records, fixed for
 the rest of the run — the component never buffers the whole HTTP response.
 A field that first appears in a later record is outside that fixed schema,
-so its value is silently **not written**; the old buffer-everything path did
-include it. This is the deliberate cost of bounded memory, not a bug.
+so its value is **not written** into the Arrow output, with a run-level WARN
+after finish; the old buffer-everything path did include it. This is the
+deliberate cost of bounded memory, not a bug.
 
 Mitigation: the run logs one `WARN` naming the dropped field(s) — capped at
 64 distinct names, though the affected-record count is always exact — via
