@@ -213,9 +213,17 @@ column — declared or inferred — keeps a value's **exact source text**
 rather than re-parsing it (`5938028332` stays `5938028332`, `1.50` stays
 `1.50` — no float round-tripping); downstream consumers that need numeric
 operations on a string column (e.g. `sql-transform`) must `CAST` it
-explicitly. Set `schema_inference: strings` to fall back to the
-pre-typed-inference behavior — every column unconditionally a string — the
-escape hatch for a feed too irregular for typed inference to fit reliably.
+explicitly. Set `schema_inference: strings` to make every column
+unconditionally a string — the escape hatch for a feed too irregular for
+typed inference to fit reliably.
+
+> `strings` mode is **not** a compatibility mode for tables created before
+> 0.12.0. It reproduces what the *component* used to put on the wire, not the
+> table schema that used to result: pre-0.12.0 the component emitted untyped
+> JSONL and the **gateway** inferred the schema, coercing strings into
+> `timestamptz`, `long`, and `double` and marking most columns `required`.
+> Nothing the component can emit today reproduces that. See the compatibility
+> caveat below.
 
 **Declared output columns.** A pipeline doc can declare, for this
 component's output table, an explicit `{name, type}` column mapping under
@@ -264,6 +272,24 @@ already has — fails Iceberg's schema check, for both `APPEND` and
 data files, not its catalog schema. Use a fresh table name, declare
 `outputs.tables[].columns` to pin a stable schema across runs, or drop the
 old table first.
+
+**Tables created before 0.12.0 cannot be written by this component at all.**
+Pre-0.12.0, schema decisions were made gateway-side from untyped JSONL, and
+that path did things the component-side path deliberately does not:
+
+| pre-0.12.0 (gateway inference) | 0.12.0+ (component/SDK) |
+|---|---|
+| parsed date-like **strings** into `timestamptz` / `date` | a JSON string stays `string` |
+| numeric-looking **strings** became `long` / `double` | a JSON string stays `string` |
+| integers could land as `double` | integral values are always `Int64` |
+| most columns `required` (non-nullable) | every column is nullable |
+
+Because the declared-column vocabulary has no timestamp/date type and no way
+to mark a column `required`, **no `columns` mapping or `schema_inference`
+setting reproduces a pre-0.12.0 schema.** The only options for such a table
+are to write to a new table name or drop and recreate it. A run that hits
+this fails at commit with an Iceberg schema error naming the table (visible
+in the component's status message and the gateway sidecar log).
 
 **Local debugging.** `make extractor-local
 CONFIG=cmd/mock-datagateway/example-nyc311.json` builds and runs the real
@@ -444,6 +470,16 @@ a user-error condition (map it to `sdk.ExitUserError`, not `ExitAppError`).
 Both are the writer-side counterpart of that module's existing Arrow reader
 (used by `sql-transform` to stream Arrow-IPC inputs); base `sdk/go` stays
 Arrow-free.
+
+**Always check `Commit`'s result, not just its error.** A per-table commit
+failure (an Iceberg schema conflict, a 409, a credential problem) comes back
+as a *successful* RPC carrying `Success: false` — so `if _, err :=
+client.Commit(ctx); err != nil` alone reports the component as having
+succeeded while its outputs were never committed. Check `result.Success`, and
+on failure use `result.FailureDetail()` for the message: the gateway populates
+only the **per-table** `Error`, so `result.Error` on its own is empty and the
+real reason is lost. Commit failures are `ExitAppError` (≥20) per the exit-code
+contract.
 
 Write a `schema.json` next to your parser, following the Form Subset rules
 above, and register it as a `ComponentDefinition` with the appropriate `io`
