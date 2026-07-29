@@ -202,10 +202,10 @@ func (s *Sink) flush() error {
 	}
 
 	payload := buf.Bytes()
-	s.bytesShipped += int64(len(payload))
 	if err := s.writer.Write(s.ctx, payload); err != nil {
 		return s.fail(&WriteError{Err: fmt.Errorf("failed to write IPC batch: %w", err)})
 	}
+	s.bytesShipped += int64(len(payload))
 	s.inBatch = 0
 	return nil
 }
@@ -268,9 +268,10 @@ func (s *Sink) closeAfterFailure() {
 func (s *Sink) Writer() ChunkWriter { return s.writer }
 
 // BytesShipped returns the running total of serialized IPC-stream bytes
-// handed to ChunkWriter.Write across every flush so far (including the
-// batch flushed by the most recent Finish). Load-bearing for callers
-// enforcing a total-bytes budget from inside their per-row loop — e.g.
-// data-generator's user-facing sizeInBytes limit, previously computed from
-// len(data) per serialized batch — check this total the same way.
+// successfully shipped via ChunkWriter.Write across every flush so far
+// (including the batch flushed by the most recent Finish). A failed Write
+// does not advance this total. Load-bearing for callers enforcing a
+// total-bytes budget from inside their per-row loop — e.g. data-generator's
+// user-facing sizeInBytes limit, previously computed from len(data) per
+// serialized batch — check this total the same way.
 func (s *Sink) BytesShipped() int64 { return s.bytesShipped }

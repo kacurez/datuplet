@@ -404,3 +404,51 @@ func TestSink_BytesShippedZeroForZeroRows(t *testing.T) {
 		t.Fatalf("BytesShipped() = %d, want 0 for zero rows", got)
 	}
 }
+
+// TestSink_BytesShippedNotAdvancedByFailedWrite proves BytesShipped() counts
+// only bytes successfully handed off: a batch that fails mid-flush (the IPC
+// payload was already serialized before ChunkWriter.Write was called) must
+// not advance the counter, while an earlier, successful flush must.
+func TestSink_BytesShippedNotAdvancedByFailedWrite(t *testing.T) {
+	fw := &fakeWriter{failWriteOn: 2} // first flush succeeds, second flush's Write fails
+	sink := NewSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, typedTestSchema(), WithBatchRows(2))
+
+	// First batch: flush succeeds -> BytesShipped must advance to the first
+	// payload's length.
+	appendTypedRow(sink.Builder(), 0, 0, true, "x")
+	if err := sink.RowDone(); err != nil {
+		t.Fatalf("RowDone(0): %v", err)
+	}
+	appendTypedRow(sink.Builder(), 1, 1, true, "x")
+	if err := sink.RowDone(); err != nil {
+		t.Fatalf("RowDone(1): %v", err)
+	}
+	if len(fw.payloads) != 1 {
+		t.Fatalf("payloads = %d, want 1 after first successful flush", len(fw.payloads))
+	}
+	afterSuccess := sink.BytesShipped()
+	if wantAfterSuccess := int64(len(fw.payloads[0])); afterSuccess != wantAfterSuccess {
+		t.Fatalf("BytesShipped() after successful flush = %d, want %d", afterSuccess, wantAfterSuccess)
+	}
+	if afterSuccess == 0 {
+		t.Fatal("test setup produced an empty first payload")
+	}
+
+	// Second batch: flush's Write call fails -> BytesShipped must NOT advance
+	// past the successful first flush, even though the failed batch's bytes
+	// were already serialized before Write was attempted.
+	appendTypedRow(sink.Builder(), 2, 2, true, "x")
+	if err := sink.RowDone(); err != nil {
+		t.Fatalf("RowDone(2) should succeed (batch not full yet), got: %v", err)
+	}
+	appendTypedRow(sink.Builder(), 3, 3, true, "x")
+	err := sink.RowDone()
+	var we *WriteError
+	if !errors.As(err, &we) {
+		t.Fatalf("RowDone(3) want WriteError, got %v", err)
+	}
+
+	if got := sink.BytesShipped(); got != afterSuccess {
+		t.Fatalf("BytesShipped() after failed write = %d, want unchanged %d (a failed write must not advance the counter)", got, afterSuccess)
+	}
+}
