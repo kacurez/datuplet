@@ -5,6 +5,7 @@ export DOCKER_BUILDKIT=1
 	build build-pipeline-api build-gateway \
 	build-components build-components-e2e build-components-local build-component-data-generator build-operators \
 	build-component-sql-transform build-component-datuplet-query \
+	engine-wasm \
 	extractor-local \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
 	clean clean-go-git-cache \
@@ -37,6 +38,12 @@ build-pipeline-api: ## Build pipeline-api binary
 
 build-operators: ## Build pipeline-operator binary
 	go build -o bin/pipeline-operator ./cmd/pipeline-operator
+
+# RFC 028 Part 0: builds the committed quickjs-ng-in-WASI engine artifact
+# (pinned versions + build recipe: utils/docker/engine-wasm.Dockerfile). CI
+# does not rebuild this — see contract-and-constraints.md "Engine ABI".
+engine-wasm: ## Build pkg/appengine/embed/engine.wasm (Docker, wasi-sdk)
+	docker build -f utils/docker/engine-wasm.Dockerfile -o pkg/appengine/embed .
 
 # Build the data gateway sidecar image
 build-gateway: ## Build gateway Docker image
