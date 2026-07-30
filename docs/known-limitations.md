@@ -359,7 +359,9 @@ produced. Check with `datuplet storage schema <ns>.<table>`:
   strings` reproduces the component's old *wire* output but not the coerced
   *table* schema, and the `outputs.tables[].columns` vocabulary has no
   timestamp/date type and no way to mark a column `required`. **Mitigation:
-  write to a new table name, or drop and recreate the table.**
+  write to a new table name, or delete the table
+  (`datuplet storage delete <ns>.<table> --confirm <ns>.<table>`, or the UI's
+  table page) and let the next run recreate it.**
 
 The failure surfaces as an Iceberg schema error under both `APPEND` and
 `FULL_LOAD`, in the component's status message and the gateway sidecar log.

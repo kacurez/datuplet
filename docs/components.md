@@ -305,8 +305,15 @@ inference produced for it. Check its current schema first —
   or a numeric column whose values arrive as JSON strings** → not
   reproducible. The declared-column vocabulary has no timestamp/date type and
   no way to mark a column `required`, so neither a `columns` mapping nor
-  `schema_inference` can match it. Write to a new table name, or drop and
-  recreate the table.
+  `schema_inference` can match it. Write to a new table name, or delete the
+  table and let the next run recreate it:
+
+  ```bash
+  datuplet storage --remote <url> delete raw.my_table --confirm raw.my_table
+  ```
+
+  That deletes the data files too and cannot be undone; the UI's table page
+  has the same action behind a typed confirmation.
 
 A run that hits the unreproducible case fails at commit with an Iceberg schema
 error naming the table (visible in the component's status message and the

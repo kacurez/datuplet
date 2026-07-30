@@ -34,6 +34,7 @@ func main() {
 	storageTokenFile := storageCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
 	storageProject := storageCmd.String("project", "", "Project name (auto-defaulted if you have exactly one)")
 	storageRows := storageCmd.Int("rows", 0, "Max preview rows (sample subcommand only; 0 = server default)")
+	storageConfirm := storageCmd.String("confirm", "", "Retype <ns>.<table> to confirm `delete` (required; no undo)")
 
 	queryCmd := flag.NewFlagSet("query", flag.ExitOnError)
 	queryRemote := queryCmd.String("remote", "", "pipeline-api URL (required)")
@@ -115,7 +116,7 @@ func main() {
 		storageCmd.Parse(os.Args[2:])
 		if *storageRemote == "" && os.Getenv(envRemote) == "" {
 			fmt.Fprintln(os.Stderr, "Error: --remote is required (or set $DATUPLET_REMOTE)")
-			fmt.Fprintln(os.Stderr, "Usage: datuplet storage --remote <url> [--project N] [--rows N] <tables|info|schema|sample|history> [<ns>.<table>]")
+			fmt.Fprintln(os.Stderr, "Usage: datuplet storage --remote <url> [--project N] [--rows N] <tables|info|schema|sample|history|delete> [<ns>.<table>]")
 			os.Exit(1)
 		}
 		if storageCmd.NArg() < 1 {
@@ -127,7 +128,7 @@ func main() {
 		switch sub {
 		case "tables":
 			err = runStorageTables(*storageRemote, *storageTokenFile, *storageProject)
-		case "info", "schema", "history", "sample":
+		case "info", "schema", "history", "sample", "delete":
 			if storageCmd.NArg() < 2 {
 				fmt.Fprintf(os.Stderr, "Error: %s requires <ns>.<table>\n", sub)
 				os.Exit(1)
@@ -142,6 +143,8 @@ func main() {
 				err = runStorageHistory(*storageRemote, *storageTokenFile, *storageProject, ref)
 			case "sample":
 				err = runStorageSample(*storageRemote, *storageTokenFile, *storageProject, ref, *storageRows)
+			case "delete":
+				err = runStorageDelete(*storageRemote, *storageTokenFile, *storageProject, ref, *storageConfirm)
 			}
 		default:
 			fmt.Fprintf(os.Stderr, "Error: unknown storage subcommand %q\n", sub)
@@ -251,7 +254,8 @@ Options for 'storage':
   -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one)
   -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   -rows int              Max preview rows for 'sample' subcommand (0 = server default)
-  <subcommand>           One of: tables | info | schema | sample | history
+  <subcommand>           One of: tables | info | schema | sample | history | delete
+  -confirm string        Retype <ns>.<table> to confirm 'delete' (required; deletes data files too, no undo)
   <ns>.<table>           Namespace.table reference (required for info/schema/sample/history)
 
 Options for 'components':

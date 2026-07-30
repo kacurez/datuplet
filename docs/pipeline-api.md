@@ -597,7 +597,7 @@ schema-generated builder form:
 
 Browse Iceberg tables produced by pipeline runs. When `DATUPLET_LAKEKEEPER_URL` is set, storage browse routes through the lakekeeper proxy (`pkg/pipelineapi/storage/catalog_proxy.go`) using a 5-minute impersonation JWT minted per request (see `docs/auth-flow.md` Leg 4). Without it, the endpoints fall back to a directory walker (`pkg/lib/datalake`) — filesystem and MinIO warehouses both supported.
 
-All four routes sit behind `auth.WithUser` (session-cookie auth, cluster mode) + `resolveProject()` (FGA `datuplet_member` check) before forwarding.
+The read routes sit behind `auth.WithUser` (session-cookie auth, cluster mode) + `resolveProject()` (FGA `datuplet_member` check) before forwarding. The one **destructive** route (`DELETE .../tables/{ns}/{t}`) requires FGA **`data_admin`** instead — see [Delete table](#delete-table).
 
 Identifier rules: `{ns}` and `{t}` must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`; `{pid}` must be a UUID. The resolved table path must not escape the warehouse root (symlink rejection, canonical containment check).
 
@@ -681,19 +681,58 @@ shared request prologue's own errors — invalid project id (400),
 unauthenticated (401), forbidden (403), and backend-not-configured (503) —
 return a bare `{"error": "..."}` without a `kind`.
 
+### Delete table
+
+`DELETE /api/v1/storage/projects/{pid}/tables/{ns}/{t}`
+
+Permanently deletes the table: catalog metadata **and its underlying data
+files** (lakekeeper `purgeRequested=true`, via
+`catalogwriter.PurgeTable`). There is no undo and no trash.
+
+Purge rather than a metadata-only drop is deliberate — dropping metadata alone
+would leave every parquet file the table wrote stranded in the bucket, still
+billed and no longer reachable through any catalog.
+
+Three ways this route differs from its read-only siblings:
+
+- **Authorization requires FGA `data_admin`**, not `datuplet_member`. That is
+  the same relation gating pipeline `PUT` and run triggers, and it resolves
+  upward through `editor`, so a project **viewer who can browse a table cannot
+  delete it** (403).
+- **Lakekeeper only.** The directory-walker fallback has no delete path, so an
+  instance without `DATUPLET_LAKEKEEPER_URL` returns **501** rather than
+  attempting deletion by path arithmetic.
+- **No server-side confirmation parameter.** Confirmation belongs in the
+  client, so that an API caller cannot satisfy it by hardcoding a magic value:
+  the CLI requires `--confirm <ns>.<table>` and the UI requires typing the
+  table reference.
+
+```json
+{ "deleted": true, "namespace": "raw", "table": "gbif_occurrences_sk" }
+```
+
+Every successful delete writes an audit line to the pipeline-api log naming
+the table, project, warehouse, and acting user.
+
+CLI equivalent (the `--confirm` value must exactly match the reference):
+
+```bash
+datuplet storage --remote <url> delete raw.gbif_occurrences_sk --confirm raw.gbif_occurrences_sk
+```
+
 ### Errors
 
 | Status | Meaning |
 |--------|---------|
 | 400 | Invalid project UUID, `ns`/`t` fails identifier regex, resolved path escapes the warehouse root, or (preview only) `sql_error` — lakekeeper/DuckDB rejected the statement |
 | 401 | No valid session cookie (cluster mode only) |
-| 403 | Not a member of the requested project |
+| 403 | Not a member of the requested project — or, for `DELETE`, a member lacking `data_admin` |
 | 404 | Table or its metadata not found |
 | 408 | Preview only: `timeout` — query exceeded its time budget |
 | 413 | Preview only: `result_too_large` — table too wide/large to preview |
 | 429 | Preview only: `rate_limited` — a preview is already running for this user |
 | 500 | Unexpected error reading warehouse or scanning table |
-| 501 | Preview only: `query_disabled` — query service not configured |
+| 501 | Preview: `query_disabled` — query service not configured. `DELETE`: no lakekeeper catalog configured, or the catalog does not support purge |
 | 503 | Storage service disabled (missing env config), OpenFGA unreachable, or (preview only) query-worker `capacity` |
 
 ## Observer + reaper split

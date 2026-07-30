@@ -110,6 +110,81 @@ var (
 	runStorageHistory = runStorageEndpoint("snapshots")
 )
 
+// runStorageDelete permanently deletes a table: catalog metadata AND data
+// files. There is no undo and no trash, so confirmation is mandatory and
+// deliberately not satisfiable by a bare --yes: the caller must retype the
+// table reference, which makes a mistyped or shell-history-recalled command
+// fail closed instead of destroying the wrong table.
+//
+// Requires FGA data_admin on the project (the same bar as triggering a run),
+// not mere membership — the server enforces this independently.
+func runStorageDelete(remote, tokenFile, project, ref, confirm string) error {
+	ns, tbl, err := parseNsTable(ref)
+	if err != nil {
+		return err
+	}
+	if err := confirmTableDeletion(ref, confirm); err != nil {
+		return err
+	}
+	args, err := storageBaseArgs(remote, tokenFile, project)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/projects/%s/tables/%s/%s",
+		url.PathEscape(args.ID), url.PathEscape(ns), url.PathEscape(tbl))
+	body, err := storageDELETE(context.Background(), args.Remote, path, args.APIToken)
+	if err != nil {
+		return err
+	}
+	if err := prettyPrintJSON(body); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "Deleted %s.%s (metadata and data files).\n", ns, tbl)
+	return nil
+}
+
+// confirmTableDeletion requires --confirm to exactly equal the table
+// reference being deleted. An exact retype (rather than a boolean --yes) is
+// what makes a recalled-from-history or copy-pasted command fail closed when
+// it names a different table than the operator intends.
+//
+// Called before any credential loading or network call, so a wrong
+// confirmation can never reach the server.
+func confirmTableDeletion(ref, confirm string) error {
+	if confirm == ref {
+		return nil
+	}
+	if confirm == "" {
+		return fmt.Errorf("refusing to delete %s: pass --confirm %s to proceed.\n"+
+			"This permanently deletes the table's metadata AND its data files — there is no undo", ref, ref)
+	}
+	return fmt.Errorf("refusing to delete %s: --confirm was %q, which does not match the table reference.\n"+
+		"Pass --confirm %s exactly", ref, confirm, ref)
+}
+
+// storageDELETE issues a DELETE against the storage REST path. Separate from
+// storageGET rather than parameterizing it by method: the read helper is used
+// by five callers and giving it a method argument would let a future caller
+// turn a read into a delete by passing the wrong constant.
+func storageDELETE(ctx context.Context, remote, path, token string) ([]byte, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/storage%s", strings.TrimRight(remote, "/"), path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := storageHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, storageMaxResponseBytes))
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
+}
+
 // runStorageSample is a special-case wrapper that passes the optional
 // --rows query parameter; the server defaults to a reasonable preview
 // row count when omitted (see pipelineapi/storage/handlers.go).

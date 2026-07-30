@@ -476,6 +476,10 @@ func (s *Server) Handler() http.Handler {
 			auth.WithUser(s.resolver, http.HandlerFunc(h.Preview)))
 		mux.Handle("GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/snapshots",
 			auth.WithUser(s.resolver, http.HandlerFunc(h.Snapshots)))
+		// The one destructive storage route. Its handler requires FGA
+		// data_admin rather than the datuplet_member the reads use.
+		mux.Handle("DELETE /api/v1/storage/projects/{pid}/tables/{ns}/{t}",
+			auth.WithUser(s.resolver, http.HandlerFunc(h.DeleteTable)))
 	default:
 		mux.HandleFunc("GET /api/v1/storage/", func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "storage endpoints are not configured on this pipeline-api instance", http.StatusServiceUnavailable)
