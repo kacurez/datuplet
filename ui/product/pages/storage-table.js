@@ -7,7 +7,7 @@
 // The router (app.js renderRoute) passes ctx = { params: [...] } where
 // params[0] = namespace, params[1] = name.
 
-import { esc, getTableInfo, getTableSchema, getTablePreview } from '/ui/api.js';
+import { esc, getTableInfo, getTableSchema, getTablePreview, deleteTable } from '/ui/api.js';
 import { skeletonRows } from '/ui/components.js';
 import { timeTag, formatBytes, storageFolderURI, gcsConsoleHref } from '/ui/format.js';
 import * as icons from '/ui/icons.js';
@@ -67,8 +67,13 @@ function renderHeader(ns, name, activeTab) {
         const label = t.charAt(0).toUpperCase() + t.slice(1);
         return `<button class="${cls}" data-tab="${t}">${esc(label)}</button>`;
       }).join('')}
+      <button class="btn btn--danger" id="delete-table-btn"
+              title="Permanently delete this table and its data files">Delete</button>
     </div>
   `;
+  document.getElementById('delete-table-btn').addEventListener('click', () => {
+    onDeleteTable(ns, name);
+  });
   document.getElementById('tab-nav').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-tab]');
     if (!btn) return;
@@ -83,6 +88,44 @@ function renderHeader(ns, name, activeTab) {
     const projectId = window.__datupletActiveProjectID;
     renderActiveTab(projectId, ns, name, tab);
   });
+}
+
+// onDeleteTable requires the operator to retype the full `ns.name` before
+// deleting. A plain yes/no confirm is too easy to dismiss reflexively for an
+// action that also removes the underlying parquet files with no undo, and
+// retyping is the same bar the CLI's --confirm enforces.
+async function onDeleteTable(ns, name) {
+  const ref = `${ns}.${name}`;
+  const typed = window.prompt(
+    `Permanently delete ${ref}?\n\n` +
+    'This removes the table from the catalog AND deletes its data files. ' +
+    'It cannot be undone.\n\n' +
+    'Do NOT do this while a pipeline is writing to this table — that run will ' +
+    'fail at commit and the files it already wrote will be orphaned.\n' +
+    'Check the Runs page (or `datuplet runs list`) for Pending/Running runs first.\n\n' +
+    `Type ${ref} to confirm:`,
+  );
+  if (typed === null) return; // cancelled
+  if (typed !== ref) {
+    window.alert(`Not deleted — you typed "${typed}", which does not match ${ref}.`);
+    return;
+  }
+  const btn = document.getElementById('delete-table-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deleting…'; }
+
+  const projectId = window.__datupletActiveProjectID;
+  try {
+    await deleteTable(projectId, ns, name);
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+    // 403 (member without data_admin) and 501 (no lakekeeper catalog) are the
+    // two expected refusals; surface the server's message rather than a
+    // generic failure so the cause is actionable.
+    window.alert(`Failed to delete ${ref}: ${e.message}`);
+    return;
+  }
+  // Table is gone — its detail route would now 404, so return to the catalog.
+  window.location.assign('/ui/storage');
 }
 
 async function renderActiveTab(projectId, ns, name, tab) {

@@ -122,6 +122,20 @@ export async function getTableInfo(projectId, namespace, name) {
 }
 
 /**
+ * Permanently delete a table: catalog metadata AND its data files. There is
+ * no undo. Requires FGA data_admin on the project (a plain member gets 403),
+ * and 501 when the instance has no lakekeeper catalog.
+ *
+ * The caller is responsible for confirming intent with the user first — the
+ * server intentionally takes no confirmation parameter.
+ */
+export async function deleteTable(projectId, namespace, name) {
+  return api(`/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
  * Iceberg schema fields for the table's current snapshot.
  * Returns { columns: [{ id, name, type, nullable }, ...] }.
  */

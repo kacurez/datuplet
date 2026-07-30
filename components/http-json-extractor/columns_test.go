@@ -260,6 +260,8 @@ func decodeIPCPayload(t *testing.T, payload []byte) []map[string]any {
 					continue
 				}
 				switch arr := col.(type) {
+				case *array.Int32:
+					row[f.Name] = arr.Value(r)
 				case *array.Int64:
 					row[f.Name] = arr.Value(r)
 				case *array.Float64:
@@ -328,8 +330,10 @@ func TestFieldsProjectingSink_ComposesDeclaredColumns(t *testing.T) {
 		t.Fatalf("decoded rows = %d, want 1", len(decoded))
 	}
 	row := decoded[0]
-	if v, ok := row["user_id"].(int64); !ok || v != 42 {
-		t.Fatalf("user_id = %v (%T), want int64(42)", row["user_id"], row["user_id"])
+	// Declared `int` is 32-bit (Iceberg's int), so this decodes as int32 —
+	// declare `long` for values that may exceed int32.
+	if v, ok := row["user_id"].(int32); !ok || v != 42 {
+		t.Fatalf("user_id = %v (%T), want int32(42)", row["user_id"], row["user_id"])
 	}
 	if v, ok := row["amount"].(float64); !ok || v != 19.99 {
 		t.Fatalf("amount = %v (%T), want float64(19.99)", row["amount"], row["amount"])

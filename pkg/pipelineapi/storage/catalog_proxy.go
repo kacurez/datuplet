@@ -81,6 +81,20 @@ func newCatalogProxy(ctx context.Context, svc *Service, projectID, warehouse str
 	return &catalogProxy{cli: cli}, nil
 }
 
+// purgeTable removes a table's catalog metadata AND its underlying data
+// files. Purge rather than plain drop is deliberate: dropping metadata alone
+// would strand every parquet file the table ever wrote in the bucket, still
+// billed and now unreachable through any catalog.
+//
+// The caller must already have passed the data_admin gate — this method does
+// no authorization of its own. lakekeeper is a REST catalog, so the
+// REST-only purge path applies; a non-REST catalog surfaces
+// catalogwriter.ErrPurgeNotSupported, which the handler maps to a clear 501
+// rather than a bare 500.
+func (p *catalogProxy) purgeTable(ctx context.Context, ns, tbl string) error {
+	return p.cli.PurgeTable(ctx, []string{ns, tbl})
+}
+
 // listAllTables returns every (namespace, table) the proxy can see in
 // the configured warehouse. The shape mirrors what walker.go's
 // ListTables produces so handlers/list_tables.go stays uniform across

@@ -111,7 +111,10 @@ func commitAndStatus(ctx context.Context, client *sdk.Client, sourceURL string) 
 		return fmt.Errorf("commit failed: %w", err)
 	}
 	if !result.Success {
-		return fmt.Errorf("commit returned failure")
+		if detail := result.FailureDetail(); detail != "" {
+			return fmt.Errorf("commit returned failure: %s", detail)
+		}
+		return fmt.Errorf("commit returned failure (gateway reported no error detail; check the gateway sidecar log)")
 	}
 	var rows int64
 	for _, b := range result.Buckets {
@@ -217,8 +220,17 @@ func main() {
 	}
 	if rows == 0 {
 		client.Log(ctx, "WARN", "No records found")
-		if _, err := client.Commit(ctx); err != nil {
+		// No writer was ever opened, so there is nothing for the gateway to
+		// fail on here — but check Success anyway rather than discard the
+		// result: the contract is that a per-table failure arrives as a
+		// successful RPC with Success=false, and a future writer opened above
+		// this point would otherwise be silently dropped.
+		result, err := client.Commit(ctx)
+		if err != nil {
 			sdk.ExitAppError(fmt.Sprintf("commit failed: %v", err))
+		}
+		if !result.Success {
+			sdk.ExitAppError(fmt.Sprintf("commit returned failure: %s", result.FailureDetail()))
 		}
 		sdk.StatusMessage("extracted 0 records (empty response)")
 		return

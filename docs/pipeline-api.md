@@ -29,7 +29,7 @@ stages:                   # sequential; components within a stage run in paralle
     components:
       - name: gen                     # instance name, unique across the pipeline
         component: data-generator     # registry reference
-        # version: v0.12.0            # optional; omit to use the registry default
+        # version: v0.12.1            # optional; omit to use the registry default
         config:                       # validated against the version's configSchema
           tables:
             - name: events
@@ -87,9 +87,22 @@ outputs:
 `columns` is `[]{name, type}` (`pkg/pipeline/config.ColumnSpec`, carried
 through the CRD and the Data Gateway's `ComponentConfig.OutputConfig` to the
 SDK as `sdk.OutputTableRef.Columns`); `type` is one of `int`, `long`,
-`float`, `double`, `boolean`, `string` — the same vocabulary
-`sdk/go/arrow.ArrowTypeFor` resolves to Int64/Float64/Boolean/String
-(all nullable). When set, the producing component writes **exactly these
+`float`, `double`, `boolean`, `string` — the vocabulary
+`sdk/go/arrow.ArrowTypeFor` resolves as follows (all nullable):
+
+| declared | Arrow / Iceberg | notes |
+|---|---|---|
+| `int` | Int32 | 32-bit. A value beyond ±2³¹ fails the run as a user error (never truncated) |
+| `long` | Int64 | 64-bit — use this when values may exceed int32 |
+| `float`, `double` | Float64 | |
+| `boolean` | Boolean | |
+| `string` | String (utf8) | keeps the value's exact source text |
+
+Narrowing to 32-bit is only offered for a **declared** `int` because the
+declaration is your assertion about the range; type *inference* never chooses
+Int32, since it cannot know from a sample that a later value will still fit.
+
+When set, the producing component writes **exactly these
 columns, with these types, for this table, and infers nothing** — a source
 field not in the list is silently excluded, and a mapped column missing
 from a given record is written as null. When omitted (the default), the
@@ -497,7 +510,7 @@ make deploy-local
 
 What it does (see the `deploy-local` / `deploy-local-helm` Makefile targets):
 
-1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.12.0`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
+1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.12.1`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
 2. Helm-installs the four charts in phase order, each waited on before the next: `datuplet-operators` (CRDs, RBAC, the CNPG operator), `datuplet-infra` (Postgres cluster, OpenFGA, MinIO), `datuplet-app` (pipeline-api, pipeline-operator, pipeline-observer — with `image.pullPolicy=IfNotPresent` and `components.registry=datuplet` so the built-in ComponentDefinitions point at the locally-built images), then `datuplet-lakekeeper`.
 3. Runs `./scripts/register.sh --namespace datuplet`, which `kubectl exec`s into the `pipeline-api` Pod and runs five idempotent `pipeline-api admin` steps: `lakekeeper-bootstrap` (creates the warehouse + server-admin FGA tuple), `create-user` (default admin `admin@datuplet.local` / `changeme`), `create-project` (default project `default`), `attach-warehouse`, and `grant --role admin`.
 
@@ -584,7 +597,7 @@ schema-generated builder form:
 
 Browse Iceberg tables produced by pipeline runs. When `DATUPLET_LAKEKEEPER_URL` is set, storage browse routes through the lakekeeper proxy (`pkg/pipelineapi/storage/catalog_proxy.go`) using a 5-minute impersonation JWT minted per request (see `docs/auth-flow.md` Leg 4). Without it, the endpoints fall back to a directory walker (`pkg/lib/datalake`) — filesystem and MinIO warehouses both supported.
 
-All four routes sit behind `auth.WithUser` (session-cookie auth, cluster mode) + `resolveProject()` (FGA `datuplet_member` check) before forwarding.
+The read routes sit behind `auth.WithUser` (session-cookie auth, cluster mode) + `resolveProject()` (FGA `datuplet_member` check) before forwarding. The one **destructive** route (`DELETE .../tables/{ns}/{t}`) requires FGA **`data_admin`** instead — see [Delete table](#delete-table).
 
 Identifier rules: `{ns}` and `{t}` must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`; `{pid}` must be a UUID. The resolved table path must not escape the warehouse root (symlink rejection, canonical containment check).
 
@@ -668,19 +681,80 @@ shared request prologue's own errors — invalid project id (400),
 unauthenticated (401), forbidden (403), and backend-not-configured (503) —
 return a bare `{"error": "..."}` without a `kind`.
 
+### Delete table
+
+`DELETE /api/v1/storage/projects/{pid}/tables/{ns}/{t}`
+
+Permanently deletes the table: catalog metadata **and its underlying data
+files** (lakekeeper `purgeRequested=true`, via
+`catalogwriter.PurgeTable`). There is no undo and no trash.
+
+Purge rather than a metadata-only drop is deliberate — dropping metadata alone
+would leave every parquet file the table wrote stranded in the bucket, still
+billed and no longer reachable through any catalog.
+
+Three ways this route differs from its read-only siblings:
+
+- **Authorization requires FGA `data_admin`**, not `datuplet_member`. That is
+  the same relation gating pipeline `PUT` and run triggers, and it resolves
+  upward through `editor`, so a project **viewer who can browse a table cannot
+  delete it** (403).
+- **Lakekeeper only.** The directory-walker fallback has no delete path, so an
+  instance without `DATUPLET_LAKEKEEPER_URL` returns **501** rather than
+  attempting deletion by path arithmetic.
+- **No server-side confirmation parameter.** Confirmation belongs in the
+  client, so that an API caller cannot satisfy it by hardcoding a magic value:
+  the CLI requires `--confirm <ns>.<table>` and the UI requires typing the
+  table reference.
+
+```json
+{ "deleted": true, "namespace": "raw", "table": "gbif_occurrences_sk" }
+```
+
+Every successful delete writes an audit line to the pipeline-api log naming
+the table, project, warehouse, and acting user.
+
+Deleting a table that no longer exists returns **404**, including when a retry
+follows a request that actually succeeded — so a client that times out can
+safely retry.
+
+> **⚠️ Do not delete a table while a pipeline is writing to it.** A Data
+> Gateway writer resolves its data prefix and storage credentials once when the
+> writer opens and holds them for the run, so a purge does not stop it: the run
+> keeps writing parquet under the old prefix and then **fails at commit**,
+> where the commit re-loads the table from the catalog and finds it gone. You
+> are left with a failed run *and* the files it wrote after the purge orphaned
+> in the bucket (still billed, unreachable from any catalog).
+>
+> This is intentionally not blocked server-side. The `runs` table carries no
+> output-table column, so a pre-flight check would mean reading PipelineRun
+> CRDs and scanning `resolvedSpec` — and it still could not close the window,
+> because a run can be triggered immediately after the check passes. A guard
+> that looks authoritative but isn't would be worse than a documented
+> constraint. Check for active runs before deleting — `datuplet runs list`
+> (newest first, project-wide) and look for **`Pending` as well as `Running`**:
+> a Pending run has not opened its writer yet but is about to, and `--phase`
+> takes only one value so filtering on `Running` alone would miss it.
+
+CLI equivalent (the `--confirm` value must exactly match the reference):
+
+```bash
+datuplet storage --remote <url> delete raw.gbif_occurrences_sk --confirm raw.gbif_occurrences_sk
+```
+
 ### Errors
 
 | Status | Meaning |
 |--------|---------|
 | 400 | Invalid project UUID, `ns`/`t` fails identifier regex, resolved path escapes the warehouse root, or (preview only) `sql_error` — lakekeeper/DuckDB rejected the statement |
 | 401 | No valid session cookie (cluster mode only) |
-| 403 | Not a member of the requested project |
+| 403 | Not a member of the requested project — or, for `DELETE`, a member lacking `data_admin` |
 | 404 | Table or its metadata not found |
 | 408 | Preview only: `timeout` — query exceeded its time budget |
 | 413 | Preview only: `result_too_large` — table too wide/large to preview |
 | 429 | Preview only: `rate_limited` — a preview is already running for this user |
 | 500 | Unexpected error reading warehouse or scanning table |
-| 501 | Preview only: `query_disabled` — query service not configured |
+| 501 | Preview: `query_disabled` — query service not configured. `DELETE`: no lakekeeper catalog configured, or the catalog does not support purge |
 | 503 | Storage service disabled (missing env config), OpenFGA unreachable, or (preview only) query-worker `capacity` |
 
 ## Observer + reaper split

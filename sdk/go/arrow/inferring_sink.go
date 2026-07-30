@@ -197,7 +197,15 @@ type TypedColumn struct {
 // function never panics.
 func ArrowTypeFor(t string) (arrow.DataType, error) {
 	switch t {
-	case "int", "long":
+	case "int":
+		// 32-bit, matching Iceberg's `int`. Narrowing is only safe because
+		// the caller DECLARED it: an out-of-range value is a
+		// TypeViolationError (a real configuration/data mismatch worth
+		// failing on), not a silent truncation. Inference never chooses
+		// Int32 for exactly the inverse reason — it cannot know from a
+		// sample that a later value will fit.
+		return arrow.PrimitiveTypes.Int32, nil
+	case "long":
 		return arrow.PrimitiveTypes.Int64, nil
 	case "float", "double":
 		return arrow.PrimitiveTypes.Float64, nil
@@ -678,6 +686,20 @@ func declaredValueFits(v any, t arrow.DataType) bool {
 		return true
 	}
 	switch t.ID() {
+	case arrow.INT32:
+		// bitSize 32 makes ParseInt itself reject out-of-range values, so a
+		// declared `int` column overflowing surfaces as a TypeViolationError
+		// rather than wrapping silently.
+		switch x := v.(type) {
+		case json.Number:
+			_, err := strconv.ParseInt(x.String(), 10, 32)
+			return err == nil
+		case float64:
+			return !math.IsNaN(x) && !math.IsInf(x, 0) && x == math.Trunc(x) &&
+				x >= math.MinInt32 && x <= math.MaxInt32
+		default:
+			return false
+		}
 	case arrow.INT64:
 		switch x := v.(type) {
 		case json.Number:
@@ -723,6 +745,15 @@ func appendValueToBuilder(b array.Builder, t arrow.DataType, v any) {
 		return
 	}
 	switch t.ID() {
+	case arrow.INT32:
+		ib := b.(*array.Int32Builder)
+		switch x := v.(type) {
+		case json.Number:
+			n, _ := strconv.ParseInt(x.String(), 10, 32) // pre-validated by declaredValueFits
+			ib.Append(int32(n))
+		case float64:
+			ib.Append(int32(x))
+		}
 	case arrow.INT64:
 		ib := b.(*array.Int64Builder)
 		switch x := v.(type) {

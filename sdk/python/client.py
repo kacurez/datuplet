@@ -116,6 +116,30 @@ class CommitResult:
     error: str
     buckets: list[BucketResult]
 
+    def failure_detail(self) -> str:
+        """Render every reported error into one actionable line.
+
+        Mirrors CommitResult.FailureDetail() in the Go SDK. Walks all three
+        levels because the gateway currently populates ONLY the per-table
+        error: the response- and bucket-level `error` fields exist on the wire
+        but are left empty for a per-table commit failure, so reading
+        `result.error` alone yields "" and the real reason (an iceberg schema
+        conflict, a 409, a credential error) is lost.
+
+        Returns "" when nothing was reported — treat that as "no detail
+        available", not "no failure".
+        """
+        parts: list[str] = []
+        if self.error:
+            parts.append(self.error)
+        for b in self.buckets:
+            if b.error:
+                parts.append(f"bucket {b.bucket}: {b.error}")
+            for t in b.tables:
+                if t.error:
+                    parts.append(f"{t.bucket}.{t.table}: {t.error}")
+        return "; ".join(parts)
+
 
 @dataclass
 class DeltaInfo:

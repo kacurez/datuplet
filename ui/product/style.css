@@ -242,6 +242,11 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .btn--secondary:hover { background: var(--bg-2); }
 .btn--ghost { color: var(--fg-1); }
 .btn--ghost:hover { color: var(--fg-0); background: var(--bg-2); }
+/* Destructive actions (e.g. deleting a table, which also deletes its data
+   files). Deliberately not filled: it sits next to ordinary tab buttons and
+   should read as dangerous without competing with the primary action. */
+.btn--danger { border-color: var(--status-fail-fg); color: var(--status-fail-fg); }
+.btn--danger:hover { background: var(--status-fail-fg); color: var(--bg-0); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ---------- Tables ---------- */

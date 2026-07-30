@@ -38,8 +38,18 @@ type Error struct {
 // refactor.
 
 // Authorize validates pid, maps it to the lakekeeper project ID, and
-// enforces FGA datuplet_member for userID.
+// enforces FGA datuplet_member for userID — the read-path bar shared by
+// every storage handler and the query proxy.
 func (g *Gate) Authorize(ctx context.Context, userID, pid string) (uuid.UUID, string, *Error) {
+	return g.AuthorizeRelation(ctx, userID, pid, "datuplet_member")
+}
+
+// AuthorizeRelation is Authorize with an explicit FGA relation, for routes
+// that need a higher bar than membership. Destructive storage operations use
+// "data_admin" — the same relation gating pipeline PUT and run triggers,
+// which resolves upward through `editor` in the FGA model, so a project
+// viewer is correctly excluded.
+func (g *Gate) AuthorizeRelation(ctx context.Context, userID, pid, relation string) (uuid.UUID, string, *Error) {
 	parsed, err := uuid.Parse(pid)
 	if err != nil {
 		return uuid.Nil, "", &Error{Status: http.StatusBadRequest, Kind: "bad_request", Msg: "invalid project id"}
@@ -55,7 +65,7 @@ func (g *Gate) Authorize(ctx context.Context, userID, pid string) (uuid.UUID, st
 		return uuid.Nil, "", &Error{Status: http.StatusServiceUnavailable, Kind: "unavailable", Msg: "project authz not yet provisioned"}
 	}
 	userStr := authz.UserObject(userID).String()
-	allowed, err := g.Authorizer.Check(ctx, userStr, "datuplet_member", authz.ProjectObject(lkPID))
+	allowed, err := g.Authorizer.Check(ctx, userStr, relation, authz.ProjectObject(lkPID))
 	if err != nil {
 		if errors.Is(err, authz.ErrAuthzUnavailable) {
 			return uuid.Nil, "", &Error{Status: http.StatusServiceUnavailable, Kind: "unavailable", Msg: "authz backend unavailable"}

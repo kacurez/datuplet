@@ -16,7 +16,7 @@ container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
 Image registry: `ghcr.io/kacurez/<name>:<components.tag>` — the tag tracks the
-chart's `components.tag` (the release version; `v0.12.0` in this release).
+chart's `components.tag` (the release version; `v0.12.1` in this release).
 
 ---
 
@@ -146,7 +146,7 @@ These stay component-enforced: the component fails fast at start with exit 1
 Generates random or literal rows inline from pipeline YAML — useful for
 testing pipelines without an external data source.
 
-**Image:** `ghcr.io/kacurez/data-generator:v0.12.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/data-generator:v0.12.1` · **Registry name:**
 `data-generator` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/data-generator/schema.json`](../components/data-generator/schema.json)
@@ -172,7 +172,7 @@ seeded from SHA-256 of the pair).
 Fetches JSON from an HTTP endpoint and writes it as an Iceberg table. Supports
 single-request and paginated modes.
 
-**Image:** `ghcr.io/kacurez/http-json-extractor:v0.12.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/http-json-extractor:v0.12.1` · **Registry name:**
 `http-json-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/http-json-extractor/schema.json`](../components/http-json-extractor/schema.json)
@@ -213,9 +213,17 @@ column — declared or inferred — keeps a value's **exact source text**
 rather than re-parsing it (`5938028332` stays `5938028332`, `1.50` stays
 `1.50` — no float round-tripping); downstream consumers that need numeric
 operations on a string column (e.g. `sql-transform`) must `CAST` it
-explicitly. Set `schema_inference: strings` to fall back to the
-pre-typed-inference behavior — every column unconditionally a string — the
-escape hatch for a feed too irregular for typed inference to fit reliably.
+explicitly. Set `schema_inference: strings` to make every column
+unconditionally a string — the escape hatch for a feed too irregular for
+typed inference to fit reliably.
+
+> `strings` mode is **not** a compatibility mode for tables created before
+> 0.12.0. It reproduces what the *component* used to put on the wire, not the
+> table schema that used to result: pre-0.12.0 the component emitted untyped
+> JSONL and the **gateway** inferred the schema, coercing strings into
+> `timestamptz`, `long`, and `double` and marking most columns `required`.
+> Nothing the component can emit today reproduces that. See the compatibility
+> caveat below.
 
 **Declared output columns.** A pipeline doc can declare, for this
 component's output table, an explicit `{name, type}` column mapping under
@@ -226,6 +234,14 @@ the mapped columns are written, with the mapped types, from every record —
 no sampling, no inference for that table. `fields` still composes with a
 declared mapping: `fields` selects/renames from the source record first, and
 the mapping then types the resulting (already-renamed) columns by name.
+
+Note `int` is **32-bit** (Iceberg's `int`) and `long` is 64-bit — declare
+`long` for anything that may exceed ±2³¹, such as an epoch-millis timestamp
+or a large surrogate key. A value that doesn't fit a declared `int` fails the
+run as a user error rather than being truncated. Inference, by contrast,
+always chooses Int64 for integers: it cannot know from the first batch that a
+later value will still fit 32 bits, so narrowing there would turn a
+late large value into a failed run.
 
 **Schema:** with a declared `outputs.tables[].columns` mapping, the output
 columns are exactly the mapped names, in mapped order and type — regardless
@@ -265,6 +281,44 @@ data files, not its catalog schema. Use a fresh table name, declare
 `outputs.tables[].columns` to pin a stable schema across runs, or drop the
 old table first.
 
+**Tables created before 0.12.0 may carry a schema this component can no
+longer produce.** Pre-0.12.0, schema decisions were made gateway-side from
+untyped JSONL, and that path did things the component-side path deliberately
+does not:
+
+| pre-0.12.0 (gateway inference) | 0.12.0+ (component/SDK) |
+|---|---|
+| parsed date-like **strings** into `timestamptz` / `date` | a JSON string stays `string` |
+| numeric-looking **strings** became `long` / `double` | a JSON string stays `string` |
+| integers could land as `double` | integral values are always `Int64` |
+| most columns `required` (non-nullable) | every column is nullable |
+
+Whether a given legacy table is still writable depends on what the old
+inference produced for it. Check its current schema first —
+`datuplet storage schema <ns>.<table>`:
+
+- **All columns `string` and nullable** → still writable: set
+  `schema_inference: strings` (or declare every column as `string`) to emit a
+  matching schema. Gateway-side inference marked a column nullable whenever
+  its sample contained a null, so this case is real, not hypothetical.
+- **Any `timestamptz` / `date` column, any `required` (non-nullable) column,
+  or a numeric column whose values arrive as JSON strings** → not
+  reproducible. The declared-column vocabulary has no timestamp/date type and
+  no way to mark a column `required`, so neither a `columns` mapping nor
+  `schema_inference` can match it. Write to a new table name, or delete the
+  table and let the next run recreate it:
+
+  ```bash
+  datuplet storage --remote <url> delete raw.my_table --confirm raw.my_table
+  ```
+
+  That deletes the data files too and cannot be undone; the UI's table page
+  has the same action behind a typed confirmation.
+
+A run that hits the unreproducible case fails at commit with an Iceberg schema
+error naming the table (visible in the component's status message and the
+gateway sidecar log).
+
 **Local debugging.** `make extractor-local
 CONFIG=cmd/mock-datagateway/example-nyc311.json` builds and runs the real
 binary against a mock Data Gateway, reporting rows written and peak RSS. The
@@ -288,7 +342,7 @@ peak RSS.
 Fetches market data from the [Finnhub](https://finnhub.io/) API. Requires a
 Finnhub API key.
 
-**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.12.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.12.1` · **Registry name:**
 `finnhub-extractor` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/finnhub-extractor/schema.json`](../components/finnhub-extractor/schema.json).
@@ -320,7 +374,7 @@ Data Gateway via Arrow IPC and are materialized into DuckDB tables before the SQ
 runs. Outputs are written back through the Data Gateway; no S3 credentials touch
 the component.
 
-**Image:** `ghcr.io/kacurez/sql-transform:v0.12.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/sql-transform:v0.12.1` · **Registry name:**
 `sql-transform` · **IO:** `{inputs: required, outputs: required}`
 
 **Config schema:** [`components/sql-transform/schema.json`](../components/sql-transform/schema.json)
@@ -359,7 +413,7 @@ Applies a sequence of pandas operations to input data. Reads the input table as
 CSV from the Data Gateway, applies the operations in order, and writes the
 result back as CSV — no S3 or Lakekeeper credentials touch the component.
 
-**Image:** `ghcr.io/kacurez/pandas-transform:v0.12.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/pandas-transform:v0.12.1` · **Registry name:**
 `pandas-transform` · **IO:** `{inputs: required, outputs: required}`
 
 **Config schema:** [`components/pandas-transform/schema.json`](../components/pandas-transform/schema.json)
@@ -380,7 +434,7 @@ skipped rather than failing the run.
 Reads input tables and prints them to stdout. For debugging only — no Iceberg
 output.
 
-**Image:** `ghcr.io/kacurez/stdout-writer:v0.12.0` · **Registry name:**
+**Image:** `ghcr.io/kacurez/stdout-writer:v0.12.1` · **Registry name:**
 `stdout-writer` · **IO:** `{inputs: required, outputs: none}`
 
 **Config schema:** [`components/stdout-writer/schema.json`](../components/stdout-writer/schema.json)
@@ -444,6 +498,16 @@ a user-error condition (map it to `sdk.ExitUserError`, not `ExitAppError`).
 Both are the writer-side counterpart of that module's existing Arrow reader
 (used by `sql-transform` to stream Arrow-IPC inputs); base `sdk/go` stays
 Arrow-free.
+
+**Always check `Commit`'s result, not just its error.** A per-table commit
+failure (an Iceberg schema conflict, a 409, a credential problem) comes back
+as a *successful* RPC carrying `Success: false` — so `if _, err :=
+client.Commit(ctx); err != nil` alone reports the component as having
+succeeded while its outputs were never committed. Check `result.Success`, and
+on failure use `result.FailureDetail()` for the message: the gateway populates
+only the **per-table** `Error`, so `result.Error` on its own is empty and the
+real reason is lost. Commit failures are `ExitAppError` (≥20) per the exit-code
+contract.
 
 Write a `schema.json` next to your parser, following the Form Subset rules
 above, and register it as a `ComponentDefinition` with the appropriate `io`

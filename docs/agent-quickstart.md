@@ -65,12 +65,12 @@ datuplet components list
 
 ```
 NAME                     DISPLAY                  DEFAULT      IO                 DEPRECATED
-data-generator           Data Generator           v0.9.1       none/required      false
-sql-transform            SQL Transform            v0.9.1       required/required  false
-finnhub-extractor        Finnhub Extractor        v0.9.1       none/required      false
-http-json-extractor      HTTP JSON Extractor      v0.9.1       none/required      false
-pandas-transform         Pandas Transform         v0.9.1       required/required  false
-stdout-writer            Stdout Writer            v0.9.1       required/none      false
+data-generator           Data Generator           v0.12.1       none/required      false
+sql-transform            SQL Transform            v0.12.1       required/required  false
+finnhub-extractor        Finnhub Extractor        v0.12.1       none/required      false
+http-json-extractor      HTTP JSON Extractor      v0.12.1       none/required      false
+pandas-transform         Pandas Transform         v0.12.1       required/required  false
+stdout-writer            Stdout Writer            v0.12.1       required/none      false
 ```
 
 (`--json` prints the server's raw JSON array instead — same fields, machine
@@ -171,7 +171,7 @@ stages:                   # sequential; components within a stage run in paralle
     components:
       - name: gen                     # instance name, unique across the pipeline
         component: data-generator     # registry reference
-        version: v0.12.0              # optional → registry default resolution
+        version: v0.12.1              # optional → registry default resolution
         config:                       # validated against the version's configSchema
           tables:
             - name: events

@@ -190,6 +190,7 @@ func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, rec
 	if ws.schema == nil && inferredSchema != nil {
 		ws.schema = inferredSchema
 		responseSchema = schemaToProto(inferredSchema)
+		logWriterSchema(ws, "gateway-inferred")
 
 		// Build common buffer config
 		bufferConfig := buffer.DefaultBufferConfig()
