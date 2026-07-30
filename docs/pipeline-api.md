@@ -714,6 +714,26 @@ Three ways this route differs from its read-only siblings:
 Every successful delete writes an audit line to the pipeline-api log naming
 the table, project, warehouse, and acting user.
 
+Deleting a table that no longer exists returns **404**, including when a retry
+follows a request that actually succeeded — so a client that times out can
+safely retry.
+
+> **⚠️ Do not delete a table while a pipeline is writing to it.** A Data
+> Gateway writer resolves its data prefix and storage credentials once when the
+> writer opens and holds them for the run, so a purge does not stop it: the run
+> keeps writing parquet under the old prefix and then **fails at commit**,
+> where the commit re-loads the table from the catalog and finds it gone. You
+> are left with a failed run *and* the files it wrote after the purge orphaned
+> in the bucket (still billed, unreachable from any catalog).
+>
+> This is intentionally not blocked server-side. The `runs` table carries no
+> output-table column, so a pre-flight check would mean reading PipelineRun
+> CRDs and scanning `resolvedSpec` — and it still could not close the window,
+> because a run can be triggered immediately after the check passes. A guard
+> that looks authoritative but isn't would be worse than a documented
+> constraint. Check for active runs (`datuplet runs list --phase Running`)
+> before deleting.
+
 CLI equivalent (the `--confirm` value must exactly match the reference):
 
 ```bash

@@ -1,9 +1,13 @@
 package storage
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/apache/iceberg-go/catalog"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
@@ -118,6 +122,34 @@ func TestDeleteTable_RejectsBadIdentifiers(t *testing.T) {
 			resp := deleteReq(t, srv, fixtureProjectID, tc.ns, tc.table)
 			if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("status = %d, want 400 (or 404 from the router); a bad identifier must never reach the catalog", resp.StatusCode)
+			}
+		})
+	}
+}
+
+// isTableGone decides whether a failed purge means "already deleted" (404,
+// retryable-safe) or a real server error (500). Getting it wrong either hides
+// a genuine catalog failure behind a 404 or makes a harmless retry look like
+// an outage.
+func TestIsTableGone(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"typed iceberg error", catalog.ErrNoSuchTable, true},
+		{"wrapped typed error", fmt.Errorf("purge: %w", catalog.ErrNoSuchTable), true},
+		{"lakekeeper 404 text", errors.New("404 NotFound: table does not exist"), true},
+		{"no such table text", errors.New("no such table: raw.t"), true},
+		{"table not found text", errors.New("Table not found"), true},
+		{"permission failure is NOT gone", errors.New("403 forbidden"), false},
+		{"transport failure is NOT gone", errors.New("connection refused"), false},
+		{"server error is NOT gone", errors.New("500 internal server error"), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTableGone(tc.err); got != tc.want {
+				t.Errorf("isTableGone(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
