@@ -29,7 +29,7 @@ stages:                   # sequential; components within a stage run in paralle
     components:
       - name: gen                     # instance name, unique across the pipeline
         component: data-generator     # registry reference
-        # version: v0.12.0            # optional; omit to use the registry default
+        # version: v0.12.1            # optional; omit to use the registry default
         config:                       # validated against the version's configSchema
           tables:
             - name: events
@@ -510,7 +510,7 @@ make deploy-local
 
 What it does (see the `deploy-local` / `deploy-local-helm` Makefile targets):
 
-1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.12.0`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
+1. Builds every service image (`datuplet/<name>:latest`) and the built-in component images, which `build-components-local` also re-tags as `datuplet/<name>:$(COMPONENT_TAG)` (the chart's `components.tag`, e.g. `v0.12.1`) so the ComponentDefinitions resolve (`docker-build-k8s` + `build-components-local`).
 2. Helm-installs the four charts in phase order, each waited on before the next: `datuplet-operators` (CRDs, RBAC, the CNPG operator), `datuplet-infra` (Postgres cluster, OpenFGA, MinIO), `datuplet-app` (pipeline-api, pipeline-operator, pipeline-observer — with `image.pullPolicy=IfNotPresent` and `components.registry=datuplet` so the built-in ComponentDefinitions point at the locally-built images), then `datuplet-lakekeeper`.
 3. Runs `./scripts/register.sh --namespace datuplet`, which `kubectl exec`s into the `pipeline-api` Pod and runs five idempotent `pipeline-api admin` steps: `lakekeeper-bootstrap` (creates the warehouse + server-admin FGA tuple), `create-user` (default admin `admin@datuplet.local` / `changeme`), `create-project` (default project `default`), `attach-warehouse`, and `grant --role admin`.
 
