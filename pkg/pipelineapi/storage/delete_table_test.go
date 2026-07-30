@@ -139,12 +139,24 @@ func TestIsTableGone(t *testing.T) {
 	}{
 		{"typed iceberg error", catalog.ErrNoSuchTable, true},
 		{"wrapped typed error", fmt.Errorf("purge: %w", catalog.ErrNoSuchTable), true},
-		{"lakekeeper 404 text", errors.New("404 NotFound: table does not exist"), true},
+		{"lakekeeper 404 naming the table", errors.New("404 NotFound: table does not exist"), true},
 		{"no such table text", errors.New("no such table: raw.t"), true},
 		{"table not found text", errors.New("Table not found"), true},
 		{"permission failure is NOT gone", errors.New("403 forbidden"), false},
 		{"transport failure is NOT gone", errors.New("connection refused"), false},
 		{"server error is NOT gone", errors.New("500 internal server error"), false},
+
+		// The purge runs AFTER a successful pre-load, so a failure here is
+		// far more likely to be catalog/warehouse state than a vanished
+		// table. Reporting any of these as "table not found" would tell the
+		// operator a destructive operation reached the desired state when it
+		// did not — the whole reason the fallback must name a TABLE.
+		{"warehouse missing is NOT gone", errors.New("warehouse does not exist"), false},
+		{"namespace missing is NOT gone", errors.New("namespace does not exist"), false},
+		{"storage profile missing is NOT gone", errors.New("storage profile does not exist"), false},
+		{"404 naming the warehouse is NOT gone", errors.New("404 NotFound: warehouse not found or not authorized"), false},
+		{"bare not-found with no subject is NOT gone", errors.New("404 NotFound"), false},
+		{"credential failure is NOT gone", errors.New("credential does not exist for warehouse"), false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

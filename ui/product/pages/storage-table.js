@@ -101,7 +101,8 @@ async function onDeleteTable(ns, name) {
     'This removes the table from the catalog AND deletes its data files. ' +
     'It cannot be undone.\n\n' +
     'Do NOT do this while a pipeline is writing to this table — that run will ' +
-    'fail at commit and the files it already wrote will be orphaned.\n\n' +
+    'fail at commit and the files it already wrote will be orphaned.\n' +
+    'Check the Runs page (or `datuplet runs list`) for Pending/Running runs first.\n\n' +
     `Type ${ref} to confirm:`,
   );
   if (typed === null) return; // cancelled

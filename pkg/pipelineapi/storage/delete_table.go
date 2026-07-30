@@ -12,17 +12,29 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 )
 
-// isTableGone reports whether an error means the table no longer exists.
-// iceberg-go's catalogs return the typed catalog.ErrNoSuchTable; the REST
-// catalog can also surface lakekeeper's 404 as an untyped error, so the
-// message check is a fallback rather than the primary test.
+// isTableGone reports whether a purge error means THIS TABLE no longer exists,
+// which the caller turns into a 404 so a retried delete is safe.
+//
+// iceberg-go's catalogs return the typed catalog.ErrNoSuchTable; lakekeeper's
+// REST catalog can surface its 404 untyped, so a message check is needed as a
+// fallback. That fallback must be TABLE-SCOPED: a purge can fail after the
+// pre-load on warehouse, namespace, storage-profile or credential state, with
+// messages like "warehouse does not exist" or
+// "404 NotFound: warehouse not found or not authorized". Matching a bare
+// "does not exist" or "notfound" would report those as "table not found" —
+// telling the operator a destructive operation reached the desired state when
+// it did not. So only wording that names a TABLE counts.
 func isTableGone(err error) bool {
 	if errors.Is(err, catalog.ErrNoSuchTable) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "no such table") || strings.Contains(msg, "table not found") ||
-		strings.Contains(msg, "notfound") || strings.Contains(msg, "does not exist")
+	for _, phrase := range []string{"no such table", "table not found", "table does not exist"} {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // DeleteTable handles DELETE /api/v1/storage/projects/{pid}/tables/{ns}/{t}.
@@ -62,8 +74,9 @@ func isTableGone(err error) bool {
 // scanning resolvedSpec — and it still could not close the window, since a run
 // can be triggered immediately after the check passes. A guard that looks
 // authoritative but isn't is worse than a documented hazard, so the contract
-// is: don't delete a table while a pipeline is writing it. The failure is at
-// least loud — the gateway now logs the commit error naming the table.
+// is: don't delete a table while a pipeline is writing it (check for Pending
+// AND Running runs — a Pending run is about to open its writer). The failure is
+// at least loud: the gateway now logs the commit error naming the table.
 func (h *HTTPHandlers) DeleteTable(w http.ResponseWriter, r *http.Request) {
 	u, authed := auth.UserFromContext(r.Context())
 	if !authed {
@@ -123,6 +136,10 @@ func (h *HTTPHandlers) DeleteTable(w http.ResponseWriter, r *http.Request) {
 		// that fails retries with a server error pushes operators toward
 		// guessing whether their first call took effect.
 		if isTableGone(err) {
+			// Logged even though it's reported as a benign 404: the pre-load
+			// succeeded moments earlier, so something removed the table in
+			// between and that is worth a trace.
+			log.Printf("storage: delete %s.%s (project=%s warehouse=%s): table already gone at purge time: %v", ns, name, lkPID, warehouse, err)
 			writeErrResp(w, http.StatusNotFound, "table not found")
 			return
 		}

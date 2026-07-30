@@ -731,8 +731,10 @@ safely retry.
 > CRDs and scanning `resolvedSpec` — and it still could not close the window,
 > because a run can be triggered immediately after the check passes. A guard
 > that looks authoritative but isn't would be worse than a documented
-> constraint. Check for active runs (`datuplet runs list --phase Running`)
-> before deleting.
+> constraint. Check for active runs before deleting — `datuplet runs list`
+> (newest first, project-wide) and look for **`Pending` as well as `Running`**:
+> a Pending run has not opened its writer yet but is about to, and `--phase`
+> takes only one value so filtering on `Running` alone would miss it.
 
 CLI equivalent (the `--confirm` value must exactly match the reference):
 

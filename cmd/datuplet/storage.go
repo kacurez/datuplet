@@ -157,8 +157,9 @@ func confirmTableDeletion(ref, confirm string) error {
 	if confirm == "" {
 		return fmt.Errorf("refusing to delete %s: pass --confirm %s to proceed.\n"+
 			"This permanently deletes the table's metadata AND its data files — there is no undo.\n"+
-			"Make sure no pipeline is currently writing to it (datuplet runs list --phase Running):\n"+
-			"deleting mid-run fails that run at commit and orphans the files it already wrote", ref, ref)
+			"Make sure no pipeline is writing to it first (datuplet runs list — check for Pending\n"+
+			"and Running): deleting mid-run fails that run at commit and orphans the files it\n"+
+			"already wrote", ref, ref)
 	}
 	return fmt.Errorf("refusing to delete %s: --confirm was %q, which does not match the table reference.\n"+
 		"Pass --confirm %s exactly", ref, confirm, ref)
