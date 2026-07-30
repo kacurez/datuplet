@@ -94,6 +94,39 @@ type renderState struct {
 	maxLog      int
 }
 
+// runQuery executes one guest query under rs.mu. The unlock is deferred so
+// the mutex is released even if the user-supplied QueryFunc panics — wazero
+// recovers host-function panics into a call error, and Render's failure
+// path then needs this same mutex in snapshotLog.
+func (rs *renderState) runQuery(ctx context.Context, mod api.Module, reqPtr, reqLen uint32) []byte {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	switch {
+	case rs.queriesLeft <= 0:
+		return queryErrEnvelope("bad_request", "query limit exceeded")
+	case rs.q == nil:
+		return queryErrEnvelope("bad_request", "no query function configured")
+	}
+	rs.queriesLeft--
+	req, ok := mod.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return queryErrEnvelope("render_error",
+			fmt.Sprintf("query request (ptr=%d len=%d) out of guest memory bounds", reqPtr, reqLen))
+	}
+	// Copy: the Read view is invalidated if guest memory grows (e.g. by the
+	// response dtp_alloc in hostQuery) and must not outlive this call.
+	req = append([]byte(nil), req...)
+	out, err := rs.q(ctx, req)
+	switch {
+	case err != nil:
+		return queryErrEnvelope("query_error", err.Error())
+	case len(out) == 0:
+		return []byte(`{"result":null}`)
+	default:
+		return out
+	}
+}
+
 func (rs *renderState) snapshotLog() []byte {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -319,38 +352,10 @@ func hostQuery(ctx context.Context, mod api.Module, stack []uint64) {
 
 	var resp []byte
 	rs, _ := ctx.Value(stateKey{}).(*renderState)
-	switch {
-	case rs == nil:
+	if rs == nil {
 		resp = queryErrEnvelope("render_error", "no render state in context")
-	default:
-		rs.mu.Lock()
-		switch {
-		case rs.queriesLeft <= 0:
-			resp = queryErrEnvelope("bad_request", "query limit exceeded")
-		case rs.q == nil:
-			resp = queryErrEnvelope("bad_request", "no query function configured")
-		default:
-			rs.queriesLeft--
-			req, ok := mod.Memory().Read(reqPtr, reqLen)
-			if !ok {
-				resp = queryErrEnvelope("render_error",
-					fmt.Sprintf("query request (ptr=%d len=%d) out of guest memory bounds", reqPtr, reqLen))
-				break
-			}
-			// Copy: the Read view is invalidated if guest memory grows
-			// (e.g. by the dtp_alloc below) and must not outlive this call.
-			req = append([]byte(nil), req...)
-			out, err := rs.q(ctx, req)
-			switch {
-			case err != nil:
-				resp = queryErrEnvelope("query_error", err.Error())
-			case len(out) == 0:
-				resp = []byte(`{"result":null}`)
-			default:
-				resp = out
-			}
-		}
-		rs.mu.Unlock()
+	} else {
+		resp = rs.runQuery(ctx, mod, reqPtr, reqLen)
 	}
 
 	ptr, err := writeGuestBytes(ctx, mod, resp)

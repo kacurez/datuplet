@@ -116,6 +116,42 @@ func TestExceptionPathStable(t *testing.T) {
 	}
 }
 
+// TestRenderQueryFuncPanicReleasesLock is the regression test for the
+// hostQuery lock-without-defer bug: a panicking QueryFunc is recovered by
+// wazero into a call error, and Render's failure path takes rs.mu again in
+// snapshotLog — if the panic escaped with the mutex held, Render would
+// deadlock there instead of returning. The watchdog is far below WallClock
+// so a hang is reported as a failure, not masked as a timeout.
+func TestRenderQueryFuncPanicReleasesLock(t *testing.T) {
+	e, err := NewEngine(context.Background(), 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := []byte(`var __dtp_app = { render: async (ctx) => {
+		await datuplet.query("SELECT 1", null);
+		return { outputDoc: 1, title: "p", blocks: [] };
+	}};`)
+	q := func(context.Context, []byte) ([]byte, error) { panic("boom in QueryFunc") }
+
+	var rerr *RenderError
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, rerr = e.Render(context.Background(), RenderInput{
+			Bundle: bundle, Path: "/", Now: time.Unix(1753228800, 0), Query: q,
+			Limits: Limits{WallClock: 30 * time.Second, MaxQueries: 1, MaxOutputBytes: 1 << 20, MaxLogBytes: 1 << 10},
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Render did not return after QueryFunc panic (render-state mutex leaked)")
+	}
+	if rerr == nil || rerr.Kind != "render_error" {
+		t.Fatalf("want render_error, got %+v", rerr)
+	}
+}
+
 // TestRenderConcurrentIsolated proves one shared Engine (one runtime + one
 // compiled module) serves parallel Renders with isolated per-render state:
 // each render sees only its own params, query func, and log.
