@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -143,6 +144,94 @@ func TestHandler_HappyPath_PassthroughBytes(t *testing.T) {
 		if strings.Count(tok, ".") != 2 {
 			t.Fatalf("%s token is not a JWT: %q", name, tok)
 		}
+	}
+}
+
+func TestHandler_ParamsForwardedVerbatim(t *testing.T) {
+	// The proxy forwards `params` blindly (RFC 028 Q3 design decision) and
+	// relies on the worker's own ValidateParams for the bad_request gate.
+	// This test proves two things: (1) the field reaches the worker body at
+	// all, and (2) it survives the round trip as an exact integer, not a
+	// float64 that has silently lost precision — which is why the proxy's
+	// own body decoder needs its own UseNumber(), independent of the
+	// worker's.
+	var gotBody []byte
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read worker body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
+	}))
+	defer worker.Close()
+
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
+	rec := httptest.NewRecorder()
+	const reqBody = `{"sql":"SELECT $n, $country, $active, $note","params":{"country":"DE","n":12345678901234567,"active":true,"note":null}}`
+	h.ServeHTTP(rec, authedRequest(t, uuid.New(), reqBody))
+
+	// Response passthrough is unaffected by the presence of params.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	const wantResult = `{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`
+	if rec.Body.String() != wantResult {
+		t.Fatalf("body passthrough mismatch:\n got %q\nwant %q", rec.Body.String(), wantResult)
+	}
+
+	// Decode the bytes actually sent to the worker WITH UseNumber, so a
+	// 17-digit integer is compared exactly rather than through a float64
+	// round trip (which would silently round it).
+	dec := json.NewDecoder(bytes.NewReader(gotBody))
+	dec.UseNumber()
+	var got workerRequest
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("decode worker body: %v", err)
+	}
+	if got.Params == nil {
+		t.Fatalf("worker body carried no params at all: %s", gotBody)
+	}
+	if n, ok := got.Params["n"].(json.Number); !ok || n.String() != "12345678901234567" {
+		t.Fatalf("params[n] = %#v, want json.Number(12345678901234567) exactly", got.Params["n"])
+	}
+	if got.Params["country"] != "DE" {
+		t.Fatalf("params[country] = %#v, want %q", got.Params["country"], "DE")
+	}
+	if got.Params["active"] != true {
+		t.Fatalf("params[active] = %#v, want true", got.Params["active"])
+	}
+	if v, ok := got.Params["note"]; !ok || v != nil {
+		t.Fatalf("params[note] = %#v, want present-and-nil", v)
+	}
+}
+
+func TestHandler_NoParams_Regression(t *testing.T) {
+	// A request with no `params` field must forward with a nil Params map
+	// (json:"params,omitempty" keeps the wire body identical to before Q3).
+	var gotBody []byte
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read worker body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
+	}))
+	defer worker.Close()
+
+	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(string(gotBody), `"params"`) {
+		t.Fatalf("worker body must omit params entirely when absent: %s", gotBody)
 	}
 }
 

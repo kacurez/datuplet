@@ -223,9 +223,18 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	}
 
 	// 3. Decode + validate the body (≤64 KiB SQL-text cap).
+	//
+	// UseNumber() is required here, independently of the query-worker's own
+	// UseNumber() call (components/queryengine/cmd/query-worker/server.go):
+	// this is a SEPARATE json.Decoder over this handler's own copy of the
+	// body. Without it, integral params (e.g. large IDs) decode into
+	// req.Params as float64 and lose precision before they are even
+	// re-marshalled into the workerRequest sent downstream.
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req queryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
 		rec.outcome = "bad_request"
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
@@ -258,7 +267,7 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	// consumer (Task 3.1) can drive the same path without an HTTP
 	// request/response pair.
 	lim := queryLimits{timeoutS: timeoutS, maxRows: maxRows, maxBytes: maxBytes}
-	raw, qerr := h.executeRaw(r.Context(), sub, warehouse, req.SQL, lim, rec)
+	raw, qerr := h.executeRaw(r.Context(), sub, warehouse, req.SQL, req.Params, lim, rec)
 	if qerr != nil {
 		rec.outcome = qerr.Kind
 		if qerr.Kind == "capacity" {

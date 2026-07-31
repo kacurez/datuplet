@@ -20,12 +20,13 @@ import (
 // set from the catalog token's Reveal() at the handler call site (the
 // second bearer-credential audit point — see handler.go).
 type workerRequest struct {
-	SQL        string `json:"sql"`
-	CatalogJWT string `json:"catalog_jwt"`
-	Warehouse  string `json:"warehouse"`
-	TimeoutS   int    `json:"timeout_s"`
-	MaxRows    int    `json:"max_rows"`
-	MaxBytes   int    `json:"max_bytes"`
+	SQL        string         `json:"sql"`
+	CatalogJWT string         `json:"catalog_jwt"`
+	Warehouse  string         `json:"warehouse"`
+	TimeoutS   int            `json:"timeout_s"`
+	MaxRows    int            `json:"max_rows"`
+	MaxBytes   int            `json:"max_bytes"`
+	Params     map[string]any `json:"params,omitempty"`
 }
 
 // workerResponse is the decoded outcome of one /internal/query call. The

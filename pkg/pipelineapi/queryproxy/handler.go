@@ -119,11 +119,15 @@ func (c Config) withDefaults() Config {
 
 // queryRequest is the client-facing JSON body for POST /api/v1/query. Only
 // `sql` is required; the limit fields are optional and clamped server-side.
+// Params carries optional bound parameters (RFC 028 §6.1) forwarded to the
+// query-worker verbatim; the worker is the authoritative validator
+// (queryengine.ValidateParams) — this proxy does not re-validate shape.
 type queryRequest struct {
-	SQL      string `json:"sql"`
-	TimeoutS *int   `json:"timeout_s,omitempty"`
-	MaxRows  *int   `json:"max_rows,omitempty"`
-	MaxBytes *int   `json:"max_bytes,omitempty"`
+	SQL      string         `json:"sql"`
+	TimeoutS *int           `json:"timeout_s,omitempty"`
+	MaxRows  *int           `json:"max_rows,omitempty"`
+	MaxBytes *int           `json:"max_bytes,omitempty"`
+	Params   map[string]any `json:"params,omitempty"`
 }
 
 // errorBody is the JSON error envelope returned to the client:

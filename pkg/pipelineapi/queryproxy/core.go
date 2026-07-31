@@ -94,7 +94,13 @@ func (c *Core) HTTPHandler() http.Handler {
 // path). On any other outcome it returns a *QueryError whose Kind is the
 // audit outcome. It does NOT touch the per-principal gate or the body
 // clamps — those stay with the caller.
-func (h *handler) executeRaw(ctx context.Context, sub, warehouse, sql string, lim queryLimits, rec *auditRecord) ([]byte, *QueryError) {
+//
+// params is forwarded to the worker verbatim (RFC 028 §6.1); nil is a
+// valid "no bound parameters" value. This proxy does not validate params
+// shape — the worker's queryengine.ValidateParams is the sole gate, and
+// its 400 bad_request/sql_error responses pass through translateRaw
+// unchanged (allowedWorkerKinds already allowlists both kinds).
+func (h *handler) executeRaw(ctx context.Context, sub, warehouse, sql string, params map[string]any, lim queryLimits, rec *auditRecord) ([]byte, *QueryError) {
 	ttl := time.Duration(lim.timeoutS)*time.Second + h.cfg.CatalogTTLSlack
 	catalogTok, err := tokens.MintQueryToken(ctx, h.signer, ttl)
 	if err != nil {
@@ -118,6 +124,7 @@ func (h *handler) executeRaw(ctx context.Context, sub, warehouse, sql string, li
 		TimeoutS:   lim.timeoutS,
 		MaxRows:    lim.maxRows,
 		MaxBytes:   lim.maxBytes,
+		Params:     params,
 	})
 	if err != nil {
 		slog.Error("queryproxy: query-worker transport error", "sub", sub, "err", err)
