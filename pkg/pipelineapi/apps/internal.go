@@ -569,8 +569,11 @@ func (h *InternalHandlers) handleImpersonate(w http.ResponseWriter, r *http.Requ
 	// there so it fires for every caller, not just this route. The two
 	// actions are deliberately distinct names so neither is mistaken for a
 	// duplicate of the other.
-	internalAudit("impersonation_requested", projectUUID, app.ID, "app", app.Name,
-		"jwt_subject", AppJWTSubject(app.ID))
+	//
+	// No token-derived field rides along here either (the JWT subject is
+	// recoverable from app_id): the mint record's jti is the only value from
+	// the credential that is ever logged.
+	internalAudit("impersonation_requested", projectUUID, app.ID, "app", app.Name)
 	writeJSON(w, http.StatusOK, impersonateResponse{Token: token})
 }
 

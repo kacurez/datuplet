@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -581,6 +582,57 @@ func TestMintAppToken_FreshPerCall(t *testing.T) {
 	}
 	if tok1.Reveal() == tok2.Reveal() {
 		t.Error("identical token bytes across two mints — a cached/replayed credential")
+	}
+}
+
+// TestMintAppToken_ConcurrentJTIsAreUnique is the collision-proof assertion.
+// app-worker mints ONE token per render with a per-app in-flight limit of 2,
+// so same-app concurrent mints are the normal operating case — and every claim
+// except the jti is identical for them. If the jti's uniqueness came from the
+// clock, two mints inside one tick would produce the same jti and a
+// byte-identical signed JWT, and query_audit could no longer tell two
+// concurrent renders apart (the contract has it carry the app subject AND the
+// jti for exactly that reason). time.Now()'s resolution is platform-dependent,
+// so "nanoseconds are fine on my laptop" is not a guarantee.
+func TestMintAppToken_ConcurrentJTIsAreUnique(t *testing.T) {
+	signer := sharedSigner(t)
+	const appUUID = "3f9c1b7a-1111-4a2b-9c3d-abcdefabcdef"
+	const n = 64
+
+	jtis := make([]string, n)
+	toks := make([]string, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tok, jti, err := tokens.MintAppToken(signer, appUUID, "lk-1")
+			jtis[i], toks[i], errs[i] = jti, tok.Reveal(), err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seenJTI := make(map[string]int, n)
+	seenTok := make(map[string]int, n)
+	for i := range jtis {
+		if errs[i] != nil {
+			t.Fatalf("mint %d: %v", i, errs[i])
+		}
+		if prev, dup := seenJTI[jtis[i]]; dup {
+			t.Fatalf("duplicate jti across concurrent mints %d and %d: %q", prev, i, jtis[i])
+		}
+		seenJTI[jtis[i]] = i
+		if prev, dup := seenTok[toks[i]]; dup {
+			t.Fatalf("byte-identical token across concurrent mints %d and %d", prev, i)
+		}
+		seenTok[toks[i]] = i
+	}
+	if len(seenJTI) != n {
+		t.Fatalf("got %d distinct jtis, want %d", len(seenJTI), n)
 	}
 }
 

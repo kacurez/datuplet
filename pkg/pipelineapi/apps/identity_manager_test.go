@@ -475,8 +475,58 @@ func TestIdentityManager_MintIsFreshPerCall(t *testing.T) {
 	}
 }
 
+// TestIdentityManager_ConcurrentMintsAreDistinct exercises the real per-render
+// path (app-worker mints once per render, with a per-app in-flight limit of 2,
+// so concurrent same-app mints are routine — not an edge case). Every token
+// and every jti must be distinct, or two concurrent renders become
+// indistinguishable in query_audit.
+func TestIdentityManager_ConcurrentMintsAreDistinct(t *testing.T) {
+	h := newIdentityHarness(t)
+	appID := uuid.NewString()
+	projectID := uuid.NewString()
+	const n = 32
+
+	toks := make([]string, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			toks[i], errs[i] = h.mgr.Mint(context.Background(), appID, projectID)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seenTok := make(map[string]int, n)
+	seenJTI := make(map[string]int, n)
+	for i := range toks {
+		if errs[i] != nil {
+			t.Fatalf("mint %d: %v", i, errs[i])
+		}
+		if prev, dup := seenTok[toks[i]]; dup {
+			t.Fatalf("byte-identical token from concurrent mints %d and %d", prev, i)
+		}
+		seenTok[toks[i]] = i
+		jti, _ := decodeClaims(t, toks[i])["jti"].(string)
+		if jti == "" {
+			t.Fatalf("mint %d produced an empty jti", i)
+		}
+		if prev, dup := seenJTI[jti]; dup {
+			t.Fatalf("duplicate jti from concurrent mints %d and %d: %q", prev, i, jti)
+		}
+		seenJTI[jti] = i
+	}
+}
+
 // TestIdentityManager_MintEmitsAudit asserts impersonation_minted{app_id, jti}
-// — and that the record's jti is the minted token's real jti.
+// — the record's jti is the minted token's real jti, and NOTHING else derived
+// from the token rides along. `jwt_subject` is deliberately absent: it is
+// recoverable from app_id, and keeping the record to "jti is the only
+// token-derived value logged" is what makes that invariant checkable.
 func TestIdentityManager_MintEmitsAudit(t *testing.T) {
 	h := newIdentityHarness(t)
 	cap := captureAudit(t)
@@ -493,6 +543,24 @@ func TestIdentityManager_MintEmitsAudit(t *testing.T) {
 	wantJTI, _ := decodeClaims(t, tok)["jti"].(string)
 	if got, _ := rec["jti"].(string); got == "" || got != wantJTI {
 		t.Errorf("audit jti = %q, want the token's jti %q", got, wantJTI)
+	}
+	if _, present := rec["jwt_subject"]; present {
+		t.Errorf("impersonation_minted must not carry jwt_subject (contract shape is {app_id, jti}): %v", rec)
+	}
+	claims := decodeClaims(t, tok)
+	for _, claim := range []string{"sub", "actor"} {
+		v, _ := claims[claim].(string)
+		if v == "" {
+			continue
+		}
+		for k, got := range rec {
+			if k == "jti" {
+				continue
+			}
+			if s, ok := got.(string); ok && s == v {
+				t.Errorf("audit field %q carries the token's %q claim (%q)", k, claim, v)
+			}
+		}
 	}
 }
 

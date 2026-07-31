@@ -2,6 +2,8 @@ package tokens
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -279,7 +281,17 @@ func MintImpersonation(ctx context.Context, signer *Signer) (ImpersonationToken,
 //	project_id=<lakekeeper project id>   (informational; audit)
 //	app_id=<app-uuid>                    (informational; audit)
 //	iat/nbf=now, exp=now+AppTokenLifetime (60s)
-//	jti=app-tok-<sub>-<unixnano>
+//	jti=app-tok-<app-uuid>-<32 hex chars from crypto/rand>
+//
+// The jti's uniqueness comes from crypto/rand, NOT from the clock. Every other
+// claim is identical for two mints of the same app in the same second, so a
+// timestamp-derived jti would make two concurrent renders produce a
+// byte-identical signed JWT — and app-worker mints one token per render with a
+// per-app in-flight limit of 2, so same-app concurrent mints are the normal
+// operating case, not an edge case. query_audit carries the app subject AND the
+// jti precisely so those two renders can be told apart (spec §5.4/§9), and
+// time.Now()'s resolution is platform-dependent. A rand failure is returned,
+// never silently downgraded to a timestamp.
 //
 // Unlike MintImpersonation / MintQueryToken this takes NO context and derives
 // nothing from an authenticated session — an app is not a *store.User, so
@@ -307,9 +319,12 @@ func MintAppToken(signer *Signer, appUUID, projectID string) (ImpersonationToken
 		return "", "", errors.New("projectID is required")
 	}
 
+	jti, err := newAppTokenJTI(appUUID)
+	if err != nil {
+		return "", "", err
+	}
 	now := time.Now()
 	sub := AppSubjectPrefix + appUUID
-	jti := fmt.Sprintf("app-tok-%s-%d", sub, now.UnixNano())
 	claims := jwt.MapClaims{
 		"iss":        tokenIssuer,
 		"aud":        TableTokenAudience,
@@ -332,6 +347,28 @@ func MintAppToken(signer *Signer, appUUID, projectID string) (ImpersonationToken
 		return "", "", fmt.Errorf("sign: %w", err)
 	}
 	return ImpersonationToken(s), jti, nil
+}
+
+// appTokenJTIRandomBytes is the entropy in an app token's jti. 16 bytes is
+// collision-free for any realistic mint volume (birthday bound ~2^64 mints)
+// and, unlike a timestamp, does not depend on the platform's clock resolution.
+const appTokenJTIRandomBytes = 16
+
+// newAppTokenJTI builds "app-tok-<app-uuid>-<32 hex chars>". The app uuid is
+// kept in the id so an operator reading a query_audit row can attribute it
+// without a join; the random tail is what makes it unique.
+//
+// crypto/rand + hex is the repo's existing shape for generated identifiers and
+// secrets (pkg/pipelineapi/apps/store.go's viewer-token secret/salt,
+// pkg/pipelineapi/k8s/run_create.go's name suffix). A rand failure propagates:
+// falling back to a timestamp would silently reinstate the collision this
+// exists to prevent, at exactly the moment the system is least healthy.
+func newAppTokenJTI(appUUID string) (string, error) {
+	b := make([]byte, appTokenJTIRandomBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate app-token jti: %w", err)
+	}
+	return "app-tok-" + appUUID + "-" + hex.EncodeToString(b), nil
 }
 
 // MintQueryToken produces a query-scoped catalog JWT for the

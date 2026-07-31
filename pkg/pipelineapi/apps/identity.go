@@ -146,9 +146,14 @@ func (m *identityManager) Mint(ctx context.Context, appID, projectID string) (st
 	if err != nil {
 		return "", fmt.Errorf("apps: mint app token for %s: %w", appID, err)
 	}
+	// Contract shape: {app_id, jti} (+ the non-token operational context every
+	// record in this package carries). The jti is the ONLY token-derived value
+	// that may be logged — jwt_subject is deliberately NOT here even though it
+	// is harmless and recoverable from app_id, because "the jti is the only
+	// thing from the token" is an invariant a test can check, and a list of
+	// individually-harmless extras is not.
 	identityAudit("impersonation_minted", appID, projectID, lakekeeperPID,
-		"jwt_subject", AppJWTSubject(appID), "jti", jti,
-		"ttl_seconds", int64(tokens.AppTokenLifetime.Seconds()))
+		"jti", jti, "ttl_seconds", int64(tokens.AppTokenLifetime.Seconds()))
 	return tok.Reveal(), nil
 }
 
