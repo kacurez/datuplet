@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -164,6 +165,20 @@ func (s *Store) Create(ctx context.Context, projectID uuid.UUID, name string) (*
 // content, the project's MaxProjectBytes stored quota (sum of RAW
 // size_bytes across every version of every app in the project).
 //
+// Concurrency: quota accounting is a classic read-then-write race under
+// Postgres's default READ COMMITTED isolation — two concurrent uploads for
+// the same project can both read the same pre-insert SUM(size_bytes) and
+// both pass the quota check. This is closed by taking a `SELECT ... FOR
+// UPDATE` on the owning PROJECT row (not just this app's row — the quota
+// is project-wide, spanning every app in it) before computing the sum:
+// any other PutVersion for any app in this project blocks here until this
+// transaction commits or rolls back, so the sum a transaction observes is
+// always up to date with every quota-relevant write that preceded it. The
+// version insert also switches to `ON CONFLICT (app_id, hash) DO NOTHING`
+// + a re-select on conflict, so that even if this code path is ever
+// reached without the project lock serializing it, a lost idempotency
+// race returns the existing version instead of a unique-constraint error.
+//
 // After the insert, version GC drops the oldest versions of this app not
 // referenced by any channel beyond MaxUnreferencedVersions.
 func (s *Store) PutVersion(ctx context.Context, appID string, bundle []byte) (*Version, error) {
@@ -185,6 +200,22 @@ func (s *Store) PutVersion(ctx context.Context, appID string, bundle []byte) (*V
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	var projectID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT project_id FROM apps WHERE id = $1`, appUUID).Scan(&projectID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("apps: app %s: %w", appID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("apps: lookup app: %w", err)
+	}
+
+	// Serialize this project's whole quota domain (see doc comment above).
+	var lockedProjectID uuid.UUID
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM projects WHERE id = $1 FOR UPDATE`, projectID,
+	).Scan(&lockedProjectID); err != nil {
+		return nil, fmt.Errorf("apps: lock project: %w", err)
+	}
+
 	v := &Version{AppID: appID, Hash: hash, SizeBytes: rawSize}
 	var versionUUID uuid.UUID
 	err = tx.QueryRow(ctx,
@@ -201,8 +232,8 @@ func (s *Store) PutVersion(ctx context.Context, appID string, bundle []byte) (*V
 			`SELECT COALESCE(SUM(av.size_bytes), 0)
 			   FROM app_versions av
 			   JOIN apps a ON a.id = av.app_id
-			  WHERE a.project_id = (SELECT project_id FROM apps WHERE id = $1)`,
-			appUUID,
+			  WHERE a.project_id = $1`,
+			projectID,
 		).Scan(&used); err != nil {
 			return nil, fmt.Errorf("apps: quota lookup: %w", err)
 		}
@@ -219,12 +250,24 @@ func (s *Store) PutVersion(ctx context.Context, appID string, bundle []byte) (*V
 			return nil, fmt.Errorf("apps: gzip close: %w", err)
 		}
 
-		if err := tx.QueryRow(ctx,
+		err = tx.QueryRow(ctx,
 			`INSERT INTO app_versions (app_id, hash, bundle, size_bytes)
 			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (app_id, hash) DO NOTHING
 			 RETURNING id, created_at`,
 			appUUID, hash, compressed.Bytes(), rawSize,
-		).Scan(&versionUUID, &v.CreatedAt); err != nil {
+		).Scan(&versionUUID, &v.CreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Lost the insert race despite the project lock (e.g. a
+			// future caller reusing this branch without holding it) —
+			// the row now exists, so re-select it instead of erroring.
+			if err := tx.QueryRow(ctx,
+				`SELECT id, created_at FROM app_versions WHERE app_id = $1 AND hash = $2`,
+				appUUID, hash,
+			).Scan(&versionUUID, &v.CreatedAt); err != nil {
+				return nil, fmt.Errorf("apps: re-select version after insert conflict: %w", err)
+			}
+		} else if err != nil {
 			return nil, fmt.Errorf("apps: insert version: %w", err)
 		}
 	default:
@@ -278,6 +321,22 @@ func gcVersions(ctx context.Context, tx pgx.Tx, appID uuid.UUID) error {
 // expectedProduction must equal it, or "" if production is not yet set.
 // Mismatch returns ErrCASMismatch (callers map this to HTTP 409). An
 // unknown versionHash returns an error wrapping ErrNotFound.
+//
+// Concurrency: the swap itself is the conditional statement — there is no
+// separate read-then-compare-then-write sequence for two concurrent
+// Promotes to race between. When production is already set, this is a
+// single UPDATE whose WHERE clause re-checks "production still points at
+// the version whose hash is expectedProduction" as part of the same
+// statement; when production is not set yet, it's an
+// INSERT ... ON CONFLICT DO NOTHING (succeeds only if no row exists yet).
+// Either way, RowsAffected()==0 means the precondition didn't hold at the
+// moment of the write, not at some earlier read — that's what makes it an
+// atomic CAS under Postgres's default READ COMMITTED isolation: if two
+// transactions target the same app_channels row, the loser's UPDATE/INSERT
+// blocks on the row lock until the winner commits, then re-evaluates its
+// condition against the now-current row (Postgres's standard READ
+// COMMITTED re-check for UPDATE/INSERT..ON CONFLICT, sometimes called
+// EvalPlanQual) and finds it no longer holds, affecting 0 rows.
 func (s *Store) Promote(ctx context.Context, appID, versionHash, expectedProduction string) error {
 	appUUID, err := uuid.Parse(appID)
 	if err != nil {
@@ -301,35 +360,35 @@ func (s *Store) Promote(ctx context.Context, appID, versionHash, expectedProduct
 		return fmt.Errorf("apps: lookup target version: %w", err)
 	}
 
-	var currentHash string
-	err = tx.QueryRow(ctx,
-		`SELECT v.hash
-		   FROM app_channels c
-		   JOIN app_versions v ON v.id = c.version_id
-		  WHERE c.app_id = $1 AND c.channel = 'production'`,
-		appUUID,
-	).Scan(&currentHash)
-	switch {
-	case err == nil:
-		if currentHash != expectedProduction {
-			return ErrCASMismatch
-		}
-	case errors.Is(err, pgx.ErrNoRows):
-		if expectedProduction != "" {
-			return ErrCASMismatch
-		}
-	default:
-		return fmt.Errorf("apps: lookup current production: %w", err)
+	var tag pgconn.CommandTag
+	if expectedProduction == "" {
+		// First promote: the INSERT succeeds only if no production row
+		// exists yet. A concurrent first-promote loser hits the conflict
+		// and DOES NOTHING, affecting 0 rows.
+		tag, err = tx.Exec(ctx,
+			`INSERT INTO app_channels (app_id, channel, version_id, updated_at)
+			 VALUES ($1, 'production', $2, now())
+			 ON CONFLICT (app_id, channel) DO NOTHING`,
+			appUUID, targetVersion,
+		)
+	} else {
+		// Conditional swap: the UPDATE only matches (and thus only
+		// affects a row) if production is STILL pointing at the version
+		// with hash expectedProduction at the moment this statement
+		// actually runs.
+		tag, err = tx.Exec(ctx,
+			`UPDATE app_channels
+			    SET version_id = $2, updated_at = now()
+			  WHERE app_id = $1 AND channel = 'production'
+			    AND version_id = (SELECT id FROM app_versions WHERE app_id = $1 AND hash = $3)`,
+			appUUID, targetVersion, expectedProduction,
+		)
 	}
-
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO app_channels (app_id, channel, version_id, updated_at)
-		 VALUES ($1, 'production', $2, now())
-		 ON CONFLICT (app_id, channel)
-		 DO UPDATE SET version_id = EXCLUDED.version_id, updated_at = now()`,
-		appUUID, targetVersion,
-	); err != nil {
+	if err != nil {
 		return fmt.Errorf("apps: promote: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrCASMismatch
 	}
 	return tx.Commit(ctx)
 }
