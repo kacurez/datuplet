@@ -88,6 +88,16 @@ type appsProjectLookup struct {
 	projects ProjectReader
 }
 
+// NewAppsProjectLookup exposes that adapter to the binary, which needs the
+// same seam to construct the concrete apps.IdentityManager (RFC 028 P4): the
+// identity manager resolves the lakekeeper project id itself, from the
+// Datuplet project UUID its callers pass. Wiring it through the same adapter
+// the routes use guarantees main.go and Handler() agree on what a project id
+// means.
+func NewAppsProjectLookup(projects ProjectReader) apps.ProjectLookup {
+	return appsProjectLookup{projects: projects}
+}
+
 func (a appsProjectLookup) LakekeeperProjectID(ctx context.Context, projectID uuid.UUID) (string, error) {
 	proj, err := a.projects.GetByID(ctx, projectID)
 	if errors.Is(err, errStoreNotFound) {

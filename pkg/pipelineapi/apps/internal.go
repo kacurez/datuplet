@@ -562,9 +562,14 @@ func (h *InternalHandlers) handleImpersonate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	projectUUID, _ := uuid.Parse(app.ProjectID)
-	// Audited unconditionally (spec §5.2: "every mint is audited"). The
-	// actor is the service principal — the internal surface has no user.
-	internalAudit("impersonate", projectUUID, app.ID, "app", app.Name,
+	// Route-level record: WHO asked (the service principal) and for which
+	// named app. The mint itself is audited separately, inside
+	// IdentityManager.Mint, as `impersonation_minted{app_id, jti}` — that is
+	// the record spec §5.2's "every mint is audited" refers to, and it lives
+	// there so it fires for every caller, not just this route. The two
+	// actions are deliberately distinct names so neither is mistaken for a
+	// duplicate of the other.
+	internalAudit("impersonation_requested", projectUUID, app.ID, "app", app.Name,
 		"jwt_subject", AppJWTSubject(app.ID))
 	writeJSON(w, http.StatusOK, impersonateResponse{Token: token})
 }

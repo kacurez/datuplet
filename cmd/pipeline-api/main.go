@@ -489,11 +489,21 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		} else {
 			chainedResolver = cookieResolver
 		}
+		projectReader := apihttp.NewPgxProjectReader(pool, authzr)
 		srv = srv.
 			WithUserResolver(chainedResolver).
-			WithProjectReader(apihttp.NewPgxProjectReader(pool, authzr)).
+			WithProjectReader(projectReader).
 			WithPipelineStore(apihttp.NewPgxPipelineStore(pool)).
 			WithRunReader(apihttp.NewPgxRunReader(pool))
+
+		// User apps (RFC 028): the author routes AND the app-worker-facing
+		// internal API. Both blocks stay unregistered without this call, so
+		// omitting it 404s every app route in a real deployment.
+		var err error
+		srv, err = wireUserApps(srv, pool, authzr, signer, projectReader)
+		if err != nil {
+			return err
+		}
 	}
 	if cfg.UIDir != "" {
 		fmt.Printf("  UI: %s\n", cfg.UIDir)

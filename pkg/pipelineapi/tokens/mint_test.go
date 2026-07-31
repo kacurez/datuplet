@@ -500,3 +500,113 @@ func TestJTIForRunID_Deterministic(t *testing.T) {
 		t.Errorf("unexpected jti shape: %q", a)
 	}
 }
+
+// --- MintAppToken (RFC 028 §5.4) ---
+
+// TestMintAppToken_ClaimsShape pins the app-token claim set. The `sub` is the
+// BARE "app-<uuid>" form — no "oidc~"/"user:" prefix — for exactly the reason
+// MintRunToken's raw-UUID sub exists: lakekeeper composes `user:oidc~<sub>`
+// itself, so pre-composing here would yield `user:oidc~user:oidc~app-<uuid>`
+// on the FGA side and never match the `viewer` tuple pipeline-api writes.
+func TestMintAppToken_ClaimsShape(t *testing.T) {
+	signer := sharedSigner(t)
+	appUUID := "3f9c1b7a-1111-4a2b-9c3d-abcdefabcdef"
+	tok, jti, err := tokens.MintAppToken(signer, appUUID, "lk-project-7")
+	if err != nil {
+		t.Fatalf("MintAppToken: %v", err)
+	}
+	parsed, _, err := jwt.NewParser().ParseUnverified(tok.Reveal(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	claims := parsed.Claims.(jwt.MapClaims)
+
+	wantSub := tokens.AppSubjectPrefix + appUUID
+	if got, _ := claims["sub"].(string); got != wantSub {
+		t.Errorf("sub = %q, want %q", got, wantSub)
+	}
+	if got, _ := claims["actor"].(string); got != wantSub {
+		t.Errorf("actor = %q, want %q (the app acts as itself)", got, wantSub)
+	}
+	if got, _ := claims["iss"].(string); got != "datuplet-api" {
+		t.Errorf("iss = %q, want datuplet-api", got)
+	}
+	if got, _ := claims["aud"].(string); got != tokens.TableTokenAudience {
+		t.Errorf("aud = %q, want %q", got, tokens.TableTokenAudience)
+	}
+	if got, _ := claims["token_kind"].(string); got != tokens.TokenKindApp {
+		t.Errorf("token_kind = %q, want %q", got, tokens.TokenKindApp)
+	}
+	if got, _ := claims["project_id"].(string); got != "lk-project-7" {
+		t.Errorf("project_id = %q, want lk-project-7", got)
+	}
+	if got, _ := claims["app_id"].(string); got != appUUID {
+		t.Errorf("app_id = %q, want %q", got, appUUID)
+	}
+	if got, _ := claims["jti"].(string); got != jti || jti == "" {
+		t.Errorf("jti claim = %q, returned jti = %q; want equal and non-empty", got, jti)
+	}
+	// 60 s TTL (spec §5.4) — asserted off the token's own iat/exp so clock
+	// skew cannot flake it, plus the constant itself.
+	iat, _ := claims["iat"].(float64)
+	exp, _ := claims["exp"].(float64)
+	if int64(exp-iat) != int64(tokens.AppTokenLifetime.Seconds()) {
+		t.Errorf("exp-iat = %ds, want %ds", int64(exp-iat), int64(tokens.AppTokenLifetime.Seconds()))
+	}
+	if tokens.AppTokenLifetime != 60*time.Second {
+		t.Errorf("AppTokenLifetime = %v, want 60s (spec §5.4)", tokens.AppTokenLifetime)
+	}
+	// The bare sub must carry neither FGA prefix.
+	if strings.Contains(wantSub, "oidc~") || strings.Contains(wantSub, "user:") {
+		t.Errorf("sub %q must not carry the FGA prefixes", wantSub)
+	}
+}
+
+// TestMintAppToken_FreshPerCall proves no mint is reusable: two calls for the
+// same app produce different jti values and different token bytes. Spec §5.4
+// forbids caching an app credential across renders.
+func TestMintAppToken_FreshPerCall(t *testing.T) {
+	signer := sharedSigner(t)
+	appUUID := "3f9c1b7a-1111-4a2b-9c3d-abcdefabcdef"
+	tok1, jti1, err := tokens.MintAppToken(signer, appUUID, "lk-1")
+	if err != nil {
+		t.Fatalf("mint 1: %v", err)
+	}
+	tok2, jti2, err := tokens.MintAppToken(signer, appUUID, "lk-1")
+	if err != nil {
+		t.Fatalf("mint 2: %v", err)
+	}
+	if jti1 == jti2 {
+		t.Errorf("jti reused across mints: %q", jti1)
+	}
+	if tok1.Reveal() == tok2.Reveal() {
+		t.Error("identical token bytes across two mints — a cached/replayed credential")
+	}
+}
+
+func TestMintAppToken_RequiresFields(t *testing.T) {
+	signer := sharedSigner(t)
+	if _, _, err := tokens.MintAppToken(nil, "app-uuid", "lk-1"); err == nil {
+		t.Error("expected error for nil signer")
+	}
+	if _, _, err := tokens.MintAppToken(signer, "", "lk-1"); err == nil {
+		t.Error("expected error for empty appUUID")
+	}
+	if _, _, err := tokens.MintAppToken(signer, "app-uuid", ""); err == nil {
+		t.Error("expected error for empty projectID (fail closed)")
+	}
+}
+
+// TestMintAppToken_RedactsInFmt: the mint returns the ImpersonationToken
+// redacting wrapper, so an app credential cannot reach a log line through a
+// stray %v/%s (RFC 019 §4.10).
+func TestMintAppToken_RedactsInFmt(t *testing.T) {
+	signer := sharedSigner(t)
+	tok, _, err := tokens.MintAppToken(signer, "3f9c1b7a-1111-4a2b-9c3d-abcdefabcdef", "lk-1")
+	if err != nil {
+		t.Fatalf("MintAppToken: %v", err)
+	}
+	if got := tok.String(); strings.Contains(got, tok.Reveal()) || strings.Contains(got, "eyJ") {
+		t.Errorf("String() leaked the JWT: %q", got)
+	}
+}

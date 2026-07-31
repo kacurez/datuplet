@@ -14,7 +14,7 @@ import (
 // Token kinds. The verifier cross-checks `aud` against `token_kind`:
 //
 //	aud=datuplet-api           requires token_kind ∈ {user, cli-api}
-//	aud=datuplet-catalog       requires token_kind ∈ {run, impersonation, local-cli, query}
+//	aud=datuplet-catalog       requires token_kind ∈ {run, impersonation, local-cli, query, app}
 //	aud=datuplet-query-worker  requires token_kind = internal-query
 //
 // User tokens are emitted by the user-login flow and consumed by
@@ -31,6 +31,12 @@ import (
 // the caller's own grants apply (viewers get read-only vended creds). An
 // `internal-query` token authenticates pipeline-api→query-worker hops
 // (aud=datuplet-query-worker) and must never be accepted by lakekeeper.
+// TokenKindApp is the RFC 028 user-apps kind: a 60s credential for an app's
+// synthetic identity, minted per render by MintAppToken. It shares
+// impersonation's audience and consumer (lakekeeper via the query path), but
+// stays a DISTINCT kind so pipeline-api's own query route — and any future
+// kind-aware policy — can tell "this came from a user app" from "this came
+// from a human's interactive session" without pattern-matching on `sub`.
 const (
 	TokenKindUser          = "user"
 	TokenKindRun           = "run"
@@ -39,6 +45,7 @@ const (
 	TokenKindCLIAPI        = "cli-api"
 	TokenKindQuery         = "query"
 	TokenKindInternalQuery = "internal-query"
+	TokenKindApp           = "app"
 )
 
 // Default JWT claim constants — issuer + token-type used by run tokens.
@@ -74,6 +81,22 @@ const MaxQueryTokenLifetime = 330 * time.Second
 // 60s is enough for one storage-browse round-trip; a longer ceiling would
 // turn a leaked impersonation JWT into a meaningful exfil window.
 const ImpersonationLifetime = 60 * time.Second
+
+// AppTokenLifetime is the TTL minted on user-app tokens (RFC 028 §5.4).
+// Same 60s reasoning as ImpersonationLifetime: it covers one render's worth
+// of queries, and every render mints afresh — nothing caches an app
+// credential, so there is no reason to widen the window.
+const AppTokenLifetime = 60 * time.Second
+
+// AppSubjectPrefix is prepended to an app's UUID to form the JWT `sub` of its
+// synthetic identity: "app-<uuid>".
+//
+// It lives here, next to the mint, so there is exactly ONE definition of the
+// app subject shape in the tree — pkg/pipelineapi/apps.AppJWTSubject composes
+// it from this constant rather than re-spelling the literal. Two independent
+// spellings of an identity prefix is precisely how a system ends up writing
+// FGA tuples for a subject its tokens never claim.
+const AppSubjectPrefix = "app-"
 
 // JTIForRunID returns the deterministic jti for the per-run JWT.
 // One jti per run; cancellation is handled via FGA tuple deletion.
@@ -235,6 +258,80 @@ func MintImpersonation(ctx context.Context, signer *Signer) (ImpersonationToken,
 		return "", fmt.Errorf("sign: %w", err)
 	}
 	return ImpersonationToken(s), nil
+}
+
+// MintAppToken produces a short-lived catalog JWT for a user app's synthetic
+// identity (RFC 028 §5.4). app-worker obtains one per render via
+// POST /internal/v1/impersonate and presents it on the query path; lakekeeper
+// authorizes it via FGA against the `viewer` tuple pipeline-api wrote for the
+// app at create time.
+//
+// Claims:
+//
+//	iss=datuplet-api
+//	aud=datuplet-catalog
+//	sub=app-<app-uuid>        (BARE; lakekeeper composes user:oidc~<sub>)
+//	actor=app-<app-uuid>      (the app acts as itself — there is no human
+//	                           in the loop at render time; the human who
+//	                           uploaded the bundle is audited separately by
+//	                           the author routes)
+//	token_kind="app"
+//	project_id=<lakekeeper project id>   (informational; audit)
+//	app_id=<app-uuid>                    (informational; audit)
+//	iat/nbf=now, exp=now+AppTokenLifetime (60s)
+//	jti=app-tok-<sub>-<unixnano>
+//
+// Unlike MintImpersonation / MintQueryToken this takes NO context and derives
+// nothing from an authenticated session — an app is not a *store.User, so
+// there is no ctx-bound subject to read (see the RFC 028 P0 preflight §B).
+// The audit-forgery defence those minters get from ctx is provided here by the
+// CALLER instead: the only call site resolves appUUID from the app row it just
+// loaded by primary key, so a client can never name the identity it gets. Do
+// not add a caller-supplied `sub` or `actor` parameter.
+//
+// Returns the ImpersonationToken redacting wrapper (same audience/consumer
+// family, so it inherits RFC 019 §4.10 redaction for free) plus the token's
+// jti. The jti is returned SEPARATELY and deliberately: it is the only part of
+// the credential that may appear in an audit line, and returning it spares
+// every caller from re-parsing the JWT just to log which mint happened.
+func MintAppToken(signer *Signer, appUUID, projectID string) (ImpersonationToken, string, error) {
+	if signer == nil {
+		return "", "", errors.New("signer is required")
+	}
+	if appUUID == "" {
+		return "", "", errors.New("appUUID is required")
+	}
+	// Fail closed: an app token whose project is unknown could not be
+	// authorized against any `project:<id>` tuple anyway.
+	if projectID == "" {
+		return "", "", errors.New("projectID is required")
+	}
+
+	now := time.Now()
+	sub := AppSubjectPrefix + appUUID
+	jti := fmt.Sprintf("app-tok-%s-%d", sub, now.UnixNano())
+	claims := jwt.MapClaims{
+		"iss":        tokenIssuer,
+		"aud":        TableTokenAudience,
+		"sub":        sub,
+		"actor":      sub,
+		"token_kind": TokenKindApp,
+		"project_id": projectID,
+		"app_id":     appUUID,
+		"iat":        now.Unix(),
+		"nbf":        now.Unix(),
+		"exp":        now.Add(AppTokenLifetime).Unix(),
+		"jti":        jti,
+	}
+
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = signer.KeyID
+
+	s, err := tok.SignedString(signer.Private())
+	if err != nil {
+		return "", "", fmt.Errorf("sign: %w", err)
+	}
+	return ImpersonationToken(s), jti, nil
 }
 
 // MintQueryToken produces a query-scoped catalog JWT for the

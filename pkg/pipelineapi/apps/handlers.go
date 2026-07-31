@@ -382,8 +382,12 @@ func (h *Handlers) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	projectUUID, _ := uuid.Parse(app.ProjectID)
-	audit("promote", userID, projectUUID, app.ID, "app", app.Name,
-		"version_hash", req.Version, "expected_production", expected)
+	// from/to (spec §9): `from` is the CAS-expected hash, which — because the
+	// CAS succeeded — IS the production version this promote replaced ("" on a
+	// first promote). An operator can reconstruct the rollout from the audit
+	// trail alone, without joining against app_channels history.
+	audit("app_promoted", userID, projectUUID, app.ID, "app", app.Name,
+		"from", expected, "to", req.Version)
 	writeJSON(w, http.StatusOK, promoteResponse{ProductionVersion: req.Version})
 }
 
@@ -453,7 +457,7 @@ func (h *Handlers) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	projectUUID, _ := uuid.Parse(app.ProjectID)
-	audit("mint_viewer_token", userID, projectUUID, app.ID, "app", app.Name, "token_id", tokenID)
+	audit("viewer_token_minted", userID, projectUUID, app.ID, "app", app.Name, "token_id", tokenID)
 	writeJSON(w, http.StatusCreated, tokenResponse{
 		TokenID: tokenID,
 		Token:   "vw_" + tokenID + "." + secret,
@@ -483,7 +487,7 @@ func (h *Handlers) handleDeleteToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	projectUUID, _ := uuid.Parse(app.ProjectID)
-	audit("revoke_viewer_token", userID, projectUUID, app.ID, "app", app.Name, "token_id", tokenID)
+	audit("viewer_token_revoked", userID, projectUUID, app.ID, "app", app.Name, "token_id", tokenID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -651,6 +655,15 @@ func renderLogToJSON(rec RenderLogRecord) renderLogJSON {
 // query proxy's single-record/single-emit discipline
 // (pkg/pipelineapi/queryproxy/audit.go). Fixed low-cardinality keys first,
 // then per-action detail. Never carries a viewer-token secret or a bundle.
+//
+// Author-surface action vocabulary (spec §9): put_version, delete_app,
+// app_promoted{from,to}, viewer_token_minted{token_id},
+// viewer_token_revoked{token_id}. The identity-lifecycle actions
+// (app_identity_created / app_identity_deleted / impersonation_minted) are
+// emitted by identityAudit in identity.go, from the IdentityManager itself, so
+// they fire for EVERY caller rather than only the routes that happen to
+// remember. These names are an operator-facing contract — renaming one breaks
+// log queries and alerts.
 func audit(action string, userID, projectID uuid.UUID, appID string, kv ...any) {
 	args := append([]any{
 		"action", action,
