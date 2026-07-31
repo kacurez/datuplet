@@ -571,6 +571,173 @@ func TestInternalSessionsVerify_DoesNotLeakSetCookie(t *testing.T) {
 	}
 }
 
+// ---- Forwarded caller credential (X-Datuplet-Forwarded-Authorization) ----
+
+// bearerResolver authenticates only when it sees one exact bearer value in
+// the request's Authorization header — the shape a real BearerJWTResolver
+// has. It also records whether an Authorization header was present at all,
+// so the negative case can assert the service credential never reaches it.
+type bearerResolver struct {
+	want       string
+	user       *store.User
+	sawAuth    string
+	sawAuthSet bool
+	calls      int
+}
+
+func (b *bearerResolver) UserFor(_ http.ResponseWriter, r *http.Request) (*store.User, bool, error) {
+	b.calls++
+	b.sawAuth = r.Header.Get("Authorization")
+	_, b.sawAuthSet = r.Header["Authorization"]
+	if b.sawAuth != b.want {
+		return nil, false, nil
+	}
+	return b.user, true, nil
+}
+func (b *bearerResolver) Mode() string        { return "test" }
+func (b *bearerResolver) SupportsLogin() bool { return false }
+
+// withBearerResolver rebuilds the harness's mux around a bearerResolver.
+func (h *internalHarness) withBearerResolver(want string) *bearerResolver {
+	h.t.Helper()
+	br := &bearerResolver{want: want, user: &store.User{ID: uuid.New(), Email: "cli@b.c"}}
+	ih := &apps.InternalHandlers{
+		Store: h.store, Identity: h.ident, Authz: h.authz,
+		Projects: h.projects, Resolver: br,
+		Token: mustServiceToken(h.t, testServiceToken),
+	}
+	mux := http.NewServeMux()
+	ih.RegisterInternal(mux)
+	h.mux = mux
+	return br
+}
+
+// A bearer-authenticated caller (Part 5's `datuplet apps render`) cannot put
+// its credential in Authorization — app-worker's service credential owns that
+// header. It forwards it in X-Datuplet-Forwarded-Authorization instead, and
+// the handler must move it into Authorization for the resolver.
+func TestInternalSessionsVerify_ForwardsBearerCredential(t *testing.T) {
+	h := newInternalHarness(t)
+	const userBearer = "Bearer user-cli-jwt-value"
+	br := h.withBearerResolver(userBearer)
+
+	w := h.doWithHeaders(http.MethodPost, "/internal/v1/sessions/verify",
+		fmt.Sprintf(`{"pid":%q}`, h.projectID.String()),
+		map[string]string{
+			"Authorization":                      "Bearer " + testServiceToken,
+			"X-Datuplet-Forwarded-Authorization": userBearer,
+		})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if br.sawAuth != userBearer {
+		t.Errorf("resolver saw Authorization = %q, want the forwarded caller credential %q",
+			br.sawAuth, userBearer)
+	}
+	var got map[string]any
+	decodeBody(t, w, &got)
+	if got["user_id"] != br.user.ID.String() {
+		t.Errorf("user_id = %v, want %s", got["user_id"], br.user.ID)
+	}
+	if got["project_member"] != true {
+		t.Errorf("project_member = %v, want true", got["project_member"])
+	}
+}
+
+// With no forwarding header, the resolver must see NO Authorization at all —
+// app-worker's service credential must never be mistakable for a user
+// credential (a resolver that accepted it would authenticate the worker as
+// whichever user that token maps to).
+func TestInternalSessionsVerify_ServiceTokenNeverReachesResolver(t *testing.T) {
+	h := newInternalHarness(t)
+	br := h.withBearerResolver("Bearer " + testServiceToken)
+
+	w := h.do(http.MethodPost, "/internal/v1/sessions/verify", fmt.Sprintf(`{"pid":%q}`, h.projectID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if br.sawAuthSet {
+		t.Errorf("resolver saw Authorization = %q, want the header absent entirely", br.sawAuth)
+	}
+	var got map[string]any
+	decodeBody(t, w, &got)
+	if got["user_id"] != "" || got["project_member"] != false {
+		t.Errorf("response = %v, want the unauthenticated {user_id:\"\", project_member:false}", got)
+	}
+}
+
+// The forwarding header itself must not leak through to the resolver: only
+// the Authorization it was translated into.
+func TestInternalSessionsVerify_StripsForwardingHeader(t *testing.T) {
+	h := newInternalHarness(t)
+	const userBearer = "Bearer user-cli-jwt-value"
+	var sawForward string
+	h.resolver = &recordingResolver{user: &store.User{ID: uuid.New()}, authed: true}
+	probe := &headerProbeResolver{inner: h.resolver, onCall: func(r *http.Request) {
+		sawForward = r.Header.Get(apps.ForwardedAuthorizationHeader)
+	}}
+	ih := &apps.InternalHandlers{
+		Store: h.store, Identity: h.ident, Authz: h.authz,
+		Projects: h.projects, Resolver: probe,
+		Token: mustServiceToken(t, testServiceToken),
+	}
+	mux := http.NewServeMux()
+	ih.RegisterInternal(mux)
+	h.mux = mux
+
+	w := h.doWithHeaders(http.MethodPost, "/internal/v1/sessions/verify",
+		fmt.Sprintf(`{"pid":%q}`, h.projectID.String()),
+		map[string]string{
+			"Authorization":                   "Bearer " + testServiceToken,
+			apps.ForwardedAuthorizationHeader: userBearer,
+		})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if sawForward != "" {
+		t.Errorf("resolver saw %s = %q, want it stripped", apps.ForwardedAuthorizationHeader, sawForward)
+	}
+}
+
+type headerProbeResolver struct {
+	inner  *recordingResolver
+	onCall func(*http.Request)
+}
+
+func (p *headerProbeResolver) UserFor(w http.ResponseWriter, r *http.Request) (*store.User, bool, error) {
+	p.onCall(r)
+	return p.inner.UserFor(w, r)
+}
+func (p *headerProbeResolver) Mode() string        { return "test" }
+func (p *headerProbeResolver) SupportsLogin() bool { return false }
+
+// Rewriting the credential must not mutate the caller's request header map —
+// http.Header is shared by reference, and the service-credential gate (plus
+// any middleware or logging after the handler) still reads Authorization.
+func TestInternalSessionsVerify_DoesNotMutateRequestHeaders(t *testing.T) {
+	h := newInternalHarness(t)
+	const userBearer = "Bearer user-cli-jwt-value"
+	h.withBearerResolver(userBearer)
+
+	r := httptest.NewRequest(http.MethodPost, "/internal/v1/sessions/verify",
+		bytes.NewReader([]byte(fmt.Sprintf(`{"pid":%q}`, h.projectID.String()))))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+testServiceToken)
+	r.Header.Set(apps.ForwardedAuthorizationHeader, userBearer)
+	w := httptest.NewRecorder()
+	h.mux.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if got := r.Header.Get("Authorization"); got != "Bearer "+testServiceToken {
+		t.Errorf("original request Authorization = %q, want the service credential untouched", got)
+	}
+	if got := r.Header.Get(apps.ForwardedAuthorizationHeader); got != userBearer {
+		t.Errorf("original request %s = %q, want it untouched", apps.ForwardedAuthorizationHeader, got)
+	}
+}
+
 func TestInternalSessionsVerify_BadRequest(t *testing.T) {
 	h := newInternalHarness(t)
 	for _, body := range []string{`{"pid":"nope"}`, `{}`, `garbage`} {

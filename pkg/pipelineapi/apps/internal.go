@@ -83,6 +83,16 @@ var bundleHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // values/secret/mount; this package only reads the path from the environment.
 const ServiceTokenFileEnv = "DATUPLET_APPS_INTERNAL_TOKEN_FILE"
 
+// ForwardedAuthorizationHeader carries the CALLER's credential on
+// sessions/verify. It exists because `Authorization` is already taken: that
+// header holds app-worker's service credential (requireServiceToken reads
+// it), and one header cannot carry two bearer values. app-worker puts the
+// viewer's/CLI's `Authorization` value here instead; handleVerifySession
+// moves it back into `Authorization` on a private copy of the request before
+// handing it to the session resolver. Cookie-based sessions need none of
+// this — the `Cookie` header rides through untouched.
+const ForwardedAuthorizationHeader = "X-Datuplet-Forwarded-Authorization"
+
 // ServiceToken is the shared bearer credential that gates every internal
 // route. It stores only the SHA-256 digest of the secret and compares
 // digests, so the comparison is both constant-time AND length-independent
@@ -404,10 +414,26 @@ func (h *InternalHandlers) handleVerifyViewerToken(w http.ResponseWriter, r *htt
 
 // handleVerifySession validates a forwarded platform session credential and
 // reports project membership — the mechanism behind app-worker's `@draft`
-// previews (spec §5.2). app-worker forwards the viewer's `Cookie` /
-// `Authorization` headers verbatim on this POST; they are handed to the SAME
+// previews (spec §5.2). The credential is handed to the SAME
 // auth.UserResolver the browser routes use, so there is exactly one session
 // implementation in the system.
+//
+// # How app-worker forwards the caller's credential (part of the contract)
+//
+//   - Cookie sessions (browser): forward the `Cookie` header verbatim. It
+//     rides through untouched.
+//   - Bearer sessions (the CLI's api-token renders, spec §5.5): forward the
+//     caller's `Authorization` value in ForwardedAuthorizationHeader —
+//     `Authorization` itself is unavailable, since it carries app-worker's
+//     own service credential and one header cannot hold two bearer values.
+//
+// This handler rebuilds the credential view for the resolver on a private
+// copy of the request: ForwardedAuthorizationHeader becomes `Authorization`
+// and is itself removed. When no forwarding header is present,
+// `Authorization` is REMOVED rather than left in place — otherwise the
+// resolver would be handed app-worker's service credential as if it were a
+// user credential, and a bearer-capable resolver would authenticate the
+// worker as whatever principal that token maps to.
 //
 // A credential that authenticates nobody is a 200 with `user_id: ""` and
 // `project_member: false`, NOT a 401. On this surface 401 means one thing
@@ -428,7 +454,7 @@ func (h *InternalHandlers) handleVerifySession(w http.ResponseWriter, r *http.Re
 	// refreshes the session cookie). That Set-Cookie is addressed to the
 	// viewer's browser, not to app-worker — discard it instead of letting it
 	// ride out on the internal response.
-	user, authed, err := h.Resolver.UserFor(discardResponseWriter{}, r)
+	user, authed, err := h.Resolver.UserFor(discardResponseWriter{}, callerCredentialRequest(r))
 	if err != nil {
 		slog.Error("apps: internal session verify", "err", err)
 		writeInternalError(w, http.StatusServiceUnavailable, kindUnavailable, "could not verify the session")
@@ -468,6 +494,27 @@ func (h *InternalHandlers) handleVerifySession(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, verifySessionResponse{UserID: user.ID.String(), ProjectMember: member})
+}
+
+// callerCredentialRequest returns a shallow copy of r whose Authorization
+// header holds the CALLER's credential rather than app-worker's service
+// credential: the value of ForwardedAuthorizationHeader when present, and
+// nothing at all when absent.
+//
+// The Header map is CLONED, never mutated in place — http.Header is shared by
+// reference, and the original still has to carry the service credential for
+// anything reading the request after this handler (middleware, access logs,
+// the caller's own copy in tests).
+func callerCredentialRequest(r *http.Request) *http.Request {
+	out := r.Clone(r.Context())
+	// r.Clone deep-copies Header, so these edits cannot reach the original.
+	if forwarded := out.Header.Get(ForwardedAuthorizationHeader); forwarded != "" {
+		out.Header.Set("Authorization", forwarded)
+	} else {
+		out.Header.Del("Authorization")
+	}
+	out.Header.Del(ForwardedAuthorizationHeader)
+	return out
 }
 
 // discardResponseWriter swallows everything written to it. Used to give the
