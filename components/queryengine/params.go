@@ -1,10 +1,12 @@
 package queryengine
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -88,6 +90,103 @@ func ValidateParams(sql string, params map[string]any) ([]string, error) {
 	}
 
 	return orderedNames, nil
+}
+
+// bindArgs converts validated parameters into database/sql named arguments,
+// ready to be appended to the SINGLE conn.QueryContext call that runs user SQL
+// (go-duckdb binds `$name` placeholders from sql.NamedArg — verified in Q0).
+// Passing them to that same call is load-bearing: a separate PrepareContext
+// would run the prepare phase outside duckdb-go's ctx-interrupt scope and make
+// the query un-interruptible on a deadline (see engine.go's Run doc).
+//
+// Values are mapped per the §6.1 bind-type table:
+//
+//	string            → VARCHAR   (dates/timestamps are ISO strings, cast in SQL)
+//	bool              → BOOLEAN
+//	nil               → untyped SQL NULL
+//	number, integral  → int64  (BIGINT)
+//	number, otherwise → float64 (DOUBLE)
+//
+// Args are emitted in sorted-name order purely for determinism; named binding
+// is order-independent. A nil/empty map yields nil, so the QueryContext call
+// is argument-free and the pre-params behaviour is unchanged.
+//
+// bindArgs assumes ValidateParams has already accepted the map. It re-checks
+// the value shape as defense in depth (an out-of-range or non-scalar value
+// returns an error rather than being silently coerced), but that path is
+// unreachable on the validated frontends.
+func bindArgs(params map[string]any) ([]any, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(params))
+	for name := range params {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	args := make([]any, 0, len(names))
+	for _, name := range names {
+		v, err := bindValue(params[name])
+		if err != nil {
+			return nil, fmt.Errorf("parameter %q: %w", name, err)
+		}
+		args = append(args, sql.Named(name, v))
+	}
+	return args, nil
+}
+
+// bindValue maps one JSON scalar onto the Go value database/sql hands to
+// go-duckdb. See bindArgs for the type table.
+func bindValue(v any) (any, error) {
+	switch val := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return val, nil
+	case bool:
+		return val, nil
+	case int:
+		return bindRat(new(big.Rat).SetInt64(int64(val)), strconv.FormatInt(int64(val), 10))
+	case int32:
+		return bindRat(new(big.Rat).SetInt64(int64(val)), strconv.FormatInt(int64(val), 10))
+	case int64:
+		return bindRat(new(big.Rat).SetInt64(val), strconv.FormatInt(val, 10))
+	case float64:
+		if err := validateFloat(val); err != nil {
+			return nil, err
+		}
+		return bindRat(new(big.Rat).SetFloat64(val), strconv.FormatFloat(val, 'g', -1, 64))
+	case json.Number:
+		if err := validateJSONNumber(val); err != nil {
+			return nil, err
+		}
+		r, ok := new(big.Rat).SetString(string(val))
+		if !ok {
+			return nil, &ParamError{Msg: fmt.Sprintf("invalid parameter type: json.Number(%q) is not numeric", string(val))}
+		}
+		return bindRat(r, string(val))
+	default:
+		return nil, &ParamError{Msg: fmt.Sprintf("invalid parameter type: %T", val)}
+	}
+}
+
+// bindRat applies the §6.1 numeric split to an exact value: an integral value
+// within ±(2^53−1) binds as int64 (BIGINT); anything non-integral binds as
+// float64 (DOUBLE). An integral value outside the safe range is rejected —
+// ValidateParams already rejects it, so this only guards unvalidated callers.
+func bindRat(r *big.Rat, display string) (any, error) {
+	if err := validateNumber(r, display); err != nil {
+		return nil, err
+	}
+	if r.IsInt() {
+		// big.Rat is normalized, so an integral value has Denom()==1 and Num()
+		// is the value itself; validateNumber proved |r| <= 2^53−1, well inside
+		// int64.
+		return r.Num().Int64(), nil
+	}
+	f, _ := r.Float64()
+	return f, nil
 }
 
 // placeholderSpans scans SQL and returns all placeholder spans (location and
