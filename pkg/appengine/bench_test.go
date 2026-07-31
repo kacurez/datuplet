@@ -80,6 +80,7 @@ func BenchmarkInstantiate(b *testing.B) {
 	defer func() { _ = e.Close(ctx) }()
 
 	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		mod, err := e.rt.InstantiateModule(ctx, e.compiled, wazero.NewModuleConfig().
 			WithName("").
@@ -112,6 +113,7 @@ func BenchmarkEval300KB(b *testing.B) {
 	limits := Limits{WallClock: 10 * time.Second, MaxQueries: 1, MaxOutputBytes: 2 << 20, MaxLogBytes: 4 << 10}
 
 	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, rerr := e.Render(ctx, RenderInput{Bundle: bundle, Now: time.Now(), Query: noQuery, Limits: limits})
 		if rerr != nil {
@@ -155,6 +157,7 @@ func BenchmarkJSON10MiB(b *testing.B) {
 	}};`)
 
 	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, rerr := e.Render(ctx, RenderInput{Bundle: bundle, Now: time.Now(), Query: q, Limits: limits})
 		if rerr != nil {
