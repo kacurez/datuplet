@@ -2,6 +2,7 @@ package queryengine
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 )
 
@@ -46,15 +47,21 @@ func TestValidateParams(t *testing.T) {
 			wantNames: []string{makeValidName(64)},
 		},
 		{
-			name:    "65-char name (exceeds limit - scanner captures first 64 chars)",
+			name:    "65-char name (exceeds limit - rejected, never truncated)",
 			sql:     "SELECT * WHERE a = $" + makeValidName(65),
-			params:  map[string]any{makeValidName(64): "value"},
-			wantNames: []string{makeValidName(64)},
+			params:  map[string]any{makeValidName(65): "value"},
+			wantErr: "exceeds the 64-character limit",
 		},
 		{
-			name:    "digit start (invalid - not recognized as placeholder)",
-			sql:     "SELECT * WHERE a = $1x",
+			name:    "200-char name (far over limit - rejected)",
+			sql:     "SELECT * WHERE a = $" + makeValidName(200),
 			params:  map[string]any{},
+			wantErr: "exceeds the 64-character limit",
+		},
+		{
+			name:      "digit start (invalid - not recognized as placeholder)",
+			sql:       "SELECT * WHERE a = $1x",
+			params:    map[string]any{},
 			wantNames: []string{},
 		},
 		{
@@ -94,6 +101,88 @@ func TestValidateParams(t *testing.T) {
 			sql:       "SELECT '$x' AS literal, * FROM t WHERE c = $country AND d = $days",
 			params:    map[string]any{"country": "DE", "days": 30},
 			wantNames: []string{"country", "days"},
+		},
+
+		// SQL comments: placeholders inside comments are NOT placeholders
+		{
+			name:      "placeholder in line comment",
+			sql:       "SELECT 1\n-- filter by $country\nWHERE a = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+		{
+			name:      "line comment at end of input",
+			sql:       "SELECT 1 -- $x",
+			params:    map[string]any{},
+			wantNames: []string{},
+		},
+		{
+			name:      "placeholder in block comment",
+			sql:       "SELECT /* $a */ 1 WHERE b = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+		{
+			name:      "placeholder in nested block comment",
+			sql:       "SELECT /* outer /* inner $a */ still comment $b */ 1 WHERE c = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+		{
+			name:      "unterminated block comment swallows the rest",
+			sql:       "SELECT 1 /* $x",
+			params:    map[string]any{},
+			wantNames: []string{},
+		},
+		{
+			name:      "division is not a block comment",
+			sql:       "SELECT a / b WHERE c = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+		{
+			name:      "single dash is not a line comment",
+			sql:       "SELECT a - b WHERE c = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+
+		// Dollar-quoted string literals: $$…$$ and $tag$…$tag$
+		{
+			name:      "placeholder inside $$ dollar-quoted string",
+			sql:       "SELECT $$literal $a$$ AS s WHERE b = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+		{
+			name:      "placeholder inside $tag$ dollar-quoted string",
+			sql:       "SELECT $q$ hi $a $q$ AS s WHERE b = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+		{
+			name:      "dollar-quoted string containing the tag prefix",
+			sql:       "SELECT $tag$ inner $tagx $tag$ AS s WHERE b = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
+		},
+		{
+			name:      "unterminated dollar quote swallows the rest",
+			sql:       "SELECT $q$ oops WHERE b = $x",
+			params:    map[string]any{},
+			wantNames: []string{},
+		},
+		{
+			name:      "$tag followed by non-dollar is a placeholder",
+			sql:       "SELECT * WHERE a = $tag AND b = $x",
+			params:    map[string]any{"tag": "t", "x": "value"},
+			wantNames: []string{"tag", "x"},
+		},
+		{
+			name:      "digit tag is not a dollar quote opener",
+			sql:       "SELECT $1$ AS c WHERE b = $x",
+			params:    map[string]any{"x": "value"},
+			wantNames: []string{"x"},
 		},
 
 		// Repeated placeholders: same name appears multiple times, ordered distinct output
@@ -210,12 +299,55 @@ func TestValidateParams(t *testing.T) {
 			wantErr: "MAX_SAFE_INTEGER",
 		},
 
-		// Value types: floating point
+		// Value types: floating point. Classification is by the *value*, not the Go
+		// type: an integral float64 is subject to the same safe-integer bound.
 		{
 			name:      "small float",
 			sql:       "SELECT * WHERE price = $price",
 			params:    map[string]any{"price": 3.14},
 			wantNames: []string{"price"},
+		},
+		{
+			name:      "integral float64 within safe range",
+			sql:       "SELECT * WHERE n = $n",
+			params:    map[string]any{"n": float64(42)},
+			wantNames: []string{"n"},
+		},
+		{
+			name:      "integral float64 at max safe",
+			sql:       "SELECT * WHERE n = $n",
+			params:    map[string]any{"n": float64(9007199254740991)},
+			wantNames: []string{"n"},
+		},
+		{
+			name:    "integral float64 exceeds max safe (1<<53)",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": float64(1 << 53)},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			name:    "integral float64 exceeds min safe (-(1<<53))",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": float64(-(1 << 53))},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			name:    "huge integral float64 (1e300)",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": 1e300},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			name:    "non-finite float64 rejected",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": math.Inf(1)},
+			wantErr: "not a finite number",
+		},
+		{
+			name:    "NaN rejected",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": math.NaN()},
+			wantErr: "not a finite number",
 		},
 		{
 			name:      "zero",
@@ -278,9 +410,79 @@ func TestValidateParams(t *testing.T) {
 			wantErr: "MAX_SAFE_INTEGER",
 		},
 		{
+			name:    "json.Number negative exceeds safe int",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": json.Number("-9007199254740992")},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			name:      "json.Number at max safe int",
+			sql:       "SELECT * WHERE n = $n",
+			params:    map[string]any{"n": json.Number("9007199254740991")},
+			wantNames: []string{"n"},
+		},
+		{
+			// Integral by value even though the literal has a fractional part.
+			name:    "json.Number integral with trailing .0 exceeds safe int",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": json.Number("9007199254740992.0")},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			name:      "json.Number integral with trailing .0 within safe range",
+			sql:       "SELECT * WHERE n = $n",
+			params:    map[string]any{"n": json.Number("9007199254740991.0")},
+			wantNames: []string{"n"},
+		},
+		{
+			// Exponent form: 1e20 is integral and far beyond the safe range.
+			name:    "json.Number exponent form exceeds safe int",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": json.Number("1e20")},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			name:    "json.Number huge exponent (1e300) exceeds safe int",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": json.Number("1e300")},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			name:    "json.Number beyond float64 range (1e400) exceeds safe int",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": json.Number("1e400")},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
+			// 1.5e3 == 1500: integral by value, well within the safe range.
+			name:      "json.Number exponent form integral within safe range",
+			sql:       "SELECT * WHERE n = $n",
+			params:    map[string]any{"n": json.Number("1.5e3")},
+			wantNames: []string{"n"},
+		},
+		{
+			// Non-integral values are bound as DOUBLE regardless of magnitude.
+			name:      "json.Number non-integral beyond safe range accepted as DOUBLE",
+			sql:       "SELECT * WHERE n = $n",
+			params:    map[string]any{"n": json.Number("12345678901234567890.5")},
+			wantNames: []string{"n"},
+		},
+		{
 			name:    "json.Number non-numeric",
 			sql:     "SELECT * WHERE n = $n",
 			params:  map[string]any{"n": json.Number("not_a_number")},
+			wantErr: "invalid parameter type",
+		},
+		{
+			name:    "json.Number empty",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": json.Number("")},
+			wantErr: "invalid parameter type",
+		},
+		{
+			name:    "json.Number fraction form is not a JSON number",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": json.Number("1/2")},
 			wantErr: "invalid parameter type",
 		},
 
@@ -431,6 +633,43 @@ func TestPlaceholderSpans(t *testing.T) {
 				{offset: 29, name: "x"},
 			},
 		},
+		{
+			name: "scanner resumes after a line comment",
+			sql:  "-- $a\nSELECT $x",
+			wantSpan: []span{
+				{offset: 14, name: "x"},
+			},
+		},
+		{
+			name: "scanner resumes after a block comment",
+			sql:  "/* $a */ SELECT $x",
+			wantSpan: []span{
+				{offset: 17, name: "x"},
+			},
+		},
+		{
+			name: "scanner resumes after a dollar-quoted string",
+			sql:  "SELECT $$a $b$$ , $x",
+			wantSpan: []span{
+				{offset: 19, name: "x"},
+			},
+		},
+		{
+			name: "scanner resumes after a tagged dollar-quoted string",
+			sql:  "SELECT $t$a $b$t$ , $x",
+			wantSpan: []span{
+				{offset: 21, name: "x"},
+			},
+		},
+		{
+			// The scanner reports the full identifier run; ValidateParams enforces
+			// the 64-character grammar limit and rejects this.
+			name: "over-long name is reported in full, never truncated",
+			sql:  "SELECT $" + makeValidName(65),
+			wantSpan: []span{
+				{offset: 8, name: makeValidName(65)},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -459,9 +698,9 @@ func TestPlaceholderSpans(t *testing.T) {
 
 // TestMaxSafeInteger validates the 2^53-1 boundary specifically
 func TestMaxSafeInteger(t *testing.T) {
-	maxSafe := int64(9007199254740991)      // 2^53 - 1
-	overSafe := int64(9007199254740992)     // 2^53
-	minSafe := int64(-9007199254740991)     // -(2^53 - 1)
+	maxSafe := int64(9007199254740991)       // 2^53 - 1
+	overSafe := int64(9007199254740992)      // 2^53
+	minSafe := int64(-9007199254740991)      // -(2^53 - 1)
 	underMinSafe := int64(-9007199254740992) // -(2^53)
 
 	tests := []struct {
@@ -520,9 +759,11 @@ func TestMaxSafeInteger(t *testing.T) {
 	}
 }
 
-// TestFloatSafeInteger checks that float64 values at the boundary are handled correctly
+// TestFloatSafeInteger checks that float64 values at the boundary are handled
+// correctly. Per spec §6.1 the bind type is decided by the *value*: an integral
+// value (whatever its Go type or lexical form) must satisfy |n| ≤ 2^53−1; a
+// non-integral value binds as DOUBLE and is unbounded.
 func TestFloatSafeInteger(t *testing.T) {
-	// Test that floats are accepted (non-integral), even at the boundary
 	tests := []struct {
 		name      string
 		value     float64
@@ -534,19 +775,42 @@ func TestFloatSafeInteger(t *testing.T) {
 			shouldErr: false,
 		},
 		{
-			name:      "float at max safe int + 0.5",
-			value:     float64(1<<53) - 0.5,
+			name:      "non-integral float well inside the safe range",
+			value:     12345.75,
 			shouldErr: false,
 		},
 		{
-			name:      "float exceeding safe int",
-			value:     float64(1<<53) + 1.5,
-			shouldErr: false, // Non-integral floats are accepted
+			name:      "integral float at max safe",
+			value:     float64(9007199254740991),
+			shouldErr: false,
 		},
 		{
-			name:      "float that is exactly 1<<53 (integral representation)",
+			// 2^53−0.5 is not representable: it rounds to 2^53, which is integral
+			// and outside the safe range, so it is rejected.
+			name:      "float64(1<<53)-0.5 rounds to 2^53 and is rejected",
+			value:     float64(1<<53) - 0.5,
+			shouldErr: true,
+		},
+		{
+			// Likewise 2^53+1.5 rounds to 9007199254740994.
+			name:      "float64(1<<53)+1.5 rounds to an integer and is rejected",
+			value:     float64(1<<53) + 1.5,
+			shouldErr: true,
+		},
+		{
+			name:      "float that is exactly 1<<53",
 			value:     float64(1 << 53),
-			shouldErr: false, // This is a float, not an integral number type
+			shouldErr: true,
+		},
+		{
+			name:      "float that is exactly -(1<<53)",
+			value:     float64(-(1 << 53)),
+			shouldErr: true,
+		},
+		{
+			name:      "huge integral float",
+			value:     1e300,
+			shouldErr: true,
 		},
 	}
 
@@ -572,10 +836,10 @@ func BenchmarkValidateParams(b *testing.B) {
 		AND amount > $minAmount
 		AND region IN (SELECT region FROM allowed_regions WHERE id = $region_id)`
 	params := map[string]any{
-		"days":       30,
-		"country":    "US",
-		"minAmount":  1000.50,
-		"region_id":  5,
+		"days":      30,
+		"country":   "US",
+		"minAmount": 1000.50,
+		"region_id": 5,
 	}
 
 	b.ResetTimer()
