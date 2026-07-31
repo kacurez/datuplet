@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/datuplet/datuplet/pkg/pipelineapi/apps"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
@@ -271,4 +272,67 @@ func (sr *selectiveResolver) UserFor(_ stdhttp.ResponseWriter, _ *stdhttp.Reques
 
 func (sr *selectiveResolver) Mode() string        { return "test" }
 func (sr *selectiveResolver) SupportsLogin() bool { return false }
+
+// stubProjects is a ProjectReader that resolves any project id to a synthetic
+// lakekeeper project id. Enough to prove route registration without a DB.
+type stubProjects struct{}
+
+func (stubProjects) ListForUser(_ context.Context, _ uuid.UUID) ([]apihttp.ProjectView, error) {
+	return nil, nil
+}
+
+func (stubProjects) GetByID(_ context.Context, id uuid.UUID) (*apihttp.ProjectView, error) {
+	return &apihttp.ProjectView{ID: id, LakekeeperProjectID: "bbbbbbbb-0000-0000-0000-000000000003"}, nil
+}
+
+// TestServer_AppRoutes_NotConfigured asserts the RFC 028 author routes stay
+// unregistered (404) until WithApps is wired — the same soft-degrade gate the
+// other optional route blocks use.
+func TestServer_AppRoutes_NotConfigured(t *testing.T) {
+	srv := apihttp.NewServer(nil).
+		WithUserResolver(stubResolver{}).
+		WithAuthorizer(authztest.New()).
+		WithProjectReader(stubProjects{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := stdhttp.Get(ts.URL + "/api/v1/projects/" + uuid.NewString() + "/apps")
+	if err != nil {
+		t.Fatalf("GET .../apps: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusNotFound {
+		t.Errorf("status = %d, want 404 (apps not wired)", resp.StatusCode)
+	}
+}
+
+// TestServer_AppRoutes_WithAppsWired asserts WithApps registers the author
+// routes behind auth.WithUser + the project-scoped FGA check: the empty authz
+// fake denies, so a 403 (not a 404) proves the real handler ran.
+func TestServer_AppRoutes_WithAppsWired(t *testing.T) {
+	srv := apihttp.NewServer(nil).
+		WithUserResolver(stubResolver{}).
+		WithAuthorizer(authztest.New()).
+		WithProjectReader(stubProjects{}).
+		// A nil pool is fine: the authz gate rejects before any query runs.
+		WithApps(apps.NewStore(nil), &apps.RecorderIdentity{})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	pid := uuid.NewString()
+	for _, path := range []string{
+		"/api/v1/projects/" + pid + "/apps",
+		"/api/v1/projects/" + pid + "/apps/dash1",
+		"/api/v1/projects/" + pid + "/apps/dash1/logs",
+	} {
+		resp, err := stdhttp.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != stdhttp.StatusForbidden {
+			t.Errorf("GET %s: status = %d, want 403 (real handler ran, authz fake denies)", path, resp.StatusCode)
+		}
+	}
+}
 

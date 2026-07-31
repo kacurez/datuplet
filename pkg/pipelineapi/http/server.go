@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/apps"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
@@ -97,6 +98,11 @@ type Server struct {
 	// WithPipelinePolicy from PIPELINE_POLICY_* env in main.go; nil disables
 	// all bound checks (ValidateTyped treats a nil *Policy as "no policy").
 	policy *validate.Policy
+	// appsStore / appsIdentity back the user-apps routes (RFC 028). Wired via
+	// WithApps; when either is nil the app routes stay unregistered — same
+	// soft-degrade gate as the other With* seams.
+	appsStore    *apps.Store
+	appsIdentity apps.IdentityManager
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -322,6 +328,16 @@ func (s *Server) WithPipelinePolicy(p *validate.Policy) *Server {
 	return s
 }
 
+// WithApps wires the user-apps control plane (RFC 028): the Postgres-backed
+// apps store and the app-identity manager (FGA registration + impersonation
+// minting). Both are required — when either is nil the author routes under
+// /api/v1/projects/{pid}/apps stay unregistered (callers get 404).
+func (s *Server) WithApps(store *apps.Store, identity apps.IdentityManager) *Server {
+	s.appsStore = store
+	s.appsIdentity = identity
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -385,6 +401,22 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("GET /api/v1/projects/{pid}/pipelines", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListPipelines)))
 		mux.Handle("GET /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleGetPipeline)))
 		mux.Handle("DELETE /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeletePipeline)))
+	}
+
+	// User-apps author routes (RFC 028 §5.1). Same gate shape as the
+	// pipeline block above plus the two apps-specific deps; the handler set
+	// owns its own route list (apps.Handlers.Register) and runs the same
+	// project-scoped FGA relations the pipeline routes use.
+	if s.resolver != nil && s.authzr != nil && s.projects != nil && s.appsStore != nil && s.appsIdentity != nil {
+		appHandlers := &apps.Handlers{
+			Store:    s.appsStore,
+			Identity: s.appsIdentity,
+			Authz:    s.authzr,
+			Projects: appsProjectLookup{projects: s.projects},
+		}
+		appHandlers.Register(mux, func(next http.Handler) http.Handler {
+			return auth.WithUser(s.resolver, next)
+		})
 	}
 
 	// Project-secrets handlers gate on s.secretsK8s in addition to the

@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/datuplet/datuplet/pkg/pipelineapi/apps"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
 
@@ -75,6 +76,27 @@ type PipelineDetail struct {
 	Doc       json.RawMessage
 	CreatedAt string
 	UpdatedAt string
+}
+
+// appsProjectLookup adapts ProjectReader to apps.ProjectLookup (RFC 028):
+// the app author routes need only the lakekeeper project id for their FGA
+// check object. errStoreNotFound is translated to apps.ErrNotFound so the
+// handler's errors.Is check maps it to 404; an empty LakekeeperProjectID
+// (project not yet provisioned) is passed through as ("", nil), which the
+// handler soft-degrades to 503 exactly as mustHaveRelation does.
+type appsProjectLookup struct {
+	projects ProjectReader
+}
+
+func (a appsProjectLookup) LakekeeperProjectID(ctx context.Context, projectID uuid.UUID) (string, error) {
+	proj, err := a.projects.GetByID(ctx, projectID)
+	if errors.Is(err, errStoreNotFound) {
+		return "", apps.ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return proj.LakekeeperProjectID, nil
 }
 
 // RunReader serves read-only run endpoints. Trigger/Cancel go through

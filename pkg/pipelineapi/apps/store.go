@@ -690,6 +690,199 @@ func scanRenderLogRow(row rowScanner) (*RenderLogRecord, error) {
 	return rec, nil
 }
 
+// ---------------------------------------------------------------------------
+// Author-route queries (RFC 028 P2)
+//
+// The contract's Store API list (contract-and-constraints.md, "Control plane
+// (Part 2)") names the write/resolve path only; the author routes
+// (GET/DELETE/list, spec §5.1) additionally need plain metadata reads and a
+// row-delete. They live here rather than in handlers.go so all SQL stays in
+// the one data-access file.
+// ---------------------------------------------------------------------------
+
+// ChannelRef is a channel's current pointer: which version hash it resolves
+// to and when it was last repointed.
+type ChannelRef struct {
+	Channel     string
+	VersionHash string
+	UpdatedAt   time.Time
+}
+
+// AppSummary is an app row plus its channel pointers — the shape the author
+// list route serializes (spec §5.1/§5.5: "apps + channel/version status").
+type AppSummary struct {
+	App
+	Channels []ChannelRef
+}
+
+// Get looks up one app by (projectID, name). Returns an error wrapping
+// ErrNotFound when no such app exists in that project.
+func (s *Store) Get(ctx context.Context, projectID uuid.UUID, name string) (*App, error) {
+	a := &App{ProjectID: projectID.String(), Name: name}
+	var id uuid.UUID
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, fga_registered, created_at FROM apps WHERE project_id = $1 AND name = $2`,
+		projectID, name,
+	).Scan(&id, &a.FGARegistered, &a.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("apps: app %s/%s: %w", projectID, name, ErrNotFound)
+		}
+		return nil, fmt.Errorf("apps: get app: %w", err)
+	}
+	a.ID = id.String()
+	return a, nil
+}
+
+// List returns every app in the project, name-ordered, each with its channel
+// pointers. One LEFT-JOINed query (not N+1) — an app with no channels yet
+// still appears, with an empty Channels slice.
+func (s *Store) List(ctx context.Context, projectID uuid.UUID) ([]AppSummary, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT a.id, a.name, a.fga_registered, a.created_at, c.channel, v.hash, c.updated_at
+		   FROM apps a
+		   LEFT JOIN app_channels c ON c.app_id = a.id
+		   LEFT JOIN app_versions v ON v.id = c.version_id
+		  WHERE a.project_id = $1
+		  ORDER BY a.name, c.channel`,
+		projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("apps: list apps: %w", err)
+	}
+	defer rows.Close()
+
+	out := []AppSummary{}
+	for rows.Next() {
+		var id uuid.UUID
+		var a App
+		var channel, hash *string
+		var updatedAt *time.Time
+		if err := rows.Scan(&id, &a.Name, &a.FGARegistered, &a.CreatedAt, &channel, &hash, &updatedAt); err != nil {
+			return nil, fmt.Errorf("apps: scan app: %w", err)
+		}
+		a.ID = id.String()
+		a.ProjectID = projectID.String()
+		if n := len(out); n == 0 || out[n-1].ID != a.ID {
+			out = append(out, AppSummary{App: a, Channels: []ChannelRef{}})
+		}
+		if channel != nil && hash != nil && updatedAt != nil {
+			cur := &out[len(out)-1]
+			cur.Channels = append(cur.Channels, ChannelRef{
+				Channel: *channel, VersionHash: *hash, UpdatedAt: *updatedAt,
+			})
+		}
+	}
+	return out, rows.Err()
+}
+
+// Channels returns the app's channel pointers (never nil).
+func (s *Store) Channels(ctx context.Context, appID string) ([]ChannelRef, error) {
+	appUUID, err := uuid.Parse(appID)
+	if err != nil {
+		return nil, fmt.Errorf("apps: invalid app id %q: %w", appID, err)
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT c.channel, v.hash, c.updated_at
+		   FROM app_channels c
+		   JOIN app_versions v ON v.id = c.version_id
+		  WHERE c.app_id = $1
+		  ORDER BY c.channel`,
+		appUUID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("apps: list channels: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ChannelRef{}
+	for rows.Next() {
+		var c ChannelRef
+		if err := rows.Scan(&c.Channel, &c.VersionHash, &c.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("apps: scan channel: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListVersions returns the app's retained versions, newest-first (never nil).
+// limit <= 0 means "every retained version" — version GC already bounds the
+// row count per app (MaxUnreferencedVersions plus the channel-referenced ones).
+func (s *Store) ListVersions(ctx context.Context, appID string, limit int) ([]Version, error) {
+	appUUID, err := uuid.Parse(appID)
+	if err != nil {
+		return nil, fmt.Errorf("apps: invalid app id %q: %w", appID, err)
+	}
+	if limit <= 0 {
+		limit = MaxUnreferencedVersions + 2 // + the two channel-referenced versions
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, hash, size_bytes, created_at
+		   FROM app_versions
+		  WHERE app_id = $1
+		  ORDER BY created_at DESC
+		  LIMIT $2`,
+		appUUID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("apps: list versions: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Version{}
+	for rows.Next() {
+		v := Version{AppID: appID}
+		var id uuid.UUID
+		if err := rows.Scan(&id, &v.Hash, &v.SizeBytes, &v.CreatedAt); err != nil {
+			return nil, fmt.Errorf("apps: scan version: %w", err)
+		}
+		v.ID = id.String()
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// Delete removes the app row; versions, channels, viewer tokens and render
+// logs go with it via ON DELETE CASCADE. Returns an error wrapping
+// ErrNotFound when the app is already gone.
+//
+// The FGA tuple must already have been removed by
+// IdentityManager.Unregister before this is called (spec §5.4 — the
+// tuple-then-rows ordering mirrors runbackend.K8sBackend.CancelRun).
+func (s *Store) Delete(ctx context.Context, appID string) error {
+	appUUID, err := uuid.Parse(appID)
+	if err != nil {
+		return fmt.Errorf("apps: invalid app id %q: %w", appID, err)
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM apps WHERE id = $1`, appUUID)
+	if err != nil {
+		return fmt.Errorf("apps: delete app: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("apps: app %s: %w", appID, ErrNotFound)
+	}
+	return nil
+}
+
+// SetFGARegistered records that the app's `viewer` tuple has been written.
+// Separate from Create because the tuple write is an HTTP call to OpenFGA,
+// not a Postgres participant: the row is inserted first, the tuple written
+// second, and this flag flipped third, so a Register that fails half-way
+// leaves fga_registered=false and the next upsert retries it.
+func (s *Store) SetFGARegistered(ctx context.Context, appID string) error {
+	appUUID, err := uuid.Parse(appID)
+	if err != nil {
+		return fmt.Errorf("apps: invalid app id %q: %w", appID, err)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE apps SET fga_registered = true WHERE id = $1`, appUUID,
+	); err != nil {
+		return fmt.Errorf("apps: mark fga_registered: %w", err)
+	}
+	return nil
+}
+
 func hashToken(salt []byte, secret string) []byte {
 	h := sha256.New()
 	h.Write(salt)
