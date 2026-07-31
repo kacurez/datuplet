@@ -103,6 +103,12 @@ type Server struct {
 	// soft-degrade gate as the other With* seams.
 	appsStore    *apps.Store
 	appsIdentity apps.IdentityManager
+	// appsInternalToken is the shared service credential gating the
+	// worker-facing /internal/v1/* routes (RFC 028 §5.2). Wired via
+	// WithAppsInternal from DATUPLET_APPS_INTERNAL_TOKEN_FILE; nil leaves the
+	// whole internal block unregistered, so app-worker gets a clear 404
+	// rather than an unauthenticated surface.
+	appsInternalToken *apps.ServiceToken
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -338,6 +344,17 @@ func (s *Server) WithApps(store *apps.Store, identity apps.IdentityManager) *Ser
 	return s
 }
 
+// WithAppsInternal wires the app-worker-facing internal API (RFC 028 §5.2):
+// the six /internal/v1/* routes, gated on one shared service credential.
+// token is loaded from DATUPLET_APPS_INTERNAL_TOKEN_FILE
+// (apps.ServiceTokenFromEnv) — when nil, the internal routes stay
+// unregistered. Registration also requires the WithApps deps, since every
+// internal route reads the apps store.
+func (s *Server) WithAppsInternal(token *apps.ServiceToken) *Server {
+	s.appsInternalToken = token
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -417,6 +434,27 @@ func (s *Server) Handler() http.Handler {
 		appHandlers.Register(mux, func(next http.Handler) http.Handler {
 			return auth.WithUser(s.resolver, next)
 		})
+	}
+
+	// User-apps internal API (RFC 028 §5.2) — the six worker-facing routes
+	// app-worker calls. Deliberately a SIBLING block to the author routes
+	// above: different caller (the app-worker process, not a platform user),
+	// different credential (one shared service token, not a session), and a
+	// different error envelope. It registers on this same mux — there is no
+	// separate internal listener — so the service-credential gate is applied
+	// inside RegisterInternal rather than here, making an unauthenticated
+	// internal route impossible to register by accident.
+	if s.resolver != nil && s.authzr != nil && s.projects != nil &&
+		s.appsStore != nil && s.appsIdentity != nil && s.appsInternalToken != nil {
+		internalHandlers := &apps.InternalHandlers{
+			Store:    s.appsStore,
+			Identity: s.appsIdentity,
+			Authz:    s.authzr,
+			Projects: appsProjectLookup{projects: s.projects},
+			Resolver: s.resolver,
+			Token:    s.appsInternalToken,
+		}
+		internalHandlers.RegisterInternal(mux)
 	}
 
 	// Project-secrets handlers gate on s.secretsK8s in addition to the

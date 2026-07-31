@@ -336,3 +336,51 @@ func TestServer_AppRoutes_WithAppsWired(t *testing.T) {
 	}
 }
 
+// TestServer_AppInternalRoutes asserts the RFC 028 §5.2 internal routes are
+// gated by their own dependency (the service credential) and, once wired,
+// answer 401 rather than 404 — i.e. the credential gate ran. WithApps alone
+// must NOT expose them: an internal route without its credential would be an
+// unauthenticated resolve/bundle/mint surface.
+func TestServer_AppInternalRoutes(t *testing.T) {
+	base := func() *apihttp.Server {
+		return apihttp.NewServer(nil).
+			WithUserResolver(stubResolver{}).
+			WithAuthorizer(authztest.New()).
+			WithProjectReader(stubProjects{}).
+			// A nil pool is fine: the credential gate rejects before any query.
+			WithApps(apps.NewStore(nil), &apps.RecorderIdentity{})
+	}
+	token, err := apps.NewServiceToken("internal-service-credential")
+	if err != nil {
+		t.Fatalf("NewServiceToken: %v", err)
+	}
+
+	paths := []string{
+		"/internal/v1/apps/" + uuid.NewString() + "/dash1/resolve",
+		"/internal/v1/bundles/" + strings.Repeat("a", 64),
+	}
+	for _, tc := range []struct {
+		name string
+		srv  *apihttp.Server
+		want int
+	}{
+		{"token not wired", base(), stdhttp.StatusNotFound},
+		{"token wired", base().WithAppsInternal(token), stdhttp.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(tc.srv.Handler())
+			defer ts.Close()
+			for _, path := range paths {
+				resp, err := stdhttp.Get(ts.URL + path)
+				if err != nil {
+					t.Fatalf("GET %s: %v", path, err)
+				}
+				resp.Body.Close()
+				if resp.StatusCode != tc.want {
+					t.Errorf("GET %s: status = %d, want %d", path, resp.StatusCode, tc.want)
+				}
+			}
+		})
+	}
+}
+

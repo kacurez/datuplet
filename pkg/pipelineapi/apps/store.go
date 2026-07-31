@@ -734,6 +734,31 @@ func (s *Store) Get(ctx context.Context, projectID uuid.UUID, name string) (*App
 	return a, nil
 }
 
+// GetByID looks up one app by its id alone, with no project scope. The
+// internal API (P3) needs this shape: app-worker names an app_id and the
+// project must be derived from the row, never from the caller (spec §5.2 —
+// the worker can't name an identity or a project).
+func (s *Store) GetByID(ctx context.Context, appID string) (*App, error) {
+	appUUID, err := uuid.Parse(appID)
+	if err != nil {
+		return nil, fmt.Errorf("apps: invalid app id %q: %w", appID, err)
+	}
+	a := &App{ID: appUUID.String()}
+	var projectUUID uuid.UUID
+	err = s.pool.QueryRow(ctx,
+		`SELECT project_id, name, fga_registered, created_at FROM apps WHERE id = $1`,
+		appUUID,
+	).Scan(&projectUUID, &a.Name, &a.FGARegistered, &a.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("apps: app %s: %w", appID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("apps: get app by id: %w", err)
+	}
+	a.ProjectID = projectUUID.String()
+	return a, nil
+}
+
 // List returns every app in the project, name-ordered, each with its channel
 // pointers. One LEFT-JOINed query (not N+1) — an app with no channels yet
 // still appears, with an empty Channels slice.
