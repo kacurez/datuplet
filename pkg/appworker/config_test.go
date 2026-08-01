@@ -106,6 +106,56 @@ func TestLoadConfigCapsClampNotError(t *testing.T) {
 	}
 }
 
+// TestLoadConfigOutputDocMaxBytesClampsToStructuralCap asserts an
+// operator override above spec §6.3's structural OutputDoc ceiling (2 MiB)
+// clamps to that ceiling rather than being honored verbatim (Codex review
+// gate finding on commit 3d34d8d: spec §7's Cap column reads "—" for this
+// row, but §6.3 calls ≤2 MiB a structural cap app-worker itself enforces).
+func TestLoadConfigOutputDocMaxBytesClampsToStructuralCap(t *testing.T) {
+	t.Setenv(EnvOutputDocMaxBytes, "104857600") // 100 MiB
+
+	cfg := LoadConfig()
+
+	if cfg.Render.OutputDocMaxBytes != HardCapOutputDocMaxBytes {
+		t.Errorf("OutputDocMaxBytes = %d, want clamp to structural cap %d",
+			cfg.Render.OutputDocMaxBytes, HardCapOutputDocMaxBytes)
+	}
+}
+
+// TestLoadConfigBundleMaxBytesClampsToStructuralCap asserts an operator
+// override above spec §4's "≤ 5 MB" bundle-size design property clamps to
+// that ceiling. Lower-risk than OutputDoc (app-worker never accepts
+// uploads; pipeline-api's store is the authoritative enforcer), but the
+// config surface applies the same uniform rule rather than special-casing
+// it.
+func TestLoadConfigBundleMaxBytesClampsToStructuralCap(t *testing.T) {
+	t.Setenv(EnvBundleMaxBytes, "52428800") // 50 MB
+
+	cfg := LoadConfig()
+
+	if cfg.Render.BundleMaxBytes != HardCapBundleMaxBytes {
+		t.Errorf("BundleMaxBytes = %d, want clamp to structural cap %d",
+			cfg.Render.BundleMaxBytes, HardCapBundleMaxBytes)
+	}
+}
+
+// TestLoadConfigOutputDocAndBundleMaxBytesBelowCapHonored asserts an
+// operator may configure LOWER values for both (the clamp is a ceiling,
+// not a fixed value).
+func TestLoadConfigOutputDocAndBundleMaxBytesBelowCapHonored(t *testing.T) {
+	t.Setenv(EnvOutputDocMaxBytes, "1048576") // 1 MiB, below the 2 MiB cap
+	t.Setenv(EnvBundleMaxBytes, "1000000")    // below the 5242880 cap
+
+	cfg := LoadConfig()
+
+	if cfg.Render.OutputDocMaxBytes != 1048576 {
+		t.Errorf("OutputDocMaxBytes = %d, want 1048576 (below-cap override honored)", cfg.Render.OutputDocMaxBytes)
+	}
+	if cfg.Render.BundleMaxBytes != 1000000 {
+		t.Errorf("BundleMaxBytes = %d, want 1000000 (below-cap override honored)", cfg.Render.BundleMaxBytes)
+	}
+}
+
 // TestLoadConfigWithinCapHonored asserts a legitimate override that stays
 // under its cap is honored verbatim (the clamp is a ceiling, not a reset to
 // default).

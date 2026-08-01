@@ -56,16 +56,34 @@ const (
 	DefaultQueriesPerRender = 10
 	HardCapQueriesPerRender = 25
 
-	// DefaultOutputDocMaxBytes = 2 MiB. No cap column in spec §7 ("—").
+	// DefaultOutputDocMaxBytes = 2 MiB. Spec §7's Cap column reads "—", but
+	// §6.3 states "Structural caps: ≤64 blocks/doc, OutputDoc ≤2 MiB" — this
+	// is a hard structural ceiling app-worker itself enforces (W5), not a
+	// mere default: an operator raising it would let a guest return a doc
+	// larger than the "OutputDoc buffer (≤2 MiB)" §7's own per-pod render-slot
+	// sizing math budgets per render. HardCapOutputDocMaxBytes carries the
+	// same value; operators may configure LOWER, never higher.
 	DefaultOutputDocMaxBytes = 2097152
+	HardCapOutputDocMaxBytes = 2097152
 	// DefaultBundleMaxBytes = 5242880 (contract literal; spec §7 calls it
-	// "5 MB"). No cap column in spec §7 ("—").
+	// "5 MB"). Spec §7's Cap column also reads "—", but §4 states app
+	// bundles are "≤ 5 MB" as a design property, and pipeline-api's store
+	// (Part 2) enforces this authoritatively with ErrBundleTooLarge — this
+	// clamp is lower-risk (app-worker never accepts uploads) but gets the
+	// same treatment for a uniform config-surface rule: clamp to the spec
+	// maximum, don't special-case. HardCapBundleMaxBytes carries the same
+	// value; operators may configure LOWER, never higher.
 	DefaultBundleMaxBytes = 5242880
-	// DefaultPerAppInflight has no cap column in spec §7 ("—").
+	HardCapBundleMaxBytes = 5242880
+	// DefaultPerAppInflight has no cap column in spec §7 ("—") and no
+	// structural-cap statement elsewhere in the spec (§7's own capacity
+	// math treats it as the tunable that capacity planning solves for) — a
+	// genuinely open operator knob, not clamped.
 	DefaultPerAppInflight = 2
 	// DefaultConcurrency is the render worker's own goroutine-pool size
 	// (contract-and-constraints.md values.yaml block); not itself a spec §7
-	// limits-table row.
+	// limits-table row and not called out anywhere else in the spec as a
+	// structural ceiling — a genuinely open operator knob, not clamped.
 	DefaultConcurrency = 8
 
 	// wazeroPageBytes: a WASM linear-memory page is 64 KiB, fixed by the
@@ -79,10 +97,20 @@ const (
 // Clamp policy (documented decision, not error): every *Default-style field
 // (TimeoutS, MemoryMiB, QueriesPerRender) is clamped to its paired Max*
 // field, and every Max* field is itself clamped to the spec's hard ceiling
-// (HardCapTimeoutS / HardCapMemoryMiB / HardCapQueriesPerRender). An invalid
-// or non-positive override (unparseable, zero, negative) falls back to the
-// default instead of clamping, since there is no sane "ceiling" to clamp a
-// garbage value toward.
+// (HardCapTimeoutS / HardCapMemoryMiB / HardCapQueriesPerRender).
+// OutputDocMaxBytes and BundleMaxBytes have no paired Max* field (spec §7's
+// Cap column reads "—" for both) but DO have spec-stated structural ceilings
+// elsewhere (§6.3: OutputDoc ≤2 MiB; §4: bundles ≤5 MB) — both clamp
+// directly to HardCapOutputDocMaxBytes / HardCapBundleMaxBytes using the
+// same clamp helper as everything else, so the config surface has one
+// uniform rule instead of two special cases. An invalid or non-positive
+// override (unparseable, zero, negative) falls back to the default instead
+// of clamping, since there is no sane "ceiling" to clamp a garbage value
+// toward.
+//
+// PerAppInflight and Concurrency are genuinely open operator knobs: neither
+// has a Max* pair, a spec §7 Cap value, nor a structural-ceiling statement
+// elsewhere in the spec, so neither is clamped.
 //
 // This mirrors the existing project convention in
 // components/queryengine/cmd/query-worker/server.go, where a per-request
@@ -170,8 +198,8 @@ func LoadConfig() Config {
 			MaxMemoryMiB:        maxMemoryMiB,
 			QueriesPerRender:    queriesPerRender,
 			MaxQueriesPerRender: maxQueriesPerRender,
-			OutputDocMaxBytes:   envIntDefault(EnvOutputDocMaxBytes, DefaultOutputDocMaxBytes),
-			BundleMaxBytes:      envIntDefault(EnvBundleMaxBytes, DefaultBundleMaxBytes),
+			OutputDocMaxBytes:   clampToHardCap(envIntDefault(EnvOutputDocMaxBytes, DefaultOutputDocMaxBytes), HardCapOutputDocMaxBytes),
+			BundleMaxBytes:      clampToHardCap(envIntDefault(EnvBundleMaxBytes, DefaultBundleMaxBytes), HardCapBundleMaxBytes),
 			PerAppInflight:      envIntDefault(EnvPerAppInflight, DefaultPerAppInflight),
 			Concurrency:         envIntDefault(EnvConcurrency, DefaultConcurrency),
 		},
