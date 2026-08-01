@@ -184,7 +184,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Steps 2–7 run under the audit deferred emit (serveWithAudit). The
 	// deferred emit fires exactly once regardless of which exit path is
 	// taken — the structural guarantee replaces per-branch discipline.
-	h.serveWithAudit(w, r, sub, time.Now())
+	// nil appPrincipal: this is the browser/CLI-facing route; the app
+	// principal path is app_query.go's appHandler.
+	h.serveWithAudit(w, r, sub, time.Now(), nil)
 }
 
 // clamp resolves an optional client-supplied limit: nil or non-positive →

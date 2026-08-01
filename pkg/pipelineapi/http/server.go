@@ -511,6 +511,20 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("POST /api/v1/projects/{pid}/query", auth.WithUser(s.resolver, s.queryHandler))
 	}
 
+	// App-principal query route (RFC 028 P5): app-worker presents an app's
+	// own impersonation JWT (token_kind=app) directly as its Authorization
+	// bearer credential, in place of a platform session — an app has no
+	// *store.User row for auth.WithUser to resolve. Registered whenever the
+	// query service itself is configured (the same *queryproxy.Core the
+	// browser route above wraps), independent of s.resolver: app renders
+	// never touch the session/cookie machinery. queryCore.AppHTTPHandler
+	// verifies the JWT itself (signature, kid, iss, aud, token_kind,
+	// exp/nbf) and re-runs the SAME projectgate.Gate FGA check the browser
+	// route runs, so an app can reach nothing beyond its viewer grant.
+	if s.queryCore != nil {
+		mux.Handle("POST /internal/v1/projects/{pid}/query", s.queryCore.AppHTTPHandler())
+	}
+
 	// Local query-JWT mint route (RFC 022 §5.3). Registered whenever the
 	// handler + resolver are wired — the handler itself returns a 403 refusal
 	// when the allowClientSideQuery policy is off (NOT a 404), so the

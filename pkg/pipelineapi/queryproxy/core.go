@@ -18,6 +18,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
 
@@ -100,16 +104,46 @@ func (c *Core) HTTPHandler() http.Handler {
 // shape — the worker's queryengine.ValidateParams is the sole gate, and
 // its 400 bad_request/sql_error responses pass through translateRaw
 // unchanged (allowedWorkerKinds already allowlists both kinds).
-func (h *handler) executeRaw(ctx context.Context, sub, warehouse, sql string, params map[string]any, lim queryLimits, rec *auditRecord) ([]byte, *QueryError) {
+//
+// appPrin is non-nil only for an app-render caller (RFC 028 P5). In that
+// case the catalog credential is the app's own already-presented,
+// already-scoped (aud=datuplet-catalog) impersonation JWT — it is forwarded
+// verbatim instead of minting a fresh MintQueryToken, and rec.jti has
+// already been seeded from it by the caller (serveWithAudit), so this
+// function does not touch rec.jti on that path. There is no ctx-bound
+// *store.User subject to mint a catalog token from for an app in the first
+// place (task-P0-report.md §B).
+func (h *handler) executeRaw(ctx context.Context, sub, warehouse, sql string, params map[string]any, lim queryLimits, rec *auditRecord, appPrin *appPrincipal) ([]byte, *QueryError) {
 	ttl := time.Duration(lim.timeoutS)*time.Second + h.cfg.CatalogTTLSlack
-	catalogTok, err := tokens.MintQueryToken(ctx, h.signer, ttl)
-	if err != nil {
-		slog.Error("queryproxy: mint catalog token failed", "sub", sub, "err", err)
-		return nil, &QueryError{http.StatusInternalServerError, "internal", "failed to mint query credentials"}
+
+	var catalogJWT string
+	if appPrin != nil {
+		catalogJWT = appPrin.rawToken
+		// MintInternalQueryToken (below) reads its subject from ctx via the
+		// same subjectFromCtx an authenticated *store.User request satisfies
+		// via auth.WithUser — a request on THIS route never goes through
+		// that middleware (app_query.go), so ctx carries no user. Bind one
+		// using the app's own id (the internal-hop token is
+		// aud=datuplet-query-worker, internal-only, and the worker's own
+		// verifier requires only a non-empty sub — never presented to
+		// lakekeeper, never FGA-checked — so this does not misrepresent
+		// anything). A malformed/missing app_id claim leaves ctx unchanged,
+		// which fails the mint below closed (500), not open.
+		if appUUID, err := uuid.Parse(appPrin.appID); err == nil {
+			ctx = auth.WithCtxUser(ctx, &store.User{ID: appUUID})
+		}
+	} else {
+		catalogTok, err := tokens.MintQueryToken(ctx, h.signer, ttl)
+		if err != nil {
+			slog.Error("queryproxy: mint catalog token failed", "sub", sub, "err", err)
+			return nil, &QueryError{http.StatusInternalServerError, "internal", "failed to mint query credentials"}
+		}
+		// Extract jti from the minted catalog token for cross-system
+		// correlation. Unverified decode is intentional — we minted this
+		// token ourselves.
+		rec.jti = extractJTIFromToken(catalogTok.Reveal())
+		catalogJWT = catalogTok.Reveal()
 	}
-	// Extract jti from the minted catalog token for cross-system correlation.
-	// Unverified decode is intentional — we minted this token ourselves.
-	rec.jti = extractJTIFromToken(catalogTok.Reveal())
 
 	internalTok, err := tokens.MintInternalQueryToken(ctx, h.signer, ttl)
 	if err != nil {
@@ -119,7 +153,7 @@ func (h *handler) executeRaw(ctx context.Context, sub, warehouse, sql string, pa
 
 	resp, err := h.client.Do(ctx, internalTok, workerRequest{
 		SQL:        sql,
-		CatalogJWT: catalogTok.Reveal(),
+		CatalogJWT: catalogJWT,
 		Warehouse:  warehouse,
 		TimeoutS:   lim.timeoutS,
 		MaxRows:    lim.maxRows,
