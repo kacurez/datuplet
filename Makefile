@@ -7,7 +7,7 @@ export DOCKER_BUILDKIT=1
 	build-component-sql-transform build-component-datuplet-query \
 	engine-wasm \
 	extractor-local \
-	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
+	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-app-worker docker-build-k8s \
 	clean clean-go-git-cache \
 	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
 	deploy-local deploy-local-helm undeploy-local k8s-smoke \
@@ -139,6 +139,9 @@ docker-build-pipeline-api: ## Build pipeline-api Docker image
 
 docker-build-pipeline-observer: ## Build pipeline-observer Docker image (RFC 015)
 	DOCKER_BUILDKIT=1 docker build -f utils/docker/Dockerfile.pipeline-observer -t datuplet/pipeline-observer:latest .
+
+docker-build-app-worker: ## Build app-worker Docker image (RFC 028 Part 3)
+	DOCKER_BUILDKIT=1 docker build -f utils/docker/app-worker.Dockerfile -t datuplet/app-worker:latest .
 
 # Build all K8s images (operators + services). RFC 025 Task 3.3: query-worker
 # is included here now that queryWorker.enabled defaults to true in the chart
