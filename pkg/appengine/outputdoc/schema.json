@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datuplet.io/schemas/outputdoc-v1.json",
+  "title": "OutputDoc v1",
+  "type": "object",
+  "required": ["outputDoc", "title", "blocks"],
+  "additionalProperties": false,
+  "properties": {
+    "outputDoc": {
+      "type": "integer",
+      "const": 1
+    },
+    "title": {
+      "type": "string"
+    },
+    "blocks": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/block"
+      }
+    },
+    "refreshInterval": {
+      "type": "integer",
+      "minimum": 15,
+      "maximum": 3600
+    }
+  },
+  "$defs": {
+    "block": {
+      "type": "object",
+      "required": ["id", "type"],
+      "discriminator": {
+        "propertyName": "type"
+      },
+      "oneOf": [
+        { "$ref": "#/$defs/markdownBlock" },
+        { "$ref": "#/$defs/metricBlock" },
+        { "$ref": "#/$defs/tableBlock" },
+        { "$ref": "#/$defs/chartBlock" },
+        { "$ref": "#/$defs/filterBlock" },
+        { "$ref": "#/$defs/tabsBlock" }
+      ]
+    },
+    "markdownBlock": {
+      "type": "object",
+      "required": ["id", "type", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "markdown"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "metricBlock": {
+      "type": "object",
+      "required": ["id", "type", "items"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "metric"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "value"],
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "value": {},
+              "format": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "tableBlock": {
+      "type": "object",
+      "required": ["id", "type", "columns", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "table"
+        },
+        "title": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array"
+          }
+        }
+      }
+    },
+    "chartBlock": {
+      "type": "object",
+      "required": ["id", "type", "library", "spec"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "chart"
+        },
+        "library": {
+          "const": "vega-lite"
+        },
+        "title": {
+          "type": "string"
+        },
+        "spec": {
+          "type": "object"
+        }
+      }
+    },
+    "filterBlock": {
+      "type": "object",
+      "required": ["id", "type", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "filter"
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "label", "kind"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "value": {},
+              "options": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      }
+    },
+    "tabsBlock": {
+      "type": "object",
+      "required": ["id", "type", "tabs"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "tabs"
+        },
+        "tabs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "blocks"],
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "blocks": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "$ref": "#/$defs/block"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
