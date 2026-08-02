@@ -27,12 +27,53 @@
     }
   },
   "$defs": {
+    "blockId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "onClick": {
+      "type": "object",
+      "required": ["param"],
+      "additionalProperties": false,
+      "properties": {
+        "param": {
+          "type": "string"
+        }
+      }
+    },
+    "modal": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["title", "blocks"],
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "blocks": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/block"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["param"],
+          "additionalProperties": false,
+          "properties": {
+            "param": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
     "block": {
       "type": "object",
       "required": ["id", "type"],
-      "discriminator": {
-        "propertyName": "type"
-      },
       "oneOf": [
         { "$ref": "#/$defs/markdownBlock" },
         { "$ref": "#/$defs/metricBlock" },
@@ -48,13 +89,16 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string"
+          "$ref": "#/$defs/blockId"
         },
         "type": {
           "const": "markdown"
         },
         "text": {
           "type": "string"
+        },
+        "modal": {
+          "$ref": "#/$defs/modal"
         }
       }
     },
@@ -64,7 +108,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string"
+          "$ref": "#/$defs/blockId"
         },
         "type": {
           "const": "metric"
@@ -85,6 +129,9 @@
               }
             }
           }
+        },
+        "modal": {
+          "$ref": "#/$defs/modal"
         }
       }
     },
@@ -94,7 +141,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string"
+          "$ref": "#/$defs/blockId"
         },
         "type": {
           "const": "table"
@@ -111,10 +158,33 @@
         "rows": {
           "type": "array",
           "items": {
-            "type": "array"
+            "$ref": "#/$defs/tableRow"
           }
+        },
+        "modal": {
+          "$ref": "#/$defs/modal"
         }
       }
+    },
+    "tableRow": {
+      "oneOf": [
+        {
+          "type": "array"
+        },
+        {
+          "type": "object",
+          "required": ["cells"],
+          "additionalProperties": false,
+          "properties": {
+            "cells": {
+              "type": "array"
+            },
+            "modal": {
+              "$ref": "#/$defs/modal"
+            }
+          }
+        }
+      ]
     },
     "chartBlock": {
       "type": "object",
@@ -122,7 +192,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string"
+          "$ref": "#/$defs/blockId"
         },
         "type": {
           "const": "chart"
@@ -135,6 +205,12 @@
         },
         "spec": {
           "type": "object"
+        },
+        "onClick": {
+          "$ref": "#/$defs/onClick"
+        },
+        "modal": {
+          "$ref": "#/$defs/modal"
         }
       }
     },
@@ -144,7 +220,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string"
+          "$ref": "#/$defs/blockId"
         },
         "type": {
           "const": "filter"
@@ -167,12 +243,38 @@
               },
               "value": {},
               "options": {
-                "type": "array"
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/filterOption"
+                }
               }
             }
           }
+        },
+        "modal": {
+          "$ref": "#/$defs/modal"
         }
       }
+    },
+    "filterOption": {
+      "oneOf": [
+        {
+          "type": ["string", "number", "boolean"]
+        },
+        {
+          "type": "object",
+          "required": ["value", "label"],
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "type": ["string", "number", "boolean"]
+            },
+            "label": {
+              "type": "string"
+            }
+          }
+        }
+      ]
     },
     "tabsBlock": {
       "type": "object",
@@ -180,7 +282,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string"
+          "$ref": "#/$defs/blockId"
         },
         "type": {
           "const": "tabs"
@@ -197,13 +299,15 @@
               },
               "blocks": {
                 "type": "array",
-                "maxItems": 64,
                 "items": {
                   "$ref": "#/$defs/block"
                 }
               }
             }
           }
+        },
+        "modal": {
+          "$ref": "#/$defs/modal"
         }
       }
     }
