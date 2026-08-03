@@ -33,12 +33,18 @@ type Engine interface {
 type EngineConstructor func(ctx context.Context, memoryPages uint32) (Engine, error)
 
 // errorKind enumerates the app-worker error envelope's `kind` values
-// (contract-and-constraints.md, spec §8). Only errKindUnavailable is used by
-// this skeleton; later tasks will produce the rest.
+// (contract-and-constraints.md, spec §8) — the complete, fixed vocabulary.
 type errorKind string
 
 const (
-	errKindUnavailable errorKind = "unavailable"
+	errKindBadRequest   errorKind = "bad_request"
+	errKindUnauthorized errorKind = "unauthorized"
+	errKindAppNotFound  errorKind = "app_not_found"
+	errKindRenderError  errorKind = "render_error"
+	errKindTimeout      errorKind = "timeout"
+	errKindRateLimited  errorKind = "rate_limited"
+	errKindCapacity     errorKind = "capacity"
+	errKindUnavailable  errorKind = "unavailable"
 )
 
 // errorBody is the JSON error envelope shape: {error, kind, request_id}
@@ -57,12 +63,58 @@ type Server struct {
 	cfg    Config
 	engine Engine
 	mux    *http.ServeMux
+
+	// api is the pipeline-api client (W3) viewer auth calls into. Nil until
+	// wired: authenticate fails closed with `unavailable` rather than
+	// panicking or — far worse — waving requests through.
+	api authAPI
+	// cookieKey is the HMAC key for the viewer session cookie (spec §5.3,
+	// mounted via Config.CookieKeyFile). An empty key never authenticates a
+	// cookie; see authenticate.
+	cookieKey string
+	// now is the injected clock: cookie expiry and every rate bucket read it,
+	// so tests drive them deterministically instead of sleeping.
+	now func() time.Time
+
+	// Render-rate buckets (spec §7) and the verify-failure anti-hammering
+	// bucket (spec §5.3). Shared mutable state across concurrent renders —
+	// each registry is mutex-guarded.
+	renderPrincipalLimits *limiterRegistry
+	renderAppLimits       *limiterRegistry
+	verifyFailLimits      *limiterRegistry
 }
 
-// NewServer builds the stub Server. engine is stored for later tasks
-// (orderly shutdown, and eventually Render calls); W0 does not call it.
-func NewServer(cfg Config, engine Engine) *Server {
-	s := &Server{cfg: cfg, engine: engine}
+// ServerOption configures a Server at construction. Production wiring
+// (cmd/app-worker/main.go, W6) passes the real APIClient and the cookie key
+// read from Config.CookieKeyFile; tests inject doubles and a fake clock.
+type ServerOption func(*Server)
+
+// WithAuthAPI injects the pipeline-api client viewer auth uses.
+func WithAuthAPI(api authAPI) ServerOption { return func(s *Server) { s.api = api } }
+
+// WithCookieKey injects the viewer session cookie's HMAC key.
+func WithCookieKey(key string) ServerOption { return func(s *Server) { s.cookieKey = key } }
+
+// WithServerClock injects the clock used for cookie expiry and rate limiting.
+func WithServerClock(now func() time.Time) ServerOption {
+	return func(s *Server) {
+		if now != nil {
+			s.now = now
+		}
+	}
+}
+
+// NewServer builds the Server. engine is stored for later tasks (orderly
+// shutdown, and eventually Render calls); W0 does not call it.
+func NewServer(cfg Config, engine Engine, opts ...ServerOption) *Server {
+	s := &Server{cfg: cfg, engine: engine, now: time.Now}
+	for _, opt := range opts {
+		opt(s)
+	}
+	s.renderPrincipalLimits = newLimiterRegistry(renderRatePerPrincipalPerMin, renderRatePerPrincipalBurst, s.now)
+	s.renderAppLimits = newLimiterRegistry(renderRatePerAppPerMin, renderRatePerAppPerMin, s.now)
+	s.verifyFailLimits = newLimiterRegistry(verifyFailuresPerMin, verifyFailuresPerMin, s.now)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleUnavailable)
 	s.mux = mux
