@@ -62,6 +62,35 @@ const serverInvalidDocBundle = `var __dtp_app = { render: () => ({ nope: 1 }) };
 // serverHotLoopBundle never yields → the wall-clock backstop fires → timeout.
 const serverHotLoopBundle = `var __dtp_app = { render: () => { while (true) {} } };`
 
+// serverInjectionBundle emits app-controlled text containing a literal
+// `</script>` breakout — the exact payload that would inject markup into the
+// trusted shell if the doc were embedded unescaped (Finding 1).
+const serverInjectionBundle = `var __dtp_app = { render: () => ({
+	outputDoc: 1,
+	title: "t",
+	blocks: [{ id: "a", type: "markdown", text: "</script><img src=x onerror=boom>" }]
+}) };`
+
+// serverPlainRowTableBundle has a table with plain-ARRAY rows (a valid W1
+// tableRow shape). Pre-fix, `block=tbl` 400'd because the array row failed the
+// whole-block unmarshal (Finding 2).
+const serverPlainRowTableBundle = `var __dtp_app = { render: () => ({
+	outputDoc: 1, title: "t", blocks: [
+		{ id: "tbl", type: "table", columns: ["a", "b"], rows: [["1", "2"], ["3", "4"]] },
+		{ id: "m", type: "markdown", text: "hi" }
+	]
+}) };`
+
+// serverObjectRowModalBundle has an OBJECT-row table whose row carries a modal
+// with a nested block — the recursion that must keep working (Finding 2).
+const serverObjectRowModalBundle = `var __dtp_app = { render: () => ({
+	outputDoc: 1, title: "t", blocks: [
+		{ id: "tbl2", type: "table", columns: ["a"], rows: [
+			{ cells: ["x"], modal: { title: "d", blocks: [{ id: "deep", type: "markdown", text: "hi" }] } }
+		] }
+	]
+}) };`
+
 // ---------------------------------------------------------------------------
 // Fake pipeline-api client: resolveAPI + authAPI + renderAPI in one value
 // ---------------------------------------------------------------------------
@@ -702,9 +731,9 @@ func TestReadParams_POSTRequiresJSON(t *testing.T) {
 			t.Error("POST with text/plain must be rejected")
 		}
 	})
-	t.Run("json body merges over query, scalars coerced to text", func(t *testing.T) {
+	t.Run("string body merges over query", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/apps/p/n?a=fromquery&q=1",
-			strings.NewReader(`{"a":"frombody","n":42,"b":true}`))
+			strings.NewReader(`{"a":"frombody"}`))
 		r.Header.Set("Content-Type", "application/json")
 		params, _, err := readParams(r)
 		if err != nil {
@@ -712,9 +741,6 @@ func TestReadParams_POSTRequiresJSON(t *testing.T) {
 		}
 		if params["a"] != "frombody" {
 			t.Errorf("body must override query: a = %q, want frombody", params["a"])
-		}
-		if params["n"] != "42" || params["b"] != "true" {
-			t.Errorf("scalar coercion: n=%q b=%q, want \"42\"/\"true\"", params["n"], params["b"])
 		}
 		if params["q"] != "1" {
 			t.Errorf("query-only key lost: q = %q", params["q"])
@@ -725,6 +751,38 @@ func TestReadParams_POSTRequiresJSON(t *testing.T) {
 		r.Header.Set("Content-Type", "application/json")
 		if _, _, err := readParams(r); err == nil {
 			t.Error("arrays/objects must be rejected (no nesting)")
+		}
+	})
+}
+
+// §6.5: ctx.params is string→string with NO type coercion. A POST body with a
+// non-string scalar must be REJECTED (the client sends `{"n":"42"}`), matching
+// the inherently-string GET query path — not coerced to "42"/"true".
+func TestReadParams_POSTRejectsNonStringValues(t *testing.T) {
+	reject := []string{
+		`{"n":42}`,      // number
+		`{"b":true}`,    // bool
+		`{"z":null}`,    // null
+		`{"o":{"k":1}}`, // object
+	}
+	for _, body := range reject {
+		t.Run("reject "+body, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/apps/p/n", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			if _, _, err := readParams(r); err == nil {
+				t.Errorf("body %s must be rejected — no coercion (§6.5)", body)
+			}
+		})
+	}
+	t.Run("accept string", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/apps/p/n", strings.NewReader(`{"n":"42"}`))
+		r.Header.Set("Content-Type", "application/json")
+		params, _, err := readParams(r)
+		if err != nil {
+			t.Fatalf("string value must be accepted: %v", err)
+		}
+		if params["n"] != "42" {
+			t.Errorf("n = %q, want \"42\"", params["n"])
 		}
 	})
 }
@@ -1152,5 +1210,118 @@ func TestServe_FailsLoudlyOnMissingBootSecrets(t *testing.T) {
 				t.Error("engine was constructed despite a boot-config error — boot must fail before that")
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round (RFC 028 W6 fix): shell escaping, block lookup, bundle cap,
+// non-string POST params
+// ---------------------------------------------------------------------------
+
+// Finding 1 (BLOCKER): app-controlled doc content must not break out of the
+// shell's <script type="application/json"> element. With the escape working,
+// the response has exactly ONE </script> (the real terminator) and the
+// embedded doc still round-trips.
+func TestShell_EscapesScriptBreakout(t *testing.T) {
+	h := newServerHarness(t)
+	h.api.bundle = []byte(serverInjectionBundle)
+	body := readBody(t, h.bearerGet(h.url(""), "")) // navigation → shell
+
+	if n := strings.Count(body, "</script>"); n != 1 {
+		t.Fatalf("found %d </script> in the shell response, want exactly 1 — "+
+			"app content broke out of the doc script element:\n%s", n, body)
+	}
+	doc := scriptDoc(t, body) // truncated/broken JSON would fail here
+	got, ok := blockTextByID(doc, "a")
+	if !ok || got != "</script><img src=x onerror=boom>" {
+		t.Errorf("round-tripped block text = %q (ok=%v), want the original payload", got, ok)
+	}
+}
+
+// escapeJSONForScript neutralizes the breakout bytes AND the two JS line
+// terminators while preserving the value semantically (JSON.parse round-trip).
+func TestEscapeJSONForScript_RoundTripsAndNeutralizes(t *testing.T) {
+	ls := string(rune(0x2028)) // U+2028 LINE SEPARATOR
+	ps := string(rune(0x2029)) // U+2029 PARAGRAPH SEPARATOR
+	orig := json.RawMessage(`{"t":"</script>&` + ls + ps + `x"}`)
+	escaped := escapeJSONForScript(orig)
+
+	if strings.Contains(escaped, "</script>") {
+		t.Error("escaped output still contains a raw </script>")
+	}
+	if strings.ContainsRune(escaped, rune(0x2028)) || strings.ContainsRune(escaped, rune(0x2029)) {
+		t.Error("escaped output still contains a raw JS line terminator")
+	}
+	if strings.ContainsRune(escaped, '<') || strings.ContainsRune(escaped, '>') || strings.ContainsRune(escaped, '&') {
+		t.Errorf("escaped output still contains a raw <, >, or &: %q", escaped)
+	}
+	// Semantic round-trip: the escaped bytes are valid JSON parsing to the
+	// identical value (what the browser's JSON.parse sees).
+	var a, b any
+	if err := json.Unmarshal([]byte(escaped), &a); err != nil {
+		t.Fatalf("escaped output is not valid JSON: %v (%q)", err, escaped)
+	}
+	if err := json.Unmarshal(orig, &b); err != nil {
+		t.Fatalf("original is not valid JSON: %v", err)
+	}
+	if fmt.Sprintf("%v", a) != fmt.Sprintf("%v", b) {
+		t.Errorf("round-trip mismatch: escaped→%v, original→%v", a, b)
+	}
+}
+
+// Finding 2: a table with plain-ARRAY rows must be findable by its own id.
+func TestFindBlock_PlainRowTableIsFoundByID(t *testing.T) {
+	h := newServerHarness(t)
+	h.api.bundle = []byte(serverPlainRowTableBundle)
+	resp := h.bearerGet(h.url("?block=tbl"), "application/json")
+	body := readBody(t, resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 — a plain-row table must be findable by id (%s)", resp.StatusCode, body)
+	}
+	var blk map[string]any
+	if err := json.Unmarshal([]byte(body), &blk); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if blk["id"] != "tbl" || blk["type"] != "table" {
+		t.Errorf("block = %v, want the tbl table block", blk)
+	}
+}
+
+// Finding 2: an object-row table's modal-nested block still resolves, and the
+// table itself resolves.
+func TestFindBlock_ObjectRowModalStillResolves(t *testing.T) {
+	h := newServerHarness(t)
+	h.api.bundle = []byte(serverObjectRowModalBundle)
+
+	if resp := h.bearerGet(h.url("?block=tbl2"), "application/json"); resp.StatusCode != 200 {
+		t.Errorf("block=tbl2 status = %d, want 200", resp.StatusCode)
+		resp.Body.Close()
+	} else {
+		resp.Body.Close()
+	}
+
+	resp := h.bearerGet(h.url("?block=deep"), "application/json")
+	body := readBody(t, resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("block=deep status = %d, want 200 — row-modal nesting must resolve (%s)", resp.StatusCode, body)
+	}
+	var blk map[string]any
+	if err := json.Unmarshal([]byte(body), &blk); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if blk["id"] != "deep" {
+		t.Errorf("block = %v, want the deep block", blk)
+	}
+}
+
+// Finding 3: an operator-configured bundle cap BELOW the 5 MB hard default must
+// be wired into the pipeline-api client (not silently overridden).
+func TestServe_ConfiguredBundleCapIsWiredIntoClient(t *testing.T) {
+	cfg := Config{APIURL: "http://api", Render: RenderConfig{BundleMaxBytes: 1 << 20}}
+	c := newConfiguredAPIClient(cfg, "tok")
+	defer c.Close()
+	if c.maxBundleBytes != int64(1<<20) {
+		t.Errorf("client maxBundleBytes = %d, want %d (configured lower cap must win)",
+			c.maxBundleBytes, int64(1<<20))
 	}
 }

@@ -812,35 +812,25 @@ func readJSONBody(r *http.Request) (map[string]string, error) {
 		return map[string]string{}, nil
 	}
 
-	var obj map[string]json.RawMessage
+	var obj map[string]any
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.UseNumber()
 	if err := dec.Decode(&obj); err != nil || obj == nil {
 		return nil, errors.New("request body must be a JSON object")
 	}
 
+	// §6.5: ctx.params is a flat string→string map with NO type coercion —
+	// "apps parse their own numbers". A JSON string value passes through; a
+	// number, bool, null, array, or object is REJECTED (the client must send
+	// `{"n":"42"}`, matching the inherently-string GET query path). Coercing
+	// a number to "42" here would silently diverge the two input channels and
+	// hand the app a value the spec says it must have parsed itself.
 	out := make(map[string]string, len(obj))
-	for k, rawVal := range obj {
-		var v any
-		d := json.NewDecoder(strings.NewReader(string(rawVal)))
-		d.UseNumber()
-		if err := d.Decode(&v); err != nil {
-			return nil, errors.New("request body must be a flat JSON object of scalar values")
+	for k, v := range obj {
+		s, ok := v.(string)
+		if !ok {
+			return nil, errors.New("request body values must be JSON strings (apps parse their own numbers)")
 		}
-		switch tv := v.(type) {
-		case string:
-			out[k] = tv
-		case json.Number:
-			out[k] = tv.String()
-		case bool:
-			if tv {
-				out[k] = "true"
-			} else {
-				out[k] = "false"
-			}
-		default:
-			return nil, errors.New("request body must be a flat JSON object of scalar values")
-		}
+		out[k] = s
 	}
 	return out, nil
 }
@@ -918,23 +908,50 @@ func docTitle(doc json.RawMessage) string {
 }
 
 // escapeJSONForScript makes a JSON document safe to inline in a
-// `<script type="application/json">` element: `<`, `>` and `&` become their
-// \u escapes, so a doc containing the literal text `</script>` cannot close
-// the element early.
+// `<script type="application/json">` element by replacing the bytes that could
+// break out of it with their JSON `\uXXXX` escapes:
 //
-// Byte-level replacement is sound here because in JSON those three bytes can
-// only ever appear inside a string literal (the structural characters are
-// `{}[],:"` plus number/keyword bytes), and inside a string literal `<`
-// is an exactly-equivalent encoding. This is the same substitution
-// json.Encoder's default SetEscapeHTML(true) performs — done here because the
-// render path deliberately re-encodes with escaping OFF to keep an author's
-// bytes intact (task-W5-report.md §4).
+//	<  → <    >  → >    &  → &
+//	U+2028 →      U+2029 →     (JS line terminators, legal raw in
+//	                                      JSON strings but not in JS source)
+//
+// The escaped forms are valid JSON that parses back to the byte-identical
+// string, so the embedded doc is unchanged SEMANTICALLY while being inert as
+// markup: a doc whose text contains `</script>` can no longer close the element
+// early and inject into the platform-owned trusted shell.
+//
+// This is load-bearing precisely because the render path re-encodes the
+// OutputDoc with `SetEscapeHTML(false)` to keep an author's bytes intact
+// (task-W5-report.md §4), so `json.Encoder`'s own HTML escaping never ran —
+// this function is the only thing standing between app-controlled output and
+// the shell response.
+//
+// Byte-level replacement is sound because in well-formed JSON these bytes can
+// only appear inside a string literal (the structural bytes are `{}[],:"` plus
+// number/keyword bytes), and inside a string literal each maps to an
+// exactly-equivalent `\uXXXX` encoding. None of the replacement strings
+// introduces a new `<`, `>`, or `&`, so the order of the replacements does not
+// matter.
 func escapeJSONForScript(doc json.RawMessage) string {
-	out := string(doc)
-	out = strings.ReplaceAll(out, "<", `<`)
-	out = strings.ReplaceAll(out, ">", `>`)
-	out = strings.ReplaceAll(out, "&", `&`)
-	return out
+	var b strings.Builder
+	b.Grow(len(doc))
+	for _, r := range string(doc) {
+		switch r {
+		case '<':
+			b.WriteString(`\u003c`)
+		case '>':
+			b.WriteString(`\u003e`)
+		case '&':
+			b.WriteString(`\u0026`)
+		case ' ':
+			b.WriteString(`\u2028`)
+		case ' ':
+			b.WriteString(`\u2029`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // findBlock locates a block by id anywhere in the document — root blocks,
@@ -954,39 +971,55 @@ func findBlock(doc json.RawMessage, id string) (json.RawMessage, bool) {
 
 func searchBlocks(blocks []json.RawMessage, id string) (json.RawMessage, bool) {
 	for _, raw := range blocks {
-		var b struct {
-			ID    string `json:"id"`
+		// The id check comes FIRST and tolerates any block shape: a table with
+		// plain-array rows (`rows: [["a","b"], …]`, a valid W1 tableRow form)
+		// must be findable by its own id even though those rows do not fit the
+		// modal-carrying struct below. Decoding into a single big struct up
+		// front — as the pre-fix code did — made a plain-array row fail the
+		// whole-block unmarshal, so the block was skipped before its id was
+		// ever compared, and `block=<that-table-id>` wrongly 400'd.
+		var idOnly struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &idOnly); err == nil && idOnly.ID == id {
+			return raw, true
+		}
+
+		// Recurse into the nesting sites. Rows are decoded as raw messages so a
+		// plain-array row does not blow up the block decode; only object rows
+		// (`{cells, modal?}`) can carry a modal, and only those are reached
+		// into. `modal`'s `{param}` form has no `blocks` and simply recurses
+		// over an empty slice.
+		var nest struct {
 			Modal *struct {
 				Blocks []json.RawMessage `json:"blocks"`
 			} `json:"modal"`
 			Tabs []struct {
 				Blocks []json.RawMessage `json:"blocks"`
 			} `json:"tabs"`
-			Rows []struct {
-				Modal *struct {
-					Blocks []json.RawMessage `json:"blocks"`
-				} `json:"modal"`
-			} `json:"rows"`
+			Rows []json.RawMessage `json:"rows"`
 		}
-		if err := json.Unmarshal(raw, &b); err != nil {
+		if err := json.Unmarshal(raw, &nest); err != nil {
 			continue
 		}
-		if b.ID == id {
-			return raw, true
-		}
-		if b.Modal != nil {
-			if found, ok := searchBlocks(b.Modal.Blocks, id); ok {
+		if nest.Modal != nil {
+			if found, ok := searchBlocks(nest.Modal.Blocks, id); ok {
 				return found, true
 			}
 		}
-		for _, tab := range b.Tabs {
+		for _, tab := range nest.Tabs {
 			if found, ok := searchBlocks(tab.Blocks, id); ok {
 				return found, true
 			}
 		}
-		for _, row := range b.Rows {
-			if row.Modal == nil {
-				continue
+		for _, rawRow := range nest.Rows {
+			var row struct {
+				Modal *struct {
+					Blocks []json.RawMessage `json:"blocks"`
+				} `json:"modal"`
+			}
+			if err := json.Unmarshal(rawRow, &row); err != nil || row.Modal == nil {
+				continue // plain-array row, or an object row with no modal
 			}
 			if found, ok := searchBlocks(row.Modal.Blocks, id); ok {
 				return found, true
@@ -1079,6 +1112,23 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, kind errorKi
 // newEngine is production-wired to appengine.NewEngine by
 // cmd/app-worker/main.go; tests inject a fake so the boot wiring is assertable
 // without paying the real WASM compile cost.
+// newConfiguredAPIClient builds the pipeline-api client with the operator's
+// configured bundle-size ceiling wired in. Serve calls this so an operator who
+// sets appWorker.render.bundleMaxBytes BELOW the 5 MB hard cap is honored:
+// NewAPIClient otherwise defaults maxBundleBytes to the hard cap, silently
+// overriding a lower configured value. Split out from Serve so the wiring is
+// unit-testable at the Serve seam without binding a listener. A non-positive
+// BundleMaxBytes (never produced by LoadConfig, which clamps) leaves the
+// client default rather than setting a zero cap that would reject every
+// bundle.
+func newConfiguredAPIClient(cfg Config, serviceToken string) *APIClient {
+	var opts []Option
+	if cfg.Render.BundleMaxBytes > 0 {
+		opts = append(opts, WithMaxBundleBytes(int64(cfg.Render.BundleMaxBytes)))
+	}
+	return NewAPIClient(cfg.APIURL, serviceToken, opts...)
+}
+
 func Serve(ctx context.Context, cfg Config, newEngine EngineConstructor) error {
 	if strings.TrimSpace(cfg.APIURL) == "" {
 		return fmt.Errorf("appworker: %s is not set — app-worker cannot reach pipeline-api", EnvAPIURL)
@@ -1092,7 +1142,7 @@ func Serve(ctx context.Context, cfg Config, newEngine EngineConstructor) error {
 		return err
 	}
 
-	client := NewAPIClient(cfg.APIURL, serviceToken)
+	client := newConfiguredAPIClient(cfg, serviceToken)
 	defer client.Close()
 
 	engine, err := newEngine(ctx, cfg.MemoryPages())
