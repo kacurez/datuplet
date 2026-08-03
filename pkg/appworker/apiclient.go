@@ -323,15 +323,22 @@ type APIClient struct {
 	resolveCache *ttlCache[Resolved]
 	resolveSF    singleflight.Group
 
-	// verifyTokenPositiveCache and verifyTokenNegativeCache are
-	// DELIBERATELY SEPARATE caches with different key shapes — see
-	// VerifyToken's doc comment. verifyTokenSF's key always includes the
-	// secret (the positive-cache key), so concurrent identical requests
-	// still coalesce without letting two DIFFERENT concurrent secrets for
-	// the same token share a singleflight leader.
-	verifyTokenPositiveCache *ttlCache[bool]
-	verifyTokenNegativeCache *ttlCache[bool]
-	verifyTokenSF            singleflight.Group
+	// verifyTokenPositiveCache, verifyTokenInactiveCache, and
+	// verifyTokenWrongSecretCache are DELIBERATELY SEPARATE caches with
+	// different key shapes — see VerifyToken's doc comment for the full
+	// rationale (RFC 028 W3 fix round 2). Summary: positive and
+	// wrong-secret-against-an-active-token both key on the FULL
+	// (app_id, token_id, secret) tuple; only "this token itself is
+	// inactive" keys on the (app_id, token_id) PAIR, since that is the only
+	// one of the three facts that has no legitimate holder to lock out.
+	// verifyTokenSF's key always includes the secret (the positive-cache
+	// key), so concurrent identical requests still coalesce without letting
+	// two DIFFERENT concurrent secrets for the same token share a
+	// singleflight leader.
+	verifyTokenPositiveCache    *ttlCache[bool]
+	verifyTokenInactiveCache    *ttlCache[bool]
+	verifyTokenWrongSecretCache *ttlCache[bool]
+	verifyTokenSF               singleflight.Group
 
 	tokenActiveCache *ttlCache[bool]
 	tokenActiveSF    singleflight.Group
@@ -413,7 +420,8 @@ func NewAPIClient(baseURL, serviceToken string, opts ...Option) *APIClient {
 	}
 	c.resolveCache = newTTLCache[Resolved](c.clock)
 	c.verifyTokenPositiveCache = newTTLCache[bool](c.clock)
-	c.verifyTokenNegativeCache = newTTLCache[bool](c.clock)
+	c.verifyTokenInactiveCache = newTTLCache[bool](c.clock)
+	c.verifyTokenWrongSecretCache = newTTLCache[bool](c.clock)
 	c.tokenActiveCache = newTTLCache[bool](c.clock)
 	c.sessionCache = newTTLCache[SessionInfo](c.clock)
 
@@ -519,33 +527,62 @@ func (c *APIClient) Bundle(ctx context.Context, hash string) ([]byte, error) {
 // ---------------------------------------------------------------------------
 
 // VerifyToken checks a viewer token's (app_id, token_id, secret) triple
-// (spec §5.3). Positive and negative results are cached under DELIBERATELY
-// ASYMMETRIC keys — this is the fix for a real DoS gap a review caught in
-// the original single-key design (RFC 028 W3 fix round):
+// (spec §5.3). Results are cached under THREE deliberately different key
+// shapes — this is the second fix round for the negative-cache design
+// (RFC 028 W3 fix round 2), after the first round's pair-keyed negative
+// cache turned out to over-correct into a NEW DoS: any single wrong-secret
+// guess against a token poisoned the pair-level entry for 60s, which meant
+// the LEGITIMATE holder presenting the correct secret got a cached `false`
+// without ever reaching pipeline-api — a denial of service on a real
+// viewer, triggerable by anyone who merely knows a token_id (no secret
+// needed to trigger it).
 //
-//   - A POSITIVE result caches under the FULL tuple (app_id, token_id,
-//     secret) via hashKey, at 15s. This must never be weakened: a wrong
-//     secret computes a different key by construction, so it can NEVER hit
-//     a positive entry meant for the correct secret (or vice versa after a
-//     rotation) — verifying a token means verifying THIS secret.
-//   - A NEGATIVE result caches under (app_id, token_id) ALONE, at 60s —
-//     matching spec §5.3's literal wording ("negative-cached 60s per
-//     (app_id, token_id)"). Keying negatives on the full tuple (the
-//     original design) meant an attacker who varies the secret on every
-//     attempt missed the cache every time, hammering the verifier and
-//     Postgres directly through what was supposed to be an abuse-control
-//     cache. Keying on the pair alone means the FIRST wrong secret for a
-//     given token poisons every subsequent guess against that token for
-//     60s — the intended behavior, and safe precisely because a negative
-//     entry never gates access (it only ever produces "false", never lets
-//     a wrong secret through as "true").
+// The fix: §5.3's "negative-cache per (app_id, token_id) for 60s" is about
+// caching the fact "this token is inactive", not "this secret was wrong".
+// Those are different facts with different safety properties, so they get
+// different keys:
+//
+//   - A POSITIVE result ("ok:true") caches under the FULL tuple (app_id,
+//     token_id, secret), at 15s. Unchanged across both fix rounds: a wrong
+//     secret computes a different key by construction, so it can never hit
+//     a positive entry meant for a different secret.
+//   - A "token is INACTIVE" result (verify answered false, and a follow-up
+//     CheckTokenActive confirms the token itself — unknown, revoked, or
+//     app-mismatched — is not active) caches under (app_id, token_id)
+//     ALONE, at 60s. This is safe to share across every secret: an inactive
+//     token has NO correct secret and therefore no legitimate holder to
+//     lock out, so pair-level caching here can never deny a real viewer.
+//   - A "WRONG SECRET against an ACTIVE token" result caches under the FULL
+//     tuple (app_id, token_id, secret), at 60s — i.e. back to the ORIGINAL
+//     (pre-fix-round-1) behavior for this specific case. A wrong secret for
+//     an active token never poisons any other secret's entry, so the
+//     legitimate holder's correct secret always reaches a fresh check.
+//     Consequence, stated plainly: varying the secret against an ACTIVE
+//     token reaches pipeline-api on EVERY distinct guess — this cache does
+//     NOT rate-limit that. Spec §5.3 assigns that job to app-worker's own
+//     "10 verify failures/min per (client IP, app) → 429 Retry-After: 60"
+//     limiter (W4), which is correctly keyed on the caller's IP (this
+//     client, running inside pipeline-api's trust boundary, never sees
+//     that) — duplicating it here at the wrong granularity is exactly what
+//     the first fix round got wrong.
+//
+// The two negative cases are distinguished by asking CheckTokenActive
+// (itself cached 15s, so this costs at most one extra call per token per
+// 15s) whenever verify answers false. If that follow-up call itself errors,
+// the false result is not cached under EITHER key — a transient failure to
+// classify must never risk locking out a legitimate holder, so the safest
+// choice is simply not to remember anything.
 func (c *APIClient) VerifyToken(ctx context.Context, appID, tokenID, secret string) (bool, error) {
 	positiveKey := hashKey("verify-token-pos", appID, tokenID, secret)
 	if v, ok := c.verifyTokenPositiveCache.get(positiveKey); ok {
 		return v, nil
 	}
-	negativeKey := hashKey("verify-token-neg", appID, tokenID)
-	if _, ok := c.verifyTokenNegativeCache.get(negativeKey); ok {
+	inactiveKey := hashKey("verify-token-inactive", appID, tokenID)
+	if _, ok := c.verifyTokenInactiveCache.get(inactiveKey); ok {
+		return false, nil
+	}
+	wrongSecretKey := hashKey("verify-token-wrong-secret", appID, tokenID, secret)
+	if _, ok := c.verifyTokenWrongSecretCache.get(wrongSecretKey); ok {
 		return false, nil
 	}
 	return doSingleflight(&c.verifyTokenSF, positiveKey, func() (bool, error) {
@@ -556,10 +593,22 @@ func (c *APIClient) VerifyToken(ctx context.Context, appID, tokenID, secret stri
 		}
 		if resp.OK {
 			c.verifyTokenPositiveCache.set(positiveKey, true, verifyTokenPositiveTTL)
-		} else {
-			c.verifyTokenNegativeCache.set(negativeKey, false, verifyTokenNegativeTTL)
+			return true, nil
 		}
-		return resp.OK, nil
+		// Classify the failure before caching it anywhere.
+		active, err := c.CheckTokenActive(ctx, appID, tokenID)
+		switch {
+		case err != nil:
+			// Unclassifiable — cache nothing, per the doc comment above.
+		case active:
+			// Wrong secret against a LIVE token: never poison any other
+			// secret's entry.
+			c.verifyTokenWrongSecretCache.set(wrongSecretKey, false, verifyTokenNegativeTTL)
+		default:
+			// Token itself is inactive: safe to share across every secret.
+			c.verifyTokenInactiveCache.set(inactiveKey, false, verifyTokenNegativeTTL)
+		}
+		return false, nil
 	})
 }
 

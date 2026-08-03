@@ -596,6 +596,28 @@ func TestBundle_BodyAtExactCapIsAccepted(t *testing.T) {
 // VerifyToken
 // ---------------------------------------------------------------------------
 
+// registerVerifyTokenFakeRoutes wires both /viewer-tokens/verify and
+// /viewer-tokens/active on mux. Since fix round 2, VerifyToken calls BOTH
+// endpoints on any verify failure (to classify "wrong secret against an
+// active token" vs "token itself is inactive"), so every test below that
+// exercises a false result needs a working /active handler — an
+// unregistered one 404s, which VerifyToken treats as "unclassifiable,
+// cache nothing" (safe, but defeats the very caching behavior most of
+// these tests assert). active is constant for the lifetime of one test;
+// call counts are tracked separately per endpoint.
+func registerVerifyTokenFakeRoutes(mux *http.ServeMux, correctSecret string, active bool, verifyCalls, activeCalls *int32) {
+	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(verifyCalls, 1)
+		var req verifyTokenRequestWire
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": req.Secret == correctSecret})
+	})
+	mux.HandleFunc("/internal/v1/viewer-tokens/active", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(activeCalls, 1)
+		writeJSONResp(w, http.StatusOK, map[string]bool{"active": active})
+	})
+}
+
 func TestVerifyToken_PositiveCache15s(t *testing.T) {
 	var calls int32
 	mux := http.NewServeMux()
@@ -632,13 +654,17 @@ func TestVerifyToken_PositiveCache15s(t *testing.T) {
 	}
 }
 
-func TestVerifyToken_NegativeCache60s(t *testing.T) {
-	var calls int32
+// TestVerifyToken_InactiveTokenNegativeCache60s: the (app_id, token_id)-keyed
+// 60s negative cache applies ONLY when the token itself is inactive
+// (unknown/revoked/app-mismatched) — never for a wrong-secret guess against
+// a live token (that would be Finding 2's fix-round-2 defect: see
+// TestVerifyToken_CorrectSecretSucceedsAfterAPriorWrongGuess below). An
+// inactive token has no correct secret and thus no legitimate holder to
+// lock out, so sharing the 60s window across every secret is safe here.
+func TestVerifyToken_InactiveTokenNegativeCache60s(t *testing.T) {
+	var verifyCalls, activeCalls int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": false})
-	})
+	registerVerifyTokenFakeRoutes(mux, "unused-correct-secret", false /* inactive */, &verifyCalls, &activeCalls)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -656,32 +682,31 @@ func TestVerifyToken_NegativeCache60s(t *testing.T) {
 	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "wrong-secret"); err != nil || ok {
 		t.Fatalf("VerifyToken (cached negative) = %v, %v", ok, err)
 	}
-	if n := atomic.LoadInt32(&calls); n != 1 {
-		t.Errorf("calls = %d, want 1 (30s < 60s negative TTL)", n)
+	if n := atomic.LoadInt32(&verifyCalls); n != 1 {
+		t.Errorf("verify calls = %d, want 1 (30s < 60s negative TTL)", n)
 	}
 
 	clock.Advance(35 * time.Second) // total 65s, past the 60s negative TTL
 	if _, err := c.VerifyToken(ctx, "app-1", "tok-1", "wrong-secret"); err != nil {
 		t.Fatal(err)
 	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
-		t.Errorf("calls = %d, want 2 (negative TTL expired at 65s)", n)
+	if n := atomic.LoadInt32(&verifyCalls); n != 2 {
+		t.Errorf("verify calls = %d, want 2 (negative TTL expired at 65s)", n)
 	}
 }
 
-// TestVerifyToken_NegativeCacheSharedAcrossDifferentWrongSecrets is the
-// Finding-2 fix's own test: the negative cache keys on (app_id, token_id)
-// ALONE, not the secret, so an attacker varying the secret on every
-// attempt cannot bypass it. Without this, the original per-tuple negative
-// key meant every distinct wrong secret was its own cache miss, hammering
-// the verifier (and Postgres behind it) on every single guess.
-func TestVerifyToken_NegativeCacheSharedAcrossDifferentWrongSecrets(t *testing.T) {
-	var calls int32
+// TestVerifyToken_InactiveTokenNegativeCacheSharedAcrossDifferentSecrets is
+// the fix-round-2 replacement for the fix-round-1 test of the same shape:
+// for an INACTIVE token, the negative cache keys on (app_id, token_id)
+// ALONE, not the secret, so an attacker varying the secret on every attempt
+// against a token that is unknown/revoked/app-mismatched cannot bypass it.
+// This is safe specifically BECAUSE the token is inactive — see
+// TestVerifyToken_VaryingSecretsAgainstActiveTokenReachesUpstreamEachTime
+// for the deliberately different behavior against a LIVE token.
+func TestVerifyToken_InactiveTokenNegativeCacheSharedAcrossDifferentSecrets(t *testing.T) {
+	var verifyCalls, activeCalls int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": false})
-	})
+	registerVerifyTokenFakeRoutes(mux, "unused-correct-secret", false /* inactive */, &verifyCalls, &activeCalls)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -696,23 +721,93 @@ func TestVerifyToken_NegativeCacheSharedAcrossDifferentWrongSecrets(t *testing.T
 			t.Fatalf("attempt %d (secret %q): %v, %v; want false, nil", i, secret, ok, err)
 		}
 	}
-	if n := atomic.LoadInt32(&calls); n != 1 {
-		t.Errorf("upstream calls for %d different wrong secrets = %d, want exactly 1 "+
-			"(the negative cache must key on (app_id, token_id) alone)", attempts, n)
+	if n := atomic.LoadInt32(&verifyCalls); n != 1 {
+		t.Errorf("verify calls for %d different secrets against an inactive token = %d, want exactly 1", attempts, n)
+	}
+	if n := atomic.LoadInt32(&activeCalls); n != 1 {
+		t.Errorf("active-check calls = %d, want exactly 1 (its own 15s cache absorbs the rest)", n)
+	}
+}
+
+// TestVerifyToken_CorrectSecretSucceedsAfterAPriorWrongGuess is the
+// fix-round-2 regression test: a prior wrong-secret attempt against a LIVE
+// token must NEVER cause the legitimate holder's subsequent correct-secret
+// attempt to be served a cached `false`. This is exactly the Major the
+// fix-round-1 pair-keyed negative cache introduced — a single wrong guess
+// (needing only a known token_id, no secret) could deny the real viewer for
+// up to 60s.
+func TestVerifyToken_CorrectSecretSucceedsAfterAPriorWrongGuess(t *testing.T) {
+	var verifyCalls, activeCalls int32
+	mux := http.NewServeMux()
+	registerVerifyTokenFakeRoutes(mux, "correct-secret", true /* ACTIVE */, &verifyCalls, &activeCalls)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken)
+	defer c.Close()
+
+	ctx := context.Background()
+	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "an-attackers-guess"); err != nil || ok {
+		t.Fatalf("wrong guess: %v, %v; want false, nil", ok, err)
+	}
+	// The LEGITIMATE holder, presenting the correct secret right after,
+	// must succeed — not be served the wrong guess's cached false.
+	ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "correct-secret")
+	if err != nil {
+		t.Fatalf("correct secret after a prior wrong guess: unexpected error %v", err)
+	}
+	if !ok {
+		t.Fatal("correct secret after a prior wrong guess = false, want true — " +
+			"a wrong guess must never lock out the legitimate holder")
+	}
+}
+
+// TestVerifyToken_VaryingSecretsAgainstActiveTokenReachesUpstreamEachTime
+// documents and pins the accepted tradeoff, stated plainly per the
+// fix-round-2 resolution: against an ACTIVE token, this cache does NOT
+// rate-limit repeated wrong-secret guesses — every distinct wrong secret
+// reaches pipeline-api's /viewer-tokens/verify. Anti-hammering for that case
+// is app-worker's own per-(client IP, app) rate limiter's job (spec §5.3,
+// W4), not this cache's — duplicating it here at the (app_id, token_id)
+// granularity is exactly the mistake fix round 1 made.
+func TestVerifyToken_VaryingSecretsAgainstActiveTokenReachesUpstreamEachTime(t *testing.T) {
+	var verifyCalls, activeCalls int32
+	mux := http.NewServeMux()
+	registerVerifyTokenFakeRoutes(mux, "correct-secret", true /* ACTIVE */, &verifyCalls, &activeCalls)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken)
+	defer c.Close()
+
+	ctx := context.Background()
+	const attempts = 10
+	for i := 0; i < attempts; i++ {
+		secret := fmt.Sprintf("guess-%d", i)
+		if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", secret); err != nil || ok {
+			t.Fatalf("attempt %d (secret %q): %v, %v; want false, nil", i, secret, ok, err)
+		}
+	}
+	if n := atomic.LoadInt32(&verifyCalls); n != attempts {
+		t.Errorf("verify calls for %d different wrong secrets against an ACTIVE token = %d, want %d "+
+			"(varying the secret must reach upstream every time — rate-limiting this is W4's job, not this cache's)",
+			attempts, n, attempts)
+	}
+	// The active-check itself is still cheap: its own 15s cache absorbs
+	// every classification after the first.
+	if n := atomic.LoadInt32(&activeCalls); n != 1 {
+		t.Errorf("active-check calls = %d, want exactly 1 (costs at most one extra call per token per 15s)", n)
 	}
 }
 
 // TestVerifyToken_PositiveEntryNeverKeyedWithoutSecret guards the OTHER
-// half of the asymmetry: only the negative cache may drop the secret from
-// its key. A positive result must still require the exact secret that
-// earned it — this is the "do not weaken this" half of the Finding-2 fix.
+// half of the asymmetry: only the inactive-token cache may drop the secret
+// from its key. A positive result must still require the exact secret that
+// earned it.
 func TestVerifyToken_PositiveEntryNeverKeyedWithoutSecret(t *testing.T) {
+	var verifyCalls, activeCalls int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
-		var req verifyTokenRequestWire
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": req.Secret == "correct-secret"})
-	})
+	registerVerifyTokenFakeRoutes(mux, "correct-secret", true /* ACTIVE */, &verifyCalls, &activeCalls)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
