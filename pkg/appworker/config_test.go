@@ -3,6 +3,8 @@ package appworker
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -304,13 +306,18 @@ func TestMemoryPages(t *testing.T) {
 }
 
 // TestServePassesMemoryPagesToEngine asserts Serve calls the injected engine
-// constructor with cfg.MemoryPages() at boot, before doing anything else —
-// the exact wiring W3+ depend on. A fake constructor is injected so this is
-// assertable without compiling the real ~0.25s WASM engine (task-E1-report.md).
+// constructor with cfg.MemoryPages() at boot — the exact wiring W3+ depend on.
+// A fake constructor is injected so this is assertable without compiling the
+// real ~0.25s WASM engine (task-E1-report.md). Serve now also reads the
+// mounted cookie-key and service-token Secrets before reaching the engine
+// (W6 boot wiring), so the test supplies both plus a non-empty APIURL.
 func TestServePassesMemoryPagesToEngine(t *testing.T) {
 	cfg := Config{
-		ListenAddr: "127.0.0.1:0",
-		Render:     RenderConfig{MemoryMiB: 128, MaxMemoryMiB: HardCapMemoryMiB},
+		ListenAddr:       "127.0.0.1:0",
+		APIURL:           "http://pipeline-api.test",
+		CookieKeyFile:    writeTempSecret(t, "cookie-key", "cookie-hmac-key"),
+		ServiceTokenFile: writeTempSecret(t, "service-token", "svc-token"),
+		Render:           RenderConfig{MemoryMiB: 128, MaxMemoryMiB: HardCapMemoryMiB},
 	}
 
 	var gotPages uint32
@@ -334,4 +341,15 @@ func TestServePassesMemoryPagesToEngine(t *testing.T) {
 	if !errors.Is(err, fakeErr) {
 		t.Errorf("Serve err = %v, want wrapped %v", err, fakeErr)
 	}
+}
+
+// writeTempSecret writes content to a temp file and returns its path, for
+// tests that exercise Serve's mounted-Secret reads.
+func writeTempSecret(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write temp secret %s: %v", name, err)
+	}
+	return path
 }

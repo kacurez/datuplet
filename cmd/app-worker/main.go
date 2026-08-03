@@ -51,14 +51,18 @@ func run() error {
 
 	// newEngine adapts appengine.NewEngine (which returns the concrete
 	// *appengine.Engine) to appworker.EngineConstructor's interface return
-	// type. Compiling the engine happens inside appworker.Serve, before the
-	// HTTP listener starts — see that function's doc comment for the
-	// readiness-ordering contract W6 wires up.
+	// type. appworker.Serve owns the whole boot sequence: it reads the mounted
+	// cookie-key and service-token Secrets (failing LOUDLY if either is
+	// missing/unreadable/empty — a pod that cannot authenticate viewers or
+	// call pipeline-api must crash-loop with a precise message, never serve
+	// 503s indistinguishable from an outage), builds the pipeline-api client,
+	// compiles the engine via newEngine, and only THEN marks /readyz ready and
+	// starts the listener. See Serve's doc comment for the ordering contract.
 	newEngine := func(ctx context.Context, memoryPages uint32) (appworker.Engine, error) {
 		return appengine.NewEngine(ctx, memoryPages)
 	}
 
-	fmt.Println("  Compiling render engine...")
+	fmt.Println("  Compiling render engine and wiring pipeline-api client...")
 	if err := appworker.Serve(ctx, cfg, newEngine); err != nil {
 		return err
 	}

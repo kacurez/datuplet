@@ -185,9 +185,20 @@ func newHarnessWithRealClient(t *testing.T, api authAPI) *authHarness {
 }
 
 // registerRoute installs the one test route that calls authenticate. Route
-// parsing itself belongs to W5/W6; this keeps the auth seam under test
-// without inventing that task's routing.
+// parsing itself belongs to W6; this keeps the auth seam under test in
+// isolation from W6's real /apps handler.
+//
+// W6's NewServer now pre-registers the real /apps/{pid}/{name}[/…] routes on
+// s.mux, so this harness swaps in a FRESH mux before registering its unit
+// route — http.ServeMux panics on a duplicate pattern, and these tests must
+// drive authenticate directly with a synthetic resolvedApp (asserting the 302
+// redirect target and cookie Path, both of which require the request to
+// actually be served at /apps/{pid}/{name}). The real s.ServeHTTP wrapper
+// (worker-wide Referrer-Policy, §6.5 path hygiene) is untouched — only the
+// route table behind it is replaced — so every W4 header/redirect assertion
+// still exercises production ServeHTTP.
 func (h *authHarness) registerRoute() {
+	h.srv.mux = http.NewServeMux()
 	h.srv.mux.HandleFunc("/apps/{pid}/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		channel := channelProduction

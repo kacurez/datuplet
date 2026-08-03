@@ -70,11 +70,12 @@ const (
 	// upstream could blow the per-render memory budget the pool semaphore is
 	// sized against.
 	queryResponseMaxBytes = 12 << 20
-
-	// outcomeSuccess is the render log's `outcome` for a successful render.
-	// Every other outcome is the §8 error kind verbatim.
-	outcomeSuccess = "success"
 )
+
+// The render log's successful `outcome` is outcomeOK ("ok", defined in
+// server.go) — ONE taxonomy shared with the §9 access log and the Prometheus
+// label, mirroring the query service's query_audit `ok`. Every other outcome
+// is the §8 error kind verbatim.
 
 // ---------------------------------------------------------------------------
 // renderAPI
@@ -375,7 +376,7 @@ func (s *Server) appendRenderLog(
 		PrincipalID:   p.ID,
 		StartedAt:     started,
 		DurationMS:    s.now().Sub(started).Milliseconds(),
-		Outcome:       outcomeSuccess,
+		Outcome:       outcomeOK,
 		LogText:       truncate(string(authorLog), renderMaxLogBytes),
 	}
 	if rerr != nil {

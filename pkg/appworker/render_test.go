@@ -383,8 +383,8 @@ func TestRenderHappyPath(t *testing.T) {
 		t.Fatalf("AppendLog records = %d, want 1", len(logs))
 	}
 	rec := logs[0]
-	if rec.Outcome != outcomeSuccess {
-		t.Errorf("outcome = %q, want %q", rec.Outcome, outcomeSuccess)
+	if rec.Outcome != outcomeOK {
+		t.Errorf("outcome = %q, want %q", rec.Outcome, outcomeOK)
 	}
 	if rec.AppID != testAppID || rec.VersionHash != testVersionHash || rec.Channel != channelProduction {
 		t.Errorf("log identity = %+v", rec)
@@ -506,8 +506,8 @@ func TestRenderQueryErrorCaughtByApp(t *testing.T) {
 		t.Errorf("guest message = %q, want the query service's message", got)
 	}
 	_, _, logs := api.snapshot()
-	if len(logs) != 1 || logs[0].Outcome != outcomeSuccess {
-		t.Errorf("outcome = %+v, want success", logs)
+	if len(logs) != 1 || logs[0].Outcome != outcomeOK {
+		t.Errorf("outcome = %+v, want ok", logs)
 	}
 }
 
