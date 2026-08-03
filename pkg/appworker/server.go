@@ -9,21 +9,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/semaphore"
+
+	"github.com/datuplet/datuplet/pkg/appengine"
 )
 
-// Engine is the subset of *appengine.Engine's behavior app-worker's boot
-// path depends on. Defining it as an interface (rather than importing
-// *appengine.Engine directly) lets tests inject a fake engine constructor
-// and assert Serve's boot-time wiring without paying the real ~0.25s WASM
-// compile cost (task-E1-report.md's "NewEngine is expensive-ish" note).
+// Engine is the subset of *appengine.Engine's behavior app-worker depends on.
+// Defining it as an interface (rather than importing *appengine.Engine
+// directly) lets tests inject a fake engine constructor and assert Serve's
+// boot-time wiring without paying the real ~0.25s WASM compile cost
+// (task-E1-report.md's "NewEngine is expensive-ish" note).
 // *appengine.Engine satisfies this interface structurally.
 //
-// W1-W6 will extend server.go's actual render path against
-// *appengine.Engine.Render directly (or grow this interface) once the
-// render request plumbing (bundle resolution, query client, OutputDoc
-// validation) exists; this skeleton only needs the boot call + orderly
-// shutdown.
+// Render was added by the render pipeline (W5); the render tests use the REAL
+// engine (a fake engine cannot exercise the guest ABI), so this interface
+// exists purely for the boot/shutdown seam.
 type Engine interface {
+	Render(ctx context.Context, in appengine.RenderInput) (*appengine.Result, *appengine.RenderError)
 	Close(ctx context.Context) error
 }
 
@@ -68,6 +70,12 @@ type Server struct {
 	// wired: authenticate fails closed with `unavailable` rather than
 	// panicking or — far worse — waving requests through.
 	api authAPI
+	// rapi is the SAME pipeline-api client, seen through the render path's
+	// method set (renderAPI in render.go). Two fields, not one union
+	// interface: W4's auth doubles implement only the three auth methods, and
+	// a union would force each to grow four irrelevant stubs. Nil until wired:
+	// render fails closed with `unavailable`.
+	rapi renderAPI
 	// cookieKey is the HMAC key for the viewer session cookie (spec §5.3,
 	// mounted via Config.CookieKeyFile). An empty key never authenticates a
 	// cookie; see authenticate.
@@ -82,6 +90,18 @@ type Server struct {
 	renderPrincipalLimits *limiterRegistry
 	renderAppLimits       *limiterRegistry
 	verifyFailLimits      *limiterRegistry
+
+	// The two admission gates (spec §7, render.go). They have DELIBERATELY
+	// DIFFERENT acquisition policies and must not be conflated:
+	//   - perAppInflight is the app's own concurrency ceiling, acquired
+	//     NON-BLOCKING → `rate_limited` (the caller should back off);
+	//   - pool is the whole-pod render-slot semaphore, acquired with a SHORT
+	//     BOUNDED WAIT (poolAcquireWait) → `capacity` (the pod is saturated;
+	//     another replica should take it). Never an unbounded block.
+	// Both are shared mutable state across concurrent renders.
+	perAppInflight  *inflightGate
+	pool            *semaphore.Weighted
+	poolAcquireWait time.Duration
 }
 
 // ServerOption configures a Server at construction. Production wiring
@@ -91,6 +111,22 @@ type ServerOption func(*Server)
 
 // WithAuthAPI injects the pipeline-api client viewer auth uses.
 func WithAuthAPI(api authAPI) ServerOption { return func(s *Server) { s.api = api } }
+
+// WithRenderAPI injects the pipeline-api client the render path uses (bundle
+// fetch, impersonation mint, query proxy, render-log append). Production
+// wiring passes the SAME *APIClient given to WithAuthAPI.
+func WithRenderAPI(api renderAPI) ServerOption { return func(s *Server) { s.rapi = api } }
+
+// WithPoolAcquireWait overrides how long a render waits for a whole-pod render
+// slot before being shed as `capacity` (default 250 ms). Tests shrink it so the
+// bounded-wait outcome is observable without a quarter-second sleep per case.
+func WithPoolAcquireWait(d time.Duration) ServerOption {
+	return func(s *Server) {
+		if d > 0 {
+			s.poolAcquireWait = d
+		}
+	}
+}
 
 // WithCookieKey injects the viewer session cookie's HMAC key.
 func WithCookieKey(key string) ServerOption { return func(s *Server) { s.cookieKey = key } }
@@ -107,10 +143,16 @@ func WithServerClock(now func() time.Time) ServerOption {
 // NewServer builds the Server. engine is stored for later tasks (orderly
 // shutdown, and eventually Render calls); W0 does not call it.
 func NewServer(cfg Config, engine Engine, opts ...ServerOption) *Server {
-	s := &Server{cfg: cfg, engine: engine, now: time.Now}
+	s := &Server{cfg: cfg, engine: engine, now: time.Now, poolAcquireWait: defaultPoolAcquireWait}
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.perAppInflight = newInflightGate(cfg.Render.PerAppInflight)
+	concurrency := cfg.Render.Concurrency
+	if concurrency <= 0 {
+		concurrency = DefaultConcurrency
+	}
+	s.pool = semaphore.NewWeighted(int64(concurrency))
 	s.renderPrincipalLimits = newLimiterRegistry(renderRatePerPrincipalPerMin, renderRatePerPrincipalBurst, s.now)
 	s.renderAppLimits = newLimiterRegistry(renderRatePerAppPerMin, renderRatePerAppPerMin, s.now)
 	s.verifyFailLimits = newLimiterRegistry(verifyFailuresPerMin, verifyFailuresPerMin, s.now)
@@ -138,11 +180,18 @@ func (s *Server) handleUnavailable(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeError renders the error envelope: JSON for `Accept:
-// application/json`, a minimal HTML page otherwise (spec §8). request_id is
-// a fresh UUID per response (this skeleton does not thread a request-scoped
-// ID through middleware yet).
+// application/json`, a minimal HTML page otherwise (spec §8).
+//
+// request_id comes from the request context when W6's middleware stamped one
+// (withRequestID), so the id in this envelope, the render log record, and
+// app-worker's structured log are the SAME value — that identity is what makes
+// `datuplet apps logs --request-id` work (spec §6.6). A fresh UUID is minted
+// only when nothing stamped the context.
 func writeError(w http.ResponseWriter, r *http.Request, status int, kind errorKind, msg string) {
-	requestID := uuid.NewString()
+	requestID := requestIDFromContext(r.Context())
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Content-Type", "application/json")
