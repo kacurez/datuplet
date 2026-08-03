@@ -7,8 +7,10 @@
 package appworker
 
 import (
+	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Env var names (contract-and-constraints.md, "app-worker (Part 3)").
@@ -20,6 +22,14 @@ const (
 	EnvListenAddr       = "DATUPLET_APPWORKER_LISTEN"
 	EnvServiceTokenFile = "DATUPLET_APPWORKER_SERVICE_TOKEN_FILE"
 	EnvCookieKeyFile    = "DATUPLET_APPWORKER_COOKIE_KEY_FILE"
+
+	// EnvTrustedProxies / EnvTrustedProxyHops describe the proxy topology in
+	// front of app-worker. They are the ONLY thing that makes
+	// X-Forwarded-For trustworthy — see ProxyTrust and resolveClientIP in
+	// auth.go. Unset (the default) means "no trusted proxies", i.e. XFF is
+	// ignored entirely and the client IP is the immediate peer.
+	EnvTrustedProxies   = "DATUPLET_APPWORKER_TRUSTED_PROXIES"
+	EnvTrustedProxyHops = "DATUPLET_APPWORKER_TRUSTED_PROXY_HOPS"
 
 	EnvTimeoutS            = "DATUPLET_APPWORKER_TIMEOUT_S"
 	EnvMaxTimeoutS         = "DATUPLET_APPWORKER_MAX_TIMEOUT_S"
@@ -135,6 +145,84 @@ type RenderConfig struct {
 	Concurrency       int
 }
 
+// DefaultTrustedProxyHops is the hop count assumed when trusted-proxy CIDRs
+// ARE configured but no explicit hop count is: one trusted proxy in front of
+// app-worker (the cluster ingress). It has no effect at all when no CIDRs are
+// configured — trust is anchored on the peer address, never on a hop count
+// alone.
+const DefaultTrustedProxyHops = 1
+
+// ProxyTrust describes which immediate peers are allowed to speak for a
+// client via X-Forwarded-For, and how many trusted hops sit in front of
+// app-worker.
+//
+// The zero value means "trust nobody", which is the SAFE DEFAULT and the
+// value a pod runs with until the chart (Part 7 / D1) sets it. Rationale: an
+// unauthenticated attacker who can reach app-worker directly controls every
+// byte of X-Forwarded-For, so honoring it without first verifying the peer
+// would make the (client IP, app) verify-failure limiter — the only bound on
+// brute-forcing a live viewer token id (spec §5.3) — bypassable by rotating
+// one header.
+//
+// D1 (chart) sets these once D0 establishes the real topology: whether
+// traffic terminates at the cluster ingress, at a reverse proxy inside
+// pipeline-api, or directly in app-worker. Until then, leaving them unset is
+// correct rather than conservative: keying on the peer address over-groups
+// viewers behind a shared proxy (they share one bucket) but never lets an
+// attacker escape a bucket.
+type ProxyTrust struct {
+	// CIDRs are the networks a trusted proxy may connect from. Empty
+	// disables XFF parsing completely.
+	CIDRs []netip.Prefix
+	// Hops is the number of trusted proxies in the chain, counting the
+	// immediate peer. 1 = a single ingress; 2 = e.g. a CDN in front of the
+	// ingress. Used to skip trusted hops whose addresses cannot be
+	// enumerated as CIDRs.
+	Hops int
+}
+
+// Enabled reports whether any proxy is trusted to supply X-Forwarded-For.
+func (t ProxyTrust) Enabled() bool { return len(t.CIDRs) > 0 }
+
+// Contains reports whether ip (a textual address) falls inside a trusted
+// CIDR. An unparseable address is never trusted.
+func (t ProxyTrust) Contains(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range t.CIDRs {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseTrustedProxies parses a comma-separated list of CIDRs and/or bare IP
+// addresses (a bare address becomes a host-sized prefix). Unparseable entries
+// are DROPPED rather than failing boot: the failure direction is "trust
+// less", never "trust more", and LoadConfig never errors (see its doc).
+func parseTrustedProxies(list string) []netip.Prefix {
+	var out []netip.Prefix
+	for _, part := range strings.Split(list, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(part); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		if a, err := netip.ParseAddr(part); err == nil {
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return out
+}
+
 // Config is app-worker's full boot-time configuration, assembled once by
 // LoadConfig from the environment.
 type Config struct {
@@ -151,7 +239,10 @@ type Config struct {
 	// session cookie (spec §5.3). Not read here — a later task owns cookie
 	// signing.
 	CookieKeyFile string
-	Render        RenderConfig
+	// TrustedProxies decides whether X-Forwarded-For may be believed at all
+	// (see ProxyTrust). Zero value = trust nobody.
+	TrustedProxies ProxyTrust
+	Render         RenderConfig
 }
 
 // MemoryPages converts Render.MemoryMiB into wazero linear-memory pages (a
@@ -191,6 +282,10 @@ func LoadConfig() Config {
 		ListenAddr:       envStringDefault(EnvListenAddr, DefaultListenAddr),
 		ServiceTokenFile: os.Getenv(EnvServiceTokenFile),
 		CookieKeyFile:    os.Getenv(EnvCookieKeyFile),
+		TrustedProxies: ProxyTrust{
+			CIDRs: parseTrustedProxies(os.Getenv(EnvTrustedProxies)),
+			Hops:  envIntDefault(EnvTrustedProxyHops, DefaultTrustedProxyHops),
+		},
 		Render: RenderConfig{
 			TimeoutS:            timeoutS,
 			MaxTimeoutS:         maxTimeoutS,

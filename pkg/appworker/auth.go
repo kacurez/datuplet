@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -244,24 +245,104 @@ func parseViewerToken(raw string) (tokenID, secret string, ok bool) {
 	return tokenID, secret, true
 }
 
-// clientIP is the per-(IP, app) verify-failure bucket's key.
+// clientIP is the per-(IP, app) verify-failure bucket's key, resolved under
+// this server's configured proxy trust.
+func (s *Server) clientIP(r *http.Request) string {
+	return resolveClientIP(r, s.cfg.TrustedProxies)
+}
+
+// resolveClientIP determines the client address for rate-limit keying.
 //
-// app-worker always sits behind the cluster ingress, which APPENDS the
-// observed peer address to X-Forwarded-For. The RIGHTMOST entry is therefore
-// the one our own infrastructure wrote; every entry to its left is
-// client-supplied and must not be trusted for rate-limit keying (trusting the
-// leftmost entry would make the limiter bypassable with one header).
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
-			return ip
+// X-Forwarded-For is entirely client-supplied unless something trustworthy
+// rewrote it, so the rule is peer-anchored and fails toward "believe less":
+//
+//  1. The client IP is the immediate peer (`r.RemoteAddr`, port stripped).
+//  2. If no trusted-proxy CIDRs are configured, stop. XFF is ignored
+//     completely — this is the default, and it is what keeps the
+//     10-failures/min per (IP, app) limiter (spec §5.3) from being bypassable
+//     by rotating a header when app-worker is reachable directly.
+//  3. If the peer is not inside a trusted CIDR, stop. A connection we did not
+//     put there does not get to describe itself.
+//  4. The peer IS a trusted proxy. Scan the XFF chain from the RIGHT — the
+//     right-hand end is what our own infrastructure appended, so entries an
+//     attacker prepended on the left can never shift the selection:
+//     a. skip `Hops-1` rightmost entries (trusted hops in front of the peer
+//     whose addresses we cannot enumerate, e.g. a CDN);
+//     b. then keep skipping entries that are themselves trusted CIDRs;
+//     c. the first remaining entry is the client — the first UNTRUSTED
+//     address scanning from the right.
+//  5. If the chain is exhausted, or the selected entry is not a parseable IP,
+//     fall back to the peer. A garbage entry must never become a cache key
+//     (unbounded key space) nor a fresh, attacker-chosen bucket.
+//
+// Topology config (`DATUPLET_APPWORKER_TRUSTED_PROXIES` /
+// `_TRUSTED_PROXY_HOPS`, see ProxyTrust) is set by the chart in Part 7 (D1)
+// once D0 establishes whether traffic terminates at the cluster ingress, at a
+// reverse proxy inside pipeline-api, or directly in app-worker. The safe
+// default until then is no trusted proxies.
+func resolveClientIP(r *http.Request, trust ProxyTrust) string {
+	peer := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(peer); err == nil {
+		peer = host
+	}
+	if ip, ok := normalizeIP(peer); ok {
+		peer = ip
+	}
+
+	if !trust.Enabled() || !trust.Contains(peer) {
+		return peer
+	}
+
+	var chain []string
+	for _, values := range r.Header.Values("X-Forwarded-For") {
+		for _, part := range strings.Split(values, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				chain = append(chain, part)
+			}
 		}
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+
+	i := len(chain) - 1
+	for skip := trust.Hops - 1; skip > 0 && i >= 0; skip, i = skip-1, i-1 {
 	}
-	return r.RemoteAddr
+	for i >= 0 && trust.Contains(canonicalOrRaw(chain[i])) {
+		i--
+	}
+	if i < 0 {
+		return peer
+	}
+	ip, ok := normalizeIP(chain[i])
+	if !ok {
+		return peer
+	}
+	return ip
+}
+
+// normalizeIP canonicalizes an XFF entry (or a peer address) to a bare IP
+// string, accepting the `host:port` and `[v6]:port` forms some proxies emit.
+// Canonicalizing means `::ffff:1.2.3.4` and `1.2.3.4` cannot become two
+// separate rate buckets.
+func normalizeIP(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	if a, err := netip.ParseAddr(strings.Trim(s, "[]")); err == nil {
+		return a.Unmap().String(), true
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		if a, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+			return a.Unmap().String(), true
+		}
+	}
+	return "", false
+}
+
+func canonicalOrRaw(s string) string {
+	if ip, ok := normalizeIP(s); ok {
+		return ip
+	}
+	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -321,19 +402,22 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, resolved r
 // by cookie. This is the only code path that ever sees a plaintext secret,
 // and it neither logs it nor echoes it into any header or body.
 func (s *Server) exchangeViewerToken(w http.ResponseWriter, r *http.Request, resolved resolvedApp, raw string) (principal, bool) {
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 
-	// Anti-hammering FIRST: an exhausted budget must cost neither a parse
-	// nor a round trip to pipeline-api (spec §5.3 — "the failure path must
-	// not hammer Postgres").
-	if !s.verifyBudgetAvailable(ip, resolved.AppID) {
+	// Anti-hammering FIRST, and atomically: one admission is taken here,
+	// before the parse and before any round trip, so an exhausted budget
+	// costs pipeline-api/Postgres nothing (spec §5.3 — "the failure path must
+	// not hammer Postgres") and concurrent attempts cannot all slip through
+	// a check-then-act window.
+	budget, ok := s.reserveVerifyAttempt(ip, resolved.AppID)
+	if !ok {
 		s.failRateLimited(w, r, verifyFailureRetryAfterS)
 		return principal{}, false
 	}
 
 	tokenID, secret, ok := parseViewerToken(raw)
 	if !ok {
-		s.recordVerifyFailure(ip, resolved.AppID)
+		// A genuine failure: keep the admission.
 		s.failViewerToken(w, r)
 		return principal{}, false
 	}
@@ -342,15 +426,20 @@ func (s *Server) exchangeViewerToken(w http.ResponseWriter, r *http.Request, res
 	if err != nil {
 		// pipeline-api unreachable (or app-worker's own service credential
 		// is wrong): fail closed as `unavailable`, never as a viewer denial
-		// — and do not spend a failure token on our own outage.
+		// — and refund, since our own outage must not consume a viewer's
+		// failure budget.
+		budget.refund()
 		s.fail(w, r, http.StatusServiceUnavailable, errKindUnavailable, "app-worker: cannot verify viewer token")
 		return principal{}, false
 	}
 	if !valid {
-		s.recordVerifyFailure(ip, resolved.AppID)
+		// A genuine failure: keep the admission.
 		s.failViewerToken(w, r)
 		return principal{}, false
 	}
+
+	// Success costs nothing.
+	budget.refund()
 
 	exp := s.now().Add(sessionCookieTTL)
 	http.SetCookie(w, &http.Cookie{
@@ -645,15 +734,51 @@ func retryAfterSeconds(d time.Duration) int {
 // verifyKey is the anti-hammering bucket's key: (client IP, app).
 func verifyKey(ip, appID string) string { return ip + "\x00" + appID }
 
-// verifyBudgetAvailable peeks at the (IP, app) failure budget WITHOUT
-// consuming it — a legitimate exchange must never spend a failure token.
-func (s *Server) verifyBudgetAvailable(ip, appID string) bool {
-	return s.verifyFailLimits.limiter(verifyKey(ip, appID)).TokensAt(s.now()) >= 1
+// verifyBudget is one admission taken from the (IP, app) verify-failure
+// budget. Holding it means the token is ALREADY spent; refund gives it back.
+type verifyBudget struct {
+	res *rate.Reservation
+	// at is the instant the reservation was taken. refund must cancel with
+	// this same instant, not "now": rate.Reservation.CancelAt refuses to
+	// restore a reservation whose timeToAct is already in the past, so
+	// cancelling with a later clock reading (a real wall clock will have
+	// advanced across the pipeline-api round trip) would silently refund
+	// nothing.
+	at time.Time
 }
 
-// recordVerifyFailure spends one token from the (IP, app) failure budget.
-func (s *Server) recordVerifyFailure(ip, appID string) {
-	_ = s.verifyFailLimits.limiter(verifyKey(ip, appID)).AllowN(s.now(), 1)
+// refund returns the admission to the bucket. Safe on a zero value.
+func (b verifyBudget) refund() {
+	if b.res != nil {
+		b.res.CancelAt(b.at)
+	}
+}
+
+// reserveVerifyAttempt atomically tests AND consumes one admission from the
+// (IP, app) failure budget, returning ok=false when the budget is spent.
+//
+// Atomicity is the point. The previous shape — peek TokensAt(now) >= 1, call
+// pipeline-api, then spend on failure — was a TOCTOU window: N concurrent
+// invalid exchanges all observed capacity before any of them recorded a
+// failure, so all N reached VerifyToken and therefore Postgres. ReserveN does
+// the test and the decrement in one critical section inside the limiter, so
+// at most `burst` admissions exist per window no matter how many goroutines
+// race for them.
+//
+// The caller KEEPS the admission on a genuine failure (malformed token,
+// unknown/revoked token) and REFUNDS it otherwise — a successful exchange and
+// an infrastructure error must both cost a viewer nothing.
+func (s *Server) reserveVerifyAttempt(ip, appID string) (verifyBudget, bool) {
+	now := s.now()
+	res := s.verifyFailLimits.limiter(verifyKey(ip, appID)).ReserveN(now, 1)
+	if !res.OK() || res.DelayFrom(now) > 0 {
+		// No capacity in this window: give the (possibly future-dated)
+		// reservation straight back so a throttled attempt doesn't push the
+		// bucket's recovery further out.
+		res.CancelAt(now)
+		return verifyBudget{}, false
+	}
+	return verifyBudget{res: res, at: now}, true
 }
 
 // ---------------------------------------------------------------------------

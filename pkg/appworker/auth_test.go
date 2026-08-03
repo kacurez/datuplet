@@ -13,18 +13,29 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // newAuthTestServer builds a *Server wired for auth tests only: no engine, no
 // render path, an injected authAPI double, cookie key, and fake clock.
-func newAuthTestServer(api authAPI, cookieKey string, now func() time.Time) *Server {
-	return NewServer(Config{}, nil,
+func newAuthTestServer(cfg Config, api authAPI, cookieKey string, now func() time.Time) *Server {
+	return NewServer(cfg, nil,
 		WithAuthAPI(api),
 		WithCookieKey(cookieKey),
 		WithServerClock(now),
 	)
+}
+
+// trustLoopbackConfig is the Config for tests that need X-Forwarded-For to be
+// honored: httptest connects from loopback, so trusting loopback as a proxy
+// makes the harness stand in for "behind the cluster ingress".
+func trustLoopbackConfig(hops int) Config {
+	return Config{TrustedProxies: ProxyTrust{
+		CIDRs: parseTrustedProxies("127.0.0.0/8,::1/128"),
+		Hops:  hops,
+	}}
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +72,10 @@ type fakeAuthAPI struct {
 	tokenActive    bool
 	tokenActiveErr error
 
+	// verifyHook runs inside VerifyToken, outside the mutex. Used by the
+	// concurrency test as a barrier.
+	verifyHook func()
+
 	session    SessionInfo
 	sessionErr error
 
@@ -73,18 +88,27 @@ type fakeAuthAPI struct {
 	lastSessionPID, lastSessionCookies, lastSessionAuthz string
 }
 
+// VerifyToken records the call, then runs verifyHook (if any) OUTSIDE the
+// mutex — the concurrency test needs real overlap inside the fake, which a
+// hook held under f.mu would serialize away.
 func (f *fakeAuthAPI) VerifyToken(_ context.Context, appID, tokenID, secret string) (bool, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.verifyCalls++
 	f.lastVerifyAppID, f.lastVerifyTokenID, f.lastVerifySecret = appID, tokenID, secret
-	if f.verifyErr != nil {
-		return false, f.verifyErr
-	}
+	hook, err := f.verifyHook, f.verifyErr
+	result := f.verifyOK
 	if f.correctSecret != "" {
-		return secret == f.correctSecret, nil
+		result = secret == f.correctSecret
 	}
-	return f.verifyOK, nil
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return false, err
+	}
+	return result, nil
 }
 
 func (f *fakeAuthAPI) CheckTokenActive(_ context.Context, appID, tokenID string) (bool, error) {
@@ -135,8 +159,13 @@ type authHarness struct {
 
 func newAuthHarness(t *testing.T) *authHarness {
 	t.Helper()
+	return newAuthHarnessWithConfig(t, Config{})
+}
+
+func newAuthHarnessWithConfig(t *testing.T, cfg Config) *authHarness {
+	t.Helper()
 	h := &authHarness{t: t, api: &fakeAuthAPI{}, now: testClockBase, appID: testAppID}
-	h.srv = newAuthTestServer(h.api, testCookieKey, h.clock)
+	h.srv = newAuthTestServer(cfg, h.api, testCookieKey, h.clock)
 	h.registerRoute()
 	h.ts = httptest.NewServer(h.srv)
 	t.Cleanup(h.ts.Close)
@@ -148,7 +177,7 @@ func newAuthHarness(t *testing.T) *authHarness {
 func newHarnessWithRealClient(t *testing.T, api authAPI) *authHarness {
 	t.Helper()
 	h := &authHarness{t: t, api: &fakeAuthAPI{}, now: testClockBase, appID: testAppID}
-	h.srv = newAuthTestServer(api, testCookieKey, h.clock)
+	h.srv = newAuthTestServer(Config{}, api, testCookieKey, h.clock)
 	h.registerRoute()
 	h.ts = httptest.NewServer(h.srv)
 	t.Cleanup(h.ts.Close)
@@ -446,7 +475,10 @@ func TestExchange_MalformedUnknownRevokedTokenGives403(t *testing.T) {
 }
 
 func TestExchange_EleventhFailureFromOneIPAndAppIsRateLimited(t *testing.T) {
-	h := newAuthHarness(t)
+	// httptest connects from loopback, so trusting loopback as a proxy is
+	// what lets this test drive distinct client IPs through X-Forwarded-For
+	// the way the real ingress would.
+	h := newAuthHarnessWithConfig(t, trustLoopbackConfig(1))
 	h.api.verifyOK = false
 
 	attempt := func(ip string) *http.Response {
@@ -983,7 +1015,7 @@ func TestSessionCookieAuthPOST_IsSubjectToCSRFChecks(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func newRateTestServer(now func() time.Time) *Server {
-	return newAuthTestServer(&fakeAuthAPI{}, testCookieKey, now)
+	return newAuthTestServer(Config{}, &fakeAuthAPI{}, testCookieKey, now)
 }
 
 func TestAllowRender_PerPrincipalBurst10ThenThrottled(t *testing.T) {
@@ -1324,16 +1356,322 @@ func TestParseViewerToken(t *testing.T) {
 	}
 }
 
-func TestClientIP_UsesTheRightmostForwardedForEntry(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Fix round — client-IP resolution is topology-safe
+// ---------------------------------------------------------------------------
+
+func xffRequest(remoteAddr string, xff ...string) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, "/apps/p/n", nil)
-	r.RemoteAddr = "10.0.0.1:5555"
-	if got := clientIP(r); got != "10.0.0.1" {
-		t.Fatalf("clientIP without XFF = %q, want 10.0.0.1", got)
+	r.RemoteAddr = remoteAddr
+	for _, v := range xff {
+		r.Header.Add("X-Forwarded-For", v)
 	}
-	// Leftmost entries are attacker-supplied; the rightmost is the one our
-	// own ingress appended.
-	r.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.7")
-	if got := clientIP(r); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want the rightmost XFF entry 203.0.113.7", got)
+	return r
+}
+
+func TestResolveClientIP_NoXFFUsesRemoteAddr(t *testing.T) {
+	for _, trust := range []ProxyTrust{
+		{}, // nobody trusted
+		{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1},
+	} {
+		r := xffRequest("10.0.0.1:5555")
+		if got := resolveClientIP(r, trust); got != "10.0.0.1" {
+			t.Fatalf("trust %+v: clientIP = %q, want 10.0.0.1", trust, got)
+		}
 	}
+}
+
+// TestResolveClientIP_IgnoresXFFFromUntrustedPeer is THE bypass regression
+// test: with no configured trusted proxies (the default), or with a peer
+// outside the configured CIDRs, X-Forwarded-For must be ignored entirely.
+// Honoring it would let anyone who can reach app-worker rotate the header and
+// walk past the 10-failures/min per (IP, app) limiter.
+func TestResolveClientIP_IgnoresXFFFromUntrustedPeer(t *testing.T) {
+	cases := []struct {
+		name  string
+		trust ProxyTrust
+	}{
+		{"no trusted proxies configured (default)", ProxyTrust{}},
+		{"peer outside the trusted CIDRs", ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}},
+		{"hops configured but no CIDRs", ProxyTrust{Hops: 3}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := xffRequest("198.51.100.23:4444", "1.2.3.4, 5.6.7.8")
+			if got := resolveClientIP(r, tc.trust); got != "198.51.100.23" {
+				t.Fatalf("clientIP = %q, want the peer 198.51.100.23 (XFF must be ignored)", got)
+			}
+		})
+	}
+}
+
+func TestResolveClientIP_TrustedPeerSelectsFirstUntrustedFromRight(t *testing.T) {
+	// Peer 10.0.0.9 is the trusted ingress; 10.0.0.8 is a second trusted
+	// proxy that appears in the chain. The client is the first untrusted
+	// address scanning from the right.
+	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}
+	r := xffRequest("10.0.0.9:1", "203.0.113.7, 10.0.0.8")
+	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
+		t.Fatalf("clientIP = %q, want 203.0.113.7", got)
+	}
+
+	// Single trusted hop, single chain entry: the rightmost entry is the
+	// client.
+	r = xffRequest("10.0.0.9:1", "203.0.113.7")
+	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
+		t.Fatalf("clientIP = %q, want 203.0.113.7", got)
+	}
+}
+
+func TestResolveClientIP_AttackerPrependedEntriesDoNotShiftSelection(t *testing.T) {
+	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}
+
+	base := resolveClientIP(xffRequest("10.0.0.9:1", "203.0.113.7"), trust)
+	if base != "203.0.113.7" {
+		t.Fatalf("baseline clientIP = %q, want 203.0.113.7", base)
+	}
+
+	// The attacker controls everything it sends, so it prepends junk — in one
+	// header and split across several, with spoofed trusted-looking entries
+	// too. Scanning from the right makes all of it irrelevant.
+	for _, spoof := range []([]string){
+		{"9.9.9.9, 203.0.113.7"},
+		{"1.1.1.1, 2.2.2.2, 3.3.3.3, 203.0.113.7"},
+		{"10.0.0.250, 203.0.113.7"},
+		{"1.1.1.1", "2.2.2.2, 203.0.113.7"},
+		{"not-an-ip, 203.0.113.7"},
+	} {
+		if got := resolveClientIP(xffRequest("10.0.0.9:1", spoof...), trust); got != base {
+			t.Fatalf("XFF %v: clientIP = %q, want the unchanged %q", spoof, got, base)
+		}
+	}
+}
+
+func TestResolveClientIP_TwoHopConfiguration(t *testing.T) {
+	// client -> CDN (address not enumerable) -> ingress 10.0.0.9 -> worker.
+	// The ingress appended the CDN; the CDN set the client. Hops=2 skips the
+	// one non-enumerable trusted hop at the right end.
+	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.9"), Hops: 2}
+	r := xffRequest("10.0.0.9:1", "203.0.113.7, 198.51.100.50")
+	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
+		t.Fatalf("clientIP = %q, want 203.0.113.7 (the CDN hop must be skipped)", got)
+	}
+
+	// Prepending more entries still cannot shift the selection.
+	r = xffRequest("10.0.0.9:1", "9.9.9.9, 8.8.8.8, 203.0.113.7, 198.51.100.50")
+	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
+		t.Fatalf("clientIP with prepended junk = %q, want 203.0.113.7", got)
+	}
+
+	// A chain shorter than the configured hop count falls back to the peer
+	// rather than trusting whatever is left.
+	r = xffRequest("10.0.0.9:1", "203.0.113.7")
+	if got := resolveClientIP(r, trust); got != "10.0.0.9" {
+		t.Fatalf("clientIP with an exhausted chain = %q, want the peer 10.0.0.9", got)
+	}
+}
+
+func TestResolveClientIP_NormalizesAndRejectsGarbage(t *testing.T) {
+	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}
+
+	// A selected entry that is not a parseable IP falls back to the peer: an
+	// attacker-chosen string must never become a fresh rate-bucket key.
+	if got := resolveClientIP(xffRequest("10.0.0.9:1", "totally-bogus"), trust); got != "10.0.0.9" {
+		t.Fatalf("clientIP = %q, want the peer for an unparseable entry", got)
+	}
+	// host:port and IPv4-in-IPv6 forms canonicalize, so they cannot become
+	// two buckets for one client.
+	if got := resolveClientIP(xffRequest("10.0.0.9:1", "203.0.113.7:8080"), trust); got != "203.0.113.7" {
+		t.Fatalf("clientIP = %q, want 203.0.113.7", got)
+	}
+	if got := resolveClientIP(xffRequest("10.0.0.9:1", "::ffff:203.0.113.7"), trust); got != "203.0.113.7" {
+		t.Fatalf("clientIP = %q, want the unmapped 203.0.113.7", got)
+	}
+}
+
+// TestExchange_XFFCannotBypassTheFailureLimiterFromAnUntrustedPeer is the
+// HTTP-level form of the bypass regression: rotating X-Forwarded-For against
+// a worker with no configured trusted proxies must NOT mint a fresh failure
+// bucket per attempt — the limiter still buckets by RemoteAddr.
+func TestExchange_XFFCannotBypassTheFailureLimiterFromAnUntrustedPeer(t *testing.T) {
+	h := newAuthHarness(t) // Config{} — no trusted proxies
+	h.api.verifyOK = false
+
+	attempt := func(i int) *http.Response {
+		req, _ := http.NewRequest(http.MethodGet, h.appURL(tokenParam(testTokenID, testSecret)), nil)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("203.0.113.%d", i))
+		return h.do(req)
+	}
+
+	for i := 1; i <= verifyFailuresPerMin; i++ {
+		resp := attempt(i)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("attempt %d: status = %d, want 403", i, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	resp := attempt(verifyFailuresPerMin + 1)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("attempt 11 with a fresh spoofed XFF: status = %d, want 429 — "+
+			"an untrusted peer must not be able to pick its own rate bucket", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "60" {
+		t.Fatalf("Retry-After = %q, want 60", got)
+	}
+	resp.Body.Close()
+	if verify, _, _ := h.api.counts(); verify != verifyFailuresPerMin {
+		t.Fatalf("VerifyToken calls = %d, want %d", verify, verifyFailuresPerMin)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round — the verify-failure limiter is atomic (no TOCTOU)
+// ---------------------------------------------------------------------------
+
+// TestExchange_ConcurrentInvalidExchangesCannotExceedTheFailureBudget is the
+// TOCTOU regression test. The proof is the count of calls that reach the
+// upstream fake: with a peek-then-spend limiter, N concurrent invalid
+// exchanges all observe capacity before any failure is recorded and all N
+// reach pipeline-api.
+func TestExchange_ConcurrentInvalidExchangesCannotExceedTheFailureBudget(t *testing.T) {
+	h := newAuthHarness(t)
+	h.api.verifyOK = false
+
+	const attempts = 50
+	// The barrier releases as soon as one more than the budget is inside the
+	// fake concurrently — which can only happen if the limiter leaked. When
+	// the limiter holds, the blocked calls fall through the short timeout.
+	const barrier = verifyFailuresPerMin + 1
+	var inside int32
+	release := make(chan struct{})
+	var once sync.Once
+	h.api.verifyHook = func() {
+		if atomic.AddInt32(&inside, 1) >= barrier {
+			once.Do(func() { close(release) })
+		}
+		select {
+		case <-release:
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+
+	// Resolve the client ONCE: h.client() mutates the shared
+	// httptest.Server client's CheckRedirect, which is a data race if every
+	// goroutine does it.
+	client := h.client()
+
+	var wg sync.WaitGroup
+	statuses := make([]int, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req, err := http.NewRequest(http.MethodGet, h.appURL(tokenParam(testTokenID, testSecret)), nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Accept", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			statuses[i] = resp.StatusCode
+			resp.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	verify, _, _ := h.api.counts()
+	if verify > verifyFailuresPerMin {
+		t.Fatalf("upstream VerifyToken calls = %d for %d concurrent invalid exchanges, "+
+			"want at most %d — the failure budget must be taken atomically",
+			verify, attempts, verifyFailuresPerMin)
+	}
+
+	var forbidden, throttled int
+	for _, s := range statuses {
+		switch s {
+		case http.StatusForbidden:
+			forbidden++
+		case http.StatusTooManyRequests:
+			throttled++
+		}
+	}
+	if forbidden+throttled != attempts {
+		t.Fatalf("statuses: 403=%d 429=%d, want %d total", forbidden, throttled, attempts)
+	}
+	if forbidden > verifyFailuresPerMin {
+		t.Fatalf("403 responses = %d, want at most %d", forbidden, verifyFailuresPerMin)
+	}
+	if throttled == 0 {
+		t.Fatal("no request was throttled, so the limiter never engaged")
+	}
+}
+
+func TestExchange_SuccessConsumesNoFailureBudget(t *testing.T) {
+	h := newAuthHarness(t)
+	h.api.correctSecret = testSecret
+
+	// Far more successful exchanges than the failure budget: none may spend
+	// a failure token, or a popular app would throttle its own viewers.
+	for i := 0; i < verifyFailuresPerMin*3; i++ {
+		resp := h.get(h.appURL(tokenParam(testTokenID, testSecret)))
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("exchange %d: status = %d, want 302", i, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	// The budget is still intact: 10 genuine failures remain available
+	// before the 11th is throttled.
+	h.api.mu.Lock()
+	h.api.correctSecret = ""
+	h.api.verifyOK = false
+	h.api.mu.Unlock()
+
+	for i := 1; i <= verifyFailuresPerMin; i++ {
+		resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("failure %d: status = %d, want 403 — successes must not have spent the budget", i, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 on the 11th failure", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestExchange_UpstreamErrorConsumesNoFailureBudget(t *testing.T) {
+	h := newAuthHarness(t)
+	h.api.verifyErr = fmt.Errorf("pipeline-api down")
+
+	// An outage is not a viewer's fault: many 503s must not exhaust the
+	// (IP, app) failure budget.
+	for i := 0; i < verifyFailuresPerMin*3; i++ {
+		resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("attempt %d: status = %d, want 503", i, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	h.api.mu.Lock()
+	h.api.verifyErr = nil
+	h.api.verifyOK = false
+	h.api.mu.Unlock()
+
+	for i := 1; i <= verifyFailuresPerMin; i++ {
+		resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("failure %d: status = %d, want 403 — 503s must not have spent the budget", i, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 on the 11th genuine failure", resp.StatusCode)
+	}
+	resp.Body.Close()
 }

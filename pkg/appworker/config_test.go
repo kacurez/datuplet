@@ -68,6 +68,69 @@ func TestLoadConfigStringOverrides(t *testing.T) {
 	}
 }
 
+// TestLoadConfigTrustedProxies covers the proxy-trust config surface, whose
+// SAFE DEFAULT (trust nobody, ignore X-Forwarded-For) is what keeps the
+// verify-failure limiter unbypassable until Part 7's D1 sets the real
+// topology.
+func TestLoadConfigTrustedProxies(t *testing.T) {
+	t.Run("default trusts nobody", func(t *testing.T) {
+		cfg := LoadConfig()
+		if cfg.TrustedProxies.Enabled() {
+			t.Fatalf("TrustedProxies must be disabled by default, got %+v", cfg.TrustedProxies)
+		}
+		if cfg.TrustedProxies.Hops != DefaultTrustedProxyHops {
+			t.Errorf("Hops = %d, want %d", cfg.TrustedProxies.Hops, DefaultTrustedProxyHops)
+		}
+	})
+
+	t.Run("CIDRs and bare addresses both parse", func(t *testing.T) {
+		t.Setenv(EnvTrustedProxies, "10.0.0.0/8, 192.168.1.5 ,::1")
+		cfg := LoadConfig()
+		if !cfg.TrustedProxies.Enabled() {
+			t.Fatal("TrustedProxies must be enabled")
+		}
+		if n := len(cfg.TrustedProxies.CIDRs); n != 3 {
+			t.Fatalf("CIDRs = %d (%v), want 3", n, cfg.TrustedProxies.CIDRs)
+		}
+		for _, ip := range []string{"10.1.2.3", "192.168.1.5", "::1"} {
+			if !cfg.TrustedProxies.Contains(ip) {
+				t.Errorf("Contains(%q) = false, want true", ip)
+			}
+		}
+		for _, ip := range []string{"11.1.2.3", "192.168.1.6", "not-an-ip", ""} {
+			if cfg.TrustedProxies.Contains(ip) {
+				t.Errorf("Contains(%q) = true, want false", ip)
+			}
+		}
+	})
+
+	t.Run("hop count override", func(t *testing.T) {
+		t.Setenv(EnvTrustedProxies, "10.0.0.0/8")
+		t.Setenv(EnvTrustedProxyHops, "2")
+		if got := LoadConfig().TrustedProxies.Hops; got != 2 {
+			t.Fatalf("Hops = %d, want 2", got)
+		}
+	})
+
+	t.Run("garbage entries are dropped, never widened", func(t *testing.T) {
+		t.Setenv(EnvTrustedProxies, "not-a-cidr, 10.0.0.0/8, 999.999.999.999/8, ")
+		cfg := LoadConfig()
+		if n := len(cfg.TrustedProxies.CIDRs); n != 1 {
+			t.Fatalf("CIDRs = %v, want only the one valid entry", cfg.TrustedProxies.CIDRs)
+		}
+		if cfg.TrustedProxies.Contains("203.0.113.7") {
+			t.Fatal("a dropped garbage entry must not widen trust")
+		}
+	})
+
+	t.Run("invalid hop count falls back to the default", func(t *testing.T) {
+		t.Setenv(EnvTrustedProxyHops, "-3")
+		if got := LoadConfig().TrustedProxies.Hops; got != DefaultTrustedProxyHops {
+			t.Fatalf("Hops = %d, want %d", got, DefaultTrustedProxyHops)
+		}
+	})
+}
+
 // TestLoadConfigCapsClampNotError is the load-bearing test for the
 // clamp-vs-error decision: an operator override above a cap silently clamps
 // to that cap rather than failing config load / boot. This mirrors the
