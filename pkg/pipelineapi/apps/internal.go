@@ -1,4 +1,4 @@
-// internal.go holds the six worker-facing routes of the user-apps control
+// internal.go holds the seven worker-facing routes of the user-apps control
 // plane (RFC 028 spec §5.2) — the ONLY pipeline-api surface app-worker talks
 // to. They are a different security surface from the author routes in
 // handlers.go: the caller is not a platform user but the app-worker process
@@ -174,7 +174,7 @@ type InternalHandlers struct {
 	Token *ServiceToken
 }
 
-// RegisterInternal registers the six internal routes on mux, each already
+// RegisterInternal registers the seven internal routes on mux, each already
 // wrapped in the service-credential gate.
 //
 // The gate is applied HERE rather than accepted as a caller-supplied
@@ -188,6 +188,7 @@ func (h *InternalHandlers) RegisterInternal(mux *http.ServeMux) {
 	route("GET /internal/v1/apps/{pid}/{name}/resolve", h.handleResolve)
 	route("GET /internal/v1/bundles/{hash}", h.handleBundle)
 	route("POST /internal/v1/viewer-tokens/verify", h.handleVerifyViewerToken)
+	route("POST /internal/v1/viewer-tokens/active", h.handleTokenActive)
 	route("POST /internal/v1/sessions/verify", h.handleVerifySession)
 	route("POST /internal/v1/impersonate", h.handleImpersonate)
 	route("POST /internal/v1/apps/{app_id}/logs", h.handleAppendLog)
@@ -253,6 +254,17 @@ type verifyTokenRequest struct {
 
 type verifyTokenResponse struct {
 	OK bool `json:"ok"`
+}
+
+// tokenActiveRequest deliberately has NO secret field — see
+// handleTokenActive's doc comment for why.
+type tokenActiveRequest struct {
+	AppID   string `json:"app_id"`
+	TokenID string `json:"token_id"`
+}
+
+type tokenActiveResponse struct {
+	Active bool `json:"active"`
 }
 
 type verifySessionRequest struct {
@@ -406,6 +418,45 @@ func (h *InternalHandlers) handleVerifyViewerToken(w http.ResponseWriter, r *htt
 		return
 	}
 	writeJSON(w, http.StatusOK, verifyTokenResponse{OK: ok})
+}
+
+// ---------------------------------------------------------------------------
+// POST /internal/v1/viewer-tokens/active
+// ---------------------------------------------------------------------------
+
+// handleTokenActive answers "is this (app_id, token_id) still active?" —
+// deliberately WITHOUT a secret. It exists for app-worker's cookie-only
+// revocation recheck (spec §5.3): the signed session cookie carries
+// `{app_id, token_id, exp}` and NO secret (the plaintext transits exactly
+// once, at the 302 exchange — contract-and-constraints.md's Cookie spec), so
+// a cookie-authenticated request has nothing to present to
+// handleVerifyViewerToken, which requires one. This endpoint is the
+// secret-less counterpart that makes the ≤15 s revocation bound reachable
+// from a cookie session at all.
+//
+// An unknown token_id, another app's token, and a revoked token are all the
+// same answer — `{"active":false}`, HTTP 200 — matching
+// handleVerifyViewerToken's "learn nothing beyond yes/no" posture exactly.
+func (h *InternalHandlers) handleTokenActive(w http.ResponseWriter, r *http.Request) {
+	var req tokenActiveRequest
+	if !readInternalJSON(w, r, &req) {
+		return
+	}
+	if _, err := uuid.Parse(req.AppID); err != nil {
+		writeInternalError(w, http.StatusBadRequest, kindBadRequest, "invalid app_id")
+		return
+	}
+	if _, err := uuid.Parse(req.TokenID); err != nil {
+		writeInternalError(w, http.StatusBadRequest, kindBadRequest, "invalid token_id")
+		return
+	}
+	active, err := h.Store.TokenActive(r.Context(), req.AppID, req.TokenID)
+	if err != nil {
+		slog.Error("apps: internal token-active check", "app_id", req.AppID, "token_id", req.TokenID, "err", err)
+		writeInternalError(w, http.StatusServiceUnavailable, kindUnavailable, "could not check the viewer token")
+		return
+	}
+	writeJSON(w, http.StatusOK, tokenActiveResponse{Active: active})
 }
 
 // ---------------------------------------------------------------------------

@@ -195,6 +195,8 @@ func internalRequests(h *internalHarness) []struct {
 		{"bundles", http.MethodGet, "/internal/v1/bundles/" + strings.Repeat("a", 64), ""},
 		{"viewer-tokens/verify", http.MethodPost, "/internal/v1/viewer-tokens/verify",
 			fmt.Sprintf(`{"app_id":%q,"token_id":%q,"secret":"x"}`, appID, uuid.New().String())},
+		{"viewer-tokens/active", http.MethodPost, "/internal/v1/viewer-tokens/active",
+			fmt.Sprintf(`{"app_id":%q,"token_id":%q}`, appID, uuid.New().String())},
 		{"sessions/verify", http.MethodPost, "/internal/v1/sessions/verify",
 			fmt.Sprintf(`{"pid":%q}`, h.projectID.String())},
 		{"impersonate", http.MethodPost, "/internal/v1/impersonate", fmt.Sprintf(`{"app_id":%q}`, appID)},
@@ -474,6 +476,80 @@ func TestInternalViewerTokenVerify_BadRequest(t *testing.T) {
 		`not json`,
 	} {
 		w := h.do(http.MethodPost, "/internal/v1/viewer-tokens/verify", body)
+		assertEnvelope(t, w, http.StatusBadRequest, "bad_request")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /internal/v1/viewer-tokens/active
+// ---------------------------------------------------------------------------
+
+// TestInternalTokenActive is the W3-fix Blocker's server-side coverage
+// (spec §5.3's cookie-only revocation recheck has no secret to present —
+// this endpoint is the secret-less counterpart to
+// TestInternalViewerTokenVerify).
+func TestInternalTokenActive(t *testing.T) {
+	h := newInternalHarness(t)
+	appID, _ := h.seedApp("dash1", []byte("bundle-one"))
+	ctx := context.Background()
+	tokenID, _, err := h.store.MintToken(ctx, appID)
+	if err != nil {
+		t.Fatalf("MintToken: %v", err)
+	}
+
+	active := func(appID, tokenID string) bool {
+		t.Helper()
+		w := h.do(http.MethodPost, "/internal/v1/viewer-tokens/active",
+			fmt.Sprintf(`{"app_id":%q,"token_id":%q}`, appID, tokenID))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+		}
+		var got map[string]any
+		decodeBody(t, w, &got)
+		if len(got) != 1 {
+			t.Errorf("response keys = %v, want exactly {active}", got)
+		}
+		val, isBool := got["active"].(bool)
+		if !isBool {
+			t.Fatalf(`"active" = %v, want a bool`, got["active"])
+		}
+		return val
+	}
+
+	// Happy path: a freshly-minted, non-revoked token is active — no
+	// secret presented anywhere in this request.
+	if !active(appID, tokenID) {
+		t.Errorf("active = false for a fresh token, want true")
+	}
+
+	// App mismatch: right token_id, wrong app.
+	otherApp, _ := h.seedApp("dash2", []byte("bundle-two"))
+	if active(otherApp, tokenID) {
+		t.Errorf("active = true for another app's token, want false")
+	}
+
+	// Unknown token_id.
+	if active(appID, uuid.New().String()) {
+		t.Errorf("active = true for an unknown token_id, want false")
+	}
+
+	// Revoked -> false, indistinguishably from unknown/mismatched.
+	if err := h.store.RevokeToken(ctx, appID, tokenID); err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	if active(appID, tokenID) {
+		t.Errorf("active = true for a revoked token, want false")
+	}
+}
+
+func TestInternalTokenActive_BadRequest(t *testing.T) {
+	h := newInternalHarness(t)
+	for _, body := range []string{
+		`{"app_id":"nope","token_id":"` + uuid.New().String() + `"}`,
+		`{"app_id":"` + uuid.New().String() + `","token_id":"nope"}`,
+		`not json`,
+	} {
+		w := h.do(http.MethodPost, "/internal/v1/viewer-tokens/active", body)
 		assertEnvelope(t, w, http.StatusBadRequest, "bad_request")
 	}
 }

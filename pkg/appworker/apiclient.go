@@ -44,6 +44,10 @@ const (
 	sessionCacheTTL        = 15 * time.Second
 	verifyTokenPositiveTTL = 15 * time.Second
 	verifyTokenNegativeTTL = 60 * time.Second
+	// tokenActiveCacheTTL is CheckTokenActive's single TTL (both true and
+	// false answers) — spec §7's 15s verify-cache bound, the same
+	// revocation-blast-radius figure VerifyToken's positive TTL uses.
+	tokenActiveCacheTTL = 15 * time.Second
 
 	// defaultBundleCacheBytes mirrors spec §7's "Memory model" planning
 	// figure ("bundle LRU (capped, default 256 MiB)"). Operator-tunable via
@@ -249,6 +253,11 @@ func newBundleLRU(maxBytes int64) *bundleLRU {
 	return &bundleLRU{maxBytes: maxBytes, order: list.New(), items: make(map[string]*list.Element)}
 }
 
+// get returns a FRESH COPY of the cached bytes, never the cache's own
+// backing array. Without this, a caller that mutates the returned slice
+// (e.g. reuses it as a scratch buffer) would corrupt what every other
+// renderer sees for the same content hash — defeating the entire premise
+// of a content-addressed, supposedly-immutable cache.
 func (c *bundleLRU) get(hash string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -257,9 +266,17 @@ func (c *bundleLRU) get(hash string) ([]byte, bool) {
 		return nil, false
 	}
 	c.order.MoveToFront(el)
-	return el.Value.(*bundleCacheEntry).data, true
+	stored := el.Value.(*bundleCacheEntry).data
+	out := make([]byte, len(stored))
+	copy(out, stored)
+	return out, true
 }
 
+// put stores a FRESH COPY of data, never the caller's own slice. Symmetric
+// with get's copy-out: the cache must never alias a buffer it does not
+// exclusively own, in either direction — a caller mutating the slice it
+// passed to put (e.g. a reused read buffer) must not be able to corrupt an
+// entry every other renderer will subsequently read.
 func (c *bundleLRU) put(hash string, data []byte) {
 	size := int64(len(data))
 	c.mu.Lock()
@@ -281,7 +298,9 @@ func (c *bundleLRU) put(hash string, data []byte) {
 		delete(c.items, entry.hash)
 		c.curBytes -= int64(len(entry.data))
 	}
-	el := c.order.PushFront(&bundleCacheEntry{hash: hash, data: data})
+	owned := make([]byte, size)
+	copy(owned, data)
+	el := c.order.PushFront(&bundleCacheEntry{hash: hash, data: owned})
 	c.items[hash] = el
 	c.curBytes += size
 }
@@ -304,14 +323,25 @@ type APIClient struct {
 	resolveCache *ttlCache[Resolved]
 	resolveSF    singleflight.Group
 
-	verifyTokenCache *ttlCache[bool]
-	verifyTokenSF    singleflight.Group
+	// verifyTokenPositiveCache and verifyTokenNegativeCache are
+	// DELIBERATELY SEPARATE caches with different key shapes — see
+	// VerifyToken's doc comment. verifyTokenSF's key always includes the
+	// secret (the positive-cache key), so concurrent identical requests
+	// still coalesce without letting two DIFFERENT concurrent secrets for
+	// the same token share a singleflight leader.
+	verifyTokenPositiveCache *ttlCache[bool]
+	verifyTokenNegativeCache *ttlCache[bool]
+	verifyTokenSF            singleflight.Group
+
+	tokenActiveCache *ttlCache[bool]
+	tokenActiveSF    singleflight.Group
 
 	sessionCache *ttlCache[SessionInfo]
 	sessionSF    singleflight.Group
 
-	bundles  *bundleLRU
-	bundleSF singleflight.Group
+	bundles        *bundleLRU
+	bundleSF       singleflight.Group
+	maxBundleBytes int64
 
 	logQueue chan RenderLogRecord
 	stopOnce sync.Once
@@ -334,6 +364,14 @@ func WithClock(now func() time.Time) Option { return func(c *APIClient) { c.cloc
 // 256 MiB, spec §7).
 func WithBundleCacheBytes(n int64) Option {
 	return func(c *APIClient) { c.bundles = newBundleLRU(n) }
+}
+
+// WithMaxBundleBytes overrides the hard ceiling Bundle will read from a
+// single response body (default HardCapBundleMaxBytes, spec §4/§7's 5 MB
+// structural bundle cap). Guards against a buggy or hostile internal
+// endpoint forcing an oversized allocation before the hash is even checked.
+func WithMaxBundleBytes(n int64) Option {
+	return func(c *APIClient) { c.maxBundleBytes = n }
 }
 
 // WithLogQueueSize overrides the AppendLog async queue's capacity (default
@@ -365,6 +403,7 @@ func NewAPIClient(baseURL, serviceToken string, opts ...Option) *APIClient {
 		logQueue:       make(chan RenderLogRecord, defaultLogQueueSize),
 		stopCh:         make(chan struct{}),
 		logDone:        make(chan struct{}),
+		maxBundleBytes: HardCapBundleMaxBytes,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -373,7 +412,9 @@ func NewAPIClient(baseURL, serviceToken string, opts ...Option) *APIClient {
 		c.bundles = newBundleLRU(defaultBundleCacheBytes)
 	}
 	c.resolveCache = newTTLCache[Resolved](c.clock)
-	c.verifyTokenCache = newTTLCache[bool](c.clock)
+	c.verifyTokenPositiveCache = newTTLCache[bool](c.clock)
+	c.verifyTokenNegativeCache = newTTLCache[bool](c.clock)
+	c.tokenActiveCache = newTTLCache[bool](c.clock)
 	c.sessionCache = newTTLCache[SessionInfo](c.clock)
 
 	go c.runLogLoop()
@@ -429,6 +470,13 @@ type resolveResponseWire struct {
 // (spec §5.2) — a mismatch is an error and is NEVER written to the cache.
 // Hits are served from the content-addressed LRU (≤256 MiB default);
 // concurrent callers requesting the same hash share one upstream fetch.
+//
+// The read is bounded at maxBundleBytes+1 (default HardCapBundleMaxBytes,
+// the spec §4/§7 structural 5 MB bundle cap): without a bound, a buggy or
+// hostile internal endpoint could force an allocation far past that limit
+// before the hash is even checked, since io.ReadAll has no size ceiling of
+// its own. An oversized body is rejected as soon as the limit is exceeded,
+// before the (pointless, since it's already known-oversized) hash check.
 func (c *APIClient) Bundle(ctx context.Context, hash string) ([]byte, error) {
 	if b, ok := c.bundles.get(hash); ok {
 		return b, nil
@@ -448,9 +496,12 @@ func (c *APIClient) Bundle(ctx context.Context, hash string) ([]byte, error) {
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, parseAPIError(resp)
 		}
-		data, err := io.ReadAll(resp.Body)
+		data, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBundleBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("appworker: read bundle %s: %w", hash, err)
+		}
+		if int64(len(data)) > c.maxBundleBytes {
+			return nil, fmt.Errorf("appworker: bundle %s exceeds %d-byte structural cap", hash, c.maxBundleBytes)
 		}
 		if got := sha256Hex(data); got != hash {
 			// Deliberately NOT cached: spec §5.2's re-verification exists
@@ -468,31 +519,46 @@ func (c *APIClient) Bundle(ctx context.Context, hash string) ([]byte, error) {
 // ---------------------------------------------------------------------------
 
 // VerifyToken checks a viewer token's (app_id, token_id, secret) triple
-// (spec §5.3). Positive results cache 15s, negative results cache 60s.
+// (spec §5.3). Positive and negative results are cached under DELIBERATELY
+// ASYMMETRIC keys — this is the fix for a real DoS gap a review caught in
+// the original single-key design (RFC 028 W3 fix round):
 //
-// The cache key folds in ALL THREE arguments (via hashKey), not just
-// (app_id, token_id): caching on the pair alone would let one caller's
-// verify of the CORRECT secret silently answer "true" for a later caller
-// presenting a WRONG secret for the same token within the TTL window (or
-// vice versa after a secret rotation). Keying on the full tuple costs a
-// cache miss whenever the presented secret changes, which is exactly
-// correct — verifying a token means verifying THIS secret.
+//   - A POSITIVE result caches under the FULL tuple (app_id, token_id,
+//     secret) via hashKey, at 15s. This must never be weakened: a wrong
+//     secret computes a different key by construction, so it can NEVER hit
+//     a positive entry meant for the correct secret (or vice versa after a
+//     rotation) — verifying a token means verifying THIS secret.
+//   - A NEGATIVE result caches under (app_id, token_id) ALONE, at 60s —
+//     matching spec §5.3's literal wording ("negative-cached 60s per
+//     (app_id, token_id)"). Keying negatives on the full tuple (the
+//     original design) meant an attacker who varies the secret on every
+//     attempt missed the cache every time, hammering the verifier and
+//     Postgres directly through what was supposed to be an abuse-control
+//     cache. Keying on the pair alone means the FIRST wrong secret for a
+//     given token poisons every subsequent guess against that token for
+//     60s — the intended behavior, and safe precisely because a negative
+//     entry never gates access (it only ever produces "false", never lets
+//     a wrong secret through as "true").
 func (c *APIClient) VerifyToken(ctx context.Context, appID, tokenID, secret string) (bool, error) {
-	key := hashKey("verify-token", appID, tokenID, secret)
-	if v, ok := c.verifyTokenCache.get(key); ok {
+	positiveKey := hashKey("verify-token-pos", appID, tokenID, secret)
+	if v, ok := c.verifyTokenPositiveCache.get(positiveKey); ok {
 		return v, nil
 	}
-	return doSingleflight(&c.verifyTokenSF, key, func() (bool, error) {
+	negativeKey := hashKey("verify-token-neg", appID, tokenID)
+	if _, ok := c.verifyTokenNegativeCache.get(negativeKey); ok {
+		return false, nil
+	}
+	return doSingleflight(&c.verifyTokenSF, positiveKey, func() (bool, error) {
 		reqBody := verifyTokenRequestWire{AppID: appID, TokenID: tokenID, Secret: secret}
 		var resp verifyTokenResponseWire
 		if err := c.doInternal(ctx, http.MethodPost, "/internal/v1/viewer-tokens/verify", reqBody, &resp, nil); err != nil {
 			return false, err
 		}
-		ttl := verifyTokenNegativeTTL
 		if resp.OK {
-			ttl = verifyTokenPositiveTTL
+			c.verifyTokenPositiveCache.set(positiveKey, true, verifyTokenPositiveTTL)
+		} else {
+			c.verifyTokenNegativeCache.set(negativeKey, false, verifyTokenNegativeTTL)
 		}
-		c.verifyTokenCache.set(key, resp.OK, ttl)
 		return resp.OK, nil
 	})
 }
@@ -505,6 +571,50 @@ type verifyTokenRequestWire struct {
 
 type verifyTokenResponseWire struct {
 	OK bool `json:"ok"`
+}
+
+// ---------------------------------------------------------------------------
+// CheckTokenActive — the secret-less revocation recheck (RFC 028 W3 fix)
+// ---------------------------------------------------------------------------
+
+// CheckTokenActive answers "is this (app_id, token_id) still active?" —
+// WITHOUT a secret. It is the client for pipeline-api's
+// POST /internal/v1/viewer-tokens/active (added in this fix round), and
+// exists specifically for app-worker's cookie-only revocation recheck (spec
+// §5.3): the signed session cookie carries `{app_id, token_id, exp}` and NO
+// secret (the plaintext transits exactly once, at the 302 exchange), so a
+// cookie-authenticated request has nothing to present to VerifyToken.
+//
+// Cached 15s (spec §7's verify-cache TTL), keyed (app_id, token_id) — there
+// is no secret to fold into the key here, and none is needed: this endpoint
+// answers a strictly narrower question than VerifyToken ("is the token row
+// still live", never "is this secret correct"), so there is no positive/
+// negative asymmetry to get wrong — a "false" answer is exactly as safe to
+// cache as a "true" one, both at the same 15s bound, matching the
+// revocation blast-radius spec §5.3 requires.
+func (c *APIClient) CheckTokenActive(ctx context.Context, appID, tokenID string) (bool, error) {
+	key := hashKey("token-active", appID, tokenID)
+	if v, ok := c.tokenActiveCache.get(key); ok {
+		return v, nil
+	}
+	return doSingleflight(&c.tokenActiveSF, key, func() (bool, error) {
+		reqBody := tokenActiveRequestWire{AppID: appID, TokenID: tokenID}
+		var resp tokenActiveResponseWire
+		if err := c.doInternal(ctx, http.MethodPost, "/internal/v1/viewer-tokens/active", reqBody, &resp, nil); err != nil {
+			return false, err
+		}
+		c.tokenActiveCache.set(key, resp.Active, tokenActiveCacheTTL)
+		return resp.Active, nil
+	})
+}
+
+type tokenActiveRequestWire struct {
+	AppID   string `json:"app_id"`
+	TokenID string `json:"token_id"`
+}
+
+type tokenActiveResponseWire struct {
+	Active bool `json:"active"`
 }
 
 // ---------------------------------------------------------------------------

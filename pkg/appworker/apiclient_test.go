@@ -455,6 +455,143 @@ func TestBundle_DoesNotStampedeConcurrentCallers(t *testing.T) {
 	}
 }
 
+// TestBundle_CallerCannotCorruptCachedBytesByMutatingReturnedSlice is the
+// Finding-3 fix: Bundle must return a private copy, never the cache's own
+// backing array — otherwise a caller that reuses/mutates the returned slice
+// would corrupt what every other renderer subsequently reads for the same
+// content hash, defeating the entire point of a content-addressed,
+// supposedly-immutable cache.
+func TestBundle_CallerCannotCorruptCachedBytesByMutatingReturnedSlice(t *testing.T) {
+	data := []byte("original-bundle-bytes")
+	hash := mustSHA256Hex(data)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/bundles/"+hash, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken)
+	defer c.Close()
+
+	ctx := context.Background()
+	// First call is a cache MISS (fetches and populates the cache). The
+	// aliasing risk is on a HIT's return path, so mutate the result of the
+	// SECOND call instead — that is the one that comes straight out of
+	// bundleLRU.get.
+	if _, err := c.Bundle(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Bundle(ctx, hash) // cache HIT
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the CALLER's copy in place.
+	for i := range got {
+		got[i] = 'X'
+	}
+
+	again, err := c.Bundle(ctx, hash) // another cache HIT
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(data) {
+		t.Errorf("third Bundle() call = %q, want the untouched original %q "+
+			"(mutating a hit's returned slice must not have reached the cache)", again, data)
+	}
+}
+
+// TestBundle_PutDoesNotAliasCallerBuffer is the OTHER half of Finding 3:
+// even though Bundle's only current caller passes a fresh io.ReadAll
+// result, the LRU itself must not assume that — mutating the buffer AFTER
+// it was (hypothetically) handed to a cache must not be observable through
+// a later cache hit. Exercised directly against bundleLRU (the actual
+// aliasing boundary) rather than through Bundle, since Bundle's HTTP path
+// has no seam to inject a reused buffer.
+func TestBundle_PutDoesNotAliasCallerBuffer(t *testing.T) {
+	lru := newBundleLRU(1024)
+	buf := []byte("bundle-data-owned-by-caller")
+	original := string(buf)
+	lru.put("some-hash", buf)
+
+	// Mutate the caller's buffer AFTER put returns.
+	for i := range buf {
+		buf[i] = 'Z'
+	}
+
+	got, ok := lru.get("some-hash")
+	if !ok {
+		t.Fatal("expected a cache hit")
+	}
+	if string(got) != original {
+		t.Errorf("cached value = %q, want %q (put must copy, not alias, the caller's slice)", got, original)
+	}
+}
+
+// TestBundle_RejectsBodyExceedingStructuralCap is the Finding-4 fix:
+// io.ReadAll on the bundle response must be bounded, so a buggy or hostile
+// internal endpoint cannot force an oversized allocation before the hash is
+// even checked.
+func TestBundle_RejectsBodyExceedingStructuralCap(t *testing.T) {
+	oversized := make([]byte, 200)
+	for i := range oversized {
+		oversized[i] = byte(i)
+	}
+	hash := mustSHA256Hex(oversized) // irrelevant: rejected on SIZE first
+	var calls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/bundles/"+hash, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(oversized)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Cap well below the fixture's 200 bytes.
+	c := NewAPIClient(srv.URL, testServiceToken, WithMaxBundleBytes(100))
+	defer c.Close()
+
+	if _, err := c.Bundle(context.Background(), hash); err == nil {
+		t.Fatal("expected an error for a body exceeding the structural cap")
+	}
+	// A second call must not be served from cache either (the oversized
+	// read was never a valid entry to begin with).
+	if _, err := c.Bundle(context.Background(), hash); err == nil {
+		t.Fatal("expected the error again on a second call")
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Errorf("upstream calls = %d, want 2 (an oversized body must never be cached)", n)
+	}
+}
+
+func TestBundle_BodyAtExactCapIsAccepted(t *testing.T) {
+	data := make([]byte, 100)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	hash := mustSHA256Hex(data)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/bundles/"+hash, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken, WithMaxBundleBytes(100))
+	defer c.Close()
+
+	got, err := c.Bundle(context.Background(), hash)
+	if err != nil {
+		t.Fatalf("body exactly AT the cap should be accepted: %v", err)
+	}
+	if len(got) != 100 {
+		t.Errorf("len = %d, want 100", len(got))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // VerifyToken
 // ---------------------------------------------------------------------------
@@ -532,6 +669,69 @@ func TestVerifyToken_NegativeCache60s(t *testing.T) {
 	}
 }
 
+// TestVerifyToken_NegativeCacheSharedAcrossDifferentWrongSecrets is the
+// Finding-2 fix's own test: the negative cache keys on (app_id, token_id)
+// ALONE, not the secret, so an attacker varying the secret on every
+// attempt cannot bypass it. Without this, the original per-tuple negative
+// key meant every distinct wrong secret was its own cache miss, hammering
+// the verifier (and Postgres behind it) on every single guess.
+func TestVerifyToken_NegativeCacheSharedAcrossDifferentWrongSecrets(t *testing.T) {
+	var calls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": false})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken)
+	defer c.Close()
+
+	ctx := context.Background()
+	const attempts = 10
+	for i := 0; i < attempts; i++ {
+		secret := fmt.Sprintf("guess-%d", i)
+		if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", secret); err != nil || ok {
+			t.Fatalf("attempt %d (secret %q): %v, %v; want false, nil", i, secret, ok, err)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("upstream calls for %d different wrong secrets = %d, want exactly 1 "+
+			"(the negative cache must key on (app_id, token_id) alone)", attempts, n)
+	}
+}
+
+// TestVerifyToken_PositiveEntryNeverKeyedWithoutSecret guards the OTHER
+// half of the asymmetry: only the negative cache may drop the secret from
+// its key. A positive result must still require the exact secret that
+// earned it — this is the "do not weaken this" half of the Finding-2 fix.
+func TestVerifyToken_PositiveEntryNeverKeyedWithoutSecret(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
+		var req verifyTokenRequestWire
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": req.Secret == "correct-secret"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken)
+	defer c.Close()
+
+	ctx := context.Background()
+	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "correct-secret"); err != nil || !ok {
+		t.Fatalf("correct secret: %v, %v", ok, err)
+	}
+	// A DIFFERENT wrong secret for the same (app_id, token_id), tried right
+	// after the correct one populated the positive cache, must still be
+	// independently verified (and rejected) — never served "true" from the
+	// positive entry the correct secret earned.
+	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "another-wrong-secret"); err != nil || ok {
+		t.Fatalf("wrong secret after a cached correct one = %v, %v; want false, nil", ok, err)
+	}
+}
+
 func TestVerifyToken_DifferentSecretsAreNotConflated(t *testing.T) {
 	// The server answers ok=true only for "correct-secret".
 	mux := http.NewServeMux()
@@ -592,6 +792,119 @@ func TestVerifyToken_RequestShape(t *testing.T) {
 	want := verifyTokenRequestWire{AppID: "app-1", TokenID: "tok-1", Secret: "sekrit"}
 	if body != want {
 		t.Errorf("body = %+v, want %+v", body, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CheckTokenActive — the secret-less revocation recheck (W3 fix, Blocker 1)
+// ---------------------------------------------------------------------------
+
+func TestCheckTokenActive_RequestShapeAndServiceCredential(t *testing.T) {
+	log := &requestLog{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/viewer-tokens/active", func(w http.ResponseWriter, r *http.Request) {
+		log.record(r)
+		writeJSONResp(w, http.StatusOK, map[string]bool{"active": true})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken)
+	defer c.Close()
+
+	active, err := c.CheckTokenActive(context.Background(), "app-1", "tok-1")
+	if err != nil {
+		t.Fatalf("CheckTokenActive: %v", err)
+	}
+	if !active {
+		t.Errorf("active = false, want true")
+	}
+
+	req, ok := log.last("/internal/v1/viewer-tokens/active")
+	if !ok {
+		t.Fatal("no request recorded")
+	}
+	if req.method != http.MethodPost {
+		t.Errorf("method = %s, want POST", req.method)
+	}
+	// The SERVICE credential authenticates this call — never an app JWT
+	// (this endpoint sits behind the same requireServiceToken gate as
+	// every other /internal/v1/* worker-facing route, unlike Query's
+	// deliberately different /internal/v1/projects/{pid}/query).
+	if got := req.headers.Get("Authorization"); got != "Bearer "+testServiceToken {
+		t.Errorf("Authorization = %q, want the service token", got)
+	}
+	var body tokenActiveRequestWire
+	if err := json.Unmarshal(req.body, &body); err != nil {
+		t.Fatal(err)
+	}
+	want := tokenActiveRequestWire{AppID: "app-1", TokenID: "tok-1"}
+	if body != want {
+		t.Errorf("body = %+v, want %+v (no secret field at all)", body, want)
+	}
+}
+
+func TestCheckTokenActive_CachesWithin15sFakeClock(t *testing.T) {
+	var calls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/viewer-tokens/active", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeJSONResp(w, http.StatusOK, map[string]bool{"active": true})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	clock := newFakeClock()
+	c := NewAPIClient(srv.URL, testServiceToken, WithClock(clock.Now))
+	defer c.Close()
+
+	ctx := context.Background()
+	if _, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(14 * time.Second)
+	if _, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("calls = %d, want 1 (14s < 15s TTL)", n)
+	}
+
+	clock.Advance(2 * time.Second) // total 16s
+	if _, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Errorf("calls = %d, want 2 (TTL expired at 16s)", n)
+	}
+}
+
+func TestCheckTokenActive_FalseForRevokedUnknownOrMismatched(t *testing.T) {
+	// The fake server mirrors pipeline-api's actual "false, indistinguishably"
+	// contract: only exactly (app-1, tok-1) is active.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/viewer-tokens/active", func(w http.ResponseWriter, r *http.Request) {
+		var req tokenActiveRequestWire
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSONResp(w, http.StatusOK, map[string]bool{
+			"active": req.AppID == "app-1" && req.TokenID == "tok-1",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL, testServiceToken)
+	defer c.Close()
+
+	ctx := context.Background()
+	if active, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); err != nil || !active {
+		t.Fatalf("live token: %v, %v; want true, nil", active, err)
+	}
+	if active, err := c.CheckTokenActive(ctx, "app-2", "tok-1"); err != nil || active {
+		t.Fatalf("app mismatch: %v, %v; want false, nil", active, err)
+	}
+	if active, err := c.CheckTokenActive(ctx, "app-1", "unknown-tok"); err != nil || active {
+		t.Fatalf("unknown token: %v, %v; want false, nil", active, err)
 	}
 }
 

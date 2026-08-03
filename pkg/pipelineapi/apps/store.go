@@ -515,6 +515,45 @@ func (s *Store) VerifyToken(ctx context.Context, appID, tokenID, secret string) 
 	return subtle.ConstantTimeCompare(hashToken(salt, secret), wantHash) == 1, nil
 }
 
+// TokenActive reports whether (appID, tokenID) names a live, non-revoked
+// viewer token — WITHOUT checking a secret. Unknown (appID, tokenID),
+// another app's token, and a revoked token all answer (false, nil), the
+// same "no error, just no" shape VerifyToken uses.
+//
+// This exists for the cookie-only revocation recheck (spec §5.3): the
+// signed session cookie deliberately carries no secret (the plaintext
+// transits exactly once, at the 302 exchange — contract-and-constraints.md's
+// Cookie spec), so a cookie-authenticated request has nothing to present to
+// VerifyToken. TokenActive answers the narrower question a cookie CAN ask:
+// "is this token I already exchanged for still live?" — never "is this
+// secret correct?", which is VerifyToken's job and stays gated on the
+// secret.
+func (s *Store) TokenActive(ctx context.Context, appID, tokenID string) (bool, error) {
+	appUUID, err := uuid.Parse(appID)
+	if err != nil {
+		return false, fmt.Errorf("apps: invalid app id %q: %w", appID, err)
+	}
+	tokenUUID, err := uuid.Parse(tokenID)
+	if err != nil {
+		return false, fmt.Errorf("apps: invalid token id %q: %w", tokenID, err)
+	}
+
+	var revokedAt *time.Time
+	err = s.pool.QueryRow(ctx,
+		`SELECT revoked_at
+		   FROM app_viewer_tokens
+		  WHERE app_id = $1 AND token_id = $2`,
+		appUUID, tokenUUID,
+	).Scan(&revokedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("apps: lookup token: %w", err)
+	}
+	return revokedAt == nil, nil
+}
+
 // RevokeToken marks a viewer token revoked (idempotent-looking to callers:
 // re-revoking an already-revoked token is a no-op, not an error — only a
 // wholly unknown (appID, tokenID) returns ErrNotFound). Not part of the P1
