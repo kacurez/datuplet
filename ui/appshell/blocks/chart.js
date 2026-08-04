@@ -16,8 +16,14 @@
 // required order (vega → vega-lite → vega-embed), and cached so later charts
 // reuse the one load. The schema fetch is same-origin (CSP `connect-src 'self'`)
 // and likewise cached.
+//
+// V3 additions: a schema-valid but empty inline dataset ({values: []}) shows
+// the shared empty state instead of mounting a blank plot; any render
+// failure (validation reject or a mount/load error) marks the mount with the
+// shared dtp-error-card class for a distinct, intentional look.
 
 import { mountVegaLiteChart } from "../shell.js";
+import { renderEmptyState } from "../shell.js";
 import { bindChartOnClick, registerVegaView } from "../interact.js";
 
 // ui/product-derived categorical palette (spec §6.4 "the `ui/product` palette").
@@ -116,7 +122,15 @@ export function renderChart(block) {
         // Defense-in-depth reject: the server already validated with the same
         // schema, so this only fires on a client/server validator gap — fail
         // closed, never embed an unvetted spec into Vega.
-        mount.textContent = "This chart could not be displayed.";
+        showChartError(mount);
+        return undefined;
+      }
+      if (isEmptyChartData(spec)) {
+        // A schema-valid spec with an inline dataset present but empty
+        // ({values: []}) — mounting Vega would just be a blank plot with no
+        // explanation (spec brief: "a … chart with no data").
+        mount.textContent = "";
+        mount.appendChild(renderEmptyState("No data to display."));
         return undefined;
       }
       mount.textContent = "";
@@ -138,10 +152,26 @@ export function renderChart(block) {
       });
     })
     .catch(() => {
-      mount.textContent = "This chart could not be displayed.";
+      showChartError(mount);
     });
 
   return el;
+}
+
+// isEmptyChartData reports whether a schema-valid spec's inline dataset is a
+// present-but-empty array. A validator pass only means the spec is
+// STRUCTURALLY sound — it says nothing about whether there is anything to
+// plot.
+function isEmptyChartData(spec) {
+  return !!(spec && spec.data && Array.isArray(spec.data.values) && spec.data.values.length === 0);
+}
+
+// showChartError marks the mount as a failed-render error card (spec brief:
+// "reuse V1/V2's error states, make them look intentional") and sets its
+// inert fallback text. Never assigns innerHTML.
+function showChartError(mount) {
+  mount.textContent = "This chart could not be displayed.";
+  mount.classList.add("dtp-error-card");
 }
 
 // ---------------------------------------------------------------------------

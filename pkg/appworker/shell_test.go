@@ -23,6 +23,7 @@ import (
 var shellAssetPaths = []string{
 	"shell.js",
 	"interact.js",
+	"csv.js",
 	"blocks/markdown.js",
 	"blocks/metric.js",
 	"blocks/table.js",
@@ -780,5 +781,345 @@ func TestInteract_RetryAfterIsCapped(t *testing.T) {
 	// backoffSeconds still honors Retry-After (waits at least that long, up to the cap).
 	if !strings.Contains(got, "Math.max(seconds,retryAfter)") {
 		t.Error("interact.js no longer honors Retry-After on the backoff path")
+	}
+}
+
+// ===========================================================================
+// RFC 028 Part 4 (V3): export + polish.
+//
+// CSV export is client-side only (spec §6.3 "Client-side, no round trip …
+// CSV export") — csv.js's buildCSV is a pure JS function with no server-side
+// counterpart, and there is no JS runtime vendored into this module tree to
+// execute it directly (adding one just to exercise a ~30-line escaper would
+// be a disproportionate new dependency, and V0-V2 already established the
+// source-level-inspection convention this file uses throughout). Two things
+// close that gap together:
+//   - TestCSVGolden_OWASPEscapingAndRFC4180Quoting is a Go PORT of csv.js's
+//     exact rule set (OWASP formula-injection escape, then RFC 4180
+//     quoting), checked against a documented input->output fixture — the
+//     "golden fixture" the task brief calls for, made genuinely runnable
+//     without a JS engine.
+//   - TestCSVModule_TriggerSetAndQuotingMatchGolden pins the SHIPPED csv.js
+//     to that exact same rule set at the source level (the trigger-character
+//     array, the quoting condition, the doubling of embedded quotes), so the
+//     Go port and the real file can never silently drift apart.
+//
+// The rest of V3 (print CSS, skeleton, empty/error states, theme reuse) is
+// visual and lands in V4's manual browser checklist; what follows are the
+// source-level guards a headless Go test CAN make — see task-V3-report.md
+// for the full checklist.
+// ===========================================================================
+
+// csvFormulaTriggers is a Go PORT of csv.js's FORMULA_TRIGGER_CHARS — the
+// exact OWASP CSV-injection trigger set spec §6.3 names, no more, no less.
+var csvFormulaTriggers = []byte{'=', '+', '-', '@', '\t', '\r'}
+
+// csvCellGolden is a Go PORT of csv.js's csvCell: OWASP formula-escape (a
+// leading trigger character gets a "'" prefix), then RFC 4180 quoting (wrap
+// in double quotes, doubling any embedded double quote, if the — possibly
+// already-escaped — value contains a comma, double quote, or newline).
+func csvCellGolden(value string) string {
+	if len(value) > 0 {
+		for _, c := range csvFormulaTriggers {
+			if value[0] == c {
+				value = "'" + value
+				break
+			}
+		}
+	}
+	if strings.ContainsAny(value, ",\"\r\n") {
+		value = `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+	}
+	return value
+}
+
+// buildCSVGolden is a Go PORT of csv.js's buildCSV: a header row (columns)
+// plus one row per entry in rows, CRLF-joined, CRLF-terminated.
+func buildCSVGolden(columns []string, rows [][]string) string {
+	csvRow := func(cells []string) string {
+		out := make([]string, len(cells))
+		for i, c := range cells {
+			out[i] = csvCellGolden(c)
+		}
+		return strings.Join(out, ",")
+	}
+	lines := []string{csvRow(columns)}
+	for _, row := range rows {
+		lines = append(lines, csvRow(row))
+	}
+	return strings.Join(lines, "\r\n") + "\r\n"
+}
+
+// TestCSVGolden_OWASPEscapingAndRFC4180Quoting is the golden-fixture check
+// the task brief calls for: a documented table of cell inputs -> expected
+// CSV-encoded output, run through the Go port above.
+func TestCSVGolden_OWASPEscapingAndRFC4180Quoting(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"plain text is untouched", "Widget", "Widget"},
+		{"empty string is never prefixed (no leading char to trigger on)", "", ""},
+		{"formula equals", "=SUM(A1:A10)", "'=SUM(A1:A10)"},
+		{"formula plus", "+1234", "'+1234"},
+		{"formula minus (also an ordinary negative number)", "-42", "'-42"},
+		{"formula at-sign", "@mention", "'@mention"},
+		{"formula tab (tab alone does not also trigger RFC 4180 quoting)", "\tTabbed", "'\tTabbed"},
+		{"formula CR (CR ALSO triggers RFC 4180 quoting, unlike tab, so this is BOTH escaped AND quoted)", "\rCarriage", "\"'\rCarriage\""},
+		{"trigger char NOT at the start is untouched", "A=B", "A=B"},
+		{"embedded comma is quoted", "Acme, Inc.", `"Acme, Inc."`},
+		{"embedded double quote is doubled and quoted", `He said "hi"`, `"He said ""hi"""`},
+		{"embedded newline is quoted", "Line1\nLine2", "\"Line1\nLine2\""},
+		{"formula-escaped AND comma: escape first, then quote the whole field", "=A1,A2", `"'=A1,A2"`},
+		{"formula-escaped AND quote-containing: apostrophe survives inside the quoting", `="x"`, `"'=""x"""`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := csvCellGolden(c.input)
+			if got != c.want {
+				t.Errorf("csvCellGolden(%q) = %q, want %q", c.input, got, c.want)
+			}
+		})
+	}
+
+	// buildCSV-level integration: header + rows, CRLF-joined and -terminated,
+	// header cells escaped exactly like data cells (a column named "=Note" is
+	// just as untrusted as a cell).
+	got := buildCSVGolden(
+		[]string{"Name", "=Note"},
+		[][]string{
+			{"Widget", "ok"},
+			{"=EVIL()", "danger, zone"},
+		},
+	)
+	want := "Name,'=Note\r\nWidget,ok\r\n'=EVIL(),\"danger, zone\"\r\n"
+	if got != want {
+		t.Errorf("buildCSVGolden(...) =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// TestCSVModule_TriggerSetAndQuotingMatchGolden pins the SHIPPED csv.js to
+// the exact same rule set TestCSVGolden_* exercises in Go, at the source
+// level: the trigger-character array (all six, nothing extra), the RFC 4180
+// quoting condition (comma/quote/CR/LF), and the embedded-quote-doubling
+// replace. Mutation-tested: with FORMULA_TRIGGER_CHARS temporarily emptied to
+// `[]` in csv.js, this test FAILs (see task-V3-report.md); reverted
+// byte-identically.
+func TestCSVModule_TriggerSetAndQuotingMatchGolden(t *testing.T) {
+	src := readShellAsset(t, "csv.js")
+
+	triggers := arrayLiteral(t, src, "FORMULA_TRIGGER_CHARS")
+	wantTriggers := stripWhitespace(`"=", "+", "-", "@", "\t", "\r"`)
+	if stripWhitespace(triggers) != wantTriggers {
+		t.Errorf("csv.js FORMULA_TRIGGER_CHARS = %q, want exactly %q", stripWhitespace(triggers), wantTriggers)
+	}
+
+	stripped := stripWhitespace(src)
+	for _, want := range []string{
+		`NEEDS_QUOTING=/[",\r\n]/`,        // the RFC 4180 quoting condition (comma/quote/CR/LF)
+		`text.replace(/"/g,'""')`,         // doubling an embedded quote
+		`escapeFormula(text)`,             // csvCell calls the formula-escape step
+		"quoteField(escapeFormula(text))", // escape BEFORE quote — order matters (see module header)
+	} {
+		if !strings.Contains(stripped, want) {
+			t.Errorf("csv.js is missing %q — does not match the golden rule set", want)
+		}
+	}
+}
+
+// TestCSVModule_PureNoDOMNoInnerHTML proves csv.js is the pure, side-effect-
+// free module its header comment claims: no innerHTML/insertAdjacentHTML
+// (trivially true if it never touches the DOM at all, which this also
+// checks), no `document.`/`window.` access, and no fetch/import. This is
+// stricter than — and deliberately separate from — the generic
+// TestShellRenderers_NeverUseInnerHTML sweep: that sweep also requires
+// `textContent` to be present (proving a renderer actually sanitizes
+// something), which csv.js correctly has none of, being pure string logic
+// rather than a DOM renderer.
+func TestCSVModule_PureNoDOMNoInnerHTML(t *testing.T) {
+	src := readShellAsset(t, "csv.js")
+	if loc := innerHTMLUsage.FindString(src); loc != "" {
+		t.Errorf("csv.js must never use innerHTML/insertAdjacentHTML — found %q", loc)
+	}
+	for _, forbidden := range []string{"document.", "window.", "fetch(", "import("} {
+		if strings.Contains(src, forbidden) {
+			t.Errorf("csv.js contains %q — it must stay a pure, DOM-free string-building module", forbidden)
+		}
+	}
+}
+
+// TestTableRenderer_CSVDownloadIsBlobNotInnerHTML proves the "Download CSV"
+// affordance is wired the way spec §6.4 requires: table.js imports csv.js's
+// pure buildCSV, exposes a "Download CSV" control, and hands the result to a
+// same-origin Blob + object URL — never a network call, never innerHTML.
+func TestTableRenderer_CSVDownloadIsBlobNotInnerHTML(t *testing.T) {
+	src := readShellAsset(t, "blocks/table.js")
+	stripped := stripWhitespace(src)
+
+	if !strings.Contains(stripped, `import{buildCSV}from"../csv.js"`) {
+		t.Error("table.js does not import buildCSV from csv.js")
+	}
+	if !strings.Contains(src, "Download CSV") {
+		t.Error("table.js has no \"Download CSV\" affordance")
+	}
+	for _, want := range []string{"new Blob(", "URL.createObjectURL(", ".download ="} {
+		if !strings.Contains(src, want) {
+			t.Errorf("table.js CSV download does not use %q — spec §6.4 requires a Blob + object URL download", want)
+		}
+	}
+	if strings.Contains(src, "://") {
+		t.Error("table.js CSV download reaches an external origin — it must be same-origin/local (Blob) only")
+	}
+	if loc := innerHTMLUsage.FindString(src); loc != "" {
+		t.Errorf("table.js must never use innerHTML/insertAdjacentHTML — found %q", loc)
+	}
+}
+
+// TestShellJS_EmptyDocAndDataUseSharedEmptyState proves the spec-brief empty
+// states (a doc with zero blocks, a table with no rows, a chart whose inline
+// dataset is present but empty) all route through the SAME shared
+// renderEmptyState placeholder (shell.js) rather than each block inventing
+// its own — table.js and chart.js both import it from shell.js.
+func TestShellJS_EmptyDocAndDataUseSharedEmptyState(t *testing.T) {
+	shell := stripWhitespace(readShellAsset(t, "shell.js"))
+	for _, want := range []string{
+		"exportfunctionrenderEmptyState(message)",
+		"blocks.length===0",
+		"renderEmptyState(",
+	} {
+		if !strings.Contains(shell, want) {
+			t.Errorf("shell.js missing %q — zero-block empty state not wired", want)
+		}
+	}
+
+	table := stripWhitespace(readShellAsset(t, "blocks/table.js"))
+	if !strings.Contains(table, `import{renderEmptyState}from"../shell.js"`) {
+		t.Error("table.js does not import the shared renderEmptyState from shell.js")
+	}
+	if !strings.Contains(table, "rows.length===0") {
+		t.Error("table.js does not detect the zero-rows (no data) case")
+	}
+
+	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
+	if !strings.Contains(chart, `import{renderEmptyState}from"../shell.js"`) {
+		t.Error("chart.js does not import the shared renderEmptyState from shell.js")
+	}
+	if !strings.Contains(chart, "isEmptyChartData(spec)") {
+		t.Error("chart.js does not detect an empty (but schema-valid) inline dataset")
+	}
+}
+
+// TestErrorCard_ChartMarkdownModalReuseSharedClass proves every V1/V2 render-
+// failure text ("this … could not be displayed") is marked with the shared
+// dtp-error-card class (spec brief: "reuse V1/V2's error states, make them
+// look intentional"), and that theme.css defines it using --dtp-danger — a
+// hue reused verbatim from ui/product/style.css's --status-fail-bg, not an
+// invented color.
+func TestErrorCard_ChartMarkdownModalReuseSharedClass(t *testing.T) {
+	for _, path := range []string{"blocks/chart.js", "blocks/markdown.js", "interact.js"} {
+		src := readShellAsset(t, path)
+		if !strings.Contains(src, `classList.add("dtp-error-card")`) {
+			t.Errorf("%s does not apply the shared dtp-error-card class on its failure path", path)
+		}
+	}
+	theme := readShellAsset(t, "theme.css")
+	if !strings.Contains(theme, ".dtp-error-card") {
+		t.Error("theme.css does not define .dtp-error-card")
+	}
+	if !strings.Contains(theme, "--dtp-danger") {
+		t.Error("theme.css does not define --dtp-danger for the error card")
+	}
+	if !strings.Contains(theme, "#ef4444") {
+		t.Error("theme.css's error color does not reuse ui/product's --status-fail-bg hue (#ef4444)")
+	}
+}
+
+// TestShellSkeleton_FirstPaintBeforeMount proves index.html ships a real
+// skeleton placeholder (not a bare "Loading…" line) marked aria-busy before
+// shell.js's boot() ever runs, and that applyDoc clears that attribute once
+// real content is mounted (so the accessibility state does not go stale).
+func TestShellSkeleton_FirstPaintBeforeMount(t *testing.T) {
+	idx := string(appshell.IndexHTML)
+	for _, want := range []string{`id="dtp-root"`, `aria-busy="true"`, "dtp-skeleton"} {
+		if !strings.Contains(idx, want) {
+			t.Errorf("index.html missing %q — no first-paint skeleton before shell.js mounts", want)
+		}
+	}
+	shell := stripWhitespace(readShellAsset(t, "shell.js"))
+	if !strings.Contains(shell, `removeAttribute("aria-busy")`) {
+		t.Error("shell.js's applyDoc does not clear aria-busy once the real doc is mounted")
+	}
+}
+
+// TestShellJS_ChartRendererUsesSVGForPrintTheming proves shell.js's
+// mountVegaLiteChart chokepoint requests the SVG renderer (vega-embed's
+// default is canvas): a canvas is an opaque bitmap baked at mount time from
+// whatever theme was active on screen, and no CSS rule (including theme.css's
+// print override) can repaint its pixels — SVG text is real DOM the print
+// stylesheet can recolor. This is load-bearing for "charts … legible on
+// paper", not a rendering-quality preference.
+func TestShellJS_ChartRendererUsesSVGForPrintTheming(t *testing.T) {
+	got := stripWhitespace(readShellAsset(t, "shell.js"))
+	if !strings.Contains(got, `renderer:"svg"`) {
+		t.Error("shell.js's mountVegaLiteChart does not force the SVG renderer — the print stylesheet cannot recolor a canvas")
+	}
+	// Still routed through the SAME lockdown call (renderer sits alongside the
+	// existing actions/loader lockdown, not a second vegaEmbed call site).
+	wantSameCall := stripWhitespace(`actions:false,loader:{load:()=>Promise.reject(new Error("loading disabled"))},renderer:"svg"`)
+	if !strings.Contains(got, wantSameCall) {
+		t.Error("shell.js's renderer:\"svg\" is not part of the single locked-down vegaEmbed call")
+	}
+}
+
+// dtpBlockClassSelector matches a bare, unqualified CSS class selector (e.g.
+// ".dtp-tab-bar {" or ".dtp-tab-bar,") — used to find where a given rule is
+// declared, not merely mentioned in a comment.
+func dtpBlockClassSelector(class string) *regexp.Regexp {
+	return regexp.MustCompile(regexp.QuoteMeta(class) + `\s*[,{]`)
+}
+
+// TestPrintCSS_HidesChromeForcesLightPageBreak proves theme.css's @media
+// print block (spec brief: hide chrome/filters/interactive controls,
+// page-break between blocks, force light) exists, hides the specific
+// interactive-chrome classes named in the V3 report, keeps a block from being
+// sliced across a page, forces the light palette, and — the cascade-ordering
+// invariant — is declared AFTER the prefers-color-scheme:dark block so it
+// wins when a viewer prints while their OS is in dark mode.
+func TestPrintCSS_HidesChromeForcesLightPageBreak(t *testing.T) {
+	theme := readShellAsset(t, "theme.css")
+
+	darkIdx := strings.Index(theme, "@media (prefers-color-scheme: dark)")
+	// "@media print {" (the actual rule, brace included) rather than "@media
+	// print" alone — the file's own header comment mentions the stylesheet by
+	// name too, and that mention must not be mistaken for the rule itself.
+	printIdx := strings.Index(theme, "@media print {")
+	if darkIdx < 0 || printIdx < 0 {
+		t.Fatalf("theme.css is missing the dark-mode (%d) or print (%d) media block", darkIdx, printIdx)
+	}
+	if printIdx < darkIdx {
+		t.Error("theme.css's @media print block must come AFTER @media (prefers-color-scheme: dark) to win the cascade tiebreak when printing in dark mode")
+	}
+
+	printBlock := theme[printIdx:]
+	for _, class := range []string{
+		".dtp-table-toolbar", ".dtp-modal-trigger", ".dtp-tab-bar",
+		".dtp-block-filter", ".dtp-modal-backdrop", ".dtp-refresh-overlay", ".dtp-refresh-error",
+	} {
+		if !dtpBlockClassSelector(class).MatchString(printBlock) {
+			t.Errorf("theme.css's @media print block does not hide %q (interactive chrome)", class)
+		}
+	}
+	if !strings.Contains(printBlock, "display: none !important") {
+		t.Error("theme.css's @media print block does not force-hide interactive chrome")
+	}
+	if !strings.Contains(printBlock, "break-inside: avoid") {
+		t.Error("theme.css's @media print block does not keep a block from splitting across a page")
+	}
+	if !strings.Contains(printBlock, "--dtp-bg: #ffffff") {
+		t.Error("theme.css's @media print block does not force the light background")
+	}
+	if !strings.Contains(printBlock, ".dtp-chart-mount svg text") {
+		t.Error("theme.css's @media print block does not recolor chart text for paper")
 	}
 }

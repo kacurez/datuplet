@@ -101,8 +101,11 @@ export function renderMarkdown(block) {
       body.appendChild(fragment);
     })
     .catch(() => {
-      // Fail visible-but-inert: never inject unsanitized text as markup.
+      // Fail visible-but-inert: never inject unsanitized text as markup. The
+      // shared dtp-error-card class (RFC 028 V3) gives this a distinct,
+      // intentional look rather than plain muted paragraph text.
       body.textContent = "This content could not be displayed.";
+      body.classList.add("dtp-error-card");
     });
 
   return el;

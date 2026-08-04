@@ -18,6 +18,12 @@
 // dynamics live in the platform-owned shell"); this module owns the mount
 // primitives (RENDERERS, renderBlock, applyDoc, boot) and hands interact.js the
 // two it needs so there is no import cycle.
+//
+// V3 additions: renderEmptyState (shared "nothing to show" placeholder, used
+// here for a zero-block doc and reused by blocks/table.js + blocks/chart.js
+// for "no data"), an aria-busy handoff with index.html's first-paint skeleton,
+// and mountVegaLiteChart now forces the SVG renderer so theme.css's print
+// stylesheet can recolor chart text for paper (see that function's comment).
 
 import { renderMarkdown } from "./blocks/markdown.js";
 import { renderMetric } from "./blocks/metric.js";
@@ -111,6 +117,13 @@ function renderUnknownBlock(block) {
  * (`actions:false` + the load-rejecting loader) stays hardcoded here so a
  * caller cannot override it.
  *
+ * `renderer:"svg"` (RFC 028 V3) is likewise hardcoded here: vega-embed
+ * defaults to a canvas renderer, an opaque bitmap baked at mount time from
+ * whatever theme (possibly dark) was active on screen — no CSS rule,
+ * including theme.css's `@media print` override, can repaint its pixels.
+ * SVG text is real DOM the print stylesheet CAN recolor, so this is
+ * load-bearing for chart legibility on paper, not a rendering preference.
+ *
  * @param {Element} el
  * @param {Record<string, unknown>} spec - already validated against
  *   vegaspec.schema.json (client-side defense-in-depth; app-worker is the
@@ -123,6 +136,7 @@ export function mountVegaLiteChart(el, spec, config) {
   return window.vegaEmbed(el, spec, {
     actions: false,
     loader: { load: () => Promise.reject(new Error("loading disabled")) },
+    renderer: "svg",
     config,
   });
 }
@@ -153,12 +167,41 @@ function renderTitle(root, doc) {
 }
 
 /**
- * renderBlocks dispatches every top-level block through renderBlock.
+ * renderEmptyState builds the shared "nothing to show" placeholder (RFC 028
+ * V3, spec brief: "a doc with zero blocks, or a table/chart with no data").
+ * `message` is platform-authored (never app-controlled text reaches this
+ * function directly) but still goes through textContent like everything
+ * else the shell renders. Exported so blocks/table.js and blocks/chart.js
+ * can reuse the exact same placeholder rather than each inventing their own
+ * (shell.js<->table.js and shell.js<->chart.js are already deferred-safe
+ * cycles — see shell.js's module header and the V1/V2 reports — because
+ * every cross-reference is used only inside a function body, never at
+ * module top-level; this is one more such reference, not a new cycle risk).
+ * @param {string} message
+ * @returns {HTMLElement}
+ */
+export function renderEmptyState(message) {
+  const el = document.createElement("div");
+  el.className = "dtp-empty-state";
+  const p = document.createElement("p");
+  p.textContent = message;
+  el.appendChild(p);
+  return el;
+}
+
+/**
+ * renderBlocks dispatches every top-level block through renderBlock, or — a
+ * doc with zero blocks — shows the shared empty state instead of an empty
+ * (and confusing) blank page.
  * @param {Element} root
  * @param {Record<string, unknown>} doc
  */
 function renderBlocks(root, doc) {
   const blocks = Array.isArray(doc.blocks) ? doc.blocks : [];
+  if (blocks.length === 0) {
+    root.appendChild(renderEmptyState("This dashboard has no blocks to display."));
+    return;
+  }
   const container = document.createElement("div");
   container.className = "dtp-blocks";
   for (const block of blocks) {
@@ -186,6 +229,10 @@ export function applyDoc(doc) {
   // (spec §6.4 boundary is unaffected; this is a resource-leak fix on re-render).
   finalizeVegaViewsWithin(root);
   root.textContent = ""; // clear the previous render / pre-render skeleton
+  // The first paint (index.html) marks #dtp-root aria-busy="true" around its
+  // static skeleton (RFC 028 V3) — clear it now that real content is mounted.
+  // A no-op on every re-render after the first (the attribute is already gone).
+  root.removeAttribute("aria-busy");
   renderTitle(root, doc);
   renderBlocks(root, doc);
 }

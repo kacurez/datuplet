@@ -578,10 +578,16 @@ function openModalShell(title, lazy) {
       body.textContent = "Loading…";
     },
     setError() {
+      // Shared dtp-error-card class (RFC 028 V3) — same "make it look
+      // intentional" treatment as chart.js/markdown.js's failure states.
       body.textContent = "This content could not be displayed.";
+      body.classList.add("dtp-error-card");
     },
     setBody(node) {
       body.textContent = "";
+      body.classList.remove("dtp-error-card"); // defensive: no code path calls
+      // setBody after setError today, but this keeps the state correct if
+      // that ever changes.
       body.appendChild(node);
     },
   };

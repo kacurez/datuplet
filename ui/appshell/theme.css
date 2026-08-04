@@ -9,6 +9,12 @@
  * block" placeholder V0 renders for every block type. Per-block-type visuals
  * (markdown, metric, table, chart, filter, tabs) land in V1 alongside their
  * renderers.
+ *
+ * V3 additions: a first-paint skeleton + sr-only utility (index.html, before
+ * shell.js mounts anything), shared empty-state and error-card classes (used
+ * by shell.js/blocks/table.js/blocks/chart.js/markdown.js/interact.js), the
+ * table toolbar + CSV download button, and a @media print stylesheet at the
+ * bottom of this file.
  */
 
 :root {
@@ -19,6 +25,12 @@
   --dtp-fg-muted: #5c6066;
   --dtp-border: #d8dbe0;
   --dtp-surface: #f5f6f7;
+  /* Reused verbatim from ui/product/style.css's --status-fail-bg (RFC 028
+   * V3 error cards). One hue for both light and dark: it is only ever used
+   * as a color-mix() tint/border, not a solid fill, so — unlike
+   * ui/product's *-fg pairs — it needs no separate per-mode contrast-checked
+   * shade. */
+  --dtp-danger: #ef4444;
 
   --dtp-font: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
   --dtp-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -68,8 +80,62 @@ body {
   padding: var(--dtp-space-4) var(--dtp-space-3);
 }
 
-.dtp-loading {
-  color: var(--dtp-fg-muted);
+/* ---- accessibility utility ---- */
+.dtp-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- first-paint skeleton (index.html; RFC 028 V3) ----
+ * Shown before shell.js's boot() mounts the real doc. Mirrors the shape of a
+ * real dashboard (a title bar + a few block-shaped rectangles) rather than a
+ * blank page or a bare "Loading…" line. */
+.dtp-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dtp-space-3);
+}
+.dtp-skeleton-title {
+  width: 40%;
+  height: 22px;
+  border-radius: var(--dtp-radius);
+  background: var(--dtp-surface);
+  animation: dtp-skeleton-pulse 1.2s ease-in-out infinite;
+}
+.dtp-skeleton-block {
+  height: 96px;
+  border: 1px solid var(--dtp-border);
+  border-radius: var(--dtp-radius);
+  background: var(--dtp-surface);
+  animation: dtp-skeleton-pulse 1.2s ease-in-out infinite;
+}
+.dtp-skeleton-block--short {
+  height: 56px;
+}
+@keyframes dtp-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Matches ui/product/style.css's .skeleton td reduced-motion treatment: a
+   * static half-opacity block still reads as "placeholder", not "content". */
+  .dtp-skeleton-title,
+  .dtp-skeleton-block {
+    animation: none;
+    opacity: 0.5;
+  }
 }
 
 .dtp-title {
@@ -98,6 +164,39 @@ body {
   font-family: var(--dtp-mono);
   font-size: 12px;
   border-style: dashed;
+}
+
+/* ---- empty states (RFC 028 V3; shell.js's renderEmptyState) ----
+ * Used for a zero-block doc, a table with no rows, and a chart whose inline
+ * dataset is present but empty. Mirrors ui/product/style.css's .empty-state
+ * idiom (muted, centered, no color-coding) — this is not an error. */
+.dtp-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--dtp-space-2);
+  padding: var(--dtp-space-4);
+  text-align: center;
+  color: var(--dtp-fg-muted);
+  font-size: 13px;
+}
+.dtp-empty-state p {
+  margin: 0;
+}
+
+/* ---- error cards (RFC 028 V3; blocks/chart.js, blocks/markdown.js,
+ * interact.js modal failures) ----
+ * "Make them look intentional": a bordered, lightly-tinted inline alert using
+ * --dtp-danger (reused verbatim from ui/product's --status-fail-bg), nested
+ * inside the block's normal card chrome rather than recoloring the whole
+ * block's border. */
+.dtp-error-card {
+  color: var(--dtp-fg-muted);
+  background: color-mix(in srgb, var(--dtp-danger) 10%, var(--dtp-surface));
+  border: 1px solid color-mix(in srgb, var(--dtp-danger) 40%, var(--dtp-border));
+  border-radius: var(--dtp-radius);
+  padding: var(--dtp-space-2) var(--dtp-space-3);
 }
 
 /* ---- markdown (blocks/markdown.js) ---- */
@@ -160,16 +259,35 @@ body {
   font-weight: 600;
   margin-bottom: var(--dtp-space-2);
 }
+/* ---- table toolbar: search + CSV download (RFC 028 V3) ---- */
+.dtp-table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--dtp-space-2);
+  margin-bottom: var(--dtp-space-2);
+}
 .dtp-table-search {
   display: block;
   width: 100%;
   max-width: 260px;
-  margin-bottom: var(--dtp-space-2);
+  margin-bottom: 0;
   padding: var(--dtp-space-1) var(--dtp-space-2);
   color: var(--dtp-fg);
   background: var(--dtp-bg);
   border: 1px solid var(--dtp-border);
   border-radius: var(--dtp-radius);
+}
+/* .dtp-table-download shares its look with .dtp-modal-trigger (interact.js) —
+ * see that rule below, which lists both selectors together. */
+.dtp-table-download {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.dtp-table-empty-row td {
+  text-align: center;
+  color: var(--dtp-fg-muted);
+  font-style: italic;
+  padding: var(--dtp-space-3);
 }
 .dtp-table-scroll {
   overflow-x: auto;
@@ -269,8 +387,13 @@ body {
 }
 
 /* ---- modals (interact.js) ---- */
-.dtp-modal-trigger {
-  margin-top: var(--dtp-space-2);
+/* .dtp-table-download (blocks/table.js's CSV export button, RFC 028 V3)
+ * shares this exact look — a plain, secondary, bordered button — with
+ * .dtp-modal-trigger; only .dtp-modal-trigger needs the top margin (it sits
+ * below block content, whereas the download button sits inline in the table
+ * toolbar). */
+.dtp-modal-trigger,
+.dtp-table-download {
   color: var(--dtp-fg);
   background: var(--dtp-bg);
   border: 1px solid var(--dtp-border);
@@ -278,6 +401,13 @@ body {
   padding: var(--dtp-space-1) var(--dtp-space-2);
   font: inherit;
   cursor: pointer;
+}
+.dtp-modal-trigger {
+  margin-top: var(--dtp-space-2);
+}
+.dtp-modal-trigger:hover,
+.dtp-table-download:hover {
+  background: var(--dtp-surface);
 }
 .dtp-has-modal {
   cursor: pointer;
@@ -374,4 +504,57 @@ body {
   border-radius: var(--dtp-radius);
   padding: var(--dtp-space-2) var(--dtp-space-3);
   font-size: 12px;
+}
+
+/* =====================================================================
+ * Print (RFC 028 V3; spec §6.3 "PDF export: print stylesheet +
+ * window.print()"): hide chrome/filters/interactive controls, avoid slicing
+ * a block across a page break, and force a light theme so charts + tables
+ * stay legible on paper regardless of the viewer's on-screen light/dark
+ * preference. `window.print()` (the browser's native print command / Cmd+P)
+ * is the trigger — this file is purely the stylesheet side.
+ *
+ * Placed AFTER the prefers-color-scheme:dark block ABOVE, on purpose: both
+ * blocks set `:root` custom properties (equal selector specificity), so when
+ * a viewer prints while their OS is in dark mode, source order is what
+ * decides the tiebreak — this block must come last in the file to win.
+ * ===================================================================== */
+@media print {
+  :root {
+    color-scheme: light;
+    --dtp-bg: #ffffff;
+    --dtp-fg: #1a1c1f;
+    --dtp-fg-muted: #5c6066;
+    --dtp-border: #d8dbe0;
+    --dtp-surface: #f5f6f7;
+  }
+
+  /* On-screen-only chrome: none of this has a printed function. Hiding the
+   * whole toolbar (not just its search input) also avoids a residual blank
+   * gap where the row's own spacing would otherwise still take up space. */
+  .dtp-table-toolbar,
+  .dtp-modal-trigger,
+  .dtp-tab-bar,
+  .dtp-block-filter,
+  .dtp-modal-backdrop,
+  .dtp-refresh-overlay,
+  .dtp-refresh-error {
+    display: none !important;
+  }
+
+  /* Keep a block from being sliced across a page boundary. */
+  .dtp-block {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Vega (blocks/chart.js, via shell.js's mountVegaLiteChart) renders chart
+   * text as real SVG <text fill="…"> DOM, colored from whatever theme
+   * (possibly dark) was active at MOUNT time — the :root override above
+   * cannot repaint that on its own. Data marks (bars/lines/points) are left
+   * alone: their colors are the platform categorical palette, not a theme
+   * text color, and already legible on white. */
+  .dtp-chart-mount svg text {
+    fill: #1a1c1f !important;
+  }
 }

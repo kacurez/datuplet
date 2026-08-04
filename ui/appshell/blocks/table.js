@@ -10,8 +10,20 @@
 // cell array (["a", 1]) and the object form ({cells:[…], modal?}). A row-level
 // modal (spec §6.3) makes that row clickable, opening the modal via interact.js
 // (the sort/search/numeric logic still operates purely over the cell arrays).
+//
+// V3 additions (spec §6.3 "CSV export"): a "Download CSV" button next to the
+// search box exports the CURRENTLY VISIBLE rows — after search, in the
+// current sort order, what-you-see-is-what-you-download — via csv.js's pure
+// buildCSV (OWASP formula-injection escaping + RFC 4180 quoting), downloaded
+// as a same-origin Blob (spec §6.4: cell data is never injected into the DOM
+// as markup, and this makes no network call). A table with zero rows shows
+// the shared empty state instead of a pointless search/download bar over
+// nothing; a search with no matches shows an inline "no rows match" row
+// instead of leaving the body silently blank.
 
 import { attachModalTrigger } from "../interact.js";
+import { renderEmptyState } from "../shell.js";
+import { buildCSV } from "../csv.js";
 
 // renderTable builds a searchable, sortable table for the block.
 export function renderTable(block) {
@@ -31,13 +43,36 @@ export function renderTable(block) {
   // but never clone the cell arrays.
   const rowModals = new WeakMap();
   const rows = normalizeRows(block && block.rows, rowModals);
+
+  // Empty state (spec brief: "a table … with no data") — no data at all, not
+  // just a search with no matches (that case is handled inside renderBody
+  // below, once the toolbar/table below actually exist).
+  if (rows.length === 0) {
+    el.appendChild(renderEmptyState("No data to display."));
+    return el;
+  }
+
   const numeric = columns.map((_c, i) => isNumericColumn(rows, i));
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "dtp-table-toolbar";
 
   const search = document.createElement("input");
   search.type = "search";
   search.className = "dtp-table-search";
   search.placeholder = "Search…";
-  el.appendChild(search);
+  toolbar.appendChild(search);
+
+  const download = document.createElement("button");
+  download.type = "button";
+  download.className = "dtp-table-download";
+  download.textContent = "Download CSV";
+  download.addEventListener("click", () => {
+    downloadCSV(csvFilename(block), columns, visibleRows().map((row) => row.map(cellText)));
+  });
+  toolbar.appendChild(download);
+
+  el.appendChild(toolbar);
 
   const scroll = document.createElement("div");
   scroll.className = "dtp-table-scroll";
@@ -109,7 +144,22 @@ export function renderTable(block) {
 
   function renderBody() {
     tbody.textContent = "";
-    for (const row of visibleRows()) {
+    const visible = visibleRows();
+    if (visible.length === 0) {
+      // The table HAS data (the rows.length===0 case returned early above) —
+      // this is search finding no matches, not "no data". Keep the toolbar
+      // visible (so the user can clear the search) and explain the blank body
+      // instead of leaving it silently empty.
+      const tr = document.createElement("tr");
+      tr.className = "dtp-table-empty-row";
+      const td = document.createElement("td");
+      td.colSpan = Math.max(1, columns.length);
+      td.textContent = "No rows match your search.";
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+    for (const row of visible) {
       const tr = document.createElement("tr");
       for (let i = 0; i < columns.length; i++) {
         const td = document.createElement("td");
@@ -162,7 +212,50 @@ function isNumericColumn(rows, i) {
 }
 
 // cellText is the single stringification point for a cell value — always a
-// plain string destined for textContent, never markup.
+// plain string destined for textContent (or, for CSV export below, csv.js's
+// buildCSV), never markup.
 function cellText(v) {
   return v === null || v === undefined ? "" : String(v);
+}
+
+// csvFilename derives a filesystem-safe .csv filename from the block's title
+// (falling back to its id, then a generic default): lowercased, runs of
+// non-[a-z0-9] characters collapsed to a single hyphen, leading/trailing
+// hyphens trimmed. Never derived from cell DATA — only the block's own
+// title/id, which (like every other text field) is still just app-controlled
+// text, but a filename is a much smaller, easier-to-make-safe surface than a
+// full CSV body.
+function csvFilename(block) {
+  const base = (block && (block.title || block.id)) || "table";
+  const slug = String(base)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return (slug || "table") + ".csv";
+}
+
+// downloadCSV builds the CSV text (csv.js's buildCSV — OWASP formula-escaped,
+// RFC 4180-quoted) and downloads it as a same-origin Blob: no network call,
+// and the CSV text is never injected into the DOM as markup (spec §6.4) — it
+// only ever exists as Blob content handed straight to the browser's download
+// machinery via a throwaway, never-visible <a download>. The UTF-8 BOM
+// prefix on the Blob (not part of the CSV text itself, so it never touches
+// buildCSV's return value or the golden fixture) helps spreadsheet apps that
+// sniff encoding by BOM open non-ASCII content correctly.
+function downloadCSV(filename, columns, rows) {
+  const csv = buildCSV(columns, rows);
+  // Built via fromCharCode rather than a literal character in source, so no
+  // invisible byte ever sits in this file (diff/editor safety).
+  const BOM = String.fromCharCode(0xfeff);
+  const blob = new Blob([BOM, csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  // Deferred rather than immediate: some browsers need the object URL to
+  // stay valid a tick past the synchronous click() hand-off.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
