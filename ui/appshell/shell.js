@@ -10,29 +10,32 @@
 // V1, marked + DOMPurify with a fixed allowlist) — NEVER innerHTML or
 // insertAdjacentHTML with doc-derived text.
 //
-// V0 scope: read the doc, render the title, and dispatch each top-level
-// block to a renderer looked up in RENDERERS by its `type` (spec §6.3:
-// markdown | metric | table | chart | filter | tabs). No renderer is
-// registered yet — V1 adds them one type at a time — so every block renders
-// through renderUnknownBlock for now. Interactivity (filters, tabs, modals,
-// auto-refresh, CSV export) is V1+; this module has no re-render / fetch
-// logic.
+// Scope: read the doc, render the title, and dispatch each top-level block to a
+// renderer looked up in RENDERERS by its `type` (spec §6.3: markdown | metric |
+// table | chart | filter | tabs). All six renderers are registered (V1: the
+// four data blocks; V2: filter + tabs). Interactivity — filters, tabs, modals,
+// partial refresh, and auto-refresh — lives in interact.js (spec §6.3 "All
+// dynamics live in the platform-owned shell"); this module owns the mount
+// primitives (RENDERERS, renderBlock, applyDoc, boot) and hands interact.js the
+// two it needs so there is no import cycle.
 
 import { renderMarkdown } from "./blocks/markdown.js";
 import { renderMetric } from "./blocks/metric.js";
 import { renderTable } from "./blocks/table.js";
 import { renderChart } from "./blocks/chart.js";
+import { renderFilter } from "./blocks/filter.js";
+import { renderTabs } from "./blocks/tabs.js";
+import { initInteract, onBooted, attachModalTrigger } from "./interact.js";
 
 const ROOT_ID = "dtp-root";
 const DOC_SCRIPT_ID = "dtp-doc";
 
 /**
  * RENDERERS maps an OutputDoc block `type` to a function `(block) => Node`.
- * V1 registers the four data-block renderers here; each lives in its own
- * ui/appshell/blocks/ module. The remaining vocabulary (filter, tabs) is
- * later work — a block whose type is absent from RENDERERS falls back to
- * renderUnknownBlock, so a doc the shell doesn't fully understand yet still
- * renders every OTHER block instead of failing the whole page.
+ * All six block types of the v1 vocabulary are registered; each lives in its
+ * own ui/appshell/blocks/ module. A block whose type is somehow absent from
+ * RENDERERS still falls back to renderUnknownBlock, so a doc the shell doesn't
+ * fully understand renders every OTHER block instead of failing the whole page.
  *
  * Each renderer returns a Node synchronously; markdown and chart return a
  * container with a loading state and fill it in once their lazily-imported
@@ -45,7 +48,29 @@ export const RENDERERS = {
   metric: renderMetric,
   table: renderTable,
   chart: renderChart,
+  filter: renderFilter,
+  tabs: renderTabs,
 };
+
+/**
+ * renderBlock dispatches one block through RENDERERS (falling back to
+ * renderUnknownBlock) and, if the block declares a `modal` (spec §6.3), wires
+ * an open affordance for it via interact.js. This is the single dispatch point
+ * every mount site uses — top-level blocks, tabs' nested blocks, and modal
+ * bodies — so modal wiring and the unknown-type fallback are applied uniformly.
+ *
+ * @param {Record<string, unknown>} block
+ * @returns {Node}
+ */
+export function renderBlock(block) {
+  const type = block && typeof block === "object" ? block.type : undefined;
+  const renderer = (typeof type === "string" && RENDERERS[type]) || renderUnknownBlock;
+  const node = renderer(block);
+  if (block && typeof block === "object" && block.modal && typeof block.modal === "object") {
+    attachModalTrigger(node, block.modal);
+  }
+  return node;
+}
 
 /**
  * renderUnknownBlock is the fallback for any block type absent from
@@ -128,8 +153,7 @@ function renderTitle(root, doc) {
 }
 
 /**
- * renderBlocks dispatches every top-level block through RENDERERS,
- * falling back to renderUnknownBlock for any type not yet registered.
+ * renderBlocks dispatches every top-level block through renderBlock.
  * @param {Element} root
  * @param {Record<string, unknown>} doc
  */
@@ -138,27 +162,44 @@ function renderBlocks(root, doc) {
   const container = document.createElement("div");
   container.className = "dtp-blocks";
   for (const block of blocks) {
-    const type = block && typeof block === "object" ? block.type : undefined;
-    const renderer = (typeof type === "string" && RENDERERS[type]) || renderUnknownBlock;
-    container.appendChild(renderer(block));
+    container.appendChild(renderBlock(block));
   }
   root.appendChild(container);
 }
 
 /**
- * boot reads the embedded OutputDoc and mounts it into #dtp-root. Exported
- * so V1+ can re-invoke it (e.g. after a partial re-render swaps the JSON
- * island's content) without re-running this module's top-level side effect.
+ * applyDoc renders an OutputDoc into #dtp-root: it clears the mount and mounts
+ * the title + blocks. This is the swap step of every render — the initial page
+ * (boot) and every re-render (interact.js after a filter change, onClick,
+ * navigation, or auto-refresh poll) call it with the doc to show. It performs
+ * NO fetch and starts NO scheduler, so interact.js can call it freely.
+ *
+ * @param {Record<string, unknown>} doc
  */
-export function boot() {
+export function applyDoc(doc) {
   const root = document.getElementById(ROOT_ID);
   if (!root) {
     throw new Error("dtp: missing #" + ROOT_ID + " mount point");
   }
-  root.textContent = ""; // clear the pre-render skeleton/loading state
-  const doc = readEmbeddedDoc();
+  root.textContent = ""; // clear the previous render / pre-render skeleton
   renderTitle(root, doc);
   renderBlocks(root, doc);
 }
 
+/**
+ * boot reads the embedded OutputDoc, mounts it, and hands off to interact.js
+ * to start auto-refresh and restore any deep-linked modal. Re-renders do NOT
+ * go through boot — they call applyDoc directly with a freshly fetched doc —
+ * so the JSON island is read exactly once, at initial load.
+ */
+export function boot() {
+  const doc = readEmbeddedDoc();
+  applyDoc(doc);
+  onBooted(doc);
+}
+
+// Hand interact.js the two mount primitives it needs (kept as an injection
+// rather than an import, so interact.js has no cycle with this module), then
+// mount the initial doc.
+initInteract({ applyDoc, renderBlock });
 boot();

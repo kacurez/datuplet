@@ -22,10 +22,13 @@ import (
 // appshell.IndexHTML's doc comment).
 var shellAssetPaths = []string{
 	"shell.js",
+	"interact.js",
 	"blocks/markdown.js",
 	"blocks/metric.js",
 	"blocks/table.js",
 	"blocks/chart.js",
+	"blocks/filter.js",
+	"blocks/tabs.js",
 	"theme.css",
 	"vegaspec.schema.json",
 	"vendor/vega.min.js",
@@ -36,14 +39,18 @@ var shellAssetPaths = []string{
 }
 
 // shellRendererJS is every platform-owned JS module that reaches a viewer's
-// browser (the boot loader + the four V1 block renderers). The §6.4 source-level
-// security guards below run across ALL of them, not just shell.js.
+// browser (the boot loader, the interactivity hub, and the six block
+// renderers). The §6.4 source-level security guards below run across ALL of
+// them, not just shell.js.
 var shellRendererJS = []string{
 	"shell.js",
+	"interact.js",
 	"blocks/markdown.js",
 	"blocks/metric.js",
 	"blocks/table.js",
 	"blocks/chart.js",
+	"blocks/filter.js",
+	"blocks/tabs.js",
 }
 
 // TestShellAssets_ServedAtReservedPath proves every embedded shell asset is
@@ -218,8 +225,10 @@ func stripWhitespace(s string) string {
 // chokepoint with the platform theme + client-side subset validation.
 // ===========================================================================
 
-// TestShellJS_RegistersAllBlockRenderers proves shell.js wires each V1 renderer
-// into RENDERERS by block type — the seam boot()/renderBlocks() dispatch on.
+// TestShellJS_RegistersAllBlockRenderers proves shell.js wires every renderer
+// of the v1 vocabulary into RENDERERS by block type — the seam
+// boot()/renderBlocks() dispatch on. V2 adds filter + tabs to the four V1
+// data-block renderers, so all six block types are now registered.
 func TestShellJS_RegistersAllBlockRenderers(t *testing.T) {
 	got := stripWhitespace(readShellAsset(t, "shell.js"))
 	for _, want := range []string{
@@ -227,10 +236,14 @@ func TestShellJS_RegistersAllBlockRenderers(t *testing.T) {
 		`import{renderMetric}from"./blocks/metric.js"`,
 		`import{renderTable}from"./blocks/table.js"`,
 		`import{renderChart}from"./blocks/chart.js"`,
+		`import{renderFilter}from"./blocks/filter.js"`,
+		`import{renderTabs}from"./blocks/tabs.js"`,
 		`markdown:renderMarkdown`,
 		`metric:renderMetric`,
 		`table:renderTable`,
 		`chart:renderChart`,
+		`filter:renderFilter`,
+		`tabs:renderTabs`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("shell.js does not register a renderer as expected: missing %q", want)
@@ -472,6 +485,177 @@ func TestShell_EmbedsAllV1BlockTypes(t *testing.T) {
 		id, _ := b["id"].(string)
 		if want, ok := wantType[id]; !ok || b["type"] != want {
 			t.Errorf("block %q has type %v, want %v", id, b["type"], want)
+		}
+	}
+}
+
+// ===========================================================================
+// RFC 028 Part 4 (V2): interactivity source-level guards.
+//
+// The live behavior — a filter change re-rendering, a modal opening, the tab
+// hidden pausing auto-refresh — is V4's manual browser checklist (no headless
+// harness; no build step). What a Go test CAN assert is what is statically true
+// of the shipped JS: the re-render fetch carries the exact CSRF/Accept/body
+// contract, every interaction fetch is same-origin, params are string-only, the
+// scheduler honors visibility + Retry-After and never drops below the 15s clamp,
+// onClick binds to the vega view, and modal content renders through the SAME
+// renderer registry (no second, unsanitized path).
+// ===========================================================================
+
+// TestInteract_RerenderPostContract proves the re-render fetch is the exact
+// POST the server's response matrix (§4.2) + CSRF check (§5.3) require: method
+// POST, Accept: application/json, Content-Type: application/json, the shell's
+// X-Datuplet-App-Render: 1 header, and a body that is the current param state.
+func TestInteract_RerenderPostContract(t *testing.T) {
+	got := stripWhitespace(readShellAsset(t, "interact.js"))
+	for _, want := range []string{
+		`method:"POST"`,
+		`Accept:"application/json"`,
+		`"Content-Type":"application/json"`,
+		`"X-Datuplet-App-Render":"1"`,
+		`body:JSON.stringify(getParams())`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("interact.js re-render fetch is missing the required contract token %q", want)
+		}
+	}
+	// The single-block partial fetch (lazy modals) rides the query string as
+	// `?block=<id>` (matches the §4.2 matrix), not a body key.
+	if !strings.Contains(got, `"?block="`) {
+		t.Error("interact.js does not select a single block via ?block= for partial (modal) fetches")
+	}
+}
+
+// TestInteract_FetchesAreSameOrigin proves no interaction module reaches a new
+// origin (spec §6.4 CSP connect-src 'self'): no scheme/authority URL appears in
+// any of them, and interact.js — the only one that fetches — builds its request
+// URL from location.pathname (same-origin, path-relative).
+func TestInteract_FetchesAreSameOrigin(t *testing.T) {
+	for _, path := range []string{"interact.js", "blocks/filter.js", "blocks/tabs.js"} {
+		src := readShellAsset(t, path)
+		if strings.Contains(src, "://") {
+			t.Errorf("%s contains a scheme/authority URL (\"://\") — every interaction fetch must be same-origin/path-relative", path)
+		}
+	}
+	interact := readShellAsset(t, "interact.js")
+	if !strings.Contains(interact, "fetch(") {
+		t.Fatal("interact.js has no fetch() — the re-render path is missing")
+	}
+	if !strings.Contains(interact, "location.pathname") {
+		t.Error("interact.js does not build its fetch URL from location.pathname (same-origin)")
+	}
+}
+
+// TestInteract_ParamsAreStringOnly proves the re-render body can only ever carry
+// string values (§6.5 "no type coercion — apps parse their own numbers"; W6
+// REJECTS non-string body values): params come from URLSearchParams (whose
+// values are strings) and the body is JSON.stringify of exactly that map.
+func TestInteract_ParamsAreStringOnly(t *testing.T) {
+	got := stripWhitespace(readShellAsset(t, "interact.js"))
+	if !strings.Contains(got, "newURLSearchParams(location.search)") {
+		t.Error("interact.js getParams does not read params from URLSearchParams (string values by construction)")
+	}
+	if !strings.Contains(got, `body:JSON.stringify(getParams())`) {
+		t.Error("interact.js re-render body is not JSON.stringify(getParams()) — string-only guarantee lost")
+	}
+	// The reserved platform names are stripped from ctx.params on the way out.
+	if !strings.Contains(readShellAsset(t, "interact.js"), "RESERVED_PARAMS") {
+		t.Error("interact.js does not strip reserved param names (token/block) from getParams")
+	}
+}
+
+// TestInteract_AutoRefreshVisibilityRetryAfterFloor proves the refreshInterval
+// scheduler (spec §6.3): ±10% jitter, pause while the tab is hidden, exponential
+// backoff on 429/503 honoring Retry-After, and — the load-bearing invariant — a
+// 15s floor it can never drop below (the server clamps; this is the client-side
+// guarantee a bundle can never drive sub-15s re-rendering).
+func TestInteract_AutoRefreshVisibilityRetryAfterFloor(t *testing.T) {
+	src := readShellAsset(t, "interact.js")
+	got := stripWhitespace(src)
+
+	// 15s floor: the constant, and the clamp that applies it as a lower bound.
+	if !strings.Contains(got, "MIN_REFRESH_SECONDS=15") {
+		t.Error("interact.js does not define the 15s minimum refresh floor")
+	}
+	if !strings.Contains(got, "Math.max(MIN_REFRESH_SECONDS,raw)") {
+		t.Error("interact.js does not clamp the refresh interval up to the 15s floor")
+	}
+	// Visibility pause.
+	if !strings.Contains(src, "visibilitychange") || !strings.Contains(got, `visibilityState==="hidden"`) {
+		t.Error("interact.js does not pause auto-refresh while the tab is hidden (spec §6.3)")
+	}
+	// Backoff on 429/503 honoring Retry-After.
+	for _, want := range []string{"429", "503", `"Retry-After"`, "parseRetryAfter"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("interact.js backoff is missing %q (429/503 + Retry-After handling)", want)
+		}
+	}
+	// ±10% jitter.
+	if !strings.Contains(got, "REFRESH_JITTER=0.1") {
+		t.Error("interact.js does not apply ±10% jitter to the refresh cadence")
+	}
+	// The backoff never falls below the base interval (which is >= the floor).
+	if !strings.Contains(got, "Math.max(base,seconds)") {
+		t.Error("interact.js backoff does not keep the delay at or above the base interval")
+	}
+}
+
+// TestInteract_ChartOnClickBindsVegaView proves the onClick cross-filter binding
+// (spec §6.3 onClick:{param}): chart.js hands the resolved vega view + the
+// declared param to interact.js's bindChartOnClick, which listens on the view
+// and sets the param (triggering a re-render) — config, not code.
+func TestInteract_ChartOnClickBindsVegaView(t *testing.T) {
+	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
+	if !strings.Contains(chart, `import{bindChartOnClick}from"../interact.js"`) {
+		t.Error("chart.js does not import bindChartOnClick from interact.js")
+	}
+	if !strings.Contains(chart, "bindChartOnClick(result.view,param)") {
+		t.Error("chart.js does not bind onClick to the resolved vega view (result.view)")
+	}
+	interact := stripWhitespace(readShellAsset(t, "interact.js"))
+	if !strings.Contains(interact, `view.addEventListener("click"`) {
+		t.Error("interact.js bindChartOnClick does not add a click listener to the vega view")
+	}
+	if !strings.Contains(interact, "setParam(param,String(value))") {
+		t.Error("interact.js bindChartOnClick does not set the named param (as a string) from the clicked datum")
+	}
+}
+
+// TestInteract_ModalsRenderThroughRegistry proves both modal forms and that
+// modal content — inline OR lazily fetched via block=<id> — is rendered through
+// the SAME renderer registry the page uses (deps.renderBlock, injected from
+// shell.js), so partial content is sanitized identically (no second path).
+func TestInteract_ModalsRenderThroughRegistry(t *testing.T) {
+	got := stripWhitespace(readShellAsset(t, "interact.js"))
+	// Inline form renders already-present blocks; lazy form fetches block=<param>.
+	if !strings.Contains(got, "fetchRender({block:param})") {
+		t.Error("interact.js lazy modal does not fetch its content via the block=<id> partial render")
+	}
+	if !strings.Contains(got, "deps.renderBlock(block)") {
+		t.Error("interact.js modals do not render blocks through the shared renderBlock registry")
+	}
+	// Modal state deep-links via a URL param (setParams with the lazy param).
+	if !strings.Contains(readShellAsset(t, "interact.js"), "restoreModalDeepLink") {
+		t.Error("interact.js does not restore a deep-linked modal from the URL param")
+	}
+}
+
+// TestShellJS_RerenderPrimitivesWiredToInteract proves shell.js exposes the two
+// mount primitives interact.js needs and injects them via initInteract, and that
+// renderBlock (the single dispatch point) wires modal triggers — so a re-render
+// or a modal reuses the exact same registry-driven, sanitized render path.
+func TestShellJS_RerenderPrimitivesWiredToInteract(t *testing.T) {
+	got := stripWhitespace(readShellAsset(t, "shell.js"))
+	for _, want := range []string{
+		`import{initInteract,onBooted,attachModalTrigger}from"./interact.js"`,
+		`initInteract({applyDoc,renderBlock})`,
+		`exportfunctionapplyDoc(doc)`,
+		`exportfunctionrenderBlock(block)`,
+		`attachModalTrigger(node,block.modal)`,
+		`onBooted(doc)`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("shell.js is missing the interact wiring token %q", want)
 		}
 	}
 }

@@ -7,8 +7,11 @@
 // sort numerically, others lexically; click toggles asc/desc) and a
 // search/filter box, both operating over the delivered rows. Numeric columns
 // are right-aligned with tabular-nums. Handles BOTH W1 row shapes — a plain
-// cell array (["a", 1]) and the object form ({cells:[…], modal?}); the modal is
-// not surfaced in v1 (modal interactivity is later work, spec §6.3).
+// cell array (["a", 1]) and the object form ({cells:[…], modal?}). A row-level
+// modal (spec §6.3) makes that row clickable, opening the modal via interact.js
+// (the sort/search/numeric logic still operates purely over the cell arrays).
+
+import { attachModalTrigger } from "../interact.js";
 
 // renderTable builds a searchable, sortable table for the block.
 export function renderTable(block) {
@@ -23,7 +26,11 @@ export function renderTable(block) {
   }
 
   const columns = block && Array.isArray(block.columns) ? block.columns.map(String) : [];
-  const rows = normalizeRows(block && block.rows);
+  // rowModals maps a row's cell-array reference -> its modal spec (object-form
+  // rows only). Keyed by reference so it survives filter/sort, which reorder
+  // but never clone the cell arrays.
+  const rowModals = new WeakMap();
+  const rows = normalizeRows(block && block.rows, rowModals);
   const numeric = columns.map((_c, i) => isNumericColumn(rows, i));
 
   const search = document.createElement("input");
@@ -110,6 +117,8 @@ export function renderTable(block) {
         td.textContent = cellText(row[i]);
         tr.appendChild(td);
       }
+      const modal = rowModals.get(row);
+      if (modal) attachModalTrigger(tr, modal, { asRow: true });
       tbody.appendChild(tr);
     }
   }
@@ -121,11 +130,17 @@ export function renderTable(block) {
 }
 
 // normalizeRows accepts BOTH W1 row shapes and returns an array of cell arrays.
-function normalizeRows(rows) {
+// For an object-form row carrying a modal, the modal is recorded in rowModals
+// keyed by the returned cell-array reference (so renderBody can wire it without
+// changing the search/sort/numeric logic, which stays purely over cell arrays).
+function normalizeRows(rows, rowModals) {
   if (!Array.isArray(rows)) return [];
   return rows.map((row) => {
     if (Array.isArray(row)) return row;
-    if (row && typeof row === "object" && Array.isArray(row.cells)) return row.cells;
+    if (row && typeof row === "object" && Array.isArray(row.cells)) {
+      if (rowModals && row.modal && typeof row.modal === "object") rowModals.set(row.cells, row.modal);
+      return row.cells;
+    }
     return [];
   });
 }

@@ -18,6 +18,7 @@
 // and likewise cached.
 
 import { mountVegaLiteChart } from "../shell.js";
+import { bindChartOnClick } from "../interact.js";
 
 // ui/product-derived categorical palette (spec §6.4 "the `ui/product` palette").
 // Anchored on ui/product's accent (#3ecf8e) and status hues (#eab308 warning,
@@ -119,7 +120,17 @@ export function renderChart(block) {
         return undefined;
       }
       mount.textContent = "";
-      return mountVegaLiteChart(mount, spec, buildThemeConfig());
+      return mountVegaLiteChart(mount, spec, buildThemeConfig()).then((result) => {
+        // Cross-filter binding (spec §6.3 onClick: {param}). Only when the
+        // block declares it; the shell sets the param + re-renders — config,
+        // not code. The vega view is reached via vega-embed's resolved result;
+        // the binding itself lives in interact.js (the one owner of param state).
+        const param = block && block.onClick ? block.onClick.param : undefined;
+        if (typeof param === "string" && result && result.view) {
+          bindChartOnClick(result.view, param);
+        }
+        return result;
+      });
     })
     .catch(() => {
       mount.textContent = "This chart could not be displayed.";

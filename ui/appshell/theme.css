@@ -208,3 +208,170 @@ body {
   color: var(--dtp-fg-muted);
   overflow-x: auto;
 }
+
+/* ---- filter (blocks/filter.js) ---- */
+.dtp-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dtp-space-3);
+  align-items: flex-end;
+}
+.dtp-filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dtp-space-1);
+}
+.dtp-filter-label {
+  color: var(--dtp-fg-muted);
+  font-size: 12px;
+}
+.dtp-filter-control {
+  color: var(--dtp-fg);
+  background: var(--dtp-bg);
+  border: 1px solid var(--dtp-border);
+  border-radius: var(--dtp-radius);
+  padding: var(--dtp-space-1) var(--dtp-space-2);
+  font: inherit;
+}
+.dtp-filter-checkbox {
+  align-self: flex-start;
+}
+
+/* ---- tabs (blocks/tabs.js) ---- */
+.dtp-tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dtp-space-1);
+  border-bottom: 1px solid var(--dtp-border);
+  margin-bottom: var(--dtp-space-3);
+}
+.dtp-tab {
+  color: var(--dtp-fg-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: var(--dtp-space-2) var(--dtp-space-3);
+  font: inherit;
+  cursor: pointer;
+}
+.dtp-tab:hover {
+  color: var(--dtp-fg);
+}
+.dtp-tab-active {
+  color: var(--dtp-fg);
+  border-bottom-color: var(--dtp-fg);
+  font-weight: 600;
+}
+.dtp-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dtp-space-3);
+}
+
+/* ---- modals (interact.js) ---- */
+.dtp-modal-trigger {
+  margin-top: var(--dtp-space-2);
+  color: var(--dtp-fg);
+  background: var(--dtp-bg);
+  border: 1px solid var(--dtp-border);
+  border-radius: var(--dtp-radius);
+  padding: var(--dtp-space-1) var(--dtp-space-2);
+  font: inherit;
+  cursor: pointer;
+}
+.dtp-has-modal {
+  cursor: pointer;
+}
+.dtp-has-modal:hover {
+  background: var(--dtp-surface);
+}
+.dtp-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: var(--dtp-space-4) var(--dtp-space-3);
+  overflow-y: auto;
+  z-index: 100;
+}
+.dtp-modal {
+  background: var(--dtp-bg);
+  color: var(--dtp-fg);
+  border: 1px solid var(--dtp-border);
+  border-radius: var(--dtp-radius);
+  width: 100%;
+  max-width: 720px;
+  margin: auto;
+}
+.dtp-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--dtp-space-3);
+  padding: var(--dtp-space-3);
+  border-bottom: 1px solid var(--dtp-border);
+}
+.dtp-modal-title {
+  font-weight: 600;
+}
+.dtp-modal-close {
+  color: var(--dtp-fg-muted);
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.dtp-modal-body {
+  padding: var(--dtp-space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--dtp-space-3);
+}
+
+/* ---- re-render loading state (interact.js) ---- */
+/* Stale-while-revalidating (spec §6.3): the current dashboard stays visible,
+ * dimmed, with a spinner, while a re-render is in flight. */
+.dtp-refreshing {
+  opacity: 0.6;
+  pointer-events: none;
+}
+.dtp-refresh-overlay {
+  position: fixed;
+  top: var(--dtp-space-3);
+  right: var(--dtp-space-3);
+  z-index: 200;
+}
+.dtp-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--dtp-border);
+  border-top-color: var(--dtp-fg);
+  border-radius: 50%;
+  animation: dtp-spin 0.7s linear infinite;
+}
+@keyframes dtp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dtp-spinner {
+    animation: none;
+  }
+}
+.dtp-refresh-error {
+  position: fixed;
+  bottom: var(--dtp-space-3);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  color: var(--dtp-fg);
+  background: var(--dtp-surface);
+  border: 1px solid var(--dtp-border);
+  border-radius: var(--dtp-radius);
+  padding: var(--dtp-space-2) var(--dtp-space-3);
+  font-size: 12px;
+}
