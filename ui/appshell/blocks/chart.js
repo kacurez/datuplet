@@ -133,6 +133,11 @@ export function renderChart(block) {
         mount.appendChild(renderEmptyState("No data to display."));
         return undefined;
       }
+      // If the mount detached while Vega + the schema loaded (a superseded
+      // re-render, a tab switch, or a modal close during this async import+embed
+      // chain — none of which the render seq-token's fetch-abort cancels), do
+      // NOT embed into a dead node. RFC 028 V4 gate fix (detached-mount race).
+      if (!mount.isConnected) return undefined;
       mount.textContent = "";
       return mountVegaLiteChart(mount, spec, buildThemeConfig()).then((result) => {
         // Cross-filter binding (spec §6.3 onClick: {param}). Only when the

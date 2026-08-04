@@ -1254,3 +1254,50 @@ func TestPrintCSS_HidesChromeForcesLightPageBreak(t *testing.T) {
 		t.Error("theme.css's @media print block does not recolor chart text for paper")
 	}
 }
+
+// ===========================================================================
+// RFC 028 Part 4 (V4 gate fix): extend the Vega finalize discipline to the two
+// paths V2/V3 did not wire it into — a tab switch, and a chart whose mount
+// detaches before its async embed resolves. Live "view count stays flat" is a
+// V4 browser-checklist item; these are the statically-checkable guards.
+// ===========================================================================
+
+// TestTabsRenderer_FinalizesViewsBeforeClearingPanel proves Finding 1: a tab
+// switch finalizes the outgoing panel's Vega views BEFORE dropping their DOM,
+// exactly as applyDoc does before clearing root — otherwise switching away from
+// a chart tab leaks the view/dataflow/timers/click-listener.
+func TestTabsRenderer_FinalizesViewsBeforeClearingPanel(t *testing.T) {
+	src := readShellAsset(t, "blocks/tabs.js")
+	if !strings.Contains(stripWhitespace(src), `import{finalizeVegaViewsWithin}from"../interact.js"`) {
+		t.Error("tabs.js does not import finalizeVegaViewsWithin from interact.js")
+	}
+	idxFinalize := strings.Index(src, "finalizeVegaViewsWithin(panel)")
+	idxClear := strings.Index(src, `panel.textContent = ""`)
+	if idxFinalize < 0 || idxClear < 0 {
+		t.Fatalf("tabs.js show() is missing the finalize (%d) or the panel clear (%d)", idxFinalize, idxClear)
+	}
+	if idxFinalize > idxClear {
+		t.Error("tabs.js show() clears the panel BEFORE finalizing its vega views — a tab switch leaks the outgoing chart")
+	}
+}
+
+// TestChartRenderer_GuardsDetachedMountRace proves Finding 2: a chart whose
+// mount detaches before its async import+embed resolves is finalized rather
+// than left live and unregistered-for-cleanup. chart.js skips embedding into an
+// already-detached node (isConnected pre-check), and interact.js's
+// registerVegaView finalizes-and-drops a view whose mount detached during the
+// embed (an orphan finalizeVegaViewsWithin(root) would never reach).
+func TestChartRenderer_GuardsDetachedMountRace(t *testing.T) {
+	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
+	if !strings.Contains(chart, "if(!mount.isConnected)returnundefined") {
+		t.Error("chart.js does not skip embedding into a detached mount (isConnected pre-check)")
+	}
+	interact := stripWhitespace(readShellAsset(t, "interact.js"))
+	if !strings.Contains(interact, "entry.mount.isConnected===false") {
+		t.Error("interact.js registerVegaView does not detect an already-detached mount")
+	}
+	// The detached branch must FINALIZE (not merely skip) so nothing leaks.
+	if !strings.Contains(interact, "if(!entry.mount||entry.mount.isConnected===false){finalizeVegaEntry(entry);") {
+		t.Error("interact.js registerVegaView does not finalize a detached-mount view (it would leak)")
+	}
+}

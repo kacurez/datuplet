@@ -704,9 +704,19 @@ function firstDatumValue(datum) {
 const liveVegaViews = new Set();
 
 // registerVegaView records a mounted chart so it can be finalized before its
-// DOM is removed. Called by blocks/chart.js once vega-embed resolves.
+// DOM is removed. Called by blocks/chart.js once vega-embed resolves. If the
+// mount has ALREADY detached by the time the embed resolves (a superseded
+// re-render, a tab switch, or a modal close during the async import+embed
+// chain), the view is an orphan finalizeVegaViewsWithin(root) would never reach
+// — its mount is inside no root — so it is finalized-and-dropped here instead of
+// being registered for a cleanup that never comes. RFC 028 V4 gate fix.
 export function registerVegaView(entry) {
-  if (entry && entry.result) liveVegaViews.add(entry);
+  if (!entry || !entry.result) return;
+  if (!entry.mount || entry.mount.isConnected === false) {
+    finalizeVegaEntry(entry); // finalize + remove listener now; not added to the live set
+    return;
+  }
+  liveVegaViews.add(entry);
 }
 
 // finalizeVegaEntry finalizes one embed result and removes its click listener.

@@ -14,6 +14,7 @@
 // Tab shape (W1 tabsBlock schema): tabs[]{label, blocks[]}.
 
 import { renderBlock } from "../shell.js";
+import { finalizeVegaViewsWithin } from "../interact.js";
 
 // renderTabs builds a client-side tab strip + panel for the block.
 export function renderTabs(block) {
@@ -32,6 +33,11 @@ export function renderTabs(block) {
   const buttons = [];
 
   function show(index) {
+    // Finalize the outgoing tab's Vega views BEFORE dropping their DOM — a bare
+    // panel.textContent="" would leak the view's dataflow/timers/click-listener
+    // (same discipline applyDoc/closeActiveModal use before clearing; a tab
+    // switch clears its own panel and must not bypass it). RFC 028 V4 gate fix.
+    finalizeVegaViewsWithin(panel);
     panel.textContent = "";
     const tab = tabs[index];
     const blocks = tab && Array.isArray(tab.blocks) ? tab.blocks : [];
