@@ -68,7 +68,15 @@ export function renderTable(block) {
   download.className = "dtp-table-download";
   download.textContent = "Download CSV";
   download.addEventListener("click", () => {
-    downloadCSV(csvFilename(block), columns, visibleRows().map((row) => row.map(cellText)));
+    // Project each row through `columns` — the SAME list and index-based
+    // accessor the render loop below uses (`for (let i = 0; i < columns.length;
+    // i++) ... cellText(row[i])`) — not the whole row array unbounded. A row
+    // with MORE cells than columns would otherwise leak un-rendered trailing
+    // cells into the export; a row with FEWER cells would desync the CSV's
+    // field count from its header (`columns`). A missing cell (row[i] ===
+    // undefined) becomes the same blank string cellText already gives it in
+    // the table (RFC 028 V3 Codex fix: what-you-see-is-what-you-download).
+    downloadCSV(csvFilename(block), columns, visibleRows().map((row) => columns.map((_c, i) => cellText(row[i]))));
   });
   toolbar.appendChild(download);
 

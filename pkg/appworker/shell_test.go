@@ -9,6 +9,7 @@ package appworker
 import (
 	"io"
 	"net/http"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -899,6 +900,109 @@ func TestCSVGolden_OWASPEscapingAndRFC4180Quoting(t *testing.T) {
 	}
 }
 
+// ===========================================================================
+// RFC 028 Part 4 (V3 fix round): Codex Major finding on commit 74b0740.
+//
+// blocks/table.js's CSV download handler used to map over the WHOLE row
+// array (`visibleRows().map((row) => row.map(cellText))`), unbounded by
+// `columns` — but the render loop (table.js's renderBody) draws exactly
+// `columns.length` cells per row (`for (let i = 0; i < columns.length; i++)
+// ... cellText(row[i])`). An over-wide row (more cells than columns) leaked
+// un-rendered trailing cells into the export; a short row (fewer cells than
+// columns) produced a CSV whose data fields didn't line up with the header
+// row. The fix projects each row through the SAME `columns` list and the
+// SAME index-based `cellText(row[i])` accessor the renderer uses.
+//
+// projectRowGolden below is a Go PORT of the FIXED projection; it is checked
+// against the two cases the fix addresses, and contrasted against
+// projectRowBuggyGolden (a Go port of the PRE-fix shape) to demonstrate, in
+// Go, why the old shape was wrong for both. The shipped table.js is pinned to
+// the fixed shape at the source level by
+// TestTableRenderer_CSVExportProjectsThroughRenderedColumns below (source-
+// level, since there is no JS runtime here — see the V3 CSV section above for
+// why that is this file's established way of closing this gap). Mutation-
+// tested: reverting table.js to the pre-fix line FAILs that test (see
+// task-V3-report.md's fix-round section); reverted byte-identically.
+// ===========================================================================
+
+// projectRowGolden is a Go PORT of the FIXED table.js download-handler
+// projection: `columns.map((_c, i) => cellText(row[i]))`. `row` here is
+// already-stringified cell text (as cellText would produce); a "missing"
+// cell is modeled by `row` simply being shorter than `columns` (in JS,
+// `row[i]` for an out-of-range `i` is `undefined`, and `cellText(undefined)
+// === ""`).
+func projectRowGolden(columns []string, row []string) []string {
+	out := make([]string, len(columns))
+	for i := range columns {
+		if i < len(row) {
+			out[i] = row[i]
+		} else {
+			out[i] = "" // cellText(undefined) === ""
+		}
+	}
+	return out
+}
+
+// projectRowBuggyGolden is a Go PORT of the PRE-FIX table.js download
+// handler (commit 74b0740): `row.map(cellText)` — the whole row, unbounded by
+// `columns`. Kept ONLY so TestCSVGolden_RowProjectionMatchesRenderedColumns
+// can demonstrate this shape is wrong for both fixture cases below; nothing
+// else in this file should ever call it.
+func projectRowBuggyGolden(row []string) []string {
+	return row
+}
+
+// TestCSVGolden_RowProjectionMatchesRenderedColumns is the golden-fixture
+// extension for the Codex Major finding: an over-wide row's extra cells are
+// dropped, and a short row is padded blank to the header's field count — the
+// CSV a viewer downloads must have exactly the fields the table rendered, no
+// more, no less.
+func TestCSVGolden_RowProjectionMatchesRenderedColumns(t *testing.T) {
+	t.Run("over-wide row: extra cells beyond columns are dropped, not exported", func(t *testing.T) {
+		columns := []string{"A", "B"}
+		row := []string{"1", "2", "3", "4"} // 4 cells, only 2 columns — table renders just A, B
+		want := []string{"1", "2"}
+
+		got := projectRowGolden(columns, row)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("projectRowGolden(%v, %v) = %v, want %v", columns, row, got, want)
+		}
+		// Demonstrate the bug this fixes: the pre-fix shape leaks the two
+		// un-rendered trailing cells straight into the export.
+		if buggy := projectRowBuggyGolden(row); reflect.DeepEqual(buggy, want) {
+			t.Fatalf("fixture is broken: the PRE-FIX projection %v must NOT already equal the fixed expectation %v", buggy, want)
+		}
+	})
+
+	t.Run("short row: missing cells are padded blank to match the header width", func(t *testing.T) {
+		columns := []string{"A", "B", "C"}
+		row := []string{"1"} // 1 cell, 3 columns — table renders A="1", B="", C=""
+		want := []string{"1", "", ""}
+
+		got := projectRowGolden(columns, row)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("projectRowGolden(%v, %v) = %v, want %v", columns, row, got, want)
+		}
+		// Demonstrate the bug this fixes: the pre-fix shape produces a row with
+		// FEWER fields than the header, desyncing every column after it.
+		if buggy := projectRowBuggyGolden(row); len(buggy) == len(want) {
+			t.Fatalf("fixture is broken: the PRE-FIX projection %v must NOT already have the fixed field count %d", buggy, len(want))
+		}
+	})
+
+	// End-to-end through the full pipeline (project -> escape -> quote): an
+	// over-wide row whose extra cell would ALSO have been formula-escaped had
+	// it leaked through must not appear in the final CSV text at all.
+	got := buildCSVGolden(
+		[]string{"Name", "Note"},
+		[][]string{projectRowGolden([]string{"Name", "Note"}, []string{"Widget", "=EVIL()", "=ALSO_EVIL()"})},
+	)
+	want := "Name,Note\r\nWidget,'=EVIL()\r\n"
+	if got != want {
+		t.Errorf("end-to-end projected+escaped CSV =\n%q\nwant\n%q (the dropped extra cell must not appear anywhere)", got, want)
+	}
+}
+
 // TestCSVModule_TriggerSetAndQuotingMatchGolden pins the SHIPPED csv.js to
 // the exact same rule set TestCSVGolden_* exercises in Go, at the source
 // level: the trigger-character array (all six, nothing extra), the RFC 4180
@@ -973,6 +1077,33 @@ func TestTableRenderer_CSVDownloadIsBlobNotInnerHTML(t *testing.T) {
 	}
 	if loc := innerHTMLUsage.FindString(src); loc != "" {
 		t.Errorf("table.js must never use innerHTML/insertAdjacentHTML — found %q", loc)
+	}
+}
+
+// TestTableRenderer_CSVExportProjectsThroughRenderedColumns proves the fix
+// for the Codex Major finding on commit 74b0740: the CSV download handler
+// projects each row through the SAME `columns` list and index-based
+// `cellText(row[i])` accessor the render loop (table.js's renderBody, `for
+// (let i = 0; i < columns.length; i++) ... cellText(row[i])`) uses — never
+// the whole row array unbounded. Without this, an over-wide row leaks
+// un-rendered trailing cells into the export, and a short row desyncs the
+// CSV's field count from its header. See TestCSVGolden_RowProjectionMatchesRenderedColumns
+// for the Go-side proof that the fixed projection produces the right shape
+// for both cases. Mutation-tested: reverting to the pre-fix
+// `visibleRows().map((row) => row.map(cellText))` FAILs this test (see
+// task-V3-report.md's fix-round section); reverted byte-identically.
+func TestTableRenderer_CSVExportProjectsThroughRenderedColumns(t *testing.T) {
+	got := stripWhitespace(readShellAsset(t, "blocks/table.js"))
+
+	want := stripWhitespace(`visibleRows().map((row) => columns.map((_c, i) => cellText(row[i])))`)
+	if !strings.Contains(got, want) {
+		t.Errorf("table.js's CSV download does not project each row through columns (missing %q) — it may leak un-rendered cells or desync the header/row field count", want)
+	}
+
+	// The pre-fix shape (the whole row, unbounded by columns) must be gone.
+	preFix := stripWhitespace(`visibleRows().map((row) => row.map(cellText))`)
+	if strings.Contains(got, preFix) {
+		t.Error("table.js's CSV download still maps the whole row unbounded by columns — the Codex Major finding on commit 74b0740 is not fixed")
 	}
 }
 
