@@ -25,16 +25,19 @@ import "embed"
 var IndexHTML []byte
 
 // Assets is the servable static subtree mounted at /apps/-/shell/ by
-// app-worker: the boot module, the base stylesheet, the vendored
-// third-party libraries (see vendor/VERSIONS — NOT yet the genuine upstream
-// builds, see that file's STATUS section), and the client-side
-// defense-in-depth copy of the restricted Vega-Lite subset schema, kept
-// byte-identical to pkg/appengine/vegaspec/schema.json by `make
+// app-worker: the boot module, the four block renderers (RFC 028 V1;
+// blocks/*.js, statically imported by shell.js and served for the browser to
+// load), the base stylesheet, the vendored third-party libraries (see
+// vendor/VERSIONS — NOT yet the genuine upstream builds, see that file's
+// STATUS section, lazy-imported same-origin by the renderers), and the
+// client-side defense-in-depth copy of the restricted Vega-Lite subset
+// schema, kept byte-identical to pkg/appengine/vegaspec/schema.json by `make
 // sync-appshell-schema` and TestVegaSchemaInSyncWithShell.
 //
 // index.html is deliberately NOT in this set (see IndexHTML above).
 //
 //go:embed shell.js theme.css vegaspec.schema.json
+//go:embed blocks/markdown.js blocks/metric.js blocks/table.js blocks/chart.js
 //go:embed vendor/vega.min.js vendor/vega-lite.min.js vendor/vega-embed.min.js
 //go:embed vendor/purify.min.js vendor/marked.min.js
 var Assets embed.FS

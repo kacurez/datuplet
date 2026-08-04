@@ -91,11 +91,120 @@ body {
   background: var(--dtp-surface);
 }
 
-/* V0's only renderer output: every block type falls back to this until V1
- * registers the real markdown/metric/table/chart/filter/tabs renderers. */
+/* The remaining unregistered block types (filter, tabs) still fall back to
+ * this until their renderers land. */
 .dtp-block-unknown {
   color: var(--dtp-fg-muted);
   font-family: var(--dtp-mono);
   font-size: 12px;
   border-style: dashed;
+}
+
+/* ---- markdown (blocks/markdown.js) ---- */
+.dtp-markdown-body > :first-child {
+  margin-top: 0;
+}
+.dtp-markdown-body > :last-child {
+  margin-bottom: 0;
+}
+.dtp-markdown-body a {
+  color: inherit;
+  text-decoration: underline;
+}
+.dtp-markdown-body code {
+  font-family: var(--dtp-mono);
+  font-size: 0.9em;
+}
+.dtp-markdown-body pre {
+  overflow-x: auto;
+  background: var(--dtp-bg);
+  padding: var(--dtp-space-2);
+  border-radius: var(--dtp-radius);
+}
+.dtp-markdown-body pre code {
+  font-size: inherit;
+}
+.dtp-markdown-body table {
+  border-collapse: collapse;
+}
+.dtp-markdown-body th,
+.dtp-markdown-body td {
+  border: 1px solid var(--dtp-border);
+  padding: var(--dtp-space-1) var(--dtp-space-2);
+}
+
+/* ---- metric (blocks/metric.js) ---- */
+.dtp-metric-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dtp-space-4);
+}
+.dtp-metric-tile {
+  flex: 1 1 140px;
+  min-width: 120px;
+}
+.dtp-metric-value {
+  font-size: 24px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+.dtp-metric-label {
+  color: var(--dtp-fg-muted);
+  font-size: 12px;
+  margin-top: var(--dtp-space-1);
+}
+
+/* ---- table (blocks/table.js) ---- */
+.dtp-table-title {
+  font-weight: 600;
+  margin-bottom: var(--dtp-space-2);
+}
+.dtp-table-search {
+  display: block;
+  width: 100%;
+  max-width: 260px;
+  margin-bottom: var(--dtp-space-2);
+  padding: var(--dtp-space-1) var(--dtp-space-2);
+  color: var(--dtp-fg);
+  background: var(--dtp-bg);
+  border: 1px solid var(--dtp-border);
+  border-radius: var(--dtp-radius);
+}
+.dtp-table-scroll {
+  overflow-x: auto;
+}
+.dtp-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.dtp-table th,
+.dtp-table td {
+  padding: var(--dtp-space-1) var(--dtp-space-2);
+  border-bottom: 1px solid var(--dtp-border);
+  text-align: left;
+}
+.dtp-table th {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+/* Numeric columns: right-aligned with tabular figures (spec §6.3). */
+.dtp-table .dtp-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.dtp-sort-caret {
+  color: var(--dtp-fg-muted);
+}
+
+/* ---- chart (blocks/chart.js) ---- */
+.dtp-chart-title {
+  font-weight: 600;
+  margin-bottom: var(--dtp-space-2);
+}
+.dtp-chart-mount {
+  min-height: 40px;
+  color: var(--dtp-fg-muted);
+  overflow-x: auto;
 }

@@ -11,17 +11,15 @@
 <script id="dtp-doc" type="application/json"><!--DTP:DOC--></script>
 <!--
   Vendored third-party libraries (ui/appshell/vendor/, versions pinned in
-  vendor/VERSIONS) loaded as classic, non-module scripts so they attach their
-  UMD globals (vega, vegaLite, vegaEmbed, DOMPurify, marked) before shell.js
-  runs. Load order matters: vega before vega-lite before vega-embed.
-  Same-origin only (spec §6.4 CSP script-src 'self') — see
-  TestShell_ReferencesOnlySameOriginAssets.
+  vendor/VERSIONS) are NOT eager-loaded here (RFC 028 V1 maintainer decision).
+  Each renderer lazy-imports its own heavy dependency on first use, from the
+  same-origin /apps/-/shell/vendor/ path only: blocks/chart.js dynamic-imports
+  the vega trio (vega, vega-lite, vega-embed), blocks/markdown.js
+  dynamic-imports marked + DOMPurify. A metric/table-only dashboard never pays
+  for vega, and every import stays same-origin so the CSP (script-src 'self')
+  and the same-origin invariant still hold — no CDN, ever. Only the platform
+  boot module is loaded up front.
 -->
-<script src="/apps/-/shell/vendor/vega.min.js"></script>
-<script src="/apps/-/shell/vendor/vega-lite.min.js"></script>
-<script src="/apps/-/shell/vendor/vega-embed.min.js"></script>
-<script src="/apps/-/shell/vendor/purify.min.js"></script>
-<script src="/apps/-/shell/vendor/marked.min.js"></script>
 <script type="module" src="/apps/-/shell/shell.js"></script>
 </body>
 </html>

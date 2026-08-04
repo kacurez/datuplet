@@ -18,19 +18,34 @@
 // auto-refresh, CSV export) is V1+; this module has no re-render / fetch
 // logic.
 
+import { renderMarkdown } from "./blocks/markdown.js";
+import { renderMetric } from "./blocks/metric.js";
+import { renderTable } from "./blocks/table.js";
+import { renderChart } from "./blocks/chart.js";
+
 const ROOT_ID = "dtp-root";
 const DOC_SCRIPT_ID = "dtp-doc";
 
 /**
  * RENDERERS maps an OutputDoc block `type` to a function `(block) => Node`.
- * V1 populates this registry one block type at a time. A block whose type
- * is absent from RENDERERS (in V0, every type) falls back to
+ * V1 registers the four data-block renderers here; each lives in its own
+ * ui/appshell/blocks/ module. The remaining vocabulary (filter, tabs) is
+ * later work — a block whose type is absent from RENDERERS falls back to
  * renderUnknownBlock, so a doc the shell doesn't fully understand yet still
  * renders every OTHER block instead of failing the whole page.
  *
+ * Each renderer returns a Node synchronously; markdown and chart return a
+ * container with a loading state and fill it in once their lazily-imported
+ * dependency resolves (see blocks/markdown.js, blocks/chart.js).
+ *
  * @type {Record<string, (block: Record<string, unknown>) => Node>}
  */
-export const RENDERERS = {};
+export const RENDERERS = {
+  markdown: renderMarkdown,
+  metric: renderMetric,
+  table: renderTable,
+  chart: renderChart,
+};
 
 /**
  * renderUnknownBlock is the fallback for any block type absent from
@@ -62,21 +77,28 @@ function renderUnknownBlock(block) {
  * vega-embed's built-in "open in Vega editor / view source / export" menu,
  * which would otherwise let a spec round-trip through an external site.
  *
- * Not called by anything in V0 — no chart renderer is registered in
- * RENDERERS yet. V1's chart renderer MUST route through this function
- * rather than calling `vegaEmbed` directly, so the lockdown can never be
- * forgotten at a second call site.
+ * V1's chart renderer (blocks/chart.js) routes through this function rather
+ * than calling `vegaEmbed` directly, so the lockdown can never be forgotten
+ * at a second call site. `config` is the PLATFORM Vega theme, authored by
+ * the chart renderer and passed in here (spec §6.4: chart config comes from
+ * the platform, never the app — an author `config` key is rejected by the
+ * vegaspec subset schema outright, so `spec` can carry none). The lockdown
+ * (`actions:false` + the load-rejecting loader) stays hardcoded here so a
+ * caller cannot override it.
  *
  * @param {Element} el
  * @param {Record<string, unknown>} spec - already validated against
  *   vegaspec.schema.json (client-side defense-in-depth; app-worker is the
  *   authoritative gate, spec §6.4).
+ * @param {Record<string, unknown>} [config] - platform-owned Vega config
+ *   (theme). Never derived from `spec`.
  * @returns {Promise<unknown>}
  */
-export function mountVegaLiteChart(el, spec) {
+export function mountVegaLiteChart(el, spec, config) {
   return window.vegaEmbed(el, spec, {
     actions: false,
     loader: { load: () => Promise.reject(new Error("loading disabled")) },
+    config,
   });
 }
 
