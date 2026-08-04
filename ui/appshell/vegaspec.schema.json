@@ -1,0 +1,460 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datuplet.io/schemas/vegaspec-v1.json",
+  "title": "Datuplet restricted Vega-Lite subset (RFC 028 spec 6.4)",
+  "description": "The normative allowlist for chart-block specs. Anything not enumerated here is rejected: additionalProperties is false at every level except inside data.values rows, which are data, not directives.",
+  "type": "object",
+  "required": ["mark"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "pattern": "^https://vega\\.github\\.io/schema/vega-lite/v[0-9][0-9.]*\\.json$"
+    },
+    "title": { "type": "string" },
+    "description": { "type": "string" },
+    "width": { "$ref": "#/$defs/size" },
+    "height": { "$ref": "#/$defs/size" },
+    "data": { "$ref": "#/$defs/data" },
+    "mark": { "$ref": "#/$defs/mark" },
+    "encoding": { "$ref": "#/$defs/encoding" },
+    "transform": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/transform" }
+    }
+  },
+  "$defs": {
+    "size": {
+      "oneOf": [
+        { "type": "number", "minimum": 0 },
+        { "const": "container" },
+        {
+          "type": "object",
+          "required": ["step"],
+          "additionalProperties": false,
+          "properties": { "step": { "type": "number", "minimum": 0 } }
+        }
+      ]
+    },
+
+    "data": {
+      "description": "Inline values only. data.url, named datasets and generator sources are rejected: the viewer's browser must never be steerable to an author-chosen host.",
+      "type": "object",
+      "required": ["values"],
+      "additionalProperties": false,
+      "properties": {
+        "values": {
+          "type": "array",
+          "items": {
+            "type": ["object", "string", "number", "boolean", "null"]
+          }
+        }
+      }
+    },
+
+    "markType": {
+      "enum": [
+        "bar",
+        "line",
+        "area",
+        "point",
+        "circle",
+        "square",
+        "tick",
+        "rect",
+        "rule",
+        "text",
+        "arc"
+      ]
+    },
+
+    "mark": {
+      "oneOf": [
+        { "$ref": "#/$defs/markType" },
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "$ref": "#/$defs/markType" },
+            "tooltip": {
+              "oneOf": [
+                { "type": ["boolean", "null"] },
+                {
+                  "type": "object",
+                  "required": ["content"],
+                  "additionalProperties": false,
+                  "properties": { "content": { "enum": ["encoding", "data"] } }
+                }
+              ]
+            },
+            "point": {
+              "oneOf": [{ "type": "boolean" }, { "const": "transparent" }]
+            },
+            "interpolate": { "type": "string" },
+            "opacity": { "type": "number" },
+            "filled": { "type": "boolean" },
+            "size": { "type": "number" },
+            "cornerRadius": { "type": "number" },
+            "orient": { "type": "string" },
+            "fontSize": { "type": "number" }
+          }
+        }
+      ]
+    },
+
+    "encoding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "x": { "$ref": "#/$defs/channelDef" },
+        "y": { "$ref": "#/$defs/channelDef" },
+        "xOffset": { "$ref": "#/$defs/channelDef" },
+        "yOffset": { "$ref": "#/$defs/channelDef" },
+        "color": { "$ref": "#/$defs/channelDef" },
+        "opacity": { "$ref": "#/$defs/channelDef" },
+        "size": { "$ref": "#/$defs/channelDef" },
+        "shape": { "$ref": "#/$defs/channelDef" },
+        "theta": { "$ref": "#/$defs/channelDef" },
+        "radius": { "$ref": "#/$defs/channelDef" },
+        "text": { "$ref": "#/$defs/channelDef" },
+        "tooltip": { "$ref": "#/$defs/channelDef" },
+        "order": { "$ref": "#/$defs/channelDef" },
+        "detail": { "$ref": "#/$defs/channelDef" }
+      }
+    },
+
+    "channelDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "field": { "type": "string" },
+        "type": { "type": "string" },
+        "value": { "type": ["string", "number", "boolean", "null"] },
+        "aggregate": { "type": "string" },
+        "bin": { "$ref": "#/$defs/bin" },
+        "timeUnit": { "type": "string" },
+        "sort": { "$ref": "#/$defs/sort" },
+        "stack": { "type": ["string", "boolean", "null"] },
+        "title": { "type": ["string", "null"] },
+        "format": { "type": "string" },
+        "scale": { "$ref": "#/$defs/scale" },
+        "axis": {
+          "oneOf": [{ "$ref": "#/$defs/guide" }, { "type": "null" }]
+        },
+        "legend": {
+          "oneOf": [{ "$ref": "#/$defs/guide" }, { "type": "null" }]
+        },
+        "condition": { "$ref": "#/$defs/condition" }
+      }
+    },
+
+    "bin": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "const": "binned" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "anchor": { "type": "number" },
+            "base": { "type": "number" },
+            "binned": { "type": "boolean" },
+            "divide": { "type": "array", "items": { "type": "number" } },
+            "extent": { "type": "array", "items": { "type": "number" } },
+            "maxbins": { "type": "number" },
+            "minstep": { "type": "number" },
+            "nice": { "type": "boolean" },
+            "step": { "type": "number" },
+            "steps": { "type": "array", "items": { "type": "number" } }
+          }
+        }
+      ]
+    },
+
+    "sort": {
+      "oneOf": [
+        { "type": ["string", "null"] },
+        {
+          "type": "array",
+          "items": { "type": ["string", "number", "boolean"] }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "field": { "type": "string" },
+            "op": { "type": "string" },
+            "order": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+
+    "scale": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string" },
+        "domain": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": { "type": ["string", "number", "boolean", "null"] }
+            },
+            { "type": "string" }
+          ]
+        },
+        "range": {
+          "oneOf": [
+            { "type": "array", "items": { "type": ["string", "number"] } },
+            { "type": "string" }
+          ]
+        },
+        "scheme": { "$ref": "#/$defs/colorScheme" },
+        "zero": { "type": "boolean" },
+        "nice": { "type": ["boolean", "number", "string"] }
+      }
+    },
+
+    "colorScheme": {
+      "description": "Vega's named-scheme list only. A free-form string here would be a resource name the renderer could be asked to resolve.",
+      "enum": [
+        "accent",
+        "category10",
+        "category20",
+        "category20b",
+        "category20c",
+        "dark2",
+        "paired",
+        "pastel1",
+        "pastel2",
+        "set1",
+        "set2",
+        "set3",
+        "tableau10",
+        "tableau20",
+        "observable10",
+        "blues",
+        "tealblues",
+        "teals",
+        "greens",
+        "browns",
+        "greys",
+        "purples",
+        "warmgreys",
+        "reds",
+        "oranges",
+        "turbo",
+        "viridis",
+        "inferno",
+        "magma",
+        "plasma",
+        "cividis",
+        "bluegreen",
+        "bluepurple",
+        "goldgreen",
+        "goldorange",
+        "goldred",
+        "greenblue",
+        "orangered",
+        "purplebluegreen",
+        "purpleblue",
+        "purplered",
+        "redpurple",
+        "yellowgreenblue",
+        "yellowgreen",
+        "yelloworangebrown",
+        "yelloworangered",
+        "darkblue",
+        "darkgold",
+        "darkgreen",
+        "darkmulti",
+        "darkred",
+        "lightgreyred",
+        "lightgreyteal",
+        "lightmulti",
+        "lightorange",
+        "lightteal",
+        "blueorange",
+        "brownbluegreen",
+        "purplegreen",
+        "pinkyellowgreen",
+        "purpleorange",
+        "redblue",
+        "redgrey",
+        "redyellowblue",
+        "redyellowgreen",
+        "spectral",
+        "rainbow",
+        "sinebow"
+      ]
+    },
+
+    "guide": {
+      "description": "axis / legend — presentation fields only.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": ["string", "null"] },
+        "format": { "type": "string" },
+        "labelAngle": { "type": "number" },
+        "grid": { "type": "boolean" },
+        "orient": { "type": "string" },
+        "tickCount": { "type": "number" },
+        "values": {
+          "type": "array",
+          "items": { "type": ["string", "number", "boolean"] }
+        }
+      }
+    },
+
+    "condition": {
+      "type": "object",
+      "required": ["test"],
+      "additionalProperties": false,
+      "properties": {
+        "test": { "type": "string" },
+        "value": { "type": ["string", "number", "boolean", "null"] },
+        "field": { "type": "string" }
+      },
+      "oneOf": [{ "required": ["value"] }, { "required": ["field"] }]
+    },
+
+    "transform": {
+      "description": "The eight allowed transforms. lookup is absent (it can carry URL data); loess / regression / density / quantile are out of scope for v1.",
+      "oneOf": [
+        { "$ref": "#/$defs/calculateTransform" },
+        { "$ref": "#/$defs/filterTransform" },
+        { "$ref": "#/$defs/aggregateTransform" },
+        { "$ref": "#/$defs/binTransform" },
+        { "$ref": "#/$defs/timeUnitTransform" },
+        { "$ref": "#/$defs/windowTransform" },
+        { "$ref": "#/$defs/foldTransform" },
+        { "$ref": "#/$defs/pivotTransform" }
+      ]
+    },
+
+    "calculateTransform": {
+      "type": "object",
+      "required": ["calculate", "as"],
+      "additionalProperties": false,
+      "properties": {
+        "calculate": { "type": "string" },
+        "as": { "type": "string" }
+      }
+    },
+
+    "filterTransform": {
+      "type": "object",
+      "required": ["filter"],
+      "additionalProperties": false,
+      "properties": {
+        "filter": { "type": "string" }
+      }
+    },
+
+    "aggregateTransform": {
+      "type": "object",
+      "required": ["aggregate"],
+      "additionalProperties": false,
+      "properties": {
+        "aggregate": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/opFieldDef" }
+        },
+        "groupby": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "binTransform": {
+      "type": "object",
+      "required": ["bin", "field", "as"],
+      "additionalProperties": false,
+      "properties": {
+        "bin": { "$ref": "#/$defs/bin" },
+        "field": { "type": "string" },
+        "as": { "$ref": "#/$defs/asName" }
+      }
+    },
+
+    "timeUnitTransform": {
+      "type": "object",
+      "required": ["timeUnit", "field", "as"],
+      "additionalProperties": false,
+      "properties": {
+        "timeUnit": { "type": "string" },
+        "field": { "type": "string" },
+        "as": { "$ref": "#/$defs/asName" }
+      }
+    },
+
+    "windowTransform": {
+      "type": "object",
+      "required": ["window"],
+      "additionalProperties": false,
+      "properties": {
+        "window": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/opFieldDef" }
+        },
+        "groupby": { "type": "array", "items": { "type": "string" } },
+        "sort": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "field": { "type": "string" },
+              "order": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "frame": {
+          "type": "array",
+          "items": { "type": ["number", "null"] }
+        }
+      }
+    },
+
+    "foldTransform": {
+      "type": "object",
+      "required": ["fold"],
+      "additionalProperties": false,
+      "properties": {
+        "fold": { "type": "array", "items": { "type": "string" } },
+        "as": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "pivotTransform": {
+      "type": "object",
+      "required": ["pivot", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "pivot": { "type": "string" },
+        "value": { "type": "string" },
+        "groupby": { "type": "array", "items": { "type": "string" } },
+        "op": { "type": "string" }
+      }
+    },
+
+    "opFieldDef": {
+      "type": "object",
+      "required": ["op", "as"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "type": "string" },
+        "field": { "type": "string" },
+        "as": { "type": "string" }
+      }
+    },
+
+    "asName": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    }
+  }
+}

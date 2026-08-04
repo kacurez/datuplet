@@ -1,0 +1,46 @@
+# ui/appshell/vendor/ — pinned third-party libraries (RFC 028 Part 4)
+#
+# Format per library: name, pinned version, upstream source, license.
+# These are the versions PLANNED for vendoring. See "STATUS" below before
+# assuming the checked-in .min.js files are the genuine upstream builds.
+
+vega           5.31.0   https://github.com/vega/vega/releases/tag/v5.31.0                    BSD-3-Clause
+vega-lite      5.23.0   https://github.com/vega/vega-lite/releases/tag/v5.23.0                BSD-3-Clause
+vega-embed     6.29.0   https://github.com/vega/vega-embed/releases/tag/v6.29.0               BSD-3-Clause
+dompurify      3.2.3    https://github.com/cure53/DOMPurify/releases/tag/3.2.3                (Apache-2.0 OR MPL-2.0)
+marked         14.1.4   https://github.com/markedjs/marked/releases/tag/v14.1.4               MIT
+
+Fetch path convention (standalone UMD/global browser builds, not the ESM
+source): jsDelivr mirrors each package's published npm tarball, e.g.
+  https://cdn.jsdelivr.net/npm/vega@5.31.0/build/vega.min.js
+  https://cdn.jsdelivr.net/npm/vega-lite@5.23.0/build/vega-lite.min.js
+  https://cdn.jsdelivr.net/npm/vega-embed@6.29.0/build/vega-embed.min.js
+  https://cdn.jsdelivr.net/npm/dompurify@3.2.3/dist/purify.min.js
+  https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js
+marked has moved its published browser-bundle path across majors (root
+marked.min.js on older releases, lib/marked.umd.js on some newer ones) —
+confirm the exact dist path for the pinned version against that release's
+package.json "files"/"browser" field before fetching.
+
+## STATUS: NOT YET VENDORED — placeholder files checked in instead
+
+This agent (Claude Code, running Task V0 non-interactively) operates under a
+tool-use safety policy that requires a live user's explicit, in-chat "yes"
+before downloading any file from the network, and had no channel to ask for
+or receive that approval during this task. Fetching and committing a
+third-party JS bundle that will execute in every viewer's browser is exactly
+the kind of action that policy gates, so rather than silently fetch the real
+libraries (bypassing the gate) or silently ship something mislabeled, the
+five vendor/*.min.js files in this directory are intentionally-inert
+placeholders: each defines its expected global (window.vega, window.vegaLite,
+window.vegaEmbed, window.DOMPurify, window.marked) but throws a clear error
+naming this file if actually called, instead of pretending to work.
+
+ACTION REQUIRED before charts/markdown rendering can work end-to-end (V1+):
+a human (or an agent turn with a live user present to grant download
+permission) must fetch the five URLs above — verifying each against the
+package's published integrity hash / npm provenance — and overwrite the
+corresponding vendor/*.min.js file byte-for-byte with the real release
+artifact. No other file in ui/appshell/ needs to change: index.html already
+references these exact paths, and shell.js's mountVegaLiteChart already
+calls window.vegaEmbed with the required network-loading lockdown.

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><!--DTP:TITLE--></title>
+<link rel="stylesheet" href="/apps/-/shell/theme.css">
+</head>
+<body>
+<div id="dtp-root"><p class="dtp-loading">Loading…</p></div>
+<script id="dtp-doc" type="application/json"><!--DTP:DOC--></script>
+<!--
+  Vendored third-party libraries (ui/appshell/vendor/, versions pinned in
+  vendor/VERSIONS) loaded as classic, non-module scripts so they attach their
+  UMD globals (vega, vegaLite, vegaEmbed, DOMPurify, marked) before shell.js
+  runs. Load order matters: vega before vega-lite before vega-embed.
+  Same-origin only (spec §6.4 CSP script-src 'self') — see
+  TestShell_ReferencesOnlySameOriginAssets.
+-->
+<script src="/apps/-/shell/vendor/vega.min.js"></script>
+<script src="/apps/-/shell/vendor/vega-lite.min.js"></script>
+<script src="/apps/-/shell/vendor/vega-embed.min.js"></script>
+<script src="/apps/-/shell/vendor/purify.min.js"></script>
+<script src="/apps/-/shell/vendor/marked.min.js"></script>
+<script type="module" src="/apps/-/shell/shell.js"></script>
+</body>
+</html>

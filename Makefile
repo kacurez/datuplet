@@ -16,7 +16,7 @@ export DOCKER_BUILDKIT=1
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
 	prune-images prune-docker-cache \
-	sync-component-schemas \
+	sync-component-schemas sync-appshell-schema \
 	lint chart-render-check tidy all help
 
 # =============================================================================
@@ -387,6 +387,16 @@ sync-component-schemas: ## Copy components/*/schema.json into the app chart
 		name=$$(basename $$(dirname $$f)); \
 		cp "$$f" "charts/datuplet-app/files/component-schemas/$$name.json"; \
 	done
+
+# RFC 028 spec §6.4 / V0 "Shared Vega schema": pkg/appengine/vegaspec/schema.json
+# (the restricted Vega-Lite subset, W2) is the source of truth; the browser
+# shell vendors a byte-identical copy for client-side defense-in-depth
+# validation (the server remains the authoritative gate). CI runs this target
+# then `git diff --exit-code ui/appshell/vegaspec.schema.json` to catch drift;
+# TestVegaSchemaInSyncWithShell (pkg/appengine/vegaspec) is the same check
+# inside `go test ./...`.
+sync-appshell-schema: ## Copy pkg/appengine/vegaspec/schema.json into ui/appshell/
+	@cp pkg/appengine/vegaspec/schema.json ui/appshell/vegaspec.schema.json
 
 # Static analysis and dead code detection. RFC 019 §4.10 bearer-redaction
 # is enforced via Stringer methods on the owned types (S3Creds, GCSCreds,

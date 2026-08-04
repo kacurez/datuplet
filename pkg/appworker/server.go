@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/datuplet/datuplet/pkg/appengine"
+	"github.com/datuplet/datuplet/ui/appshell"
 )
 
 // Engine is the subset of *appengine.Engine's behavior app-worker depends on.
@@ -121,11 +122,37 @@ const (
 		"connect-src 'self'; img-src 'self' data:; base-uri 'none'; " +
 		"form-action 'self'; frame-ancestors 'self'"
 
-	// shellDocScriptID is the element id the shell (Part 4) reads the embedded
-	// OutputDoc from.
+	// shellDocScriptID is the element id ui/appshell/index.html's doc island
+	// carries, and shell.js reads the embedded OutputDoc from. No longer
+	// interpolated at render time (Part 4 made index.html a real static
+	// asset with this id hardcoded) — kept as a named constant purely so
+	// tests assert against one source of truth instead of a repeated
+	// literal.
 	shellDocScriptID = "dtp-doc"
-	// shellRootID is the mount point the shell renders into.
+	// shellRootID is the mount point id ui/appshell/index.html hardcodes and
+	// shell.js renders into. See shellDocScriptID's comment on why this is a
+	// constant despite not being interpolated into the template anymore.
 	shellRootID = "dtp-root"
+
+	// shellAssetPrefix is where app-worker mounts the embedded
+	// ui/appshell.Assets subtree (shell.js, theme.css, the vendored
+	// third-party libraries, the vendored vegaspec schema copy) — the
+	// same-origin assets ui/appshell/index.html's <script src>/<link href>
+	// tags reference. "-" is a reserved pid sentinel: a real {pid} is a
+	// lakekeeper project id and can never literally be "-", so this literal
+	// subtree route can never collide with a real app's
+	// /apps/{pid}/{name}/{path...} URL, and Go 1.22 ServeMux resolves the
+	// ambiguity in this route's favor (a literal path segment is more
+	// specific than a wildcard at the same position) — proven by
+	// TestShellAssets_ServedAtReservedPath's resolveCalls assertion.
+	shellAssetPrefix = "/apps/-/shell/"
+
+	// shellTitlePlaceholder and shellDocPlaceholder are the two tokens
+	// ui/appshell/index.html carries for writeShell to substitute. They are
+	// HTML comments so the template renders inertly (e.g. in an editor
+	// preview) before substitution.
+	shellTitlePlaceholder = "<!--DTP:TITLE-->"
+	shellDocPlaceholder   = "<!--DTP:DOC-->"
 
 	// blockQueryParam selects a single block for a partial re-render
 	// (spec §4.2). One of the two reserved param names (with `token`) stripped
@@ -136,6 +163,12 @@ const (
 	// (spec §4.1).
 	draftSuffix = "@draft"
 )
+
+// shellTemplate is ui/appshell/index.html (RFC 028 Part 4), read once at
+// package init from the embedded asset. writeShell substitutes
+// shellTitlePlaceholder/shellDocPlaceholder into a copy of this string per
+// request; the template itself is immutable package state.
+var shellTemplate = string(appshell.IndexHTML)
 
 // Request-input normalization limits — spec §6.5/§7 verbatim.
 const (
@@ -319,6 +352,13 @@ func NewServer(cfg Config, engine Engine, opts ...ServerOption) *Server {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.metrics, promhttp.HandlerOpts{}))
+	// The trusted-shell static asset subtree (RFC 028 Part 4). Registered
+	// under the reserved "-" pid sentinel so it out-specificities the
+	// wildcard app route below for any request under shellAssetPrefix (see
+	// that constant's doc comment); registration order here does not matter
+	// to Go 1.22 ServeMux's specificity resolution, but the route is placed
+	// first for readability, next to the other non-app-render endpoints.
+	mux.Handle("GET "+shellAssetPrefix, shellAssetHandler())
 	// Two patterns, one handler: the bare app URL and any sub-path (which
 	// becomes ctx.path, spec §6.5).
 	mux.HandleFunc("/apps/{pid}/{name}", s.handleApp)
@@ -877,22 +917,48 @@ func wantsJSON(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept"), "application/json")
 }
 
-// writeShell emits the trusted viewer shell.
+// shellAssetHandler serves the trusted-viewer-shell static subtree embedded
+// in ui/appshell (shell.js, theme.css, the vendored third-party libraries,
+// and the client-side Vega-schema copy) at shellAssetPrefix.
 //
-// W6 STUB: this is `<!doctype html>` + the root div + the OutputDoc in a
-// `<script type="application/json">` tag, which is the contract Part 4's real
-// shell asset consumes. Part 4 REPLACES this template with the served asset;
-// nothing here is meant to be a UI.
+// Deliberately NOT behind handleApp: these are platform-owned, public,
+// tenant-agnostic files (no OutputDoc, no query data ever touches them), and
+// the viewer session cookie is scoped to Path=/apps/{pid}/{name} (spec
+// §5.3) — it would never even be attached to a request here, so the shell's
+// own assets cannot be gated behind the same per-app auth without breaking
+// every app that loads them. Bypassing handleApp also means these requests
+// are not access-logged or rate-limited, matching /healthz, /readyz, and
+// /metrics, which are the same kind of infrastructure endpoint.
+//
+// index.html is excluded on purpose (see appshell.IndexHTML's doc comment):
+// it is a server-side template, never a static file.
+func shellAssetHandler() http.Handler {
+	fileServer := http.FileServerFS(appshell.Assets)
+	return http.StripPrefix(shellAssetPrefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Refuse directory-style requests (the bare prefix, or any
+		// subdirectory with a trailing slash): the embedded FS has no
+		// index.html of its own, so http.FileServer would otherwise
+		// auto-generate a directory listing instead of a 404.
+		if r.URL.Path == "" || strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	}))
+}
+
+// writeShell emits the trusted viewer shell: ui/appshell/index.html (RFC 028
+// Part 4) with the OutputDoc's title and JSON substituted into its two
+// placeholders. The template's own <script src>/<link href> tags reference
+// ONLY same-origin assets served by shellAssetHandler — no CDN, no external
+// fonts (TestShell_ReferencesOnlySameOriginAssets enforces this).
 func (s *Server) writeShell(w http.ResponseWriter, doc json.RawMessage) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", shellCSP)
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w,
-		"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"+
-			"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"+
-			"<title>%s</title>\n</head>\n<body>\n<div id=%q></div>\n"+
-			"<script id=%q type=\"application/json\">%s</script>\n</body>\n</html>\n",
-		html.EscapeString(docTitle(doc)), shellRootID, shellDocScriptID, escapeJSONForScript(doc))
+	page := strings.Replace(shellTemplate, shellTitlePlaceholder, html.EscapeString(docTitle(doc)), 1)
+	page = strings.Replace(page, shellDocPlaceholder, escapeJSONForScript(doc), 1)
+	_, _ = io.WriteString(w, page)
 }
 
 // docTitle reads the OutputDoc's title for the <title> element, falling back

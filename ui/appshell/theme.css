@@ -1,0 +1,101 @@
+/* ui/appshell/theme.css — RFC 028 Part 4 trusted viewer shell base styles.
+ *
+ * Same-origin only (spec §6.4 CSP: style-src 'self'; there is no font-src,
+ * so CSP falls back to default-src 'none' for fonts too — this file MUST
+ * NOT declare @font-face / remote or self-hosted webfonts. System font
+ * stack only.)
+ *
+ * Scope: page chrome (reset, title, block list layout) and the "unknown
+ * block" placeholder V0 renders for every block type. Per-block-type visuals
+ * (markdown, metric, table, chart, filter, tabs) land in V1 alongside their
+ * renderers.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --dtp-bg: #ffffff;
+  --dtp-fg: #1a1c1f;
+  --dtp-fg-muted: #5c6066;
+  --dtp-border: #d8dbe0;
+  --dtp-surface: #f5f6f7;
+
+  --dtp-font: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+  --dtp-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --dtp-space-1: 4px;
+  --dtp-space-2: 8px;
+  --dtp-space-3: 16px;
+  --dtp-space-4: 24px;
+  --dtp-radius: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --dtp-bg: #0a0a0b;
+    --dtp-fg: #e7e9ea;
+    --dtp-fg-muted: #9ea3a8;
+    --dtp-border: #26282d;
+    --dtp-surface: #17181b;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--dtp-font);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--dtp-fg);
+  background: var(--dtp-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#dtp-root {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: var(--dtp-space-4) var(--dtp-space-3);
+}
+
+.dtp-loading {
+  color: var(--dtp-fg-muted);
+}
+
+.dtp-title {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0 0 var(--dtp-space-4);
+}
+
+.dtp-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dtp-space-3);
+}
+
+.dtp-block {
+  border: 1px solid var(--dtp-border);
+  border-radius: var(--dtp-radius);
+  padding: var(--dtp-space-3);
+  background: var(--dtp-surface);
+}
+
+/* V0's only renderer output: every block type falls back to this until V1
+ * registers the real markdown/metric/table/chart/filter/tabs renderers. */
+.dtp-block-unknown {
+  color: var(--dtp-fg-muted);
+  font-family: var(--dtp-mono);
+  font-size: 12px;
+  border-style: dashed;
+}

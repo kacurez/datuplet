@@ -503,6 +503,9 @@ func TestResponseMatrix_NavigationServesShell(t *testing.T) {
 	if !strings.Contains(body, `id="`+shellRootID+`"`) {
 		t.Errorf("shell missing <div id=%q>", shellRootID)
 	}
+	if !strings.Contains(body, `id="`+shellDocScriptID+`"`) {
+		t.Errorf("shell missing the doc island's <script id=%q>", shellDocScriptID)
+	}
 	if resp.Header.Get("Content-Security-Policy") != shellCSP {
 		t.Errorf("CSP = %q, want the shell CSP", resp.Header.Get("Content-Security-Policy"))
 	}
@@ -1219,17 +1222,29 @@ func TestServe_FailsLoudlyOnMissingBootSecrets(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Finding 1 (BLOCKER): app-controlled doc content must not break out of the
-// shell's <script type="application/json"> element. With the escape working,
-// the response has exactly ONE </script> (the real terminator) and the
-// embedded doc still round-trips.
+// shell's <script type="application/json"> element.
+//
+// Since Part 4 (V0) replaced the W6 stub with the real ui/appshell/index.html
+// asset, the legitimate response now carries SEVERAL <script> elements (the
+// doc island, the vendored libraries, the module loader) — a fixed
+// `</script>` count of 1 is no longer the right invariant. Instead:
+//  1. every "<script" open has a matching "</script>" close (an unescaped
+//     payload injects a BARE close with no matching open, which this
+//     balance check catches regardless of how many legitimate script tags
+//     the template has);
+//  2. the raw injected markup never appears verbatim in the response; and
+//  3. the doc still round-trips (truncated/broken JSON would fail here).
 func TestShell_EscapesScriptBreakout(t *testing.T) {
 	h := newServerHarness(t)
 	h.api.bundle = []byte(serverInjectionBundle)
 	body := readBody(t, h.bearerGet(h.url(""), "")) // navigation → shell
 
-	if n := strings.Count(body, "</script>"); n != 1 {
-		t.Fatalf("found %d </script> in the shell response, want exactly 1 — "+
-			"app content broke out of the doc script element:\n%s", n, body)
+	if opens, closes := strings.Count(body, "<script"), strings.Count(body, "</script>"); opens != closes {
+		t.Fatalf("found %d <script but %d </script> in the shell response — "+
+			"app content broke out of the doc script element:\n%s", opens, closes, body)
+	}
+	if strings.Contains(body, "<img src=x onerror=boom>") {
+		t.Fatalf("the raw injected payload appears unescaped in the shell response:\n%s", body)
 	}
 	doc := scriptDoc(t, body) // truncated/broken JSON would fail here
 	got, ok := blockTextByID(doc, "a")
