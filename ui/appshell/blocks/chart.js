@@ -18,7 +18,7 @@
 // and likewise cached.
 
 import { mountVegaLiteChart } from "../shell.js";
-import { bindChartOnClick } from "../interact.js";
+import { bindChartOnClick, registerVegaView } from "../interact.js";
 
 // ui/product-derived categorical palette (spec §6.4 "the `ui/product` palette").
 // Anchored on ui/product's accent (#3ecf8e) and status hues (#eab308 warning,
@@ -125,10 +125,15 @@ export function renderChart(block) {
         // block declares it; the shell sets the param + re-renders — config,
         // not code. The vega view is reached via vega-embed's resolved result;
         // the binding itself lives in interact.js (the one owner of param state).
+        let listener;
         const param = block && block.onClick ? block.onClick.param : undefined;
         if (typeof param === "string" && result && result.view) {
-          bindChartOnClick(result.view, param);
+          listener = bindChartOnClick(result.view, param);
         }
+        // Register the mounted view so interact.js finalizes it (and removes the
+        // click listener) before the next re-render/auto-refresh swaps the DOM —
+        // otherwise each swap leaks the view (fix). `mount` scopes finalization.
+        registerVegaView({ result, listener, mount });
         return result;
       });
     })

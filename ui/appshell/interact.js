@@ -39,9 +39,19 @@ const REFRESH_JITTER = 0.1;
 // at MAX_REFRESH_SECONDS.
 const MAX_BACKOFF_SHIFTS = 6;
 
-// Reserved param names the platform owns (spec §6.5). Stripped from ctx.params
-// on both the read side (here) and the server; a filter can never author them.
-const RESERVED_PARAMS = ["token", "block"];
+// MODAL_PARAM is the reserved URL key that deep-links an open (lazy) modal. It
+// lives in its own `__dtp_`-prefixed namespace so it can NEVER collide with an
+// app filter param: opening a modal writes `?__dtp_modal=<block-id>` and closing
+// deletes that key, without ever touching an app param name. It is stripped from
+// the ctx.params view on BOTH sides — getParams() below and app-worker's
+// readParams (modalStateParam) — so it never reaches the guest.
+const MODAL_PARAM = "__dtp_modal";
+
+// Reserved param names the platform owns (spec §6.5). Stripped from the
+// ctx.params VIEW sent to the server; app filters can never author them. Note
+// setParams preserves them in the URL (they are platform bookkeeping) — only
+// the getParams() view drops them.
+const RESERVED_PARAMS = ["token", "block", MODAL_PARAM];
 
 // Injected by shell.js's initInteract — the render primitives that live with
 // the RENDERERS registry. Kept as injected deps (rather than importing
@@ -56,6 +66,31 @@ let deps = {
 // The most recently applied OutputDoc — the scheduler reads refreshInterval
 // off it, and popstate/modal-restore re-derive from it.
 let currentDoc = null;
+
+// Render sequencing (fix: out-of-order responses must never overwrite a newer
+// render). Every FULL re-render (filter change, onClick, auto-refresh tick,
+// ctx.path nav) takes a monotonic token and, if it is superseded before its
+// response lands, drops that response instead of applying it. The in-flight
+// request of a superseded render is aborted (its abort is treated as
+// "superseded", never as an error state). renderSeq is shared by all full
+// renders so a user render and an auto-refresh poll can never both apply.
+let renderSeq = 0;
+let activeRenderController = null;
+
+// beginRender advances the sequence, aborts the previous full render's in-flight
+// fetch, and returns this render's token + AbortSignal.
+function beginRender() {
+  renderSeq += 1;
+  if (activeRenderController) activeRenderController.abort();
+  activeRenderController = typeof AbortController === "function" ? new AbortController() : null;
+  return { seq: renderSeq, signal: activeRenderController ? activeRenderController.signal : undefined };
+}
+
+// isAbortError reports whether a rejection is a fetch abort (a superseded
+// render), which must NOT surface as an error state.
+function isAbortError(error) {
+  return !!error && (error.name === "AbortError" || error.code === 20);
+}
 
 // ---------------------------------------------------------------------------
 // Wiring
@@ -86,15 +121,25 @@ export function onBooted(doc) {
 // shareable link").
 // ---------------------------------------------------------------------------
 
-// getParams reads ctx.params out of the current URL: a flat string->string map
-// with the reserved names stripped. Values are strings by construction
-// (URLSearchParams), which is exactly what the re-render POST body must carry.
-export function getParams() {
+// readAllParams reads the FULL URL query as a string->string map, INCLUDING the
+// reserved platform keys — the mutation base for setParams, so a filter change
+// preserves `__dtp_modal` (and vice versa). Not sent to the server.
+function readAllParams() {
   const usp = new URLSearchParams(location.search);
   const out = {};
-  for (const [k, v] of usp.entries()) {
-    if (RESERVED_PARAMS.indexOf(k) !== -1) continue;
-    out[k] = v;
+  for (const [k, v] of usp.entries()) out[k] = v;
+  return out;
+}
+
+// getParams is the ctx.params VIEW: readAllParams with the reserved names
+// (token/block/__dtp_modal) stripped. Values are strings by construction
+// (URLSearchParams), which is exactly what the re-render POST body must carry.
+export function getParams() {
+  const all = readAllParams();
+  const out = {};
+  for (const key of Object.keys(all)) {
+    if (RESERVED_PARAMS.indexOf(key) !== -1) continue;
+    out[key] = all[key];
   }
   return out;
 }
@@ -102,10 +147,11 @@ export function getParams() {
 // setParams merges a patch into the URL params (deep-link), then — unless
 // opts.refresh === false — triggers a re-render. A null/undefined patch value
 // deletes that key; everything else is coerced to a string, so the URL (and
-// therefore the next re-render body) is always string->string.
+// therefore the next re-render body) is always string->string. It operates over
+// readAllParams so a change to one key never drops the reserved modal key.
 export function setParams(patch, opts) {
   const refresh = !opts || opts.refresh !== false;
-  const params = getParams();
+  const params = readAllParams();
   for (const key of Object.keys(patch)) {
     const v = patch[key];
     if (v === null || v === undefined) delete params[key];
@@ -141,6 +187,7 @@ function pathWithParams(params) {
 // body described in the module header.
 async function fetchRender(opts) {
   const block = opts && opts.block;
+  const signal = opts && opts.signal;
   // Same-origin, path-relative: the current app URL, nothing else. `block` is
   // the one selector that rides the query string (matches §4.2 `?block=<id>`).
   let url = location.pathname;
@@ -149,6 +196,7 @@ async function fetchRender(opts) {
   const resp = await fetch(url, {
     method: "POST",
     credentials: "same-origin",
+    signal,
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
@@ -170,35 +218,43 @@ async function fetchRender(opts) {
 // doFullRender is the shared core of every full re-render (filter change,
 // onClick, auto-refresh). It shows the stale-while-revalidating overlay (spec
 // §6.3 "the stale dashboard stays visible, dimmed, with a spinner"), fetches
-// the whole doc, and swaps the blocks in on success; on failure the stale
-// content is left untouched.
+// the whole doc, and swaps the blocks in on success. It is SEQUENCED: it takes
+// a render token and, if a newer render started before its response lands (or
+// its fetch was aborted by that newer render), it DROPS the response — a slow
+// earlier response can never overwrite a newer one. On a real failure the stale
+// content is left untouched. Returns one of {ok,doc} | {superseded} | {error}.
 async function doFullRender() {
+  const { seq, signal } = beginRender();
   showRefreshOverlay();
   try {
-    const doc = await fetchRender({});
+    const doc = await fetchRender({ signal });
+    if (seq !== renderSeq) return { superseded: true }; // a newer render won
     if (deps.applyDoc) deps.applyDoc(doc);
     currentDoc = doc;
     setBaseIntervalFromDoc(doc);
     restoreModalDeepLink(doc);
     return { ok: true, doc };
   } catch (error) {
-    return { ok: false, error };
+    if (isAbortError(error) || seq !== renderSeq) return { superseded: true };
+    return { error };
   } finally {
     hideRefreshOverlay();
   }
 }
 
-// requestRerender is the user-initiated full re-render (filters, onClick). It
-// resets the backoff and re-arms the auto-refresh cadence around the fresh
-// render so a manual change does not stack an extra poll right behind it.
+// requestRerender is the user-initiated full re-render (filters, onClick). Its
+// beginRender() cancels any in-flight auto-refresh poll, so the two can never
+// both apply. On success it resets backoff and re-arms the cadence around the
+// fresh render; on a real error it re-arms at the base cadence (a user-render
+// failure must not silently kill auto-refresh) and surfaces a transient note; a
+// SUPERSEDED result (a newer render already started) is a no-op — that newer
+// render owns rescheduling.
 export async function requestRerender() {
   const result = await doFullRender();
-  if (result.ok) {
-    refreshFailures = 0;
-    scheduleNextRefresh();
-  } else {
-    showTransientError();
-  }
+  if (result.superseded) return result;
+  if (result.ok) refreshFailures = 0;
+  else showTransientError();
+  scheduleNextRefresh();
   return result;
 }
 
@@ -241,12 +297,17 @@ function clearRefreshTimer() {
 }
 
 // scheduleNextRefresh arms the next poll. With no override it uses the base
-// interval plus jitter; an override (backoff) is used verbatim. Either way the
-// delay is never below the base interval (>= 15s), so the clamp always holds.
+// interval plus jitter; an override (backoff) is already bounded by
+// backoffSeconds. Either way the delay is clamped to [base, MAX_REFRESH_SECONDS]
+// here as a final guard, so it is never below the 15s floor and — critically —
+// never large enough to overflow setTimeout's ~2^31 ms limit (a huge
+// Retry-After that wrapped would otherwise fire almost immediately).
 function scheduleNextRefresh(overrideSeconds) {
   clearRefreshTimer();
   if (refreshBaseSeconds <= 0) return; // disabled
-  const seconds = overrideSeconds != null ? overrideSeconds : jitteredInterval(refreshBaseSeconds);
+  let seconds = overrideSeconds != null ? overrideSeconds : jitteredInterval(refreshBaseSeconds);
+  if (!(seconds >= refreshBaseSeconds)) seconds = refreshBaseSeconds; // floor (also catches NaN)
+  seconds = Math.min(MAX_REFRESH_SECONDS, seconds); // ceiling — no setTimeout overflow
   refreshTimer = setTimeout(refreshTick, seconds * 1000);
 }
 
@@ -265,6 +326,7 @@ async function refreshTick() {
     return;
   }
   const result = await doFullRender();
+  if (result.superseded) return; // a newer render (e.g. a user filter change) owns rescheduling
   if (result.ok) {
     refreshFailures = 0;
     scheduleNextRefresh();
@@ -286,6 +348,11 @@ function backoffSeconds(error) {
     const retryAfter = parseRetryAfter(error.retryAfter);
     if (retryAfter != null) seconds = Math.max(seconds, retryAfter);
   }
+  // Cap the honored Retry-After too (fix: an unbounded/hostile Retry-After must
+  // not overflow setTimeout's ~2^31 ms limit and wrap to fire immediately). A
+  // server asking for longer than the ceiling just gets MAX_REFRESH_SECONDS —
+  // still >= base, so "wait at least base" is honored and we never busy-loop.
+  seconds = Math.min(MAX_REFRESH_SECONDS, seconds);
   return Math.max(base, seconds);
 }
 
@@ -364,22 +431,28 @@ function installPopstateHandler() {
 
 // loadPath performs an in-shell navigation to a same-app path: a GET full
 // re-render (Accept: application/json) plus a history push when `push` is set.
+// SEQUENCED like doFullRender (a nav during an in-flight filter re-render must
+// win, and a stale nav response must never overwrite a newer render).
 async function loadPath(pathAndQuery, push) {
   if (push) history.pushState({}, "", pathAndQuery);
+  const { seq, signal } = beginRender();
   showRefreshOverlay();
   try {
     const resp = await fetch(pathAndQuery, {
       method: "GET",
       credentials: "same-origin",
+      signal,
       headers: { Accept: "application/json" },
     });
     if (!resp.ok) throw new Error("navigation failed with status " + resp.status);
     const doc = await resp.json();
+    if (seq !== renderSeq) return; // superseded by a newer render
     if (deps.applyDoc) deps.applyDoc(doc);
     currentDoc = doc;
     configureAutoRefresh(doc);
     restoreModalDeepLink(doc);
-  } catch (_error) {
+  } catch (error) {
+    if (isAbortError(error) || seq !== renderSeq) return; // superseded — not an error state
     showTransientError();
   } finally {
     hideRefreshOverlay();
@@ -392,12 +465,14 @@ async function loadPath(pathAndQuery, push) {
 // fetches its content as a `block=<id>` partial render). v1 modals only display
 // and set params — no side-effectful submits (that is writebacks, §10).
 //
-// Contract for the lazy form: the declared `param` names BOTH the deep-link URL
-// param and the id of the block the app emits as the modal body. Opening sets
-// `?<param>=1` (a presence marker for the deep link) and partial-fetches
-// `block=<param>`; the app, seeing the param in ctx.params, includes a block
-// whose id === param. This makes "modal state deep-links via a URL param"
-// literally true and reuses the §4.2 partial-render matrix.
+// Contract for the lazy form: the declared `param` is the id of the block the
+// app emits as the modal body (the app, seeing the modal open, includes a block
+// whose id === param). Opening records that id in the RESERVED deep-link key
+// `?__dtp_modal=<param>` — its own `__dtp_`-namespace, so it can NEVER clobber
+// an app filter param of the same name — and partial-fetches `block=<param>`.
+// This makes "modal state deep-links via a URL param" true while keeping the
+// URL bookkeeping entirely off the app's param namespace (and the reserved key
+// is stripped from ctx.params on both sides, so the guest never sees it).
 // ---------------------------------------------------------------------------
 
 let activeModal = null;
@@ -432,7 +507,7 @@ export function attachModalTrigger(node, modalSpec, opts) {
 }
 
 function openInlineModal(title, blocks) {
-  const modal = openModalShell(title, null);
+  const modal = openModalShell(title, false);
   const frag = document.createDocumentFragment();
   const list = Array.isArray(blocks) ? blocks : [];
   for (const block of list) {
@@ -443,10 +518,10 @@ function openInlineModal(title, blocks) {
 
 async function openLazyModal(param, opts) {
   const title = opts && typeof opts.title === "string" ? opts.title : "";
-  // Deep-link: mark the param present (without a full re-render — the modal
-  // fetches only its own block).
-  if (getParams()[param] == null) setParams({ [param]: "1" }, { refresh: false });
-  const modal = openModalShell(title, param);
+  // Deep-link via the RESERVED modal key (never an app param name) — no full
+  // re-render; the modal fetches only its own block.
+  setParams({ [MODAL_PARAM]: param }, { refresh: false });
+  const modal = openModalShell(title, true);
   modal.setLoading();
   try {
     const block = await fetchRender({ block: param });
@@ -458,9 +533,9 @@ async function openLazyModal(param, opts) {
 }
 
 // openModalShell builds the backdrop + dialog and returns a small controller.
-// lazyParam, when set, is cleared from the URL on close so the deep link
-// closes with the modal.
-function openModalShell(title, lazyParam) {
+// `lazy` (a deep-linked lazy modal) causes the reserved MODAL_PARAM to be
+// cleared from the URL on close, so the deep link closes with the modal.
+function openModalShell(title, lazy) {
   closeActiveModal();
 
   const backdrop = document.createElement("div");
@@ -496,7 +571,7 @@ function openModalShell(title, lazyParam) {
   backdrop.appendChild(dialog);
   document.body.appendChild(backdrop);
 
-  activeModal = { backdrop, lazyParam };
+  activeModal = { backdrop, lazy };
 
   return {
     setLoading() {
@@ -514,11 +589,15 @@ function openModalShell(title, lazyParam) {
 
 function closeActiveModal() {
   if (!activeModal) return;
-  const { backdrop, lazyParam } = activeModal;
+  const { backdrop, lazy } = activeModal;
   activeModal = null;
+  // Finalize any Vega view rendered into the modal before its DOM is dropped
+  // (fix: views leak otherwise — see finalizeVegaViewsWithin).
+  if (backdrop) finalizeVegaViewsWithin(backdrop);
   if (backdrop && backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
-  // Closing a deep-linked (lazy) modal cleans its param out of the URL.
-  if (lazyParam) setParams({ [lazyParam]: null }, { refresh: false });
+  // Closing a deep-linked (lazy) modal cleans the RESERVED modal key out of the
+  // URL — never an app param.
+  if (lazy) setParams({ [MODAL_PARAM]: null }, { refresh: false });
 }
 
 function installModalKeyHandler() {
@@ -529,18 +608,16 @@ function installModalKeyHandler() {
   modalKeyInstalled = true;
 }
 
-// restoreModalDeepLink re-opens a lazy modal whose param is present in the URL
-// on load / after navigation, so a shared deep link lands with the modal open.
+// restoreModalDeepLink re-opens the lazy modal named by the RESERVED modal key
+// in the URL on load / after navigation, so a shared deep link lands with the
+// modal open. The key is read from readAllParams (getParams strips it), and the
+// title (if any) comes from the doc's matching declaration.
 function restoreModalDeepLink(doc) {
   if (activeModal) return; // do not fight an already-open modal
-  const params = getParams();
-  const lazy = collectLazyModalParams(doc);
-  for (const entry of lazy) {
-    if (params[entry.param] != null) {
-      openLazyModal(entry.param, { title: entry.title });
-      return; // one modal at a time
-    }
-  }
+  const openId = readAllParams()[MODAL_PARAM];
+  if (openId == null) return;
+  const match = collectLazyModalParams(doc).find((entry) => entry.param === openId);
+  openLazyModal(openId, { title: match ? match.title : "" });
 }
 
 // collectLazyModalParams walks the doc (root blocks, tabs, table rows, and
@@ -582,10 +659,11 @@ function collectLazyModalParams(doc) {
 // vega-embed resolves) that sets `param` from the clicked datum and re-renders.
 // The value is the clicked datum's field matching `param` when present, else
 // the datum's first non-internal field (Vega prefixes internal fields with
-// "_"). Called by blocks/chart.js after mountVegaLiteChart resolves.
+// "_"). Called by blocks/chart.js after mountVegaLiteChart resolves. RETURNS the
+// listener handle so it can be removed at finalize time (fix: leak).
 export function bindChartOnClick(view, param) {
-  if (!view || typeof view.addEventListener !== "function" || typeof param !== "string" || !param) return;
-  view.addEventListener("click", (_event, item) => {
+  if (!view || typeof view.addEventListener !== "function" || typeof param !== "string" || !param) return undefined;
+  const handler = (_event, item) => {
     if (!item || !item.datum) return;
     const datum = item.datum;
     let value;
@@ -593,7 +671,9 @@ export function bindChartOnClick(view, param) {
     else value = firstDatumValue(datum);
     if (value === undefined || value === null) return;
     setParam(param, String(value));
-  });
+  };
+  view.addEventListener("click", handler);
+  return handler;
 }
 
 function firstDatumValue(datum) {
@@ -602,6 +682,57 @@ function firstDatumValue(datum) {
     return datum[key];
   }
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Vega view lifecycle (fix: views leaked on every swap). applyDoc clears
+// #dtp-root with textContent="", which drops DOM nodes but never calls
+// vega-embed's result.finalize() — so each re-render/auto-refresh leaked the
+// prior view's listeners/timers/dataflow, unbounded on a long-lived
+// auto-refreshing dashboard. chart.js registers each mounted view here; shell.js
+// (applyDoc) and closeActiveModal drain the relevant ones BEFORE dropping the DOM.
+// ---------------------------------------------------------------------------
+
+// liveVegaViews holds {result, listener, mount} for every currently-mounted
+// chart. mount is the chart's mount element, used to scope finalization.
+const liveVegaViews = new Set();
+
+// registerVegaView records a mounted chart so it can be finalized before its
+// DOM is removed. Called by blocks/chart.js once vega-embed resolves.
+export function registerVegaView(entry) {
+  if (entry && entry.result) liveVegaViews.add(entry);
+}
+
+// finalizeVegaEntry finalizes one embed result and removes its click listener.
+function finalizeVegaEntry(entry) {
+  try {
+    if (entry.result && entry.result.view && entry.listener && typeof entry.result.view.removeEventListener === "function") {
+      entry.result.view.removeEventListener("click", entry.listener);
+    }
+  } catch (_e) {
+    // ignore — best-effort teardown
+  }
+  try {
+    if (entry.result && typeof entry.result.finalize === "function") entry.result.finalize();
+  } catch (_e) {
+    // ignore — best-effort teardown
+  }
+  liveVegaViews.delete(entry);
+}
+
+// finalizeVegaViewsWithin finalizes every registered view whose mount is inside
+// `container` (about to be cleared) OR is already detached from the document (a
+// mount that resolved after its container was cleared — a race orphan). A view
+// mounted elsewhere (e.g. a chart in an OPEN modal during a background
+// re-render) is left alone. Called with #dtp-root before applyDoc clears it,
+// and with the modal backdrop before a modal closes.
+export function finalizeVegaViewsWithin(container) {
+  for (const entry of Array.from(liveVegaViews)) {
+    const mount = entry.mount;
+    const inContainer = container && mount && typeof container.contains === "function" && container.contains(mount);
+    const orphaned = !mount || mount.isConnected === false;
+    if (inContainer || orphaned) finalizeVegaEntry(entry);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -665,6 +665,26 @@ func TestReadParams_StripsReservedTokenAndBlock(t *testing.T) {
 	}
 }
 
+// TestReadParams_StripsModalStateKey proves the shell's reserved modal deep-link
+// key (`__dtp_modal`, ui/appshell/interact.js MODAL_PARAM) is stripped before
+// the guest sees ctx.params — like `token`/`block` — so a modal's URL
+// bookkeeping never reaches the app, even when it arrives in a GET nav query
+// string (RFC 028 V2 fix, Finding 2). A same-named app filter is unaffected only
+// because the shell writes the modal state under this reserved name, never the
+// app's param name.
+func TestReadParams_StripsModalStateKey(t *testing.T) {
+	params, _, err := readParams(reqGet("/apps/p/n?" + modalStateParam + "=order-detail&country=DE"))
+	if err != nil {
+		t.Fatalf("readParams: %v", err)
+	}
+	if _, ok := params[modalStateParam]; ok {
+		t.Errorf("reserved modal key %q leaked into ctx.params: %v", modalStateParam, params)
+	}
+	if params["country"] != "DE" || len(params) != 1 {
+		t.Errorf("params = %v, want only {country:DE} (app params untouched)", params)
+	}
+}
+
 func TestReadParams_DuplicateKeyLastWins(t *testing.T) {
 	params, _, err := readParams(reqGet("/apps/p/n?x=1&x=2&x=3"))
 	if err != nil {

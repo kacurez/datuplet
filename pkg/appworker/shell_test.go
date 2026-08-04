@@ -606,7 +606,7 @@ func TestInteract_AutoRefreshVisibilityRetryAfterFloor(t *testing.T) {
 // and sets the param (triggering a re-render) — config, not code.
 func TestInteract_ChartOnClickBindsVegaView(t *testing.T) {
 	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
-	if !strings.Contains(chart, `import{bindChartOnClick}from"../interact.js"`) {
+	if !strings.Contains(chart, `import{bindChartOnClick,registerVegaView}from"../interact.js"`) {
 		t.Error("chart.js does not import bindChartOnClick from interact.js")
 	}
 	if !strings.Contains(chart, "bindChartOnClick(result.view,param)") {
@@ -647,7 +647,7 @@ func TestInteract_ModalsRenderThroughRegistry(t *testing.T) {
 func TestShellJS_RerenderPrimitivesWiredToInteract(t *testing.T) {
 	got := stripWhitespace(readShellAsset(t, "shell.js"))
 	for _, want := range []string{
-		`import{initInteract,onBooted,attachModalTrigger}from"./interact.js"`,
+		`import{initInteract,onBooted,attachModalTrigger,finalizeVegaViewsWithin}from"./interact.js"`,
 		`initInteract({applyDoc,renderBlock})`,
 		`exportfunctionapplyDoc(doc)`,
 		`exportfunctionrenderBlock(block)`,
@@ -657,5 +657,128 @@ func TestShellJS_RerenderPrimitivesWiredToInteract(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("shell.js is missing the interact wiring token %q", want)
 		}
+	}
+}
+
+// ===========================================================================
+// RFC 028 Part 4 (V2 fix round): the four Codex-gate Major findings. Live
+// behavior (race ordering, finalize-on-swap, modal namespace in the live DOM)
+// is V4's browser checklist; these are the statically-checkable guards.
+// ===========================================================================
+
+// TestInteract_RendersAreSequenced proves the fix for Finding 1: every full
+// re-render takes a monotonic token + AbortController, and a response is dropped
+// (superseded) if a newer render started or its fetch was aborted — so a slow
+// earlier response can never overwrite a newer one. The abort of a superseded
+// render is treated as "superseded", never an error state.
+func TestInteract_RendersAreSequenced(t *testing.T) {
+	src := readShellAsset(t, "interact.js")
+	got := stripWhitespace(src)
+	for _, want := range []string{
+		"letrenderSeq=0",                             // the monotonic token
+		"functionbeginRender()",                      // taken per full render
+		"newAbortController()",                       // supersede-abort of the prior fetch
+		"if(seq!==renderSeq)return{superseded:true}", // drop a stale/late response
+		"fetchRender({signal})",                      // the POST re-render carries the abort signal
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("interact.js render-sequencing is missing %q", want)
+		}
+	}
+	// An abort must NOT surface as an error state (it is treated as superseded).
+	if !strings.Contains(src, "isAbortError") {
+		t.Error("interact.js does not distinguish an aborted (superseded) fetch from a real error")
+	}
+	// The GET ctx.path navigation (loadPath) is sequenced too — the signal is
+	// threaded into its fetch options alongside the GET method.
+	if !strings.Contains(got, `method:"GET",credentials:"same-origin",signal,`) {
+		t.Error("interact.js loadPath (ctx.path nav) does not pass the abort signal — nav is not sequenced")
+	}
+}
+
+// TestInteract_ModalStateReservedNamespace proves the fix for Finding 2: modal
+// deep-link state uses a reserved `__dtp_modal` key (its own namespace), never a
+// top-level param named after the block — so it cannot clobber an app filter of
+// the same name — and the shell + server agree on the reserved literal.
+func TestInteract_ModalStateReservedNamespace(t *testing.T) {
+	src := readShellAsset(t, "interact.js")
+	got := stripWhitespace(src)
+	if !strings.Contains(got, `constMODAL_PARAM="__dtp_modal"`) {
+		t.Error("interact.js does not define the reserved modal key MODAL_PARAM=\"__dtp_modal\"")
+	}
+	if !strings.Contains(got, `RESERVED_PARAMS=["token","block",MODAL_PARAM]`) {
+		t.Error("interact.js does not include MODAL_PARAM in the reserved (stripped-from-ctx.params) set")
+	}
+	// Open/close write the RESERVED key, not the app param name.
+	if !strings.Contains(got, `setParams({[MODAL_PARAM]:param},{refresh:false})`) {
+		t.Error("openLazyModal does not deep-link via the reserved MODAL_PARAM key")
+	}
+	if !strings.Contains(got, `setParams({[MODAL_PARAM]:null},{refresh:false})`) {
+		t.Error("closeActiveModal does not clear the reserved MODAL_PARAM key")
+	}
+	// The old, colliding pattern (a top-level param named after the block) is gone.
+	if strings.Contains(got, `setParams({[param]:"1"}`) || strings.Contains(got, `setParams({[param]:null}`) {
+		t.Error("interact.js still writes a modal param under the app's own param namespace (collision not fixed)")
+	}
+	// The server strips the SAME literal (same package const), so the reserved
+	// key never reaches ctx.params. The behavioral proof is
+	// TestReadParams_StripsModalStateKey; here we pin the literal agreement.
+	if modalStateParam != "__dtp_modal" {
+		t.Errorf("server modalStateParam = %q, must match the shell's MODAL_PARAM __dtp_modal", modalStateParam)
+	}
+}
+
+// TestInteract_VegaViewsFinalizedBeforeSwap proves the fix for Finding 3: charts
+// register their embed result, and the shell finalizes live views (calling
+// result.finalize() and removing the click listener) BEFORE clearing the DOM on
+// a re-render, and before a modal closes — so a view never leaks across a swap.
+func TestInteract_VegaViewsFinalizedBeforeSwap(t *testing.T) {
+	interact := readShellAsset(t, "interact.js")
+	gi := stripWhitespace(interact)
+	for _, want := range []string{
+		"exportfunctionregisterVegaView(",
+		"exportfunctionfinalizeVegaViewsWithin(",
+		"entry.result.finalize()",                     // the finalize call
+		`removeEventListener("click",entry.listener)`, // listener teardown
+	} {
+		if !strings.Contains(gi, want) {
+			t.Errorf("interact.js vega finalize is missing %q", want)
+		}
+	}
+	// chart.js registers each mounted view (with its result, listener, mount).
+	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
+	if !strings.Contains(chart, `import{bindChartOnClick,registerVegaView}from"../interact.js"`) {
+		t.Error("chart.js does not import registerVegaView")
+	}
+	if !strings.Contains(chart, "registerVegaView({result,listener,mount})") {
+		t.Error("chart.js does not register the mounted vega view for finalization")
+	}
+	// shell.js applyDoc finalizes BEFORE it clears the root (ordering matters —
+	// finalize after clear would already have leaked the view).
+	shell := readShellAsset(t, "shell.js")
+	idxFinalize := strings.Index(shell, "finalizeVegaViewsWithin(root)")
+	idxClear := strings.Index(shell, `root.textContent = ""`)
+	if idxFinalize < 0 || idxClear < 0 {
+		t.Fatalf("shell.js applyDoc is missing the finalize (%d) or clear (%d)", idxFinalize, idxClear)
+	}
+	if idxFinalize > idxClear {
+		t.Error("shell.js applyDoc clears the root BEFORE finalizing vega views — the view leaks")
+	}
+}
+
+// TestInteract_RetryAfterIsCapped proves the fix for Finding 4: the honored
+// Retry-After delay is capped to MAX_REFRESH_SECONDS before scheduling, so a
+// huge/hostile value can never overflow setTimeout's ~2^31 ms limit and wrap to
+// fire immediately. The cap is applied on the honored path (backoffSeconds) and
+// again as a final guard in scheduleNextRefresh.
+func TestInteract_RetryAfterIsCapped(t *testing.T) {
+	got := stripWhitespace(readShellAsset(t, "interact.js"))
+	// The cap reassignment appears on the honored path and the scheduler guard.
+	if strings.Count(got, "seconds=Math.min(MAX_REFRESH_SECONDS,seconds)") < 2 {
+		t.Error("interact.js does not cap the honored Retry-After delay to MAX_REFRESH_SECONDS (setTimeout overflow risk)")
+	}
+	// backoffSeconds still honors Retry-After (waits at least that long, up to the cap).
+	if !strings.Contains(got, "Math.max(seconds,retryAfter)") {
+		t.Error("interact.js no longer honors Retry-After on the backoff path")
 	}
 }

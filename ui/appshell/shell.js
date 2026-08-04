@@ -25,7 +25,7 @@ import { renderTable } from "./blocks/table.js";
 import { renderChart } from "./blocks/chart.js";
 import { renderFilter } from "./blocks/filter.js";
 import { renderTabs } from "./blocks/tabs.js";
-import { initInteract, onBooted, attachModalTrigger } from "./interact.js";
+import { initInteract, onBooted, attachModalTrigger, finalizeVegaViewsWithin } from "./interact.js";
 
 const ROOT_ID = "dtp-root";
 const DOC_SCRIPT_ID = "dtp-doc";
@@ -181,6 +181,10 @@ export function applyDoc(doc) {
   if (!root) {
     throw new Error("dtp: missing #" + ROOT_ID + " mount point");
   }
+  // Finalize every live Vega view inside the root BEFORE clearing it — a bare
+  // textContent="" drops the DOM but leaks the view's listeners/timers/dataflow
+  // (spec §6.4 boundary is unaffected; this is a resource-leak fix on re-render).
+  finalizeVegaViewsWithin(root);
   root.textContent = ""; // clear the previous render / pre-render skeleton
   renderTitle(root, doc);
   renderBlocks(root, doc);

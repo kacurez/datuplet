@@ -155,9 +155,18 @@ const (
 	shellDocPlaceholder   = "<!--DTP:DOC-->"
 
 	// blockQueryParam selects a single block for a partial re-render
-	// (spec §4.2). One of the two reserved param names (with `token`) stripped
-	// before the guest sees ctx.params (spec §6.5).
+	// (spec §4.2). One of the reserved param names (with `token` and
+	// modalStateParam) stripped before the guest sees ctx.params (spec §6.5).
 	blockQueryParam = "block"
+
+	// modalStateParam is the shell's reserved modal deep-link key
+	// (ui/appshell/interact.js MODAL_PARAM). The shell writes `?__dtp_modal=<id>`
+	// to deep-link an open modal; it is platform-owned URL bookkeeping, NOT an
+	// app filter param, so — like `token` and `block` — it is stripped before
+	// the guest sees ctx.params. The `__dtp_` prefix is reserved for the shell
+	// and app filter params must not use it. (The POST body already omits it via
+	// the shell's getParams(); stripping here also covers the GET nav query.)
+	modalStateParam = "__dtp_modal"
 
 	// draftSuffix marks the draft channel in the app name: `{name}@draft`
 	// (spec §4.1).
@@ -807,6 +816,10 @@ func readParams(r *http.Request) (params map[string]string, block string, err er
 	block = params[blockQueryParam]
 	delete(params, blockQueryParam)
 	delete(params, tokenQueryParam)
+	// The shell's modal deep-link key is platform-owned URL bookkeeping, not an
+	// app filter param — strip it so it never reaches ctx.params (it can arrive
+	// in a GET nav query string; the POST body already omits it shell-side).
+	delete(params, modalStateParam)
 
 	if len(params) > maxParamKeys {
 		return nil, "", fmt.Errorf("too many parameters (max %d)", maxParamKeys)
