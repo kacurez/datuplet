@@ -22,25 +22,35 @@ marked.min.js on older releases, lib/marked.umd.js on some newer ones) —
 confirm the exact dist path for the pinned version against that release's
 package.json "files"/"browser" field before fetching.
 
-## STATUS: NOT YET VENDORED — placeholder files checked in instead
+## STATUS: VENDORED (RFC 028 V4, maintainer-approved 2026-08-03)
 
-This agent (Claude Code, running Task V0 non-interactively) operates under a
-tool-use safety policy that requires a live user's explicit, in-chat "yes"
-before downloading any file from the network, and had no channel to ask for
-or receive that approval during this task. Fetching and committing a
-third-party JS bundle that will execute in every viewer's browser is exactly
-the kind of action that policy gates, so rather than silently fetch the real
-libraries (bypassing the gate) or silently ship something mislabeled, the
-five vendor/*.min.js files in this directory are intentionally-inert
-placeholders: each defines its expected global (window.vega, window.vegaLite,
-window.vegaEmbed, window.DOMPurify, window.marked) but throws a clear error
-naming this file if actually called, instead of pretending to work.
+The five vendor/*.min.js files are the genuine upstream release builds,
+fetched from the npm registry with tarball-integrity verification: for each
+package the fetcher read the registry metadata, downloaded dist.tarball,
+verified its sha512 equalled the registry's published dist.integrity, and
+extracted exactly the build file below from that verified tarball. This ties
+each committed file to the npm-published artifact the registry vouches for.
 
-ACTION REQUIRED before charts/markdown rendering can work end-to-end (V1+):
-a human (or an agent turn with a live user present to grant download
-permission) must fetch the five URLs above — verifying each against the
-package's published integrity hash / npm provenance — and overwrite the
-corresponding vendor/*.min.js file byte-for-byte with the real release
-artifact. No other file in ui/appshell/ needs to change: index.html already
-references these exact paths, and shell.js's mountVegaLiteChart already
-calls window.vegaEmbed with the required network-loading lockdown.
+Verified provenance (tarball-integrity = the registry's dist.integrity;
+file-sha256 = SHA-256 of the extracted, committed .min.js):
+
+vega@5.31.0        build/vega.min.js        514891 B
+  file-sha256=71874ccfaabb9bb0f73a16ac409472d7fe53875602127710a554f4773d599a37
+  tarball-integrity=sha512-ZZ+8kcKqCeRi7pBdS7kfBpfhV2gDpa6N950GKGWFw0QL4fH319A9o8FAJzdY8zK0WW0PKrivZSoRmK9fWUxnhg==
+vega-lite@5.23.0   build/vega-lite.min.js   252198 B
+  file-sha256=58c27358e26f2d319cf62f45bc17a4c8362f08645001df2ec8d341eee4097c7f
+  tarball-integrity=sha512-l4J6+AWE3DIjvovEoHl2LdtCUkfm4zs8Xxx7INwZEAv+XVb6kR6vIN1gt3t2gN2gs/y4DYTs/RPoTeYAuEg6mA==
+vega-embed@6.29.0  build/vega-embed.min.js  60630 B
+  file-sha256=12d02acfbe3ec59ef9a37dd4822a2e04e2961b5bbb671bbe661d2221715b99da
+  tarball-integrity=sha512-PmlshTLtLFLgWtF/b23T1OwX53AugJ9RZ3qPE2c01VFAbgt3/GSNI/etzA/GzdrkceXFma+FDHNXUppKuM0U6Q==
+dompurify@3.2.3    dist/purify.min.js       22068 B
+  file-sha256=68769fa503bf609ec914fdbeba73eb1ea6fb4491292d0d0e691ea75aad570217
+  tarball-integrity=sha512-U1U5Hzc2MO0oW3DF+G9qYN0aT7atAou4AgI0XjWz061nyBPbdxkfdhfy5uMgGn6+oLFCfn44ZGbdDqCzVmlOWA==
+marked@14.1.4      marked.min.js            36546 B
+  file-sha256=0a0fbf5ea62f007e7ede02d6f75b4eb142ee8acb310cd957ed566af3304c0bcc
+  tarball-integrity=sha512-vkVZ8ONmUdPnjCKc5uTRvmkRbx4EAi2OkTOXmfTDhZz3OFqMNBM1oTTWwTr4HY4uAEojhzPf+Fy8F1DWa3Sndg==
+
+To re-verify or re-fetch: re-run the tarball-integrity check against
+registry.npmjs.org for each (version, dist.integrity) pair above. index.html
+references these exact paths and the shell lazy-imports them from same-origin
+/apps/-/shell/vendor/ — no code change accompanies a byte-for-byte refresh.
