@@ -11,6 +11,35 @@ import (
 	"testing"
 )
 
+// --- validateAppName (pure) ---
+
+// TestValidateAppName pins the server's own regex
+// (^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$, pkg/pipelineapi/apps.appNamePattern)
+// against the shapes the C1 gate review called out, plus a few more: a
+// leading hyphen ("-leading-hyphen") is included here even though, reached
+// via the CLI, it never gets this far (parseAppsFlags's pre-existing
+// leading-dash-means-flag convention intercepts it first) — this proves the
+// regex itself independently rejects that shape too.
+func TestValidateAppName(t *testing.T) {
+	invalid := append([]string{
+		"", "A", "aB", "1_2", "a.", "a b", strings.Repeat("a", 64),
+	}, invalidAppNames...)
+	for _, name := range invalid {
+		if err := validateAppName(name); err == nil {
+			t.Errorf("validateAppName(%q) = nil, want an error", name)
+		} else if !strings.Contains(err.Error(), appNamePattern) {
+			t.Errorf("validateAppName(%q) error should name the pattern: %v", name, err)
+		}
+	}
+
+	valid := []string{"a", "a1", "sales-overview", "x", "abc-def-123", strings.Repeat("a", 63)}
+	for _, name := range valid {
+		if err := validateAppName(name); err != nil {
+			t.Errorf("validateAppName(%q) = %v, want nil", name, err)
+		}
+	}
+}
+
 // --- parseAppsFlags (pure) ---
 
 func TestParseAppsFlags(t *testing.T) {
@@ -534,6 +563,114 @@ func TestRunAppsDelete_RequiresExactlyOneName(t *testing.T) {
 	}
 	if err := runAppsDelete([]string{"a", "b", "--project", "proj1"}); err == nil {
 		t.Error("expected error with more than one name")
+	}
+}
+
+// --- app-name validation (C1 gate fix round, Major finding) ---
+//
+// url.PathEscape does NOT encode ".": url.PathEscape("..") == "..". An
+// unvalidated name reaching appsURL could therefore build a path like
+// /api/v1/projects/{pid}/apps/.. that a ServeMux/proxy/intermediary
+// canonicalizes to a different endpoint before any handler sees it. Every
+// named command (put/get/delete) must reject a bad name LOCALLY — before
+// loadRemoteArgs or any network call — using the server's own regex
+// (^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$).
+//
+// Each case below points --remote at a port nothing listens on (matching
+// the 5 MB cap test's technique): a rejection that reaches the network
+// layer surfaces as a connection error, not this validation error, so the
+// assertions distinguish the two rather than just checking "err != nil".
+
+var invalidAppNames = []string{
+	"..", "a/b", "x@draft", "a?b", "-leading-hyphen", "trailing-hyphen-",
+}
+
+func assertLocalNameRejection(t *testing.T, name string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected a local rejection for name %q, got nil", name)
+	}
+	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
+		t.Errorf("name %q: error looks like it came from a network call, not a local rejection: %v", name, err)
+	}
+	// A name starting with "-" (e.g. "-leading-hyphen") never reaches
+	// validateAppName at all: parseAppsFlags's pre-existing convention
+	// (shared with pipeline.go's/components.go's hand-rolled parsers) treats
+	// any leading-dash argument as an unrecognized FLAG, not a positional
+	// value — itself a legitimate local, before-network rejection, just from
+	// a different, older layer than the new name check. Every other shape
+	// here reaches validateAppName and must carry its message; the leading-
+	// hyphen shape is separately proven to fail the regex itself in
+	// TestValidateAppName.
+	if strings.HasPrefix(name, "-") {
+		if !strings.Contains(err.Error(), "unknown flag") {
+			t.Errorf("name %q: expected the flag parser's rejection, got: %v", name, err)
+		}
+		return
+	}
+	if !strings.Contains(err.Error(), "invalid app name") {
+		t.Errorf("name %q: error should name the validation rule: %v", name, err)
+	}
+}
+
+func TestRunAppsGet_InvalidNameRejectedLocally(t *testing.T) {
+	for _, name := range invalidAppNames {
+		t.Run(name, func(t *testing.T) {
+			err := runAppsGet([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
+			assertLocalNameRejection(t, name, err)
+		})
+	}
+}
+
+func TestRunAppsDelete_InvalidNameRejectedLocally(t *testing.T) {
+	for _, name := range invalidAppNames {
+		t.Run(name, func(t *testing.T) {
+			err := runAppsDelete([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
+			assertLocalNameRejection(t, name, err)
+		})
+	}
+}
+
+func TestRunAppsPut_InvalidNameRejectedLocally(t *testing.T) {
+	bundlePath := writeTempBundle(t, []byte("export async function render(ctx){}"))
+	for _, name := range invalidAppNames {
+		t.Run(name, func(t *testing.T) {
+			err := runAppsPut([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1", "--bundle", bundlePath})
+			assertLocalNameRejection(t, name, err)
+		})
+	}
+}
+
+// TestRunAppsGet_ValidNameNotRejectedByNameCheck proves a well-formed name
+// sails past local validation: the call still fails (the remote is
+// unreachable), but for a DIFFERENT reason than name validation.
+func TestRunAppsGet_ValidNameNotRejectedByNameCheck(t *testing.T) {
+	err := runAppsGet([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1"})
+	if err == nil {
+		t.Fatal("expected an error (unreachable remote), got nil")
+	}
+	if strings.Contains(err.Error(), "invalid app name") {
+		t.Errorf("a valid name must not be rejected by local validation: %v", err)
+	}
+}
+
+// --- non-regular bundle files (C1 gate fix round, Minor finding) ---
+
+// TestRunAppsPut_RejectsNonRegularBundleFile proves a non-regular path
+// (a directory, standing in for a FIFO/device per the review's suggested
+// fallback) is rejected before any network call, rather than being
+// Stat()'d for a possibly-bogus size and silently let through.
+func TestRunAppsPut_RejectsNonRegularBundleFile(t *testing.T) {
+	dir := t.TempDir() // a directory is not a regular file
+	err := runAppsPut([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1", "--bundle", dir})
+	if err == nil {
+		t.Fatal("expected an error for a non-regular bundle path, got nil")
+	}
+	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
+		t.Errorf("error looks like it came from a network call, not the local regular-file check: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("error should say the bundle path is not a regular file: %v", err)
 	}
 }
 

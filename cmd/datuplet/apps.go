@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -173,19 +175,52 @@ func parseAppsFlags(args []string) (positional []string, remote, tokenFile, proj
 	return
 }
 
+// appNamePattern mirrors pkg/pipelineapi/apps.appNamePattern
+// (handlers.go) — the server's app-name grammar (spec §4.1): a DNS-label-
+// style name. This MUST be enforced locally before a name is embedded in a
+// URL path segment: url.PathEscape does NOT encode "." — PathEscape("..")
+// == ".." — so an unvalidated name like ".." would let net/http's ServeMux
+// (or an intermediary proxy) canonicalize the request path to a DIFFERENT,
+// unintended endpoint (e.g. the bare .../apps collection, or something
+// outside it) before any handler runs. This was gate-review finding C1-1
+// (Major).
+const appNamePattern = `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`
+
+var appNameRe = regexp.MustCompile(appNamePattern)
+
+// validateAppName is the single source of truth for the app-name check.
+// Every named command (put/get/delete) calls it FIRST — right after
+// extracting the positional <name> and before loadRemoteArgs or any network
+// I/O — so a bad name fails fast without touching credentials, project
+// resolution, or the wire at all. appsURL also calls it before embedding a
+// name in a path segment, so no future named subcommand can reach the wire
+// with an unvalidated name even if it forgets the early call.
+func validateAppName(name string) error {
+	if !appNameRe.MatchString(name) {
+		return fmt.Errorf("invalid app name %q: must match %s (lowercase alphanumerics and '-', not starting or ending with '-', 1-63 chars)", name, appNamePattern)
+	}
+	return nil
+}
+
 // appsURL composes /api/v1/projects/{pid}/apps[/{name}[/{suffix}]],
 // mirroring pipelineURL/componentsURL. suffix (e.g. "promote", "logs",
 // "tokens") is appended after {name} when non-empty — unused by this task's
-// subcommands, provided for the render/promote/logs/token follow-up.
-func appsURL(remote, projectID, name, suffix string) string {
+// subcommands, provided for the render/promote/logs/token follow-up. When
+// name is non-empty it is validated via validateAppName before being
+// escaped into the path; list's call (name == "") skips validation, since
+// there is nothing to validate.
+func appsURL(remote, projectID, name, suffix string) (string, error) {
 	base := strings.TrimRight(remote, "/") + "/api/v1/projects/" + url.PathEscape(projectID) + "/apps"
 	if name != "" {
+		if err := validateAppName(name); err != nil {
+			return "", err
+		}
 		base += "/" + url.PathEscape(name)
 	}
 	if suffix != "" {
 		base += "/" + suffix
 	}
-	return base
+	return base, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +361,8 @@ func writeAppsScaffold(dir string) error {
 // ---------------------------------------------------------------------------
 
 // runAppsPut implements `datuplet apps put <name> --bundle <file>`. Reads
-// the bundle file, rejects it locally if it exceeds the 5 MB raw cap
-// (before any network I/O), base64-encodes it, and PUTs
+// the bundle file, rejects it locally if it isn't a regular file or exceeds
+// the 5 MB raw cap (before any network I/O), base64-encodes it, and PUTs
 // {"bundle_base64": "..."} — the exact shape pkg/pipelineapi/apps's
 // putAppRequest decodes.
 func runAppsPut(args []string) error {
@@ -339,6 +374,9 @@ func runAppsPut(args []string) error {
 		return fmt.Errorf("usage: datuplet apps put <name> --bundle <file>")
 	}
 	name := positional[0]
+	if err := validateAppName(name); err != nil {
+		return err
+	}
 	if bundlePath == "" {
 		return fmt.Errorf("put: --bundle <file> is required\nusage: datuplet apps put <name> --bundle <file>")
 	}
@@ -347,15 +385,37 @@ func runAppsPut(args []string) error {
 	if err != nil {
 		return fmt.Errorf("stat bundle %s: %w", bundlePath, err)
 	}
+	// Reject anything that isn't a plain file BEFORE trusting its reported
+	// size: a FIFO/device/directory can report a bogus or zero Size(), which
+	// would let the cap below be bypassed (or a non-file slurped).
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("put: %s is not a regular file (bundle must be a plain file)", bundlePath)
+	}
 	// Enforce the 5 MB raw cap as a LOCAL error before reading the file or
 	// making any HTTP call — no reason to ship an oversize bundle just to
-	// receive the server's 413.
+	// receive the server's 413. This Stat-based check is the fast path.
 	if info.Size() > maxBundleBytes {
 		return fmt.Errorf("put: bundle %s is %d bytes, exceeds the %d byte (5 MB) limit", bundlePath, info.Size(), maxBundleBytes)
 	}
-	raw, err := os.ReadFile(bundlePath)
+	f, err := os.Open(bundlePath)
+	if err != nil {
+		return fmt.Errorf("open bundle %s: %w", bundlePath, err)
+	}
+	// Re-check the actual byte count against a LimitReader capped one byte
+	// above the limit, rather than trusting Stat's size a second time: the
+	// file can grow between Stat and Open/Read (TOCTOU), and this also
+	// bounds memory use instead of fully reading an oversize file just to
+	// reject it.
+	raw, err := io.ReadAll(io.LimitReader(f, maxBundleBytes+1))
+	closeErr := f.Close()
 	if err != nil {
 		return fmt.Errorf("read bundle %s: %w", bundlePath, err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close bundle %s: %w", bundlePath, closeErr)
+	}
+	if len(raw) > maxBundleBytes {
+		return fmt.Errorf("put: bundle %s exceeds the %d byte (5 MB) limit", bundlePath, maxBundleBytes)
 	}
 
 	resolved, err := loadRemoteArgs(remote, tokenFile, project)
@@ -373,8 +433,12 @@ func runAppsPut(args []string) error {
 		return fmt.Errorf("encode bundle: %w", err)
 	}
 
+	putURL, err := appsURL(resolved.Remote, resolved.ID, name, "")
+	if err != nil {
+		return err
+	}
 	status, respBody, err := doAuthedRequest(context.Background(),
-		http.MethodPut, appsURL(resolved.Remote, resolved.ID, name, ""),
+		http.MethodPut, putURL,
 		resolved.APIToken, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return err
@@ -406,6 +470,9 @@ func runAppsGet(args []string) error {
 		return fmt.Errorf("usage: datuplet apps get <name>")
 	}
 	name := positional[0]
+	if err := validateAppName(name); err != nil {
+		return err
+	}
 
 	resolved, err := loadRemoteArgs(remote, tokenFile, project)
 	if err != nil {
@@ -415,8 +482,12 @@ func runAppsGet(args []string) error {
 		return err
 	}
 
+	getURL, err := appsURL(resolved.Remote, resolved.ID, name, "")
+	if err != nil {
+		return err
+	}
 	status, body, err := doAuthedRequest(context.Background(),
-		http.MethodGet, appsURL(resolved.Remote, resolved.ID, name, ""),
+		http.MethodGet, getURL,
 		resolved.APIToken, "", nil)
 	if err != nil {
 		return err
@@ -475,8 +546,12 @@ func runAppsList(args []string) error {
 		return err
 	}
 
+	listURL, err := appsURL(resolved.Remote, resolved.ID, "", "")
+	if err != nil {
+		return err // unreachable in practice: name == "" skips validation
+	}
 	status, body, err := doAuthedRequest(context.Background(),
-		http.MethodGet, appsURL(resolved.Remote, resolved.ID, "", ""),
+		http.MethodGet, listURL,
 		resolved.APIToken, "", nil)
 	if err != nil {
 		return err
@@ -518,6 +593,9 @@ func runAppsDelete(args []string) error {
 		return fmt.Errorf("usage: datuplet apps delete <name>")
 	}
 	name := positional[0]
+	if err := validateAppName(name); err != nil {
+		return err
+	}
 
 	resolved, err := loadRemoteArgs(remote, tokenFile, project)
 	if err != nil {
@@ -527,8 +605,12 @@ func runAppsDelete(args []string) error {
 		return err
 	}
 
+	deleteURL, err := appsURL(resolved.Remote, resolved.ID, name, "")
+	if err != nil {
+		return err
+	}
 	status, body, err := doAuthedRequest(context.Background(),
-		http.MethodDelete, appsURL(resolved.Remote, resolved.ID, name, ""),
+		http.MethodDelete, deleteURL,
 		resolved.APIToken, "", nil)
 	if err != nil {
 		return err

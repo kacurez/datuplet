@@ -290,12 +290,12 @@ Options for 'apps':
   -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
   <subcommand>           One of: init | put | get | list | delete
   init <dir>             Scaffold a new app in <dir> (no network; refuses a non-empty dir)
-  put <name> -bundle <f> Upload a built bundle (see the scaffold's esbuild.mjs), moving 'draft' to it
+  put <name> --bundle <f> Upload a built bundle (see the scaffold's esbuild.mjs), moving 'draft' to it
                           Rejected locally above 5 MB, before any network call
   get <name>             Show one app's channels + versions
   list                   List apps in the current project
   delete <name>          Delete an app (non-interactive — no confirmation prompt)
-  -json                  Emit JSON output (put, get, list)
+  --json                 Emit JSON output (put, get, list)
 
 Options for 'query':
   -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
