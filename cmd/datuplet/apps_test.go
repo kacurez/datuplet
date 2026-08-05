@@ -1341,3 +1341,49 @@ func TestRunAppsRender_AuthorLog404StaysSilent(t *testing.T) {
 		t.Errorf("a 404 (aged out) must stay silent — no diagnostic; stderr:\n%s", stderr)
 	}
 }
+
+// TestRunAppsRender_NonEnvelopeBodyIsNotEchoed (C2 fix 2) closes the residual
+// leak: the non-envelope branch fires when the response is NOT app-worker's
+// envelope — i.e. an intermediary (ingress/proxy/LB) error page, which often
+// reflects the requested URI (query included) back into arbitrary HTML.
+// Echoing that body would re-open the --param leak the rest of the fix closed,
+// so the CLI must drop the untrusted body entirely and print only the status +
+// the already-redacted path.
+func TestRunAppsRender_NonEnvelopeBodyIsNotEchoed(t *testing.T) {
+	const reflected = "The requested URL /apps/p1/app?secret=SHIBBOLETH failed"
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onRender: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html><body>" + reflected + "</body></html>"))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var err error
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		err = runAppsRender([]string{"app", "--project", "p1", "--channel", "draft", "--param", "secret=SHIBBOLETH"})
+	})
+	if code := exitCodeOf(err); code != 20 {
+		t.Fatalf("exit code = %d, want 20: %v", code, err)
+	}
+	for label, s := range map[string]string{"error": err.Error(), "stdout": stdout, "stderr": stderr} {
+		if strings.Contains(s, "SHIBBOLETH") {
+			t.Errorf("%s leaked the reflected --param value: %q", label, s)
+		}
+		if strings.Contains(s, "secret=") {
+			t.Errorf("%s leaked secret=: %q", label, s)
+		}
+		if strings.Contains(s, "The requested URL") {
+			t.Errorf("%s echoed the untrusted proxy body: %q", label, s)
+		}
+	}
+	// Still actionable: names the status and the redacted (query-free) path.
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("error should name the HTTP status 502: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/apps/p1/app") {
+		t.Errorf("error should name the redacted request path: %v", err)
+	}
+}

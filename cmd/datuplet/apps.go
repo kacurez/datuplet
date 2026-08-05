@@ -837,8 +837,14 @@ func runAppsRender(args []string) error {
 	// discriminator — a proxy/ingress error page has no `kind`.
 	var env appsRenderEnvelope
 	if json.Unmarshal(body, &env) != nil || env.Kind == "" {
-		return &exitCodeErr{code: 20, err: fmt.Errorf("apps render: HTTP %d (no error envelope): %s",
-			resp.StatusCode, truncateForError(string(body)))}
+		// The body did NOT come from app-worker's envelope — it's from an
+		// intermediary (ingress/proxy/LB error page), which routinely reflects
+		// the requested URI (query included) back into arbitrary HTML. Query-
+		// scrubbing arbitrary HTML reliably isn't achievable, so the untrusted
+		// body is DROPPED entirely (RFC 028 §9). The status + the redacted,
+		// query-free target is enough to tell which app/remote failed.
+		return &exitCodeErr{code: 20, err: fmt.Errorf("apps render: HTTP %d (no error envelope) for %s",
+			resp.StatusCode, redactedTarget)}
 	}
 
 	// Render failure. Best-effort author-log fetch (never turns this into a
