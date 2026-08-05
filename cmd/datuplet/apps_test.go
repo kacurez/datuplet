@@ -1236,3 +1236,108 @@ func TestRunAppsLogs_ByRequestIDNotFoundExits1(t *testing.T) {
 		t.Errorf("error should say 'not found': %v", err)
 	}
 }
+
+// --- C2 fix round: no --param value in render error text; author-log fetch
+//     failure distinguishable from a 404 ---
+
+// TestRunAppsRender_TransportErrorDoesNotLeakParamValues pins RFC 028 §9's
+// invariant that request URLs / params carrying secrets must not be logged.
+// The CLI is the agent-facing surface where a credential may arrive as a
+// filter --param, so a connection-refused transport error must NOT echo the
+// query string (which the raw request URL and the *url.Error from client.Do
+// both embed) into the returned error or anything printed. Exit stays 20.
+func TestRunAppsRender_TransportErrorDoesNotLeakParamValues(t *testing.T) {
+	setHeadlessEnv(t, "http://127.0.0.1:1") // nothing listens here
+	var err error
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		err = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--param", "secret=SHIBBOLETH"})
+	})
+	if code := exitCodeOf(err); code != 20 {
+		t.Fatalf("exit code = %d, want 20 (transport failure): %v", code, err)
+	}
+	for label, s := range map[string]string{"error": err.Error(), "stdout": stdout, "stderr": stderr} {
+		if strings.Contains(s, "SHIBBOLETH") {
+			t.Errorf("%s leaked the --param VALUE: %q", label, s)
+		}
+		if strings.Contains(s, "secret=") {
+			t.Errorf("%s leaked the --param key=value: %q", label, s)
+		}
+	}
+}
+
+// TestRunAppsRender_AuthorLogFetch500EmitsStderrNoteButNullObject proves a
+// NON-404 author-log fetch failure (500 here) keeps the stdout object shape
+// exactly {error,kind,request_id,author_log:null} (JSON consumers unaffected)
+// while additionally emitting a one-line diagnostic to stderr, so the agent
+// can tell "log route broken" from "log aged out".
+func TestRunAppsRender_AuthorLogFetch500EmitsStderrNoteButNullObject(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onRender: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"render failed","kind":"render_error","request_id":"req-1"}`))
+		},
+		onLogs: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		runErr = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--json"})
+	})
+	if code := exitCodeOf(runErr); code != 1 {
+		t.Fatalf("exit code = %d, want 1: %v", code, runErr)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(stdout), &obj); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%s", err, stdout)
+	}
+	al, present := obj["author_log"]
+	if !present || al != nil {
+		t.Errorf("author_log must stay null on a non-404 fetch failure, got present=%v value=%v", present, al)
+	}
+	if !strings.Contains(stderr, "could not fetch author log") {
+		t.Errorf("a non-404 log-fetch failure must emit a stderr diagnostic; stderr:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "req-1") {
+		t.Errorf("the diagnostic should name the request_id; stderr:\n%s", stderr)
+	}
+}
+
+// TestRunAppsRender_AuthorLog404StaysSilent proves a genuine 404 (aged out /
+// never existed) stays silent — null is the expected signal, no diagnostic.
+func TestRunAppsRender_AuthorLog404StaysSilent(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onRender: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"render failed","kind":"render_error","request_id":"req-1"}`))
+		},
+		onLogs: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"no render log for that request_id"}`, http.StatusNotFound)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		runErr = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--json"})
+	})
+	if code := exitCodeOf(runErr); code != 1 {
+		t.Fatalf("exit code = %d, want 1: %v", code, runErr)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(stdout), &obj); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%s", err, stdout)
+	}
+	if al, present := obj["author_log"]; !present || al != nil {
+		t.Errorf("author_log must be null on a 404, got present=%v value=%v", present, al)
+	}
+	if strings.Contains(stderr, "could not fetch author log") {
+		t.Errorf("a 404 (aged out) must stay silent — no diagnostic; stderr:\n%s", stderr)
+	}
+}

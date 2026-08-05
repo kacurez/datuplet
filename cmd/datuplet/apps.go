@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -798,10 +799,17 @@ func runAppsRender(args []string) error {
 	if err != nil {
 		return err
 	}
+	// redactedTarget is the request target with the query string stripped —
+	// the ONLY form of the URL that may appear in error text. A --param value
+	// may be a secret (the CLI is the agent surface where a credential can be
+	// passed as a filter), and RFC 028 §9 forbids logging request URLs/params.
+	// Both the raw renderURL and the *url.Error client.Do returns embed the
+	// full query, so error text uses redactedTarget + scrubURLError(err).
+	redactedTarget := redactRenderTarget(renderURL)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, renderURL, nil)
 	if err != nil {
-		return &exitCodeErr{code: 20, err: fmt.Errorf("apps render: build request: %w", err)}
+		return &exitCodeErr{code: 20, err: fmt.Errorf("apps render: build request for %s: %w", redactedTarget, scrubURLError(err))}
 	}
 	req.Header.Set("Authorization", "Bearer "+resolved.APIToken)
 	req.Header.Set("Accept", "application/json")
@@ -809,7 +817,8 @@ func runAppsRender(args []string) error {
 	resp, err := appsRenderHTTPClient.Do(req)
 	if err != nil {
 		// Could not reach the service (or a refused redirect) — transport class.
-		return &exitCodeErr{code: 20, err: fmt.Errorf("apps render: %s: %w", renderURL, err)}
+		// scrubURLError strips the URL (query included) from the *url.Error.
+		return &exitCodeErr{code: 20, err: fmt.Errorf("apps render: %s: %w", redactedTarget, scrubURLError(err))}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, appsRenderMaxResponseBytes))
@@ -906,26 +915,80 @@ func appsRenderURL(remote, projectID, name, channel, query string) (string, erro
 	return base, nil
 }
 
+// redactRenderTarget returns the render request target with its query string
+// (and fragment) stripped — the ONLY URL form allowed in error text, since a
+// --param value carried in the query may be a secret (RFC 028 §9). The path
+// still carries pid/name/@draft (none secret). If the URL can't be parsed it
+// is NOT echoed at all — an unparseable raw string could still carry the
+// query — so a fixed placeholder is returned instead.
+func redactRenderTarget(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "(app render URL)"
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+// scrubURLError strips the URL from a *url.Error before it reaches error text.
+// http.Client.Do and http.NewRequest return *url.Error, whose Error() embeds
+// the full request URL (query included) — returning the inner cause instead
+// keeps the useful reason ("connection refused", "unexpected redirect
+// (refused)", "Client.Timeout exceeded …", a parse reason) without the query.
+// Non-url.Error values pass through unchanged (they carry no request URL).
+func scrubURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
+}
+
 // fetchAuthorLog fetches the render-log record matching requestID from
 // pipeline-api's author logs route, for the render-failure combined object.
-// Best-effort: an empty requestID, a 404 (aged out of the ring buffer / never
-// existed), an invalid-JSON body, or any transport hiccup yields a nil
-// RawMessage → author_log:null (spec §5.5). It never turns a render failure
-// into a transport failure.
+// Best-effort: it always returns a nil RawMessage (→ author_log:null, spec
+// §5.5) on failure and never turns a render failure into a transport failure.
+//
+// It distinguishes a genuine 404 — the record aged out of the ring buffer or
+// never existed, for which null is the expected signal and no diagnostic is
+// warranted — from any OTHER failure (transport error, 5xx, unparseable body),
+// which additionally emits a one-line note to stderr. This keeps the
+// machine-readable stdout object shape unchanged (author_log:null either way,
+// so JSON consumers are unaffected) while restoring the agent's ability to
+// tell "log route broken" from "log aged out". The note's reason is
+// URL-scrubbed and the logs route carries no --param anyway (only the
+// non-secret request_id), so no secret can reach it.
 func fetchAuthorLog(ctx context.Context, remote, apiToken, projectID, name, requestID string) json.RawMessage {
 	if requestID == "" {
 		return nil
 	}
+	note := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "note: could not fetch author log (request_id=%s): "+format+"\n",
+			append([]any{requestID}, args...)...)
+	}
 	logsURL, err := appsURL(remote, projectID, name, "logs")
 	if err != nil {
+		note("%v", err)
 		return nil
 	}
 	logsURL += "?request_id=" + url.QueryEscape(requestID)
 	status, body, err := doAuthedRequest(ctx, http.MethodGet, logsURL, apiToken, "", nil)
-	if err != nil || status != http.StatusOK || !json.Valid(body) {
+	switch {
+	case err != nil:
+		note("%v", scrubURLError(err))
 		return nil
+	case status == http.StatusNotFound:
+		return nil // expected "aged out / never existed" — stay silent.
+	case status != http.StatusOK:
+		note("HTTP %d", status)
+		return nil
+	case !json.Valid(body):
+		note("response was not valid JSON")
+		return nil
+	default:
+		return json.RawMessage(body)
 	}
-	return json.RawMessage(body)
 }
 
 // formatRenderFailureText writes the human-readable render-failure block to w
