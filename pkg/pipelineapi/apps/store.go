@@ -583,6 +583,54 @@ func (s *Store) RevokeToken(ctx context.Context, appID, tokenID string) error {
 	return nil
 }
 
+// TokenSummary is one viewer token's public metadata for the author-facing
+// list route — deliberately NEVER a secret or salt: ListTokens's SELECT
+// (below) does not read either column, so this type has no field that
+// could carry one. RevokedAt is nil for an active token.
+type TokenSummary struct {
+	TokenID   string
+	CreatedAt time.Time
+	RevokedAt *time.Time
+}
+
+// ListTokens returns appID's viewer tokens, newest-first (never nil). Only
+// token_id, created_at and revoked_at are selected — never salt or
+// secret_hash — so this method is structurally incapable of returning a
+// token's secret, which is unrecoverable after mint anyway (spec §5.3): it
+// was never stored, only SHA-256(salt||secret) was. A revoked token still
+// appears in the list, with RevokedAt set, rather than being dropped;
+// VerifyToken/TokenActive remain the only ways to ask "is this one still
+// live".
+func (s *Store) ListTokens(ctx context.Context, appID string) ([]TokenSummary, error) {
+	appUUID, err := uuid.Parse(appID)
+	if err != nil {
+		return nil, fmt.Errorf("apps: invalid app id %q: %w", appID, err)
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT token_id, created_at, revoked_at
+		   FROM app_viewer_tokens
+		  WHERE app_id = $1
+		  ORDER BY created_at DESC`,
+		appUUID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("apps: list tokens: %w", err)
+	}
+	defer rows.Close()
+
+	out := []TokenSummary{}
+	for rows.Next() {
+		var id uuid.UUID
+		var t TokenSummary
+		if err := rows.Scan(&id, &t.CreatedAt, &t.RevokedAt); err != nil {
+			return nil, fmt.Errorf("apps: scan token: %w", err)
+		}
+		t.TokenID = id.String()
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // AppendRenderLog appends one render record to the app's ring buffer, then
 // trims it by BOTH bounds: records older than the Store's retention window
 // (default DefaultRenderLogRetention, measured against the injectable

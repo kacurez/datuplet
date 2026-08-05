@@ -99,6 +99,7 @@ func (h *Handlers) Register(mux *http.ServeMux, mw func(http.Handler) http.Handl
 	route("POST /api/v1/projects/{pid}/apps/{name}/promote", h.handlePromote)
 	route("GET /api/v1/projects/{pid}/apps/{name}/logs", h.handleLogs)
 	route("POST /api/v1/projects/{pid}/apps/{name}/tokens", h.handleCreateToken)
+	route("GET /api/v1/projects/{pid}/apps/{name}/tokens", h.handleListTokens)
 	route("DELETE /api/v1/projects/{pid}/apps/{name}/tokens/{token_id}", h.handleDeleteToken)
 }
 
@@ -160,6 +161,18 @@ type tokenResponse struct {
 	// returned EXACTLY ONCE, here, at mint: only SHA-256(salt||secret) is
 	// stored, so no route can ever surface it again (spec §5.3).
 	Token string `json:"token"`
+}
+
+// tokenSummaryJSON is one entry of the GET .../tokens list response — the
+// public metadata of a viewer token, and NEVER its secret (spec §5.3: the
+// plaintext transits exactly once, at mint, in tokenResponse above).
+// RevokedAt has no `omitempty`: an active token serializes revoked_at as a
+// literal JSON null, not an absent key, so callers can rely on the key
+// always being present.
+type tokenSummaryJSON struct {
+	TokenID   string  `json:"token_id"`
+	CreatedAt string  `json:"created_at"`
+	RevokedAt *string `json:"revoked_at"`
 }
 
 type renderLogJSON struct {
@@ -462,6 +475,34 @@ func (h *Handlers) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		TokenID: tokenID,
 		Token:   "vw_" + tokenID + "." + secret,
 	})
+}
+
+// handleListTokens lists appID's viewer tokens (spec §5.1/§5.3): token_id,
+// created_at, revoked_at — never a secret or salt, since Store.ListTokens's
+// SELECT never reads those columns. Gated on relationRead ("describe"),
+// the same relation every other read route (list/get/logs) uses — this is
+// a read, not a mutation, so it does not take relationWrite like
+// create/delete.
+func (h *Handlers) handleListTokens(w http.ResponseWriter, r *http.Request) {
+	app, _, ok := h.resolveApp(w, r, relationRead)
+	if !ok {
+		return
+	}
+	tokens, err := h.Store.ListTokens(r.Context(), app.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list viewer tokens")
+		return
+	}
+	out := make([]tokenSummaryJSON, 0, len(tokens))
+	for _, t := range tokens {
+		item := tokenSummaryJSON{TokenID: t.TokenID, CreatedAt: t.CreatedAt.Format(timeLayout)}
+		if t.RevokedAt != nil {
+			revoked := t.RevokedAt.Format(timeLayout)
+			item.RevokedAt = &revoked
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleDeleteToken revokes a viewer token. Revocation kills live viewer

@@ -313,7 +313,7 @@ Options for 'apps':
   token create <name>    Mint a viewer token; prints vw_<id>.<secret> ONCE (never retrievable again)
   token list <name>      List this app's viewer token ids + created/revoked (never a secret)
   token delete <name> <token_id>  Revoke a viewer token (token_id must be a UUID)
-  -json                  Emit JSON output (put, get, list, render, logs, promote, token create, token list)
+  --json                 Emit JSON output (put, get, list, render, logs, promote, token create, token list)
 
 Options for 'query':
   -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)

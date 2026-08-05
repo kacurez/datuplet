@@ -58,9 +58,6 @@ const maxBundleBytes = 5 * 1024 * 1024
 //     exit appsPromoteCASConflictExitCode, never the default exit 1)
 //   - token:   create/list/delete sub-subcommands over
 //     POST/GET/DELETE /api/v1/projects/{pid}/apps/{name}/tokens[/{token_id}]
-//     (token list has no server route as of this task — see
-//     runAppsTokenList's doc comment for the gap and the assumed
-//     contract it is implemented and tested against)
 func runApps(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: datuplet apps <init|put|get|list|delete|render|logs|promote|token> [args]\n%s", appsHelpText())
@@ -1379,13 +1376,16 @@ type appTokenCreateResponseJSON struct {
 	Token   string `json:"token"`
 }
 
-// appTokenSummaryJSON is the CLI's contract for a `apps token list` response
-// — see runAppsTokenList's doc comment for why the matching server route
-// does not exist yet at HEAD. Field names mirror the app_viewer_tokens
-// columns (migration 013: token_id, created_at, revoked_at) exactly, so a
-// follow-up server handler has an unambiguous shape to implement against.
-// Deliberately has NO secret/secret_hash field: the type itself makes "list
-// can't print a secret" a compile-time property, not just a runtime habit.
+// appTokenSummaryJSON is the CLI's decode target for a `GET
+// .../apps/{name}/tokens` response (pkg/pipelineapi/apps/handlers.go's
+// handleListTokens / tokenSummaryJSON). Field names mirror the
+// app_viewer_tokens columns (migration 013: token_id, created_at,
+// revoked_at) exactly. Deliberately has NO secret/secret_hash field: the
+// type itself makes "list can't print a secret" a compile-time property,
+// not just a runtime habit — runAppsTokenList decodes every response into
+// this type (never passes the server body through verbatim), so even a
+// future server bug that added a sensitive field to the response could not
+// reach this CLI's output.
 type appTokenSummaryJSON struct {
 	TokenID   string  `json:"token_id"`
 	CreatedAt string  `json:"created_at"`
@@ -1473,21 +1473,17 @@ func runAppsTokenCreate(args []string) error {
 	return nil
 }
 
-// runAppsTokenList implements `datuplet apps token list <name> [--json]`.
+// runAppsTokenList implements `datuplet apps token list <name> [--json]`
+// against `GET .../apps/{name}/tokens` (pkg/pipelineapi/apps/handlers.go's
+// handleListTokens, added alongside Store.ListTokens — RFC 028 token-list
+// gap fix, Part 5 phase gate).
 //
-// KNOWN GAP, flagged for the orchestrator, not fixed here (out of C3's
-// CLI-only scope): pipeline-api has no GET .../apps/{name}/tokens route as
-// of this task. Verified against pkg/pipelineapi/apps/handlers.go's
-// Register (only POST .../tokens and DELETE .../tokens/{token_id} are
-// registered) and store.go (no ListTokens method) — and independently
-// confirmed absent from C0's own route enumeration and from P3's
-// internal.go. This function is fully implemented and tested (against a
-// fake server) against the shape appTokenSummaryJSON documents, mirroring
-// app_viewer_tokens' actual columns, so it is ready the moment a follow-up
-// task adds `Store.ListTokens` + a handler + the route registration. Against
-// today's real server it will fail loudly with a generic HTTP error (the
-// ServeMux's catch-all for an unmatched path) rather than silently return
-// wrong data — see the "list tokens: HTTP %d" branch below.
+// The response is ALWAYS decoded into appTokenSummaryJSON first, and --json
+// mode RE-ENCODES that decoded value rather than printing the server body
+// through verbatim: even if a future server response carried an unexpected
+// sensitive field, appTokenSummaryJSON has no field to decode it into, so
+// it structurally cannot reach this CLI's output (Codex Minor, RFC 028
+// Part 5 gate).
 func runAppsTokenList(args []string) error {
 	positional, remote, tokenFile, project, _, _, _, _, _, _, asJSON, err := parseAppsFlags(args)
 	if err != nil {
@@ -1525,15 +1521,25 @@ func runAppsTokenList(args []string) error {
 		return fmt.Errorf("list tokens: HTTP %d: %s", status, truncateForError(string(body)))
 	}
 
-	if asJSON {
-		fmt.Println(string(body))
-		return nil
-	}
-
+	// Decode into the safe summary type and, for --json, RE-ENCODE that
+	// rather than passing the server body through verbatim: even if a
+	// future server response carried an unexpected sensitive field,
+	// appTokenSummaryJSON has no field to decode it into, so it cannot
+	// reach this CLI's output (Codex Minor, RFC 028 Part 5 gate).
 	var items []appTokenSummaryJSON
 	if err := json.Unmarshal(body, &items); err != nil {
 		return fmt.Errorf("decode token list response: %w", err)
 	}
+
+	if asJSON {
+		encoded, err := json.Marshal(items)
+		if err != nil {
+			return fmt.Errorf("encode token list response: %w", err)
+		}
+		fmt.Println(string(encoded))
+		return nil
+	}
+
 	if len(items) == 0 {
 		fmt.Println("(no viewer tokens)")
 		return nil

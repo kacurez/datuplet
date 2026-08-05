@@ -719,6 +719,85 @@ func TestDeleteToken_RevokesAndIsNotFoundTwiceOver(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// GET .../tokens — list (RFC 028 token-list gap, Part 5 phase gate)
+// ---------------------------------------------------------------------------
+
+// tokenListItemJSON is this test file's decode target for the list-tokens
+// response — RevokedAt has no `omitempty` tag so a missing key and an
+// explicit `null` are distinguishable via the raw body text (checked
+// separately below); decoding-wise both give a nil pointer either way.
+type tokenListItemJSON struct {
+	TokenID   string  `json:"token_id"`
+	CreatedAt string  `json:"created_at"`
+	RevokedAt *string `json:"revoked_at"`
+}
+
+func TestListTokens_ReturnsSummariesNotSecrets(t *testing.T) {
+	h := newAppsHarness(t)
+	h.putApp("dash1", []byte("v1"))
+
+	// Empty before any mint.
+	w := h.do(http.MethodGet, h.appsPath("/dash1/tokens"), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty list status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	var empty []tokenListItemJSON
+	decodeBody(t, w, &empty)
+	if len(empty) != 0 {
+		t.Fatalf("empty token list = %+v, want []", empty)
+	}
+
+	tokenID1, _, err := mintViaHTTP(h, "dash1")
+	if err != nil {
+		t.Fatalf("mint 1: %v", err)
+	}
+	tokenID2, _, err := mintViaHTTP(h, "dash1")
+	if err != nil {
+		t.Fatalf("mint 2: %v", err)
+	}
+	if w := h.do(http.MethodDelete, h.appsPath("/dash1/tokens/"+tokenID1), ""); w.Code != http.StatusNoContent {
+		t.Fatalf("revoke status = %d, want 204 (body %s)", w.Code, w.Body.String())
+	}
+
+	w = h.do(http.MethodGet, h.appsPath("/dash1/tokens"), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	lower := strings.ToLower(body)
+	if strings.Contains(body, "vw_") || strings.Contains(lower, "secret") || strings.Contains(lower, "salt") {
+		t.Fatalf("token list response must never carry a secret/salt: %s", body)
+	}
+	// An active token's revoked_at must serialize as a literal null, not be
+	// omitted (the route's documented contract).
+	if !strings.Contains(body, `"revoked_at":null`) {
+		t.Fatalf("active token's revoked_at must be literal null in the response, got body %s", body)
+	}
+
+	var got []tokenListItemJSON
+	decodeBody(t, w, &got)
+	if len(got) != 2 {
+		t.Fatalf("list = %d entries, want 2 (%+v)", len(got), got)
+	}
+	// Newest-first: tokenID2 (minted second) sorts before tokenID1.
+	if got[0].TokenID != tokenID2 || got[1].TokenID != tokenID1 {
+		t.Fatalf("order = [%s, %s], want newest-first [%s, %s]",
+			got[0].TokenID, got[1].TokenID, tokenID2, tokenID1)
+	}
+	if got[0].RevokedAt != nil {
+		t.Fatalf("active token (tokenID2) revoked_at = %v, want nil", got[0].RevokedAt)
+	}
+	if got[1].RevokedAt == nil {
+		t.Fatalf("revoked token (tokenID1) revoked_at = nil, want set")
+	}
+
+	// Unknown app -> 404, same as every other named author route.
+	if w := h.do(http.MethodGet, h.appsPath("/nope/tokens"), ""); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown app status = %d, want 404 (body %s)", w.Code, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Auth matrix — every route, 401 unauthenticated + 403 non-member
 // ---------------------------------------------------------------------------
 
@@ -736,6 +815,7 @@ func authMatrixRoutes(h *appsHarness, tokenID string) []struct {
 		{http.MethodPost, h.appsPath("/dash1/promote"), `{"version":"` + strings.Repeat("a", 64) + `"}`},
 		{http.MethodGet, h.appsPath("/dash1/logs"), ""},
 		{http.MethodPost, h.appsPath("/dash1/tokens"), ""},
+		{http.MethodGet, h.appsPath("/dash1/tokens"), ""},
 		{http.MethodDelete, h.appsPath("/dash1/tokens/" + tokenID), ""},
 	}
 }

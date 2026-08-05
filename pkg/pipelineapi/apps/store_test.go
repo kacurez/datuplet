@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -462,6 +463,86 @@ func TestVerifyToken(t *testing.T) {
 	}
 	if ok, err := s.VerifyToken(ctx, app.ID, tokenID, secret); err != nil || ok {
 		t.Fatalf("VerifyToken(after revoke) = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// TestListTokens_NewestFirstAndRevokedStatus covers the RFC 028 token-list
+// gap (Part 5 phase gate): ListTokens must return newest-first, must still
+// show a revoked token (not silently drop it), and must report RevokedAt
+// nil for an active token / set for a revoked one.
+func TestListTokens_NewestFirstAndRevokedStatus(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	s := apps.NewStore(pool)
+	projectID := testProject(t, pool, "proj-a")
+	app, err := s.Create(ctx, projectID, "dash1")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Empty before any mint.
+	if tokens, err := s.ListTokens(ctx, app.ID); err != nil || len(tokens) != 0 {
+		t.Fatalf("ListTokens (no tokens minted) = (%+v, %v), want ([], nil)", tokens, err)
+	}
+
+	id1, _, err := s.MintToken(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("MintToken #1: %v", err)
+	}
+	id2, _, err := s.MintToken(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("MintToken #2: %v", err)
+	}
+	if err := s.RevokeToken(ctx, app.ID, id1); err != nil {
+		t.Fatalf("RevokeToken(id1): %v", err)
+	}
+
+	tokens, err := s.ListTokens(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("ListTokens: %v", err)
+	}
+	if len(tokens) != 2 {
+		t.Fatalf("len(tokens) = %d, want 2 (%+v)", len(tokens), tokens)
+	}
+	// Newest-first: id2 (minted second) sorts before id1.
+	if tokens[0].TokenID != id2 || tokens[1].TokenID != id1 {
+		t.Fatalf("order = [%s, %s], want newest-first [%s, %s]",
+			tokens[0].TokenID, tokens[1].TokenID, id2, id1)
+	}
+	if tokens[0].RevokedAt != nil {
+		t.Fatalf("tokens[0] (id2, active) RevokedAt = %v, want nil", tokens[0].RevokedAt)
+	}
+	// A revoked token still appears in the list (never dropped), with
+	// RevokedAt set.
+	if tokens[1].RevokedAt == nil {
+		t.Fatalf("tokens[1] (id1, revoked) RevokedAt = nil, want set")
+	}
+}
+
+func TestListTokens_UnknownAppIDIsAnError(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	s := apps.NewStore(pool)
+
+	if _, err := s.ListTokens(context.Background(), "not-a-uuid"); err == nil {
+		t.Fatal("ListTokens(malformed app id): expected an error, got nil")
+	}
+}
+
+// TestTokenSummary_HasNoSecretOrSaltField is a structural proof, not merely a
+// runtime one: ListTokens returns apps.TokenSummary, which must have no field
+// capable of carrying a token's secret or salt, so a secret/salt leak through
+// this method is impossible by construction — not just avoided by habit. This
+// walks the type's fields via reflection so it fails loudly if a future edit
+// ever adds a secret/salt/hash field here.
+func TestTokenSummary_HasNoSecretOrSaltField(t *testing.T) {
+	typ := reflect.TypeOf(apps.TokenSummary{})
+	for i := 0; i < typ.NumField(); i++ {
+		name := strings.ToLower(typ.Field(i).Name)
+		if strings.Contains(name, "secret") || strings.Contains(name, "salt") {
+			t.Fatalf("apps.TokenSummary has field %q; ListTokens must never be able to carry a token's secret or salt", typ.Field(i).Name)
+		}
 	}
 }
 

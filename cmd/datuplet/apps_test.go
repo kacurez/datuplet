@@ -1916,6 +1916,45 @@ func TestRunAppsTokenList_Empty(t *testing.T) {
 	}
 }
 
+// TestRunAppsTokenList_JSONProjectsThroughSafeSummaryType proves --json
+// DECODES the server response into appTokenSummaryJSON and RE-ENCODES that,
+// rather than printing the raw server body through verbatim (Codex Minor,
+// RFC 028 Part 5 gate): a server response carrying an unexpected sensitive
+// field must never reach the CLI's --json output, because
+// appTokenSummaryJSON has no field for it to decode into. Run against the
+// pre-fix raw-passthrough code, this test fails (the fixture's
+// "secret_hash" and "deadbeef" appear verbatim in stdout).
+func TestRunAppsTokenList_JSONProjectsThroughSafeSummaryType(t *testing.T) {
+	const leakyBody = `[{"token_id":"` + testTokenID + `","created_at":"2026-07-31T00:00:00Z","revoked_at":null,"secret_hash":"deadbeefdeadbeef"}]`
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onListTokens: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(leakyBody))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runAppsTokenList([]string{"sales-overview", "--project", "proj1", "--json"})
+	})
+	if runErr != nil {
+		t.Fatalf("runAppsTokenList --json: %v", runErr)
+	}
+	if strings.Contains(out, "secret_hash") || strings.Contains(out, "deadbeef") {
+		t.Fatalf("--json output must project through appTokenSummaryJSON (decode+re-encode), not pass the server body through verbatim; got:\n%s", out)
+	}
+	var items []appTokenSummaryJSON
+	if err := json.Unmarshal([]byte(out), &items); err != nil {
+		t.Fatalf("--json output is not a JSON array of appTokenSummaryJSON: %v\n%s", err, out)
+	}
+	if len(items) != 1 || items[0].TokenID != testTokenID {
+		t.Fatalf("decoded items = %+v, want one entry with token_id %s", items, testTokenID)
+	}
+}
+
 func TestRunAppsTokenDelete_CallsDeleteWithID(t *testing.T) {
 	var gotMethod, gotName, gotTokenID string
 	srv := newAppsFakeServer(t, appsFakeBehaviour{
