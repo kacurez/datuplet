@@ -195,6 +195,21 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "apps":
+		if err := runApps(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			// A future `apps render` distinguishes a transport/HTTP failure
+			// (>=20, the repo's FailedApplication band) from "the render
+			// failed" (plain error, default exit 1) — same exitCodeErr
+			// mechanism as the "pipeline" case above.
+			code := 1
+			var ece *exitCodeErr
+			if errors.As(err, &ece) {
+				code = ece.code
+			}
+			os.Exit(code)
+		}
+
 	case "version":
 		fmt.Println("datuplet version 0.1.0-poc")
 
@@ -229,6 +244,7 @@ Commands:
   pipeline               CRUD for pipeline specs (list, get, put, delete, validate)
   runs                   List runs (filter by pipeline/phase) and get run detail + timeline
   components             Browse the component catalog (list, get --schema)
+  apps                   Manage user apps (init, put, get, list, delete)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
   gateway                Start the data gateway server (container entrypoint)
@@ -267,6 +283,19 @@ Options for 'components':
   get -version <v>       Resolve a specific version (default: registry defaultVersion, else highest stable)
   get -schema            Print the resolved version's configSchema verbatim (mutually exclusive with -json)
   Not project-scoped: no -project flag (spec RFC 027 §4.7 — shared catalog).
+
+Options for 'apps':
+  -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
+  -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one) — not used by 'init'
+  -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
+  <subcommand>           One of: init | put | get | list | delete
+  init <dir>             Scaffold a new app in <dir> (no network; refuses a non-empty dir)
+  put <name> -bundle <f> Upload a built bundle (see the scaffold's esbuild.mjs), moving 'draft' to it
+                          Rejected locally above 5 MB, before any network call
+  get <name>             Show one app's channels + versions
+  list                   List apps in the current project
+  delete <name>          Delete an app (non-interactive — no confirmation prompt)
+  -json                  Emit JSON output (put, get, list)
 
 Options for 'query':
   -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)

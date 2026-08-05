@@ -1,0 +1,13 @@
+{
+  "name": "datuplet-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Datuplet user app (RFC 028) — scaffolded by `datuplet apps init`.",
+  "scripts": {
+    "build": "node esbuild.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
