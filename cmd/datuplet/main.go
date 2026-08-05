@@ -288,14 +288,20 @@ Options for 'apps':
   -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
   -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one) — not used by 'init'
   -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
-  <subcommand>           One of: init | put | get | list | delete
+  <subcommand>           One of: init | put | get | list | delete | render | logs
   init <dir>             Scaffold a new app in <dir> (no network; refuses a non-empty dir)
   put <name> --bundle <f> Upload a built bundle (see the scaffold's esbuild.mjs), moving 'draft' to it
                           Rejected locally above 5 MB, before any network call
   get <name>             Show one app's channels + versions
   list                   List apps in the current project
   delete <name>          Delete an app (non-interactive — no confirmation prompt)
-  --json                 Emit JSON output (put, get, list)
+  render <name>          Server-side render (the agent's test step): prints the OutputDoc
+                          JSON on success; on failure, one {error,kind,request_id,author_log}
+                          object. Exit 0 ok / 1 render failure / 20 transport failure
+  --channel draft|production  Which channel render targets (default: production)
+  --param k=v            Bind a render param (repeatable): --param days=7 --param country=DE
+  logs <name>            Recent render logs; --request-id <id> returns one record (exit 1 if not found)
+  --json                 Emit JSON output (put, get, list, render, logs)
 
 Options for 'query':
   -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
