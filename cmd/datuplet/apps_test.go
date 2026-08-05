@@ -94,7 +94,7 @@ func TestValidateAppName(t *testing.T) {
 // --- parseAppsFlags (pure) ---
 
 func TestParseAppsFlags(t *testing.T) {
-	positional, remote, tokenFile, project, bundle, channel, requestID, params, asJSON, err := parseAppsFlags(
+	positional, remote, tokenFile, project, bundle, channel, requestID, params, version, expectedProduction, asJSON, err := parseAppsFlags(
 		[]string{"sales-overview", "--remote", "http://x", "--project=proj1", "--bundle", "b.js", "--json"})
 	if err != nil {
 		t.Fatalf("parseAppsFlags: %v", err)
@@ -117,12 +117,15 @@ func TestParseAppsFlags(t *testing.T) {
 	if channel != "" || requestID != "" || len(params) != 0 {
 		t.Errorf("channel/requestID/params should be zero-valued here: %q %q %v", channel, requestID, params)
 	}
+	if version != "" || expectedProduction != "" {
+		t.Errorf("version/expectedProduction should be zero-valued here: %q %q", version, expectedProduction)
+	}
 	if !asJSON {
 		t.Error("asJSON = false, want true")
 	}
 
 	// render's flags: --channel plus a REPEATABLE --param, gathered in order.
-	_, _, _, _, _, channel, _, params, _, err = parseAppsFlags(
+	_, _, _, _, _, channel, _, params, _, _, _, err = parseAppsFlags(
 		[]string{"sales-overview", "--channel", "draft", "--param", "days=7", "--param=country=DE"})
 	if err != nil {
 		t.Fatalf("parseAppsFlags (render): %v", err)
@@ -135,7 +138,7 @@ func TestParseAppsFlags(t *testing.T) {
 	}
 
 	// logs' flag: --request-id.
-	_, _, _, _, _, _, requestID, _, _, err = parseAppsFlags(
+	_, _, _, _, _, _, requestID, _, _, _, _, err = parseAppsFlags(
 		[]string{"sales-overview", "--request-id", "req-abc"})
 	if err != nil {
 		t.Fatalf("parseAppsFlags (logs): %v", err)
@@ -144,23 +147,42 @@ func TestParseAppsFlags(t *testing.T) {
 		t.Errorf("requestID = %q, want req-abc", requestID)
 	}
 
-	if _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--bogus"}); err == nil {
+	// promote's flags: --version plus optional --expected-production.
+	_, _, _, _, _, _, _, _, version, expectedProduction, _, err = parseAppsFlags(
+		[]string{"sales-overview", "--version", "abc123", "--expected-production=def456"})
+	if err != nil {
+		t.Fatalf("parseAppsFlags (promote): %v", err)
+	}
+	if version != "abc123" {
+		t.Errorf("version = %q, want abc123", version)
+	}
+	if expectedProduction != "def456" {
+		t.Errorf("expectedProduction = %q, want def456", expectedProduction)
+	}
+
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--bogus"}); err == nil {
 		t.Error("expected error for unknown flag")
 	}
-	if _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--remote"}); err == nil {
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--remote"}); err == nil {
 		t.Error("expected error for --remote missing a value")
 	}
-	if _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--bundle"}); err == nil {
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--bundle"}); err == nil {
 		t.Error("expected error for --bundle missing a value")
 	}
-	if _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--channel"}); err == nil {
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--channel"}); err == nil {
 		t.Error("expected error for --channel missing a value")
 	}
-	if _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--param"}); err == nil {
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--param"}); err == nil {
 		t.Error("expected error for --param missing a value")
 	}
-	if _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--request-id"}); err == nil {
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--request-id"}); err == nil {
 		t.Error("expected error for --request-id missing a value")
+	}
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--version"}); err == nil {
+		t.Error("expected error for --version missing a value")
+	}
+	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--expected-production"}); err == nil {
+		t.Error("expected error for --expected-production missing a value")
 	}
 }
 
@@ -306,12 +328,16 @@ func TestRunAppsInit_CreatesMissingParentDirs(t *testing.T) {
 // one ingress host — which is what lets `apps render` fetch the matching
 // author log from the same resolved.Remote.
 type appsFakeBehaviour struct {
-	onPut    func(w http.ResponseWriter, r *http.Request)
-	onGet    func(w http.ResponseWriter, r *http.Request)
-	onList   func(w http.ResponseWriter, r *http.Request)
-	onDelete func(w http.ResponseWriter, r *http.Request)
-	onRender func(w http.ResponseWriter, r *http.Request)
-	onLogs   func(w http.ResponseWriter, r *http.Request)
+	onPut         func(w http.ResponseWriter, r *http.Request)
+	onGet         func(w http.ResponseWriter, r *http.Request)
+	onList        func(w http.ResponseWriter, r *http.Request)
+	onDelete      func(w http.ResponseWriter, r *http.Request)
+	onRender      func(w http.ResponseWriter, r *http.Request)
+	onLogs        func(w http.ResponseWriter, r *http.Request)
+	onPromote     func(w http.ResponseWriter, r *http.Request)
+	onCreateToken func(w http.ResponseWriter, r *http.Request)
+	onListTokens  func(w http.ResponseWriter, r *http.Request)
+	onDeleteToken func(w http.ResponseWriter, r *http.Request)
 }
 
 // newAppsFakeServer serves the exact author-route patterns registered by
@@ -373,6 +399,39 @@ func newAppsFakeServer(t *testing.T, b appsFakeBehaviour) *httptest.Server {
 			return
 		}
 		notConfigured("onRender")(w, r)
+	})
+	mux.HandleFunc("POST /api/v1/projects/{pid}/apps/{name}/promote", func(w http.ResponseWriter, r *http.Request) {
+		if b.onPromote != nil {
+			b.onPromote(w, r)
+			return
+		}
+		notConfigured("onPromote")(w, r)
+	})
+	// GET and POST on the identical /tokens path are separate Go 1.22+
+	// method-prefixed registrations (create is POST; list — see
+	// runAppsTokenList's doc comment for why this route does not exist on
+	// the real server yet — is GET), mirroring how PUT/GET/DELETE already
+	// coexist on plain /apps/{name} above.
+	mux.HandleFunc("POST /api/v1/projects/{pid}/apps/{name}/tokens", func(w http.ResponseWriter, r *http.Request) {
+		if b.onCreateToken != nil {
+			b.onCreateToken(w, r)
+			return
+		}
+		notConfigured("onCreateToken")(w, r)
+	})
+	mux.HandleFunc("GET /api/v1/projects/{pid}/apps/{name}/tokens", func(w http.ResponseWriter, r *http.Request) {
+		if b.onListTokens != nil {
+			b.onListTokens(w, r)
+			return
+		}
+		notConfigured("onListTokens")(w, r)
+	})
+	mux.HandleFunc("DELETE /api/v1/projects/{pid}/apps/{name}/tokens/{token_id}", func(w http.ResponseWriter, r *http.Request) {
+		if b.onDeleteToken != nil {
+			b.onDeleteToken(w, r)
+			return
+		}
+		notConfigured("onDeleteToken")(w, r)
 	})
 	return httptest.NewServer(mux)
 }
@@ -1385,5 +1444,616 @@ func TestRunAppsRender_NonEnvelopeBodyIsNotEchoed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "/apps/p1/app") {
 		t.Errorf("error should name the redacted request path: %v", err)
+	}
+}
+
+// --- shared fixtures: promote/token (C3) ---
+
+// testVersionHash/testOldVersionHash are well-formed 64-hex-char content
+// hashes (the app_versions.hash shape: hex.EncodeToString(sha256.Sum256(...)),
+// store.go's PutVersion) — built via strings.Repeat so their length is
+// self-evidently correct rather than hand-counted.
+var (
+	testVersionHash    = strings.Repeat("ab12cd34", 8) // 64 hex chars
+	testOldVersionHash = strings.Repeat("98fe76dc", 8) // 64 hex chars, distinct from testVersionHash
+)
+
+const (
+	testTokenID                = "550e8400-e29b-41d4-a716-446655440000"
+	testTokenSecret            = "vw_" + testTokenID + ".SUPER-SECRET-VALUE-DO-NOT-LOG"
+	tokenCreateResponseFixture = `{"token_id":"` + testTokenID + `","token":"` + testTokenSecret + `"}`
+	tokenListFixture           = `[{"token_id":"` + testTokenID + `","created_at":"2026-07-31T00:00:00Z"},` +
+		`{"token_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","created_at":"2026-07-30T00:00:00Z","revoked_at":"2026-07-30T12:00:00Z"}]`
+)
+
+// --- validateVersionHash / validateTokenID (pure) ---
+
+func TestValidateVersionHash(t *testing.T) {
+	if len(testVersionHash) != 64 {
+		t.Fatalf("test fixture bug: testVersionHash is %d chars, want 64", len(testVersionHash))
+	}
+	if got, err := validateVersionHash(testVersionHash); err != nil || got != testVersionHash {
+		t.Errorf("validateVersionHash(%q) = (%q, %v), want (%q, nil)", testVersionHash, got, err, testVersionHash)
+	}
+	// Upper-case hex is accepted but normalized to lower-case (matching the
+	// server's hex.EncodeToString output byte-for-byte, since app_versions.hash
+	// is compared with plain string equality).
+	upper := strings.ToUpper(testVersionHash)
+	if got, err := validateVersionHash(upper); err != nil || got != testVersionHash {
+		t.Errorf("validateVersionHash(%q) = (%q, %v), want normalized to %q", upper, got, err, testVersionHash)
+	}
+
+	invalid := []string{"", "deadbeef", testVersionHash + "0", strings.Repeat("g", 64), "../../etc/passwd", "not-a-hash"}
+	for _, h := range invalid {
+		if _, err := validateVersionHash(h); err == nil {
+			t.Errorf("validateVersionHash(%q) = nil error, want an error", h)
+		}
+	}
+}
+
+func TestValidateTokenID(t *testing.T) {
+	got, err := validateTokenID(testTokenID)
+	if err != nil {
+		t.Fatalf("validateTokenID(%q): %v", testTokenID, err)
+	}
+	if got != testTokenID {
+		t.Errorf("validateTokenID(%q) = %q, want unchanged (already canonical)", testTokenID, got)
+	}
+
+	upper := strings.ToUpper(testTokenID)
+	if got, err := validateTokenID(upper); err != nil || got != testTokenID {
+		t.Errorf("validateTokenID(%q) = (%q, %v), want (%q, nil) — canonicalized to lower-case", upper, got, err, testTokenID)
+	}
+
+	for _, bad := range []string{"", "not-a-uuid", "sales-overview", "..", "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"} {
+		if _, err := validateTokenID(bad); err == nil {
+			t.Errorf("validateTokenID(%q) = nil error, want an error", bad)
+		}
+	}
+}
+
+// --- apps promote (CAS-repoint production, spec §5.1) ---
+
+// TestRunAppsPromote_HappyPathOmitsExpectedProductionOnFirstPromote proves
+// the request shape for a first promote: expectedProduction must be OMITTED
+// (not sent as an empty string) when --expected-production is not passed,
+// and a 200 prints the new production version in text mode.
+func TestRunAppsPromote_HappyPathOmitsExpectedProductionOnFirstPromote(t *testing.T) {
+	var gotBody map[string]any
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onPromote: func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"production_version":"` + testVersionHash + `"}`))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash})
+	})
+	if runErr != nil {
+		t.Fatalf("runAppsPromote: %v", runErr)
+	}
+	if _, present := gotBody["expectedProduction"]; present {
+		t.Errorf("expectedProduction should be OMITTED from the body on a first promote, got %v", gotBody)
+	}
+	if gotBody["version"] != testVersionHash {
+		t.Errorf("body version = %v, want %s", gotBody["version"], testVersionHash)
+	}
+	if !strings.Contains(out, testVersionHash) {
+		t.Errorf("text output should show the new production version:\n%s", out)
+	}
+}
+
+// TestRunAppsPromote_SendsExpectedProductionWhenProvided proves the CAS
+// precondition round-trips into the request body when --expected-production
+// is passed.
+func TestRunAppsPromote_SendsExpectedProductionWhenProvided(t *testing.T) {
+	var gotBody map[string]any
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onPromote: func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"production_version":"` + testVersionHash + `"}`))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	err := runAppsPromote([]string{"sales-overview", "--project", "proj1",
+		"--version", testVersionHash, "--expected-production", testOldVersionHash})
+	if err != nil {
+		t.Fatalf("runAppsPromote: %v", err)
+	}
+	if gotBody["expectedProduction"] != testOldVersionHash {
+		t.Errorf("body expectedProduction = %v, want %s", gotBody["expectedProduction"], testOldVersionHash)
+	}
+}
+
+// TestRunAppsPromote_CASConflictExitsDistinctCodeWithClearMessage is the core
+// §5.1/§5.5 contract: a 409 must produce a message that clearly explains
+// someone promoted a different version meanwhile and to re-fetch/retry, AND a
+// distinct, non-zero exit code the agent loop can branch on without parsing
+// text — never the plain default exit 1 every other local/user error uses,
+// and never render's transport-class exit 20 (promote never talks to
+// app-worker).
+func TestRunAppsPromote_CASConflictExitsDistinctCodeWithClearMessage(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onPromote: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"production has moved since expectedProduction was read; re-read the app and retry"}`, http.StatusConflict)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	err := runAppsPromote([]string{"sales-overview", "--project", "proj1",
+		"--version", testVersionHash, "--expected-production", testOldVersionHash})
+	if err == nil {
+		t.Fatal("expected an error for a 409 CAS conflict, got nil")
+	}
+	if code := exitCodeOf(err); code != appsPromoteCASConflictExitCode {
+		t.Errorf("exit code = %d, want %d (the CAS-conflict code, distinct from 0/1/20)", code, appsPromoteCASConflictExitCode)
+	}
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "promot") {
+		t.Errorf("error should clearly say a promote conflict occurred: %v", err)
+	}
+	if !strings.Contains(lower, "retry") {
+		t.Errorf("error should tell the caller to retry: %v", err)
+	}
+}
+
+func TestRunAppsPromote_MissingVersionErrorsLocally(t *testing.T) {
+	err := runAppsPromote([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1"})
+	if err == nil {
+		t.Fatal("expected an error when --version is omitted, got nil")
+	}
+	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
+		t.Errorf("error looks like it came from a network call: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--version") {
+		t.Errorf("error should name --version as required: %v", err)
+	}
+}
+
+// TestRunAppsPromote_BadHashRejectedLocally proves a malformed --version
+// value is rejected LOCALLY (before any network call) — the "basic shape
+// check" the task calls for, not full server-side validation.
+func TestRunAppsPromote_BadHashRejectedLocally(t *testing.T) {
+	for _, bad := range []string{"not-a-hash", "deadbeef", strings.Repeat("g", 64)} {
+		t.Run(bad, func(t *testing.T) {
+			err := runAppsPromote([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1", "--version", bad})
+			if err == nil {
+				t.Fatal("expected a local rejection for a malformed --version, got nil")
+			}
+			if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
+				t.Errorf("error looks like it came from a network call, not a local rejection: %v", err)
+			}
+			if !strings.Contains(err.Error(), "invalid version hash") {
+				t.Errorf("error should name the validation rule: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunAppsPromote_BadExpectedProductionRejectedLocally(t *testing.T) {
+	err := runAppsPromote([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1",
+		"--version", testVersionHash, "--expected-production", "not-a-hash"})
+	if err == nil {
+		t.Fatal("expected a local rejection for a malformed --expected-production, got nil")
+	}
+	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
+		t.Errorf("error looks like it came from a network call: %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid version hash") {
+		t.Errorf("error should name the validation rule: %v", err)
+	}
+}
+
+func TestRunAppsPromote_InvalidNameRejectedLocally(t *testing.T) {
+	for _, name := range invalidAppNames {
+		t.Run(name, func(t *testing.T) {
+			err := runAppsPromote([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1", "--version", testVersionHash})
+			assertLocalNameRejection(t, name, err)
+		})
+	}
+}
+
+func TestRunAppsPromote_NotFoundExits1(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onPromote: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"app not found"}`, http.StatusNotFound)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	err := runAppsPromote([]string{"nope", "--project", "proj1", "--version", testVersionHash})
+	if err == nil {
+		t.Fatal("expected an error for 404, got nil")
+	}
+	if code := exitCodeOf(err); code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error should mention 'not found': %v", err)
+	}
+}
+
+// TestRunAppsPromote_UnknownVersionExits1 proves a 400 (a hash that never
+// existed for this app) is a plain user error — exit 1 — DISTINCT from the
+// 409 CAS-conflict's own exit code, even though both are "your promote
+// didn't happen".
+func TestRunAppsPromote_UnknownVersionExits1(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onPromote: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"unknown version hash for this app"}`, http.StatusBadRequest)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	err := runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash})
+	if err == nil {
+		t.Fatal("expected an error for an unknown version, got nil")
+	}
+	if code := exitCodeOf(err); code != 1 {
+		t.Errorf("exit code = %d, want 1 (distinct from the 409 CAS-conflict code)", code)
+	}
+}
+
+func TestRunAppsPromote_JSONPassesThroughServerBody(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onPromote: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"production_version":"` + testVersionHash + `"}`))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash, "--json"})
+	})
+	if runErr != nil {
+		t.Fatalf("runAppsPromote --json: %v", runErr)
+	}
+	var decoded appsPromoteResponseJSON
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\noutput: %s", err, out)
+	}
+	if decoded.ProductionVersion != testVersionHash {
+		t.Errorf("production_version = %q, want %s", decoded.ProductionVersion, testVersionHash)
+	}
+}
+
+// --- apps token create/list/delete (viewer-token lifecycle, spec §5.3) ---
+
+// TestRunAppsTokenCreate_PrintsSecretExactlyOnceWithStoreNote is the core
+// §5.3/§5.5 contract: the plaintext secret is shown EXACTLY once, ever,
+// together with a note that it will not be shown again — in both --json and
+// text mode.
+func TestRunAppsTokenCreate_PrintsSecretExactlyOnceWithStoreNote(t *testing.T) {
+	modes := []struct {
+		name   string
+		asJSON bool
+	}{{"text", false}, {"json", true}}
+	for _, m := range modes {
+		t.Run(m.name, func(t *testing.T) {
+			var gotMethod, gotPath string
+			srv := newAppsFakeServer(t, appsFakeBehaviour{
+				onCreateToken: func(w http.ResponseWriter, r *http.Request) {
+					gotMethod = r.Method
+					gotPath = r.URL.Path
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(tokenCreateResponseFixture))
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
+
+			args := []string{"sales-overview", "--project", "proj1"}
+			if m.asJSON {
+				args = append(args, "--json")
+			}
+			var runErr error
+			stdout, stderr := captureStdoutAndStderr(t, func() {
+				runErr = runAppsTokenCreate(args)
+			})
+			if runErr != nil {
+				t.Fatalf("runAppsTokenCreate: %v", runErr)
+			}
+			if gotMethod != http.MethodPost {
+				t.Errorf("method = %s, want POST", gotMethod)
+			}
+			if gotPath != "/api/v1/projects/proj1/apps/sales-overview/tokens" {
+				t.Errorf("path = %q", gotPath)
+			}
+
+			combined := stdout + stderr
+			if n := strings.Count(combined, testTokenSecret); n != 1 {
+				t.Errorf("secret appeared %d times across stdout+stderr, want exactly 1:\nstdout:\n%s\nstderr:\n%s", n, stdout, stderr)
+			}
+			lowerStderr := strings.ToLower(stderr)
+			if !strings.Contains(lowerStderr, "store") {
+				t.Errorf("stderr should say to store the token now: %q", stderr)
+			}
+			if !strings.Contains(lowerStderr, "shown again") {
+				t.Errorf("stderr should say it will not be shown again: %q", stderr)
+			}
+
+			if m.asJSON {
+				var decoded appTokenCreateResponseJSON
+				if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+					t.Fatalf("--json stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+				}
+				if decoded.TokenID != testTokenID || decoded.Token != testTokenSecret {
+					t.Errorf("decoded = %+v, unexpected", decoded)
+				}
+			} else if strings.TrimSpace(stdout) != testTokenSecret {
+				t.Errorf("text-mode stdout = %q, want exactly the token value", stdout)
+			}
+		})
+	}
+}
+
+func TestRunAppsTokenCreate_NotFoundExits1(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onCreateToken: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"app not found"}`, http.StatusNotFound)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	err := runAppsTokenCreate([]string{"nope", "--project", "proj1"})
+	if err == nil {
+		t.Fatal("expected an error for 404, got nil")
+	}
+	if code := exitCodeOf(err); code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunAppsTokenCreate_InvalidNameRejectedLocally(t *testing.T) {
+	for _, name := range invalidAppNames {
+		t.Run(name, func(t *testing.T) {
+			err := runAppsTokenCreate([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
+			assertLocalNameRejection(t, name, err)
+		})
+	}
+}
+
+// TestRunAppsTokenList_ShowsIDsNotSecrets is the core "never prints a
+// secret" contract: appTokenSummaryJSON has no secret field at all, so this
+// also proves the type itself can't leak one.
+func TestRunAppsTokenList_ShowsIDsNotSecrets(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onListTokens: func(w http.ResponseWriter, r *http.Request) {
+			gotMethod = r.Method
+			gotPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(tokenListFixture))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runAppsTokenList([]string{"sales-overview", "--project", "proj1", "--json"})
+	})
+	if runErr != nil {
+		t.Fatalf("runAppsTokenList --json: %v", runErr)
+	}
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %s, want GET", gotMethod)
+	}
+	if gotPath != "/api/v1/projects/proj1/apps/sales-overview/tokens" {
+		t.Errorf("path = %q", gotPath)
+	}
+	var items []appTokenSummaryJSON
+	if err := json.Unmarshal([]byte(out), &items); err != nil {
+		t.Fatalf("--json output is not a JSON array: %v\n%s", err, out)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(items) = %d, want 2", len(items))
+	}
+	if strings.Contains(out, "vw_") || strings.Contains(out, "secret") {
+		t.Errorf("token list output must never contain a secret: %s", out)
+	}
+
+	out = captureStdout(t, func() {
+		runErr = runAppsTokenList([]string{"sales-overview", "--project", "proj1"})
+	})
+	if runErr != nil {
+		t.Fatalf("runAppsTokenList (text): %v", runErr)
+	}
+	if !strings.Contains(out, testTokenID) {
+		t.Errorf("table output missing the token id:\n%s", out)
+	}
+	if strings.Contains(out, "vw_") {
+		t.Errorf("table output must never contain a secret:\n%s", out)
+	}
+}
+
+func TestRunAppsTokenList_Empty(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onListTokens: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runAppsTokenList([]string{"sales-overview", "--project", "proj1"})
+	})
+	if runErr != nil {
+		t.Fatalf("runAppsTokenList: %v", runErr)
+	}
+	if !strings.Contains(out, "no viewer tokens") {
+		t.Errorf("expected an empty-list message, got:\n%s", out)
+	}
+}
+
+func TestRunAppsTokenDelete_CallsDeleteWithID(t *testing.T) {
+	var gotMethod, gotName, gotTokenID string
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onDeleteToken: func(w http.ResponseWriter, r *http.Request) {
+			gotMethod = r.Method
+			gotName = r.PathValue("name")
+			gotTokenID = r.PathValue("token_id")
+			w.WriteHeader(http.StatusNoContent)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	if err := runAppsTokenDelete([]string{"sales-overview", testTokenID, "--project", "proj1"}); err != nil {
+		t.Fatalf("runAppsTokenDelete: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %s, want DELETE", gotMethod)
+	}
+	if gotName != "sales-overview" {
+		t.Errorf("name = %q, want sales-overview", gotName)
+	}
+	if gotTokenID != testTokenID {
+		t.Errorf("token_id = %q, want %s", gotTokenID, testTokenID)
+	}
+}
+
+// TestRunAppsTokenDelete_MalformedTokenIDRejectedLocally proves a malformed
+// token_id is rejected LOCALLY, before any network call, via its OWN
+// validator (validateTokenID) — never validateAppName, which is for app
+// names and would accept/reject on a completely different grammar.
+func TestRunAppsTokenDelete_MalformedTokenIDRejectedLocally(t *testing.T) {
+	cases := []struct{ label, value string }{
+		{"not-a-uuid", "not-a-uuid"},
+		{"looks-like-an-app-name", "sales-overview"},
+		{"dot-dot", ".."},
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			err := runAppsTokenDelete([]string{"sales-overview", tc.value, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
+			if err == nil {
+				t.Fatal("expected a local rejection for a malformed token_id, got nil")
+			}
+			if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
+				t.Errorf("error looks like it came from a network call, not a local rejection: %v", err)
+			}
+			if !strings.Contains(err.Error(), "invalid token id") {
+				t.Errorf("error should name the validation rule: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunAppsTokenDelete_RequiresTwoPositionalArgs(t *testing.T) {
+	if err := runAppsTokenDelete([]string{"sales-overview", "--project", "proj1"}); err == nil {
+		t.Error("expected an error with only <name> (missing <token_id>)")
+	}
+	if err := runAppsTokenDelete([]string{"--project", "proj1"}); err == nil {
+		t.Error("expected an error with no positional args")
+	}
+}
+
+func TestRunAppsTokenDelete_NotFoundExits1(t *testing.T) {
+	srv := newAppsFakeServer(t, appsFakeBehaviour{
+		onDeleteToken: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"viewer token not found"}`, http.StatusNotFound)
+		},
+	})
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	err := runAppsTokenDelete([]string{"sales-overview", testTokenID, "--project", "proj1"})
+	if err == nil {
+		t.Fatal("expected an error for 404, got nil")
+	}
+	if code := exitCodeOf(err); code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunAppsToken_UnknownSubcommandErrors(t *testing.T) {
+	if err := runAppsToken([]string{"bogus", "sales-overview"}); err == nil {
+		t.Error("expected an error for an unknown token subcommand")
+	}
+	if err := runAppsToken(nil); err == nil {
+		t.Error("expected an error with no subcommand")
+	}
+}
+
+// --- 401/403: doAuthedRequest has no special case for either (confirmed by
+// inspection — it returns the raw status/body to the caller), so the only
+// thing to prove is that the shared generic non-2xx branch each new
+// subcommand already has produces a clear, non-nil, non-zero-exit error
+// rather than a panic or a false success. ---
+
+func TestRunAppsPromoteAndToken_AuthDenialsSurfaceAsErrors(t *testing.T) {
+	deny := func(status int) func(w http.ResponseWriter, r *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"denied"}`, status)
+		}
+	}
+	cases := []struct {
+		name   string
+		status int
+		run    func() error
+	}{
+		{"promote/401", http.StatusUnauthorized, func() error {
+			return runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash})
+		}},
+		{"token-create/403", http.StatusForbidden, func() error {
+			return runAppsTokenCreate([]string{"sales-overview", "--project", "proj1"})
+		}},
+		{"token-list/401", http.StatusUnauthorized, func() error {
+			return runAppsTokenList([]string{"sales-overview", "--project", "proj1"})
+		}},
+		{"token-delete/403", http.StatusForbidden, func() error {
+			return runAppsTokenDelete([]string{"sales-overview", testTokenID, "--project", "proj1"})
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newAppsFakeServer(t, appsFakeBehaviour{
+				onPromote:     deny(tc.status),
+				onCreateToken: deny(tc.status),
+				onListTokens:  deny(tc.status),
+				onDeleteToken: deny(tc.status),
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
+
+			err := tc.run()
+			if err == nil {
+				t.Fatalf("expected an error for HTTP %d, got nil", tc.status)
+			}
+			if exitCodeOf(err) == 0 {
+				t.Errorf("exit code should be non-zero: %v", err)
+			}
+		})
 	}
 }

@@ -198,9 +198,13 @@ func main() {
 	case "apps":
 		if err := runApps(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			// A future `apps render` distinguishes a transport/HTTP failure
-			// (>=20, the repo's FailedApplication band) from "the render
-			// failed" (plain error, default exit 1) — same exitCodeErr
+			// exitCodeErr carries a non-default exit code for outcomes the
+			// agent loop must distinguish from a generic failure: `apps
+			// render`'s transport/HTTP failure (20, the repo's
+			// FailedApplication band) vs. a render failure (plain error,
+			// exit 1); `apps promote`'s 409 CAS conflict (9 — a retryable
+			// "someone else promoted first" outcome, distinct from the
+			// plain-error exit 1 every other promote failure uses). Same
 			// mechanism as the "pipeline" case above.
 			code := 1
 			var ece *exitCodeErr
@@ -244,7 +248,7 @@ Commands:
   pipeline               CRUD for pipeline specs (list, get, put, delete, validate)
   runs                   List runs (filter by pipeline/phase) and get run detail + timeline
   components             Browse the component catalog (list, get --schema)
-  apps                   Manage user apps (init, put, get, list, delete)
+  apps                   Manage user apps (init, put, get, list, delete, render, promote, token)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
   gateway                Start the data gateway server (container entrypoint)
@@ -288,7 +292,7 @@ Options for 'apps':
   -remote string         pipeline-api URL (required; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)
   -project string        Project name (falls back to $DATUPLET_PROJECT; auto-defaulted if you have exactly one) — not used by 'init'
   -token-file string     Path to JWT/api-token file (falls back to $DATUPLET_API_TOKEN, then ~/.datuplet/api-token)
-  <subcommand>           One of: init | put | get | list | delete | render | logs
+  <subcommand>           One of: init | put | get | list | delete | render | logs | promote | token
   init <dir>             Scaffold a new app in <dir> (no network; refuses a non-empty dir)
   put <name> --bundle <f> Upload a built bundle (see the scaffold's esbuild.mjs), moving 'draft' to it
                           Rejected locally above 5 MB, before any network call
@@ -301,7 +305,15 @@ Options for 'apps':
   --channel draft|production  Which channel render targets (default: production)
   --param k=v            Bind a render param (repeatable): --param days=7 --param country=DE
   logs <name>            Recent render logs; --request-id <id> returns one record (exit 1 if not found)
-  --json                 Emit JSON output (put, get, list, render, logs)
+  promote <name>         CAS-repoint 'production': --version <hash> required,
+                          --expected-production <hash> optional (omit on a first promote)
+                          Exit 0 ok / 9 CAS conflict (re-fetch via 'get' and retry) / 1 other failure
+  --version <hash>       Content hash to promote (64 hex chars, as printed by 'put'/'get')
+  --expected-production <hash>  CAS precondition; omit on a first promote
+  token create <name>    Mint a viewer token; prints vw_<id>.<secret> ONCE (never retrievable again)
+  token list <name>      List this app's viewer token ids + created/revoked (never a secret)
+  token delete <name> <token_id>  Revoke a viewer token (token_id must be a UUID)
+  -json                  Emit JSON output (put, get, list, render, logs, promote, token create, token list)
 
 Options for 'query':
   -remote string         pipeline-api URL (required unless --local; falls back to $DATUPLET_REMOTE, then ~/.datuplet/cluster.json)

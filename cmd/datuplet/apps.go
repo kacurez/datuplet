@@ -17,6 +17,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // appsScaffoldFS embeds the `datuplet apps init` scaffold (spec §5.5):
@@ -45,19 +47,23 @@ const maxBundleBytes = 5 * 1024 * 1024
 // runApps dispatches `datuplet apps <sub> ...`.
 //
 // Subcommands implemented here (spec §5.5's CLI table):
-//   - init:   scaffold a new app directory locally (no network, no --project)
-//   - put:    PUT    /api/v1/projects/{pid}/apps/{name}   (upload -> draft)
-//   - get:    GET    /api/v1/projects/{pid}/apps/{name}
-//   - list:   GET    /api/v1/projects/{pid}/apps
-//   - delete: DELETE /api/v1/projects/{pid}/apps/{name}
-//   - render: GET    {remote}/apps/{pid}/{name}[@draft]   (app-worker route)
-//   - logs:   GET    /api/v1/projects/{pid}/apps/{name}/logs
-//
-// promote/token land in a follow-up task against the same dispatcher and
-// parseAppsFlags (see the doc comment there).
+//   - init:    scaffold a new app directory locally (no network, no --project)
+//   - put:     PUT    /api/v1/projects/{pid}/apps/{name}   (upload -> draft)
+//   - get:     GET    /api/v1/projects/{pid}/apps/{name}
+//   - list:    GET    /api/v1/projects/{pid}/apps
+//   - delete:  DELETE /api/v1/projects/{pid}/apps/{name}
+//   - render:  GET    {remote}/apps/{pid}/{name}[@draft]   (app-worker route)
+//   - logs:    GET    /api/v1/projects/{pid}/apps/{name}/logs
+//   - promote: POST   /api/v1/projects/{pid}/apps/{name}/promote (CAS; 409 ->
+//     exit appsPromoteCASConflictExitCode, never the default exit 1)
+//   - token:   create/list/delete sub-subcommands over
+//     POST/GET/DELETE /api/v1/projects/{pid}/apps/{name}/tokens[/{token_id}]
+//     (token list has no server route as of this task — see
+//     runAppsTokenList's doc comment for the gap and the assumed
+//     contract it is implemented and tested against)
 func runApps(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datuplet apps <init|put|get|list|delete|render|logs> [args]\n%s", appsHelpText())
+		return fmt.Errorf("usage: datuplet apps <init|put|get|list|delete|render|logs|promote|token> [args]\n%s", appsHelpText())
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -76,6 +82,10 @@ func runApps(args []string) error {
 		return runAppsRender(rest)
 	case "logs":
 		return runAppsLogs(rest)
+	case "promote":
+		return runAppsPromote(rest)
+	case "token":
+		return runAppsToken(rest)
 	case "help", "-h", "--help":
 		fmt.Println(appsHelpText())
 		return nil
@@ -95,13 +105,22 @@ func appsHelpText() string {
                                   prints the OutputDoc JSON on success, one
                                   {error,kind,request_id,author_log} object on failure
   logs <name> [--request-id <id>] recent render logs, or one record by request id
+  promote <name> --version <hash> CAS-repoint 'production' to <hash>; a 409 means
+                                  someone promoted a different version meanwhile —
+                                  re-fetch via 'get' and retry -- exit code 9
+  token create <name>            mint a viewer token; prints vw_<id>.<secret> ONCE
+                                  (store it now -- it cannot be retrieved again)
+  token list <name>               list this app's viewer tokens (ids + created/
+                                  revoked; never a secret)
+  token delete <name> <token_id>  revoke a viewer token (token_id must be a UUID)
 
 common flags:
   --remote <url>     pipeline-api URL (defaults to logged-in cluster)
   --token-file <p>   override default ~/.datuplet/token path
   --project <name>   project to operate in (falls back to $DATUPLET_PROJECT,
                       then the logged-in cluster's default)
-  --json             emit JSON output (put, get, list, render, logs)
+  --json             emit JSON output (put, get, list, render, logs, promote,
+                      token create, token list)
 
 put-only flags:
   --bundle <file>    path to the built IIFE bundle (see 'datuplet apps init'
@@ -115,9 +134,19 @@ render-only flags:
 logs-only flags:
   --request-id <id>  return exactly one render's record (exit 1 if not found)
 
+promote-only flags:
+  --version <hash>              content hash to promote (required; 64 hex chars,
+                                 as printed by 'apps put'/'apps get')
+  --expected-production <hash>  CAS precondition: the production hash you last
+                                 observed; omit on a first promote (no production
+                                 version set yet). Mismatch -> HTTP 409 -> exit 9.
+
 exit codes (render): 0 success, 1 render failure (the app reported an error),
   20 transport failure (could not reach the service) — the agent loop branches
   on this split.
+exit codes (promote): 0 success, 9 CAS conflict (production moved -- re-fetch
+  via 'get' and retry with a fresh --expected-production), 1 any other failure
+  (bad/unknown version, unknown app, local validation, ...).
 
 examples:
   datuplet apps init ./sales-overview
@@ -126,6 +155,10 @@ examples:
   datuplet apps render sales-overview --project myproj --channel draft --param days=7 --json
   datuplet apps logs sales-overview --project myproj --request-id <id> --json
   datuplet apps promote sales-overview --project myproj --version <hash>
+  datuplet apps promote sales-overview --project myproj --version <new-hash> --expected-production <old-hash>
+  datuplet apps token create sales-overview --project myproj
+  datuplet apps token list sales-overview --project myproj
+  datuplet apps token delete sales-overview <token_id> --project myproj
 `
 }
 
@@ -134,13 +167,16 @@ examples:
 // parsePipelineFlags's/parseComponentsFlags's hand-rolled convention (flags
 // in any order, a single positional-args slice remains).
 //
-// render/promote/logs/token add their own flags here (one grammar for the
-// whole `apps` family, never a second parser): --channel and the REPEATABLE
-// --param (render), --request-id (logs). Threading a new return value through
-// forces every existing call site to update (Go won't compile otherwise) —
-// that is the intended safety net. Still to come as those subcommands land:
-// --version / --expected-production (promote).
-func parseAppsFlags(args []string) (positional []string, remote, tokenFile, project, bundle, channel, requestID string, params []string, asJSON bool, err error) {
+// Every `apps` subcommand's flags live here — one grammar for the whole
+// family, never a second parser: --channel and the REPEATABLE --param
+// (render), --request-id (logs), --version / --expected-production
+// (promote). `token`'s create/list/delete need no flags of their own beyond
+// the common ones — their extra positional args (<name>, and <token_id> for
+// delete) are plain positionals, handled by each runAppsToken* function.
+// Threading a new return value through forces every existing call site to
+// update (Go won't compile otherwise) — that is the intended safety net:
+// one flag grammar, no drift between subcommands.
+func parseAppsFlags(args []string) (positional []string, remote, tokenFile, project, bundle, channel, requestID string, params []string, version, expectedProduction string, asJSON bool, err error) {
 	i := 0
 	for i < len(args) {
 		a := args[i]
@@ -215,6 +251,26 @@ func parseAppsFlags(args []string) (positional []string, remote, tokenFile, proj
 		case strings.HasPrefix(a, "--param="):
 			params = append(params, strings.TrimPrefix(a, "--param="))
 			i++
+		case a == "--version":
+			if i+1 >= len(args) {
+				err = fmt.Errorf("--version requires a value")
+				return
+			}
+			version = args[i+1]
+			i += 2
+		case strings.HasPrefix(a, "--version="):
+			version = strings.TrimPrefix(a, "--version=")
+			i++
+		case a == "--expected-production":
+			if i+1 >= len(args) {
+				err = fmt.Errorf("--expected-production requires a value")
+				return
+			}
+			expectedProduction = args[i+1]
+			i += 2
+		case strings.HasPrefix(a, "--expected-production="):
+			expectedProduction = strings.TrimPrefix(a, "--expected-production=")
+			i++
 		case a == "--json":
 			asJSON = true
 			i++
@@ -258,11 +314,14 @@ func validateAppName(name string) error {
 
 // appsURL composes /api/v1/projects/{pid}/apps[/{name}[/{suffix}]],
 // mirroring pipelineURL/componentsURL. suffix (e.g. "promote", "logs",
-// "tokens") is appended after {name} when non-empty — unused by this task's
-// subcommands, provided for the render/promote/logs/token follow-up. When
-// name is non-empty it is validated via validateAppName before being
-// escaped into the path; list's call (name == "") skips validation, since
-// there is nothing to validate.
+// "tokens", or "tokens/"+tokenID for the delete-token route) is appended
+// after {name} when non-empty. When name is non-empty it is validated via
+// validateAppName before being escaped into the path; list's call
+// (name == "") skips validation, since there is nothing to validate. suffix
+// itself is appended UNESCAPED — safe only because every caller builds it
+// from a fixed literal or a value already validated/canonicalized to a safe
+// character set (e.g. validateTokenID's canonical UUID string), never a raw
+// user string.
 func appsURL(remote, projectID, name, suffix string) (string, error) {
 	base := strings.TrimRight(remote, "/") + "/api/v1/projects/" + url.PathEscape(projectID) + "/apps"
 	if name != "" {
@@ -420,7 +479,7 @@ func writeAppsScaffold(dir string) error {
 // {"bundle_base64": "..."} — the exact shape pkg/pipelineapi/apps's
 // putAppRequest decodes.
 func runAppsPut(args []string) error {
-	positional, remote, tokenFile, project, bundlePath, _, _, _, asJSON, err := parseAppsFlags(args)
+	positional, remote, tokenFile, project, bundlePath, _, _, _, _, _, asJSON, err := parseAppsFlags(args)
 	if err != nil {
 		return err
 	}
@@ -516,7 +575,7 @@ func runAppsPut(args []string) error {
 
 // runAppsGet implements `datuplet apps get <name>`.
 func runAppsGet(args []string) error {
-	positional, remote, tokenFile, project, _, _, _, _, asJSON, err := parseAppsFlags(args)
+	positional, remote, tokenFile, project, _, _, _, _, _, _, asJSON, err := parseAppsFlags(args)
 	if err != nil {
 		return err
 	}
@@ -584,7 +643,7 @@ func runAppsGet(args []string) error {
 
 // runAppsList implements `datuplet apps list`.
 func runAppsList(args []string) error {
-	positional, remote, tokenFile, project, _, _, _, _, asJSON, err := parseAppsFlags(args)
+	positional, remote, tokenFile, project, _, _, _, _, _, _, asJSON, err := parseAppsFlags(args)
 	if err != nil {
 		return err
 	}
@@ -639,7 +698,7 @@ func runAppsList(args []string) error {
 // non-interactive (R6, agent-first) — unlike `pipeline delete`, which
 // predates that requirement.
 func runAppsDelete(args []string) error {
-	positional, remote, tokenFile, project, _, _, _, _, _, err := parseAppsFlags(args)
+	positional, remote, tokenFile, project, _, _, _, _, _, _, _, err := parseAppsFlags(args)
 	if err != nil {
 		return err
 	}
@@ -764,7 +823,7 @@ type appsRenderLogRecord struct {
 //   - could not reach the service, or a non-200 with no envelope: transport
 //     failure. Exit 20 (via exitCodeErr, the repo's FailedApplication band).
 func runAppsRender(args []string) error {
-	positional, remote, tokenFile, project, _, channel, _, params, asJSON, err := parseAppsFlags(args)
+	positional, remote, tokenFile, project, _, channel, _, params, _, _, asJSON, err := parseAppsFlags(args)
 	if err != nil {
 		return err
 	}
@@ -1058,7 +1117,7 @@ func indentLines(s, prefix string) string {
 // found" when the author route 404s (aged out of the ring buffer or never
 // existed, §6.6).
 func runAppsLogs(args []string) error {
-	positional, remote, tokenFile, project, _, _, requestID, _, asJSON, err := parseAppsFlags(args)
+	positional, remote, tokenFile, project, _, _, requestID, _, _, _, asJSON, err := parseAppsFlags(args)
 	if err != nil {
 		return err
 	}
@@ -1140,5 +1199,403 @@ func printRenderLogRecord(w io.Writer, r appsRenderLogRecord) {
 	}
 	if r.LogText != "" {
 		fmt.Fprintf(w, "Log:\n%s\n", indentLines(r.LogText, "  "))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// promote — CAS-repoint the `production` channel (spec §5.1). POST
+// .../apps/{name}/promote {"version","expectedProduction"} on pipeline-api —
+// the same host/client as put/get/list/delete (doAuthedRequest/
+// pipelineHTTPClient): this never talks to app-worker, so there is no reason
+// for a dedicated client/timeout here the way render needed one (C1's note).
+// ---------------------------------------------------------------------------
+
+// versionHashPattern matches app_versions.hash's actual shape:
+// hex.EncodeToString(sha256.Sum256(bundle)) (store.go's PutVersion) — exactly
+// 64 hex characters. Case-insensitive here (a user may paste a hash from
+// somewhere that upper-cases hex); validateVersionHash normalizes to
+// lower-case before it reaches the wire, matching the server's own
+// hex.EncodeToString output byte-for-byte, since app_versions.hash is
+// looked up with plain string equality.
+const versionHashPattern = `^[0-9a-fA-F]{64}$`
+
+var versionHashRe = regexp.MustCompile(versionHashPattern)
+
+// validateVersionHash checks the basic shape of a --version/--expected-production
+// value BEFORE it reaches a URL or JSON body — a "hex, right length" check,
+// not full server-side existence validation (the task's "don't send
+// arbitrary junk into the URL/body") — and returns the normalized
+// (lower-case) form the server's exact-match lookup expects.
+func validateVersionHash(hash string) (string, error) {
+	if !versionHashRe.MatchString(hash) {
+		return "", fmt.Errorf("invalid version hash %q: must be 64 hex characters (a SHA-256 digest, as printed by `apps put`/`apps get`)", hash)
+	}
+	return strings.ToLower(hash), nil
+}
+
+// appsPromoteCASConflictExitCode is a distinct, non-zero exit code for a 409
+// CAS mismatch on `apps promote`: an expected, retryable "the world moved
+// under you" outcome (someone promoted a different version between the
+// caller's read of --expected-production and this call) — not a generic
+// local/user mistake (a malformed hash, a missing --version, an unknown
+// app/version: all plain errors, the default exit 1) and not app-worker's
+// transport/render split (`apps render`'s exitCodeErr{20}, C2 — promote
+// never talks to app-worker). A distinct code lets a scripted retry loop
+// `case $? in 9) re-fetch-and-retry ;; esac` without parsing stderr text.
+const appsPromoteCASConflictExitCode = 9
+
+// appsPromoteRequest mirrors promoteRequest (pkg/pipelineapi/apps/handlers.go).
+// ExpectedProduction is a *string so an omitted --expected-production (nil,
+// dropped by omitempty) lands on Store.Promote's "" CAS sentinel for
+// "production is not set yet" — P2's note that an omitted field and an
+// explicit JSON null are handled identically server-side, so the CLI never
+// needs to send a literal null.
+type appsPromoteRequest struct {
+	Version            string  `json:"version"`
+	ExpectedProduction *string `json:"expectedProduction,omitempty"`
+}
+
+// appsPromoteResponseJSON mirrors promoteResponse.
+type appsPromoteResponseJSON struct {
+	ProductionVersion string `json:"production_version"`
+}
+
+// runAppsPromote implements
+// `datuplet apps promote <name> --version <hash> [--expected-production <hash>] [--json]`.
+//
+// --expected-production is the CAS precondition (spec §5.1): omit it for a
+// first promote (no production version exists yet); otherwise pass the
+// production hash last observed via `apps get`/a previous promote's
+// response. A 409 means production moved between that read and this call —
+// re-fetch and retry with the new value; the CLI surfaces this with a
+// dedicated exit code (appsPromoteCASConflictExitCode) so a scripted retry
+// loop can branch on it without parsing text.
+func runAppsPromote(args []string) error {
+	positional, remote, tokenFile, project, _, _, _, _, version, expectedProduction, asJSON, err := parseAppsFlags(args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return fmt.Errorf("usage: datuplet apps promote <name> --version <hash> [--expected-production <hash>] [--json]")
+	}
+	name := positional[0]
+	// Validate name, version and (if given) expected-production locally,
+	// before any network I/O or credential resolution — deterministic,
+	// cheap, and independent of ambient ~/.datuplet state (mirrors
+	// get/put/delete/render).
+	if err := validateAppName(name); err != nil {
+		return err
+	}
+	if version == "" {
+		return fmt.Errorf("promote: --version <hash> is required (the content hash to promote; see `apps put`/`apps get`)")
+	}
+	version, err = validateVersionHash(version)
+	if err != nil {
+		return err
+	}
+	var expectedPtr *string
+	if expectedProduction != "" {
+		expectedProduction, err = validateVersionHash(expectedProduction)
+		if err != nil {
+			return fmt.Errorf("--expected-production: %w", err)
+		}
+		expectedPtr = &expectedProduction
+	}
+
+	resolved, err := loadRemoteArgs(remote, tokenFile, project)
+	if err != nil {
+		return err
+	}
+	if err := resolved.RequireAPIToken(); err != nil {
+		return err
+	}
+
+	promoteURL, err := appsURL(resolved.Remote, resolved.ID, name, "promote")
+	if err != nil {
+		return err
+	}
+	reqBody, err := json.Marshal(appsPromoteRequest{Version: version, ExpectedProduction: expectedPtr})
+	if err != nil {
+		return fmt.Errorf("encode promote request: %w", err)
+	}
+	status, body, err := doAuthedRequest(context.Background(),
+		http.MethodPost, promoteURL, resolved.APIToken, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	if status == http.StatusConflict {
+		return &exitCodeErr{code: appsPromoteCASConflictExitCode, err: fmt.Errorf(
+			"promote: conflict — production changed to a different version while this request was in flight; "+
+				"run `datuplet apps get %s` to see the current production version, then retry promote with a fresh --expected-production", name)}
+	}
+	if status == http.StatusNotFound {
+		return fmt.Errorf("app %q not found in project %q", name, resolved.ProjectName)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("promote app: HTTP %d: %s", status, truncateForError(string(body)))
+	}
+
+	if asJSON {
+		fmt.Println(string(body))
+		return nil
+	}
+	var decoded appsPromoteResponseJSON
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return fmt.Errorf("decode promote response: %w", err)
+	}
+	fmt.Printf("app %q production is now %s\n", name, decoded.ProductionVersion)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// token — viewer-token lifecycle (spec §5.3/§5.5):
+// `datuplet apps token <create|list|delete> <name> [<token_id>] [--json]`.
+// ---------------------------------------------------------------------------
+
+// validateTokenID mirrors the server's token_id check (handleDeleteToken:
+// uuid.Parse(tokenID)) for `apps token delete`. A token_id
+// (app_viewer_tokens.token_id) is a server-generated UUID — a completely
+// different shape from an app name, so it gets its OWN validator, never
+// validateAppName (C2's note to C3). Returns the canonical (lower-case,
+// hyphenated, no braces/"urn:uuid:" prefix) form: uuid.Parse accepts several
+// input spellings, and appsURL's suffix is appended UNESCAPED (mirroring its
+// existing "promote"/"logs"/"tokens" literals), so canonicalizing here is
+// what keeps that safe for a user-supplied token_id.
+func validateTokenID(tokenID string) (string, error) {
+	id, err := uuid.Parse(tokenID)
+	if err != nil {
+		return "", fmt.Errorf("invalid token id %q: must be a UUID: %w", tokenID, err)
+	}
+	return id.String(), nil
+}
+
+// appTokenCreateResponseJSON mirrors tokenResponse (pkg/pipelineapi/apps/handlers.go).
+// Token is the plaintext `vw_<token_id>.<secret>` — returned EXACTLY ONCE by
+// the server, at mint; no route (including a future list route) can ever
+// surface it again (spec §5.3). The CLI must never log, cache, or re-print
+// it beyond the single runAppsTokenCreate response that carries it.
+type appTokenCreateResponseJSON struct {
+	TokenID string `json:"token_id"`
+	Token   string `json:"token"`
+}
+
+// appTokenSummaryJSON is the CLI's contract for a `apps token list` response
+// — see runAppsTokenList's doc comment for why the matching server route
+// does not exist yet at HEAD. Field names mirror the app_viewer_tokens
+// columns (migration 013: token_id, created_at, revoked_at) exactly, so a
+// follow-up server handler has an unambiguous shape to implement against.
+// Deliberately has NO secret/secret_hash field: the type itself makes "list
+// can't print a secret" a compile-time property, not just a runtime habit.
+type appTokenSummaryJSON struct {
+	TokenID   string  `json:"token_id"`
+	CreatedAt string  `json:"created_at"`
+	RevokedAt *string `json:"revoked_at,omitempty"`
+}
+
+// runAppsToken dispatches `datuplet apps token <create|list|delete> ...`.
+func runAppsToken(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: datuplet apps token <create|list|delete> <name> [args]")
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "create":
+		return runAppsTokenCreate(rest)
+	case "list", "ls":
+		return runAppsTokenList(rest)
+	case "delete", "del", "rm":
+		return runAppsTokenDelete(rest)
+	default:
+		return fmt.Errorf("unknown apps token subcommand %q (want create, list, or delete)", sub)
+	}
+}
+
+// runAppsTokenCreate implements `datuplet apps token create <name> [--json]`.
+// Mints a new viewer token and prints the plaintext `vw_<token_id>.<secret>`
+// EXACTLY ONCE, with a "store it now" note — this is the caller's only
+// chance to ever see the secret; the server stores only a salted hash, so no
+// route (including `token list`) can return it again (spec §5.3).
+//
+// The note always goes to stderr, keeping stdout minimal and parseable in
+// both modes: the bare token string in text mode, or the server's own
+// {token_id, token} object verbatim in --json mode. This also keeps the
+// secret's TOTAL print count at exactly one across combined output — the
+// note names only the (non-secret) token_id, never the secret itself.
+func runAppsTokenCreate(args []string) error {
+	positional, remote, tokenFile, project, _, _, _, _, _, _, asJSON, err := parseAppsFlags(args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return fmt.Errorf("usage: datuplet apps token create <name> [--json]")
+	}
+	name := positional[0]
+	if err := validateAppName(name); err != nil {
+		return err
+	}
+
+	resolved, err := loadRemoteArgs(remote, tokenFile, project)
+	if err != nil {
+		return err
+	}
+	if err := resolved.RequireAPIToken(); err != nil {
+		return err
+	}
+
+	tokensURL, err := appsURL(resolved.Remote, resolved.ID, name, "tokens")
+	if err != nil {
+		return err
+	}
+	status, body, err := doAuthedRequest(context.Background(),
+		http.MethodPost, tokensURL, resolved.APIToken, "", nil)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound {
+		return fmt.Errorf("app %q not found in project %q", name, resolved.ProjectName)
+	}
+	if status != http.StatusCreated {
+		return fmt.Errorf("create token: HTTP %d: %s", status, truncateForError(string(body)))
+	}
+
+	var decoded appTokenCreateResponseJSON
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return fmt.Errorf("decode token response: %w", err)
+	}
+
+	if asJSON {
+		fmt.Println(string(body))
+	} else {
+		fmt.Println(decoded.Token)
+	}
+	fmt.Fprintf(os.Stderr, "store this token now (id %s) — it will not be shown again and cannot be retrieved later\n", decoded.TokenID)
+	return nil
+}
+
+// runAppsTokenList implements `datuplet apps token list <name> [--json]`.
+//
+// KNOWN GAP, flagged for the orchestrator, not fixed here (out of C3's
+// CLI-only scope): pipeline-api has no GET .../apps/{name}/tokens route as
+// of this task. Verified against pkg/pipelineapi/apps/handlers.go's
+// Register (only POST .../tokens and DELETE .../tokens/{token_id} are
+// registered) and store.go (no ListTokens method) — and independently
+// confirmed absent from C0's own route enumeration and from P3's
+// internal.go. This function is fully implemented and tested (against a
+// fake server) against the shape appTokenSummaryJSON documents, mirroring
+// app_viewer_tokens' actual columns, so it is ready the moment a follow-up
+// task adds `Store.ListTokens` + a handler + the route registration. Against
+// today's real server it will fail loudly with a generic HTTP error (the
+// ServeMux's catch-all for an unmatched path) rather than silently return
+// wrong data — see the "list tokens: HTTP %d" branch below.
+func runAppsTokenList(args []string) error {
+	positional, remote, tokenFile, project, _, _, _, _, _, _, asJSON, err := parseAppsFlags(args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return fmt.Errorf("usage: datuplet apps token list <name> [--json]")
+	}
+	name := positional[0]
+	if err := validateAppName(name); err != nil {
+		return err
+	}
+
+	resolved, err := loadRemoteArgs(remote, tokenFile, project)
+	if err != nil {
+		return err
+	}
+	if err := resolved.RequireAPIToken(); err != nil {
+		return err
+	}
+
+	tokensURL, err := appsURL(resolved.Remote, resolved.ID, name, "tokens")
+	if err != nil {
+		return err
+	}
+	status, body, err := doAuthedRequest(context.Background(),
+		http.MethodGet, tokensURL, resolved.APIToken, "", nil)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound {
+		return fmt.Errorf("app %q not found in project %q", name, resolved.ProjectName)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("list tokens: HTTP %d: %s", status, truncateForError(string(body)))
+	}
+
+	if asJSON {
+		fmt.Println(string(body))
+		return nil
+	}
+
+	var items []appTokenSummaryJSON
+	if err := json.Unmarshal(body, &items); err != nil {
+		return fmt.Errorf("decode token list response: %w", err)
+	}
+	if len(items) == 0 {
+		fmt.Println("(no viewer tokens)")
+		return nil
+	}
+	fmt.Printf("%-38s %-25s %s\n", "TOKEN_ID", "CREATED", "REVOKED")
+	for _, tk := range items {
+		revoked := "-"
+		if tk.RevokedAt != nil && *tk.RevokedAt != "" {
+			revoked = *tk.RevokedAt
+		}
+		fmt.Printf("%-38s %-25s %s\n", tk.TokenID, tk.CreatedAt, revoked)
+	}
+	return nil
+}
+
+// runAppsTokenDelete implements
+// `datuplet apps token delete <name> <token_id> [--json]`. token_id is
+// validated by validateTokenID (its OWN check — never validateAppName) and
+// canonicalized before it reaches the URL. --json is accepted (shared flag
+// grammar) but unused: there is no data to return, matching
+// runAppsDelete's confirmation-to-stderr convention.
+func runAppsTokenDelete(args []string) error {
+	positional, remote, tokenFile, project, _, _, _, _, _, _, _, err := parseAppsFlags(args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 2 {
+		return fmt.Errorf("usage: datuplet apps token delete <name> <token_id>")
+	}
+	name, rawTokenID := positional[0], positional[1]
+	if err := validateAppName(name); err != nil {
+		return err
+	}
+	tokenID, err := validateTokenID(rawTokenID)
+	if err != nil {
+		return err
+	}
+
+	resolved, err := loadRemoteArgs(remote, tokenFile, project)
+	if err != nil {
+		return err
+	}
+	if err := resolved.RequireAPIToken(); err != nil {
+		return err
+	}
+
+	deleteURL, err := appsURL(resolved.Remote, resolved.ID, name, "tokens/"+tokenID)
+	if err != nil {
+		return err
+	}
+	status, body, err := doAuthedRequest(context.Background(),
+		http.MethodDelete, deleteURL, resolved.APIToken, "", nil)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case http.StatusNoContent, http.StatusOK:
+		fmt.Fprintf(os.Stderr, "token %q revoked\n", tokenID)
+		return nil
+	case http.StatusNotFound:
+		return fmt.Errorf("token %q not found for app %q", tokenID, name)
+	default:
+		return fmt.Errorf("delete token: HTTP %d: %s", status, truncateForError(string(body)))
 	}
 }

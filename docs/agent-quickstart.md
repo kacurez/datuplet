@@ -354,3 +354,198 @@ datuplet pipeline put -f events-etl.yaml
 datuplet trigger --wait --json events-etl
 datuplet storage sample curated.daily_summary          # verify output
 ```
+
+## Apps quickstart: the agent build-test-ship loop (RFC 028)
+
+A second, independent CLI surface — `datuplet apps` — for a different kind
+of artifact: small server-rendered dashboards ("apps") that run untrusted
+author JS in a sandboxed WASM engine and read data via `datuplet.query(...)`
+(bound params — never string-spliced into SQL). The loop is deliberately
+agent-shaped: write code, ship it to a draft channel, render it server-side
+and assert on the JSON result, iterate, then promote and share. No browser
+is needed until you actually want to look at it.
+
+This uses the same headless auth and project resolution as the pipeline
+walkthrough above (`$DATUPLET_REMOTE` / `$DATUPLET_API_TOKEN` /
+`$DATUPLET_PROJECT`) — every `apps` subcommand resolves the project through
+the identical chain, `init` excepted (it never touches the network).
+
+### 1 — Scaffold
+
+```bash
+datuplet apps init ./sales-overview
+```
+
+```
+scaffolded a Datuplet app in ./sales-overview
+(next: cd ./sales-overview && npm install && npm run build)
+```
+
+This writes `app.js` (an ESM `export async function render(ctx)` stub),
+`datuplet.d.ts` (the `ctx` / `datuplet.query` / OutputDoc-block types an
+editor or agent codes against), `esbuild.mjs` + `package.json` (a working
+`npm run build` bundle step), and a `README.md`. `init` takes no
+`--project`/`--remote` at all — it is a pure local file-writer.
+
+### 2 — Write the app, then build it
+
+Edit `sales-overview/app.js` — e.g. (trimmed from spec Appendix A's worked
+example):
+
+```js
+// sales-overview/app.js
+export async function render(ctx) {
+  const days = Number(ctx.params.days ?? 30);
+  const kpi = await datuplet.query(
+    `SELECT count(*) AS orders, sum(amount) AS revenue
+     FROM sales.orders WHERE order_date >= current_date - $days`,
+    { days });
+  const [orders, revenue] = kpi.rows[0];
+  return {
+    outputDoc: 1,
+    title: "Sales overview",
+    blocks: [
+      { id: "kpis", type: "metric", items: [
+        { label: "Revenue", value: revenue, format: "currency:EUR" },
+        { label: "Orders",  value: orders },
+      ]},
+    ],
+  };
+}
+```
+
+`ctx.params` values are bound as prepared-statement parameters — the query
+*structure* is author-written, values never get concatenated into the SQL
+string (spec §6.1's injection-safety contract).
+
+```bash
+cd sales-overview && npm install && npm run build
+```
+
+This runs the scaffold's `esbuild.mjs` (`esbuild.build({bundle:true,
+format:"iife", globalName:"__dtp_app", ...})`) and writes `bundle.js` — the
+artifact `apps put` uploads.
+
+### 3 — Ship to draft
+
+```bash
+datuplet apps put sales-overview --bundle bundle.js
+```
+
+```
+APP_ID                                 VERSION_HASH
+3f1c2a90-6b7a-4c1b-9e2f-6a2b7c9d1e10   3f1c2a90b6e4d8517c0a9f2b6d4e8a1c3f5b7d9e2a4c6f8b0d2e4a6c8f0b2d4e
+```
+
+Every upload is a new immutable, content-addressed version (the hash is
+`sha256` of the raw bundle); it moves only the app's `draft` channel
+pointer — production is untouched. A bundle over 5 MB is rejected locally,
+before any network call. `--json` prints
+`{"app_id":"...","version_hash":"..."}` instead — script against
+`version_hash` for the `promote` step below.
+
+### 4 — Render the draft and assert — the agent's test step
+
+```bash
+datuplet apps render sales-overview --channel draft --param days=7 --json
+```
+
+Success prints the OutputDoc verbatim on stdout, exit `0`:
+
+```json
+{"outputDoc":1,"title":"Sales overview","blocks":[{"id":"kpis","type":"metric","items":[{"label":"Revenue","value":812345.67,"format":"currency:EUR"},{"label":"Orders","value":41213}]}]}
+```
+
+A render failure — a JS exception, a bad-shape query, a timeout — prints
+**exactly one** machine-readable object instead, and exits `1`:
+
+```json
+{"error":"the app threw","kind":"render_error","request_id":"c1a2b3c4-0000-0000-0000-000000000001","author_log":{"request_id":"c1a2b3c4-0000-0000-0000-000000000001","app_id":"3f1c2a90-6b7a-4c1b-9e2f-6a2b7c9d1e10","version_hash":"3f1c2a90b6e4d8517c0a9f2b6d4e8a1c3f5b7d9e2a4c6f8b0d2e4a6c8f0b2d4e","channel":"draft","principal_kind":"platform_user","principal_id":"user-1","started_at":"2026-08-05T00:00:00Z","duration_ms":18,"outcome":"render_error","log_text":"TypeError: cannot read properties of undefined (reading 'rows')","error":"the app threw"}}
+```
+
+> The three JSON payloads above (put, render success, render failure) are
+> not invented — they were produced by actually invoking `runAppsPut` /
+> `runAppsRender` against an `httptest` fake server during authoring of
+> this doc, the same technique `cmd/datuplet/apps_test.go` uses.
+
+`author_log` is the matching render-log record — fetched automatically via
+`apps logs --request-id`, folded into this one object — or JSON `null` if
+that lookup 404s (the record aged out of the ring buffer). If the CLI can't
+reach the service at all, or gets back something that *isn't* this
+structured envelope (an ingress error page, say), it exits `20` instead of
+`1`: this is the split an agent loop branches on — `1` means "my app is
+broken, go fix the code," `20` means "the platform itself is unreachable,
+retry or escalate."
+
+Iterate: edit `app.js` → `npm run build` → `apps put` → `apps render
+--channel draft --json` → assert on the JSON → repeat, until it looks
+right. `datuplet apps logs sales-overview --json` also lists recent render
+records directly, without a specific `request_id`.
+
+### 5 — Promote to production
+
+```bash
+datuplet apps promote sales-overview --version <hash-from-put>
+```
+
+```
+app "sales-overview" production is now 3f1c2a90b6e4d8517c0a9f2b6d4e8a1c3f5b7d9e2a4c6f8b0d2e4a6c8f0b2d4e
+```
+
+`--version` is required (the content hash from `put`/`get`); omit
+`--expected-production` on a first promote — there is no production version
+yet to compare against. For any **later** promote, pass the production hash
+you last observed as `--expected-production <old-hash>`: a compare-and-swap
+precondition (spec §5.1). If production moved to a different version since
+you read it — someone else promoted concurrently — the call fails with
+**HTTP 409**, and the CLI surfaces a clear message plus a **distinct,
+non-zero exit code (`9`)**, separate from the generic exit `1` every other
+promote failure uses:
+
+```
+Error: promote: conflict — production changed to a different version while this request was in flight; run `datuplet apps get sales-overview` to see the current production version, then retry promote with a fresh --expected-production
+```
+
+(exit code `9` — re-run `datuplet apps get sales-overview` to see the
+current production hash, then retry `promote` with that value as
+`--expected-production`.) A malformed `--version` / `--expected-production`
+— anything that isn't 64 hex characters — is rejected locally, before any
+network call.
+
+### 6 — Share it
+
+```bash
+datuplet apps token create sales-overview
+```
+
+```
+vw_6ba7b810-9dad-11d1-80b4-00c04fd430c8.k7QpN2xR9mZ4vL8sT1wJ6yF3hB0dC5eA
+store this token now (id 6ba7b810-9dad-11d1-80b4-00c04fd430c8) — it will not be shown again and cannot be retrieved later
+```
+
+The plaintext `vw_<token_id>.<secret>` (first line, stdout) is shown
+**exactly once** — the server stores only a salted hash of it, so no
+command, including `apps token list`, can ever surface it again. The note
+(second line, stderr) names the token id only, never the secret itself.
+Share the token appended to the viewer URL:
+`https://<host>/apps/<project>/sales-overview?token=vw_...` — the exchange
+happens once; the viewer's browser is then redirected to a token-free URL
+with a signed session cookie, so the plaintext never rides a bookmark or a
+`Referer` header.
+
+Manage tokens with `datuplet apps token list sales-overview` (ids +
+created/revoked timestamps — never a secret) and revoke one with
+`datuplet apps token delete sales-overview <token_id>` (`token_id` must be a
+UUID; anything else is rejected locally before any network call).
+
+### The full build-test-ship loop, back to back
+
+```bash
+datuplet apps init ./sales-overview
+# edit sales-overview/app.js, then:
+cd sales-overview && npm install && npm run build
+datuplet apps put sales-overview --bundle bundle.js
+datuplet apps render sales-overview --channel draft --param days=7 --json   # assert on this; iterate
+datuplet apps promote sales-overview --version <hash>
+datuplet apps token create sales-overview                                    # share the link once
+```
