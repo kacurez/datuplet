@@ -1,0 +1,191 @@
+{{- /*
+app-worker Deployment (RFC 028 Part 3 / Task D1).
+
+Viewer-facing render service for user-authored dashboard apps. Each app runs
+inside a per-request WASM sandbox (pkg/appengine: quickjs-ng on wazero); the
+resulting OutputDoc is served back. app-worker holds ZERO storage credentials
+— every data read is proxied through pipeline-api's project-scoped query route
+under a per-render impersonation JWT.
+
+HARD DEPENDENCY on the query service (spec §8): user apps have no data plane of
+their own, so enabling appWorker without queryWorker is a misconfiguration. The
+`fail` guard below aborts `helm template`/install in that case rather than
+shipping a Deployment that can only ever answer `unavailable`.
+
+BOOT SECRETS (all three are FATAL if missing/empty — the pod crash-loops by
+design rather than serving 503s indistinguishable from an outage, RFC 028 W6):
+  - DATUPLET_API_URL                        pipeline-api base URL
+  - DATUPLET_APPWORKER_SERVICE_TOKEN_FILE   shared internal-API credential
+  - DATUPLET_APPWORKER_COOKIE_KEY_FILE      viewer-cookie HMAC key
+The service-token is the SAME value pipeline-api mounts as its
+DATUPLET_APPS_INTERNAL_TOKEN_FILE (one Secret, both sides) — that is what makes
+app-worker's calls to /internal/v1/* authenticate.
+
+READINESS: /readyz returns 503 until the WASM engine finishes compiling at boot
+(markEngineReady, RFC 028 W6) — a viewer never hits an uncompiled engine.
+/healthz is unconditionally 200 (liveness).
+
+Pod hardening matches the repo convention (mirrors query-worker):
+  automountServiceAccountToken: false — app-worker needs no K8s API access.
+  runAsNonRoot + runAsUser 1000 (datuplet UID baked into the image).
+  drop ALL caps + seccompProfile RuntimeDefault.
+
+Gated on appWorker.enabled — renders nothing when false.
+*/ -}}
+{{- if and .Values.appWorker.enabled (not .Values.queryWorker.enabled) }}
+{{- fail "appWorker requires queryWorker.enabled=true (RFC 028 §8)" }}
+{{- end }}
+{{- if .Values.appWorker.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}app-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: app-worker
+spec:
+  replicas: {{ .Values.appWorker.replicas | default 2 }}
+  selector:
+    matchLabels:
+      {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "app-worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "app-worker") | nindent 8 }}
+    spec:
+      # app-worker needs NO K8s API access — disable SA token automount to
+      # match the pod-hardening convention applied to component Pods.
+      automountServiceAccountToken: false
+      # app-worker's SIGTERM handler drains in-flight renders with a fixed 10 s
+      # window (pkg/appworker/server.go). The preStop sleep (5 s) below gives
+      # the kubelet time to remove this pod from the Service endpoints before
+      # the process starts draining; 5 s (preStop) + 10 s (drain) = 15 s, kept
+      # comfortably under this 30 s grace so the graceful path always wins the
+      # SIGKILL race. Sized off the binary's real 10 s constant, not a render
+      # timeout (renders are bounded by the WASM deadline, not the drain).
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: app-worker
+          image: "{{ include "datuplet-app.image" (dict "img" .Values.appWorker.image "root" $) }}"
+          imagePullPolicy: {{ ((.Values.appWorker).image).pullPolicy | default .Values.image.pullPolicy }}
+          ports:
+            - { containerPort: 8090, name: http }
+          env:
+            # ---- Required boot inputs (FATAL if missing/empty) -----------
+            # pipeline-api base URL for resolve / bundle / verify / mint / log.
+            # Always the in-cluster Service DNS (never publicUrl) — this is an
+            # in-cluster pod-to-pod call.
+            - name: DATUPLET_API_URL
+              value: {{ include "datuplet-app.pipelineApiInClusterUrl" . | quote }}
+            # Shared internal-API credential — SAME value pipeline-api mounts as
+            # DATUPLET_APPS_INTERNAL_TOKEN_FILE (one datuplet-app-worker Secret).
+            - name: DATUPLET_APPWORKER_SERVICE_TOKEN_FILE
+              value: "/var/run/secrets/datuplet-app-worker/service-token"
+            # Viewer session-cookie HMAC signing key (app-worker only).
+            - name: DATUPLET_APPWORKER_COOKIE_KEY_FILE
+              value: "/var/run/secrets/datuplet-app-worker/cookie-hmac-key"
+
+            # ---- Listen address -----------------------------------------
+            - name: DATUPLET_APPWORKER_LISTEN
+              value: ":8090"
+
+            # ---- Render limits (spec §7; mirror pkg/appworker/config.go) --
+            - name: DATUPLET_APPWORKER_TIMEOUT_S
+              value: {{ ((.Values.appWorker).render).timeoutS | default 10 | quote }}
+            - name: DATUPLET_APPWORKER_MAX_TIMEOUT_S
+              value: {{ ((.Values.appWorker).render).maxTimeoutS | default 30 | quote }}
+            - name: DATUPLET_APPWORKER_MEMORY_MIB
+              value: {{ ((.Values.appWorker).render).memoryMiB | default 128 | quote }}
+            - name: DATUPLET_APPWORKER_MAX_MEMORY_MIB
+              value: {{ ((.Values.appWorker).render).maxMemoryMiB | default 256 | quote }}
+            - name: DATUPLET_APPWORKER_QUERIES_PER_RENDER
+              value: {{ ((.Values.appWorker).render).queriesPerRender | default 10 | quote }}
+            - name: DATUPLET_APPWORKER_MAX_QUERIES_PER_RENDER
+              value: {{ ((.Values.appWorker).render).maxQueriesPerRender | default 25 | quote }}
+            - name: DATUPLET_APPWORKER_OUTPUT_DOC_MAX_BYTES
+              value: {{ ((.Values.appWorker).render).outputDocMaxBytes | default 2097152 | quote }}
+            - name: DATUPLET_APPWORKER_BUNDLE_MAX_BYTES
+              value: {{ ((.Values.appWorker).render).bundleMaxBytes | default 5242880 | quote }}
+            - name: DATUPLET_APPWORKER_PER_APP_INFLIGHT
+              value: {{ ((.Values.appWorker).render).perAppInflight | default 2 | quote }}
+            - name: DATUPLET_APPWORKER_CONCURRENCY
+              value: {{ ((.Values.appWorker).render).concurrency | default 8 | quote }}
+
+            # ---- Proxy topology (empty by default → XFF ignored) ---------
+            # There is no chart-shipped ingress, so the trustworthy CIDR space
+            # is unknowable here; set appWorker.trustedProxies only when you
+            # front app-worker with your own ingress/LB whose XFF you trust.
+            {{- with .Values.appWorker.trustedProxies }}
+            - name: DATUPLET_APPWORKER_TRUSTED_PROXIES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.appWorker.trustedProxyHops }}
+            - name: DATUPLET_APPWORKER_TRUSTED_PROXY_HOPS
+              value: {{ . | quote }}
+            {{- end }}
+
+          volumeMounts:
+            - name: app-worker-secrets
+              mountPath: /var/run/secrets/datuplet-app-worker
+              readOnly: true
+
+          resources:
+            {{- if .Values.appWorker.resources }}
+            {{- toYaml .Values.appWorker.resources | nindent 12 }}
+            {{- else }}
+            requests:
+              memory: 512Mi
+              cpu: 250m
+            limits:
+              memory: 1Gi
+              cpu: "1"
+            {{- end }}
+
+          # Readiness is gated on the engine having compiled (RFC 028 W6):
+          # /readyz is 503 until markEngineReady, so a viewer never reaches an
+          # uncompiled engine. Liveness (/healthz) is unconditionally 200.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 20
+
+          # Delay SIGTERM so the pod leaves the Service endpoints before the
+          # in-process drain begins (see terminationGracePeriodSeconds above).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+          securityContext:
+            runAsNonRoot: true
+            # UID 1000 = datuplet user created in the app-worker Dockerfile.
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+
+      volumes:
+        - name: app-worker-secrets
+          secret:
+            secretName: {{ include "datuplet-app.appWorkerSecret" . }}
+{{- end }}

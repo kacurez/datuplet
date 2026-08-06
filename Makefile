@@ -145,8 +145,9 @@ docker-build-app-worker: ## Build app-worker Docker image (RFC 028 Part 3)
 
 # Build all K8s images (operators + services). RFC 025 Task 3.3: query-worker
 # is included here now that queryWorker.enabled defaults to true in the chart
-# — a stock deploy-local must have the image available.
-docker-build-k8s: docker-build-operators build-gateway docker-build-pipeline-api docker-build-pipeline-observer ## Build all K8s images (operators + gateway + pipeline-api + pipeline-observer + query-worker)
+# — a stock deploy-local must have the image available. RFC 028 D1: app-worker
+# is included for the same reason (appWorker.enabled defaults to true).
+docker-build-k8s: docker-build-operators build-gateway docker-build-pipeline-api docker-build-pipeline-observer docker-build-app-worker ## Build all K8s images (operators + gateway + pipeline-api + pipeline-observer + app-worker + query-worker)
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
 # =============================================================================

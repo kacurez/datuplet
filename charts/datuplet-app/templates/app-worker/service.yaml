@@ -1,0 +1,34 @@
+{{- /*
+app-worker Service (RFC 028 Part 3 / Task D1).
+
+ClusterIP, mirroring query-worker's Service shape. app-worker is the
+viewer-facing render surface (spec §4.2), but — like pipeline-api's own /api
+and /ui — routing external `/apps/{pid}/{name}` traffic to this Service is
+BYO/operator: no Ingress or Gateway resource is shipped by any datuplet chart
+(D0). In-cluster consumers reach the worker at:
+  http://app-worker.<namespace>.svc.cluster.local:8090
+
+Operators expose it in production by fronting this ClusterIP with their own
+Ingress + TLS (the same posture documented for pipeline-api's Service).
+
+Gated on appWorker.enabled — renders nothing when false.
+*/ -}}
+{{- if .Values.appWorker.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}app-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: app-worker
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+  selector:
+    {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "app-worker") | nindent 4 }}
+{{- end }}

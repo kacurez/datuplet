@@ -248,6 +248,102 @@ queryWorker:
     # exhausting the worker's semaphore.
     perPrincipalInflight: 2
 
+# ─── App Worker (RFC 028) ─────────────────────────────────────────────────────
+#
+# Viewer-facing render service for user-authored dashboard apps. Each app is
+# rendered inside a per-request WASM sandbox (quickjs-ng on wazero) and the
+# resulting OutputDoc is served back. app-worker holds ZERO storage
+# credentials: all data access is proxied through pipeline-api's project-scoped
+# query route under a per-render impersonation JWT. app-worker therefore
+# HARD-DEPENDS on the query service — an install that enables appWorker without
+# queryWorker fails template rendering (see the guard in
+# templates/app-worker/deployment.yaml; spec §8).
+#
+# REDACTION (spec §5.3): there is NO chart-shipped ingress and NO ingress-level
+# redaction knob to configure — routing /apps → app-worker is BYO/operator,
+# exactly like /api and /ui today. Query-string / Referer redaction is entirely
+# app-worker's OWN, already-shipped control: it sets `Referrer-Policy:
+# no-referrer` on every /apps/* response (including the 302 token exchange) and
+# its structured access log records fields only — never request URLs or the
+# Referer header (implemented + tested in RFC 028 task W6). Operators who front
+# app-worker with their own ingress/LB should ensure that layer likewise does
+# not log full request URLs for /apps/*.
+appWorker:
+  # enabled: true → renders the app-worker Deployment, Service, NetworkPolicy,
+  # and PodDisruptionBudget; mounts the shared datuplet-app-worker Secret into
+  # BOTH app-worker and pipeline-api; and registers pipeline-api's
+  # /internal/v1/* routes. false → none of those render.
+  enabled: true
+
+  # replicas: number of app-worker Deployment replicas. app-worker is stateless
+  # — no server-side sessions, viewer cookies are self-contained (signature +
+  # revocation check), impersonation JWTs are per-render — so a Deployment
+  # restart is a non-event (spec §7): only warm caches are lost.
+  replicas: 2
+
+  # tag "" resolves to the chart appVersion (RFC 024: charts are released as
+  # committed; the release pipeline no longer rewrites values). Local dev / e2e
+  # override the image via tests/e2e/values-app.yaml.
+  image:
+    # repository: image repository for the app-worker binary.
+    repository: ghcr.io/kacurez/app-worker
+    # tag: image tag. Defaults to the chart appVersion.
+    tag: ""
+    # pullPolicy: overrides the chart-global image.pullPolicy for the
+    # app-worker only. Leave empty ("") to inherit the global setting.
+    pullPolicy: ""
+
+  # resources: per-pod budget. Per spec §7 the per-render host budget is ≈ WASM
+  # cap (≤128 MiB default) + one buffered query response (≤10 MiB) + OutputDoc
+  # buffer (≤2 MiB); per pod add the compiled engine (~tens of MB) and the
+  # bundle LRU. Sized for the `render.concurrency` render slots below.
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 1Gi
+      cpu: "1"
+
+  # trustedProxies / trustedProxyHops: the proxy topology in front of app-worker
+  # (DATUPLET_APPWORKER_TRUSTED_PROXIES / _TRUSTED_PROXY_HOPS). EMPTY BY DEFAULT
+  # — X-Forwarded-For is then ignored and both the per-viewer rate-limit buckets
+  # and the access-log client IP key off the immediate peer address. There is no
+  # chart-shipped ingress, so the trustworthy CIDR space is unknowable at
+  # chart-authoring time. Set these when you front app-worker with your own
+  # ingress/LB whose XFF you trust, otherwise per-viewer rate limits collapse
+  # onto the proxy's single source IP.
+  trustedProxies: ""
+  trustedProxyHops: ""
+
+  # render: per-render limits + operator-tunable caps, spec §7 verbatim (also
+  # mirrored in pkg/appworker/config.go's Default*/HardCap* constants). Each
+  # `max*` sibling is itself clamped to the spec's absolute hard ceiling by
+  # app-worker at boot, so raising it past the ceiling is a no-op, never an
+  # error.
+  render:
+    # timeoutS / maxTimeoutS: render wall clock — default 10 s, hard cap 30 s.
+    timeoutS: 10
+    maxTimeoutS: 30
+    # memoryMiB / maxMemoryMiB: WASM instance memory — default 128, hard cap 256.
+    memoryMiB: 128
+    maxMemoryMiB: 256
+    # queriesPerRender / maxQueriesPerRender: query() calls allowed per render —
+    # default 10, hard cap 25.
+    queriesPerRender: 10
+    maxQueriesPerRender: 25
+    # outputDocMaxBytes: OutputDoc structural size cap, 2 MiB (spec §6.3).
+    outputDocMaxBytes: 2097152
+    # bundleMaxBytes: app bundle size cap, 5 MB (spec §4; pipeline-api's store
+    # is the authoritative enforcer — this is a defence-in-depth bound).
+    bundleMaxBytes: 5242880
+    # perAppInflight: concurrent in-flight renders per app (spec §7). Coupled
+    # with the query service's per-principal in-flight default — raising one
+    # without the other starves renders or idles capacity.
+    perAppInflight: 2
+    # concurrency: total render slots per pod (pool semaphore size).
+    concurrency: 8
+
 # allowClientSideQuery gates the POST /api/v1/query/token mint endpoint (RFC 022
 # §5.3): the per-invocation query-JWT mint the laptop-side `datuplet-query` CLI
 # calls to run ad-hoc SQL locally (BYO-local, mode c). DEFAULT FALSE — an

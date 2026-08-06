@@ -1,0 +1,84 @@
+{{- /*
+app-worker NetworkPolicy (RFC 028 Part 3 / Task D1).
+
+ENFORCEMENT WARNING (same as query-worker):
+  OrbStack/dev clusters without a policy CNI (e.g. plain kindnet) do NOT
+  enforce NetworkPolicies — the rules are stored in etcd but never applied.
+  Production REQUIRES a policy-capable CNI (GKE Dataplane V2 / Calico / Cilium
+  / Antrea). The e2e suite self-checks enforcement via a probe pod.
+
+DELIBERATE CONTRAST WITH query-worker (D0 finding §C4 — this is NOT a verbatim
+mirror, and copying query-worker's rules wholesale would be a real security
+regression):
+
+  INGRESS is OPEN on :8090. query-worker accepts traffic only from pipeline-api
+  pods because it is an internal service; app-worker is the PUBLIC viewer-facing
+  surface (spec §4.2). Since routing /apps → app-worker is BYO/operator (no
+  chart-shipped ingress, D0 §B), there is no chart-knowable pod selector for
+  "the viewers" — an operator's ingress controller may live in any namespace —
+  so the ingress rule permits :8090 from all sources.
+
+  EGRESS is DNS + pipeline-api ONLY. query-worker additionally egresses to
+  lakekeeper (:8181) and minio (:9000) for its data plane; app-worker MUST NOT.
+  app-worker holds ZERO storage credentials — every data read is proxied
+  through pipeline-api's project-scoped query route under a per-render
+  impersonation JWT (spec §4/§9). Granting it lakekeeper/object-store reach
+  would hand the render sandbox network paths it has no business using.
+
+Selector conventions match what each chart emits:
+  pipeline-api: app.kubernetes.io/part-of=datuplet, name=pipeline-api
+
+Gated on appWorker.enabled — renders nothing when false.
+*/ -}}
+{{- if .Values.appWorker.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}app-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: app-worker
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "app-worker") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+
+  ingress:
+    # Viewer-facing: accept render traffic on :8090 from ALL sources. There is
+    # no chart-knowable selector for the public / the operator's ingress (see
+    # header). An ingress rule with ports and no `from` permits all sources on
+    # those ports.
+    - ports:
+        - { protocol: TCP, port: 8090 }
+
+  egress:
+    # 1. kube-dns — scoped to kube-system namespace + kube-dns pod label
+    #    (k8s >= 1.21 guarantees the kubernetes.io/metadata.name label; earlier
+    #    clusters must label the namespace manually). Prevents DNS-tunnel
+    #    exfiltration.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+
+    # 2. pipeline-api (:8081) — app-worker's ONLY data/control path: resolve,
+    #    bundle fetch, viewer-token / session verify, impersonation-JWT mint,
+    #    and render-log append all go here (DATUPLET_API_URL). No lakekeeper,
+    #    no object store — app-worker holds no storage credentials (see header).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: pipeline-api
+      ports:
+        - { protocol: TCP, port: 8081 }
+{{- end }}

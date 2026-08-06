@@ -37,6 +37,15 @@ signing-key
 openfga-api-key
 {{- end -}}
 
+{{/* Shared app-worker Secret (RFC 028 Part 7). Two keys: `service-token` (the
+     internal-API credential mounted into BOTH app-worker and pipeline-api —
+     same value, one Secret) and `cookie-hmac-key` (app-worker only). Generated
+     by the datuplet-infra keygen Job; consumed here by bare name (empty
+     prefix), matching the platformSigningKeySecret convention above. */}}
+{{- define "datuplet-app.appWorkerSecret" -}}
+datuplet-app-worker
+{{- end -}}
+
 {{- define "datuplet-app.platformPgPipelineApiSecret" -}}
 pg-pipeline-api
 {{- end -}}

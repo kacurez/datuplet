@@ -158,6 +158,20 @@ spec:
             - name: DATUPLET_QUERY_PER_PRINCIPAL_INFLIGHT
               value: {{ .Values.queryWorker.query.perPrincipalInflight | default 2 | quote }}
             {{- end }}
+            {{- if .Values.appWorker.enabled }}
+            # ── User apps internal API (RFC 028 Part 7) ─────────────────────
+            # The shared service credential app-worker presents on
+            # /internal/v1/* (resolve / bundle / verify / mint / log). This is
+            # the SAME value mounted into app-worker as its
+            # DATUPLET_APPWORKER_SERVICE_TOKEN_FILE (one datuplet-app-worker
+            # Secret, both sides) — pipeline-api verifies the bearer app-worker
+            # sends. File present-but-empty/unreadable = a FATAL boot error
+            # (apps.ServiceTokenFromEnv); unset = internal routes 404 (a cluster
+            # that has not deployed app-worker). Gated with the Deployment/
+            # Service/NetworkPolicy so all four appear/disappear together.
+            - name: DATUPLET_APPS_INTERNAL_TOKEN_FILE
+              value: "/var/run/secrets/datuplet-app-worker/service-token"
+            {{- end }}
             # Pipeline-policy gateway bounds (RFC 026 §4.4/§4.6). pipeline-api
             # rejects (403) a non-superadmin PUT whose gateway knobs exceed
             # these on the diff-gate. 0/unset = no bound on that knob.
@@ -192,6 +206,14 @@ spec:
             - name: signing-key
               mountPath: /var/run/secrets/datuplet-signing-key
               readOnly: true
+            {{- if .Values.appWorker.enabled }}
+            # Shared app-worker service-token (RFC 028 Part 7). Only the
+            # service-token key is projected (see volumes) — pipeline-api never
+            # needs app-worker's cookie-hmac-key.
+            - name: app-worker-service-token
+              mountPath: /var/run/secrets/datuplet-app-worker
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.pipelineApi.resources | nindent 12 }}
           readinessProbe:
@@ -214,3 +236,13 @@ spec:
         - name: signing-key
           secret:
             secretName: {{ include "datuplet-app.platformSigningKeySecret" . }}
+        {{- if .Values.appWorker.enabled }}
+        - name: app-worker-service-token
+          secret:
+            secretName: {{ include "datuplet-app.appWorkerSecret" . }}
+            # Project ONLY the service-token key — pipeline-api must not receive
+            # app-worker's viewer-cookie HMAC key (cookie-hmac-key).
+            items:
+              - key: service-token
+                path: service-token
+        {{- end }}
