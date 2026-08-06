@@ -127,6 +127,7 @@ Full diagram and component descriptions: [docs/architecture.md](docs/architectur
 | [docs/pipeline-api.md](docs/pipeline-api.md) | pipeline-api REST reference + PipelineDoc format |
 | [docs/agent-quickstart.md](docs/agent-quickstart.md) | CLI loop for agents/scripts: components → validate → put → trigger → storage sample |
 | [docs/ad-hoc-query.md](docs/ad-hoc-query.md) | Ad-hoc SQL query (browser console, REST, CLI) |
+| [docs/user-apps.md](docs/user-apps.md) | User apps: sandboxed dashboards, CLI build-test-ship loop, viewer tokens |
 | [docs/auth-flow.md](docs/auth-flow.md) | Token lifecycle (session → run JWT → FGA) |
 | [docs/secrets.md](docs/secrets.md) | Secret references in pipeline YAML |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common failures and fixes |

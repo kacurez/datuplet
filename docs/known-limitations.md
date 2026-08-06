@@ -305,6 +305,58 @@ upgrading.
 
 ---
 
+## User apps (RFC 028)
+
+**Project-wide read grant, not row-scoped (spec §5.4).** An app's synthetic
+identity gets an FGA `viewer` (read-only) tuple on the **whole project** —
+there is no per-namespace/per-table scoping in v1. "Install an app and hand
+out its viewer tokens" is equivalent to "expose anything that app's queries
+can read from this project." Per-app scoped grants (per-namespace/table FGA
+tuples) are follow-up work.
+
+**Promote is eventually consistent across replicas.** app-worker replicas
+cache slug→version resolution for up to ≤15 s, so different replicas may
+briefly serve different versions after a promote/rollback. Versions are
+immutable and any version is safe to serve, so the window is cosmetic, not a
+correctness risk — but a viewer refreshing during that window can observe
+the old version.
+
+**No Ingress ships in the chart — the operator must route `/apps` onto the
+SAME host as `/ui`.** `charts/datuplet-app` renders no `Ingress` resource for
+either surface (mirroring pipeline-api's own "front with your own Ingress +
+TLS" posture, `charts/datuplet-app/templates/pipeline-api/service.yaml`).
+For user apps this is load-bearing, not cosmetic:
+
+- The management UI's draft-preview iframe (`/ui/apps/<name>` embedding
+  `/apps/{pid}/{name}@draft`) renders only same-origin — the app shell's CSP
+  ships `frame-ancestors 'self'`, which the browser evaluates against the
+  *embedding* page's origin. If `/apps` sits on a different host than `/ui`,
+  the browser blocks the iframe outright.
+- That draft preview authenticates with the viewer's **existing platform
+  session cookie** (no viewer token involved) — a cookie is only sent to the
+  host it was set for. A separate `/apps` host would never receive it.
+- The viewer session cookie the `?token=` exchange sets is `Path`-scoped
+  (`Path=/apps/{pid}/{name}`), which only disambiguates paths **within one
+  host** — it provides no cross-host isolation by itself.
+
+Front both `/ui/*` and `/apps/*` with one Ingress/reverse-proxy on one
+hostname. `appWorker.trustedProxies` / `.trustedProxyHops` (`values.yaml`)
+tell app-worker which hop to trust for the real client IP once you do — both
+are empty by default because the trustworthy CIDR space is unknowable at
+chart-authoring time. A dedicated `apps.<domain>` for origin-level isolation
+from `/ui` is documented as an optional future hardening, not the v1
+default.
+
+**No writebacks, no Python authoring, no SSO at the viewer edge yet.** v1
+apps are read-only (a modal may set a param and re-render, never a
+side-effectful submit); the guest runtime is JS-only (QuickJS — no
+Python/WASM-Python runtime); viewer authentication is opaque bearer tokens
+only (no SAML/OIDC login for viewers — an app's *authors* already
+authenticate with the normal platform session/api-token). All three are
+named future work in the design spec (§10), not oversights.
+
+---
+
 ## http-json-extractor
 
 **Late-arriving fields are dropped when neither `fields` nor a declared

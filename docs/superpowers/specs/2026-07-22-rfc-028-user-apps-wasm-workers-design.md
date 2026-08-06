@@ -342,12 +342,13 @@ protecting.
   deletion; because FGA is evaluated per query, even an already-minted
   impersonation JWT authorizes nothing afterwards — the same ≤15 s
   blast-radius property as run cancellation.
-- Per render, app-worker obtains a **60 s impersonation JWT** for that
-  identity (§5.2) and attaches it to `query()` calls. Every statement lands
-  in the existing `query_audit` log attributed to the app identity. The
-  query route must accept impersonation-kind JWTs as principals (it already
-  does for interactive storage browse; the contract requirement is stated
-  here explicitly).
+- Per render, app-worker obtains a **60 s app-identity JWT**
+  (`token_kind="app"` — a distinct kind from the general impersonation JWT,
+  introduced in P4) for that identity (§5.2) and attaches it to `query()`
+  calls. Every statement lands in the existing `query_audit` log attributed
+  to the app identity. The query route accepts `token_kind="app"` JWTs as
+  principals via a dedicated internal route (an app has no `*store.User` row
+  for the session-verifying route to resolve).
 - **v1 authz posture (explicit):** an app can read **everything a project
   viewer can read**. There is no per-app table scoping in v1; authors and
   operators must treat "install an app + hand out its viewer tokens" as

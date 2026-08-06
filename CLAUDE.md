@@ -220,6 +220,22 @@ These are conventions a new contributor wouldn't infer from the code:
 - **CNPG CRDs** live in `charts/datuplet-operators/crds/` (sidesteps
   helm's pre-flight REST-mapper validation issue for
   `Cluster.postgresql.cnpg.io`).
+- **`pkg/appengine/embed/engine.wasm` is a committed build artifact**,
+  produced by `make engine-wasm` (`utils/docker/engine-wasm.Dockerfile`,
+  wasi-sdk) — not built by `go build` or CI. Regenerate and commit it
+  whenever the QuickJS host/guest shim changes; a stale binary silently
+  serves old engine behavior. **app-worker holds zero storage credentials**:
+  `pkg/appworker/` never talks to S3/GCS/lakekeeper directly — the only host
+  capability a render gets is `datuplet.query(...)`, forwarded to
+  pipeline-api's query route under a per-render `token_kind="app"`
+  impersonation JWT (RFC 028 §5.4, `tokens.MintAppToken`). **Shared
+  service-token wiring**: the `datuplet-app-worker` Secret (generated once by
+  the `datuplet-infra` keygen Job; `datuplet-app.appWorkerSecret` helper)
+  carries two keys — `service-token` (the SAME value mounted into both
+  app-worker's `DATUPLET_APPWORKER_SERVICE_TOKEN_FILE` and pipeline-api's
+  `DATUPLET_APPS_INTERNAL_TOKEN_FILE`, authenticating app-worker's calls to
+  pipeline-api's `/internal/v1/*` routes) and `cookie-hmac-key` (app-worker
+  only, signs viewer session cookies).
 - **Monorepo `go mod tidy`**: the repo has multiple Go modules
   (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`).
   Tidying root in isolation drifts the others —
@@ -244,11 +260,14 @@ These are conventions a new contributor wouldn't infer from the code:
 | `cmd/pipeline-observer/` | Standalone informer; mirrors PipelineRun status to DB. |
 | `cmd/pipeline-api/` | HTTP server + admin subcommands. |
 | `pkg/pipelineapi/` | HTTP handlers, auth, authz, runbackend, store, storage UI. |
+| `pkg/appengine/` | WASM render engine — wazero host + QuickJS guest (`embed/engine.wasm`), OutputDoc/Vega-Lite-subset schema validation (RFC 028). |
+| `pkg/appworker/` | app-worker HTTP service: viewer/platform auth, render dispatch via `pkg/appengine`, render logs, rate limits (RFC 028). |
 | `pkg/lib/datalake/` | Metadata-only fallback I/O. NOT the data plane. |
 | `sdk/go/`, `sdk/python/` | Thin SDKs (~200 LOC each). |
 | `sdk/python-sandbox/` | Sandbox library (DuckDB + pre-signed URLs). |
 | `components/` | Built-in extractors, transforms, writers. |
 | `ui/product/` | Browser SPA (vanilla ES modules). |
+| `ui/appshell/` | Viewer-facing shell app-worker serves alongside a render (OutputDoc → DOM, Vega-Lite embed, DOMPurify/marked) — distinct from `ui/product/`'s author-facing SPA (RFC 028). |
 | `charts/` | Four Helm charts: `datuplet-operators`, `-infra`, `-app`, `-lakekeeper`. |
 | `utils/docker/` | Dockerfiles for all services. |
 | `examples/pipelines/` | Example PipelineDocs, envelope-free (CI-guarded; RFC 027). |
