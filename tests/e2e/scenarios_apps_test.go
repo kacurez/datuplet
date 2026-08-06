@@ -99,22 +99,35 @@ func TestApps_ViewerAndSecurity(t *testing.T) {
 	pid := getQueryProjectID(t)
 	apiBase := framework.PipelineAPIBaseURL()
 
-	// Gate on app-worker actually being deployed + ready (mirrors
-	// TestQueryBootstrap's query-worker readiness gate). A missing Deployment
-	// almost always means the values-app.yaml appWorker override or the
-	// docker-build-app-worker image is absent — skip with that hint.
-	if ready := appsDeploymentReadyReplicas(ctx, t); ready <= 0 {
-		framework.SkipOrFail(t, "app-worker has %d ready replicas — appWorker.enabled + image built? (values-app.yaml, make docker-build-app-worker)", ready)
+	// The final stage proves EVERY replica flips to v2 within ≤15 s, which is
+	// only meaningful with ≥2 replicas (values-app.yaml sets appWorker.replicas:
+	// 2). A single-replica run would fake-green that multi-replica claim, so <2
+	// is a FAILURE, not a skip. Skip only when the Deployment is entirely absent
+	// (wrong/older stack — environment not provisioned), consistent with the
+	// suite's other "stack not up" skips.
+	const wantReplicas = 2
+	ready := appsWaitDeploymentReady(ctx, t, wantReplicas, 90*time.Second)
+	if ready < 0 {
+		framework.SkipOrFail(t, "app-worker Deployment not found — appWorker.enabled + values-app.yaml override + image built? (make docker-build-app-worker)")
+	}
+	if ready < wantReplicas {
+		t.Fatalf("app-worker has %d ready replicas, want >= %d (values-app.yaml appWorker.replicas) — cannot prove multi-replica v2 propagation", ready, wantReplicas)
 	}
 
-	// Per-pod port-forwards so the promote-propagation stage can poll EVERY
-	// replica. workerBases[0] is the primary endpoint for the viewer flow.
-	workerBases := appsStartWorkerForwards(ctx, t)
-	if len(workerBases) == 0 {
-		framework.SkipOrFail(t, "no app-worker pod became reachable via port-forward")
+	// Per-pod port-forwards (per POD, not the Service — a Service port-forward
+	// pins ONE backend) so the promote-propagation stage can poll EVERY replica
+	// independently. Require ≥ wantReplicas DISTINCT reachable pods, else the
+	// all-replicas v2 check would silently degrade to a single-replica check.
+	workers := appsStartWorkerForwards(ctx, t)
+	distinctPods := map[string]bool{}
+	for _, w := range workers {
+		distinctPods[w.pod] = true
 	}
-	appBase := workerBases[0]
-	t.Logf("app-worker reachable via %d per-pod port-forward(s): %v", len(workerBases), workerBases)
+	if len(distinctPods) < wantReplicas {
+		t.Fatalf("only %d distinct app-worker pod(s) reachable via port-forward, need >= %d — the all-replicas v2 check would degrade to a single-replica check", len(distinctPods), wantReplicas)
+	}
+	appBase := workers[0].base
+	t.Logf("app-worker reachable via %d per-pod port-forward(s): %v", len(workers), workers)
 
 	// Two apps: `sales` is the app under test; `sales2` is the cross-app cookie
 	// replay target. runPrefix ("e2e-xxxx") keeps both names DNS-label-valid
@@ -279,6 +292,28 @@ func TestApps_ViewerAndSecurity(t *testing.T) {
 		if c.Value == "" || strings.Contains(c.Value, secret) {
 			t.Errorf("session cookie value is empty or leaks the secret")
 		}
+
+		// The plaintext leaks NOWHERE beyond being consumed: neither the full
+		// vw_<id>.<secret> token nor its bare secret may appear in the 302
+		// response body or in ANY response header (Set-Cookie included — the
+		// signed cookie encodes app_id/token_id/exp+HMAC, never the raw token
+		// or the secret). Location-only checking (the old form) would miss a
+		// leak into the body or a non-Location header.
+		for _, leak := range []struct{ name, val string }{
+			{"full token", viewerToken},
+			{"bare secret", secret},
+		} {
+			if strings.Contains(string(body), leak.val) {
+				t.Errorf("302 response body leaks the %s", leak.name)
+			}
+			for hName, hVals := range resp.Header {
+				for _, hv := range hVals {
+					if strings.Contains(hv, leak.val) {
+						t.Errorf("302 response header %q leaks the %s: %q", hName, leak.name, hv)
+					}
+				}
+			}
+		}
 		v1Cookie = c.Value
 	})
 
@@ -339,40 +374,94 @@ func TestApps_ViewerAndSecurity(t *testing.T) {
 		}
 	})
 
-	// ── query_audit attributes the APP principal (spec §9 / P5) ──────────────
-	t.Run("query_audit_attributes_app_principal", func(t *testing.T) {
+	// ── query_audit attributes the APP principal, with jti + ok outcome ──────
+	t.Run("query_audit_attributes_app_principal_jti_and_ok", func(t *testing.T) {
 		// Every sales render above ran datuplet.query under the app's
-		// impersonation JWT; pipeline-api's query route logs a single
-		// "query_audit" slog line whose `principal` is "app-<app_id>" (P5).
-		// That slog line is the only e2e-observable attribution channel, so we
-		// scrape pipeline-api's pod logs (poll: the line may lag the render).
+		// per-render impersonation JWT; pipeline-api's query route logs one
+		// "query_audit" slog line carrying principal=app-<app_id>, the token's
+		// crypto-random jti (P4/P5), and the outcome. That slog line is the only
+		// e2e-observable attribution channel, so we scrape pipeline-api's pod
+		// logs. A bare "query_audit"+principal grep (the old form) would
+		// FAKE-GREEN a regression that dropped the jti or flipped the outcome, so
+		// we parse the line and require BOTH an exact principal match AND a
+		// NON-EMPTY jti AND outcome==ok.
 		var found bool
-		var sample string
+		var sample, gotJTI, gotOutcome string
 		deadline := time.Now().Add(15 * time.Second)
 		for {
-			ok, line := appsGrepPipelineAPILogs(ctx, "query_audit", principalMatch)
-			if ok {
-				found, sample = true, line
+			lines, _ := appsPipelineAPILogLines(ctx)
+			for _, ln := range lines {
+				if !strings.Contains(ln, "query_audit") {
+					continue
+				}
+				if appsExtractField(ln, "principal") != principalMatch {
+					continue
+				}
+				jti := appsExtractField(ln, "jti")
+				outcome := appsExtractField(ln, "outcome")
+				if jti != "" && outcome == "ok" {
+					found, sample, gotJTI, gotOutcome = true, ln, jti, outcome
+					break
+				}
+			}
+			if found || time.Now().After(deadline) {
 				break
 			}
-			if time.Now().After(deadline) {
-				break
-			}
-			// Trigger one more render so a fresh audit line is emitted.
+			// Nudge a fresh successful render so a matching audit line appears.
 			_, _, _ = appsRender(ctx, appBase, pid, salesName, false, nil, "application/json", appsSessionCookies(v1Cookie))
 			time.Sleep(2 * time.Second)
 		}
 		if !found {
-			t.Fatalf("no query_audit slog line attributing principal %q found in pipeline-api logs", principalMatch)
+			t.Fatalf("no query_audit line with principal=%s AND non-empty jti AND outcome=ok found in pipeline-api logs", principalMatch)
 		}
-		t.Logf("query_audit attributes app principal: %s", truncateLog([]byte(sample), 300))
+		t.Logf("query_audit: principal=%s jti=%s outcome=%s (%s)", principalMatch, gotJTI, gotOutcome, truncateLog([]byte(sample), 200))
 	})
 
-	// ── injection: `?country=' UNION …` binds as a literal (zero rows) ───────
-	t.Run("injection_binds_literal_zero_rows", func(t *testing.T) {
+	// ── bound-param POSITIVE control, THEN injection binds as a literal ──────
+	t.Run("bound_param_positive_control_then_injection", func(t *testing.T) {
 		if v1Cookie == "" {
 			t.Skip("prerequisite token exchange did not set a cookie")
 		}
+
+		// POSITIVE CONTROL first. Without it, the injection's "zero rows" could
+		// fake-green a bind path that ALWAYS returns zero (i.e. one that never
+		// filters at all). Render with a legitimate country == a real seeded
+		// `title` and assert the sample returns ONLY rows carrying that title —
+		// proving $country binds AND filters for a genuine value.
+		known := appsDiscoverKnownTitle(ctx, t, session, pid, ns, table)
+		{
+			q := url.Values{"country": {known}}
+			resp, body, err := appsRender(ctx, appBase, pid, salesName, false, q,
+				"application/json", appsSessionCookies(v1Cookie))
+			if err != nil {
+				t.Fatalf("positive-control render: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("positive-control render: status=%d body=%s", resp.StatusCode, truncateLog(body, 512))
+			}
+			doc, err := appsParseDoc(body)
+			if err != nil {
+				t.Fatalf("positive-control render: parse OutputDoc: %v (body=%s)", err, truncateLog(body, 512))
+			}
+			rows := appsTableRows(doc, "sample")
+			if len(rows) == 0 {
+				t.Fatalf("positive control: country=%q returned 0 rows — $country did not bind/filter for a legitimate value", known)
+			}
+			if len(rows) > 5 {
+				t.Errorf("positive control: %d rows, want <=5 (LIMIT 5)", len(rows))
+			}
+			for i, r := range rows {
+				if title := appsRowString(r, 1); title != known {
+					t.Errorf("positive control row %d title=%q, want %q (the filter must return only matching rows)", i, title, known)
+				}
+			}
+		}
+
+		// NEGATIVE (injection). `?country=' UNION SELECT ...` binds as a VARCHAR
+		// literal → the `title` column never equals that garbage → zero rows,
+		// 200, no error leak. If it were string-interpolated instead, the UNION
+		// would return extra rows (row count changes) — so a regression to
+		// interpolation FAILS this stage.
 		injection := `' UNION SELECT id, body FROM "` + ns + `"."` + table + `" --`
 		q := url.Values{"country": {injection}}
 		resp, body, err := appsRender(ctx, appBase, pid, salesName, false, q,
@@ -477,28 +566,35 @@ func TestApps_ViewerAndSecurity(t *testing.T) {
 		}
 
 		// Poll EVERY replica's own port-forward until it serves the v2 title,
-		// bounded by ≤15 s + slack. This is where per-pod forwarding earns its
-		// keep: a Service port-forward would pin one backend.
-		for i, base := range workerBases {
+		// bounded by ≤15 s + slack, and record which DISTINCT pods flipped. This
+		// is where per-pod forwarding earns its keep (a Service port-forward pins
+		// one backend). Asserting ≥ wantReplicas distinct pods served v2 is what
+		// stops this degrading into a single-replica check.
+		servedV2 := map[string]bool{}
+		for i, w := range workers {
 			start := time.Now()
 			deadline := start.Add(appPropagationBound)
 			var lastTitle string
 			for {
-				resp, body, err := appsRender(ctx, base, pid, salesName, false, nil, "application/json", appsSessionCookies(v2Cookie))
+				resp, body, err := appsRender(ctx, w.base, pid, salesName, false, nil, "application/json", appsSessionCookies(v2Cookie))
 				if err == nil && resp.StatusCode == http.StatusOK {
 					if doc, derr := appsParseDoc(body); derr == nil {
 						lastTitle = doc.Title
 						if doc.Title == "Sales overview v2" {
-							t.Logf("replica %d (%s) serving v2 after %s", i, base, time.Since(start).Round(time.Millisecond))
+							servedV2[w.pod] = true
+							t.Logf("replica %d pod=%s (%s) serving v2 after %s", i, w.pod, w.base, time.Since(start).Round(time.Millisecond))
 							break
 						}
 					}
 				}
 				if time.Now().After(deadline) {
-					t.Fatalf("replica %d (%s) still not serving v2 after %s (last title=%q)", i, base, appPropagationBound, lastTitle)
+					t.Fatalf("replica %d pod=%s (%s) still not serving v2 after %s (last title=%q)", i, w.pod, w.base, appPropagationBound, lastTitle)
 				}
 				time.Sleep(time.Second)
 			}
+		}
+		if len(servedV2) < wantReplicas {
+			t.Fatalf("only %d distinct pod(s) observed serving v2, need >= %d — the poll did not cover all replicas", len(servedV2), wantReplicas)
 		}
 	})
 
@@ -858,6 +954,46 @@ func appsTableRows(doc appsDoc, blockID string) []json.RawMessage {
 	return nil
 }
 
+// appsRowString returns the string cell at idx of a table row (a JSON array),
+// or "" if the row is not an array or the cell is not a string.
+func appsRowString(row json.RawMessage, idx int) string {
+	var cells []json.RawMessage
+	if err := json.Unmarshal(row, &cells); err != nil || idx < 0 || idx >= len(cells) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(cells[idx], &s); err != nil {
+		return ""
+	}
+	return s
+}
+
+// appsDiscoverKnownTitle returns a real `title` value from the seeded table via
+// the admin query route — the legitimate value the positive bind control
+// filters on, so the injection's zero-rows result is proven meaningful (not a
+// bind path that always returns nothing). Reuses postQuery/queryResult from the
+// query scenario.
+func appsDiscoverKnownTitle(ctx context.Context, t *testing.T, session, pid, ns, table string) string {
+	t.Helper()
+	sql := fmt.Sprintf(`SELECT title FROM "%s"."%s" WHERE title IS NOT NULL ORDER BY id LIMIT 1`, ns, table)
+	status, body, err := postQuery(ctx, session, pid, queryRequest{SQL: sql})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("discover known title: status=%d err=%v body=%s", status, err, truncateLog(body, 256))
+	}
+	var res queryResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatalf("discover known title: decode: %v", err)
+	}
+	if len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+		t.Fatalf("discover known title: query returned no rows")
+	}
+	title, ok := res.Rows[0][0].(string)
+	if !ok || title == "" {
+		t.Fatalf("discover known title: title cell is not a non-empty string: %#v", res.Rows[0][0])
+	}
+	return title
+}
+
 // appsAsInt tolerates a JSON number ("100") or a numeric string ("\"100\"").
 func appsAsInt(raw json.RawMessage) (int, bool) {
 	if len(raw) == 0 {
@@ -901,32 +1037,53 @@ func appsLooksLikeUUID(s string) bool {
 // Cluster access — app-worker port-forwards + pipeline-api log scraping
 // ─────────────────────────────────────────────────────────────────────────────
 
-// appsDeploymentReadyReplicas returns app-worker's ready replica count (-1 on
-// lookup failure), mirroring TestQueryBootstrap's readiness gate.
-func appsDeploymentReadyReplicas(ctx context.Context, t *testing.T) int {
+// appsWaitDeploymentReady polls app-worker's ready-replica count until it
+// reaches `want` or `timeout` elapses, returning the last observed count. It
+// returns -1 only when the Deployment cannot be found at all (kubectl lookup
+// error for the whole window) so the caller can SKIP (env not provisioned)
+// rather than FAIL; an existing-but-under-replicated Deployment returns its
+// real count (0/1/…) so the caller can fail the multi-replica requirement.
+func appsWaitDeploymentReady(ctx context.Context, t *testing.T, want int, timeout time.Duration) int {
 	t.Helper()
-	out, err := exec.CommandContext(ctx, "kubectl", "get", "deployment", "app-worker",
-		"-n", queryE2ENamespace,
-		"-o", "jsonpath={.status.readyReplicas}").Output()
-	if err != nil {
-		t.Logf("app-worker deployment lookup failed: %v", err)
-		return -1
+	deadline := time.Now().Add(timeout)
+	last := -1
+	for {
+		out, err := exec.CommandContext(ctx, "kubectl", "get", "deployment", "app-worker",
+			"-n", queryE2ENamespace,
+			"-o", "jsonpath={.status.readyReplicas}").Output()
+		if err != nil {
+			// Deployment absent (or kubectl unavailable): keep -1 so the caller
+			// skips rather than fails.
+			if time.Now().After(deadline) {
+				return last
+			}
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		n := 0
+		if s := strings.TrimSpace(string(out)); s != "" {
+			_, _ = fmt.Sscanf(s, "%d", &n)
+		}
+		last = n
+		if n >= want || time.Now().After(deadline) {
+			return last
+		}
+		time.Sleep(2 * time.Second)
 	}
-	s := strings.TrimSpace(string(out))
-	if s == "" {
-		return 0
-	}
-	var n int
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-		return 0
-	}
-	return n
+}
+
+// appsWorkerFwd is one app-worker pod reachable via its own per-pod
+// port-forward. The pod identity is carried so the v2-propagation stage can
+// assert it observed ≥2 DISTINCT replicas serving the new version.
+type appsWorkerFwd struct {
+	pod  string
+	base string
 }
 
 // appsStartWorkerForwards port-forwards every app-worker pod on its own local
-// port and returns the base URLs that became ready (/readyz==200). Each is
+// port and returns the ones that became ready (/readyz==200). Each forward is
 // killed on test cleanup.
-func appsStartWorkerForwards(ctx context.Context, t *testing.T) []string {
+func appsStartWorkerForwards(ctx context.Context, t *testing.T) []appsWorkerFwd {
 	t.Helper()
 	out, err := exec.CommandContext(ctx, "kubectl", "get", "pods",
 		"-n", queryE2ENamespace,
@@ -937,25 +1094,24 @@ func appsStartWorkerForwards(ctx context.Context, t *testing.T) []string {
 		return nil
 	}
 	pods := strings.Fields(strings.TrimSpace(string(out)))
-	var bases []string
+	var fwds []appsWorkerFwd
 	for i, pod := range pods {
-		localPort := 38090 + i
-		if base, ok := appsStartPodForward(t, pod, localPort); ok {
-			bases = append(bases, base)
+		if w, ok := appsStartPodForward(t, pod, 38090+i); ok {
+			fwds = append(fwds, w)
 		}
 	}
-	return bases
+	return fwds
 }
 
 // appsStartPodForward starts one `kubectl port-forward pod/<pod>` and waits for
-// /readyz==200 (the engine has compiled). Returns (baseURL, true) when ready.
-func appsStartPodForward(t *testing.T, pod string, localPort int) (string, bool) {
+// /readyz==200 (the engine has compiled). Returns the forward when ready.
+func appsStartPodForward(t *testing.T, pod string, localPort int) (appsWorkerFwd, bool) {
 	t.Helper()
 	cmd := exec.Command("kubectl", "port-forward", "pod/"+pod,
 		fmt.Sprintf("%d:8090", localPort), "-n", queryE2ENamespace)
 	if err := cmd.Start(); err != nil {
 		t.Logf("port-forward %s: start failed: %v", pod, err)
-		return "", false
+		return appsWorkerFwd{}, false
 	}
 	t.Cleanup(func() {
 		if cmd.Process != nil {
@@ -973,34 +1129,52 @@ func appsStartPodForward(t *testing.T, pod string, localPort int) (string, bool)
 		}
 		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
-			return base, true
+			return appsWorkerFwd{pod: pod, base: base}, true
 		}
 	}
 	t.Logf("port-forward %s (%s): /readyz never became 200", pod, base)
-	return "", false
+	return appsWorkerFwd{}, false
 }
 
-// appsGrepPipelineAPILogs aggregates recent logs from ALL pipeline-api pods and
-// reports whether any single line contains all of `needles`.
-func appsGrepPipelineAPILogs(ctx context.Context, needles ...string) (bool, string) {
+// appsPipelineAPILogLines returns recent log lines aggregated across ALL
+// pipeline-api pods.
+func appsPipelineAPILogLines(ctx context.Context) ([]string, error) {
 	out, err := exec.CommandContext(ctx, "kubectl", "logs",
 		"-l", "app.kubernetes.io/name=pipeline-api",
 		"-n", queryE2ENamespace,
 		"--tail=5000", "--prefix").CombinedOutput()
 	if err != nil {
-		return false, ""
+		return nil, err
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		all := true
-		for _, n := range needles {
-			if !strings.Contains(line, n) {
-				all = false
-				break
+	return strings.Split(string(out), "\n"), nil
+}
+
+// appsExtractField pulls one structured-log field value from a line, tolerating
+// both slog's default logfmt (key=value, value bare or "quoted") and a JSON
+// handler ("key":"value"). Returns "" when the field is absent or empty. Used
+// to assert the query_audit line carries a NON-EMPTY jti and outcome=ok rather
+// than merely mentioning the principal.
+func appsExtractField(line, key string) string {
+	if i := strings.Index(line, `"`+key+`":"`); i >= 0 {
+		rest := line[i+len(key)+4:]
+		if j := strings.IndexByte(rest, '"'); j >= 0 {
+			return rest[:j]
+		}
+		return ""
+	}
+	if i := strings.Index(line, key+"="); i >= 0 {
+		rest := line[i+len(key)+1:]
+		if len(rest) > 0 && rest[0] == '"' {
+			rest = rest[1:]
+			if j := strings.IndexByte(rest, '"'); j >= 0 {
+				return rest[:j]
 			}
+			return ""
 		}
-		if all {
-			return true, line
+		if j := strings.IndexAny(rest, " \t\n"); j >= 0 {
+			return rest[:j]
 		}
+		return rest
 	}
-	return false, ""
+	return ""
 }
