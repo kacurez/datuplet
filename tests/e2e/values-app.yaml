@@ -55,6 +55,35 @@ queryWorker:
     defaultMaxRows: 1000
     maxMaxRows: 10000
 
+# RFC 028 Task D1/D2: the base datuplet-app chart now defaults
+# appWorker.enabled=true with a GHCR image, so the e2e install WILL deploy
+# app-worker. Point it at the locally docker-built ":latest" image (built by
+# `make docker-build-app-worker`, wired into docker-build-k8s) with
+# IfNotPresent so the cluster uses the loaded image instead of pulling from
+# GHCR (mirrors the queryWorker override above). Without this block app-worker
+# ImagePullBackOffs. Two replicas (the base default) so the D2 scenario's
+# "all replicas serve v2 within ≤15 s" promote-propagation assertion is
+# meaningful; resources are trimmed for the RAM-constrained e2e cluster. The
+# app-worker Service is ClusterIP:8090 (no NodePort) — the D2 scenario reaches
+# it via per-pod `kubectl port-forward`.
+appWorker:
+  enabled: true
+  replicas: 2
+  image:
+    repository: datuplet/app-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Reduced resources for the e2e cluster (OrbStack / kind has limited RAM).
+  # The WASM instance cap is 128 MiB; 512 MiB per pod leaves room for the
+  # compiled engine + one buffered query response + the OutputDoc buffer.
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: "1"
+
 # RFC 022 Task 3.3: enable the client-side query mint endpoint
 # (POST /api/v1/query/token) for the BYO-local e2e (TestQuery_LocalMint_Enabled).
 # Production defaults this OFF (chart values.yaml); the e2e fixes it ON at deploy
