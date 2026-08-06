@@ -118,6 +118,11 @@ func TestAppWorkerChart_ProbesAndHardening(t *testing.T) {
 		"type: RuntimeDefault",
 		"preStop:",
 		"terminationGracePeriodSeconds: 30",
+		// Stricter rootfs than query-worker: app-worker runs untrusted user JS.
+		"readOnlyRootFilesystem: true",
+		// The one writable surface: a /tmp emptyDir volume + its mount.
+		"mountPath: /tmp",
+		"emptyDir: {}",
 	)
 }
 

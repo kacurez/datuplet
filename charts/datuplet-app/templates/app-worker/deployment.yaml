@@ -140,6 +140,10 @@ spec:
             - name: app-worker-secrets
               mountPath: /var/run/secrets/datuplet-app-worker
               readOnly: true
+            # Writable scratch: rootfs is read-only (securityContext below), so
+            # /tmp is the process's only writable surface.
+            - name: tmp
+              mountPath: /tmp
 
           resources:
             {{- if .Values.appWorker.resources }}
@@ -183,9 +187,18 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
             seccompProfile: { type: RuntimeDefault }
+            # Stricter than query-worker (which omits this, with a comment):
+            # app-worker executes UNTRUSTED user JS in the WASM sandbox, so its
+            # rootfs is immutable. wazero compiles engine.wasm in memory and the
+            # shell/schema assets are embedded, so the /tmp emptyDir below is the
+            # only writable surface needed (Go os.TempDir, TLS temp, etc.).
+            readOnlyRootFilesystem: true
 
       volumes:
         - name: app-worker-secrets
           secret:
             secretName: {{ include "datuplet-app.appWorkerSecret" . }}
+        # Writable /tmp for the read-only-rootfs container (see volumeMounts).
+        - name: tmp
+          emptyDir: {}
 {{- end }}
