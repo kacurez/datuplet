@@ -282,3 +282,119 @@ export async function runQuery(projectId, sql, opts = {}) {
   }
   return payload; // queryengine Result
 }
+
+// ----- User apps endpoints (RFC 028 §5.1, Part 6) -----
+//
+// Author-facing control-plane routes for user apps
+// (pkg/pipelineapi/apps/handlers.go). All go through the api() wrapper
+// above for consistent auth/401 handling and JSON (de)serialization —
+// no second fetch path. See that file's wire-shape doc comments
+// (appJSON/channelJSON/versionJSON/tokenResponse/tokenSummaryJSON/
+// renderLogJSON) for the authoritative field list; summarized per
+// function below.
+
+/**
+ * List apps in a project.
+ * Returns [{ app_id, name, created_at,
+ *            channels: { production?: {version_hash, updated_at},
+ *                        draft?: {version_hash, updated_at} } }, ...].
+ * A channel key is absent, never null, until something points at it.
+ */
+export async function listApps(projectId) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps`);
+}
+
+/**
+ * One app's detail: channels (as above) plus the full version history,
+ * newest first. Returns { app_id, name, created_at, channels,
+ * versions: [{hash, size_bytes, created_at}, ...] }. Throws (404) if
+ * the app doesn't exist.
+ */
+export async function getApp(projectId, name) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}`);
+}
+
+/**
+ * Upload a bundle version: creates the app on first call, otherwise adds
+ * a version and repoints the app's `draft` channel to it — `production`
+ * is never touched here (see promoteApp). bundleBase64 is the RAW bundle
+ * bytes, base64-encoded by the caller (pages/apps.js does this via
+ * FileReader). Returns { app_id, version_hash }. Throws 413 if the raw
+ * bundle exceeds the server's 5 MB cap, 409 on the per-project storage
+ * quota.
+ */
+export async function putApp(projectId, name, bundleBase64) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ bundle_base64: bundleBase64 }),
+  });
+}
+
+/**
+ * Delete an app: revokes its FGA viewer identity first, then removes
+ * every row (versions, channels, tokens, logs cascade). 204 on success.
+ */
+export async function deleteApp(projectId, name) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
+ * Compare-and-swap promote: repoints `production` to versionHash iff it
+ * currently points at expectedProduction (pass null/undefined for a
+ * first promote, when production isn't set yet). Returns
+ * { production_version }. Throws 409 if production moved since
+ * expectedProduction was read (re-fetch and retry), 400 for an unknown
+ * version hash.
+ */
+export async function promoteApp(projectId, name, versionHash, expectedProduction) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}/promote`, {
+    method: 'POST',
+    body: JSON.stringify({ version: versionHash, expectedProduction: expectedProduction ?? null }),
+  });
+}
+
+/**
+ * Render logs. Omit requestId for the newest-first list (optionally
+ * capped by limit); pass requestId for a single record — throws 404 if
+ * no record with that id exists (never ran, or aged out of the per-app
+ * ring buffer).
+ */
+export async function getAppLogs(projectId, name, { requestId, limit } = {}) {
+  const params = new URLSearchParams();
+  if (requestId) params.set('request_id', requestId);
+  if (limit) params.set('limit', String(limit));
+  const qs = params.toString();
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}/logs${qs ? `?${qs}` : ''}`);
+}
+
+/**
+ * Mint a viewer token. The plaintext `token` (`vw_<token_id>.<secret>`)
+ * is returned EXACTLY ONCE, here — no other route can ever surface it
+ * again. Returns { token_id, token }.
+ */
+export async function createAppToken(projectId, name) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}/tokens`, {
+    method: 'POST',
+  });
+}
+
+/**
+ * List viewer-token metadata — never a secret or salt.
+ * Returns [{ token_id, created_at, revoked_at }, ...]; revoked_at is a
+ * literal null for an active token, not an absent key.
+ */
+export async function listAppTokens(projectId, name) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}/tokens`);
+}
+
+/**
+ * Revoke a viewer token. 204 on success; 404 if unknown or it belongs to
+ * a different app.
+ */
+export async function deleteAppToken(projectId, name, tokenId) {
+  return api(`/api/v1/projects/${encodeURIComponent(projectId)}/apps/${encodeURIComponent(name)}/tokens/${encodeURIComponent(tokenId)}`, {
+    method: 'DELETE',
+  });
+}

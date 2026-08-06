@@ -18,6 +18,7 @@ import { renderStorageCatalog } from '/ui/pages/storage-catalog.js';
 import { renderStorageTable } from '/ui/pages/storage-table.js';
 import { renderQuery } from '/ui/pages/query.js';
 import { renderComponents } from '/ui/pages/components.js';
+import { renderApps } from '/ui/pages/apps.js';
 import { install as installHotkeys } from '/ui/hotkeys.js';
 import { install as installOverlay } from '/ui/overlay.js';
 import * as icons from '/ui/icons.js';
@@ -45,12 +46,33 @@ const routes = [
   { pattern: /^\/ui\/storage\/t\/([^/]+)\/([^/]+)\/?$/, render: renderStorageTable },
   { pattern: /^\/ui\/query\/?$/, render: renderQuery },
   { pattern: /^\/ui\/components\/?$/, render: renderComponents },
+  { pattern: /^\/ui\/apps\/?$/, render: renderApps },
+  // Detail page is task U1 (RFC 028 Part 6); this placeholder just keeps
+  // the route resolving to something coherent until it lands.
+  { pattern: /^\/ui\/apps\/([^/]+)\/?$/, render: renderAppDetailPlaceholder },
   { pattern: /^\/ui\/settings\/secrets\/?$/, render: renderSecrets },
 ];
 
 function redirect(to) {
   window.history.replaceState({}, '', to);
   renderRoute();
+}
+
+// Stand-in for pages/app-detail.js (RFC 028 Part 6, task U1). Kept
+// inline rather than as its own page module so U0's file list stays
+// exactly api.js + app.js + pages/apps.js — U1 adds the real module and
+// swaps this import/route out.
+async function renderAppDetailPlaceholder({ params }) {
+  const head = document.getElementById('page-head');
+  const app = document.getElementById('app');
+  const name = params[0];
+  if (head) {
+    head.innerHTML = `
+      <h1><code class="inline">${esc(name)}</code></h1>
+      <div class="actions"><a class="btn btn--secondary" href="/ui/apps">Back to catalog</a></div>
+    `;
+  }
+  app.innerHTML = `<p style="color: var(--fg-2);">App detail is coming soon.</p>`;
 }
 
 // Exposed on window so api.js can trigger a login redirect on 401
@@ -69,6 +91,7 @@ const NAV_ITEMS = [
   { href: '/ui/storage',          label: 'Storage',   icon: 'database' },
   { href: '/ui/query',            label: 'Query',      icon: 'terminal' },
   { href: '/ui/components',       label: 'Components', icon: 'database' },
+  { href: '/ui/apps',             label: 'Apps',        icon: 'database' },
   { href: '/ui/settings/secrets', label: 'Secrets',    icon: 'key'      },
 ];
 
