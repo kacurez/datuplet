@@ -18,6 +18,10 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
 COPY api/ ./api/
+# pkg/appworker/server.go //go:embed-imports the trusted viewer shell package
+# github.com/datuplet/datuplet/ui/appshell (RFC 028 V0); its source must be in
+# the build context or `go build ./cmd/app-worker` fails to resolve it.
+COPY ui/appshell/ ./ui/appshell/
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
