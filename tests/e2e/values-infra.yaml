@@ -2,6 +2,17 @@ postgres:
   cluster:
     storageSize: 1Gi  # smaller for e2e
 
+# OpenFGA runs a single replica in e2e. The chart default (3) exists for HA
+# but each replica opens a Postgres connection pool (maxOpenConns:10 here), and
+# on the RAM/connection-constrained e2e node the extra replicas add scheduling
+# + connection pressure that has intermittently kept the CNPG cluster from
+# reaching "healthy" in time (the openfga-dsn wait-for-cnpg gate then hangs the
+# whole install). One replica is functionally sufficient for the e2e FGA checks
+# and materially lightens the deploy. (RFC 028 Part 7 D-fix: e2e-only; the
+# production HA default is unchanged.)
+openfga:
+  replicaCount: 1
+
 minio:
   # Pin MinIO root creds to the static minioadmin/minioadmin pair the test
   # framework's SetupFGABootstrap defaults to (framework/bootstrap.go). The
