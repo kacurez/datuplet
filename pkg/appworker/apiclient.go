@@ -457,24 +457,33 @@ func (c *APIClient) Resolve(ctx context.Context, pid, name, channel string) (Res
 	if channel == "" {
 		channel = channelDefault
 	}
-	cacheable := channel != channelDraft
 	key := hashKey("resolve", pid, name, channel)
-	if cacheable {
-		if v, ok := c.resolveCache.get(key); ok {
-			return v, nil
-		}
-	}
-	return doSingleflight(&c.resolveSF, key, func() (Resolved, error) {
+	fetch := func() (Resolved, error) {
 		path := fmt.Sprintf("/internal/v1/apps/%s/%s/resolve?channel=%s",
 			url.PathEscape(pid), url.PathEscape(name), url.QueryEscape(channel))
 		var resp resolveResponseWire
 		if err := c.doInternal(ctx, http.MethodGet, path, nil, &resp, nil); err != nil {
 			return Resolved{}, err
 		}
-		res := Resolved{AppID: resp.AppID, VersionHash: resp.VersionHash}
-		if cacheable {
-			c.resolveCache.set(key, res, resolveCacheTTL)
+		return Resolved{AppID: resp.AppID, VersionHash: resp.VersionHash}, nil
+	}
+	// Draft is the author's live-iteration channel: it is never cached AND
+	// never singleflighted, so every draft resolve hits pipeline-api directly
+	// and reflects the latest `apps put` immediately. Sharing the singleflight
+	// group would let a request that starts AFTER an upload join an in-flight
+	// pre-upload resolve and receive the stale prior version for that window.
+	if channel == channelDraft {
+		return fetch()
+	}
+	if v, ok := c.resolveCache.get(key); ok {
+		return v, nil
+	}
+	return doSingleflight(&c.resolveSF, key, func() (Resolved, error) {
+		res, err := fetch()
+		if err != nil {
+			return Resolved{}, err
 		}
+		c.resolveCache.set(key, res, resolveCacheTTL)
 		return res, nil
 	})
 }
