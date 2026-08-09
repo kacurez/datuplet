@@ -442,15 +442,27 @@ func (c *APIClient) Close() {
 // ---------------------------------------------------------------------------
 
 // Resolve maps (project, app name, channel) to the version app-worker
-// should render (spec §5.2), cached ≤15s and keyed "pid|name|channel" (via
-// hashKey, so the raw strings never sit in the key literally).
+// should render (spec §5.2), keyed "pid|name|channel" (via hashKey, so the
+// raw strings never sit in the key literally).
+//
+// Production is cached ≤15s — its propagation SLA. The DRAFT channel is the
+// author's live-iteration surface and is NEVER cached: it must reflect the
+// latest `apps put` immediately, or an author previewing a freshly-put draft
+// keeps seeing the previous version for up to 15s (RFC 028 agent-loop
+// acceptance test: a throwing draft render must fail on attempt 1). The spec
+// §7 "≤15s" is a ceiling; 0 for draft is within it. Singleflight still dedupes
+// concurrent identical draft resolves — that collapses in-flight load without
+// serving stale results.
 func (c *APIClient) Resolve(ctx context.Context, pid, name, channel string) (Resolved, error) {
 	if channel == "" {
 		channel = channelDefault
 	}
+	cacheable := channel != channelDraft
 	key := hashKey("resolve", pid, name, channel)
-	if v, ok := c.resolveCache.get(key); ok {
-		return v, nil
+	if cacheable {
+		if v, ok := c.resolveCache.get(key); ok {
+			return v, nil
+		}
 	}
 	return doSingleflight(&c.resolveSF, key, func() (Resolved, error) {
 		path := fmt.Sprintf("/internal/v1/apps/%s/%s/resolve?channel=%s",
@@ -460,7 +472,9 @@ func (c *APIClient) Resolve(ctx context.Context, pid, name, channel string) (Res
 			return Resolved{}, err
 		}
 		res := Resolved{AppID: resp.AppID, VersionHash: resp.VersionHash}
-		c.resolveCache.set(key, res, resolveCacheTTL)
+		if cacheable {
+			c.resolveCache.set(key, res, resolveCacheTTL)
+		}
 		return res, nil
 	})
 }
