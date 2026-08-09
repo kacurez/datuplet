@@ -225,7 +225,17 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	// 2. Project gate: {pid} → FGA datuplet_member → project-qualified
 	//    warehouse. Runs before the body decode — an unauthorized caller
 	//    learns nothing about the body-validation surface.
-	warehouse, gerr := h.cfg.Gate.QualifiedWarehouse(r.Context(), sub, r.PathValue("pid"))
+	//
+	// RFC 028 P5: warehouse resolution mints a user-impersonation token from
+	// the ctx user, but an app-render request has no *store.User (this route
+	// bypasses auth.WithUser). Stash the app's own catalog credential so the
+	// resolver presents it instead of failing to mint (its viewer grant
+	// transitively allows can_list_warehouses). No-op for browser/CLI callers.
+	gateCtx := r.Context()
+	if appPrin != nil {
+		gateCtx = tokens.WithCatalogCredential(gateCtx, appPrin.rawToken)
+	}
+	warehouse, gerr := h.cfg.Gate.QualifiedWarehouse(gateCtx, sub, r.PathValue("pid"))
 	if gerr != nil {
 		rec.outcome = gerr.Kind
 		// A gate rejection is otherwise invisible (the audit line records only
