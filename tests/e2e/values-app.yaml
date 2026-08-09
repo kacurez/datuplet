@@ -4,6 +4,15 @@ fgaModel:
 platform:
   releaseName: datuplet-infra
 
+# OrbStack's kube-apiserver endpoint is <node>:26443 and OrbStack enforces
+# egress NetworkPolicy post-DNAT, so pipeline-observer (which watches
+# PipelineRun CRs) must be allowed to reach :26443 — production clusters serve
+# the API on 443/6443, which the chart default already covers. Without this the
+# observer crashloops on informer cache-sync and run status never reaches the
+# DB, so every run-based e2e scenario times out at phase=Pending.
+pipelineObserver:
+  apiServerEgressPorts: [443, 6443, 26443]
+
 image:
   # e2e loads images into the kind cluster via `kind load docker-image`;
   # Always would make K8s try to pull from Docker Hub instead of using

@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	ctrl "sigs.k8s.io/controller-runtime"
+	crzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi"
 	pipelineapidb "github.com/datuplet/datuplet/pkg/pipelineapi/db"
@@ -45,6 +47,13 @@ func run() error {
 	cacheSyncTimeout := fs.Duration("cache-sync-timeout", 2*time.Minute, "Max time to wait for initial informer cache sync")
 	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "Graceful shutdown timeout on SIGTERM")
 	_ = fs.Parse(os.Args[1:])
+
+	// Without a logger, controller-runtime silently discards every error it
+	// emits — including reflector LIST/WATCH failures and controller cache-sync
+	// errors — which makes crashloops undiagnosable (it only prints the generic
+	// "log.SetLogger(...) was never called" stack). Set one so the manager's
+	// real errors reach stderr, matching cmd/pipeline-operator.
+	ctrl.SetLogger(crzap.New(crzap.UseDevMode(true)))
 
 	cfg := pipelineapi.LoadConfig()
 	if *addr == "" {

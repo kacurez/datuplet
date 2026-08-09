@@ -158,6 +158,14 @@ pipelineObserver:
   resources:
     requests: { cpu: 50m,  memory: 128Mi }
     limits:   { cpu: 500m, memory: 512Mi }
+  # TCP ports the observer's egress NetworkPolicy permits for reaching the
+  # Kubernetes API server (it watches PipelineRun CRs). Default covers the
+  # standard in-cluster API ports. Some clusters serve the API endpoint on a
+  # non-standard port AND enforce egress NetworkPolicy post-DNAT — e.g.
+  # OrbStack's kube-apiserver endpoint is :26443 — in which case the observer
+  # can't reach the API on 443/6443 and crashloops on informer cache-sync;
+  # override this list to include the actual endpoint port there.
+  apiServerEgressPorts: [443, 6443]
 
 # ─── Query Worker (RFC 022) ───────────────────────────────────────────────────
 #

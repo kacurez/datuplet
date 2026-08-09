@@ -38,10 +38,14 @@ spec:
       ports:
         - { protocol: TCP, port: 5432 }
     # K8s API server. We can't pod-select kube-apiserver (it's not a Pod
-    # in the cluster), so allow TCP/443 to anywhere — this is the
-    # standard K8s NetworkPolicy idiom for in-cluster API access.
-    # The API server is the only thing on TCP/443 in the cluster's
-    # service CIDR by default.
+    # in the cluster), so allow the API ports to anywhere — the standard
+    # NetworkPolicy idiom for in-cluster API access. Ports are configurable
+    # (pipelineObserver.apiServerEgressPorts, default [443, 6443]) because some
+    # clusters serve the API endpoint on a non-standard port and enforce egress
+    # post-DNAT — e.g. OrbStack's endpoint is :26443, so the observer must be
+    # allowed to reach that actual port or its PipelineRun watch is rejected and
+    # it crashloops on cache-sync.
     - ports:
-        - { protocol: TCP, port: 443 }
-        - { protocol: TCP, port: 6443 }
+        {{- range .Values.pipelineObserver.apiServerEgressPorts }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
