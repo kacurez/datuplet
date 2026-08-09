@@ -228,6 +228,10 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	warehouse, gerr := h.cfg.Gate.QualifiedWarehouse(r.Context(), sub, r.PathValue("pid"))
 	if gerr != nil {
 		rec.outcome = gerr.Kind
+		// A gate rejection is otherwise invisible (the audit line records only
+		// the low-cardinality Kind, never the Msg), which makes an
+		// unavailable/forbidden on this path undiagnosable in the field.
+		logger.Warn("query gate rejected", "principal", sub, "pid", r.PathValue("pid"), "kind", gerr.Kind, "msg", gerr.Msg)
 		writeError(w, gerr.Status, gerr.Kind, gerr.Msg)
 		return
 	}
