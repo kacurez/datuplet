@@ -86,6 +86,7 @@ jobs:
             datuplet/stdout-writer:latest \
             datuplet/http-json-extractor:latest \
             datuplet/query-worker:latest \
+            datuplet/app-worker:latest \
             public.ecr.aws/nginx/nginx:1.27-alpine \
           ; do
             kind load docker-image --name datuplet-e2e "$img"
