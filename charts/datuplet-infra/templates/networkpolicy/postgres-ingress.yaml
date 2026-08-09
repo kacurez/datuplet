@@ -51,5 +51,34 @@ spec:
             matchLabels:
               app.kubernetes.io/part-of: datuplet
               app.kubernetes.io/name: pipeline-observer
+        # Lakekeeper db-migration Job (lakekeeper subchart, runs `lakekeeper
+        # migrate` at install time). Its pod carries part-of=lakekeeper (the
+        # upstream subchart default) — NOT the part-of=datuplet overlay the main
+        # catalog Deployment gets — so the name=lakekeeper,part-of=datuplet
+        # selector above misses it. Match by the stable component label instead.
+        # Without this the migration Job can't reach pg:5432, `lakekeeper migrate`
+        # never runs, and the catalog Pod loops wait_for_db on NoMigrationsTable
+        # until helm --wait times out. Latent until a NetworkPolicy-enforcing CNI.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lakekeeper
+              app.kubernetes.io/component: db-migration
       ports:
         - { protocol: TCP, port: 5432 }
+    # CloudNativePG operator -> instance-manager status endpoint (port 8000).
+    # The operator scrapes https://<instance>:8000/pg/status every few seconds to
+    # populate Cluster status. WITHOUT this rule, a NetworkPolicy-enforcing CNI
+    # (Calico/Cilium, most managed clouds, and OrbStack k8s >= 1.35) silently
+    # drops the connection and the Cluster wedges at "Instance Status Extraction
+    # Error: HTTP communication issue" (dial tcp :8000: i/o timeout), which in
+    # turn hangs the openfga-dsn wait-for-cnpg gate and the whole infra install.
+    # The postgres Pod still reports Ready because kubelet probes :8000 from the
+    # host, which NetworkPolicy does not filter. The operator ships in the
+    # datuplet-operators chart, installed into this same namespace by
+    # scripts/install.sh, so a same-namespace podSelector matches it.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+      ports:
+        - { protocol: TCP, port: 8000 }
