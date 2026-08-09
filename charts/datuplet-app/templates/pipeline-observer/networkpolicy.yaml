@@ -45,6 +45,15 @@ spec:
     # post-DNAT — e.g. OrbStack's endpoint is :26443, so the observer must be
     # allowed to reach that actual port or its PipelineRun watch is rejected and
     # it crashloops on cache-sync.
+    #
+    # Fail rendering on an empty list: a bare `- ports:` with no entries and no
+    # `to` is read by Kubernetes as "egress to ANY destination on ANY port",
+    # which would silently defeat this lockdown (fail-open). The observer always
+    # needs the API server, so an empty list is never valid — surface it at
+    # install time instead of shipping an accidental allow-all.
+    {{- if not .Values.pipelineObserver.apiServerEgressPorts }}
+    {{- fail "pipelineObserver.apiServerEgressPorts must be a non-empty list of API-server TCP ports (default [443, 6443]); an empty list renders an allow-all egress rule and defeats the pipeline-observer lockdown" }}
+    {{- end }}
     - ports:
         {{- range .Values.pipelineObserver.apiServerEgressPorts }}
         - { protocol: TCP, port: {{ . }} }
