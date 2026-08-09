@@ -712,6 +712,179 @@ func TestServer_RunnerError_LogAndBodyStripSQLEcho(t *testing.T) {
 	}
 }
 
+// ---- RFC 028 Q2: bound parameters ----
+
+// TestServer_Params_ForwardedToRunner: a well-formed `params` object passes
+// validation and reaches the engine Request verbatim, with JSON numbers
+// decoded as json.Number (UseNumber) so the §6.1 integral/non-integral
+// distinction survives the decode.
+func TestServer_Params_ForwardedToRunner(t *testing.T) {
+	priv := genTestKey(t)
+	runner := &fakeRunner{result: echoResult}
+	srv := newTestServer(t, priv, runner, testWorkerCfg())
+
+	token := mintTestToken(t, priv)
+	body := `{"sql":"SELECT $country AS c, $days AS d, $ratio AS r, $flag AS f, $nul AS n",` +
+		`"catalog_jwt":"a.b.c","warehouse":"p/w",` +
+		`"params":{"country":"DE","days":30,"ratio":1.5,"flag":true,"nul":null}}`
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/query", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	got := runner.lastReq().Params
+	if len(got) != 5 {
+		t.Fatalf("Params = %#v, want 5 entries", got)
+	}
+	if got["country"] != "DE" {
+		t.Errorf("params[country] = %v (%T), want string \"DE\"", got["country"], got["country"])
+	}
+	if n, ok := got["days"].(json.Number); !ok || n.String() != "30" {
+		t.Errorf("params[days] = %v (%T), want json.Number(\"30\") — the decoder must UseNumber()", got["days"], got["days"])
+	}
+	if n, ok := got["ratio"].(json.Number); !ok || n.String() != "1.5" {
+		t.Errorf("params[ratio] = %v (%T), want json.Number(\"1.5\")", got["ratio"], got["ratio"])
+	}
+	if got["flag"] != true {
+		t.Errorf("params[flag] = %v (%T), want true", got["flag"], got["flag"])
+	}
+	if v, ok := got["nul"]; !ok || v != nil {
+		t.Errorf("params[nul] = %v (present=%v), want an explicit nil entry", v, ok)
+	}
+}
+
+// TestServer_NoParams_Regression: a body without `params` behaves exactly as
+// before — the engine Request carries a nil Params map and nothing else
+// changes. Reuses the shape of TestServer_ValidToken_Returns200.
+func TestServer_NoParams_Regression(t *testing.T) {
+	priv := genTestKey(t)
+	runner := &fakeRunner{result: echoResult}
+	srv := newTestServer(t, priv, runner, testWorkerCfg())
+
+	token := mintTestToken(t, priv)
+	body := map[string]any{
+		"sql":         "SELECT 42",
+		"catalog_jwt": "hdr.pld.sig",
+		"warehouse":   "proj/wh",
+	}
+	resp := doPost(t, srv, body, token)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var result queryengine.Result
+	if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if len(result.Schema) != 1 || result.Schema[0].Name != "n" || len(result.Rows) != 1 {
+		t.Errorf("unexpected result: %+v", result)
+	}
+	if p := runner.lastReq().Params; p != nil {
+		t.Errorf("Params = %#v, want nil when the body carries no params field", p)
+	}
+	// Timeout/rows/bytes clamping is untouched by the params wiring.
+	req := runner.lastReq()
+	if req.Timeout != 300*time.Second || req.MaxRows != 10000 || req.MaxBytes != 10*1024*1024 {
+		t.Errorf("clamped limits drifted: %+v", req)
+	}
+}
+
+// TestServer_ParamsShapeViolations_Return400BadRequest: every ValidateParams
+// failure (missing / unreferenced / non-scalar / out-of-safe-range) is a 400
+// with kind=bad_request, and the runner is never called.
+func TestServer_ParamsShapeViolations_Return400BadRequest(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing param",
+			body: `{"sql":"SELECT $a, $b","catalog_jwt":"a.b.c","warehouse":"p/w","params":{"a":1}}`,
+		},
+		{
+			name: "unreferenced param",
+			body: `{"sql":"SELECT $a","catalog_jwt":"a.b.c","warehouse":"p/w","params":{"a":1,"typo":2}}`,
+		},
+		{
+			name: "no params supplied for a referenced placeholder",
+			body: `{"sql":"SELECT $a","catalog_jwt":"a.b.c","warehouse":"p/w"}`,
+		},
+		{
+			name: "non-scalar param (object)",
+			body: `{"sql":"SELECT $a","catalog_jwt":"a.b.c","warehouse":"p/w","params":{"a":{"k":1}}}`,
+		},
+		{
+			name: "non-scalar param (array)",
+			body: `{"sql":"SELECT $a","catalog_jwt":"a.b.c","warehouse":"p/w","params":{"a":[1,2]}}`,
+		},
+		{
+			name: "integral number beyond MAX_SAFE_INTEGER",
+			body: `{"sql":"SELECT $a","catalog_jwt":"a.b.c","warehouse":"p/w","params":{"a":9007199254740992}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			priv := genTestKey(t)
+			runner := &fakeRunner{result: echoResult}
+			srv := newTestServer(t, priv, runner, testWorkerCfg())
+			token := mintTestToken(t, priv)
+
+			req := httptest.NewRequest(http.MethodPost, "/internal/query", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+			}
+			_, kind := decodeError(t, w.Body.String())
+			if kind != "bad_request" {
+				t.Errorf("kind = %q, want bad_request", kind)
+			}
+			if runner.wasCalled() {
+				t.Error("runner must not be called when parameter validation fails")
+			}
+		})
+	}
+}
+
+// TestServer_ParamsBindError_Returns400SQLError: params that pass shape
+// validation but blow up at DuckDB bind/execute time come back from the
+// engine as a plain error — which the worker maps to 400 kind=sql_error, not
+// bad_request. (The engine-side proof that a real DuckDB bind failure IS a
+// plain error lives in TestBindParams_DuckDBBindErrorIsPlainError.)
+func TestServer_ParamsBindError_Returns400SQLError(t *testing.T) {
+	priv := genTestKey(t)
+	runner := &fakeRunner{err: errors.New(
+		"Conversion Error: Could not convert string 'not-a-number' to INT32")}
+	srv := newTestServer(t, priv, runner, testWorkerCfg())
+
+	token := mintTestToken(t, priv)
+	body := `{"sql":"SELECT $a::INT","catalog_jwt":"a.b.c","warehouse":"p/w","params":{"a":"not-a-number"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/query", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+	}
+	_, kind := decodeError(t, w.Body.String())
+	if kind != "sql_error" {
+		t.Errorf("kind = %q, want sql_error (bind failures are not shape violations)", kind)
+	}
+	if !runner.wasCalled() {
+		t.Error("runner should have been called — the params shape was valid")
+	}
+}
+
 // Test 10: timeout_s=0 in body → runner receives cfg.MaxTimeoutS (default applies).
 func TestServer_ZeroTimeoutUsesDefault(t *testing.T) {
 	priv := genTestKey(t)

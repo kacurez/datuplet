@@ -114,3 +114,14 @@ jobs:
         run: |
           make sync-component-schemas
           git diff --exit-code charts/datuplet-app/files/component-schemas charts/datuplet-app/templates/components
+
+  appshell-schema:
+    name: appshell Vega schema sync check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Appshell Vega schema sync check
+        run: |
+          make sync-appshell-schema
+          git diff --exit-code ui/appshell/vegaspec.schema.json

@@ -119,11 +119,15 @@ func (c Config) withDefaults() Config {
 
 // queryRequest is the client-facing JSON body for POST /api/v1/query. Only
 // `sql` is required; the limit fields are optional and clamped server-side.
+// Params carries optional bound parameters (RFC 028 §6.1) forwarded to the
+// query-worker verbatim; the worker is the authoritative validator
+// (queryengine.ValidateParams) — this proxy does not re-validate shape.
 type queryRequest struct {
-	SQL      string `json:"sql"`
-	TimeoutS *int   `json:"timeout_s,omitempty"`
-	MaxRows  *int   `json:"max_rows,omitempty"`
-	MaxBytes *int   `json:"max_bytes,omitempty"`
+	SQL      string         `json:"sql"`
+	TimeoutS *int           `json:"timeout_s,omitempty"`
+	MaxRows  *int           `json:"max_rows,omitempty"`
+	MaxBytes *int           `json:"max_bytes,omitempty"`
+	Params   map[string]any `json:"params,omitempty"`
 }
 
 // errorBody is the JSON error envelope returned to the client:
@@ -180,7 +184,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Steps 2–7 run under the audit deferred emit (serveWithAudit). The
 	// deferred emit fires exactly once regardless of which exit path is
 	// taken — the structural guarantee replaces per-branch discipline.
-	h.serveWithAudit(w, r, sub, time.Now())
+	// nil appPrincipal: this is the browser/CLI-facing route; the app
+	// principal path is app_query.go's appHandler.
+	h.serveWithAudit(w, r, sub, time.Now(), nil)
 }
 
 // clamp resolves an optional client-supplied limit: nil or non-positive →

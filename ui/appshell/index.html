@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><!--DTP:TITLE--></title>
+<link rel="stylesheet" href="/apps/-/shell/theme.css">
+</head>
+<body>
+<div id="dtp-root" aria-busy="true">
+<!--
+  First-paint skeleton (RFC 028 V3): shown for the brief window between this
+  HTML landing and shell.js's boot() mounting the real OutputDoc. applyDoc
+  clears #dtp-root (and its aria-busy attribute) before rendering anything, so
+  none of this markup needs any JS to go away again.
+-->
+<div class="dtp-skeleton" aria-hidden="true">
+<div class="dtp-skeleton-title"></div>
+<div class="dtp-skeleton-block"></div>
+<div class="dtp-skeleton-block"></div>
+<div class="dtp-skeleton-block dtp-skeleton-block--short"></div>
+</div>
+<p class="dtp-sr-only">Loading dashboard…</p>
+</div>
+<script id="dtp-doc" type="application/json"><!--DTP:DOC--></script>
+<!--
+  Vendored third-party libraries (ui/appshell/vendor/, versions pinned in
+  vendor/VERSIONS) are NOT eager-loaded here (RFC 028 V1 maintainer decision).
+  Each renderer lazy-imports its own heavy dependency on first use, from the
+  same-origin /apps/-/shell/vendor/ path only: blocks/chart.js dynamic-imports
+  the vega trio (vega, vega-lite, vega-embed), blocks/markdown.js
+  dynamic-imports marked + DOMPurify. A metric/table-only dashboard never pays
+  for vega, and every import stays same-origin so the CSP (script-src 'self')
+  and the same-origin invariant still hold — no CDN, ever. Only the platform
+  boot module is loaded up front.
+-->
+<script type="module" src="/apps/-/shell/shell.js"></script>
+</body>
+</html>

@@ -28,16 +28,73 @@ func WriteAdminTuple(ctx context.Context, a Authorizer, userSubject, lakekeeperP
 	if lakekeeperProjectID == "" {
 		return errors.New("WriteAdminTuple: lakekeeperProjectID is required")
 	}
+	return WriteProjectTuple(ctx, a, userSubject, "project_admin", lakekeeperProjectID)
+}
+
+// WriteProjectTuple writes ONE `<userSubject> <relation> project:<id>` tuple
+// idempotently: a duplicate-tuple error from OpenFGA is swallowed, every other
+// error propagates.
+//
+// `userSubject` is the BARE subject (a user UUID, or RFC 028's "app-<uuid>") —
+// UserObject applies the `oidc~`/`user:` composition, so callers must never
+// pre-compose it (that yields user:oidc~user:oidc~… and matches nothing).
+//
+// This is the general form of WriteAdminTuple, extracted so RFC 028's app
+// identity (relation `viewer`) shares one implementation of the
+// already-exists swallow rather than growing a second copy of that
+// string-matching heuristic.
+func WriteProjectTuple(ctx context.Context, a Authorizer, userSubject, relation, lakekeeperProjectID string) error {
+	if userSubject == "" {
+		return errors.New("WriteProjectTuple: userSubject is required")
+	}
+	if relation == "" {
+		return errors.New("WriteProjectTuple: relation is required")
+	}
+	if lakekeeperProjectID == "" {
+		return errors.New("WriteProjectTuple: lakekeeperProjectID is required")
+	}
 	tuple := Tuple{
 		User:     UserObject(userSubject).String(),
-		Relation: "project_admin",
+		Relation: relation,
 		Object:   ProjectObject(lakekeeperProjectID),
 	}
 	if err := a.WriteTuples(ctx, []Tuple{tuple}); err != nil {
 		if isAlreadyExistsErr(err) {
 			return nil
 		}
-		return fmt.Errorf("write project_admin tuple: %w", err)
+		return fmt.Errorf("write %s tuple: %w", relation, err)
+	}
+	return nil
+}
+
+// DeleteProjectTuple removes ONE `<userSubject> <relation> project:<id>`
+// tuple, tolerating a tuple that is already gone (so a retried teardown
+// succeeds). The counterpart of WriteProjectTuple, and the single-relation
+// form of DeleteProjectTuples.
+//
+// RFC 028's app identity uses this directly: an app only ever holds `viewer`,
+// so looping every relation would issue two guaranteed-miss round-trips per
+// app delete.
+func DeleteProjectTuple(ctx context.Context, a Authorizer, userSubject, relation, lakekeeperProjectID string) error {
+	if userSubject == "" {
+		return errors.New("DeleteProjectTuple: userSubject is required")
+	}
+	if relation == "" {
+		return errors.New("DeleteProjectTuple: relation is required")
+	}
+	if lakekeeperProjectID == "" {
+		return errors.New("DeleteProjectTuple: lakekeeperProjectID is required")
+	}
+	t := Tuple{
+		User:     UserObject(userSubject).String(),
+		Relation: relation,
+		Object:   ProjectObject(lakekeeperProjectID),
+	}
+	if err := a.DeleteTuples(ctx, []Tuple{t}); err != nil {
+		if isMissingTupleErr(err) {
+			return nil
+		}
+		return fmt.Errorf("delete %s tuple for user %q: %w", relation, userSubject, err)
 	}
 	return nil
 }
@@ -61,21 +118,16 @@ func DeleteProjectTuples(ctx context.Context, a Authorizer, lakekeeperProjectID 
 	if len(userSubjects) == 0 {
 		return nil
 	}
-	obj := ProjectObject(lakekeeperProjectID)
 	// Issue per-user deletes so a missing tuple on one user doesn't
 	// abort the whole batch (OpenFGA's Write transaction fails atomically
 	// on any missing-tuple error).
 	for _, sub := range userSubjects {
 		// Cover all three relations that admin grant can write: project_admin
 		// (project creator), editor, and viewer. Missing tuples are tolerated
-		// — the per-relation loop tolerates each miss individually.
-		for _, rel := range []string{"project_admin", "editor", "viewer"} {
-			t := Tuple{User: UserObject(sub).String(), Relation: rel, Object: obj}
-			if err := a.DeleteTuples(ctx, []Tuple{t}); err != nil {
-				if isMissingTupleErr(err) {
-					continue
-				}
-				return fmt.Errorf("delete %s tuple for user %q: %w", rel, sub, err)
+		// — DeleteProjectTuple tolerates each miss individually.
+		for _, rel := range []string{"project_admin", RelationEditor, RelationViewer} {
+			if err := DeleteProjectTuple(ctx, a, sub, rel, lakekeeperProjectID); err != nil {
+				return err
 			}
 		}
 	}

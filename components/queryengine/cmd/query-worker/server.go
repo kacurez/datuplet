@@ -133,6 +133,11 @@ type queryRequest struct {
 	TimeoutS   int    `json:"timeout_s"`
 	MaxRows    int    `json:"max_rows"`
 	MaxBytes   int    `json:"max_bytes"`
+	// Params binds values to the SQL's named `$name` placeholders
+	// (RFC 028 §6.1). Optional: omitting it leaves behaviour unchanged.
+	// Decoded with UseNumber(), so JSON numbers arrive as json.Number and the
+	// integral / non-integral distinction survives the decode.
+	Params map[string]any `json:"params,omitempty"`
 }
 
 // errorResponse is the JSON body for all error responses.
@@ -194,7 +199,13 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 3. Parse and validate the request body.
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req queryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	// UseNumber: params values land in an `any`, and the §6.1 bind-type table
+	// classifies a JSON number by its exact value (integral within ±2^53−1 →
+	// BIGINT, else DOUBLE, else rejected). A default float64 decode would have
+	// already rounded away the distinction before validation could see it.
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
 		// MaxBytesReader returns *http.MaxBytesError when the request body
 		// exceeds maxBodyBytes. Return 413 with kind="request_too_large" so
 		// callers can distinguish an oversized body from a malformed one.
@@ -222,6 +233,20 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound parameters (RFC 028 §6.1). Validated HERE, before the engine runs,
+	// so a shape violation (missing / unreferenced / non-scalar / outside the
+	// safe-integer range) is a 400 bad_request. Failures that only DuckDB can
+	// detect — binding a value where a value cannot go, or a value that will
+	// not convert — come back from Run as plain errors and fall through to the
+	// sql_error branch below.
+	//
+	// SECURITY: the ParamError message names parameter keys and echoes an
+	// offending numeric literal, but never the SQL and never a string value.
+	if _, err := queryengine.ValidateParams(req.SQL, req.Params); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+
 	// 4. Build queryengine.Request: clamp/apply worker config limits.
 	//    Timeout: body value (>0) clamped to MaxTimeoutS; 0 or negative → max.
 	timeoutS := req.TimeoutS
@@ -241,6 +266,7 @@ func (s *queryServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	engineReq := queryengine.Request{
 		SQL:           req.SQL,
+		Params:        req.Params,
 		CatalogJWT:    req.CatalogJWT,
 		Warehouse:     req.Warehouse,
 		LakekeeperURL: s.cfg.LakekeeperURL,

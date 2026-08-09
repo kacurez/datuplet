@@ -133,7 +133,7 @@ jobs:
           for img in \
             datuplet/pipeline-api:latest datuplet/pipeline-observer:latest \
             datuplet/pipeline-operator:latest datuplet/gateway:latest \
-            datuplet/query-worker:latest \
+            datuplet/query-worker:latest datuplet/app-worker:latest \
             "datuplet/data-generator:$CTAG" "datuplet/sql-transform:$CTAG" \
             "datuplet/stdout-writer:$CTAG" "datuplet/http-json-extractor:$CTAG" \
             "datuplet/finnhub-extractor:$CTAG" \

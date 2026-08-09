@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/apps"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
@@ -97,6 +98,17 @@ type Server struct {
 	// WithPipelinePolicy from PIPELINE_POLICY_* env in main.go; nil disables
 	// all bound checks (ValidateTyped treats a nil *Policy as "no policy").
 	policy *validate.Policy
+	// appsStore / appsIdentity back the user-apps routes (RFC 028). Wired via
+	// WithApps; when either is nil the app routes stay unregistered — same
+	// soft-degrade gate as the other With* seams.
+	appsStore    *apps.Store
+	appsIdentity apps.IdentityManager
+	// appsInternalToken is the shared service credential gating the
+	// worker-facing /internal/v1/* routes (RFC 028 §5.2). Wired via
+	// WithAppsInternal from DATUPLET_APPS_INTERNAL_TOKEN_FILE; nil leaves the
+	// whole internal block unregistered, so app-worker gets a clear 404
+	// rather than an unauthenticated surface.
+	appsInternalToken *apps.ServiceToken
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -322,6 +334,27 @@ func (s *Server) WithPipelinePolicy(p *validate.Policy) *Server {
 	return s
 }
 
+// WithApps wires the user-apps control plane (RFC 028): the Postgres-backed
+// apps store and the app-identity manager (FGA registration + impersonation
+// minting). Both are required — when either is nil the author routes under
+// /api/v1/projects/{pid}/apps stay unregistered (callers get 404).
+func (s *Server) WithApps(store *apps.Store, identity apps.IdentityManager) *Server {
+	s.appsStore = store
+	s.appsIdentity = identity
+	return s
+}
+
+// WithAppsInternal wires the app-worker-facing internal API (RFC 028 §5.2):
+// the six /internal/v1/* routes, gated on one shared service credential.
+// token is loaded from DATUPLET_APPS_INTERNAL_TOKEN_FILE
+// (apps.ServiceTokenFromEnv) — when nil, the internal routes stay
+// unregistered. Registration also requires the WithApps deps, since every
+// internal route reads the apps store.
+func (s *Server) WithAppsInternal(token *apps.ServiceToken) *Server {
+	s.appsInternalToken = token
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -387,6 +420,43 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("DELETE /api/v1/projects/{pid}/pipelines/{name}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeletePipeline)))
 	}
 
+	// User-apps author routes (RFC 028 §5.1). Same gate shape as the
+	// pipeline block above plus the two apps-specific deps; the handler set
+	// owns its own route list (apps.Handlers.Register) and runs the same
+	// project-scoped FGA relations the pipeline routes use.
+	if s.resolver != nil && s.authzr != nil && s.projects != nil && s.appsStore != nil && s.appsIdentity != nil {
+		appHandlers := &apps.Handlers{
+			Store:    s.appsStore,
+			Identity: s.appsIdentity,
+			Authz:    s.authzr,
+			Projects: appsProjectLookup{projects: s.projects},
+		}
+		appHandlers.Register(mux, func(next http.Handler) http.Handler {
+			return auth.WithUser(s.resolver, next)
+		})
+	}
+
+	// User-apps internal API (RFC 028 §5.2) — the six worker-facing routes
+	// app-worker calls. Deliberately a SIBLING block to the author routes
+	// above: different caller (the app-worker process, not a platform user),
+	// different credential (one shared service token, not a session), and a
+	// different error envelope. It registers on this same mux — there is no
+	// separate internal listener — so the service-credential gate is applied
+	// inside RegisterInternal rather than here, making an unauthenticated
+	// internal route impossible to register by accident.
+	if s.resolver != nil && s.authzr != nil && s.projects != nil &&
+		s.appsStore != nil && s.appsIdentity != nil && s.appsInternalToken != nil {
+		internalHandlers := &apps.InternalHandlers{
+			Store:    s.appsStore,
+			Identity: s.appsIdentity,
+			Authz:    s.authzr,
+			Projects: appsProjectLookup{projects: s.projects},
+			Resolver: s.resolver,
+			Token:    s.appsInternalToken,
+		}
+		internalHandlers.RegisterInternal(mux)
+	}
+
 	// Project-secrets handlers gate on s.secretsK8s in addition to the
 	// standard resolver/authzr/projects trio — mirrors the pipeline routes'
 	// gate shape above.
@@ -439,6 +509,20 @@ func (s *Server) Handler() http.Handler {
 	// Absent env → queryHandler is nil → route stays unregistered (404).
 	if s.queryHandler != nil && s.resolver != nil {
 		mux.Handle("POST /api/v1/projects/{pid}/query", auth.WithUser(s.resolver, s.queryHandler))
+	}
+
+	// App-principal query route (RFC 028 P5): app-worker presents an app's
+	// own impersonation JWT (token_kind=app) directly as its Authorization
+	// bearer credential, in place of a platform session — an app has no
+	// *store.User row for auth.WithUser to resolve. Registered whenever the
+	// query service itself is configured (the same *queryproxy.Core the
+	// browser route above wraps), independent of s.resolver: app renders
+	// never touch the session/cookie machinery. queryCore.AppHTTPHandler
+	// verifies the JWT itself (signature, kid, iss, aud, token_kind,
+	// exp/nbf) and re-runs the SAME projectgate.Gate FGA check the browser
+	// route runs, so an app can reach nothing beyond its viewer grant.
+	if s.queryCore != nil {
+		mux.Handle("POST /internal/v1/projects/{pid}/query", s.queryCore.AppHTTPHandler())
 	}
 
 	// Local query-JWT mint route (RFC 022 §5.3). Registered whenever the

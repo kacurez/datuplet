@@ -9,6 +9,9 @@ Secrets generated:
   - <release>-pg-openfga-pw:      32 hex bytes
   - <release>-pg-pipeline-api-pw: 32 hex bytes
   - <release>-openfga-api-key:    32 hex bytes
+  - datuplet-app-worker:          service-token + cookie-hmac-key, 32 hex
+                                   bytes each (RFC 028 Part 7 — shared by
+                                   app-worker + pipeline-api)
   - <release>-pg-init-sql:        01-init.sql rendered with the 3 pg passwords
                                    for CNPG postInitSQLRefs
 
@@ -123,6 +126,30 @@ spec:
 
               # 5. OpenFGA preshared API key.
               create_secret "${PREFIX}openfga-api-key"    "keys" "$OPENFGA_API_KEY"
+
+              # 5b. app-worker shared Secret (RFC 028 Part 7). Two independent
+              # 32-hex-byte keys in ONE Secret (create_secret is single-key, so
+              # use the inline multi-key form, like signing-key above):
+              #   service-token   — internal-API credential presented by
+              #     app-worker on pipeline-api's /internal/v1/*. The SAME value
+              #     is mounted into BOTH app-worker
+              #     (DATUPLET_APPWORKER_SERVICE_TOKEN_FILE) and pipeline-api
+              #     (DATUPLET_APPS_INTERNAL_TOKEN_FILE) — one shared secret.
+              #   cookie-hmac-key — signs viewer session cookies; app-worker only.
+              # Named datuplet-app-worker (matches datuplet-app.appWorkerSecret);
+              # consumed cross-chart by bare name (empty prefix convention).
+              if ! kubectl get secret -n "$NS" "${PREFIX}datuplet-app-worker" >/dev/null 2>&1; then
+                APPWORKER_SERVICE_TOKEN=$(gen_hex)
+                APPWORKER_COOKIE_KEY=$(gen_hex)
+                kubectl create secret generic "${PREFIX}datuplet-app-worker" -n "$NS" \
+                  --from-literal=service-token="$APPWORKER_SERVICE_TOKEN" \
+                  --from-literal=cookie-hmac-key="$APPWORKER_COOKIE_KEY"
+                kubectl annotate secret "${PREFIX}datuplet-app-worker" -n "$NS" \
+                  helm.sh/resource-policy=keep --overwrite
+                echo "Created Secret ${PREFIX}datuplet-app-worker (2 keys)."
+              else
+                echo "Secret ${PREFIX}datuplet-app-worker already exists — skipping."
+              fi
 
               # 6. Compose CNPG postInitSQLRefs target — roles + databases +
               # grants split into 5 separate keys. Each key is referenced

@@ -18,6 +18,8 @@ import { renderStorageCatalog } from '/ui/pages/storage-catalog.js';
 import { renderStorageTable } from '/ui/pages/storage-table.js';
 import { renderQuery } from '/ui/pages/query.js';
 import { renderComponents } from '/ui/pages/components.js';
+import { renderApps } from '/ui/pages/apps.js';
+import { renderAppDetail } from '/ui/pages/app-detail.js';
 import { install as installHotkeys } from '/ui/hotkeys.js';
 import { install as installOverlay } from '/ui/overlay.js';
 import * as icons from '/ui/icons.js';
@@ -45,6 +47,8 @@ const routes = [
   { pattern: /^\/ui\/storage\/t\/([^/]+)\/([^/]+)\/?$/, render: renderStorageTable },
   { pattern: /^\/ui\/query\/?$/, render: renderQuery },
   { pattern: /^\/ui\/components\/?$/, render: renderComponents },
+  { pattern: /^\/ui\/apps\/?$/, render: renderApps },
+  { pattern: /^\/ui\/apps\/([^/]+)\/?$/, render: renderAppDetail },
   { pattern: /^\/ui\/settings\/secrets\/?$/, render: renderSecrets },
 ];
 
@@ -69,6 +73,7 @@ const NAV_ITEMS = [
   { href: '/ui/storage',          label: 'Storage',   icon: 'database' },
   { href: '/ui/query',            label: 'Query',      icon: 'terminal' },
   { href: '/ui/components',       label: 'Components', icon: 'database' },
+  { href: '/ui/apps',             label: 'Apps',        icon: 'database' },
   { href: '/ui/settings/secrets', label: 'Secrets',    icon: 'key'      },
 ];
 

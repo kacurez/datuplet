@@ -5,8 +5,9 @@ export DOCKER_BUILDKIT=1
 	build build-pipeline-api build-gateway \
 	build-components build-components-e2e build-components-local build-component-data-generator build-operators \
 	build-component-sql-transform build-component-datuplet-query \
+	engine-wasm \
 	extractor-local \
-	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-k8s \
+	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-app-worker docker-build-k8s \
 	clean clean-go-git-cache \
 	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
 	deploy-local deploy-local-helm undeploy-local k8s-smoke \
@@ -15,7 +16,7 @@ export DOCKER_BUILDKIT=1
 	k8s-rebuild-retry-simple k8s-rebuild-all \
 	port-forward-minio-k8s kill-port-forward-minio-k8s \
 	prune-images prune-docker-cache \
-	sync-component-schemas \
+	sync-component-schemas sync-appshell-schema \
 	lint chart-render-check tidy all help
 
 # =============================================================================
@@ -37,6 +38,12 @@ build-pipeline-api: ## Build pipeline-api binary
 
 build-operators: ## Build pipeline-operator binary
 	go build -o bin/pipeline-operator ./cmd/pipeline-operator
+
+# RFC 028 Part 0: builds the committed quickjs-ng-in-WASI engine artifact
+# (pinned versions + build recipe: utils/docker/engine-wasm.Dockerfile). CI
+# does not rebuild this — see contract-and-constraints.md "Engine ABI".
+engine-wasm: ## Build pkg/appengine/embed/engine.wasm (Docker, wasi-sdk)
+	docker build -f utils/docker/engine-wasm.Dockerfile -o pkg/appengine/embed .
 
 # Build the data gateway sidecar image
 build-gateway: ## Build gateway Docker image
@@ -133,10 +140,14 @@ docker-build-pipeline-api: ## Build pipeline-api Docker image
 docker-build-pipeline-observer: ## Build pipeline-observer Docker image (RFC 015)
 	DOCKER_BUILDKIT=1 docker build -f utils/docker/Dockerfile.pipeline-observer -t datuplet/pipeline-observer:latest .
 
+docker-build-app-worker: ## Build app-worker Docker image (RFC 028 Part 3)
+	DOCKER_BUILDKIT=1 docker build -f utils/docker/app-worker.Dockerfile -t datuplet/app-worker:latest .
+
 # Build all K8s images (operators + services). RFC 025 Task 3.3: query-worker
 # is included here now that queryWorker.enabled defaults to true in the chart
-# — a stock deploy-local must have the image available.
-docker-build-k8s: docker-build-operators build-gateway docker-build-pipeline-api docker-build-pipeline-observer ## Build all K8s images (operators + gateway + pipeline-api + pipeline-observer + query-worker)
+# — a stock deploy-local must have the image available. RFC 028 D1: app-worker
+# is included for the same reason (appWorker.enabled defaults to true).
+docker-build-k8s: docker-build-operators build-gateway docker-build-pipeline-api docker-build-pipeline-observer docker-build-app-worker ## Build all K8s images (operators + gateway + pipeline-api + pipeline-observer + app-worker + query-worker)
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
 # =============================================================================
@@ -377,6 +388,16 @@ sync-component-schemas: ## Copy components/*/schema.json into the app chart
 		name=$$(basename $$(dirname $$f)); \
 		cp "$$f" "charts/datuplet-app/files/component-schemas/$$name.json"; \
 	done
+
+# RFC 028 spec §6.4 / V0 "Shared Vega schema": pkg/appengine/vegaspec/schema.json
+# (the restricted Vega-Lite subset, W2) is the source of truth; the browser
+# shell vendors a byte-identical copy for client-side defense-in-depth
+# validation (the server remains the authoritative gate). CI runs this target
+# then `git diff --exit-code ui/appshell/vegaspec.schema.json` to catch drift;
+# TestVegaSchemaInSyncWithShell (pkg/appengine/vegaspec) is the same check
+# inside `go test ./...`.
+sync-appshell-schema: ## Copy pkg/appengine/vegaspec/schema.json into ui/appshell/
+	@cp pkg/appengine/vegaspec/schema.json ui/appshell/vegaspec.schema.json
 
 # Static analysis and dead code detection. RFC 019 §4.10 bearer-redaction
 # is enforced via Stringer methods on the owned types (S3Creds, GCSCreds,

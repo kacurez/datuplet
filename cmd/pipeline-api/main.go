@@ -263,7 +263,18 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 			// in ctx. Lakekeeper validates it, checks FGA grants, returns table
 			// metadata + vended STS creds. Per-request; never cached across
 			// requests (STS creds have their own TTL).
+			//
+			// RFC 028 P5: an app-render request has no *store.User to impersonate
+			// (the app-query route bypasses auth.WithUser), but it carries its own
+			// app-token — itself an aud=datuplet-catalog credential with the app's
+			// FGA identity — which the app-query path stashes via
+			// tokens.WithCatalogCredential. Prefer that when present so warehouse
+			// resolution works for apps; every other path leaves it unset and
+			// falls back to the user-impersonation mint (unchanged behaviour).
 			impersonationMinter := func(ctx context.Context) (tokens.ImpersonationToken, error) {
+				if tok := tokens.CatalogCredentialFromCtx(ctx); tok != "" {
+					return tokens.ImpersonationToken(tok), nil
+				}
 				return tokens.MintImpersonation(ctx, signer)
 			}
 			// Pgx-backed resolver: maps Datuplet project UUID → lakekeeper Project UUID.
@@ -489,11 +500,21 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		} else {
 			chainedResolver = cookieResolver
 		}
+		projectReader := apihttp.NewPgxProjectReader(pool, authzr)
 		srv = srv.
 			WithUserResolver(chainedResolver).
-			WithProjectReader(apihttp.NewPgxProjectReader(pool, authzr)).
+			WithProjectReader(projectReader).
 			WithPipelineStore(apihttp.NewPgxPipelineStore(pool)).
 			WithRunReader(apihttp.NewPgxRunReader(pool))
+
+		// User apps (RFC 028): the author routes AND the app-worker-facing
+		// internal API. Both blocks stay unregistered without this call, so
+		// omitting it 404s every app route in a real deployment.
+		var err error
+		srv, err = wireUserApps(srv, pool, authzr, signer, projectReader)
+		if err != nil {
+			return err
+		}
 	}
 	if cfg.UIDir != "" {
 		fmt.Printf("  UI: %s\n", cfg.UIDir)

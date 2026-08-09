@@ -65,12 +65,12 @@ var queryRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // statement_hash is the first 16 hex chars of SHA-256(sql); jti is extracted
 // from the minted catalog token's payload (cross-system correlation ID only).
 type auditRecord struct {
-	principal     string  // authenticated subject UUID
-	jti           string  // jti from the catalog token payload; "" if not minted
-	statementHash string  // sha256[:16] hex of the raw SQL; "" for empty SQL
-	durationMS    int64   // wall time of the full handler in milliseconds
-	outcome       string  // ok / bad_request / rate_limited / timeout / result_too_large / capacity / sql_error / internal
-	truncated     bool    // true only when the worker 200 body has {"truncated":true}
+	principal     string // authenticated subject UUID
+	jti           string // jti from the catalog token payload; "" if not minted
+	statementHash string // sha256[:16] hex of the raw SQL; "" for empty SQL
+	durationMS    int64  // wall time of the full handler in milliseconds
+	outcome       string // ok / bad_request / rate_limited / timeout / result_too_large / capacity / sql_error / internal
+	truncated     bool   // true only when the worker 200 body has {"truncated":true}
 }
 
 // emitAudit logs the record as a single slog.Info "query_audit" line and
@@ -190,11 +190,21 @@ func HandlerWithAudit(cfg Config, signer *tokens.Signer, counter *prometheus.Cou
 // from the handler's ServeHTTP after authentication so the principal is
 // guaranteed to be known. The mutable rec is updated by the various handler
 // branches before the deferred emit fires.
-func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub string, start time.Time) {
+//
+// appPrin is non-nil only for app-render calls (RFC 028 P5, app_query.go's
+// appHandler). When set, rec.jti is seeded from the app token's own jti up
+// front (executeRaw does not mint a fresh catalog token for that path, so
+// there is nothing else to extract it from), and it is threaded to
+// executeRaw so the app's presented JWT is forwarded as the catalog
+// credential instead of a freshly-minted one.
+func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub string, start time.Time, appPrin *appPrincipal) {
 	// outcome defaults to "internal" so an unexpected exit (e.g. a panic
 	// unwinding through the deferred emit) never mints an empty-string
 	// Prometheus label.
 	rec := &auditRecord{principal: sub, outcome: "internal"}
+	if appPrin != nil {
+		rec.jti = appPrin.jti
+	}
 	// Snapshot the active logger at request entry rather than re-reading
 	// slog.Default() inside the deferred emit. The emit can fire after the
 	// request goroutine has handed back (and, in tests that swap the global
@@ -215,17 +225,40 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	// 2. Project gate: {pid} → FGA datuplet_member → project-qualified
 	//    warehouse. Runs before the body decode — an unauthorized caller
 	//    learns nothing about the body-validation surface.
-	warehouse, gerr := h.cfg.Gate.QualifiedWarehouse(r.Context(), sub, r.PathValue("pid"))
+	//
+	// RFC 028 P5: warehouse resolution mints a user-impersonation token from
+	// the ctx user, but an app-render request has no *store.User (this route
+	// bypasses auth.WithUser). Stash the app's own catalog credential so the
+	// resolver presents it instead of failing to mint (its viewer grant
+	// transitively allows can_list_warehouses). No-op for browser/CLI callers.
+	gateCtx := r.Context()
+	if appPrin != nil {
+		gateCtx = tokens.WithCatalogCredential(gateCtx, appPrin.rawToken)
+	}
+	warehouse, gerr := h.cfg.Gate.QualifiedWarehouse(gateCtx, sub, r.PathValue("pid"))
 	if gerr != nil {
 		rec.outcome = gerr.Kind
+		// A gate rejection is otherwise invisible (the audit line records only
+		// the low-cardinality Kind, never the Msg), which makes an
+		// unavailable/forbidden on this path undiagnosable in the field.
+		logger.Warn("query gate rejected", "principal", sub, "pid", r.PathValue("pid"), "kind", gerr.Kind, "msg", gerr.Msg)
 		writeError(w, gerr.Status, gerr.Kind, gerr.Msg)
 		return
 	}
 
 	// 3. Decode + validate the body (≤64 KiB SQL-text cap).
+	//
+	// UseNumber() is required here, independently of the query-worker's own
+	// UseNumber() call (components/queryengine/cmd/query-worker/server.go):
+	// this is a SEPARATE json.Decoder over this handler's own copy of the
+	// body. Without it, integral params (e.g. large IDs) decode into
+	// req.Params as float64 and lose precision before they are even
+	// re-marshalled into the workerRequest sent downstream.
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req queryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
 		rec.outcome = "bad_request"
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
@@ -258,7 +291,7 @@ func (h *handler) serveWithAudit(w http.ResponseWriter, r *http.Request, sub str
 	// consumer (Task 3.1) can drive the same path without an HTTP
 	// request/response pair.
 	lim := queryLimits{timeoutS: timeoutS, maxRows: maxRows, maxBytes: maxBytes}
-	raw, qerr := h.executeRaw(r.Context(), sub, warehouse, req.SQL, lim, rec)
+	raw, qerr := h.executeRaw(r.Context(), sub, warehouse, req.SQL, req.Params, lim, rec, appPrin)
 	if qerr != nil {
 		rec.outcome = qerr.Kind
 		if qerr.Kind == "capacity" {
@@ -334,4 +367,3 @@ func (h *handler) translateRaw(sub string, resp workerResponse, rec *auditRecord
 		return nil, &QueryError{http.StatusBadGateway, "internal", "query service unavailable"}
 	}
 }
-

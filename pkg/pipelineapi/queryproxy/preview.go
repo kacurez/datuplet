@@ -49,8 +49,8 @@ func (c *Core) Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table s
 	}
 	defer c.h.previewGate.Release(sub)
 
-	raw, qerr := c.h.executeRaw(ctx, sub, qualifiedWarehouse, sql,
-		queryLimits{timeoutS: lim.TimeoutS, maxRows: lim.MaxRows, maxBytes: lim.MaxBytes}, rec)
+	raw, qerr := c.h.executeRaw(ctx, sub, qualifiedWarehouse, sql, nil,
+		queryLimits{timeoutS: lim.TimeoutS, maxRows: lim.MaxRows, maxBytes: lim.MaxBytes}, rec, nil)
 	if qerr != nil {
 		rec.outcome = qerr.Kind
 		return nil, qerr

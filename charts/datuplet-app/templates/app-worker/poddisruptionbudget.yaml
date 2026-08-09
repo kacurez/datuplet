@@ -1,0 +1,31 @@
+{{- /*
+app-worker PodDisruptionBudget (RFC 028 Part 3 / Task D1; spec §7 rollout
+requirements).
+
+Keeps at least one app-worker replica serving through a voluntary disruption
+(node drain, cluster upgrade), so the viewer-facing render surface never goes
+fully dark on maintenance. Paired with the Deployment's preStop drain +
+termination grace, a rolling restart is a non-event (app-worker is stateless;
+spec §7). minAvailable: 1 is the spec-fixed floor.
+
+This is the FIRST PodDisruptionBudget in any datuplet chart (D0 §C3) — there is
+no pre-existing convention to mirror beyond the spec's literal minAvailable: 1.
+
+Gated on appWorker.enabled — renders nothing when false.
+*/ -}}
+{{- if .Values.appWorker.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}app-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: app-worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "datuplet-app.selectorLabels" (dict "ctx" . "name" "app-worker") | nindent 6 }}
+{{- end }}

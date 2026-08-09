@@ -80,7 +80,8 @@ session cookie.
 
 ```json
 {
-  "sql": "SELECT * FROM my_namespace.my_table LIMIT 10",
+  "sql": "SELECT * FROM my_namespace.my_table WHERE country = $country AND order_date >= current_date - $days",
+  "params": {"country": "DE", "days": 30},
   "timeout_s": 60,
   "max_rows": 1000,
   "max_bytes": 1048576
@@ -90,12 +91,38 @@ session cookie.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `sql` | string | yes | SQL statement to execute |
+| `params` | object | no | Bound parameters (RFC 028 §6.1). Optional; existing callers are unaffected |
 | `timeout_s` | int | no | Query timeout in seconds; clamped to `[1, 300]`; default 60 |
 | `max_rows` | int | no | Row limit; clamped to `[1, 10 000]`; default 1 000 |
 | `max_bytes` | int | no | Result byte limit; clamped to `[1, 10 485 760]` (10 MiB); default 1 MiB |
 
-All three optional fields are clamped server-side to the operator-configured
+All three limit fields are clamped server-side to the operator-configured
 ceilings. A value above the ceiling is silently reduced, never rejected.
+
+**Bound parameters (`params`).** Named `$param` placeholders in `sql` are
+executed as a DuckDB prepared statement — values in `params` are **never
+parsed as SQL**.
+
+- **Placeholder grammar:** `$[A-Za-z_][A-Za-z0-9_]{0,63}`, case-sensitive. A
+  placeholder may repeat (same bound value). Every placeholder must have a
+  matching key in `params`, and every `params` key must be referenced by at
+  least one placeholder — unreferenced keys are rejected (typo defence).
+  Positional (`?`) placeholders are not supported.
+- Param values are JSON scalars only (string, number, boolean, null) in v1;
+  arrays/structs are out. **Bind-type mapping:**
+
+  | JSON value | DuckDB bind |
+  |---|---|
+  | string | `VARCHAR` (dates/timestamps arrive as ISO strings; cast in SQL, e.g. `CAST($d AS DATE)`) |
+  | number, integral, `\|n\| ≤ 2^53−1` | `BIGINT` |
+  | number, non-integral | `DOUBLE` |
+  | number, integral, `\|n\| > 2^53−1` | rejected — 400 `bad_request` (**single precision rule**: values outside the JavaScript safe-integer range, `\|n\| > Number.MAX_SAFE_INTEGER`, are never silently bound; pass big integers/decimals as strings + explicit `CAST`, e.g. `CAST($id AS BIGINT)`) |
+  | boolean | `BOOLEAN` |
+  | null | untyped SQL `NULL`; where DuckDB cannot infer the type, the SQL must cast explicitly |
+
+- Missing/unknown/unreferenced/mistyped params → 400 `bad_request`; bind
+  failures at prepare/execute time surface as 400 `sql_error`.
+- Backward compatible: `params` is optional; existing callers unchanged.
 
 **Success response (200):**
 
@@ -128,8 +155,8 @@ All error responses share the shape:
 
 | HTTP status | `kind` | Meaning |
 |---|---|---|
-| 400 | `sql_error` | Bad SQL syntax, unresolved table, or FGA/lakekeeper authz denial (lakekeeper rejects the ATTACH and DuckDB surfaces it as a SQL error — authz denial appears as 400 `sql_error`, not 403) |
-| 400 | `bad_request` | Malformed request body or empty `sql` field |
+| 400 | `sql_error` | Bad SQL syntax, unresolved table, FGA/lakekeeper authz denial (lakekeeper rejects the ATTACH and DuckDB surfaces it as a SQL error — authz denial appears as 400 `sql_error`, not 403), or a `params` bind/prepare failure (e.g. a value that fails to convert to the placeholder's inferred type) |
+| 400 | `bad_request` | Malformed request body, empty `sql` field, or a `params` shape violation (missing, unknown, unreferenced, or mistyped parameter — see "Bound parameters" above) |
 | 400 | `result_too_large` | Result exceeded the byte cap before truncation was possible |
 | 408 | `timeout` | Query exceeded the clamped `timeout_s` |
 | 429 | `rate_limited` | Caller has reached the per-principal in-flight cap (default 2 concurrent queries); `Retry-After: 2` is set |

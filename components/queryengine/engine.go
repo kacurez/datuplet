@@ -118,6 +118,16 @@ func Run(ctx context.Context, r Request) (*Result, error) {
 func (e *engine) runUserSQL(ctx context.Context, r Request) (*Result, error) {
 	start := time.Now()
 
+	// Bound parameters (RFC 028 §6.1). Converted BEFORE the watchdog is armed
+	// because this is pure, non-blocking value mapping; the args are handed to
+	// the same single QueryContext call below, never to a separate
+	// PrepareContext (see the note at that call site). Nil/empty params yield
+	// nil args, so the call is argument-free exactly as it was pre-params.
+	args, err := bindArgs(r.Params)
+	if err != nil {
+		return nil, err
+	}
+
 	// Arm the watchdog only when there is a deadline to arm it against.
 	var disarm func()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -145,7 +155,15 @@ func (e *engine) runUserSQL(ctx context.Context, r Request) (*Result, error) {
 	// USER SQL VIA QueryContext ONLY (see Run doc): the whole multi-statement
 	// prepare+execute runs inside duckdb-go's ctx-interrupt scope, so a deadline
 	// interrupts every statement, not just the last.
-	rows, err := e.conn.QueryContext(ctx, r.SQL)
+	//
+	// BOUND PARAMS RIDE THIS SAME CALL. go-duckdb accepts sql.NamedArg values
+	// directly on conn.QueryContext (Q0 probe), so binding does NOT need a
+	// separate PrepareContext — which would be a correctness regression, not a
+	// style choice: duckdb-go's standalone prepare runs outside the
+	// ctx-interrupt scope, so a slow query with params would escape the
+	// deadline and only be stopped by the watchdog's force-close. args is nil
+	// when there are no params, making this identical to the pre-params call.
+	rows, err := e.conn.QueryContext(ctx, r.SQL, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -18,8 +18,18 @@ type Request struct {
 	// There is no separate ProjectID field by design — the caller assembles
 	// the qualified string and attachCatalog treats it as an opaque value
 	// (the repo's opaque-storage-string principle).
-	Warehouse   string
-	CatalogJWT  string
+	Warehouse  string
+	CatalogJWT string
+	// Params carries the bound values for the SQL's named `$name` placeholders
+	// (RFC 028 §6.1). Values are JSON scalars: string, bool, nil, or a number as
+	// json.Number / int / int32 / int64 / float64. They are bound as prepared-
+	// statement parameters and are NEVER parsed as SQL.
+	//
+	// The engine does NOT validate the map's shape — frontends MUST call
+	// ValidateParams first so that missing/unreferenced/mistyped params surface
+	// as a 400 bad_request rather than as a DuckDB error. A nil or empty map
+	// leaves the execution path byte-identical to the pre-params behaviour.
+	Params      map[string]any
 	Timeout     time.Duration
 	MaxRows     int
 	MaxBytes    int

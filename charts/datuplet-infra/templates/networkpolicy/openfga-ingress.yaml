@@ -42,6 +42,29 @@ spec:
             matchLabels:
               app.kubernetes.io/part-of: datuplet
               app.kubernetes.io/name: authz-bootstrap
+        # Lakekeeper wait-for-fga-pin pre-install hook (Layer 4 bootstrap): polls
+        # openfga:8080 for the model-version pin authz-bootstrap wrote. Without
+        # this rule the hook can't reach openfga, loops 60x (its curl errors are
+        # swallowed, so it prints a misleading "Waiting for FGA model pin"),
+        # helm's pre-install --wait then times out and the datuplet-lakekeeper
+        # install fails. Latent until a NetworkPolicy-enforcing CNI (Calico/
+        # Cilium, most managed clouds, OrbStack k8s >= 1.35) actually enforces it.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: datuplet
+              app.kubernetes.io/name: wait-for-fga-pin
+        # Lakekeeper db-migration Job also runs an OpenFGA authorizer migration
+        # ("Migrating authorizer..." -> lists/creates stores in the datuplet FGA
+        # store) right after the Postgres migration. Its pod carries
+        # part-of=lakekeeper (upstream subchart default), NOT the datuplet overlay
+        # — same mismatch as the postgres-ingress db-migration rule — so match by
+        # the stable component label. Without this the OpenFGA step fails with
+        # "tcp connect error", the Job CrashLoops to backoffLimit, and the
+        # lakekeeper install --wait times out. Latent until a NP-enforcing CNI.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lakekeeper
+              app.kubernetes.io/component: db-migration
       ports:
         - { protocol: TCP, port: 8080 }
         - { protocol: TCP, port: 8081 }
