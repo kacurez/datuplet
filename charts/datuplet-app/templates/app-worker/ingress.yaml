@@ -1,0 +1,52 @@
+{{- /*
+Optional app-worker Ingress (RFC 028): routes the /apps viewer/render surface
+to the app-worker Service (ClusterIP :8090). DISABLED by default — routing
+/apps → app-worker is BYO/operator otherwise, exactly like /api and /ui.
+
+Single-path by design: it owns only `/apps` (app-worker-only; pipeline-api's
+app routes live under /api + /ui), so it composes with a separate pipeline-api
+Ingress on the same host — ingress controllers merge per-host rules across
+Ingress objects.
+
+Gated on appWorker.enabled AND appWorker.ingress.enabled; fails fast when
+enabled without a host (an Ingress rule with no host would match every host).
+*/ -}}
+{{- if and .Values.appWorker.enabled .Values.appWorker.ingress.enabled }}
+{{- if not .Values.appWorker.ingress.host }}
+{{- fail "appWorker.ingress.enabled=true requires appWorker.ingress.host to be set" }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "datuplet-app.prefix" . }}app-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datuplet-app.labels" . | nindent 4 }}
+    app.kubernetes.io/name: app-worker
+  {{- with .Values.appWorker.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.appWorker.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.appWorker.ingress.tls.secretName }}
+  tls:
+    - hosts:
+        - {{ .Values.appWorker.ingress.host | quote }}
+      secretName: {{ .Values.appWorker.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.appWorker.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.appWorker.ingress.path }}
+            pathType: {{ .Values.appWorker.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "datuplet-app.prefix" . }}app-worker
+                port:
+                  number: 8090
+{{- end }}
