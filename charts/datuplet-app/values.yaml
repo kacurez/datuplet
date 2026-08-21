@@ -267,9 +267,10 @@ queryWorker:
 # queryWorker fails template rendering (see the guard in
 # templates/app-worker/deployment.yaml; spec §8).
 #
-# REDACTION (spec §5.3): there is NO chart-shipped ingress and NO ingress-level
-# redaction knob to configure — routing /apps → app-worker is BYO/operator,
-# exactly like /api and /ui today. Query-string / Referer redaction is entirely
+# REDACTION (spec §5.3): routing /apps → app-worker is BYO/operator by default,
+# exactly like /api and /ui. An optional chart-shipped Ingress (appWorker.ingress
+# below, DISABLED by default) can own the /apps route instead; it exposes no
+# ingress-level redaction knob. Query-string / Referer redaction is entirely
 # app-worker's OWN, already-shipped control: it sets `Referrer-Policy:
 # no-referrer` on every /apps/* response (including the 302 token exchange) and
 # its structured access log records fields only — never request URLs or the
@@ -282,6 +283,36 @@ appWorker:
   # BOTH app-worker and pipeline-api; and registers pipeline-api's
   # /internal/v1/* routes. false → none of those render.
   enabled: true
+
+  # ingress: optional chart-shipped Ingress routing the /apps viewer/render
+  # surface to the app-worker Service. DISABLED BY DEFAULT — routing /apps is
+  # otherwise BYO/operator (same posture as /api and /ui). Enable it to have the
+  # chart own the /apps route instead of hand-maintaining it in your own Ingress.
+  # It emits a single-path Ingress (path /apps → app-worker:8090) that composes
+  # with a separate pipeline-api Ingress on the same host: ingress controllers
+  # merge per-host rules across Ingress objects, and /apps never shadows
+  # pipeline-api (whose app routes live under /api and /ui). Requires queryWorker
+  # + appWorker enabled like the rest of the app-worker stack.
+  ingress:
+    # enabled: true → render the Ingress. Requires `host` to be set.
+    enabled: false
+    # className: spec.ingressClassName (e.g. "haproxy", "nginx"). Empty ("")
+    # leaves it unset so the cluster's default IngressClass applies.
+    className: ""
+    # host: the DNS name /apps is served on. REQUIRED when enabled (template
+    # fails fast otherwise).
+    host: ""
+    # path / pathType: the viewer/render prefix. /apps is app-worker-only; the
+    # defaults suit every controller.
+    path: /apps
+    pathType: Prefix
+    # annotations: controller-specific knobs (cert-manager issuer, ssl-redirect,
+    # …). Same keys you would set on a BYO Ingress.
+    annotations: {}
+    # tls: when secretName is non-empty, emit a spec.tls entry for [host]. Pair
+    # with a cert-manager annotation above, or pre-create the Secret yourself.
+    tls:
+      secretName: ""
 
   # replicas: number of app-worker Deployment replicas. app-worker is stateless
   # — no server-side sessions, viewer cookies are self-contained (signature +
