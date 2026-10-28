@@ -64,29 +64,123 @@ func TestLoadRemoteArgs_LoadsTokenAndCluster(t *testing.T) {
 	}
 }
 
-// TestLoadRemoteArgs_ExpiredToken checks that a past expires_at returns an
-// error that mentions `datuplet login --remote`.
-func TestLoadRemoteArgs_ExpiredToken(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
+// TestLoadRemoteArgs_UnusableCredentialsErrors covers the credential-state
+// failures that must send the user to `datuplet login --remote`: an expired
+// token (and, as a security invariant, the raw JWT is never leaked into the
+// error), a malformed expires_at (fail-closed rather than silently skipping
+// the expiry check), and a missing token file / cluster.json.
+func TestLoadRemoteArgs_UnusableCredentialsErrors(t *testing.T) {
 	past := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339)
-	meta := clusterMeta{
-		LakekeeperURL: "http://lk:8181/catalog",
-		WarehouseName: "datuplet",
-		ExpiresAt:     past,
+	// writeAll writes token + a cluster.json with the given expires_at.
+	writeAll := func(expiresAt string) func(t *testing.T, home string) {
+		return func(t *testing.T, home string) {
+			writeDatupletFiles(t, home, fakeJWT, clusterMeta{
+				LakekeeperURL:  "http://lk:8181/catalog",
+				WarehouseName:  "datuplet",
+				ExpiresAt:      expiresAt,
+				PipelineAPIURL: "http://api",
+				Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+			})
+		}
 	}
-	writeDatupletFiles(t, tmp, fakeJWT, meta)
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, home string)
+		want  []string
+	}{
+		{"expired token", writeAll(past), []string{"datuplet login --remote", "expired"}},
+		{"expired token does not leak the JWT", writeAll(past), nil},
+		{"malformed expires_at", writeAll("not-a-date"), []string{"corrupt", "datuplet login --remote"}},
+		{"missing token file", func(t *testing.T, home string) {
+			// cluster.json exists but token file is absent.
+			dotDir := filepath.Join(home, ".datuplet")
+			if err := os.MkdirAll(dotDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			b, _ := json.MarshalIndent(clusterMeta{LakekeeperURL: "http://lk:8181/catalog", ExpiresAt: "2099-01-01T00:00:00Z"}, "", "  ")
+			if err := os.WriteFile(filepath.Join(dotDir, "cluster.json"), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, []string{"datuplet login --remote"}},
+		{"missing cluster.json", func(t *testing.T, home string) {
+			// Token file exists but cluster.json is absent.
+			dotDir := filepath.Join(home, ".datuplet")
+			if err := os.MkdirAll(dotDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dotDir, "token"), []byte(fakeJWT), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, []string{"datuplet login --remote"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			tc.setup(t, tmp)
 
-	_, err := loadRemoteArgs("http://api", "", "")
-	if err == nil {
-		t.Fatal("expected error for expired token, got nil")
+			_, err := loadRemoteArgs("http://api", "", "")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error does not mention %q: %v", want, err)
+				}
+			}
+			if strings.Contains(err.Error(), fakeJWT) {
+				t.Errorf("error message leaks JWT token (security violation): %v", err)
+			}
+		})
 	}
-	if !strings.Contains(err.Error(), "datuplet login --remote") {
-		t.Errorf("error does not mention 'datuplet login --remote': %v", err)
+}
+
+// TestLoadRemoteArgs_RemoteUrlMatching verifies that a --remote URL that
+// differs from the one stored in cluster.json returns a descriptive error
+// asking the user to re-login, while trailing slashes and scheme/host case
+// differences are ignored (e.g. "HTTP://Localhost:30081/" matches
+// "http://localhost:30081").
+func TestLoadRemoteArgs_RemoteUrlMatching(t *testing.T) {
+	tests := []struct {
+		name       string
+		clusterURL string
+		remote     string
+		wantErr    []string // nil means success
+	}{
+		{"mismatch errors", "http://cluster-a:30081", "http://cluster-b:30081", []string{"datuplet login --remote", "cluster-b"}},
+		{"trailing slash and case are normalized", "http://localhost:30081", "HTTP://Localhost:30081/", nil},
 	}
-	if !strings.Contains(err.Error(), "expired") {
-		t.Errorf("error does not mention 'expired': %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			writeDatupletFiles(t, tmp, fakeJWT, clusterMeta{
+				LakekeeperURL:  "http://lk:8181/catalog",
+				WarehouseName:  "datuplet",
+				ExpiresAt:      "2099-01-01T00:00:00Z",
+				PipelineAPIURL: tc.clusterURL,
+				Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
+			})
+
+			args, err := loadRemoteArgs(tc.remote, "", "")
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("expected normalization to match, got error: %v", err)
+				}
+				if args.LakekeeperURL != "http://lk:8181/catalog" {
+					t.Errorf("LakekeeperURL = %q", args.LakekeeperURL)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected error for URL mismatch, got nil")
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error does not mention %q: %v", want, err)
+				}
+			}
+		})
 	}
 }
 
@@ -131,127 +225,6 @@ func TestLoadRemoteArgs_TokenFileFlag(t *testing.T) {
 	absCustom, _ := filepath.Abs(customPath)
 	if args.TokenPath != absCustom {
 		t.Errorf("TokenPath = %q, want %q", args.TokenPath, absCustom)
-	}
-}
-
-// TestLoadRemoteArgs_MissingTokenFile verifies a friendly error when the
-// default token file does not exist.
-func TestLoadRemoteArgs_MissingTokenFile(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	// cluster.json exists but token file is absent.
-	meta := clusterMeta{LakekeeperURL: "http://lk:8181/catalog", ExpiresAt: "2099-01-01T00:00:00Z"}
-	dotDir := filepath.Join(tmp, ".datuplet")
-	os.MkdirAll(dotDir, 0o700)
-	b, _ := json.MarshalIndent(meta, "", "  ")
-	os.WriteFile(filepath.Join(dotDir, "cluster.json"), b, 0o600)
-
-	_, err := loadRemoteArgs("http://api", "", "")
-	if err == nil {
-		t.Fatal("expected error for missing token file, got nil")
-	}
-	if !strings.Contains(err.Error(), "datuplet login --remote") {
-		t.Errorf("error does not mention 'datuplet login --remote': %v", err)
-	}
-}
-
-// TestLoadRemoteArgs_MissingClusterJSON verifies a friendly error when
-// ~/.datuplet/cluster.json does not exist.
-func TestLoadRemoteArgs_MissingClusterJSON(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	// Token file exists but cluster.json is absent.
-	dotDir := filepath.Join(tmp, ".datuplet")
-	os.MkdirAll(dotDir, 0o700)
-	os.WriteFile(filepath.Join(dotDir, "token"), []byte(fakeJWT), 0o600)
-
-	_, err := loadRemoteArgs("http://api", "", "")
-	if err == nil {
-		t.Fatal("expected error for missing cluster.json, got nil")
-	}
-	if !strings.Contains(err.Error(), "datuplet login --remote") {
-		t.Errorf("error does not mention 'datuplet login --remote': %v", err)
-	}
-}
-
-// TestLoadRemoteArgs_TokenNotInError ensures the raw JWT is never leaked
-// into error messages (security invariant).
-func TestLoadRemoteArgs_TokenNotInError(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	// Write a valid token but an expired cluster.json so we get an error
-	// after the token is loaded.
-	past := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339)
-	meta := clusterMeta{
-		LakekeeperURL: "http://lk:8181/catalog",
-		ExpiresAt:     past,
-	}
-	writeDatupletFiles(t, tmp, fakeJWT, meta)
-
-	_, err := loadRemoteArgs("http://api", "", "")
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	// The error must not contain the JWT.
-	if strings.Contains(err.Error(), fakeJWT) {
-		t.Errorf("error message leaks JWT token (security violation): %v", err)
-	}
-}
-
-// TestLoadRemoteArgs_RemoteUrlMismatchErrors verifies that passing a --remote
-// URL that differs from the one stored in cluster.json returns a descriptive
-// error asking the user to re-login.
-func TestLoadRemoteArgs_RemoteUrlMismatchErrors(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	meta := clusterMeta{
-		LakekeeperURL:  "http://lk:8181/catalog",
-		WarehouseName:  "datuplet",
-		ExpiresAt:      "2099-01-01T00:00:00Z",
-		PipelineAPIURL: "http://cluster-a:30081",
-	}
-	writeDatupletFiles(t, tmp, fakeJWT, meta)
-
-	// Pass cluster-B — should error.
-	_, err := loadRemoteArgs("http://cluster-b:30081", "", "")
-	if err == nil {
-		t.Fatal("expected error for URL mismatch, got nil")
-	}
-	if !strings.Contains(err.Error(), "datuplet login --remote") {
-		t.Errorf("error does not mention 'datuplet login --remote': %v", err)
-	}
-	if !strings.Contains(err.Error(), "cluster-b") {
-		t.Errorf("error does not mention the requested URL: %v", err)
-	}
-}
-
-// TestLoadRemoteArgs_RemoteUrlNormalization verifies that trailing slashes and
-// scheme/host case differences are ignored when comparing --remote to the
-// logged-in URL (e.g. "http://Localhost:30081/" matches "http://localhost:30081").
-func TestLoadRemoteArgs_RemoteUrlNormalization(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	meta := clusterMeta{
-		LakekeeperURL:  "http://lk:8181/catalog",
-		WarehouseName:  "datuplet",
-		ExpiresAt:      "2099-01-01T00:00:00Z",
-		PipelineAPIURL: "http://localhost:30081",
-		Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
-	}
-	writeDatupletFiles(t, tmp, fakeJWT, meta)
-
-	// Trailing slash + uppercase scheme/host — should succeed.
-	args, err := loadRemoteArgs("HTTP://Localhost:30081/", "", "")
-	if err != nil {
-		t.Fatalf("expected normalization to match, got error: %v", err)
-	}
-	if args.LakekeeperURL != "http://lk:8181/catalog" {
-		t.Errorf("LakekeeperURL = %q", args.LakekeeperURL)
 	}
 }
 
@@ -402,42 +375,59 @@ func TestLoadRemoteArgs_RemotePrecedence(t *testing.T) {
 	}
 }
 
-// TestLoadRemoteArgs_HeadlessNoDatupletFileRead verifies the core headless
-// promise (RFC 027 §7): with both DATUPLET_API_TOKEN and DATUPLET_REMOTE set
-// and no --token-file flag, loadRemoteArgs never touches ~/.datuplet at all
-// — not even to check it exists. HOME points at a path that does not exist
-// on disk at all (not merely an empty existing temp dir): os.UserHomeDir()-
-// based path construction works fine either way, but any actual
-// os.ReadFile/os.Stat against a path under a non-existent parent directory
-// fails loudly with "no such file or directory". A nil error here is proof
-// loadRemoteArgs never attempted such a read — an empty-but-existing temp
-// dir would not distinguish "no read attempted" from "a read was attempted
-// and happened to find nothing", since both look identical from the outside.
-func TestLoadRemoteArgs_HeadlessNoDatupletFileRead(t *testing.T) {
-	tmp := t.TempDir()
-	home := filepath.Join(tmp, "does-not-exist")
-	t.Setenv("HOME", home)
-	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
-	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
+// TestLoadRemoteArgs_HeadlessFastPath verifies the core headless promise
+// (RFC 027 §7): with both DATUPLET_API_TOKEN and DATUPLET_REMOTE set and no
+// --token-file flag, loadRemoteArgs never touches ~/.datuplet at all — not
+// even to check it exists. HOME points at a path that does not exist on disk
+// (not merely an empty existing temp dir): any actual os.ReadFile/os.Stat
+// against a path under a non-existent parent directory fails loudly, so a nil
+// error plus the home dir still not existing is proof no read was attempted.
+// On this path $DATUPLET_PROJECT supplies the project ID when --project is
+// omitted, --project wins over it when both are set, and with neither the ID
+// resolves to empty (callers that don't need project scoping are unaffected).
+func TestLoadRemoteArgs_HeadlessFastPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		envProject  string
+		projectFlag string
+		wantID      string
+	}{
+		{"project flag only", "", "my-project", "my-project"},
+		{"project from env", "env-project-uuid", "", "env-project-uuid"},
+		{"project flag wins over env", "env-project-uuid", "flag-project-uuid", "flag-project-uuid"},
+		{"no project source", "", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			home := filepath.Join(tmp, "does-not-exist")
+			t.Setenv("HOME", home)
+			t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
+			t.Setenv("DATUPLET_REMOTE", "http://headless-api")
+			if tc.envProject != "" {
+				t.Setenv("DATUPLET_PROJECT", tc.envProject)
+			}
 
-	args, err := loadRemoteArgs("", "", "my-project")
-	if err != nil {
-		t.Fatalf("loadRemoteArgs: unexpected error in headless mode: %v", err)
-	}
-	if args.APIToken != "headless-api-token" {
-		t.Errorf("APIToken = %q, want %q", args.APIToken, "headless-api-token")
-	}
-	if args.Remote != "http://headless-api" {
-		t.Errorf("Remote = %q, want %q", args.Remote, "http://headless-api")
-	}
-	if args.ID != "my-project" {
-		t.Errorf("ID = %q, want %q", args.ID, "my-project")
-	}
+			args, err := loadRemoteArgs("", "", tc.projectFlag)
+			if err != nil {
+				t.Fatalf("loadRemoteArgs: unexpected error in headless mode: %v", err)
+			}
+			if args.APIToken != "headless-api-token" {
+				t.Errorf("APIToken = %q, want %q", args.APIToken, "headless-api-token")
+			}
+			if args.Remote != "http://headless-api" {
+				t.Errorf("Remote = %q, want %q", args.Remote, "http://headless-api")
+			}
+			if args.ID != tc.wantID {
+				t.Errorf("ID = %q, want %q", args.ID, tc.wantID)
+			}
 
-	// Confirm the home dir itself was never created (no read/write attempt
-	// anywhere under it, including ~/.datuplet).
-	if _, statErr := os.Stat(home); !os.IsNotExist(statErr) {
-		t.Errorf("expected %s to not exist, stat err = %v", home, statErr)
+			// Confirm the home dir itself was never created (no read/write
+			// attempt anywhere under it, including ~/.datuplet).
+			if _, statErr := os.Stat(home); !os.IsNotExist(statErr) {
+				t.Errorf("expected %s to not exist, stat err = %v", home, statErr)
+			}
+		})
 	}
 }
 
@@ -488,70 +478,6 @@ func TestLoadRemoteArgs_EnvAPITokenNoTokenFileClusterRemoteFallback(t *testing.T
 	}
 }
 
-// TestLoadRemoteArgs_ProjectEnvFastPath verifies that on the headless fast
-// path (both DATUPLET_API_TOKEN and DATUPLET_REMOTE set, no --token-file),
-// $DATUPLET_PROJECT supplies the project ID when --project is omitted.
-func TestLoadRemoteArgs_ProjectEnvFastPath(t *testing.T) {
-	tmp := t.TempDir()
-	home := filepath.Join(tmp, "does-not-exist")
-	t.Setenv("HOME", home)
-	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
-	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
-	t.Setenv("DATUPLET_PROJECT", "env-project-uuid")
-
-	args, err := loadRemoteArgs("", "", "")
-	if err != nil {
-		t.Fatalf("loadRemoteArgs: unexpected error: %v", err)
-	}
-	if args.ID != "env-project-uuid" {
-		t.Errorf("ID = %q, want %q (from $DATUPLET_PROJECT)", args.ID, "env-project-uuid")
-	}
-	// Fast path must still not touch ~/.datuplet.
-	if _, statErr := os.Stat(home); !os.IsNotExist(statErr) {
-		t.Errorf("expected %s to not exist, stat err = %v", home, statErr)
-	}
-}
-
-// TestLoadRemoteArgs_ProjectFlagWinsOverEnv verifies the --project flag
-// overrides $DATUPLET_PROJECT when both are set (fast path).
-func TestLoadRemoteArgs_ProjectFlagWinsOverEnv(t *testing.T) {
-	tmp := t.TempDir()
-	home := filepath.Join(tmp, "does-not-exist")
-	t.Setenv("HOME", home)
-	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
-	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
-	t.Setenv("DATUPLET_PROJECT", "env-project-uuid")
-
-	args, err := loadRemoteArgs("", "", "flag-project-uuid")
-	if err != nil {
-		t.Fatalf("loadRemoteArgs: unexpected error: %v", err)
-	}
-	if args.ID != "flag-project-uuid" {
-		t.Errorf("ID = %q, want %q (--project must win over env)", args.ID, "flag-project-uuid")
-	}
-}
-
-// TestLoadRemoteArgs_ProjectEmptyFastPath verifies existing behavior is
-// preserved: with neither --project nor $DATUPLET_PROJECT set, the pure fast
-// path still resolves ID to empty string (callers that don't need project
-// scoping are unaffected).
-func TestLoadRemoteArgs_ProjectEmptyFastPath(t *testing.T) {
-	tmp := t.TempDir()
-	home := filepath.Join(tmp, "does-not-exist")
-	t.Setenv("HOME", home)
-	t.Setenv("DATUPLET_API_TOKEN", "headless-api-token")
-	t.Setenv("DATUPLET_REMOTE", "http://headless-api")
-	// DATUPLET_PROJECT deliberately unset.
-
-	args, err := loadRemoteArgs("", "", "")
-	if err != nil {
-		t.Fatalf("loadRemoteArgs: unexpected error: %v", err)
-	}
-	if args.ID != "" {
-		t.Errorf("ID = %q, want empty string (no project source)", args.ID)
-	}
-}
-
 // TestLoadRemoteArgs_ProjectEnvDiskBackedMultiProject verifies that on the
 // disk-backed (non-fast) path, $DATUPLET_PROJECT can disambiguate a
 // multi-project account via resolveProject without needing --project.
@@ -586,33 +512,5 @@ func TestLoadRemoteArgs_ProjectEnvDiskBackedMultiProject(t *testing.T) {
 	}
 	if args.ProjectName != "beta" {
 		t.Errorf("ProjectName = %q, want %q", args.ProjectName, "beta")
-	}
-}
-
-// TestLoadRemoteArgs_MalformedExpiresAt verifies that a cluster.json with a
-// non-RFC3339 expires_at returns a credentials error instead of silently
-// skipping the expiry check (fail-closed requirement).
-func TestLoadRemoteArgs_MalformedExpiresAt(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	meta := clusterMeta{
-		LakekeeperURL:  "http://lk:8181/catalog",
-		WarehouseName:  "datuplet",
-		ExpiresAt:      "not-a-date",
-		PipelineAPIURL: "http://api",
-		Projects:       []clusterMetaProject{{ID: "p-1", Name: "default", LakekeeperProjectID: "lk-proj-1"}},
-	}
-	writeDatupletFiles(t, tmp, fakeJWT, meta)
-
-	_, err := loadRemoteArgs("http://api", "", "")
-	if err == nil {
-		t.Fatal("expected error for malformed expires_at, got nil")
-	}
-	if !strings.Contains(err.Error(), "corrupt") {
-		t.Errorf("error does not mention 'corrupt': %v", err)
-	}
-	if !strings.Contains(err.Error(), "datuplet login --remote") {
-		t.Errorf("error does not mention 'datuplet login --remote': %v", err)
 	}
 }

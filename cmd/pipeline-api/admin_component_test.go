@@ -25,50 +25,48 @@ spec:
       image: datuplet/http-fetch:v1.0.0
 `
 
-func TestApplyComponentDefinition_CreatesWhenMissing(t *testing.T) {
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-
-	def, err := applyComponentDefinition(context.Background(), c, []byte(testComponentYAML))
-	if err != nil {
-		t.Fatalf("applyComponentDefinition: %v", err)
-	}
-	if def.Name != "http-fetch" {
-		t.Fatalf("name = %q, want http-fetch", def.Name)
-	}
-
-	got := &datupletv1.ComponentDefinition{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "http-fetch"}, got); err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if len(got.Spec.Versions) != 1 || got.Spec.Versions[0].Version != "v1.0.0" {
-		t.Fatalf("unexpected spec: %+v", got.Spec)
-	}
-}
-
-func TestApplyComponentDefinition_UpdatesWhenPresent(t *testing.T) {
-	existing := &datupletv1.ComponentDefinition{
+func TestApplyComponentDefinition_CreatesOrUpdates(t *testing.T) {
+	stale := &datupletv1.ComponentDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "http-fetch"},
 		Spec: datupletv1.ComponentDefinitionSpec{
 			DisplayName: "stale",
 			Versions:    []datupletv1.VersionSpec{{Version: "v0.1.0", Image: "datuplet/http-fetch:v0.1.0"}},
 		},
 	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(existing).Build()
+	tests := []struct {
+		name     string
+		existing bool
+	}{
+		{"creates when missing", false},
+		{"updates when present", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := fake.NewClientBuilder().WithScheme(pkg8s.Scheme())
+			if tc.existing {
+				b = b.WithObjects(stale.DeepCopy())
+			}
+			c := b.Build()
 
-	def, err := applyComponentDefinition(context.Background(), c, []byte(testComponentYAML))
-	if err != nil {
-		t.Fatalf("applyComponentDefinition: %v", err)
-	}
-	if def.Spec.DisplayName != "HTTP Fetch" {
-		t.Fatalf("DisplayName = %q, want the re-applied value", def.Spec.DisplayName)
-	}
+			def, err := applyComponentDefinition(context.Background(), c, []byte(testComponentYAML))
+			if err != nil {
+				t.Fatalf("applyComponentDefinition: %v", err)
+			}
+			if def.Name != "http-fetch" {
+				t.Fatalf("name = %q, want http-fetch", def.Name)
+			}
+			if def.Spec.DisplayName != "HTTP Fetch" {
+				t.Fatalf("DisplayName = %q, want the applied value", def.Spec.DisplayName)
+			}
 
-	got := &datupletv1.ComponentDefinition{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "http-fetch"}, got); err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if len(got.Spec.Versions) != 1 || got.Spec.Versions[0].Version != "v1.0.0" {
-		t.Fatalf("update did not take effect: %+v", got.Spec)
+			got := &datupletv1.ComponentDefinition{}
+			if err := c.Get(context.Background(), types.NamespacedName{Name: "http-fetch"}, got); err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if len(got.Spec.Versions) != 1 || got.Spec.Versions[0].Version != "v1.0.0" {
+				t.Fatalf("apply did not take effect: %+v", got.Spec)
+			}
+		})
 	}
 }
 

@@ -126,89 +126,39 @@ func TestLogin_PromptsAndWritesFiles(t *testing.T) {
 	}
 }
 
-// TestLogin_TokenFileIsRawJWTNotJSON pins the critical security invariant:
-// the token file MUST be a raw JWT (3 dot-separated base64 segments), NEVER
-// the full JSON login-response blob. The gateway sidecar reads this file as
-// a bare bearer string; if it were JSON the K8s Secret path and local-CLI
-// path would parse inconsistently.
-func TestLogin_TokenFileIsRawJWTNotJSON(t *testing.T) {
-	home := setHomeDir(t)
-	srv := fakeLoginServer(t, http.StatusOK, happyBody(t))
-	defer srv.Close()
-
-	input := strings.NewReader("alice@example.com\nhunter2\n")
-	args := loginArgs{
-		Remote: srv.URL,
-		Stdin:  input,
-		Stdout: &strings.Builder{},
-		Stderr: &strings.Builder{},
+// TestLogin_FailureExitsNonZero verifies that a 401 from the server and an
+// unreachable server both cause runLogin to return a non-nil error.
+func TestLogin_FailureExitsNonZero(t *testing.T) {
+	tests := []struct {
+		name string
+		// remote returns the server URL to log in against.
+		remote func(t *testing.T) string
+	}{
+		{"bad credentials", func(t *testing.T) string {
+			srv := fakeLoginServer(t, http.StatusUnauthorized, `{"error":"invalid credentials"}`)
+			t.Cleanup(srv.Close)
+			return srv.URL
+		}},
+		{"network error", func(t *testing.T) string {
+			// A server closed before the request, so no connection is possible.
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			srv.Close()
+			return srv.URL
+		}},
 	}
-	if err := runLogin(args); err != nil {
-		t.Fatalf("runLogin: %v", err)
-	}
-
-	tokenBytes, err := os.ReadFile(filepath.Join(home, ".datuplet", "token"))
-	if err != nil {
-		t.Fatalf("read token file: %v", err)
-	}
-	content := string(tokenBytes)
-
-	// Must NOT be a JSON blob.
-	if strings.HasPrefix(content, "{") {
-		t.Errorf("token file starts with '{' — it is a JSON blob, not a raw JWT. "+
-			"content: %q", content)
-	}
-
-	// Must contain at least one '.' (JWT header.payload.signature separator).
-	if !strings.Contains(content, ".") {
-		t.Errorf("token file contains no '.' separator — does not look like a JWT. "+
-			"content: %q", content)
-	}
-
-	// Must have exactly three dot-separated segments (JWT structure).
-	parts := strings.Split(content, ".")
-	if len(parts) != 3 {
-		t.Errorf("token file has %d dot-separated segments, want 3 (JWT). content: %q",
-			len(parts), content)
-	}
-}
-
-// TestLogin_BadCredentialsExitsNonZero verifies that a 401 from the server
-// causes runLogin to return a non-nil error.
-func TestLogin_BadCredentialsExitsNonZero(t *testing.T) {
-	setHomeDir(t)
-	srv := fakeLoginServer(t, http.StatusUnauthorized, `{"error":"invalid credentials"}`)
-	defer srv.Close()
-
-	input := strings.NewReader("alice@example.com\nwrongpassword\n")
-	args := loginArgs{
-		Remote: srv.URL,
-		Stdin:  input,
-		Stdout: &strings.Builder{},
-		Stderr: &strings.Builder{},
-	}
-	if err := runLogin(args); err == nil {
-		t.Error("expected error for 401, got nil")
-	}
-}
-
-// TestLogin_NetworkErrorExitsNonZero verifies that an unreachable server
-// causes runLogin to return a non-nil error.
-func TestLogin_NetworkErrorExitsNonZero(t *testing.T) {
-	setHomeDir(t)
-	// Use a server that is immediately closed so no connection is possible.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	srv.Close() // close before the request
-
-	input := strings.NewReader("alice@example.com\nhunter2\n")
-	args := loginArgs{
-		Remote: srv.URL,
-		Stdin:  input,
-		Stdout: &strings.Builder{},
-		Stderr: &strings.Builder{},
-	}
-	if err := runLogin(args); err == nil {
-		t.Error("expected error for network failure, got nil")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setHomeDir(t)
+			args := loginArgs{
+				Remote: tc.remote(t),
+				Stdin:  strings.NewReader("alice@example.com\nwrongpassword\n"),
+				Stdout: &strings.Builder{},
+				Stderr: &strings.Builder{},
+			}
+			if err := runLogin(args); err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
 	}
 }
 

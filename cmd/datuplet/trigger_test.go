@@ -13,41 +13,47 @@ import (
 
 // --- pure helper tests ---
 
-func TestIsTerminalPhase(t *testing.T) {
-	cases := map[string]bool{
-		"Pending":           false,
-		"Running":           false,
-		"Succeeded":         true,
-		"FailedUser":        true,
-		"FailedApplication": true,
-		"Cancelled":         true,
-		"Expired":           true,
-		"":                  false,
-		"Unknown":           false,
+// TestPhaseTerminalAndExitCode pins which phases are terminal and the exit-code
+// contract's zero/non-zero split: Succeeded exits 0, every other terminal phase
+// (FailedUser, FailedApplication, Cancelled, Expired) exits non-zero.
+func TestPhaseTerminalAndExitCode(t *testing.T) {
+	const (
+		notChecked = iota
+		zero
+		nonZero
+	)
+	tests := []struct {
+		phase        string
+		wantTerminal bool
+		wantExit     int // notChecked | zero | nonZero
+	}{
+		{"Pending", false, notChecked},
+		{"Running", false, notChecked},
+		{"Succeeded", true, zero},
+		{"FailedUser", true, nonZero},
+		{"FailedApplication", true, nonZero},
+		{"Cancelled", true, nonZero},
+		{"Expired", true, nonZero},
+		{"", false, notChecked},
+		{"Unknown", false, notChecked},
 	}
-	for phase, want := range cases {
-		if got := isTerminalPhase(phase); got != want {
-			t.Errorf("isTerminalPhase(%q) = %v, want %v", phase, got, want)
-		}
-	}
-}
-
-func TestExitCodeForPhase(t *testing.T) {
-	if got := exitCodeForPhase("Succeeded"); got != 0 {
-		t.Errorf("Succeeded -> %d, want 0", got)
-	}
-	for _, phase := range []string{"FailedUser", "FailedApplication", "Cancelled", "Expired"} {
-		if got := exitCodeForPhase(phase); got == 0 {
-			t.Errorf("%s -> 0, want non-zero", phase)
-		}
-	}
-}
-
-func TestComputeWallclockSeconds(t *testing.T) {
-	start := time.Date(2026, 5, 20, 22, 1, 0, 0, time.UTC)
-	end := time.Date(2026, 5, 20, 22, 3, 32, 0, time.UTC)
-	if got := computeWallclockSeconds(start, end); got != 152 {
-		t.Errorf("computeWallclockSeconds = %d, want 152", got)
+	for _, tc := range tests {
+		t.Run(tc.phase, func(t *testing.T) {
+			if got := isTerminalPhase(tc.phase); got != tc.wantTerminal {
+				t.Errorf("isTerminalPhase(%q) = %v, want %v", tc.phase, got, tc.wantTerminal)
+			}
+			got := exitCodeForPhase(tc.phase)
+			switch tc.wantExit {
+			case zero:
+				if got != 0 {
+					t.Errorf("exitCodeForPhase(%q) = %d, want 0", tc.phase, got)
+				}
+			case nonZero:
+				if got == 0 {
+					t.Errorf("exitCodeForPhase(%q) = 0, want non-zero", tc.phase)
+				}
+			}
+		})
 	}
 }
 

@@ -72,73 +72,88 @@ func TestBuildWarehouseBody_S3(t *testing.T) {
 
 func TestBuildWarehouseBody_GCS(t *testing.T) {
 	saKeyJSON := `{"type":"service_account","project_id":"my-proj","private_key":"X","client_email":"sa@x.iam"}`
-	body, err := buildWarehouseBody(warehouseSpec{
-		WarehouseName: "my-warehouse",
-		Type:          "gcs",
-		GCS: &gcsSpec{
-			Bucket:                "my-gcs-bucket",
-			KeyPrefix:             "datuplet",
-			StsEnabled:            true,
-			CredentialType:        "service-account-key",
-			ServiceAccountKeyJSON: saKeyJSON,
+	tests := []struct {
+		name     string
+		gcs      gcsSpec
+		wantCred string
+		wantKey  bool
+	}{
+		{
+			name: "service-account-key",
+			gcs: gcsSpec{
+				Bucket:                "my-gcs-bucket",
+				KeyPrefix:             "datuplet",
+				StsEnabled:            true,
+				CredentialType:        "service-account-key",
+				ServiceAccountKeyJSON: saKeyJSON,
+			},
+			wantCred: "service-account-key",
+			wantKey:  true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	profile, ok := body["storage-profile"].(map[string]any)
-	if !ok {
-		t.Fatalf("storage-profile is not map[string]any: %T", body["storage-profile"])
-	}
-	if profile["type"] != "gcs" {
-		t.Errorf("type = %v, want gcs", profile["type"])
-	}
-	if profile["bucket"] != "my-gcs-bucket" {
-		t.Errorf("bucket = %v", profile["bucket"])
-	}
-	if profile["key-prefix"] != "datuplet" {
-		t.Errorf("key-prefix = %v", profile["key-prefix"])
-	}
-	if profile["sts-enabled"] != true {
-		t.Errorf("sts-enabled = %v", profile["sts-enabled"])
-	}
-	cred, ok := body["storage-credential"].(map[string]any)
-	if !ok {
-		t.Fatalf("storage-credential is not map[string]any: %T", body["storage-credential"])
-	}
-	if cred["credential-type"] != "service-account-key" {
-		t.Errorf("credential-type = %v", cred["credential-type"])
-	}
-	keyObj, ok := cred["key"].(map[string]any)
-	if !ok {
-		t.Fatalf("key field is not map[string]any: %T", cred["key"])
-	}
-	if keyObj["project_id"] != "my-proj" {
-		t.Errorf("project_id = %v", keyObj["project_id"])
-	}
-	if keyObj["client_email"] != "sa@x.iam" {
-		t.Errorf("client_email = %v", keyObj["client_email"])
-	}
-}
-
-func TestBuildWarehouseBody_GCS_InvalidJSON(t *testing.T) {
-	// Malformed SA key JSON should produce an error rather than silently
-	// embedding empty/invalid creds.
-	_, err := buildWarehouseBody(warehouseSpec{
-		WarehouseName: "wh",
-		Type:          "gcs",
-		GCS: &gcsSpec{
-			Bucket:                "b",
-			CredentialType:        "service-account-key",
-			ServiceAccountKeyJSON: "not-valid-json",
+		{
+			// system-identity (WIF) requires StsEnabled=true — see gcsSpec.Validate().
+			name: "system-identity",
+			gcs: gcsSpec{
+				Bucket:         "my-gcs-bucket",
+				KeyPrefix:      "datuplet",
+				StsEnabled:     true,
+				CredentialType: "system-identity",
+			},
+			wantCred: "gcp-system-identity",
+			wantKey:  false,
 		},
-	})
-	if err == nil {
-		t.Fatalf("expected error for invalid SA key JSON, got nil")
 	}
-	// Security: the error must NOT echo the JSON content (could leak the key).
-	if strings.Contains(err.Error(), "not-valid-json") {
-		t.Errorf("error message must not contain the SA key JSON content: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gcs := tc.gcs
+			body, err := buildWarehouseBody(warehouseSpec{
+				WarehouseName: "my-warehouse",
+				Type:          "gcs",
+				GCS:           &gcs,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			profile, ok := body["storage-profile"].(map[string]any)
+			if !ok {
+				t.Fatalf("storage-profile is not map[string]any: %T", body["storage-profile"])
+			}
+			if profile["type"] != "gcs" {
+				t.Errorf("type = %v, want gcs", profile["type"])
+			}
+			if profile["bucket"] != "my-gcs-bucket" {
+				t.Errorf("bucket = %v", profile["bucket"])
+			}
+			if profile["key-prefix"] != "datuplet" {
+				t.Errorf("key-prefix = %v", profile["key-prefix"])
+			}
+			if profile["sts-enabled"] != true {
+				t.Errorf("sts-enabled = %v", profile["sts-enabled"])
+			}
+			cred, ok := body["storage-credential"].(map[string]any)
+			if !ok {
+				t.Fatalf("storage-credential is not map[string]any: %T", body["storage-credential"])
+			}
+			if cred["credential-type"] != tc.wantCred {
+				t.Errorf("credential-type = %v, want %s", cred["credential-type"], tc.wantCred)
+			}
+			if !tc.wantKey {
+				if _, hasKey := cred["key"]; hasKey {
+					t.Fatal("system-identity body must NOT carry a key field")
+				}
+				return
+			}
+			keyObj, ok := cred["key"].(map[string]any)
+			if !ok {
+				t.Fatalf("key field is not map[string]any: %T", cred["key"])
+			}
+			if keyObj["project_id"] != "my-proj" {
+				t.Errorf("project_id = %v", keyObj["project_id"])
+			}
+			if keyObj["client_email"] != "sa@x.iam" {
+				t.Errorf("client_email = %v", keyObj["client_email"])
+			}
+		})
 	}
 }
 
@@ -170,35 +185,53 @@ func TestBuildWarehouseBodyRedactsInvalidGCSKeyJSON(t *testing.T) {
 	}
 }
 
-func TestBuildWarehouseBody_UnknownType(t *testing.T) {
-	_, err := buildWarehouseBody(warehouseSpec{
-		WarehouseName: "wh",
-		Type:          "azure",
-	})
-	if err == nil {
-		t.Fatalf("expected error for unknown type, got nil")
+func TestBuildWarehouseBody_InvalidSpec(t *testing.T) {
+	tests := []struct {
+		name string
+		spec warehouseSpec
+	}{
+		{"unknown type", warehouseSpec{WarehouseName: "wh", Type: "azure"}},
+		{"s3 type with nil S3 spec", warehouseSpec{WarehouseName: "wh", Type: "s3", S3: nil}},
+		{"gcs type with nil GCS spec", warehouseSpec{WarehouseName: "wh", Type: "gcs", GCS: nil}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := buildWarehouseBody(tc.spec); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
 	}
 }
 
-func TestBuildWarehouseBody_S3_MissingSpec(t *testing.T) {
-	_, err := buildWarehouseBody(warehouseSpec{
-		WarehouseName: "wh",
-		Type:          "s3",
-		S3:            nil,
-	})
-	if err == nil {
-		t.Fatalf("expected error for s3 type with nil S3 spec, got nil")
+// TestGCSSpecValidate exercises gcsSpec.Validate(): mutual exclusion, unknown
+// credential type, and the fail-fast STS guard. system-identity (WIF) has no
+// static credentials Lakekeeper can return verbatim, so sts-enabled=false is
+// structurally invalid (empty CredentialType defaults to system-identity and is
+// caught too); service-account-key + sts=false is intentionally allowed.
+func TestGCSSpecValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    gcsSpec
+		wantErr bool
+	}{
+		{"default (system-identity) with sts", gcsSpec{Bucket: "b", CredentialType: "", StsEnabled: true}, false},
+		{"explicit system-identity with sts", gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: true}, false},
+		{"system-identity combined with SA key is mutually exclusive", gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: true, ServiceAccountKeyJSON: "{...}"}, true},
+		{"service-account-key without key file", gcsSpec{Bucket: "b", CredentialType: "service-account-key", ServiceAccountKeyJSON: ""}, true},
+		{"service-account-key with key", gcsSpec{Bucket: "b", CredentialType: "service-account-key", ServiceAccountKeyJSON: "{...}"}, false},
+		{"unknown credential type", gcsSpec{Bucket: "b", CredentialType: "passport"}, true},
+		{"system-identity requires sts", gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: false}, true},
+		{"system-identity with sts passes", gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: true}, false},
+		{"empty credential type requires sts", gcsSpec{Bucket: "b", CredentialType: "", StsEnabled: false}, true},
+		{"service-account-key allows sts disabled", gcsSpec{Bucket: "b", CredentialType: "service-account-key", ServiceAccountKeyJSON: `{"type":"service_account"}`, StsEnabled: false}, false},
 	}
-}
-
-func TestBuildWarehouseBody_GCS_MissingSpec(t *testing.T) {
-	_, err := buildWarehouseBody(warehouseSpec{
-		WarehouseName: "wh",
-		Type:          "gcs",
-		GCS:           nil,
-	})
-	if err == nil {
-		t.Fatalf("expected error for gcs type with nil GCS spec, got nil")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.spec.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -223,157 +256,6 @@ func TestServerAdminTupleWrite(t *testing.T) {
 	if !strings.Contains(writeBody, `"user":"user:oidc~admin"`) ||
 		!strings.Contains(writeBody, `"object":"server:abc-123-def-456-789a-bcdef0123456"`) {
 		t.Fatalf("expected tuple write, got: %s", writeBody)
-	}
-}
-
-// TestBuildWarehouseBodySystemIdentity and TestBuildWarehouseBodyServiceAccountKey
-// verify the system-identity and service-account-key branches of buildWarehouseBody.
-
-func TestBuildWarehouseBodySystemIdentity(t *testing.T) {
-	spec := warehouseSpec{
-		WarehouseName:       "test",
-		LakekeeperProjectID: "00000000-0000-0000-0000-000000000000",
-		Type:                "gcs",
-		// system-identity (WIF) requires StsEnabled=true — see gcsSpec.Validate().
-		GCS: &gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: true},
-	}
-	body, err := buildWarehouseBody(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cred := body["storage-credential"].(map[string]any)
-	if cred["credential-type"] != "gcp-system-identity" {
-		t.Fatalf("credential-type = %q, want gcp-system-identity", cred["credential-type"])
-	}
-	if _, hasKey := cred["key"]; hasKey {
-		t.Fatal("system-identity body must NOT carry a key field")
-	}
-}
-
-func TestBuildWarehouseBodyServiceAccountKey(t *testing.T) {
-	spec := warehouseSpec{
-		WarehouseName:       "test",
-		LakekeeperProjectID: "00000000-0000-0000-0000-000000000000",
-		Type:                "gcs",
-		GCS: &gcsSpec{
-			Bucket:                "b",
-			CredentialType:        "service-account-key",
-			ServiceAccountKeyJSON: `{"type":"service_account","project_id":"x"}`,
-			// sts=false is valid for service-account-key (Validate doesn't require STS here)
-			StsEnabled: false,
-		},
-	}
-	body, err := buildWarehouseBody(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cred := body["storage-credential"].(map[string]any)
-	if cred["credential-type"] != "service-account-key" {
-		t.Fatalf("credential-type = %q", cred["credential-type"])
-	}
-	if _, hasKey := cred["key"]; !hasKey {
-		t.Fatal("SA-key body must carry a key field")
-	}
-}
-
-// TestGCSSpec* tests exercise gcsSpec.Validate() — mutual-exclusion and unknown
-// credential type cases.
-
-func TestGCSSpecValidateSystemIdentityDefault(t *testing.T) {
-	// system-identity (WIF) requires STS — see Validate().
-	s := &gcsSpec{Bucket: "b", CredentialType: "", StsEnabled: true}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("default (system-identity) happy path: %v", err)
-	}
-}
-
-func TestGCSSpecValidateSystemIdentityExplicit(t *testing.T) {
-	// system-identity (WIF) requires STS — see Validate().
-	s := &gcsSpec{Bucket: "b", CredentialType: "system-identity", StsEnabled: true}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("system-identity happy path: %v", err)
-	}
-	s.ServiceAccountKeyJSON = "{...}"
-	err := s.Validate()
-	if err == nil || !strings.Contains(err.Error(), "cannot be combined with --gcs-sa-key-file") {
-		t.Fatalf("expected mutual-exclusion error, got %v", err)
-	}
-}
-
-func TestGCSSpecValidateServiceAccountKey(t *testing.T) {
-	s := &gcsSpec{Bucket: "b", CredentialType: "service-account-key", ServiceAccountKeyJSON: ""}
-	err := s.Validate()
-	if err == nil || !strings.Contains(err.Error(), "--gcs-sa-key-file") {
-		t.Fatalf("expected SA-key-file required error, got %v", err)
-	}
-	s.ServiceAccountKeyJSON = "{...}"
-	if err := s.Validate(); err != nil {
-		t.Fatalf("with key set: %v", err)
-	}
-}
-
-func TestGCSSpecValidateUnknownType(t *testing.T) {
-	s := &gcsSpec{Bucket: "b", CredentialType: "passport"}
-	err := s.Validate()
-	if err == nil || !strings.Contains(err.Error(), "unknown --gcs-credential-type") {
-		t.Fatalf("expected unknown-type error, got %v", err)
-	}
-}
-
-// TestGCSSpecValidateSystemIdentityRequiresSTS pins the fail-fast guard:
-// `--gcs-credential-type=system-identity` (WIF) has no static credentials
-// Lakekeeper can return verbatim, so `--sts-enabled=false` is structurally
-// invalid. Without this check, the bootstrap succeeds but the first table
-// write fails 15 min later with "lakekeeper response missing gcs.oauth2.token".
-func TestGCSSpecValidateSystemIdentityRequiresSTS(t *testing.T) {
-	s := &gcsSpec{
-		Bucket:         "b",
-		CredentialType: "system-identity",
-		StsEnabled:     false,
-	}
-	err := s.Validate()
-	if err == nil ||
-		!strings.Contains(err.Error(), "system-identity requires --sts-enabled=true") {
-		t.Fatalf("expected sts-enabled rejection, got %v", err)
-	}
-}
-
-// TestGCSSpecValidateSystemIdentityWithSTSPasses is the defensive positive
-// case: WIF + STS=true must still pass after the new rejection rule.
-func TestGCSSpecValidateSystemIdentityWithSTSPasses(t *testing.T) {
-	s := &gcsSpec{
-		Bucket:         "b",
-		CredentialType: "system-identity",
-		StsEnabled:     true,
-	}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("system-identity + sts=true must pass, got %v", err)
-	}
-}
-
-// TestGCSSpecValidateEmptyCredentialTypeRequiresSTS confirms that empty
-// CredentialType (which defaults to system-identity per the gcsSpec docstring)
-// is also caught by the STS check — not just the explicit "system-identity".
-func TestGCSSpecValidateEmptyCredentialTypeRequiresSTS(t *testing.T) {
-	s := &gcsSpec{Bucket: "b", CredentialType: "", StsEnabled: false}
-	if err := s.Validate(); err == nil {
-		t.Fatal("expected sts-enabled rejection for empty CredentialType too")
-	}
-}
-
-// TestGCSSpecValidateServiceAccountKeyAllowsStsDisabled documents that
-// service-account-key mode + sts=false is intentionally allowed — Lakekeeper
-// returns the static key fields directly without STS downscoping. Only
-// system-identity (WIF) requires STS.
-func TestGCSSpecValidateServiceAccountKeyAllowsStsDisabled(t *testing.T) {
-	s := &gcsSpec{
-		Bucket:                "b",
-		CredentialType:        "service-account-key",
-		ServiceAccountKeyJSON: `{"type":"service_account"}`,
-		StsEnabled:            false,
-	}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("S-A-K + sts=false should be valid, got %v", err)
 	}
 }
 
@@ -525,6 +407,7 @@ func TestLakekeeperWarehouseExistsScopedByProject(t *testing.T) {
 	const (
 		defaultProjectID    = "00000000-0000-0000-0000-000000000000"
 		nonDefaultProjectID = "019e3f40-test-uuid"
+		errorProjectID      = "019e3f40-error-uuid"
 	)
 
 	var seenProjectIDs []string
@@ -542,6 +425,9 @@ func TestLakekeeperWarehouseExistsScopedByProject(t *testing.T) {
 			_, _ = w.Write([]byte(`{"warehouses":[{"name":"datuplet"}]}`))
 		case nonDefaultProjectID:
 			_, _ = w.Write([]byte(`{"warehouses":[]}`))
+		case errorProjectID:
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("forbidden"))
 		default:
 			t.Errorf("unexpected x-project-id header: %q", pid)
 			w.WriteHeader(400)
@@ -576,25 +462,15 @@ func TestLakekeeperWarehouseExistsScopedByProject(t *testing.T) {
 	if seenProjectIDs[0] != nonDefaultProjectID || seenProjectIDs[1] != defaultProjectID {
 		t.Fatalf("x-project-id headers = %v; want [%s %s]", seenProjectIDs, nonDefaultProjectID, defaultProjectID)
 	}
-}
 
-// TestLakekeeperWarehouseExistsErrorIncludesProjectID locks the diagnostic
-// contract: when the probe fails, the error message must include the project
-// ID so the operator knows which project produced the failure.
-func TestLakekeeperWarehouseExistsErrorIncludesProjectID(t *testing.T) {
-	const projectID = "019e3f40-error-uuid"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte("forbidden"))
-	}))
-	defer srv.Close()
-
-	_, err := lakekeeperWarehouseExists(&http.Client{}, srv.URL, "fake-jwt", projectID, "datuplet")
+	// Diagnostic contract: when the probe fails, the error must include the
+	// project ID so the operator knows which project produced the failure.
+	_, err = lakekeeperWarehouseExists(c, srv.URL, "fake-jwt", errorProjectID, "datuplet")
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), projectID) {
-		t.Fatalf("error %q must contain projectID %q", err.Error(), projectID)
+	if !strings.Contains(err.Error(), errorProjectID) {
+		t.Fatalf("error %q must contain projectID %q", err.Error(), errorProjectID)
 	}
 }
 

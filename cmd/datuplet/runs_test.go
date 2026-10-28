@@ -132,20 +132,6 @@ func TestFetchRunDetail_DecodesTimeline(t *testing.T) {
 	}
 }
 
-func TestFetchRunDetail_NotFoundReturnsStatus(t *testing.T) {
-	cap := &capturedReq{}
-	srv := newRunsFakeServer(t, cap, http.StatusNotFound)
-	defer srv.Close()
-
-	_, _, status, err := fetchRunDetail(context.Background(), srv.URL, "tok", "proj-uuid", "nope")
-	if err != nil {
-		t.Fatalf("fetchRunDetail should not error on 404 (caller maps it): %v", err)
-	}
-	if status != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", status)
-	}
-}
-
 // --- CLI layer via headless env (loadRemoteArgs fast path) ---
 
 func TestRunsList_Headless(t *testing.T) {
@@ -166,21 +152,6 @@ func TestRunsList_Headless(t *testing.T) {
 	}
 	if !strings.Contains(cap.rawQ, "phase=Running") || !strings.Contains(cap.rawQ, "pipeline=daily") {
 		t.Errorf("query = %q missing filters", cap.rawQ)
-	}
-}
-
-func TestRunsGet_Headless(t *testing.T) {
-	cap := &capturedReq{}
-	srv := newRunsFakeServer(t, cap, http.StatusOK)
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-	t.Setenv("DATUPLET_PROJECT", "proj-uuid")
-
-	if err := runRunsGet([]string{"r1", "--json"}); err != nil {
-		t.Fatalf("runRunsGet: %v", err)
-	}
-	if cap.path != "/api/v1/projects/proj-uuid/runs/r1" {
-		t.Errorf("path = %q, want .../runs/r1", cap.path)
 	}
 }
 

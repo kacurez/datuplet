@@ -110,257 +110,205 @@ func newPipelineFakeServer(t *testing.T, b pipelineFakeBehaviour) *httptest.Serv
 	return httptest.NewServer(mux)
 }
 
-// TestRunPipelineGetDefaultHitsFormatYAML pins the default `get` contract:
-// it must hit ?format=yaml and print the server's response body verbatim
-// (RFC 027 §5.2 / S6's deterministic-YAML rendering).
-func TestRunPipelineGetDefaultHitsFormatYAML(t *testing.T) {
-	var gotQuery string
+// TestRunPipelineGet pins the `get` contract. Default: hit ?format=yaml and
+// print the server's response body verbatim (RFC 027 §5.2 / S6's
+// deterministic-YAML rendering). `--json`: no ?format= param, and the detail
+// JSON (including `doc` as an object) is printed byte-for-byte rather than
+// being re-decoded and re-serialized.
+func TestRunPipelineGet(t *testing.T) {
 	const wantYAML = "name: mypipe\nstages: []\n"
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onGet: func(w http.ResponseWriter, r *http.Request) {
-			gotQuery = r.URL.RawQuery
-			w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(wantYAML))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runPipelineGet([]string{"mypipe", "--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelineGet: %v", runErr)
-	}
-	if gotQuery != "format=yaml" {
-		t.Errorf("query = %q, want %q", gotQuery, "format=yaml")
-	}
-	if out != wantYAML {
-		t.Errorf("stdout = %q, want %q (verbatim)", out, wantYAML)
-	}
-}
-
-// TestRunPipelineGetJSONHitsPlainEndpoint pins the `--json` contract: no
-// ?format= param, and the detail JSON (including `doc` as an object) is
-// printed verbatim rather than being re-decoded and re-serialized.
-func TestRunPipelineGetJSONHitsPlainEndpoint(t *testing.T) {
-	var gotQuery string
 	const jsonBody = `{"id":"abc","name":"mypipe","doc":{"name":"mypipe","stages":[]},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`
 	// The real server's json.Encoder.Encode appends exactly one trailing
 	// newline (pkg/pipelineapi/http/json.go) — mirror that here so this
 	// test can pin byte-for-byte fidelity, not just content equality.
-	wireBody := jsonBody + "\n"
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onGet: func(w http.ResponseWriter, r *http.Request) {
-			gotQuery = r.URL.RawQuery
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(wireBody))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+	const wireBody = jsonBody + "\n"
 
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runPipelineGet([]string{"mypipe", "--json", "--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelineGet --json: %v", runErr)
+	tests := []struct {
+		name        string
+		args        []string
+		contentType string
+		body        string
+		wantQuery   string
+		asJSON      bool
+	}{
+		{"default hits format=yaml", []string{"mypipe", "--project", "proj1"}, "text/yaml; charset=utf-8", wantYAML, "format=yaml", false},
+		{"json hits plain endpoint", []string{"mypipe", "--json", "--project", "proj1"}, "application/json", wireBody, "", true},
 	}
-	if gotQuery != "" {
-		t.Errorf("query = %q, want empty (no format param)", gotQuery)
-	}
-	// Byte-for-byte fidelity: exactly the server's body, one trailing
-	// newline — not zero (would mean truncation) and not two (would mean
-	// datuplet added its own on top of the encoder's, printing a blank
-	// line after the JSON).
-	if out != wireBody {
-		t.Errorf("stdout = %q, want server body verbatim (byte-for-byte): %q", out, wireBody)
-	}
-	if strings.HasSuffix(out, "\n\n") {
-		t.Errorf("stdout = %q, ends with two newlines; want exactly one (no extra fmt.Println newline)", out)
-	}
-	var decoded pipelineDetailJSON
-	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
-		t.Fatalf("output does not decode as pipelineDetailJSON: %v", err)
-	}
-	if string(decoded.Doc) != `{"name":"mypipe","stages":[]}` {
-		t.Errorf("Doc = %s, want the raw doc object", decoded.Doc)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotQuery string
+			srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
+				onGet: func(w http.ResponseWriter, r *http.Request) {
+					gotQuery = r.URL.RawQuery
+					w.Header().Set("Content-Type", tc.contentType)
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(tc.body))
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
+
+			var runErr error
+			out := captureStdout(t, func() {
+				runErr = runPipelineGet(tc.args)
+			})
+			if runErr != nil {
+				t.Fatalf("runPipelineGet: %v", runErr)
+			}
+			if gotQuery != tc.wantQuery {
+				t.Errorf("query = %q, want %q", gotQuery, tc.wantQuery)
+			}
+			// Byte-for-byte fidelity: exactly the server's body — for JSON, one
+			// trailing newline: not zero (truncation) and not two (datuplet
+			// added its own on top of the encoder's).
+			if out != tc.body {
+				t.Errorf("stdout = %q, want server body verbatim (byte-for-byte): %q", out, tc.body)
+			}
+			if !tc.asJSON {
+				return
+			}
+			if strings.HasSuffix(out, "\n\n") {
+				t.Errorf("stdout = %q, ends with two newlines; want exactly one (no extra fmt.Println newline)", out)
+			}
+			var decoded pipelineDetailJSON
+			if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+				t.Fatalf("output does not decode as pipelineDetailJSON: %v", err)
+			}
+			if string(decoded.Doc) != `{"name":"mypipe","stages":[]}` {
+				t.Errorf("Doc = %s, want the raw doc object", decoded.Doc)
+			}
+		})
 	}
 }
 
-// TestRunPipelinePutJSONBodySendsJSONContentType pins the put content-type
-// sniffing: a `{`-prefixed body must be sent as application/json.
-func TestRunPipelinePutJSONBodySendsJSONContentType(t *testing.T) {
-	var gotContentType string
-	var gotBody []byte
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onPut: func(w http.ResponseWriter, r *http.Request) {
-			gotContentType = r.Header.Get("Content-Type")
-			gotBody, _ = io.ReadAll(r.Body)
-			w.WriteHeader(http.StatusNoContent)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+// TestRunPipelinePutSendsSniffedContentType pins the put content-type
+// sniffing: a `{`-prefixed body must be sent as application/json, a YAML body
+// as application/yaml, and the body goes over the wire unchanged.
+func TestRunPipelinePutSendsSniffedContentType(t *testing.T) {
+	tests := []struct {
+		name            string
+		file            string
+		content         string
+		wantContentType string
+	}{
+		{"json body", "pipe.json", `{"name":"mypipe","stages":[]}`, "application/json"},
+		{"yaml body", "pipe.yaml", "name: mypipe\nstages: []\n", "application/yaml"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotContentType string
+			var gotBody []byte
+			srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
+				onPut: func(w http.ResponseWriter, r *http.Request) {
+					gotContentType = r.Header.Get("Content-Type")
+					gotBody, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusNoContent)
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
 
-	dir := t.TempDir()
-	f := filepath.Join(dir, "pipe.json")
-	const content = `{"name":"mypipe","stages":[]}`
-	if err := os.WriteFile(f, []byte(content), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
+			f := filepath.Join(t.TempDir(), tc.file)
+			if err := os.WriteFile(f, []byte(tc.content), 0o644); err != nil {
+				t.Fatalf("write temp file: %v", err)
+			}
 
-	var runErr error
-	captureStdout(t, func() {
-		runErr = runPipelinePut([]string{"-f", f, "--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelinePut: %v", runErr)
-	}
-	if gotContentType != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", gotContentType)
-	}
-	if string(gotBody) != content {
-		t.Errorf("body sent = %q, want %q", gotBody, content)
+			var runErr error
+			captureStdout(t, func() {
+				runErr = runPipelinePut([]string{"-f", f, "--project", "proj1"})
+			})
+			if runErr != nil {
+				t.Fatalf("runPipelinePut: %v", runErr)
+			}
+			if gotContentType != tc.wantContentType {
+				t.Errorf("Content-Type = %q, want %q", gotContentType, tc.wantContentType)
+			}
+			if string(gotBody) != tc.content {
+				t.Errorf("body sent = %q, want %q", gotBody, tc.content)
+			}
+		})
 	}
 }
 
-// TestRunPipelinePutYAMLBodySendsYAMLContentType is the YAML-body mirror
-// of the JSON test above.
-func TestRunPipelinePutYAMLBodySendsYAMLContentType(t *testing.T) {
-	var gotContentType string
-	var gotBody []byte
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onPut: func(w http.ResponseWriter, r *http.Request) {
-			gotContentType = r.Header.Get("Content-Type")
-			gotBody, _ = io.ReadAll(r.Body)
-			w.WriteHeader(http.StatusNoContent)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+// TestRunPipelinePutNameErrorsLocally verifies the positional-vs-doc-name
+// mismatch and the missing-name case are caught before any network call — no
+// --remote/env is configured here, so a false pass would surface as a network
+// dial error rather than the expected one. The no-name error must point at
+// the doc's `name` field, not the old metadata.name.
+func TestRunPipelinePutNameErrorsLocally(t *testing.T) {
+	tests := []struct {
+		name       string
+		doc        string
+		posArgs    []string
+		wantSuffix string
+		wantHas    string
+	}{
+		{"positional name mismatch", "name: foo\nstages: []\n", []string{"bar"}, "", "mismatch"},
+		{"no name anywhere", "stages: []\n", nil, "set name in the doc", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := filepath.Join(t.TempDir(), "pipe.yaml")
+			if err := os.WriteFile(f, []byte(tc.doc), 0o644); err != nil {
+				t.Fatalf("write temp file: %v", err)
+			}
 
-	dir := t.TempDir()
-	f := filepath.Join(dir, "pipe.yaml")
-	const content = "name: mypipe\nstages: []\n"
-	if err := os.WriteFile(f, []byte(content), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
-
-	var runErr error
-	captureStdout(t, func() {
-		runErr = runPipelinePut([]string{"-f", f, "--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelinePut: %v", runErr)
-	}
-	if gotContentType != "application/yaml" {
-		t.Errorf("Content-Type = %q, want application/yaml", gotContentType)
-	}
-	if string(gotBody) != content {
-		t.Errorf("body sent = %q, want %q", gotBody, content)
+			err := runPipelinePut(append(tc.posArgs, "-f", f))
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if tc.wantHas != "" && !strings.Contains(err.Error(), tc.wantHas) {
+				t.Errorf("error = %q, want it to mention %q", err.Error(), tc.wantHas)
+			}
+			if tc.wantSuffix != "" && !strings.HasSuffix(err.Error(), tc.wantSuffix) {
+				t.Errorf("error = %q, want suffix %q", err.Error(), tc.wantSuffix)
+			}
+		})
 	}
 }
 
-// TestRunPipelinePutNameMismatchErrorsLocally verifies the positional-vs-
-// doc-name mismatch is caught before any network call — no --remote/env is
-// configured here, so a false pass would surface as a network dial error
-// (not a mismatch error) rather than a false positive.
-func TestRunPipelinePutNameMismatchErrorsLocally(t *testing.T) {
-	dir := t.TempDir()
-	f := filepath.Join(dir, "pipe.yaml")
-	if err := os.WriteFile(f, []byte("name: foo\nstages: []\n"), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
-
-	err := runPipelinePut([]string{"bar", "-f", f})
-	if err == nil {
-		t.Fatal("expected a mismatch error, got nil")
-	}
-	if !strings.Contains(err.Error(), "mismatch") {
-		t.Errorf("error = %q, want it to mention mismatch", err.Error())
-	}
-}
-
-// TestRunPipelinePutNoNameErrors pins the updated no-name error wording:
-// it must now point at the doc's `name` field, not the old metadata.name.
-func TestRunPipelinePutNoNameErrors(t *testing.T) {
-	dir := t.TempDir()
-	f := filepath.Join(dir, "pipe.yaml")
-	if err := os.WriteFile(f, []byte("stages: []\n"), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
-
-	err := runPipelinePut([]string{"-f", f})
-	if err == nil {
-		t.Fatal("expected an error, got nil")
-	}
-	if !strings.HasSuffix(err.Error(), "set name in the doc") {
-		t.Errorf("error = %q, want suffix %q", err.Error(), "set name in the doc")
-	}
-}
-
-// TestRunPipelineListRendersDescriptionColumn pins the S6 list-description
-// contract: a DESCRIPTION column appears when at least one item carries a
-// non-empty description.
-func TestRunPipelineListRendersDescriptionColumn(t *testing.T) {
-	const listBody = `[
+// TestRunPipelineListDescriptionColumn pins the S6 list-description contract:
+// a DESCRIPTION column appears when at least one item carries a non-empty
+// description, and an older server (or an all-empty-description response)
+// keeps the original two-column table.
+func TestRunPipelineListDescriptionColumn(t *testing.T) {
+	tests := []struct {
+		name            string
+		body            string
+		wantDescription bool
+	}{
+		{"column rendered when a description exists", `[
 		{"name":"p1","description":"desc one","updated_at":"2026-01-01T00:00:00Z"},
 		{"name":"p2","description":"","updated_at":"2026-01-02T00:00:00Z"}
-	]`
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onList: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(listBody))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+	]`, true},
+		{"column omitted when absent", `[{"name":"p1","updated_at":"2026-01-01T00:00:00Z"}]`, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
+				onList: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(tc.body))
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
 
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runPipelineList([]string{"--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelineList: %v", runErr)
-	}
-	if !strings.Contains(out, "DESCRIPTION") {
-		t.Errorf("output missing DESCRIPTION header:\n%s", out)
-	}
-	if !strings.Contains(out, "desc one") {
-		t.Errorf("output missing description value:\n%s", out)
-	}
-}
-
-// TestRunPipelineListOmitsDescriptionColumnWhenAbsent guards the fallback
-// path: an older server (or an all-empty-description response) keeps the
-// original two-column table.
-func TestRunPipelineListOmitsDescriptionColumnWhenAbsent(t *testing.T) {
-	const listBody = `[{"name":"p1","updated_at":"2026-01-01T00:00:00Z"}]`
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onList: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(listBody))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runPipelineList([]string{"--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelineList: %v", runErr)
-	}
-	if strings.Contains(out, "DESCRIPTION") {
-		t.Errorf("output should not contain DESCRIPTION header when absent:\n%s", out)
+			var runErr error
+			out := captureStdout(t, func() {
+				runErr = runPipelineList([]string{"--project", "proj1"})
+			})
+			if runErr != nil {
+				t.Fatalf("runPipelineList: %v", runErr)
+			}
+			if got := strings.Contains(out, "DESCRIPTION"); got != tc.wantDescription {
+				t.Errorf("DESCRIPTION header present = %v, want %v:\n%s", got, tc.wantDescription, out)
+			}
+			if tc.wantDescription && !strings.Contains(out, "desc one") {
+				t.Errorf("output missing description value:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -412,118 +360,70 @@ func TestRunPipelineListJSONPrintsBodyVerbatim(t *testing.T) {
 
 // --- validate (RFC 027 C4) ---
 
-// TestRunPipelineValidateCleanExitsZero pins the "no findings at all" case:
-// exit 0 (nil error), and the table still renders (a friendly "no findings"
-// rather than a blank table).
-func TestRunPipelineValidateCleanExitsZero(t *testing.T) {
-	var gotMethod, gotPath, gotQuery string
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onValidate: func(w http.ResponseWriter, r *http.Request) {
-			gotMethod = r.Method
-			gotPath = r.URL.Path
-			gotQuery = r.URL.RawQuery
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"findings":[]}`))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+// TestRunPipelineValidateExitCodes pins the agent-facing exit-code contract:
+// no findings and warning-only findings exit 0 (nil error; the table still
+// renders, a friendly "no findings" rather than a blank one), while any
+// error-severity finding is a non-nil error with the default exit 1 (NOT an
+// exitCodeErr, which is reserved for transport failures) with the table
+// still rendered so a human sees why.
+func TestRunPipelineValidateExitCodes(t *testing.T) {
+	tests := []struct {
+		name     string
+		resp     string
+		wantExit int
+		wantOut  []string
+	}{
+		{"clean", `{"findings":[]}`, 0, []string{"no findings"}},
+		{"warnings only", `{"findings":[{"path":"stages[0].config.foo","message":"deprecated field","severity":"warning"}]}`, 0, []string{"WARNING", "deprecated field"}},
+		{"errors", `{"findings":[{"path":"stages[0].component","message":"unknown component \"bogus\"","severity":"error"}]}`, 1, []string{"ERROR", "unknown component"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath, gotQuery string
+			srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
+				onValidate: func(w http.ResponseWriter, r *http.Request) {
+					gotMethod = r.Method
+					gotPath = r.URL.Path
+					gotQuery = r.URL.RawQuery
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(tc.resp))
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
 
-	dir := t.TempDir()
-	f := filepath.Join(dir, "pipe.yaml")
-	if err := os.WriteFile(f, []byte("name: mypipe\nstages: []\n"), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
+			f := filepath.Join(t.TempDir(), "pipe.yaml")
+			if err := os.WriteFile(f, []byte("name: mypipe\nstages: []\n"), 0o644); err != nil {
+				t.Fatalf("write temp file: %v", err)
+			}
 
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runPipelineValidate([]string{"-f", f, "--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelineValidate: %v (want nil — exit 0)", runErr)
-	}
-	if gotMethod != http.MethodPost {
-		t.Errorf("method = %q, want POST", gotMethod)
-	}
-	if !strings.HasSuffix(gotPath, "/pipelines/validate") {
-		t.Errorf("path = %q, want suffix /pipelines/validate", gotPath)
-	}
-	if gotQuery != "" {
-		t.Errorf("query = %q, want empty (no --name given)", gotQuery)
-	}
-	if !strings.Contains(out, "no findings") {
-		t.Errorf("output = %q, want a friendly no-findings message", out)
-	}
-}
-
-// TestRunPipelineValidateWarningsOnlyExitsZero pins the core agent-facing
-// contract: warning-severity findings render, but the command still exits 0
-// (nil error) since none are error-severity.
-func TestRunPipelineValidateWarningsOnlyExitsZero(t *testing.T) {
-	const respBody = `{"findings":[{"path":"stages[0].config.foo","message":"deprecated field","severity":"warning"}]}`
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onValidate: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(respBody))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	dir := t.TempDir()
-	f := filepath.Join(dir, "pipe.yaml")
-	if err := os.WriteFile(f, []byte("name: mypipe\nstages: []\n"), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runPipelineValidate([]string{"-f", f, "--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runPipelineValidate: %v (want nil — warnings alone must still exit 0)", runErr)
-	}
-	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "deprecated field") {
-		t.Errorf("output = %q, want the warning rendered", out)
-	}
-}
-
-// TestRunPipelineValidateErrorsExitsOne pins the error-severity contract:
-// a non-nil error (default exit 1 via main.go) when any finding is
-// error-severity, with the table still rendered so a human sees why.
-func TestRunPipelineValidateErrorsExitsOne(t *testing.T) {
-	const respBody = `{"findings":[{"path":"stages[0].component","message":"unknown component \"bogus\"","severity":"error"}]}`
-	srv := newPipelineFakeServer(t, pipelineFakeBehaviour{
-		onValidate: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(respBody))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	dir := t.TempDir()
-	f := filepath.Join(dir, "pipe.yaml")
-	if err := os.WriteFile(f, []byte("name: mypipe\nstages: []\n"), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runPipelineValidate([]string{"-f", f, "--project", "proj1"})
-	})
-	if runErr == nil {
-		t.Fatal("runPipelineValidate: expected a non-nil error (exit 1) when an error-severity finding exists")
-	}
-	var ece *exitCodeErr
-	if errors.As(runErr, &ece) {
-		t.Errorf("error = %v, must NOT be an exitCodeErr — error findings are exit 1 (the default), not a transport failure", runErr)
-	}
-	if !strings.Contains(out, "ERROR") || !strings.Contains(out, "unknown component") {
-		t.Errorf("output = %q, want the error finding rendered", out)
+			var runErr error
+			out := captureStdout(t, func() {
+				runErr = runPipelineValidate([]string{"-f", f, "--project", "proj1"})
+			})
+			if code := exitCodeOf(runErr); code != tc.wantExit {
+				t.Fatalf("exit code = %d, want %d (err = %v)", code, tc.wantExit, runErr)
+			}
+			var ece *exitCodeErr
+			if errors.As(runErr, &ece) {
+				t.Errorf("error = %v, must NOT be an exitCodeErr — findings are exit 0/1, not a transport failure", runErr)
+			}
+			if gotMethod != http.MethodPost {
+				t.Errorf("method = %q, want POST", gotMethod)
+			}
+			if !strings.HasSuffix(gotPath, "/pipelines/validate") {
+				t.Errorf("path = %q, want suffix /pipelines/validate", gotPath)
+			}
+			if gotQuery != "" {
+				t.Errorf("query = %q, want empty (no --name given)", gotQuery)
+			}
+			for _, want := range tc.wantOut {
+				if !strings.Contains(out, want) {
+					t.Errorf("output = %q, want it to contain %q", out, want)
+				}
+			}
+		})
 	}
 }
 
