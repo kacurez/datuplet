@@ -12,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	sdk "github.com/datuplet/datuplet/sdk/go"
 )
 
 // mustNewInferringSink builds an InferringSink and fails the test immediately
@@ -639,6 +640,53 @@ func TestInferringSink_DeclaredValues(t *testing.T) {
 				if rows[i]["n"] != want {
 					t.Errorf("row%d n = %v (%T), want %v (%T)", i, rows[i]["n"], rows[i]["n"], want, want)
 				}
+			}
+		})
+	}
+}
+
+// TestFacadeSinks_ZeroRecordsNeverOpenWriter: with zero records the lazy-open
+// guarantee holds for each façade (StringSink, InferringSink in inference and
+// in declared mode, whose core is built immediately): the writer factory is
+// never invoked, Finish succeeds with no rows and no CloseResult, and Writer()
+// is nil afterwards. The core Sink tests cannot reach the façades' own
+// lazy-core `Writer()` branch.
+func TestFacadeSinks_ZeroRecordsNeverOpenWriter(t *testing.T) {
+	type facade interface {
+		Finish() (int64, *sdk.CloseResult, error)
+		Writer() ChunkWriter
+	}
+	cases := []struct {
+		name  string
+		build func(t *testing.T, open func() (ChunkWriter, error)) facade
+	}{
+		{"StringSink", func(t *testing.T, open func() (ChunkWriter, error)) facade {
+			return NewStringSink(context.Background(), open, WithBatchRows(4))
+		}},
+		{"InferringSink inference mode", func(t *testing.T, open func() (ChunkWriter, error)) facade {
+			return mustNewInferringSink(t, context.Background(), open, WithBatchRows(4))
+		}},
+		{"InferringSink declared mode", func(t *testing.T, open func() (ChunkWriter, error)) facade {
+			return mustNewInferringSink(t, context.Background(), open,
+				WithTypedColumns([]TypedColumn{{Name: "a", Type: "int"}}), WithBatchRows(4))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opened := false
+			sink := tc.build(t, func() (ChunkWriter, error) {
+				opened = true
+				return &fakeWriter{}, nil
+			})
+			rows, cr, err := sink.Finish()
+			if err != nil || rows != 0 || cr != nil {
+				t.Fatalf("rows=%d cr=%v err=%v", rows, cr, err)
+			}
+			if opened {
+				t.Fatal("writer must not be opened for zero records")
+			}
+			if sink.Writer() != nil {
+				t.Fatal("Writer() must be nil for zero records")
 			}
 		})
 	}
