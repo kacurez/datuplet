@@ -32,6 +32,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Unit and e2e test suites consolidated into table-driven tests; the e2e
   suite keeps one scenario per deployment behaviour.
+- **Bundled object store image is now `docker.io/pgsty/silo`** (Pigsty's
+  maintained AGPL-3.0 fork of the MinIO server, pinned by tag + digest in
+  `charts/datuplet-infra/values.yaml` for both `minio.image` and
+  `minio.mcImage`). MinIO Inc. removed the community `minio/minio` and
+  `minio/mc` images from Docker Hub (2026-09-11) and closed quay.io to
+  anonymous pulls (2026-09-24), which broke every fresh install, `deploy-local`
+  and e2e. Same S3 API and on-disk format; existing MinIO volumes are read in
+  place.
 
 ## [0.2.1] — 2026-05-19
 
