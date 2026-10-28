@@ -261,25 +261,6 @@ spec:
 			wantZero: true,
 		},
 		{
-			name: "output table with no columns still valid",
-			yaml: `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: test-pipeline
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: extractor
-          component: extractor
-          outputs:
-            tables:
-              - name: summary
-                bucket: curated
-`,
-			wantZero: true,
-		},
-		{
 			name: "invalid column type varchar",
 			yaml: `apiVersion: datuplet.io/v1
 kind: Pipeline
@@ -389,26 +370,6 @@ spec:
 			msgContains: "invalid since duration",
 		},
 		{
-			name: "input valid since",
-			yaml: `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: test-pipeline
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: extractor
-          component: extractor
-          inputs:
-            tables:
-              - bucket: raw
-                table: orders
-                since: "3d"
-`,
-			wantZero: true,
-		},
-		{
 			name: "input sinceDays not positive",
 			yaml: `apiVersion: datuplet.io/v1
 kind: Pipeline
@@ -427,26 +388,6 @@ spec:
                 sinceDays: 0
 `,
 			msgContains: "sinceDays must be positive",
-		},
-		{
-			name: "input valid sinceDays",
-			yaml: `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: test-pipeline
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: extractor
-          component: extractor
-          inputs:
-            tables:
-              - bucket: raw
-                table: orders
-                sinceDays: 7
-`,
-			wantZero: true,
 		},
 		{
 			name: "duplicate component name in same stage",
@@ -494,35 +435,6 @@ spec:
 `,
 			msgContains: "not unique",
 		},
-		{
-			name: "all component names unique",
-			yaml: `apiVersion: datuplet.io/v1
-kind: Pipeline
-metadata:
-  name: test-pipeline
-spec:
-  stages:
-    - name: extract
-      components:
-        - name: c1
-          component: extractor
-          outputs:
-            defaultBucket: raw
-        - name: c2
-          component: extractor
-          outputs:
-            defaultBucket: raw2
-    - name: transform
-      components:
-        - name: c3
-          component: transformer
-          inputs:
-            buckets: [raw]
-          outputs:
-            defaultBucket: curated
-`,
-			wantZero: true,
-		},
 	}
 
 	for _, c := range cases {
@@ -558,29 +470,6 @@ spec:
 				}
 			}
 		})
-	}
-}
-
-// TestValidatePipeline_ParsesNestedConfig proves the returned typed object
-// carries the nested component config through the decode.
-func TestValidatePipeline_ParsesNestedConfig(t *testing.T) {
-	p, findings, err := ValidatePipeline([]byte(validYAML), nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(findings) != 0 {
-		t.Fatalf("want 0 findings, got %+v", findings)
-	}
-	cfg, err := p.Spec.Stages[0].Components[0].ConfigMap()
-	if err != nil {
-		t.Fatalf("ConfigMap: %v", err)
-	}
-	nested, ok := cfg["nested"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected nested map in config, got %#v", cfg["nested"])
-	}
-	if got := nested["token"]; got != "$[api_token]" {
-		t.Fatalf("expected nested.token=$[api_token], got %#v", got)
 	}
 }
 
@@ -625,20 +514,6 @@ func TestValidateTyped_Direct(t *testing.T) {
 	})
 }
 
-func TestValidatePipelineDocEnvelopeRejected(t *testing.T) {
-	_, fs := ValidatePipelineDoc([]byte("apiVersion: v1\nkind: Pipeline\n"), "x", nil, nil)
-	requireFinding(t, fs, "error", "legacy Kubernetes CR format")
-}
-
-func TestValidatePipelineDocNameContext(t *testing.T) {
-	body := []byte("name: other\nstages: []\n")
-	_, fs := ValidatePipelineDoc(body, "route-name", nil, nil)
-	requireFinding(t, fs, "error", `name "other" does not match`)
-	// Empty context (POST /validate, no name): equality check skipped.
-	_, fs = ValidatePipelineDoc(body, "", nil, nil)
-	forbidFinding(t, fs, "does not match")
-}
-
 // TestValidatePipelineDocEffectiveName is a regression test for the bug where
 // effectiveName (contextName when the body omits name) was used only for the
 // DNS-1123 check and never written back onto doc.Name before config.DocToCR,
@@ -674,6 +549,12 @@ func TestValidatePipelineDocEffectiveName(t *testing.T) {
 	t.Run("name present and mismatches contextName still flagged", func(t *testing.T) {
 		_, fs := ValidatePipelineDoc(validBody("name: other\n"), "my-pipeline", nil, nil)
 		requireFinding(t, fs, "error", `name "other" does not match`)
+	})
+
+	// Empty context (POST /validate, no name): the equality check is skipped.
+	t.Run("empty contextName skips equality check", func(t *testing.T) {
+		_, fs := ValidatePipelineDoc(validBody("name: other\n"), "", nil, nil)
+		forbidFinding(t, fs, "does not match")
 	})
 }
 

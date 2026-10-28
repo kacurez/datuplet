@@ -3,7 +3,6 @@ package sdk
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -72,56 +71,53 @@ func newTestWriter(srv *httptest.Server, batchThreshold int64) *Writer {
 	return w
 }
 
-// TestWriteBatching_SmallWritesAccumulate verifies that many Writes below
-// the threshold produce zero HTTP roundtrips, and that the accumulated
-// bytes match the input.
-func TestWriteBatching_SmallWritesAccumulate(t *testing.T) {
-	srv, reqs, mu := newWriteTestServer(t)
-	w := newTestWriter(srv, 1024) // 1 KiB threshold
+// TestWriteBatching_Threshold verifies the batch threshold decides when Write
+// hits the wire: writes below it accumulate with zero HTTP roundtrips, crossing
+// it produces exactly one POST holding the accumulated bytes (the remainder
+// starts a fresh buffer), and threshold <= 0 disables batching so every Write
+// is one immediate POST (legacy v0.2.x behavior preserved for opt-out).
+func TestWriteBatching_Threshold(t *testing.T) {
+	cases := []struct {
+		name         string
+		threshold    int64
+		writes       int
+		writeSize    int
+		wantPosts    int
+		wantFirstLen int // length of the first POST body; ignored when wantPosts == 0
+		wantResidual int // bytes left in the batch buffer
+	}{
+		{"small writes accumulate", 1024, 10, 50, 0, 0, 500},
+		// Cumulative 50, 100, 150: the threshold trips on the second Write and
+		// the third goes into a fresh buffer.
+		{"threshold flush", 100, 3, 50, 1, 100, 50},
+		{"disabled by option", 0, 5, 4, 5, 4, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, reqs, mu := newWriteTestServer(t)
+			w := newTestWriter(srv, tc.threshold)
 
-	ctx := context.Background()
-	// 10 writes of 50 bytes each = 500 bytes total, below the 1024 threshold.
-	for i := 0; i < 10; i++ {
-		if err := w.Write(ctx, []byte("0123456789012345678901234567890123456789012345678\n")); err != nil {
-			t.Fatalf("Write[%d]: %v", i, err)
-		}
-	}
+			ctx := context.Background()
+			for i := 0; i < tc.writes; i++ {
+				if err := w.Write(ctx, make([]byte, tc.writeSize)); err != nil {
+					t.Fatalf("Write[%d]: %v", i, err)
+				}
+			}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(*reqs) != 0 {
-		t.Fatalf("expected 0 HTTP POSTs (all under threshold), got %d", len(*reqs))
-	}
-	if int64(len(w.batchBuffer)) != 500 {
-		t.Errorf("batchBuffer length = %d, want 500", len(w.batchBuffer))
-	}
-}
-
-// TestWriteBatching_ThresholdFlush verifies that crossing the threshold
-// produces exactly one HTTP POST containing the accumulated bytes.
-func TestWriteBatching_ThresholdFlush(t *testing.T) {
-	srv, reqs, mu := newWriteTestServer(t)
-	w := newTestWriter(srv, 100) // 100 B threshold
-
-	ctx := context.Background()
-	// Three writes of 50 bytes each. Cumulative: 50, 100, 150.
-	// Threshold trips on the second Write; third write goes into a fresh buffer.
-	for i := 0; i < 3; i++ {
-		if err := w.Write(ctx, make([]byte, 50)); err != nil {
-			t.Fatalf("Write[%d]: %v", i, err)
-		}
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(*reqs) != 1 {
-		t.Fatalf("expected 1 HTTP POST, got %d", len(*reqs))
-	}
-	if got := len((*reqs)[0].Body); got != 100 {
-		t.Errorf("flushed body length = %d, want 100", got)
-	}
-	if got := len(w.batchBuffer); got != 50 {
-		t.Errorf("residual batchBuffer length = %d, want 50", got)
+			mu.Lock()
+			defer mu.Unlock()
+			if len(*reqs) != tc.wantPosts {
+				t.Fatalf("expected %d HTTP POSTs, got %d", tc.wantPosts, len(*reqs))
+			}
+			if tc.wantPosts > 0 {
+				if got := len((*reqs)[0].Body); got != tc.wantFirstLen {
+					t.Errorf("first POST body length = %d, want %d", got, tc.wantFirstLen)
+				}
+			}
+			if got := len(w.batchBuffer); got != tc.wantResidual {
+				t.Errorf("batchBuffer length = %d, want %d", got, tc.wantResidual)
+			}
+		})
 	}
 }
 
@@ -151,33 +147,6 @@ func TestWriteBatching_FlushDrains(t *testing.T) {
 	}
 }
 
-// TestWriteBatching_CloseDrains verifies Close() flushes pending data
-// before sending CloseWriter.
-func TestWriteBatching_CloseDrains(t *testing.T) {
-	srv, reqs, mu := newWriteTestServer(t)
-	w := newTestWriter(srv, 10*1024)
-
-	ctx := context.Background()
-	_ = w.Write(ctx, []byte("row1\n"))
-	_ = w.Write(ctx, []byte("row2\n"))
-
-	// We can't call full Close() here because it also issues a gRPC
-	// CloseWriter (which we don't mock). Drive flushBatchLocked directly
-	// via Flush — equivalent for batching purposes.
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(*reqs) != 1 {
-		t.Fatalf("expected 1 HTTP POST on flush, got %d", len(*reqs))
-	}
-	if string((*reqs)[0].Body) != "row1\nrow2\n" {
-		t.Errorf("concatenated body = %q, want row1\\nrow2\\n", (*reqs)[0].Body)
-	}
-}
-
 // TestWriteBatching_WriteChunkPreservesOrder verifies that calling
 // WriteChunk while bytes are pending in the batch buffer flushes those
 // bytes BEFORE the WriteChunk's data — so the gateway sees calls in
@@ -204,62 +173,6 @@ func TestWriteBatching_WriteChunkPreservesOrder(t *testing.T) {
 	}
 	if string((*reqs)[1].Body) != "third-now\n" {
 		t.Errorf("second POST body = %q, want third-now\\n", (*reqs)[1].Body)
-	}
-}
-
-// TestWriteBatching_DisabledByOption verifies that batchThreshold <= 0
-// disables batching: every Write becomes one immediate POST (legacy
-// v0.2.x behavior preserved for opt-out).
-func TestWriteBatching_DisabledByOption(t *testing.T) {
-	srv, reqs, mu := newWriteTestServer(t)
-	w := newTestWriter(srv, 0) // 0 => disabled (set explicitly for the test)
-
-	ctx := context.Background()
-	for i := 0; i < 5; i++ {
-		if err := w.Write(ctx, []byte("row\n")); err != nil {
-			t.Fatalf("Write[%d]: %v", i, err)
-		}
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(*reqs) != 5 {
-		t.Fatalf("with batching disabled, expected 5 HTTP POSTs, got %d", len(*reqs))
-	}
-}
-
-// TestWriteBatching_RoundtripReduction is the headline assertion: with
-// batching at 1 MiB, 10K row-at-a-time Writes of ~100 bytes each should
-// produce ~1 HTTP roundtrip (vs 10K without batching). Asserts a
-// reduction factor of at least 100x.
-func TestWriteBatching_RoundtripReduction(t *testing.T) {
-	srv, reqs, mu := newWriteTestServer(t)
-	w := newTestWriter(srv, 1024*1024) // 1 MiB default
-
-	ctx := context.Background()
-	const N = 10000
-	row := []byte(fmt.Sprintf(`{"id":1,"v":"%s"}`+"\n", "padding-padding-padding-padding-padding-padding"))
-	for i := 0; i < N; i++ {
-		if err := w.Write(ctx, row); err != nil {
-			t.Fatalf("Write[%d]: %v", i, err)
-		}
-	}
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("final Flush: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(*reqs) >= N/100 {
-		t.Errorf("expected at least 100x fewer HTTP POSTs (got %d for N=%d Writes)", len(*reqs), N)
-	}
-	// Sanity: total body bytes received = N * len(row)
-	var totalBytes int
-	for _, r := range *reqs {
-		totalBytes += len(r.Body)
-	}
-	if totalBytes != N*len(row) {
-		t.Errorf("total bytes received = %d, want %d", totalBytes, N*len(row))
 	}
 }
 

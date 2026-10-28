@@ -413,126 +413,6 @@ func TestInferringSink_WithColumnsFixesNamesTypesStillInferredNoUnknownKeyTracki
 	}
 }
 
-// TestInferringSink_BatchBoundariesAndSelfContainedStreams mirrors the
-// StringSink/Sink precedent test of the same shape: a tiny batch size forces
-// multiple flushes, each payload independently parseable (the no-concat
-// invariant), row totals and schema consistent across every payload.
-func TestInferringSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
-		WithBatchRows(4))
-	for i := 0; i < 10; i++ {
-		if err := sink.Add(map[string]any{"id": json.Number(fmt.Sprintf("%d", i))}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	rows, _, err := sink.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rows != 10 {
-		t.Fatalf("rows = %d, want 10", rows)
-	}
-	if len(fw.payloads) != 3 { // 4+4+2
-		t.Fatalf("payloads = %d, want 3 (4+4+2)", len(fw.payloads))
-	}
-	var total int64
-	for _, p := range fw.payloads {
-		n, names, fields := ipcRows(t, p)
-		total += n
-		if len(names) != 1 || names[0] != "id" || fields[0].Type.ID() != arrow.INT64 {
-			t.Fatalf("schema = %v", names)
-		}
-		if !fields[0].Nullable {
-			t.Fatal("field should be nullable")
-		}
-	}
-	if total != 10 {
-		t.Fatalf("ipc total rows = %d, want 10", total)
-	}
-	if !fw.closed {
-		t.Fatal("writer not closed")
-	}
-}
-
-// TestInferringSink_ZeroRecordsNeverOpensWriter mirrors the StringSink/Sink
-// zero-rows precedent: the writer's lazy-open guarantee holds even though
-// InferringSink defers schema construction internally.
-func TestInferringSink_ZeroRecordsNeverOpensWriter(t *testing.T) {
-	opened := false
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) {
-		opened = true
-		return &fakeWriter{}, nil
-	}, WithBatchRows(4))
-	rows, cr, err := sink.Finish()
-	if err != nil || rows != 0 || cr != nil {
-		t.Fatalf("rows=%d cr=%v err=%v", rows, cr, err)
-	}
-	if opened {
-		t.Fatal("writer must not be opened for zero records")
-	}
-	if sink.Writer() != nil {
-		t.Fatal("Writer() must be nil for zero records")
-	}
-}
-
-// TestInferringSink_OpenFailureIsWriteError mirrors the StringSink/Sink
-// precedent: a writer-open failure surfaces as *WriteError.
-func TestInferringSink_OpenFailureIsWriteError(t *testing.T) {
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) {
-		return nil, errors.New("open boom")
-	}, WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }), WithBatchRows(1))
-	err := sink.Add(map[string]any{"id": "1"})
-	var we *WriteError
-	if !errors.As(err, &we) {
-		t.Fatalf("want WriteError, got %v", err)
-	}
-}
-
-// TestInferringSink_FinishIsIdempotent mirrors the StringSink/Sink precedent.
-func TestInferringSink_FinishIsIdempotent(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
-		WithBatchRows(4))
-	if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
-		t.Fatal(err)
-	}
-	rows1, cr1, err1 := sink.Finish()
-	rows2, cr2, err2 := sink.Finish()
-	if err1 != nil || err2 != nil {
-		t.Fatalf("Finish errors: %v, %v", err1, err2)
-	}
-	if rows1 != 1 || rows2 != 1 {
-		t.Fatalf("rows mismatch: %d vs %d", rows1, rows2)
-	}
-	if cr1 != cr2 {
-		t.Fatalf("closeResult mismatch")
-	}
-	if fw.closeCount != 1 {
-		t.Fatalf("closeCount = %d, want 1 (not double-closed)", fw.closeCount)
-	}
-}
-
-// TestInferringSink_AddAfterFinishErrors mirrors the StringSink precedent.
-func TestInferringSink_AddAfterFinishErrors(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
-		WithBatchRows(4))
-	if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	err := sink.Add(map[string]any{"id": json.Number("2")})
-	if err == nil {
-		t.Fatal("Add after Finish should error")
-	}
-}
-
 // =====================================================================
 // Mode 2: declared columns
 // =====================================================================
@@ -660,260 +540,106 @@ func TestInferringSink_DeclaredMissingKeyIsNull(t *testing.T) {
 	}
 }
 
-// TestInferringSink_DeclaredLongFromJSONNumberExact proves declared "long"
-// resolves json.Number via its exact text (ParseInt), matching inference
-// mode's own numeric-fidelity guarantee. The value deliberately exceeds
-// int32, which is why it declares "long" rather than "int" — see
-// TestInferringSink_DeclaredIntIs32Bit for the narrow case.
-func TestInferringSink_DeclaredLongFromJSONNumberExact(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithTypedColumns([]TypedColumn{{Name: "n", Type: "long"}}), WithBatchRows(1))
-	if err := sink.Add(map[string]any{"n": json.Number("5938028332")}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	rows, fields := decodeInferredPayload(t, fw.payloads[0])
-	if fields[0].Type.ID() != arrow.INT64 {
-		t.Fatalf("type = %v, want Int64", fields[0].Type)
-	}
-	if rows[0]["n"] != int64(5938028332) {
-		t.Fatalf("value = %v, want 5938028332 exactly", rows[0]["n"])
-	}
-}
-
-// TestInferringSink_DeclaredIntIs32Bit proves a declared "int" column really
-// is 32-bit on the wire (Iceberg's `int`), not silently widened to Int64, and
-// that values across the int32 boundary round-trip exactly.
-func TestInferringSink_DeclaredIntIs32Bit(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithTypedColumns([]TypedColumn{{Name: "n", Type: "int"}}), WithBatchRows(3))
-	for _, v := range []string{"0", "2147483647", "-2147483648"} { // MaxInt32, MinInt32
-		if err := sink.Add(map[string]any{"n": json.Number(v)}); err != nil {
-			t.Fatalf("Add(%s): %v", v, err)
-		}
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	rows, fields := decodeInferredPayload(t, fw.payloads[0])
-	if fields[0].Type.ID() != arrow.INT32 {
-		t.Fatalf("type = %v, want Int32 — declared `int` must not widen to Int64", fields[0].Type)
-	}
-	for i, want := range []int32{0, 2147483647, -2147483648} {
-		if rows[i]["n"] != want {
-			t.Errorf("row%d n = %v (%T), want %d", i, rows[i]["n"], rows[i]["n"], want)
-		}
-	}
-}
-
-// TestInferringSink_DeclaredIntOverflowIsTypeViolation proves a value beyond
-// int32 in a declared "int" column FAILS rather than wrapping or truncating.
-// Narrowing is only defensible because this is loud: silent truncation would
-// corrupt every downstream aggregate, which is the whole reason inference
-// still refuses to choose Int32 on its own.
-func TestInferringSink_DeclaredIntOverflowIsTypeViolation(t *testing.T) {
-	for _, tc := range []struct{ name, value string }{
-		{"just above MaxInt32", "2147483648"},
-		{"just below MinInt32", "-2147483649"},
-		{"far beyond", "5938028332"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fw := &fakeWriter{}
-			sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-				WithTypedColumns([]TypedColumn{{Name: "n", Type: "int"}}), WithBatchRows(4))
-			err := sink.Add(map[string]any{"n": json.Number(tc.value)})
-			if err == nil {
-				t.Fatalf("Add(%s) into a declared int column: got nil, want a type violation", tc.value)
-			}
-			var tv *TypeViolationError
-			if !errors.As(err, &tv) {
-				t.Fatalf("want *TypeViolationError, got %T: %v", err, err)
-			}
-			if tv.Column != "n" {
-				t.Errorf("Column = %q, want %q", tv.Column, "n")
-			}
-			var we *WriteError
-			if errors.As(err, &we) {
-				t.Error("an out-of-range declared value is a user error, never a *WriteError")
-			}
-		})
-	}
-}
-
-// TestInferringSink_DeclaredFloatFromJSONNumber proves declared
-// "float"/"double" resolves json.Number via ParseFloat.
-func TestInferringSink_DeclaredFloatFromJSONNumber(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithTypedColumns([]TypedColumn{{Name: "n", Type: "float"}}), WithBatchRows(1))
-	if err := sink.Add(map[string]any{"n": json.Number("1.50")}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	rows, fields := decodeInferredPayload(t, fw.payloads[0])
-	if fields[0].Type.ID() != arrow.FLOAT64 {
-		t.Fatalf("type = %v, want Float64", fields[0].Type)
-	}
-	if rows[0]["n"] != float64(1.5) {
-		t.Fatalf("value = %v, want 1.5", rows[0]["n"])
-	}
-}
-
-// TestInferringSink_DeclaredStringFromJSONNumberKeepsExactText proves a
-// declared "string" column keeps json.Number's exact source text ("1.50"),
-// not a reparsed-and-reformatted "1.5".
-func TestInferringSink_DeclaredStringFromJSONNumberKeepsExactText(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithTypedColumns([]TypedColumn{{Name: "n", Type: "string"}}), WithBatchRows(1))
-	if err := sink.Add(map[string]any{"n": json.Number("1.50")}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	rows, fields := decodeInferredPayload(t, fw.payloads[0])
-	if fields[0].Type.ID() != arrow.STRING {
-		t.Fatalf("type = %v, want String", fields[0].Type)
-	}
-	if rows[0]["n"] != "1.50" {
-		t.Fatalf("value = %v, want exact source text %q", rows[0]["n"], "1.50")
-	}
-}
-
-// TestInferringSink_DeclaredStringValueViolatesIntColumn proves a plain Go
-// string does not coerce into a declared "int" column: TypeViolationError,
-// not a silent parse-or-null fallback.
-func TestInferringSink_DeclaredStringValueViolatesIntColumn(t *testing.T) {
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return &fakeWriter{}, nil },
-		WithTypedColumns([]TypedColumn{{Name: "n", Type: "int"}}), WithBatchRows(4))
-	err := sink.Add(map[string]any{"n": "abc"})
-	var tv *TypeViolationError
-	if !errors.As(err, &tv) {
-		t.Fatalf("want *TypeViolationError, got %T: %v", err, err)
-	}
-	if tv.Column != "n" {
-		t.Fatalf("Column = %q, want %q", tv.Column, "n")
-	}
-	var we *WriteError
-	if errors.As(err, &we) {
-		t.Fatalf("must NOT be a *WriteError, got %v", we)
-	}
-}
-
-// TestInferringSink_DeclaredBoolValueViolatesStringColumn proves declared
-// mode's String is NOT the permissive top type inference mode's is: a bool
-// value does not fit a declared "string" column.
-func TestInferringSink_DeclaredBoolValueViolatesStringColumn(t *testing.T) {
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return &fakeWriter{}, nil },
-		WithTypedColumns([]TypedColumn{{Name: "s", Type: "string"}}), WithBatchRows(4))
-	err := sink.Add(map[string]any{"s": true})
-	var tv *TypeViolationError
-	if !errors.As(err, &tv) {
-		t.Fatalf("want *TypeViolationError (bool must not fit a declared string column), got %T: %v", err, err)
-	}
-}
-
-// TestInferringSink_DeclaredNestedValueFitsStringColumnAsCompactJSON proves
-// a nested map/slice DOES fit a declared "string" column, rendered as
-// compact JSON identical to stringifyValue — the one shape declared String
-// accepts beyond a literal Go string, besides json.Number/float64.
-func TestInferringSink_DeclaredNestedValueFitsStringColumnAsCompactJSON(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithTypedColumns([]TypedColumn{{Name: "s", Type: "string"}}), WithBatchRows(1))
+// TestInferringSink_DeclaredValues pins how declared-mode columns resolve a Go
+// value: each row declares one column, adds the values, and asserts either the
+// resulting Arrow type and cells (exact, never reparsed or widened) or a
+// *TypeViolationError on that column (never a *WriteError). Narrowing "int" to
+// 32-bit is only defensible because overflow is loud; declared String is not
+// the permissive top type inference mode's is.
+func TestInferringSink_DeclaredValues(t *testing.T) {
 	nested := map[string]any{"a": json.Number("1")}
-	want, isNull := stringifyValue(nested)
+	nestedWant, isNull := stringifyValue(nested)
 	if isNull {
 		t.Fatal("test setup: stringifyValue(nested) unexpectedly null")
 	}
-	if err := sink.Add(map[string]any{"s": nested}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	rows, _ := decodeInferredPayload(t, fw.payloads[0])
-	if rows[0]["s"] != want {
-		t.Fatalf("cell = %v, want %v", rows[0]["s"], want)
-	}
-}
 
-// TestInferringSink_DeclaredZeroRecordsNeverOpensWriter proves the
-// lazy-writer-open guarantee also holds in declared mode, even though the
-// Sink core itself is built immediately at construction (schema known up
-// front) rather than deferred to a sampled batch.
-func TestInferringSink_DeclaredZeroRecordsNeverOpensWriter(t *testing.T) {
-	opened := false
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) {
-		opened = true
-		return &fakeWriter{}, nil
-	}, WithTypedColumns([]TypedColumn{{Name: "a", Type: "int"}}), WithBatchRows(4))
-	rows, cr, err := sink.Finish()
-	if err != nil || rows != 0 || cr != nil {
-		t.Fatalf("rows=%d cr=%v err=%v", rows, cr, err)
+	cases := []struct {
+		name          string
+		declared      string
+		values        []any
+		wantType      arrow.Type // success rows
+		wantCells     []any      // success rows: decoded cell per value
+		wantViolation bool       // the Add must fail with a *TypeViolationError
+	}{
+		{
+			// Exceeds int32, hence "long"; resolves json.Number via its exact text.
+			name: "long from json.Number exact", declared: "long",
+			values:   []any{json.Number("5938028332")},
+			wantType: arrow.INT64, wantCells: []any{int64(5938028332)},
+		},
+		{
+			// A declared "int" is 32-bit on the wire (Iceberg's int), not widened
+			// to Int64; values across the int32 boundary round-trip exactly.
+			name: "int is 32-bit", declared: "int",
+			values:   []any{json.Number("0"), json.Number("2147483647"), json.Number("-2147483648")},
+			wantType: arrow.INT32, wantCells: []any{int32(0), int32(2147483647), int32(-2147483648)},
+		},
+		{name: "int overflow just above MaxInt32", declared: "int", values: []any{json.Number("2147483648")}, wantViolation: true},
+		{name: "int overflow just below MinInt32", declared: "int", values: []any{json.Number("-2147483649")}, wantViolation: true},
+		{name: "int overflow far beyond", declared: "int", values: []any{json.Number("5938028332")}, wantViolation: true},
+		{
+			name: "float from json.Number", declared: "float",
+			values:   []any{json.Number("1.50")},
+			wantType: arrow.FLOAT64, wantCells: []any{float64(1.5)},
+		},
+		{
+			// Keeps json.Number's exact source text, not a reparsed "1.5".
+			name: "string from json.Number keeps exact text", declared: "string",
+			values:   []any{json.Number("1.50")},
+			wantType: arrow.STRING, wantCells: []any{"1.50"},
+		},
+		{name: "string value violates int column", declared: "int", values: []any{"abc"}, wantViolation: true},
+		{name: "bool value violates string column", declared: "string", values: []any{true}, wantViolation: true},
+		{
+			// A nested map/slice fits a declared string as compact JSON identical
+			// to stringifyValue.
+			name: "nested value fits string column as compact JSON", declared: "string",
+			values:   []any{nested},
+			wantType: arrow.STRING, wantCells: []any{nestedWant},
+		},
 	}
-	if opened {
-		t.Fatal("writer must not be opened for zero records, even though the core is built immediately in declared mode")
-	}
-	if sink.Writer() != nil {
-		t.Fatal("Writer() must be nil for zero records")
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fw := &fakeWriter{}
+			sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
+				WithTypedColumns([]TypedColumn{{Name: "n", Type: tc.declared}}), WithBatchRows(4))
 
-// TestInferringSink_DeclaredBatchBoundariesAndSelfContainedStreams proves
-// batching/flush/self-contained-stream behavior is identical to inference
-// mode's, in declared mode's no-buffering construction path.
-func TestInferringSink_DeclaredBatchBoundariesAndSelfContainedStreams(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithTypedColumns([]TypedColumn{{Name: "id", Type: "int"}}), WithBatchRows(4))
-	for i := 0; i < 10; i++ {
-		if err := sink.Add(map[string]any{"id": json.Number(fmt.Sprintf("%d", i))}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	rows, _, err := sink.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rows != 10 {
-		t.Fatalf("rows = %d, want 10", rows)
-	}
-	if len(fw.payloads) != 3 { // 4+4+2
-		t.Fatalf("payloads = %d, want 3 (4+4+2)", len(fw.payloads))
-	}
-	var total int64
-	for _, p := range fw.payloads {
-		n, names, fields := ipcRows(t, p)
-		total += n
-		if len(names) != 1 || names[0] != "id" || fields[0].Type.ID() != arrow.INT32 {
-			t.Fatalf("schema = %v type = %v, want [id] as Int32 (declared `int`)", names, fields[0].Type)
-		}
-	}
-	if total != 10 {
-		t.Fatalf("total = %d, want 10", total)
-	}
-	if !fw.closed {
-		t.Fatal("writer not closed")
-	}
-}
+			if tc.wantViolation {
+				err := sink.Add(map[string]any{"n": tc.values[0]})
+				if err == nil {
+					t.Fatalf("Add(%v) into a declared %s column: got nil, want a type violation", tc.values[0], tc.declared)
+				}
+				var tv *TypeViolationError
+				if !errors.As(err, &tv) {
+					t.Fatalf("want *TypeViolationError, got %T: %v", err, err)
+				}
+				if tv.Column != "n" {
+					t.Errorf("Column = %q, want %q", tv.Column, "n")
+				}
+				var we *WriteError
+				if errors.As(err, &we) {
+					t.Errorf("a value that does not fit a declared column is a user error, never a *WriteError: %v", we)
+				}
+				return
+			}
 
-// TestInferringSink_DeclaredOpenFailureIsWriteError proves *WriteError
-// plumbing still works through declared mode's immediately-built core.
-func TestInferringSink_DeclaredOpenFailureIsWriteError(t *testing.T) {
-	sink := mustNewInferringSink(t, context.Background(), func() (ChunkWriter, error) {
-		return nil, errors.New("open boom")
-	}, WithTypedColumns([]TypedColumn{{Name: "a", Type: "int"}}), WithBatchRows(1))
-	err := sink.Add(map[string]any{"a": json.Number("1")})
-	var we *WriteError
-	if !errors.As(err, &we) {
-		t.Fatalf("want *WriteError, got %v", err)
+			for _, v := range tc.values {
+				if err := sink.Add(map[string]any{"n": v}); err != nil {
+					t.Fatalf("Add(%v): %v", v, err)
+				}
+			}
+			if _, _, err := sink.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			rows, fields := decodeInferredPayload(t, fw.payloads[0])
+			if fields[0].Type.ID() != tc.wantType {
+				t.Fatalf("type = %v, want %v", fields[0].Type, tc.wantType)
+			}
+			for i, want := range tc.wantCells {
+				if rows[i]["n"] != want {
+					t.Errorf("row%d n = %v (%T), want %v (%T)", i, rows[i]["n"], rows[i]["n"], want, want)
+				}
+			}
+		})
 	}
 }

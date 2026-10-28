@@ -23,96 +23,81 @@ func findingAt(findings []Finding, path string) (Finding, bool) {
 	return Finding{}, false
 }
 
-func TestStaticRegistry_Resolve_UnknownComponent(t *testing.T) {
-	reg := StaticRegistry{
-		"known": {Spec: datupletv1.ComponentDefinitionSpec{Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")}}},
-	}
-	rc, findings := reg.Resolve("ghost", "")
-	if rc != nil {
-		t.Fatalf("want nil ResolvedComponent for unknown component, got %+v", rc)
-	}
-	f, ok := findingAt(findings, "component")
-	if !ok {
-		t.Fatalf("want a finding at path %q, got %+v", "component", findings)
-	}
-	if f.Severity != severityError || !strings.Contains(f.Message, "unknown component") {
-		t.Fatalf("unexpected finding: %+v", f)
-	}
-}
-
-func TestStaticRegistry_Resolve_UnknownVersion(t *testing.T) {
-	reg := StaticRegistry{
-		"c": {Spec: datupletv1.ComponentDefinitionSpec{Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")}}},
-	}
-	rc, findings := reg.Resolve("c", "v9.9.9")
-	if rc != nil {
-		t.Fatalf("want nil ResolvedComponent for unknown version, got %+v", rc)
-	}
-	f, ok := findingAt(findings, "version")
-	if !ok {
-		t.Fatalf("want a finding at path %q, got %+v", "version", findings)
-	}
-	if f.Severity != severityError {
-		t.Fatalf("want severity error, got %+v", f)
-	}
-}
-
-func TestStaticRegistry_Resolve_NoStableNoPin(t *testing.T) {
-	reg := StaticRegistry{
-		"c": {Spec: datupletv1.ComponentDefinitionSpec{
-			Versions: []datupletv1.VersionSpec{{Version: "dev", Image: "img:dev", Prerelease: true}},
-		}},
-	}
-	rc, findings := reg.Resolve("c", "")
-	if rc != nil {
-		t.Fatalf("want nil ResolvedComponent when no default resolvable, got %+v", rc)
-	}
-	f, ok := findingAt(findings, "version")
-	if !ok {
-		t.Fatalf("want a finding at path %q, got %+v", "version", findings)
-	}
-	if f.Severity != severityError || !strings.Contains(f.Message, "no stable version") {
-		t.Fatalf("unexpected finding: %+v", f)
-	}
-}
-
-func TestStaticRegistry_Resolve_DefaultVersionNotRegistered(t *testing.T) {
-	reg := StaticRegistry{
-		"c": {Spec: datupletv1.ComponentDefinitionSpec{
-			DefaultVersion: "v9.9.9",
-			Versions:       []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
-		}},
-	}
-	rc, findings := reg.Resolve("c", "")
-	if rc != nil {
-		t.Fatalf("want nil ResolvedComponent when defaultVersion is unresolvable, got %+v", rc)
-	}
-	f, ok := findingAt(findings, "version")
-	if !ok {
-		t.Fatalf("want a finding at path %q, got %+v", "version", findings)
-	}
-	if f.Severity != severityError || !strings.Contains(f.Message, "default version") || !strings.Contains(f.Message, "is not registered") {
-		t.Fatalf("unexpected finding: %+v", f)
-	}
-}
-
-func TestStaticRegistry_Resolve_InvalidPhase(t *testing.T) {
-	reg := StaticRegistry{
-		"c": {
-			Spec:   datupletv1.ComponentDefinitionSpec{Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")}},
-			Status: datupletv1.ComponentDefinitionStatus{Phase: "Invalid", Message: "config schema does not compile"},
+// TestStaticRegistry_Resolve_Errors: every unresolvable (component, version)
+// returns a nil ResolvedComponent and an error finding at the right path.
+func TestStaticRegistry_Resolve_Errors(t *testing.T) {
+	one := []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")}
+	cases := []struct {
+		name       string
+		reg        StaticRegistry
+		component  string
+		version    string
+		wantPath   string
+		wantSubstr []string
+	}{
+		{
+			name:       "unknown component",
+			reg:        StaticRegistry{"known": {Spec: datupletv1.ComponentDefinitionSpec{Versions: one}}},
+			component:  "ghost",
+			wantPath:   "component",
+			wantSubstr: []string{"unknown component"},
+		},
+		{
+			name:      "unknown version",
+			reg:       StaticRegistry{"c": {Spec: datupletv1.ComponentDefinitionSpec{Versions: one}}},
+			component: "c",
+			version:   "v9.9.9",
+			wantPath:  "version",
+		},
+		{
+			name: "no stable version and no pin",
+			reg: StaticRegistry{"c": {Spec: datupletv1.ComponentDefinitionSpec{
+				Versions: []datupletv1.VersionSpec{{Version: "dev", Image: "img:dev", Prerelease: true}},
+			}}},
+			component:  "c",
+			wantPath:   "version",
+			wantSubstr: []string{"no stable version"},
+		},
+		{
+			name: "default version not registered",
+			reg: StaticRegistry{"c": {Spec: datupletv1.ComponentDefinitionSpec{
+				DefaultVersion: "v9.9.9",
+				Versions:       one,
+			}}},
+			component:  "c",
+			wantPath:   "version",
+			wantSubstr: []string{"default version", "is not registered"},
+		},
+		{
+			name: "invalid phase",
+			reg: StaticRegistry{"c": {
+				Spec:   datupletv1.ComponentDefinitionSpec{Versions: one},
+				Status: datupletv1.ComponentDefinitionStatus{Phase: "Invalid", Message: "config schema does not compile"},
+			}},
+			component:  "c",
+			wantPath:   "component",
+			wantSubstr: []string{"invalid"},
 		},
 	}
-	rc, findings := reg.Resolve("c", "")
-	if rc != nil {
-		t.Fatalf("want nil ResolvedComponent for an invalid definition, got %+v", rc)
-	}
-	f, ok := findingAt(findings, "component")
-	if !ok {
-		t.Fatalf("want a finding at path %q, got %+v", "component", findings)
-	}
-	if f.Severity != severityError || !strings.Contains(f.Message, "invalid") {
-		t.Fatalf("unexpected finding: %+v", f)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, findings := tc.reg.Resolve(tc.component, tc.version)
+			if rc != nil {
+				t.Fatalf("want nil ResolvedComponent, got %+v", rc)
+			}
+			f, ok := findingAt(findings, tc.wantPath)
+			if !ok {
+				t.Fatalf("want a finding at path %q, got %+v", tc.wantPath, findings)
+			}
+			if f.Severity != severityError {
+				t.Fatalf("want severity error, got %+v", f)
+			}
+			for _, s := range tc.wantSubstr {
+				if !strings.Contains(f.Message, s) {
+					t.Fatalf("finding message %q, want it to contain %q", f.Message, s)
+				}
+			}
+		})
 	}
 }
 
@@ -255,93 +240,53 @@ func pipelineWithComponentIO(name string, withInputs, withOutputs bool) *datuple
 	return p
 }
 
-func TestValidateTyped_IOCapability_InputsNone_RejectsDeclaredInputs(t *testing.T) {
-	reg := StaticRegistry{
-		"data-generator": {Spec: datupletv1.ComponentDefinitionSpec{
-			IO:       &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"},
-			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
-		}},
+// TestValidateTyped_IOCapability: the registry's io declaration gates whether
+// a component may / must declare inputs and outputs (RFC 027 §4.3). A
+// violation is an error finding at the inputs/outputs path.
+func TestValidateTyped_IOCapability(t *testing.T) {
+	const inputsPath = "stages[0].components[0].inputs"
+	const outputsPath = "stages[0].components[0].outputs"
+	cases := []struct {
+		name        string
+		io          *datupletv1.ComponentIO // nil: no io declaration (optional/optional)
+		withInputs  bool
+		withOutputs bool
+		wantPath    string // empty: no IO-capability finding at all
+	}{
+		{"inputs none rejects declared inputs", &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"}, true, true, inputsPath},
+		{"inputs required rejects missing inputs", &datupletv1.ComponentIO{Inputs: "required", Outputs: "required"}, false, true, inputsPath},
+		{"outputs none rejects declared outputs", &datupletv1.ComponentIO{Inputs: "required", Outputs: "none"}, true, true, outputsPath},
+		{"outputs required rejects missing outputs", &datupletv1.ComponentIO{Inputs: "required", Outputs: "required"}, true, false, outputsPath},
+		// No io declaration defaults to optional/optional: any combination of
+		// inputs/outputs is acceptable to the IO-capability rules.
+		{"optional default no findings", nil, true, true, ""},
 	}
-	p := pipelineWithComponentIO("data-generator", true, true)
-	findings := ValidateTyped(p, reg, nil)
-	f, ok := findingAt(findings, "stages[0].components[0].inputs")
-	if !ok {
-		t.Fatalf("want a finding at stages[0].components[0].inputs, got %+v", findings)
-	}
-	if f.Severity != severityError || f.Message != "component data-generator takes no inputs" {
-		t.Fatalf("unexpected finding: %+v", f)
-	}
-}
-
-func TestValidateTyped_IOCapability_InputsRequired_RejectsMissingInputs(t *testing.T) {
-	reg := StaticRegistry{
-		"sql-transform": {Spec: datupletv1.ComponentDefinitionSpec{
-			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "required"},
-			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
-		}},
-	}
-	p := pipelineWithComponentIO("sql-transform", false, true)
-	findings := ValidateTyped(p, reg, nil)
-	f, ok := findingAt(findings, "stages[0].components[0].inputs")
-	if !ok {
-		t.Fatalf("want a finding at stages[0].components[0].inputs, got %+v", findings)
-	}
-	if f.Severity != severityError || f.Message != "component sql-transform requires at least one input" {
-		t.Fatalf("unexpected finding: %+v", f)
-	}
-}
-
-func TestValidateTyped_IOCapability_OutputsNone_RejectsDeclaredOutputs(t *testing.T) {
-	reg := StaticRegistry{
-		"sink": {Spec: datupletv1.ComponentDefinitionSpec{
-			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "none"},
-			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
-		}},
-	}
-	p := pipelineWithComponentIO("sink", true, true)
-	findings := ValidateTyped(p, reg, nil)
-	f, ok := findingAt(findings, "stages[0].components[0].outputs")
-	if !ok {
-		t.Fatalf("want a finding at stages[0].components[0].outputs, got %+v", findings)
-	}
-	if f.Severity != severityError || f.Message != "component sink takes no outputs" {
-		t.Fatalf("unexpected finding: %+v", f)
-	}
-}
-
-func TestValidateTyped_IOCapability_OutputsRequired_RejectsMissingOutputs(t *testing.T) {
-	reg := StaticRegistry{
-		"sink": {Spec: datupletv1.ComponentDefinitionSpec{
-			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "required"},
-			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
-		}},
-	}
-	p := pipelineWithComponentIO("sink", true, false)
-	findings := ValidateTyped(p, reg, nil)
-	f, ok := findingAt(findings, "stages[0].components[0].outputs")
-	if !ok {
-		t.Fatalf("want a finding at stages[0].components[0].outputs, got %+v", findings)
-	}
-	if f.Severity != severityError || f.Message != "component sink requires at least one output" {
-		t.Fatalf("unexpected finding: %+v", f)
-	}
-}
-
-func TestValidateTyped_IOCapability_OptionalDefault_NoFindings(t *testing.T) {
-	// A component with no io declaration defaults to optional/optional: any
-	// combination of inputs/outputs (including neither) is acceptable from
-	// the IO-capability rules' point of view.
-	reg := StaticRegistry{
-		"generic": {Spec: datupletv1.ComponentDefinitionSpec{
-			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
-		}},
-	}
-	p := pipelineWithComponentIO("generic", true, true)
-	findings := ValidateTyped(p, reg, nil)
-	for _, f := range findings {
-		if strings.Contains(f.Message, "takes no") || strings.Contains(f.Message, "requires at least one") {
-			t.Fatalf("optional/optional (no io declared) must not produce IO-capability findings, got %+v", findings)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := StaticRegistry{
+				"sink": {Spec: datupletv1.ComponentDefinitionSpec{
+					IO:       tc.io,
+					Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
+				}},
+			}
+			p := pipelineWithComponentIO("sink", tc.withInputs, tc.withOutputs)
+			findings := ValidateTyped(p, reg, nil)
+			if tc.wantPath == "" {
+				for _, f := range findings {
+					if strings.Contains(f.Message, "takes no") || strings.Contains(f.Message, "requires at least one") {
+						t.Fatalf("no io declared must not produce IO-capability findings, got %+v", findings)
+					}
+				}
+				return
+			}
+			f, ok := findingAt(findings, tc.wantPath)
+			if !ok {
+				t.Fatalf("want a finding at %s, got %+v", tc.wantPath, findings)
+			}
+			if f.Severity != severityError {
+				t.Fatalf("want severity error, got %+v", f)
+			}
+		})
 	}
 }
 

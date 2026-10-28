@@ -72,113 +72,103 @@ func assertInvalid(t *testing.T, got *datupletv1.ComponentDefinition, wantSubstr
 		t.Errorf("message = %q, want it to contain %q", got.Status.Message, wantSubstr)
 	}
 }
-
-func TestComponentDefinitionReconcile_Valid_SetsValidPhase(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	got := reconcileComponentDefinition(t, def)
-
-	if got.Status.Phase != "Valid" {
-		t.Fatalf("phase = %q, want Valid (message: %q)", got.Status.Phase, got.Status.Message)
-	}
-	if got.Status.ObservedGeneration != def.Generation {
-		t.Fatalf("observedGeneration = %d, want %d", got.Status.ObservedGeneration, def.Generation)
-	}
-}
-
-func TestComponentDefinitionReconcile_ConfigSchemaDoesNotCompile(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].ConfigSchema = "{ this is not json"
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, "v1.0.0")
-}
-
-func TestComponentDefinitionReconcile_StableVersionBadFormat(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].Version = "1.0" // missing leading "v" and patch
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, "1.0")
-}
-
-func TestComponentDefinitionReconcile_DuplicateVersions(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions = append(def.Spec.Versions, datupletv1.VersionSpec{
-		Version: "v1.0.0",
-		Image:   "img:v1.0.0-other",
-	})
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, "v1.0.0")
-}
-
-func TestComponentDefinitionReconcile_DefaultVersionNotRegistered(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.DefaultVersion = "v9.9.9"
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, "v9.9.9")
-}
-
-func TestComponentDefinitionReconcile_ImageMissingTag(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].Image = "img"
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, "img")
-}
-
-func TestComponentDefinitionReconcile_ImageLatestTag(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].Image = "img:latest"
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, "img:latest")
-}
-
-func TestComponentDefinitionReconcile_ImageRegistryPortNoTag(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].Image = "registry.example.com:5000/component"
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, "registry.example.com:5000/component")
-}
-
-func TestComponentDefinitionReconcile_ImageRegistryPortWithTag(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].Image = "registry.example.com:5000/component:v1.2.3"
-
-	got := reconcileComponentDefinition(t, def)
-	if got.Status.Phase != "Valid" {
-		t.Fatalf("phase = %q, want Valid for registry-port image with a real tag (message: %q)", got.Status.Phase, got.Status.Message)
-	}
-}
-
-func TestComponentDefinitionReconcile_PrereleaseSkipsVersionAndImageChecks(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].Version = "dev"
-	def.Spec.Versions[0].Image = "img:latest"
-	def.Spec.Versions[0].Prerelease = true
-
-	got := reconcileComponentDefinition(t, def)
-	if got.Status.Phase != "Valid" {
-		t.Fatalf("phase = %q, want Valid for prerelease version (message: %q)", got.Status.Phase, got.Status.Message)
-	}
-}
-
-func TestComponentDefinitionReconcile_ResourcesDefaultExceedsMax(t *testing.T) {
-	def := validComponentDefinition("comp-a")
-	def.Spec.Versions[0].Resources = &datupletv1.ComponentResources{
-		Default: corev1.ResourceRequirements{
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("4"),
+func TestComponentDefinitionReconcile(t *testing.T) {
+	cases := []struct {
+		name       string
+		mutate     func(*datupletv1.ComponentDefinition)
+		wantSubstr string // empty: the definition must reconcile to Valid
+	}{
+		{name: "valid sets Valid phase", mutate: func(*datupletv1.ComponentDefinition) {}},
+		{
+			name: "config schema does not compile",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.Versions[0].ConfigSchema = "{ this is not json"
+			},
+			wantSubstr: "v1.0.0",
+		},
+		{
+			name: "stable version bad format",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.Versions[0].Version = "1.0" // missing leading "v" and patch
+			},
+			wantSubstr: "1.0",
+		},
+		{
+			name: "duplicate versions",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.Versions = append(d.Spec.Versions, datupletv1.VersionSpec{
+					Version: "v1.0.0",
+					Image:   "img:v1.0.0-other",
+				})
+			},
+			wantSubstr: "v1.0.0",
+		},
+		{
+			name: "default version not registered",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.DefaultVersion = "v9.9.9"
+			},
+			wantSubstr: "v9.9.9",
+		},
+		{
+			name:       "image missing tag",
+			mutate:     func(d *datupletv1.ComponentDefinition) { d.Spec.Versions[0].Image = "img" },
+			wantSubstr: "img",
+		},
+		{
+			name:       "image latest tag",
+			mutate:     func(d *datupletv1.ComponentDefinition) { d.Spec.Versions[0].Image = "img:latest" },
+			wantSubstr: "img:latest",
+		},
+		{
+			name: "image registry port no tag",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.Versions[0].Image = "registry.example.com:5000/component"
+			},
+			wantSubstr: "registry.example.com:5000/component",
+		},
+		{
+			name: "image registry port with tag is valid",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.Versions[0].Image = "registry.example.com:5000/component:v1.2.3"
 			},
 		},
-		Max: corev1.ResourceList{
-			corev1.ResourceCPU: resource.MustParse("2"),
+		{
+			name: "prerelease skips version and image checks",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.Versions[0].Version = "dev"
+				d.Spec.Versions[0].Image = "img:latest"
+				d.Spec.Versions[0].Prerelease = true
+			},
+		},
+		{
+			name: "resources default exceeds max",
+			mutate: func(d *datupletv1.ComponentDefinition) {
+				d.Spec.Versions[0].Resources = &datupletv1.ComponentResources{
+					Default: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+					},
+					Max: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+				}
+			},
+			wantSubstr: string(corev1.ResourceCPU),
 		},
 	}
-
-	got := reconcileComponentDefinition(t, def)
-	assertInvalid(t, got, string(corev1.ResourceCPU))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			def := validComponentDefinition("comp-a")
+			tc.mutate(def)
+			got := reconcileComponentDefinition(t, def)
+			if tc.wantSubstr != "" {
+				assertInvalid(t, got, tc.wantSubstr)
+				return
+			}
+			if got.Status.Phase != "Valid" {
+				t.Fatalf("phase = %q, want Valid (message: %q)", got.Status.Phase, got.Status.Message)
+			}
+			if got.Status.ObservedGeneration != def.Generation {
+				t.Fatalf("observedGeneration = %d, want %d", got.Status.ObservedGeneration, def.Generation)
+			}
+		})
+	}
 }

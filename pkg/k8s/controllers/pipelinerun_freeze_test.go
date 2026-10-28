@@ -22,7 +22,7 @@ import (
 )
 
 // ver / preVer build VersionSpecs for a ComponentDefinition.
-func ver(v, img string) datupletv1.VersionSpec  { return datupletv1.VersionSpec{Version: v, Image: img} }
+func ver(v, img string) datupletv1.VersionSpec { return datupletv1.VersionSpec{Version: v, Image: img} }
 func preVer(v, img string) datupletv1.VersionSpec {
 	return datupletv1.VersionSpec{Version: v, Image: img, Prerelease: true}
 }
@@ -155,56 +155,62 @@ func TestFreeze_StageStatusesPopulatedFromFrozenSpec(t *testing.T) {
 	}
 }
 
-// (a) valid run → resolvedSpec + components set with resolved image; the Job
-// uses the resolved image.
-func TestFreeze_ValidRun_ResolvedSpecAndJobImage(t *testing.T) {
-	scheme := newTestScheme(t)
-	pipeline := singleStagePipeline("comp-a", "v1.0.0")
-	pr := runFor("p1")
-	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(pipeline, pr, compDef("comp-a", ver("v1.0.0", "img-a:v1"))).
-		WithStatusSubresource(pr).Build()
-	r := registryReconciler(c, scheme)
+// (a)+(b) admission resolves the component version against the registry and
+// freezes {resolvedSpec, components}; an explicit version resolves to that
+// version, an omitted one to the latest stable. The Job uses the resolved image.
+func TestFreeze_ResolvedSpecAndJobImage(t *testing.T) {
+	cases := []struct {
+		name        string
+		version     string
+		def         *datupletv1.ComponentDefinition
+		wantVersion string
+		wantImage   string
+	}{
+		{
+			name:        "valid run resolves explicit version",
+			version:     "v1.0.0",
+			def:         compDef("comp-a", ver("v1.0.0", "img-a:v1")),
+			wantVersion: "v1.0.0",
+			wantImage:   "img-a:v1",
+		},
+		{
+			name:        "omitted version resolves latest stable",
+			version:     "",
+			def:         compDef("comp-a", ver("v0.1.0", "img-a:v0.1.0"), ver("v0.2.0", "img-a:v0.2.0")),
+			wantVersion: "v0.2.0",
+			wantImage:   "img-a:v0.2.0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newTestScheme(t)
+			pipeline := singleStagePipeline("comp-a", tc.version)
+			pr := runFor("p1")
+			c := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(pipeline, pr, tc.def).
+				WithStatusSubresource(pr).Build()
+			r := registryReconciler(c, scheme)
 
-	reconcileOnce(t, r) // admission
-	got := getRun(t, c)
-	if got.Status.ResolvedSpec == nil {
-		t.Fatal("ResolvedSpec nil after admission")
-	}
-	if len(got.Status.Components) != 1 {
-		t.Fatalf("Components len = %d, want 1", len(got.Status.Components))
-	}
-	rc := got.Status.Components[0]
-	if rc.Name != "c1" || rc.Component != "comp-a" || rc.Version != "v1.0.0" || rc.Image != "img-a:v1" {
-		t.Fatalf("resolved component = %+v, want {c1 comp-a v1.0.0 img-a:v1}", rc)
-	}
+			reconcileOnce(t, r) // admission
+			got := getRun(t, c)
+			if got.Status.ResolvedSpec == nil {
+				t.Fatal("ResolvedSpec nil after admission")
+			}
+			if len(got.Status.Components) != 1 {
+				t.Fatalf("Components len = %d, want 1", len(got.Status.Components))
+			}
+			rc := got.Status.Components[0]
+			if rc.Name != "c1" || rc.Component != "comp-a" || rc.Version != tc.wantVersion || rc.Image != tc.wantImage {
+				t.Fatalf("resolved component = %+v, want {c1 comp-a %s %s}", rc, tc.wantVersion, tc.wantImage)
+			}
 
-	reconcileOnce(t, r) // startStage builds the Job
-	job := getJob(t, c, componentJobName(got, "extract", "c1"))
-	img, _ := componentContainerImage(job)
-	if img != "img-a:v1" {
-		t.Errorf("component container image = %q, want img-a:v1 (resolved)", img)
-	}
-}
-
-// (b) omitted version → latest stable resolved & recorded.
-func TestFreeze_OmittedVersion_LatestStable(t *testing.T) {
-	scheme := newTestScheme(t)
-	pipeline := singleStagePipeline("comp-a", "") // no version
-	pr := runFor("p1")
-	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(pipeline, pr, compDef("comp-a", ver("v0.1.0", "img-a:v0.1.0"), ver("v0.2.0", "img-a:v0.2.0"))).
-		WithStatusSubresource(pr).Build()
-	r := registryReconciler(c, scheme)
-
-	reconcileOnce(t, r)
-	got := getRun(t, c)
-	if len(got.Status.Components) != 1 {
-		t.Fatalf("Components len = %d, want 1", len(got.Status.Components))
-	}
-	rc := got.Status.Components[0]
-	if rc.Version != "v0.2.0" || rc.Image != "img-a:v0.2.0" {
-		t.Errorf("resolved = {%s %s}, want {v0.2.0 img-a:v0.2.0} (latest stable)", rc.Version, rc.Image)
+			reconcileOnce(t, r) // startStage builds the Job
+			job := getJob(t, c, componentJobName(got, "extract", "c1"))
+			img, _ := componentContainerImage(job)
+			if img != tc.wantImage {
+				t.Errorf("component container image = %q, want %q (resolved)", img, tc.wantImage)
+			}
+		})
 	}
 }
 

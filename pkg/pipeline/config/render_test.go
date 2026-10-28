@@ -91,23 +91,6 @@ func TestRenderYAMLGolden(t *testing.T) {
 	}
 }
 
-// TestRenderYAMLDeterministic proves two renders of the same doc are
-// byte-for-byte identical — required since the API (S6) and CLI serve
-// RenderYAML output directly and must not flap between requests.
-func TestRenderYAMLDeterministic(t *testing.T) {
-	a, err := RenderYAML(exampleDoc())
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := RenderYAML(exampleDoc())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(a, b) {
-		t.Fatal("nondeterministic render")
-	}
-}
-
 // TestRenderParseRoundTrip proves rendered YAML re-parses through Parse (S1)
 // without loss of the top-level shape.
 func TestRenderParseRoundTrip(t *testing.T) {

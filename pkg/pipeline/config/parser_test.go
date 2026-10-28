@@ -33,11 +33,18 @@ stages:
 	}
 }
 
-// TestParseRejectsUnknownComponentField proves the decode is strict at nested
-// levels too: an unknown component field is an error naming the key, not a
-// silently-dropped value.
-func TestParseRejectsUnknownComponentField(t *testing.T) {
-	yaml := `
+// TestParseRejectsUnknownField proves the decode is strict at every level: an
+// unknown field (nested component field or top level) is an error naming the
+// key, not a silently-dropped value.
+func TestParseRejectsUnknownField(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		wantKey string
+	}{
+		{
+			name: "component field",
+			yaml: `
 name: legacy
 stages:
   - name: s1
@@ -47,13 +54,25 @@ stages:
         configJSON: "{}"
         outputs:
           defaultBucket: raw
-`
-	_, err := Parse([]byte(yaml))
-	if err == nil {
-		t.Fatal("expected unknown-field error for configJSON")
+`,
+			wantKey: "configJSON",
+		},
+		{
+			name:    "top-level field",
+			yaml:    "name: x\nbogus: 1\nstages: []\n",
+			wantKey: "bogus",
+		},
 	}
-	if !strings.Contains(err.Error(), "configJSON") {
-		t.Errorf("error does not mention the unknown field: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			if err == nil {
+				t.Fatalf("expected unknown-field error for %s", tc.wantKey)
+			}
+			if !strings.Contains(err.Error(), tc.wantKey) {
+				t.Errorf("error does not mention the unknown field %q: %v", tc.wantKey, err)
+			}
+		})
 	}
 }
 
@@ -62,24 +81,6 @@ func TestParseRejectsLegacyEnvelope(t *testing.T) {
 	_, err := Parse(body)
 	if err == nil || !strings.Contains(err.Error(), "legacy Kubernetes CR format") {
 		t.Fatalf("want legacy-format error, got %v", err)
-	}
-}
-
-func TestParseEnvelopeFreeDoc(t *testing.T) {
-	body := []byte("name: events-etl\nstages:\n  - name: s1\n    components:\n      - name: c1\n        component: data-generator\n        config: {tables: [{name: events}]}\n        outputs: {defaultBucket: raw}\n")
-	p, err := Parse(body)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if p.Name != "events-etl" || len(p.Stages) != 1 {
-		t.Fatalf("bad doc: %+v", p)
-	}
-}
-
-func TestParseRejectsUnknownTopLevelField(t *testing.T) {
-	_, err := Parse([]byte("name: x\nbogus: 1\nstages: []\n"))
-	if err == nil || !strings.Contains(err.Error(), "bogus") {
-		t.Fatalf("want unknown-field error naming the key, got %v", err)
 	}
 }
 
