@@ -172,7 +172,7 @@ func newComponentsFakeServer(t *testing.T, listBody, detailBody string, detailSt
 
 // setHeadlessEnv points loadRemoteArgs at remote via the RFC 027 §7
 // headless env vars, bypassing ~/.datuplet entirely (mirrors
-// TestLoadRemoteArgs_HeadlessNoDatupletFileRead in remote_test.go).
+// TestLoadRemoteArgs_HeadlessFastPath in remote_test.go).
 func setHeadlessEnv(t *testing.T, remote string) {
 	t.Helper()
 	t.Setenv("HOME", "/nonexistent-for-test")

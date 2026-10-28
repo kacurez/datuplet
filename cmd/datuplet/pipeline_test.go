@@ -315,7 +315,7 @@ func TestRunPipelineListDescriptionColumn(t *testing.T) {
 // TestRunPipelineListJSONPrintsBodyVerbatim pins the `list --json` contract:
 // the server's JSON is printed byte-for-byte, not re-decoded/re-serialized
 // and not given an extra trailing newline on top of the encoder's own
-// (RFC 027 C3 fix 2 — mirrors TestRunPipelineGetJSONHitsPlainEndpoint).
+// (RFC 027 C3 fix 2 — mirrors TestRunPipelineGet's "json hits plain endpoint" row).
 func TestRunPipelineListJSONPrintsBodyVerbatim(t *testing.T) {
 	const jsonBody = `[{"name":"p1","description":"desc one","updated_at":"2026-01-01T00:00:00Z"}]`
 	// The real server's json.Encoder.Encode appends exactly one trailing

@@ -417,11 +417,11 @@ func TestServerV2_MissingRequiredFields(t *testing.T) {
 		{"OpenReader without bucket", func(s *ServerV2) error {
 			_, err := s.OpenReader(context.Background(), &pb.OpenReaderRequest{Table: "products"})
 			return err
-		}, "bucket is required"},
+		}, "bucket is required for reads"},
 		{"OpenReader without table", func(s *ServerV2) error {
 			_, err := s.OpenReader(context.Background(), &pb.OpenReaderRequest{Bucket: "raw"})
 			return err
-		}, "table is required"},
+		}, "table is required for reads"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

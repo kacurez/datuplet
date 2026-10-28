@@ -58,7 +58,7 @@ build-components: build-gateway ## Build all component Docker images
 
 # E2E-only component subset: builds only the components scenarios reference.
 # Keeps gateway as a build dep (sidecar is required for every run). RFC 010
-# scenarios (duckdb-etl, multi-table-join) need datuplet/sql-transform too.
+# scenarios (multi-table-join) need datuplet/sql-transform too.
 # RFC 022 Task 2.7: query-worker is needed for the query e2e scenarios.
 # RFC 026 Task R11: data-generator is additionally tagged v0.0.1 — a second,
 # STABLE tag of the same local image — so the e2e ComponentDefinition

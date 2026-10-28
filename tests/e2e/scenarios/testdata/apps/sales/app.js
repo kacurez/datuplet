@@ -24,7 +24,7 @@
 // tokens are replaced by the e2e harness (scenarios_apps_test.go) before
 // upload. They are the seeded warehouse-table identifier and the app version
 // marker — supplied by the test acting as the app's author, never by a viewer:
-//   __DTP_E2E_NS__      -> the seeded Iceberg namespace  ("<runPrefix>-api")
+//   __DTP_E2E_NS__      -> the seeded Iceberg namespace  ("<runPrefix>-seed-api")
 //   __DTP_E2E_TABLE__   -> the seeded table              ("data")
 //   __DTP_APP_VERSION__ -> "v1" or "v2" (distinct bytes => distinct content
 //                          hash => a genuine second immutable version, which

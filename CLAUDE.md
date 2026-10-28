@@ -370,7 +370,7 @@ These are conventions a new contributor wouldn't infer from the code:
 | `pkg/appworker/` | app-worker HTTP service: viewer/platform auth, render dispatch via `pkg/appengine`, render logs, rate limits (RFC 028). |
 | `pkg/lib/datalake/` | Metadata-only fallback I/O. NOT the data plane. |
 | `sdk/go/` | Thin Go SDK (~200 LOC). |
-| `components/` | Built-in extractors, transforms, writers. |
+| `components/` | The three built-ins (`data-generator`, `http-json-extractor`, `sql-transform`) plus `queryengine` (the DuckDB engine behind query-worker and `datuplet-query`, not a pipeline component). |
 | `ui/product/` | Browser SPA (vanilla ES modules). |
 | `ui/appshell/` | Viewer-facing shell app-worker serves alongside a render (OutputDoc → DOM, Vega-Lite embed, DOMPurify/marked) — distinct from `ui/product/`'s author-facing SPA (RFC 028). |
 | `charts/` | Four Helm charts: `datuplet-operators`, `-infra`, `-app`, `-lakekeeper`. |

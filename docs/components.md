@@ -9,7 +9,8 @@ read its `schema.json` directly (pointers below) or fetch it live:
 datuplet components get <name> --schema
 ```
 
-Datuplet ships five built-in components. Each runs as an ordinary
+Datuplet ships three built-in components (`data-generator`,
+`http-json-extractor`, `sql-transform`). Each runs as an ordinary
 container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
@@ -372,7 +373,7 @@ the component.
 
 Use the Go SDK (`sdk/go/`) to build a component.
 The SDK is ~200–300 LOC and exposes three operations: `OpenWriter`,
-`WriteChunk` / `Write`, and `Close`. The SDKs handle gRPC connection, config
+`WriteChunk` / `Write`, and `Close`. The SDK handles gRPC connection, config
 resolution, and secret delivery from the Data Gateway sidecar.
 
 Go components can opt into writer-side Arrow output via the `sdk/go/arrow`

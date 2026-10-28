@@ -17,6 +17,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer sets `ICEBERG_JOB_IMAGE` and `image.icebergJob` values are removed.
 - **`pkg/lib/orchestrator` and `pkg/pipeline` runner** (internal packages);
   `pkg/pipeline/config` (the YAML spec parser) is unchanged.
+- **Python SDK (`sdk/python`, `sdk/python-sandbox`).** The Go SDK
+  (`sdk/go`, `sdk/go/arrow`) is the only supported component SDK.
+- **`pandas-transform`, `finnhub-extractor`, `stdout-writer` built-in
+  components** (images, ComponentDefinitions, chart schemas). The remaining
+  built-ins are `data-generator`, `http-json-extractor`, `sql-transform`.
+  `helm upgrade` removes the chart-owned ComponentDefinitions; ones registered
+  outside the chart (e.g. with `components.builtins=false`) stay on an
+  existing cluster until
+  `kubectl delete componentdefinition finnhub-extractor stdout-writer pandas-transform`.
+- **`tests/integration/`** (the parked integration-test module).
+
+### Changed
+
+- Unit and e2e test suites consolidated into table-driven tests; the e2e
+  suite keeps one scenario per deployment behaviour.
 
 ## [0.2.1] — 2026-05-19
 

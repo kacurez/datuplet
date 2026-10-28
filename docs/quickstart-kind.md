@@ -66,7 +66,7 @@ use them. Build the same images `make deploy-local` builds on OrbStack, then
 
 ```bash
 # Build the five service images (pipeline-api, pipeline-observer,
-# pipeline-operator, gateway, query-worker) + the five built-in component
+# pipeline-operator, gateway, query-worker) + the three built-in component
 # images. `build-components-local` tags the built-ins at the chart's
 # `components.tag` (a stable vX.Y.Z, via COMPONENT_TAG).
 make docker-build-k8s build-components-local

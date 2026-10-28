@@ -88,8 +88,7 @@ func TestLoadRemoteArgs_UnusableCredentialsErrors(t *testing.T) {
 		setup func(t *testing.T, home string)
 		want  []string
 	}{
-		{"expired token", writeAll(past), []string{"datuplet login --remote", "expired"}},
-		{"expired token does not leak the JWT", writeAll(past), nil},
+		{"expired token (and no JWT leak)", writeAll(past), []string{"datuplet login --remote", "expired"}},
 		{"malformed expires_at", writeAll("not-a-date"), []string{"corrupt", "datuplet login --remote"}},
 		{"missing token file", func(t *testing.T, home string) {
 			// cluster.json exists but token file is absent.

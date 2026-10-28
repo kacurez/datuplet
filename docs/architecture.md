@@ -278,7 +278,7 @@ Gateway passes these verbatim. Only Lakekeeper interprets them.
   STS credentials, separate K8s namespaces).
 - Greenfield setups where you want a K8s-native control plane with a browser UI,
   without running a full Airflow or Prefect cluster.
-- Component development using thin Go or Python SDKs without direct S3 access.
+- Component development using a thin Go SDK without direct S3 access.
 
 ## What this is not good for (v0.1)
 

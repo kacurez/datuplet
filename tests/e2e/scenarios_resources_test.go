@@ -294,11 +294,13 @@ func TestResources_PutGate(t *testing.T) {
 			status, body, err := putPipelineHTTP(ctx, nonadmin, projectID, tc.name, []byte(tc.yaml))
 			cancel()
 			if err != nil {
-				t.Fatalf("PUT /pipelines (nonadmin, %s): %v", tc.label, err)
+				t.Errorf("PUT /pipelines (nonadmin, %s): %v", tc.label, err)
+				continue
 			}
 			if status != http.StatusForbidden {
-				t.Fatalf("PUT /pipelines (nonadmin, %s): status=%d, want 403 (modification gate); body=%s",
+				t.Errorf("PUT /pipelines (nonadmin, %s): status=%d, want 403 (modification gate); body=%s",
 					tc.label, status, body)
+				continue
 			}
 			if !strings.Contains(strings.ToLower(string(body)), "superadmin") {
 				t.Errorf("nonadmin 403 body (%s) does not mention superadmin: %s", tc.label, body)

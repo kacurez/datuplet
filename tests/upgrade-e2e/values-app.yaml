@@ -27,8 +27,8 @@ image:
 #
 # RFC 025: the warehouse is resolved per request from the project-scoped
 # route (POST /api/v1/projects/{pid}/query) — no bootstrap-ordering env patch
-# is needed. TestQueryBootstrap verifies the worker is ready and skips the
-# query suite if it is not.
+# is needed. The query scenarios (tests/e2e/scenarios_query_test.go) skip,
+# or fail under E2E_REQUIRE=1, when their seed run or project lookup fails.
 queryWorker:
   enabled: true
   image:

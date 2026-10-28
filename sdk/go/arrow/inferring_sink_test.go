@@ -646,11 +646,11 @@ func TestInferringSink_DeclaredValues(t *testing.T) {
 }
 
 // TestFacadeSinks_ZeroRecordsNeverOpenWriter: with zero records the lazy-open
-// guarantee holds for each façade (StringSink, InferringSink in inference and
-// in declared mode, whose core is built immediately): the writer factory is
-// never invoked, Finish succeeds with no rows and no CloseResult, and Writer()
-// is nil afterwards. The core Sink tests cannot reach the façades' own
-// lazy-core `Writer()` branch.
+// guarantee holds for each façade (StringSink; InferringSink in inference mode;
+// InferringSink in declared mode, the only one whose core is built
+// immediately): the writer factory is never invoked, Finish succeeds with no
+// rows and no CloseResult, and Writer() is nil afterwards. The core Sink
+// tests cannot reach the façades' own lazy-core `Writer()` branch.
 func TestFacadeSinks_ZeroRecordsNeverOpenWriter(t *testing.T) {
 	type facade interface {
 		Finish() (int64, *sdk.CloseResult, error)

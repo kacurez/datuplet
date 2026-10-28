@@ -41,6 +41,9 @@ var scenarios = []framework.Scenario{
 	{
 		// One pipeline, two extractors in one stage: FULL_LOAD replaces (still
 		// 100 rows after two runs) while APPEND accumulates (200 rows).
+		// Fallback: if run 2 exits 20 after a stale `datuplet.io/cancel="true"`
+		// projection (the cancel-watch race that kept the old APPEND scenario
+		// skipped), re-skip the APPEND half; that race is still open.
 		Name:        "write-modes",
 		Description: "FULL_LOAD replaces and APPEND accumulates across two runs (K8s)",
 		K8sPipeline: "k8s/write-modes.yaml",
