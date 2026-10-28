@@ -74,7 +74,10 @@ jobs:
           # nginx backs the in-cluster http-fixture (RFC 024 W7 T7.4) that
           # replaces jsonplaceholder.typicode.com; it isn't built locally so
           # it must be pulled before it can be kind-loaded like the others.
-          docker pull public.ecr.aws/nginx/nginx:1.27-alpine
+          # Pulled from Google's Docker Hub mirror: public.ecr.aws anonymous pulls
+          # hit "toomanyrequests: Data limit exceeded" on shared GitHub runner IPs
+          # (2026-10-28, two of three runs), and docker.io is rate-limited the same way.
+          docker pull mirror.gcr.io/library/nginx:1.27-alpine
           for img in \
             datuplet/pipeline-api:latest \
             datuplet/pipeline-observer:latest \
@@ -86,7 +89,7 @@ jobs:
             datuplet/http-json-extractor:latest \
             datuplet/query-worker:latest \
             datuplet/app-worker:latest \
-            public.ecr.aws/nginx/nginx:1.27-alpine \
+            mirror.gcr.io/library/nginx:1.27-alpine \
           ; do
             kind load docker-image --name datuplet-e2e "$img"
           done
