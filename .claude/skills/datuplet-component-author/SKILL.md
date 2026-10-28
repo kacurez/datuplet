@@ -48,7 +48,7 @@ canonical templates:
 
 - **Source** (pull data in, no inputs): `components/http-json-extractor/`
 - **Transform** (read tables → write tables): `components/sql-transform/`
-- **Sink** (read tables → external, no storage output): `components/stdout-writer/`
+- **Sink** (read tables → external, no storage output): there is no built-in sink; start from `components/sql-transform/` for the read side and use `OpenReader` from `sdk/go`
 
 Then, in order:
 

@@ -9,8 +9,7 @@ This directory contains runnable pipeline examples demonstrating Datuplet's core
 | `pipelines/simple-http-extract.yaml` | Basic extraction: fetch JSON from public API and write to table | `http-json-extractor` |
 | `pipelines/full-etl.yaml` | Full ETL: extract JSON, then SQL-transform into curated table | `http-json-extractor`, `sql-transform` |
 | `pipelines/etl-duckdb.yaml` | Extract JSON, then aggregate with DuckDB SQL transform | `http-json-extractor`, `sql-transform` |
-| `pipelines/processors-drop.yaml` | Generate data, then drop columns with a gateway processor before commit | `data-generator`, `stdout-writer` |
-| `pipelines/incremental-reads.yaml` | Incremental read of a table using the `since` duration filter | `stdout-writer` |
+| `pipelines/processors-drop.yaml` | Generate data, then drop columns with a gateway processor before commit | `data-generator` |
 | `pipelines/secrets-http-auth.yaml` | HTTP extraction authenticated with a secret-backed header | `http-json-extractor` |
 
 ## How to Run

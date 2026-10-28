@@ -1,7 +1,7 @@
 name: release-components
 
 # Reusable: builds + manifests the three built-in component images
-# (data-generator, sql-transform, stdout-writer, http-json-extractor).
+# (data-generator, sql-transform, http-json-extractor).
 # Each is a call to _release-image.yml. Called once
 # from release.yml as the `components` job; appears as a collapsible
 # group in the run-detail UI containing the three image rows.
@@ -26,13 +26,6 @@ jobs:
     with:
       name: sql-transform
       dockerfile: components/sql-transform/Dockerfile
-    secrets: inherit
-
-  stdout-writer:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: stdout-writer
-      dockerfile: components/stdout-writer/Dockerfile
     secrets: inherit
 
   http-json-extractor:

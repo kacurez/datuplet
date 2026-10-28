@@ -152,7 +152,6 @@ var builtinE2EComponents = []string{
 	"data-generator",
 	"http-json-extractor",
 	"sql-transform",
-	"stdout-writer",
 }
 
 // RegisterBuiltinComponents kubectl-applies a ComponentDefinition for every

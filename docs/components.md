@@ -115,7 +115,7 @@ type ComponentIO struct {
 - The catalog API (`GET /api/v1/components(/{name})`) always returns a
   resolved, never-empty `io: {inputs, outputs}` object per component.
 - UI gating: `inputs: none` hides the Inputs section entirely (extractors,
-  data-generator); `outputs: none` hides the Outputs section (stdout-writer).
+  data-generator); `outputs: none` hides the Outputs section.
 - Validation: declaring `inputs` on an `inputs: none` component is an error;
   omitting inputs on an `inputs: required` component is an error; symmetric
   for outputs.
@@ -124,7 +124,7 @@ type ComponentIO struct {
   identity, not per-version behavior.
 - Built-in IO declarations: data-generator / http-json-extractor
   are `{none, required}`; sql-transform
-  is `{required, required}`; stdout-writer is `{required, none}`.
+  is `{required, required}`.
 
 ## What schema validation cannot catch
 
@@ -365,56 +365,6 @@ the component.
   is not yet honoured by the Lakekeeper read path; full-snapshot reads are used.
 - Schema evolution: if your SQL creates an output table with a different schema than
   the existing Iceberg target, the commit fails with `FailedUser`.
-
----
-
-## stdout-writer
-
-Reads input tables and prints them to stdout. For debugging only — no Iceberg
-output.
-
-**Image:** `ghcr.io/kacurez/stdout-writer:v0.12.1` · **Registry name:**
-`stdout-writer` · **IO:** `{inputs: required, outputs: none}`
-
-**Config schema:** [`components/stdout-writer/schema.json`](../components/stdout-writer/schema.json)
-(`format`: `csv` (default) or `json`).
-
-**Example pipeline** (PipelineDoc format, RFC 027 — see
-[docs/pipeline-api.md](pipeline-api.md)):
-
-```yaml
-name: debug-pipeline
-stages:
-  - name: generate
-    components:
-      - name: gen
-        component: data-generator
-        config:
-          tables:
-            - name: events
-              random:
-                schema: { id: int, value: double }
-                limit: { rowsCount: 10 }
-        outputs:
-          defaultBucket: raw
-          defaultWriteMode: APPEND
-  - name: print
-    components:
-      - name: printer
-        component: stdout-writer
-        inputs:
-          tables:
-            - bucket: raw
-              table: events
-        config:
-          format: json
-```
-
-View output in component logs:
-
-```bash
-kubectl logs -n datuplet <pod-name> -c component
-```
 
 ---
 

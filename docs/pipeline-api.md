@@ -474,7 +474,7 @@ The catalog and the pipeline builder are driven by the component registry
   (earlier stages' `outputs.tables`, plus names resolved via the
   `x-datuplet-produces` schema-root annotation) and tables **in storage**
   (`GET /api/v1/storage/projects/{pid}/tables`), searchable and multi-select.
-- **Outputs section** (hidden when `io.outputs: none`, e.g. stdout-writer) —
+- **Outputs section** (hidden when `io.outputs: none`) —
   a segmented toggle between **Dynamic** (`defaultBucket` +
   `defaultWriteMode` — the component names tables at runtime) and
   **Explicit** (`tables[]` mapping rows: bucket + table name + per-table

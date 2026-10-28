@@ -226,45 +226,6 @@ func TestRegistry_ErrorSchemaInvalid(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Reading a non-existent / invalid input table → rejected pre-flight at PUT.
-//
-// RFC 027 E5: this used to be a run scenario (error-missing-table) expecting a
-// FailedUser terminal from a runtime missing-table read. The migrated harness
-// drives runs through pipeline-api, whose validator rejects the fixture's
-// invalid input-table reference at PUT (HTTP 400, error finding naming
-// stages[].components[].inputs.tables[].table) before any run is created — so
-// it no longer fits the run-to-terminal Scenario{} table (see scenarios_test.go).
-// Asserting the rejection keeps the "bad input is refused" intent.
-// ──────────────────────────────────────────────────────────────────────────
-
-func TestErrorMissingTableRejected(t *testing.T) {
-	h := registrySkipUnlessReady(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	kb, err := framework.NewK8sBackend(h, runPrefix)
-	if err != nil {
-		t.Fatalf("init K8s backend: %v", err)
-	}
-	defer kb.Cleanup(context.Background())
-
-	rendered := renderRegistryFixture(t, "error-missing-table.yaml")
-
-	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
-	if err == nil {
-		t.Fatalf("expected PUT pre-flight rejection for an invalid input table, got success=%v", result != nil && result.Success)
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "status=400") {
-		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
-	}
-	if !strings.Contains(msg, "inputs.tables[0].table") {
-		t.Errorf("rejection does not point at the offending input-table path: %v", err)
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 // Unpinned data-generator resolves the only stable version (v0.0.1) and the
 // resolution is recorded verbatim in status.components.
 // ──────────────────────────────────────────────────────────────────────────

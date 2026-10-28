@@ -82,7 +82,6 @@ for img in \
   datuplet/query-worker:latest \
   "datuplet/data-generator:$CTAG" \
   "datuplet/sql-transform:$CTAG" \
-  "datuplet/stdout-writer:$CTAG" \
   "datuplet/http-json-extractor:$CTAG" \
 ; do
   kind load docker-image --name datuplet "$img"

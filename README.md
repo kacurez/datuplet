@@ -45,7 +45,7 @@ for img in \
   datuplet/pipeline-api:latest datuplet/pipeline-observer:latest \
   datuplet/pipeline-operator:latest datuplet/gateway:latest datuplet/query-worker:latest \
   "datuplet/data-generator:$CTAG" "datuplet/sql-transform:$CTAG" \
-  "datuplet/stdout-writer:$CTAG" "datuplet/http-json-extractor:$CTAG" \
+  "datuplet/http-json-extractor:$CTAG" \
 ; do kind load docker-image --name datuplet "$img"; done
 
 # 4. Install the four charts + bootstrap warehouse/admin user (register.sh runs last)
@@ -95,7 +95,7 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
   No long-lived warehouse credentials on any Datuplet Deployment.
 - OpenFGA fine-grained authorization per project, run, and table.
 - Built-in component images: `data-generator`, `http-json-extractor`,
-  `sql-transform` (embedded DuckDB), `stdout-writer`.
+  `sql-transform` (embedded DuckDB).
 
 ---
 

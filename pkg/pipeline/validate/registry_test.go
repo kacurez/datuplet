@@ -293,36 +293,36 @@ func TestValidateTyped_IOCapability_InputsRequired_RejectsMissingInputs(t *testi
 
 func TestValidateTyped_IOCapability_OutputsNone_RejectsDeclaredOutputs(t *testing.T) {
 	reg := StaticRegistry{
-		"stdout-writer": {Spec: datupletv1.ComponentDefinitionSpec{
+		"sink": {Spec: datupletv1.ComponentDefinitionSpec{
 			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "none"},
 			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
 		}},
 	}
-	p := pipelineWithComponentIO("stdout-writer", true, true)
+	p := pipelineWithComponentIO("sink", true, true)
 	findings := ValidateTyped(p, reg, nil)
 	f, ok := findingAt(findings, "stages[0].components[0].outputs")
 	if !ok {
 		t.Fatalf("want a finding at stages[0].components[0].outputs, got %+v", findings)
 	}
-	if f.Severity != severityError || f.Message != "component stdout-writer takes no outputs" {
+	if f.Severity != severityError || f.Message != "component sink takes no outputs" {
 		t.Fatalf("unexpected finding: %+v", f)
 	}
 }
 
 func TestValidateTyped_IOCapability_OutputsRequired_RejectsMissingOutputs(t *testing.T) {
 	reg := StaticRegistry{
-		"stdout-writer": {Spec: datupletv1.ComponentDefinitionSpec{
+		"sink": {Spec: datupletv1.ComponentDefinitionSpec{
 			IO:       &datupletv1.ComponentIO{Inputs: "required", Outputs: "required"},
 			Versions: []datupletv1.VersionSpec{stableV("v0.1.0", "img:v0.1.0")},
 		}},
 	}
-	p := pipelineWithComponentIO("stdout-writer", true, false)
+	p := pipelineWithComponentIO("sink", true, false)
 	findings := ValidateTyped(p, reg, nil)
 	f, ok := findingAt(findings, "stages[0].components[0].outputs")
 	if !ok {
 		t.Fatalf("want a finding at stages[0].components[0].outputs, got %+v", findings)
 	}
-	if f.Severity != severityError || f.Message != "component stdout-writer requires at least one output" {
+	if f.Severity != severityError || f.Message != "component sink requires at least one output" {
 		t.Fatalf("unexpected finding: %+v", f)
 	}
 }

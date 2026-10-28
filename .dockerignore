@@ -6,7 +6,6 @@ bin/
 *.dylib
 /csv-extractor
 /sql-transform
-/stdout-writer
 /duckdb-transform
 /http-json-extractor
 

@@ -118,14 +118,6 @@ var scenarios = []framework.Scenario{
 		},
 	},
 	{
-		Name:        "read-back",
-		Description: "Two-stage: http-json extract then read back via stdout-writer (K8s)",
-		K8sPipeline: "k8s/read-back.yaml",
-		Assertions: []framework.Assertion{
-			{Type: "row_count", Bucket: "{{.RunPrefix}}-readback", Table: "data", ExpectedCount: 100},
-		},
-	},
-	{
 		Name:        "http-json-extract",
 		Description: "Extract JSON data from an HTTP API endpoint",
 		K8sPipeline: "k8s/http-json-extract.yaml",

@@ -12,13 +12,18 @@ stages:
         outputs:
           defaultBucket: verify
           defaultWriteMode: FULL_LOAD
-  - name: read
+  - name: copy
     components:
-      - name: stdout-writer
-        component: stdout-writer
+      - name: sql-transform
+        component: sql-transform
         inputs:
           tables:
             - bucket: verify
               table: data
+        outputs:
+          tables:
+            - name: data_copy
+              bucket: verify
+              writeMode: FULL_LOAD
         config:
-          format: json
+          sql: CREATE TABLE data_copy AS SELECT * FROM data

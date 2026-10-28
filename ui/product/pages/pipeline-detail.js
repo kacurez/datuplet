@@ -758,8 +758,7 @@ function openInputPicker(upstreamRows, storageRows, have, onAdd) {
 // ---- Outputs (RFC 027 U5) --------------------------------------------------
 //
 // Rendered only when the component can produce tables at all (io.outputs !==
-// 'none' — stdout-writer declares 'none' and gets no Outputs section, spec
-// §6). Dual-mode, mirroring the RFC 027 UX mockup's renderOutputs(box, comp):
+// 'none' — such a component gets no Outputs section, spec §6). Dual-mode, mirroring the RFC 027 UX mockup's renderOutputs(box, comp):
 // "Dynamic — bucket only" (outputs.defaultBucket [+ defaultWriteMode]) vs
 // "Explicit tables" (outputs.tables[] rows of {name, bucket, writeMode?}).
 // Switching modes carries the first table's bucket (+ writeMode) over, and

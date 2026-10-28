@@ -68,7 +68,6 @@ NAME                     DISPLAY                  DEFAULT      IO               
 data-generator           Data Generator           v0.12.1       none/required      false
 sql-transform            SQL Transform            v0.12.1       required/required  false
 http-json-extractor      HTTP JSON Extractor      v0.12.1       none/required      false
-stdout-writer            Stdout Writer            v0.12.1       required/none      false
 ```
 
 (`--json` prints the server's raw JSON array instead — same fields, machine

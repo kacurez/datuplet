@@ -89,7 +89,9 @@ func main() {
 **Transform / sink** reads instead (or as well): open a reader per
 `client.Config().InputTables`, stream `NextChunk()`, process, and (transform)
 write to an output table or (sink) push to the external system. `sql-transform`
-and `stdout-writer` are the reference implementations.
+is the reference implementation for the read side; there is no built-in sink.
+For a sink, open readers with `sdk/go`'s `OpenReader` and push the chunks to the
+external system.
 
 ## Choosing the data format
 

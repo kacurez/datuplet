@@ -83,7 +83,6 @@ jobs:
             datuplet/data-generator:latest \
             datuplet/data-generator:v0.0.1 \
             datuplet/sql-transform:latest \
-            datuplet/stdout-writer:latest \
             datuplet/http-json-extractor:latest \
             datuplet/query-worker:latest \
             datuplet/app-worker:latest \
