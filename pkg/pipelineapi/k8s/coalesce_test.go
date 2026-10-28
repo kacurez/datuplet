@@ -45,60 +45,6 @@ func statusFor(runID uuid.UUID, phase string, rv int64) pkg8s.RunStatus {
 	}
 }
 
-func TestCoalesce_DropsIdenticalSecondWrite(t *testing.T) {
-	inner := &countingUpdater{applied: true}
-	c := pkg8s.NewCoalescedUpdater(inner)
-	runID := uuid.New()
-	s := statusFor(runID, "Running", 10)
-	_, _ = c.Update(context.Background(), s)
-	_, _ = c.Update(context.Background(), s)
-	if inner.count() != 1 {
-		t.Errorf("inner calls = %d, want 1 (identity write should coalesce)", inner.count())
-	}
-}
-
-func TestCoalesce_WritesOnPhaseChange(t *testing.T) {
-	inner := &countingUpdater{applied: true}
-	c := pkg8s.NewCoalescedUpdater(inner)
-	runID := uuid.New()
-	_, _ = c.Update(context.Background(), statusFor(runID, "Running", 10))
-	_, _ = c.Update(context.Background(), statusFor(runID, "Succeeded", 20))
-	if inner.count() != 2 {
-		t.Errorf("inner calls = %d, want 2 (phase change must pass through)", inner.count())
-	}
-}
-
-func TestCoalesce_WritesOnStageChange(t *testing.T) {
-	// Phase identical, stage differs — coalesce must not drop.
-	inner := &countingUpdater{applied: true}
-	c := pkg8s.NewCoalescedUpdater(inner)
-	runID := uuid.New()
-	s1 := statusFor(runID, "Running", 10)
-	s1.CurrentStage = "extract"
-	s2 := s1
-	s2.CurrentStage = "transform"
-	s2.ResourceVersion = 11
-	_, _ = c.Update(context.Background(), s1)
-	_, _ = c.Update(context.Background(), s2)
-	if inner.count() != 2 {
-		t.Errorf("inner calls = %d, want 2 (stage change must pass through)", inner.count())
-	}
-}
-
-func TestCoalesce_IgnoresResourceVersionForEquality(t *testing.T) {
-	// Same content, different rv — must coalesce. If we cached rv, an
-	// informer replay of the same object with a bumped rv would bump
-	// observed_rv for no DB-visible reason.
-	inner := &countingUpdater{applied: true}
-	c := pkg8s.NewCoalescedUpdater(inner)
-	runID := uuid.New()
-	_, _ = c.Update(context.Background(), statusFor(runID, "Running", 10))
-	_, _ = c.Update(context.Background(), statusFor(runID, "Running", 25))
-	if inner.count() != 1 {
-		t.Errorf("inner calls = %d, want 1 (rv bump alone should coalesce)", inner.count())
-	}
-}
-
 func TestCoalesce_ForgetEvictsEntry(t *testing.T) {
 	inner := &countingUpdater{applied: true}
 	c := pkg8s.NewCoalescedUpdater(inner)
@@ -127,65 +73,123 @@ func TestCoalesce_DoesNotCacheWhenInnerReportsNotApplied(t *testing.T) {
 	}
 }
 
-func TestCoalesce_JanitorDropsOldEntries(t *testing.T) {
-	inner := &countingUpdater{applied: true}
-	fake := time.Now()
-	c := pkg8s.NewCoalescedUpdaterWithClock(inner, func() time.Time { return fake })
-
-	runID := uuid.New()
-	s := statusFor(runID, "Running", 10)
-	_, _ = c.Update(context.Background(), s)
-	if c.Size() != 1 {
-		t.Fatalf("size = %d, want 1 after first Update", c.Size())
-	}
-
-	fake = fake.Add(49 * time.Hour)
-	c.SweepOnce(48 * time.Hour)
-	if c.Size() != 0 {
-		t.Fatalf("size = %d, want 0 after sweep past TTL", c.Size())
-	}
-
-	// Identical write after sweep must reach inner again.
-	_, _ = c.Update(context.Background(), s)
-	if inner.count() != 2 {
-		t.Errorf("inner calls = %d, want 2 (janitor should have evicted)", inner.count())
-	}
-}
-
-func TestCoalesce_SnapshotOnlyChangeIsNotCoalesced(t *testing.T) {
+// TestCoalesce_DropsIdenticalWrites: an identical second write coalesces, and
+// so does the same content with a bumped rv. If we cached rv, an informer
+// replay of the same object with a bumped rv would bump observed_rv for no
+// DB-visible reason.
+func TestCoalesce_DropsIdenticalWrites(t *testing.T) {
 	inner := &countingUpdater{applied: true}
 	c := pkg8s.NewCoalescedUpdater(inner)
 	runID := uuid.New()
-
-	base := statusFor(runID, "Running", 1)
-	base.CurrentStage = "extract"
-	base.StageStatuses = []byte(`[{"name":"extract","phase":"Running"}]`)
-	if _, err := c.Update(context.Background(), base); err != nil {
-		t.Fatalf("first: %v", err)
+	s := statusFor(runID, "Running", 10)
+	_, _ = c.Update(context.Background(), s)
+	_, _ = c.Update(context.Background(), s)
+	if inner.count() != 1 {
+		t.Errorf("inner calls = %d, want 1 (identity write should coalesce)", inner.count())
 	}
-	// Same scalars, DIFFERENT snapshot (a component finished) + higher rv.
-	next := base
-	next.ResourceVersion = 2
-	next.StageStatuses = []byte(`[{"name":"extract","phase":"Succeeded"}]`)
-	if _, err := c.Update(context.Background(), next); err != nil {
-		t.Fatalf("second: %v", err)
-	}
-	if inner.count() != 2 {
-		t.Fatalf("inner calls = %d, want 2 (snapshot-only change must flush)", inner.count())
+	_, _ = c.Update(context.Background(), statusFor(runID, "Running", 25))
+	if inner.count() != 1 {
+		t.Errorf("inner calls = %d, want 1 (rv bump alone should coalesce)", inner.count())
 	}
 }
 
-func TestCoalesce_JanitorKeepsFreshEntries(t *testing.T) {
-	inner := &countingUpdater{applied: true}
-	fake := time.Now()
-	c := pkg8s.NewCoalescedUpdaterWithClock(inner, func() time.Time { return fake })
-
+// TestCoalesce_WritesOnChange: any content change passes through.
+func TestCoalesce_WritesOnChange(t *testing.T) {
 	runID := uuid.New()
-	_, _ = c.Update(context.Background(), statusFor(runID, "Running", 10))
+	cases := []struct {
+		name   string
+		first  pkg8s.RunStatus
+		second func(base pkg8s.RunStatus) pkg8s.RunStatus
+	}{
+		{
+			"phase_change",
+			statusFor(runID, "Running", 10),
+			func(pkg8s.RunStatus) pkg8s.RunStatus { return statusFor(runID, "Succeeded", 20) },
+		},
+		{
+			// Phase identical, stage differs — coalesce must not drop.
+			"stage_change",
+			func() pkg8s.RunStatus {
+				s := statusFor(runID, "Running", 10)
+				s.CurrentStage = "extract"
+				return s
+			}(),
+			func(base pkg8s.RunStatus) pkg8s.RunStatus {
+				s := base
+				s.CurrentStage = "transform"
+				s.ResourceVersion = 11
+				return s
+			},
+		},
+		{
+			// Same scalars, DIFFERENT snapshot (a component finished) +
+			// higher rv.
+			"snapshot_only_change",
+			func() pkg8s.RunStatus {
+				s := statusFor(runID, "Running", 1)
+				s.CurrentStage = "extract"
+				s.StageStatuses = []byte(`[{"name":"extract","phase":"Running"}]`)
+				return s
+			}(),
+			func(base pkg8s.RunStatus) pkg8s.RunStatus {
+				s := base
+				s.ResourceVersion = 2
+				s.StageStatuses = []byte(`[{"name":"extract","phase":"Succeeded"}]`)
+				return s
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := &countingUpdater{applied: true}
+			c := pkg8s.NewCoalescedUpdater(inner)
+			if _, err := c.Update(context.Background(), tc.first); err != nil {
+				t.Fatalf("first: %v", err)
+			}
+			if _, err := c.Update(context.Background(), tc.second(tc.first)); err != nil {
+				t.Fatalf("second: %v", err)
+			}
+			if inner.count() != 2 {
+				t.Errorf("inner calls = %d, want 2 (change must pass through)", inner.count())
+			}
+		})
+	}
+}
 
-	fake = fake.Add(24 * time.Hour)
-	c.SweepOnce(48 * time.Hour)
-	if c.Size() != 1 {
-		t.Errorf("size = %d, want 1 (entry was within TTL)", c.Size())
+func TestCoalesce_Janitor(t *testing.T) {
+	cases := []struct {
+		name      string
+		advance   time.Duration
+		wantSize  int
+		wantCalls int // after an identical write following the sweep
+	}{
+		{"drops_old_entries", 49 * time.Hour, 0, 2},
+		{"keeps_fresh_entries", 24 * time.Hour, 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := &countingUpdater{applied: true}
+			fake := time.Now()
+			c := pkg8s.NewCoalescedUpdaterWithClock(inner, func() time.Time { return fake })
+
+			s := statusFor(uuid.New(), "Running", 10)
+			_, _ = c.Update(context.Background(), s)
+			if c.Size() != 1 {
+				t.Fatalf("size = %d, want 1 after first Update", c.Size())
+			}
+
+			fake = fake.Add(tc.advance)
+			c.SweepOnce(48 * time.Hour)
+			if c.Size() != tc.wantSize {
+				t.Fatalf("size = %d, want %d after sweep", c.Size(), tc.wantSize)
+			}
+
+			// An identical write after the sweep reaches inner only if the
+			// janitor evicted the entry.
+			_, _ = c.Update(context.Background(), s)
+			if inner.count() != tc.wantCalls {
+				t.Errorf("inner calls = %d, want %d", inner.count(), tc.wantCalls)
+			}
+		})
 	}
 }

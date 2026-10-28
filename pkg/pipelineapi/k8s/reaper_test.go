@@ -68,54 +68,6 @@ func TestReapOnce_DeletesOldPipelineRuns(t *testing.T) {
 	}
 }
 
-func TestReapOnce_IgnoresPipelineRunsWithoutStartTime(t *testing.T) {
-	// StartTime nil, phase Pending — not yet started. Reaper must not
-	// delete these even if they're old (slow bootstrap is legitimate).
-	pr := &datupletv1.PipelineRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "pending", Namespace: "ns1",
-			Labels:            map[string]string{"datuplet.io/run-id": "pending"},
-			CreationTimestamp: metav1.Time{Time: time.Now().Add(-30 * time.Hour)},
-		},
-		Spec: datupletv1.PipelineRunSpec{PipelineRef: datupletv1.PipelineRef{Name: "p"}},
-		// Phase unset / not terminal.
-	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
-	if err := pkg8s.ReapOnce(context.Background(), c, 24*time.Hour, nil); err != nil {
-		t.Fatalf("ReapOnce: %v", err)
-	}
-	list := &datupletv1.PipelineRunList{}
-	_ = c.List(context.Background(), list)
-	if len(list.Items) != 1 {
-		t.Errorf("pending PipelineRun was deleted by reaper")
-	}
-}
-
-func TestReapOnce_DeletesTerminalRunsEvenWithoutStartTime(t *testing.T) {
-	// Validation-failed run: FailedUser, no StartTime, creationTimestamp > maxAge.
-	// Must be reaped so its owner-referenced Secret gets GC'd.
-	pr := &datupletv1.PipelineRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "invalid", Namespace: "ns1",
-			Labels:            map[string]string{"datuplet.io/run-id": "invalid"},
-			CreationTimestamp: metav1.Time{Time: time.Now().Add(-25 * time.Hour)},
-		},
-		Spec: datupletv1.PipelineRunSpec{PipelineRef: datupletv1.PipelineRef{Name: "p"}},
-		Status: datupletv1.PipelineRunStatus{
-			Phase: datupletv1.PipelineRunPhaseFailedUser,
-		},
-	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
-	if err := pkg8s.ReapOnce(context.Background(), c, 24*time.Hour, nil); err != nil {
-		t.Fatalf("ReapOnce: %v", err)
-	}
-	list := &datupletv1.PipelineRunList{}
-	_ = c.List(context.Background(), list)
-	if len(list.Items) != 0 {
-		t.Errorf("terminal run without startTime should be reaped; remaining=%v", list.Items)
-	}
-}
-
 // projectNS builds a project-labelled Namespace (the marker the reaper
 // iterates on now that Secret listing is per-namespace, not cluster-wide).
 func projectNS(name string) *corev1.Namespace {
@@ -185,28 +137,51 @@ func TestReapOnce_SweepsOrphanSecretsPerNamespace(t *testing.T) {
 	}
 }
 
-func TestReapOnce_PrefersCompletionTimeForTerminalRuns(t *testing.T) {
-	// A run that finished 10 minutes ago but started 25h ago should be
-	// kept — age is measured from completionTime, not startTime.
-	pr := &datupletv1.PipelineRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "recent-finish", Namespace: "ns1",
-			Labels: map[string]string{"datuplet.io/run-id": "recent-finish"},
-		},
-		Spec: datupletv1.PipelineRunSpec{PipelineRef: datupletv1.PipelineRef{Name: "p"}},
-		Status: datupletv1.PipelineRunStatus{
-			Phase:          datupletv1.PipelineRunPhaseSucceeded,
-			StartTime:      &metav1.Time{Time: time.Now().Add(-25 * time.Hour)},
-			CompletionTime: &metav1.Time{Time: time.Now().Add(-10 * time.Minute)},
-		},
+// TestReapOnce_AgeBasis pins which timestamp decides a PipelineRun's age.
+func TestReapOnce_AgeBasis(t *testing.T) {
+	ago := func(d time.Duration) *metav1.Time { return &metav1.Time{Time: time.Now().Add(-d)} }
+	cases := []struct {
+		name       string
+		phase      datupletv1.PipelineRunPhase
+		start      *metav1.Time
+		completion *metav1.Time
+		creation   time.Duration
+		wantReaped bool
+	}{
+		// StartTime nil, phase Pending — not yet started. Reaper must not
+		// delete these even if they're old (slow bootstrap is legitimate).
+		{"not_started_is_kept", "", nil, nil, 30 * time.Hour, false},
+		// Validation-failed run: FailedUser, no StartTime, creationTimestamp
+		// > maxAge. Must be reaped so its owner-referenced Secret gets GC'd.
+		{"terminal_without_start_is_reaped", datupletv1.PipelineRunPhaseFailedUser, nil, nil, 25 * time.Hour, true},
+		// Finished 10 minutes ago but started 25h ago: kept — age is
+		// measured from completionTime, not startTime.
+		{"completion_time_preferred", datupletv1.PipelineRunPhaseSucceeded, ago(25 * time.Hour), ago(10 * time.Minute), 0, false},
 	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
-	if err := pkg8s.ReapOnce(context.Background(), c, 24*time.Hour, nil); err != nil {
-		t.Fatalf("ReapOnce: %v", err)
-	}
-	list := &datupletv1.PipelineRunList{}
-	_ = c.List(context.Background(), list)
-	if len(list.Items) != 1 {
-		t.Errorf("terminal run completed 10m ago should NOT be reaped (startTime is 25h ago but completion was fresh)")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := &datupletv1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "run", Namespace: "ns1",
+					Labels: map[string]string{"datuplet.io/run-id": "run"},
+				},
+				Spec: datupletv1.PipelineRunSpec{PipelineRef: datupletv1.PipelineRef{Name: "p"}},
+				Status: datupletv1.PipelineRunStatus{
+					Phase: tc.phase, StartTime: tc.start, CompletionTime: tc.completion,
+				},
+			}
+			if tc.creation > 0 {
+				pr.CreationTimestamp = *ago(tc.creation)
+			}
+			c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
+			if err := pkg8s.ReapOnce(context.Background(), c, 24*time.Hour, nil); err != nil {
+				t.Fatalf("ReapOnce: %v", err)
+			}
+			list := &datupletv1.PipelineRunList{}
+			_ = c.List(context.Background(), list)
+			if reaped := len(list.Items) == 0; reaped != tc.wantReaped {
+				t.Errorf("reaped = %v, want %v; remaining=%v", reaped, tc.wantReaped, list.Items)
+			}
+		})
 	}
 }

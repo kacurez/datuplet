@@ -45,8 +45,7 @@ for img in \
   datuplet/pipeline-api:latest datuplet/pipeline-observer:latest \
   datuplet/pipeline-operator:latest datuplet/gateway:latest datuplet/query-worker:latest \
   "datuplet/data-generator:$CTAG" "datuplet/sql-transform:$CTAG" \
-  "datuplet/stdout-writer:$CTAG" "datuplet/http-json-extractor:$CTAG" \
-  "datuplet/finnhub-extractor:$CTAG" \
+  "datuplet/http-json-extractor:$CTAG" \
 ; do kind load docker-image --name datuplet "$img"; done
 
 # 4. Install the four charts + bootstrap warehouse/admin user (register.sh runs last)
@@ -85,7 +84,7 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
 - Four-chart Helm install: `datuplet-operators`, `datuplet-infra`, `datuplet-app`,
   `datuplet-lakekeeper` — each with its own upgrade cadence.
 - Streaming ETL via a Data Gateway sidecar (gRPC control + HTTP data) with
-  thin Go and Python SDKs.
+  a thin Go SDK.
 - Apache Iceberg table format on top of S3 / GCS / bundled MinIO.
 - `pipeline-api` HTTP control plane and browser UI for pipelines, runs, secrets,
   storage browse, and the registry-driven component catalog.
@@ -96,7 +95,7 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
   No long-lived warehouse credentials on any Datuplet Deployment.
 - OpenFGA fine-grained authorization per project, run, and table.
 - Built-in component images: `data-generator`, `http-json-extractor`,
-  `finnhub-extractor`, `sql-transform` (embedded DuckDB), `stdout-writer`.
+  `sql-transform` (embedded DuckDB).
 
 ---
 

@@ -48,12 +48,12 @@ canonical templates:
 
 - **Source** (pull data in, no inputs): `components/http-json-extractor/`
 - **Transform** (read tables → write tables): `components/sql-transform/`
-- **Sink** (read tables → external, no storage output): `components/stdout-writer/`
+- **Sink** (read tables → external, no storage output): there is no built-in sink; start from `components/sql-transform/` for the read side and use `OpenReader` from `sdk/go`
 
 Then, in order:
 
-1. **Scaffold** `components/<name>/` — program file (`main.go` or Python), `go.mod`
-   (Go; keep the `replace` directive to the in-repo SDK), `Dockerfile`,
+1. **Scaffold** `components/<name>/` — program file (`main.go`), `go.mod`
+   (keep the `replace` directive to the in-repo SDK), `Dockerfile`,
    `schema.json`. See `references/build-a-component.md`.
 2. **Implement** against the SDK: parse config, read inputs and/or write outputs
    through the gateway, and signal status via the exit-code contract. The SDK
@@ -93,8 +93,7 @@ Then, in order:
 
 - **Exit-code contract:** `0` = Succeeded, `1` = FailedUser (bad config/input —
   the user's fault), `>=20` = FailedApplication (infra/your-bug). Emit a
-  human-readable reason with the `DUPLET_STATUS_MESSAGE:` stdout prefix (Python:
-  `sdk/python/status.py` has `fail_user`/`fail_application`; Go: print the prefix
+  human-readable reason with the `DUPLET_STATUS_MESSAGE:` stdout prefix (Go: print the prefix
   then `os.Exit(code)`). Getting this right is how runs surface the correct
   phase and message to the operator.
 - **Stay credentials-clean when you can.** Components read/write through the

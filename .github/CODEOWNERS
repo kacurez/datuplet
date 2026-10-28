@@ -1,0 +1,17 @@
+# High-risk paths (REVIEW.md "Risk tiers"): a maintainer reads these on
+# every PR. With one maintainer this is documentation GitHub surfaces on
+# the PR, not a second approver.
+
+/.github/workflows/            @kacurez
+/Makefile                      @kacurez
+/scripts/install.sh            @kacurez
+/scripts/upgrade.sh            @kacurez
+/scripts/verify-versions.sh    @kacurez
+/charts/datuplet-app/crds/     @kacurez
+/charts/datuplet-operators/crds/ @kacurez
+/charts/datuplet-app/files/fga/ @kacurez
+/pkg/pipelineapi/auth/         @kacurez
+/pkg/pipelineapi/authz/        @kacurez
+/pkg/pipelineapi/tokens/       @kacurez
+/pkg/catalogwriter/            @kacurez
+/pkg/datagateway/lakekeeper/   @kacurez

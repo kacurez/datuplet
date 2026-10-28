@@ -1,7 +1,8 @@
 # Processors: Drop — data-generator seeds a table, a drop processor removes
-# columns before they're committed, then stdout-writer prints what's left
+# columns before they're committed; inspect raw.products in the storage browser
+# or `datuplet storage`
 #
-# Components: data-generator, stdout-writer
+# Components: data-generator
 # Prerequisites: running Datuplet install (lakekeeper + pipeline-api), see docs/install.md
 #
 # Run it:
@@ -44,14 +45,3 @@ stages:
               columns:
                 - price
                 - quantity
-
-  # Stage 2: Print what's left (id, name, category)
-  - name: load
-    components:
-      - name: stdout-writer
-        component: stdout-writer
-        inputs:
-          buckets:
-            - raw
-        config:
-          format: json

@@ -6,10 +6,8 @@ bin/
 *.dylib
 /csv-extractor
 /sql-transform
-/stdout-writer
 /duckdb-transform
 /http-json-extractor
-/pandas-transform
 
 # Git repository (1.2GB - BIGGEST WIN)
 .git/

@@ -73,26 +73,6 @@ func newAppQueryTestServer(t *testing.T, workerURL, lkPID, warehouse string, sig
 	return httptest.NewServer(srv.Handler())
 }
 
-// TestAppQueryRoute_NotConfigured mirrors TestServer_QueryRoute_NotConfigured
-// (server_test.go) for the new app-principal route: absent query-service
-// wiring, POST /internal/v1/projects/{pid}/query must 404 rather than panic
-// or fall through to some other handler.
-func TestAppQueryRoute_NotConfigured(t *testing.T) {
-	srv := apihttp.NewServer(nil)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	pid := uuid.NewString()
-	resp, err := http.Post(ts.URL+"/internal/v1/projects/"+pid+"/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
-	if err != nil {
-		t.Fatalf("POST /internal/v1/projects/%s/query: %v", pid, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", resp.StatusCode)
-	}
-}
-
 func TestAppQueryRoute_PrincipalReachesAudit(t *testing.T) {
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

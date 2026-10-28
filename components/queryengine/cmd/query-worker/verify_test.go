@@ -97,91 +97,164 @@ func TestVerify_Valid(t *testing.T) {
 	}
 }
 
-func TestVerify_WrongAud_CatalogQueryToken(t *testing.T) {
-	// Cross-token replay: a query token minted for lakekeeper
-	// (aud=datuplet-catalog) must NOT be accepted by the query-worker.
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
+// mintFn builds the token string for one verification-matrix row.
+type mintFn func(t *testing.T, priv *rsa.PrivateKey, c jwt.MapClaims) string
 
-	c := validClaims(testSub)
-	c["aud"] = tokens.TableTokenAudience // datuplet-catalog
-	c["token_kind"] = tokens.TokenKindQuery
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of catalog-audience token, got nil")
-	}
+func mintRS256(t *testing.T, priv *rsa.PrivateKey, c jwt.MapClaims) string {
+	return signClaims(t, priv, testKID, c)
 }
 
-func TestVerify_WrongTokenKind_QueryWithWorkerAud(t *testing.T) {
-	// Hand-crafted: aud forced to the worker audience but token_kind=query.
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["token_kind"] = tokens.TokenKindQuery // aud already QueryWorkerAudience
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of token_kind=query, got nil")
+// TestVerify_ClaimMatrix is the JWT verification matrix: each row mutates a
+// valid claim set (or the signing step) and asserts accept/reject.
+func TestVerify_ClaimMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(c jwt.MapClaims)
+		mint    mintFn // nil = RS256 with testKID
+		wantErr bool
+	}{
+		{
+			// Cross-token replay: a query token minted for lakekeeper
+			// (aud=datuplet-catalog) must NOT be accepted by the query-worker.
+			name: "catalog-audience query token rejected",
+			mutate: func(c jwt.MapClaims) {
+				c["aud"] = tokens.TableTokenAudience
+				c["token_kind"] = tokens.TokenKindQuery
+			},
+			wantErr: true,
+		},
+		{
+			// aud already QueryWorkerAudience, but token_kind=query.
+			name:    "token_kind=query with worker aud rejected",
+			mutate:  func(c jwt.MapClaims) { c["token_kind"] = tokens.TokenKindQuery },
+			wantErr: true,
+		},
+		{
+			// A run token (token_kind=run, aud=datuplet-catalog) must be rejected.
+			name: "run-token shape rejected",
+			mutate: func(c jwt.MapClaims) {
+				c["aud"] = tokens.TableTokenAudience
+				c["token_kind"] = tokens.TokenKindRun
+			},
+			wantErr: true,
+		},
+		{
+			// 10 minutes in the past, well beyond the +-60s skew window.
+			name: "expired rejected",
+			mutate: func(c jwt.MapClaims) {
+				c["exp"] = time.Now().Add(-10 * time.Minute).Unix()
+				c["nbf"] = time.Now().Add(-15 * time.Minute).Unix()
+			},
+			wantErr: true,
+		},
+		{
+			// nbf 10 minutes in the future, beyond the skew window.
+			name:    "not yet valid rejected",
+			mutate:  func(c jwt.MapClaims) { c["nbf"] = time.Now().Add(10 * time.Minute).Unix() },
+			wantErr: true,
+		},
+		{
+			// exp 30s in the past: inside the +-60s leeway window.
+			name:   "expired within skew accepted",
+			mutate: func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-30 * time.Second).Unix() },
+		},
+		{
+			name: "alg=none rejected",
+			mint: func(t *testing.T, _ *rsa.PrivateKey, c jwt.MapClaims) string {
+				tok := jwt.NewWithClaims(jwt.SigningMethodNone, c)
+				tok.Header["kid"] = testKID
+				s, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
+				if err != nil {
+					t.Fatalf("mint none-alg token: %v", err)
+				}
+				return s
+			},
+			wantErr: true,
+		},
+		{
+			// Sign with HS256 using arbitrary bytes; WithValidMethods must reject.
+			name: "HS256 rejected",
+			mint: func(t *testing.T, _ *rsa.PrivateKey, c jwt.MapClaims) string {
+				tok := jwt.NewWithClaims(jwt.SigningMethodHS256, c)
+				tok.Header["kid"] = testKID
+				s, err := tok.SignedString([]byte("attacker-shared-secret"))
+				if err != nil {
+					t.Fatalf("mint HS256 token: %v", err)
+				}
+				return s
+			},
+			wantErr: true,
+		},
+		{
+			// Right key, but a kid the provider doesn't know.
+			name: "unknown kid rejected",
+			mint: func(t *testing.T, priv *rsa.PrivateKey, c jwt.MapClaims) string {
+				return signClaims(t, priv, "unknown-kid", c)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "empty sub rejected",
+			mutate:  func(c jwt.MapClaims) { c["sub"] = "" },
+			wantErr: true,
+		},
+		{
+			name:    "wrong issuer rejected",
+			mutate:  func(c jwt.MapClaims) { c["iss"] = "evil-issuer" },
+			wantErr: true,
+		},
+		{
+			// nbf 30s in the future: inside the +-60s leeway window.
+			name:   "nbf within skew accepted",
+			mutate: func(c jwt.MapClaims) { c["nbf"] = time.Now().Add(30 * time.Second).Unix() },
+		},
+		{
+			// []string signs to a JSON array, so the parse path sees a
+			// []interface{} and exercises GetAudience's array branch.
+			name:   "aud JSON array single element accepted",
+			mutate: func(c jwt.MapClaims) { c["aud"] = []string{queryWorkerAudience} },
+		},
+		{
+			// Strict single-audience: worker + catalog audience is a
+			// dual-audience replay and must be rejected outright.
+			name:    "aud JSON array multi element rejected",
+			mutate:  func(c jwt.MapClaims) { c["aud"] = []string{queryWorkerAudience, "datuplet-catalog"} },
+			wantErr: true,
+		},
+		{
+			// Must be rejected without panicking on the type assertion.
+			name:    "non-string token_kind rejected",
+			mutate:  func(c jwt.MapClaims) { c["token_kind"] = 42 },
+			wantErr: true,
+		},
+		{
+			// Pins jwt.WithExpirationRequired.
+			name:    "missing exp rejected",
+			mutate:  func(c jwt.MapClaims) { delete(c, "exp") },
+			wantErr: true,
+		},
 	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			priv := genKey(t)
+			v := newTokenVerifier(provider(t, priv))
 
-func TestVerify_RunTokenShape(t *testing.T) {
-	// A run token (token_kind=run, aud=datuplet-catalog) must be rejected.
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["aud"] = tokens.TableTokenAudience
-	c["token_kind"] = tokens.TokenKindRun
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of run-token shape, got nil")
-	}
-}
-
-func TestVerify_Expired(t *testing.T) {
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	// 10 minutes in the past — well beyond the ±60s skew window.
-	c["exp"] = time.Now().Add(-10 * time.Minute).Unix()
-	c["nbf"] = time.Now().Add(-15 * time.Minute).Unix()
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of expired token, got nil")
-	}
-}
-
-func TestVerify_NotYetValid(t *testing.T) {
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	// nbf 10 minutes in the future — beyond the skew window.
-	c["nbf"] = time.Now().Add(10 * time.Minute).Unix()
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of not-yet-valid token, got nil")
-	}
-}
-
-func TestVerify_ExpiredWithinSkew_Accepted(t *testing.T) {
-	// exp 30s in the past: inside the ±60s leeway window → ACCEPTED.
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["exp"] = time.Now().Add(-30 * time.Second).Unix()
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err != nil {
-		t.Fatalf("token expired 30s ago should be accepted within ±60s skew, got: %v", err)
+			c := validClaims(testSub)
+			if tc.mutate != nil {
+				tc.mutate(c)
+			}
+			mint := tc.mint
+			if mint == nil {
+				mint = mintRS256
+			}
+			_, _, err := v.Verify(context.Background(), mint(t, priv, c))
+			if tc.wantErr && err == nil {
+				t.Fatal("expected rejection, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected acceptance, got: %v", err)
+			}
+		})
 	}
 }
 
@@ -196,78 +269,6 @@ func TestVerify_BadSignature(t *testing.T) {
 
 	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
 		t.Fatal("expected rejection of bad signature, got nil")
-	}
-}
-
-func TestVerify_AlgNoneRejected(t *testing.T) {
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	tok := jwt.NewWithClaims(jwt.SigningMethodNone, c)
-	tok.Header["kid"] = testKID
-	tokenStr, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
-	if err != nil {
-		t.Fatalf("mint none-alg token: %v", err)
-	}
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of alg=none token, got nil")
-	}
-}
-
-func TestVerify_HS256Rejected(t *testing.T) {
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	// Sign with HS256 using arbitrary bytes; WithValidMethods must reject.
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, validClaims(testSub))
-	tok.Header["kid"] = testKID
-	tokenStr, err := tok.SignedString([]byte("attacker-shared-secret"))
-	if err != nil {
-		t.Fatalf("mint HS256 token: %v", err)
-	}
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of HS256 token, got nil")
-	}
-}
-
-func TestVerify_UnknownKid(t *testing.T) {
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	// Sign with the right key but stamp a kid the provider doesn't know.
-	tokenStr := signClaims(t, priv, "unknown-kid", validClaims(testSub))
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of unknown kid, got nil")
-	}
-}
-
-func TestVerify_EmptySub(t *testing.T) {
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["sub"] = ""
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of empty sub, got nil")
-	}
-}
-
-func TestVerify_WrongIssuer(t *testing.T) {
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["iss"] = "evil-issuer"
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of wrong issuer, got nil")
 	}
 }
 
@@ -296,80 +297,6 @@ func TestVerify_ErrorNeverLeaksToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "internal token rejected") {
 		t.Errorf("error should carry the stable prefix, got: %v", err)
-	}
-}
-
-func TestVerify_NbfWithinSkew_Accepted(t *testing.T) {
-	// nbf 30s in the future: inside the ±60s leeway window → ACCEPTED.
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["nbf"] = time.Now().Add(30 * time.Second).Unix()
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err != nil {
-		t.Fatalf("token with nbf +30s should be accepted within ±60s skew, got: %v", err)
-	}
-}
-
-func TestVerify_AudJSONArray_SingleElement_Accepted(t *testing.T) {
-	// aud as a JSON array with the single worker audience. Setting it to
-	// []string here means that after signing + JSON round-trip the parse path
-	// sees a []interface{} — exercising GetAudience's array branch.
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["aud"] = []string{queryWorkerAudience}
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err != nil {
-		t.Fatalf("single-element aud array should be accepted, got: %v", err)
-	}
-}
-
-func TestVerify_AudJSONArray_MultiElement_Rejected(t *testing.T) {
-	// Strict single-audience: a token carrying both the worker audience and
-	// the catalog audience must be rejected outright (dual-audience replay).
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["aud"] = []string{queryWorkerAudience, "datuplet-catalog"}
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of multi-audience token, got nil")
-	}
-}
-
-func TestVerify_NonStringTokenKind_Rejected(t *testing.T) {
-	// token_kind as a number must be rejected (not match the expected string)
-	// and must not panic on the type assertion.
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	c["token_kind"] = 42
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of non-string token_kind, got nil")
-	}
-}
-
-func TestVerify_MissingExp_Rejected(t *testing.T) {
-	// A token without exp must be rejected (pins jwt.WithExpirationRequired).
-	priv := genKey(t)
-	v := newTokenVerifier(provider(t, priv))
-
-	c := validClaims(testSub)
-	delete(c, "exp")
-	tokenStr := signClaims(t, priv, testKID, c)
-
-	if _, _, err := v.Verify(context.Background(), tokenStr); err == nil {
-		t.Fatal("expected rejection of token missing exp, got nil")
 	}
 }
 

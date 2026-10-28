@@ -52,38 +52,33 @@ func TestRejectSymlinks(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
 	}
-
-	if err := RejectSymlinks(real); err != nil {
-		t.Errorf("RejectSymlinks(real dir) = %v, want nil", err)
-	}
-	if err := RejectSymlinks(link); err == nil {
-		t.Error("RejectSymlinks(symlink) = nil, want non-nil")
-	}
-	// a path whose parent contains a symlink should also be rejected
 	inside := filepath.Join(link, "sub")
 	_ = os.Mkdir(inside, 0o755)
-	if err := RejectSymlinks(inside); err == nil {
-		t.Error("RejectSymlinks(path-via-symlink) = nil, want non-nil")
-	}
-}
 
-// Regression: a non-existing leaf whose parent IS a symlink used to pass
-// because EvalSymlinks returned IsNotExist and we short-circuited. Walk
-// up to the deepest existing ancestor and evaluate there instead.
-func TestRejectSymlinks_MissingLeafViaSymlinkParent(t *testing.T) {
-	dir := t.TempDir()
-	real := filepath.Join(dir, "real")
-	if err := os.Mkdir(real, 0o755); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{"real_dir", real, false},
+		{"symlink", link, true},
+		// a path whose parent contains a symlink should also be rejected
+		{"path_via_symlink", inside, true},
+		// Regression: a non-existing leaf whose parent IS a symlink used to
+		// pass because EvalSymlinks returned IsNotExist and we
+		// short-circuited. Walk up to the deepest existing ancestor and
+		// evaluate there instead.
+		{"missing_leaf_via_symlink_parent", filepath.Join(link, "unwritten-file"), true},
 	}
-	link := filepath.Join(dir, "link")
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
-
-	// Probe a leaf that doesn't exist yet under the symlinked parent.
-	p := filepath.Join(link, "unwritten-file")
-	if err := RejectSymlinks(p); err == nil {
-		t.Error("want reject for path via symlink parent with missing leaf, got nil")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := RejectSymlinks(tc.path)
+			if tc.wantErr && err == nil {
+				t.Errorf("RejectSymlinks(%s) = nil, want non-nil", tc.name)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("RejectSymlinks(%s) = %v, want nil", tc.name, err)
+			}
+		})
 	}
 }

@@ -47,78 +47,44 @@ func authedRequest() *http.Request {
 	return r.WithContext(auth.WithCtxUser(r.Context(), testUser))
 }
 
-func TestMustBeSuperadmin_Allows(t *testing.T) {
-	s := &Server{serverAdmin: stubServerAdmin{result: true}}
-	rec := httptest.NewRecorder()
-
-	user, ok := s.mustBeSuperadmin(rec, authedRequest())
-	if !ok {
-		t.Fatalf("ok = false (status %d), want true", rec.Code)
+func TestMustBeSuperadmin(t *testing.T) {
+	tests := []struct {
+		name     string
+		s        *Server
+		unauthed bool // no user in the request context
+		wantOK   bool
+		wantCode int // checked when !wantOK
+	}{
+		{name: "superadmin allowed", s: &Server{serverAdmin: stubServerAdmin{result: true}}, wantOK: true},
+		{name: "non-admin 403", s: &Server{serverAdmin: stubServerAdmin{result: false}}, wantCode: http.StatusForbidden},
+		{name: "unauthenticated 401", s: &Server{serverAdmin: stubServerAdmin{result: true}}, unauthed: true, wantCode: http.StatusUnauthorized},
+		{name: "authz unavailable 503", s: &Server{serverAdmin: stubServerAdmin{err: authz.ErrAuthzUnavailable}}, wantCode: http.StatusServiceUnavailable},
+		// serverAdmin nil: the superadmin checker is unwired.
+		{name: "unwired 503", s: &Server{}, wantCode: http.StatusServiceUnavailable},
+		{name: "unexpected error 500", s: &Server{serverAdmin: stubServerAdmin{err: errors.New("boom")}}, wantCode: http.StatusInternalServerError},
 	}
-	if user == nil || user.ID != testUser.ID {
-		t.Fatalf("user = %+v, want testUser", user)
-	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := authedRequest()
+			if tc.unauthed {
+				req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/components/x", nil)
+			}
 
-func TestMustBeSuperadmin_NonAdmin403(t *testing.T) {
-	s := &Server{serverAdmin: stubServerAdmin{result: false}}
-	rec := httptest.NewRecorder()
-
-	if _, ok := s.mustBeSuperadmin(rec, authedRequest()); ok {
-		t.Fatal("ok = true, want false for a non-superadmin")
-	}
-	if rec.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want 403", rec.Code)
-	}
-}
-
-func TestMustBeSuperadmin_Unauthenticated401(t *testing.T) {
-	s := &Server{serverAdmin: stubServerAdmin{result: true}}
-	rec := httptest.NewRecorder()
-	// No user in context.
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/components/x", nil)
-
-	if _, ok := s.mustBeSuperadmin(rec, req); ok {
-		t.Fatal("ok = true, want false when unauthenticated")
-	}
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", rec.Code)
-	}
-}
-
-func TestMustBeSuperadmin_Unavailable503(t *testing.T) {
-	s := &Server{serverAdmin: stubServerAdmin{err: authz.ErrAuthzUnavailable}}
-	rec := httptest.NewRecorder()
-
-	if _, ok := s.mustBeSuperadmin(rec, authedRequest()); ok {
-		t.Fatal("ok = true, want false when authz backend unavailable")
-	}
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", rec.Code)
-	}
-}
-
-func TestMustBeSuperadmin_Unwired503(t *testing.T) {
-	s := &Server{} // serverAdmin nil
-	rec := httptest.NewRecorder()
-
-	if _, ok := s.mustBeSuperadmin(rec, authedRequest()); ok {
-		t.Fatal("ok = true, want false when the superadmin checker is unwired")
-	}
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", rec.Code)
-	}
-}
-
-func TestMustBeSuperadmin_UnexpectedError500(t *testing.T) {
-	s := &Server{serverAdmin: stubServerAdmin{err: errors.New("boom")}}
-	rec := httptest.NewRecorder()
-
-	if _, ok := s.mustBeSuperadmin(rec, authedRequest()); ok {
-		t.Fatal("ok = true, want false on an unexpected authz error")
-	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want 500", rec.Code)
+			user, ok := tc.s.mustBeSuperadmin(rec, req)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v (status %d), want %v", ok, rec.Code, tc.wantOK)
+			}
+			if tc.wantOK {
+				if user == nil || user.ID != testUser.ID {
+					t.Fatalf("user = %+v, want testUser", user)
+				}
+				return
+			}
+			if rec.Code != tc.wantCode {
+				t.Errorf("status = %d, want %d", rec.Code, tc.wantCode)
+			}
+		})
 	}
 }
 
@@ -138,42 +104,30 @@ func decodeMe(t *testing.T, s *Server) map[string]any {
 	return body
 }
 
-func TestHandleMe_IsSuperadmin_True(t *testing.T) {
-	s := &Server{resolver: meStubResolver{}, serverAdmin: stubServerAdmin{result: true}}
-	body := decodeMe(t, s)
-	if body["is_superadmin"] != true {
-		t.Errorf("is_superadmin = %v, want true", body["is_superadmin"])
+// TestHandleMe_IsSuperadmin: the whoami call must never 5xx over authz
+// availability — an error from the checker, or an unwired checker, degrades
+// is_superadmin to false (key still present, status still 200).
+func TestHandleMe_IsSuperadmin(t *testing.T) {
+	tests := []struct {
+		name string
+		s    *Server
+		want bool
+	}{
+		{"granted", &Server{resolver: meStubResolver{}, serverAdmin: stubServerAdmin{result: true}}, true},
+		{"denied", &Server{resolver: meStubResolver{}, serverAdmin: stubServerAdmin{result: false}}, false},
+		{"checker error degrades to false", &Server{resolver: meStubResolver{}, serverAdmin: stubServerAdmin{err: authz.ErrAuthzUnavailable}}, false},
+		{"unwired checker", &Server{resolver: meStubResolver{}}, false},
 	}
-}
-
-func TestHandleMe_IsSuperadmin_FalseWhenDenied(t *testing.T) {
-	s := &Server{resolver: meStubResolver{}, serverAdmin: stubServerAdmin{result: false}}
-	body := decodeMe(t, s)
-	if body["is_superadmin"] != false {
-		t.Errorf("is_superadmin = %v, want false", body["is_superadmin"])
-	}
-}
-
-func TestHandleMe_IsSuperadmin_FalseOnError(t *testing.T) {
-	// The whoami call must never 5xx over authz availability: an error from
-	// the checker degrades is_superadmin to false, still 200.
-	s := &Server{resolver: meStubResolver{}, serverAdmin: stubServerAdmin{err: authz.ErrAuthzUnavailable}}
-	body := decodeMe(t, s)
-	if _, ok := body["is_superadmin"]; !ok {
-		t.Fatal("is_superadmin key missing from /me response")
-	}
-	if body["is_superadmin"] != false {
-		t.Errorf("is_superadmin = %v, want false (error degraded)", body["is_superadmin"])
-	}
-}
-
-func TestHandleMe_IsSuperadmin_FalseWhenUnwired(t *testing.T) {
-	s := &Server{resolver: meStubResolver{}} // serverAdmin nil
-	body := decodeMe(t, s)
-	if _, ok := body["is_superadmin"]; !ok {
-		t.Fatal("is_superadmin key missing from /me response")
-	}
-	if body["is_superadmin"] != false {
-		t.Errorf("is_superadmin = %v, want false (checker unwired)", body["is_superadmin"])
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := decodeMe(t, tc.s)
+			got, ok := body["is_superadmin"]
+			if !ok {
+				t.Fatal("is_superadmin key missing from /me response")
+			}
+			if got != tc.want {
+				t.Errorf("is_superadmin = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

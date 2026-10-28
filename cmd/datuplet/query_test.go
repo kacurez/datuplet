@@ -111,18 +111,6 @@ func TestServerQuery_ErrorStatus(t *testing.T) {
 	}
 }
 
-func TestLocalQueryMessage(t *testing.T) {
-	var out bytes.Buffer
-	err := localQueryNotAvailable(&out)
-	if err == nil {
-		t.Fatalf("--local must error: root datuplet is duckdb-free")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "datuplet-query") {
-		t.Fatalf("message must name the datuplet-query binary, got: %q", msg)
-	}
-}
-
 func ptr(s string) *string { return &s }
 
 func writeTempFile(t *testing.T, content string) string {

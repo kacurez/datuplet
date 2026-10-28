@@ -43,7 +43,7 @@ func (s *stubAuthorizer) ListObjects(context.Context, string, string, ObjectType
 	return nil, nil
 }
 
-func (s *stubAuthorizer) WriteTuples(context.Context, []Tuple) error { return nil }
+func (s *stubAuthorizer) WriteTuples(context.Context, []Tuple) error  { return nil }
 func (s *stubAuthorizer) DeleteTuples(context.Context, []Tuple) error { return nil }
 
 var _ Authorizer = (*stubAuthorizer)(nil)
@@ -58,37 +58,6 @@ func newTestServerAdmin(authzr Authorizer, count *int) *serverAdmin {
 			*count++
 			return testServerWire, nil
 		},
-	}
-}
-
-func TestIsServerAdmin_Allowed(t *testing.T) {
-	fake := newStubAuthorizer()
-	fake.allow(UserObject("u1").String(), "admin", ServerObject(testServerUUID))
-
-	var n int
-	s := newTestServerAdmin(fake, &n)
-
-	ok, err := s.IsServerAdmin(context.Background(), "u1")
-	if err != nil {
-		t.Fatalf("IsServerAdmin: unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("IsServerAdmin: want true for seeded superadmin, got false")
-	}
-}
-
-func TestIsServerAdmin_Denied(t *testing.T) {
-	fake := newStubAuthorizer()
-
-	var n int
-	s := newTestServerAdmin(fake, &n)
-
-	ok, err := s.IsServerAdmin(context.Background(), "u2")
-	if err != nil {
-		t.Fatalf("IsServerAdmin: unexpected error: %v", err)
-	}
-	if ok {
-		t.Fatal("IsServerAdmin: want false for unseeded user, got true")
 	}
 }
 
@@ -142,5 +111,34 @@ func TestIsServerAdmin_DiscoveryMemoized(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("discovery ran %d times across two IsServerAdmin calls, want 1", n)
+	}
+}
+
+func TestIsServerAdmin(t *testing.T) {
+	cases := []struct {
+		name   string
+		seeded bool
+		want   bool
+	}{
+		{"allowed_for_seeded_superadmin", true, true},
+		{"denied_for_unseeded_user", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newStubAuthorizer()
+			if tc.seeded {
+				fake.allow(UserObject("u1").String(), "admin", ServerObject(testServerUUID))
+			}
+			var n int
+			s := newTestServerAdmin(fake, &n)
+
+			ok, err := s.IsServerAdmin(context.Background(), "u1")
+			if err != nil {
+				t.Fatalf("IsServerAdmin: unexpected error: %v", err)
+			}
+			if ok != tc.want {
+				t.Fatalf("IsServerAdmin = %v, want %v", ok, tc.want)
+			}
+		})
 	}
 }

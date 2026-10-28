@@ -41,7 +41,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipeline/config"
 )
 
-// K8sBackend implements Backend by driving pipeline-api over HTTP.
+// K8sBackend runs pipelines by driving pipeline-api over HTTP.
 // Constructed with a per-suite FGAHarness so every run is scoped to
 // the harness's lakekeeper Project (and per-project namespace).
 type K8sBackend struct {
@@ -62,8 +62,6 @@ type K8sBackend struct {
 	// project, by name); callers that construct the backend as a literal (e.g.
 	// the secrets ladder) set it directly to target a specific project.
 	DatupletProjectID string
-
-	Resources []string // legacy kubectl "kind/name" cleanup entries (unused by the HTTP path)
 
 	// apiSession caches the RunAsUser login cookie for the backend's lifetime.
 	apiSession string
@@ -290,9 +288,8 @@ func (k *K8sBackend) RunPipeline(ctx context.Context, pipelinePath string, opts 
 // therefore (a) provisions a real DB login user for non-admin identities
 // (Alice maps to the pre-seeded admin), (b) logs in, and (c) seeds the run's
 // REAL UUID with the SAME project relation SetupFGABootstrap grants the fixed
-// UUID. The token-mint path (k8s_token.go, exercised by k8s_token_test.go and
-// the buildK8sVerifier browse impersonation) still uses the fixed UUIDs, which
-// SeedFGAGrants keeps granting — both identities are covered.
+// UUID. The buildK8sVerifier browse impersonation still uses the fixed UUIDs,
+// which SeedFGAGrants keeps granting — both identities are covered.
 func (k *K8sBackend) apiSessionFor(ctx context.Context) (string, error) {
 	if k.apiSession != "" {
 		return k.apiSession, nil
@@ -323,7 +320,7 @@ func (k *K8sBackend) apiSessionFor(ctx context.Context) (string, error) {
 // ensureRunAsUserGrant threads the run's REAL DB UUID into the same project
 // relation SetupFGABootstrap grants this TestUser's fixed UUID, so the
 // run-trigger's mustHaveRelation FGA check passes for the authenticated caller.
-// No-op for a no-grant identity (dora-like: relation == "").
+// No-op for a no-grant identity (relation == "").
 func (k *K8sBackend) ensureRunAsUserGrant(ctx context.Context, cookie string) error {
 	relation := relationForTestUser(k.RunAsUser)
 	if relation == "" {
@@ -403,17 +400,6 @@ func (k *K8sBackend) Cleanup(ctx context.Context) error {
 			if err := apiDeletePipeline(ctx, PipelineAPIBaseURL(), k.apiSession, k.DatupletProjectID, name); err != nil {
 				errs = append(errs, fmt.Sprintf("delete pipeline %s: %v", name, err))
 			}
-		}
-	}
-
-	// Legacy kubectl "kind/name" resources (unused by the HTTP path; retained
-	// so any externally-appended entries are still cleaned up).
-	for _, res := range k.Resources {
-		out, err := exec.CommandContext(ctx, "kubectl", "delete", res,
-			"-n", k.Namespace,
-			"--ignore-not-found").CombinedOutput()
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("delete %s: %v (%s)", res, err, strings.TrimSpace(string(out))))
 		}
 	}
 

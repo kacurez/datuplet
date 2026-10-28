@@ -9,7 +9,7 @@ components/sql-transform/config.go (ComponentConfig — sql is required at
 runtime via parseConfig; memory/max_temp_size/threads/temp_directory all
 default when omitted).
 
-Resources: bigger defaults than the other five built-ins — sql-transform
+Resources: bigger defaults than the other two built-ins — sql-transform
 runs an embedded DuckDB engine and materializes inputs into in-memory
 tables before the user SQL executes.
 */ -}}

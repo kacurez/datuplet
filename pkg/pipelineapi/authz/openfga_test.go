@@ -23,7 +23,7 @@ func TestOpenFGAAuthorizer_Check_NetworkUnreachable(t *testing.T) {
 		"http://127.0.0.1:1",
 		"01AAAAAAAAAAAAAAAAAAAAAAA1", // fake but non-empty ULID
 		"01AAAAAAAAAAAAAAAAAAAAAAA2", // fake but non-empty ULID
-		"",                          // no apiKey — existing behaviour
+		"",                           // no apiKey — existing behaviour
 		5*time.Second,
 	)
 	if err != nil {

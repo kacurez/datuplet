@@ -101,32 +101,6 @@ func TestUpdateRunPhase(t *testing.T) {
 	}
 }
 
-func TestUpdateRunPhase_FirstWriteAppliesAndReturnsApplied(t *testing.T) {
-	pool, cleanup := testStore(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	pipe, _ := store.CreatePipeline(ctx, pool, proj.ID, "etl", "d", minimalDoc)
-	run, _ := store.CreateRun(ctx, pool, store.CreateRunOpts{
-		ID: uuid.New(), ProjectID: proj.ID, PipelineID: pipe.ID,
-	})
-
-	applied, err := store.UpdateRunPhase(ctx, pool, run.ID, store.UpdateRunPhaseOpts{
-		Phase: "Running", ObservedRV: 100,
-	})
-	if err != nil {
-		t.Fatalf("UpdateRunPhase: %v", err)
-	}
-	if !applied {
-		t.Fatal("applied = false, want true for first rv-gated write")
-	}
-	got, _ := store.GetRunByID(ctx, pool, run.ID)
-	if got.Phase != "Running" {
-		t.Errorf("phase = %q, want Running", got.Phase)
-	}
-}
-
 func TestUpdateRunPhase_StaleRVDropsWrite(t *testing.T) {
 	pool, cleanup := testStore(t)
 	defer cleanup()

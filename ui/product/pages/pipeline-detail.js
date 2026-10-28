@@ -544,7 +544,7 @@ export function renderEditor() {
 // ---- Inputs (RFC 027 U4) ---------------------------------------------------
 //
 // Rendered only when the component can consume tables at all (io.inputs !==
-// 'none' — data-generator / http-json-extractor / finnhub-extractor all
+// 'none' — data-generator / http-json-extractor both
 // declare 'none' and get no Inputs section, spec §6). Current inputs show as
 // chips; "+ Add input table…" opens a modal picker over two groups — tables
 // produced by earlier stages, and tables already in project storage.
@@ -758,8 +758,7 @@ function openInputPicker(upstreamRows, storageRows, have, onAdd) {
 // ---- Outputs (RFC 027 U5) --------------------------------------------------
 //
 // Rendered only when the component can produce tables at all (io.outputs !==
-// 'none' — stdout-writer declares 'none' and gets no Outputs section, spec
-// §6). Dual-mode, mirroring the RFC 027 UX mockup's renderOutputs(box, comp):
+// 'none' — such a component gets no Outputs section, spec §6). Dual-mode, mirroring the RFC 027 UX mockup's renderOutputs(box, comp):
 // "Dynamic — bucket only" (outputs.defaultBucket [+ defaultWriteMode]) vs
 // "Explicit tables" (outputs.tables[] rows of {name, bucket, writeMode?}).
 // Switching modes carries the first table's bucket (+ writeMode) over, and

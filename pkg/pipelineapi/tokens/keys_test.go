@@ -46,28 +46,6 @@ func TestLoadPrivateKeyFromPEMFile_OK(t *testing.T) {
 	}
 }
 
-func TestLoadPrivateKeyFromPEMFile_MissingFile(t *testing.T) {
-	if _, err := tokens.LoadPrivateKeyFromPEMFile("/nonexistent", "key-1"); err == nil {
-		t.Error("expected error for missing file")
-	}
-}
-
-func TestLoadPrivateKeyFromPEMFile_EmptyKeyID(t *testing.T) {
-	_, path := writeRSAPrivateKeyPEM(t)
-	if _, err := tokens.LoadPrivateKeyFromPEMFile(path, ""); err == nil {
-		t.Error("expected error for empty KeyID")
-	}
-}
-
-func TestLoadPrivateKeyFromPEMFile_BadPEM(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "bad.pem")
-	_ = os.WriteFile(path, []byte("not a PEM file"), 0o400)
-	if _, err := tokens.LoadPrivateKeyFromPEMFile(path, "key-1"); err == nil {
-		t.Error("expected error for invalid PEM")
-	}
-}
-
 func TestEnsureSigningKey_GeneratesOnFirstCall(t *testing.T) {
 	dir := t.TempDir()
 	priv := filepath.Join(dir, "signing-key.pem")
@@ -136,17 +114,40 @@ func TestEnsureSigningKey_HalfPresentRefuses(t *testing.T) {
 	}
 }
 
-func TestLoadPrivateKeyFromPEMFile_NonRSA(t *testing.T) {
-	// EC key: should be rejected cleanly.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "ec.pem")
-	_ = os.WriteFile(path, []byte(`-----BEGIN PRIVATE KEY-----
+func TestLoadPrivateKeyFromPEMFile_Rejects(t *testing.T) {
+	cases := []struct {
+		name string
+		// setup returns the path and key ID to load.
+		setup func(t *testing.T) (path, keyID string)
+	}{
+		{"missing_file", func(*testing.T) (string, string) { return "/nonexistent", "key-1" }},
+		{"empty_key_id", func(t *testing.T) (string, string) {
+			_, path := writeRSAPrivateKeyPEM(t)
+			return path, ""
+		}},
+		{"bad_pem", func(t *testing.T) (string, string) {
+			path := filepath.Join(t.TempDir(), "bad.pem")
+			_ = os.WriteFile(path, []byte("not a PEM file"), 0o400)
+			return path, "key-1"
+		}},
+		// EC key: should be rejected cleanly.
+		{"non_rsa", func(t *testing.T) (string, string) {
+			path := filepath.Join(t.TempDir(), "ec.pem")
+			_ = os.WriteFile(path, []byte(`-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgFq3lc0LiMjGn7+xt
 bkH5+ghZ70vVZWX55W4oHX3Bf5mhRANCAAS+O1Dv7e1VVOQJhP5oUoCohJk2Mxft
 /LCCLqvrcRQYuSU4tGErVcD+uaS82GpKkXt4mCYvrdNzN2Rlq/EPaYR/
 -----END PRIVATE KEY-----
 `), 0o400)
-	if _, err := tokens.LoadPrivateKeyFromPEMFile(path, "key-1"); err == nil {
-		t.Error("expected error for non-RSA key")
+			return path, "key-1"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, keyID := tc.setup(t)
+			if _, err := tokens.LoadPrivateKeyFromPEMFile(path, keyID); err == nil {
+				t.Error("expected error")
+			}
+		})
 	}
 }

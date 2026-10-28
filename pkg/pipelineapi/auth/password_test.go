@@ -46,43 +46,25 @@ func TestHash_EachCallProducesDistinctHash(t *testing.T) {
 }
 
 func TestVerify_RejectsMalformedHash(t *testing.T) {
-	for _, bad := range []string{
-		"",
-		"not-a-phc",
-		"$argon2id$v=19$", // truncated
-		"$scrypt$foo",     // wrong algorithm
-	} {
-		ok, err := auth.VerifyPassword("any", bad)
-		if err == nil {
-			t.Errorf("malformed hash %q should return an error; got ok=%v", bad, ok)
-		}
+	cases := []struct{ name, hash string }{
+		{"empty", ""},
+		{"not_phc", "not-a-phc"},
+		{"truncated", "$argon2id$v=19$"},
+		{"wrong_algorithm", "$scrypt$foo"},
+		// Valid shape but t=0, which would panic inside x/crypto/argon2 if
+		// passed through. Salt and hash use 4-byte placeholder data encoded
+		// with RawStdEncoding.
+		{"zero_time", "$argon2id$v=19$m=65536,t=0,p=4$AAAAAA$AAAAAA"},
+		{"zero_threads", "$argon2id$v=19$m=65536,t=1,p=0$AAAAAA$AAAAAA"},
+		// Empty hash (len(wantHash) == 0). RawStdEncoding of "" is "".
+		{"empty_hash_segment", "$argon2id$v=19$m=65536,t=1,p=4$AAAAAA$"},
 	}
-}
-
-func TestVerify_RejectsZeroTime(t *testing.T) {
-	// Craft a PHC with valid shape but t=0, which would panic inside
-	// x/crypto/argon2 if passed through. Salt and hash use 4-byte placeholder
-	// data encoded with RawStdEncoding.
-	malformed := "$argon2id$v=19$m=65536,t=0,p=4$AAAAAA$AAAAAA"
-	ok, err := auth.VerifyPassword("anything", malformed)
-	if err == nil {
-		t.Errorf("t=0 hash must return an error, not panic; got ok=%v", ok)
-	}
-}
-
-func TestVerify_RejectsZeroThreads(t *testing.T) {
-	malformed := "$argon2id$v=19$m=65536,t=1,p=0$AAAAAA$AAAAAA"
-	ok, err := auth.VerifyPassword("anything", malformed)
-	if err == nil {
-		t.Errorf("p=0 hash must return an error; got ok=%v", ok)
-	}
-}
-
-func TestVerify_RejectsEmptyHashSegment(t *testing.T) {
-	// Empty hash (len(wantHash) == 0). RawStdEncoding of an empty string is "".
-	malformed := "$argon2id$v=19$m=65536,t=1,p=4$AAAAAA$"
-	ok, err := auth.VerifyPassword("anything", malformed)
-	if err == nil {
-		t.Errorf("empty hash segment must return an error; got ok=%v", ok)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, err := auth.VerifyPassword("any", tc.hash)
+			if err == nil {
+				t.Errorf("malformed hash %q must return an error (not panic); got ok=%v", tc.hash, ok)
+			}
+		})
 	}
 }

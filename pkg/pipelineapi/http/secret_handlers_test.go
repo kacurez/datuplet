@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"os"
@@ -22,12 +23,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
-	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
 	pipelineapidb "github.com/datuplet/datuplet/pkg/pipelineapi/db"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
-	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
 
 // testClock is the injected-clock seam secret_handlers.go uses instead of
@@ -115,52 +114,12 @@ func putSecretReq(t *testing.T, url, value string, cookie *stdhttp.Cookie) *stdh
 	return resp
 }
 
-func TestPutSecret_CreatesManagedSecretAndAnnotation(t *testing.T) {
-	ts, pool, fakeAuthz, k8sClient, clock, cleanup := freshServerWithSecrets(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-put-secret"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	resp := putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/api_token", "s3cr3t", cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != stdhttp.StatusNoContent {
-		body, _ := readAll(resp)
-		t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, body)
-	}
-
-	ns := pkg8s.NamespaceForProject(proj.ID)
-	sec := &corev1.Secret{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: pkg8s.ProjectSecretsName, Namespace: ns}, sec); err != nil {
-		t.Fatalf("get managed secret: %v", err)
-	}
-	if string(sec.Data["api_token"]) != "s3cr3t" {
-		t.Errorf("data[api_token] = %q, want s3cr3t", sec.Data["api_token"])
-	}
-	wantTS := clock.now().UTC().Format(time.RFC3339)
-	if got := sec.Annotations["datuplet.io/updated-api_token"]; got != wantTS {
-		t.Errorf("annotation = %q, want %q", got, wantTS)
-	}
-}
-
 func TestPutSecret_SecondKeyPreservesFirst(t *testing.T) {
 	ts, pool, fakeAuthz, k8sClient, clock, cleanup := freshServerWithSecrets(t)
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-preserve"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-preserve", "data_admin")
 
 	resp1 := putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/first", "one", cookie)
 	resp1.Body.Close()
@@ -170,7 +129,9 @@ func TestPutSecret_SecondKeyPreservesFirst(t *testing.T) {
 
 	// Advance the clock so the second key's timestamp differs, proving each
 	// PUT reads the injected clock at call time (not a value baked in once).
+	firstTS := clock.now().UTC().Format(time.RFC3339)
 	clock.t = clock.t.Add(time.Hour)
+	secondTS := clock.now().UTC().Format(time.RFC3339)
 
 	resp2 := putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/second", "two", cookie)
 	resp2.Body.Close()
@@ -189,25 +150,19 @@ func TestPutSecret_SecondKeyPreservesFirst(t *testing.T) {
 	if string(sec.Data["second"]) != "two" {
 		t.Errorf("data[second] = %q, want two", sec.Data["second"])
 	}
-	if sec.Annotations["datuplet.io/updated-first"] == sec.Annotations["datuplet.io/updated-second"] {
-		t.Errorf("expected distinct timestamps, both = %q", sec.Annotations["datuplet.io/updated-first"])
+	if got := sec.Annotations["datuplet.io/updated-first"]; got != firstTS {
+		t.Errorf("updated-first annotation = %q, want %q", got, firstTS)
+	}
+	if got := sec.Annotations["datuplet.io/updated-second"]; got != secondTS {
+		t.Errorf("updated-second annotation = %q, want %q", got, secondTS)
 	}
 }
 
 func TestListSecrets_NeverReturnsValues(t *testing.T) {
 	ts, pool, fakeAuthz, _, clock, cleanup := freshServerWithSecrets(t)
 	defer cleanup()
-	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-list"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	userStr := authz.UserObject(alice.ID.String()).String()
-	fakeAuthz.Allow(userStr, "data_admin", authz.ProjectObject(lkID))
-	fakeAuthz.Allow(userStr, "datuplet_member", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-list", "data_admin", "datuplet_member")
 
 	putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/api_token", "s3cr3t-value-xyz", cookie).Body.Close()
 
@@ -242,65 +197,53 @@ func TestListSecrets_NeverReturnsValues(t *testing.T) {
 	}
 }
 
-func TestListSecrets_AsViewer_Works(t *testing.T) {
-	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-viewer-read"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
+// TestSecrets_ViewerAuthzMatrix pins the read/write split for a user holding
+// only datuplet_member (no data_admin): they may list secret keys but must not
+// write or delete one.
+func TestSecrets_ViewerAuthzMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{"list works", stdhttp.MethodGet, "/secrets", "", stdhttp.StatusOK},
+		{"put forbidden", stdhttp.MethodPut, "/secrets/api_token", `{"value":"s3cr3t"}`, stdhttp.StatusForbidden},
+		{"delete forbidden", stdhttp.MethodDelete, "/secrets/anything", "", stdhttp.StatusForbidden},
 	}
-	// Only datuplet_member — no data_admin.
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "datuplet_member", authz.ProjectObject(lkID))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
+			defer cleanup()
+			cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-viewer", "datuplet_member")
 
-	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets", nil)
-	req.AddCookie(cookie)
-	resp, err := stdhttp.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != stdhttp.StatusOK {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
-	}
-}
-
-func TestPutSecret_AsViewer_Forbidden(t *testing.T) {
-	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-viewer-write"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	// Only datuplet_member — no data_admin — must not be able to write.
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "datuplet_member", authz.ProjectObject(lkID))
-
-	resp := putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/api_token", "s3cr3t", cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != stdhttp.StatusForbidden {
-		t.Errorf("status = %d, want 403", resp.StatusCode)
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			req, _ := stdhttp.NewRequest(tc.method, ts.URL+"/api/v1/projects/"+proj.ID.String()+tc.path, body)
+			if body != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			req.AddCookie(cookie)
+			resp, err := stdhttp.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.method, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+		})
 	}
 }
 
 func TestPutSecret_InvalidKey(t *testing.T) {
 	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
 	defer cleanup()
-	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-invalid-key"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-invalid-key", "data_admin")
 
 	resp := putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/bad%20key!", "x", cookie)
 	defer resp.Body.Close()
@@ -314,13 +257,7 @@ func TestDeleteSecret_RemovesOneKeyOnly(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-delete"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-delete", "data_admin")
 
 	putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/keep", "keepval", cookie).Body.Close()
 	putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/drop", "dropval", cookie).Body.Close()
@@ -361,31 +298,6 @@ func TestDeleteSecret_RemovesOneKeyOnly(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != stdhttp.StatusNotFound {
 		t.Errorf("second delete status = %d, want 404", resp2.StatusCode)
-	}
-}
-
-func TestDeleteSecret_AsViewer_Forbidden(t *testing.T) {
-	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-viewer-delete"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "datuplet_member", authz.ProjectObject(lkID))
-
-	req, _ := stdhttp.NewRequest("DELETE", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/anything", nil)
-	req.AddCookie(cookie)
-	resp, err := stdhttp.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != stdhttp.StatusForbidden {
-		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
 }
 

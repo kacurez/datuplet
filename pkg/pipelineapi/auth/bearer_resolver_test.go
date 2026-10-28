@@ -88,29 +88,6 @@ func buildResolver(signer *tokens.Signer, pool auth.UserLookup) *auth.BearerJWTR
 	}
 }
 
-func TestBearerJWTResolver_ValidToken(t *testing.T) {
-	signer, _ := testSignerAndKey(t)
-	userID := uuid.New()
-	pool := &fakeUserLookup{
-		users: map[uuid.UUID]*store.User{
-			userID: {ID: userID},
-		},
-	}
-	r := buildResolver(signer, pool)
-
-	req := bearerRequest(t, mintCLIAPIToken(t, signer, userID, time.Hour))
-	user, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected ok=true for valid token")
-	}
-	if user == nil || user.ID != userID {
-		t.Errorf("user = %v, want id=%v", user, userID)
-	}
-}
-
 func TestBearerJWTResolver_NoAuthorizationHeader(t *testing.T) {
 	signer, _ := testSignerAndKey(t)
 	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{}})
@@ -122,264 +99,6 @@ func TestBearerJWTResolver_NoAuthorizationHeader(t *testing.T) {
 	}
 	if ok || user != nil {
 		t.Errorf("expected (nil, false, nil) for missing header, got ok=%v user=%v", ok, user)
-	}
-}
-
-func TestBearerJWTResolver_LowerCaseBearer(t *testing.T) {
-	signer, _ := testSignerAndKey(t)
-	userID := uuid.New()
-	pool := &fakeUserLookup{
-		users: map[uuid.UUID]*store.User{
-			userID: {ID: userID},
-		},
-	}
-	r := buildResolver(signer, pool)
-
-	tok := mintCLIAPIToken(t, signer, userID, time.Hour)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "bearer "+tok) // lowercase
-	user, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected ok=true for lowercase 'bearer' prefix")
-	}
-	if user == nil || user.ID != userID {
-		t.Errorf("user.ID = %v, want %v", user.ID, userID)
-	}
-}
-
-func TestBearerJWTResolver_WrongAlg(t *testing.T) {
-	signer, _ := testSignerAndKey(t)
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{}})
-
-	// Mint an HS256 token manually.
-	claims := jwt.MapClaims{
-		"iss":        "datuplet-api",
-		"aud":        "datuplet-api",
-		"sub":        uuid.New().String(),
-		"token_kind": "cli-api",
-		"exp":        time.Now().Add(time.Hour).Unix(),
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokStr, _ := tok.SignedString([]byte("secret"))
-
-	req := bearerRequest(t, tokStr)
-	user, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok || user != nil {
-		t.Errorf("expected rejection of HS256 token, got ok=%v", ok)
-	}
-}
-
-func TestBearerJWTResolver_WrongKid(t *testing.T) {
-	signer, priv := testSignerAndKey(t)
-
-	// Build a token with a different kid header.
-	userID := uuid.New()
-	u := &store.User{ID: userID}
-	ctx := auth.WithCtxUser(context.Background(), u)
-	// Mint with the signer (correct key) but manually override kid.
-	tok, _, err := tokens.MintCLIAPIToken(ctx, signer, time.Hour)
-	if err != nil {
-		t.Fatalf("mint: %v", err)
-	}
-	// Decode, change kid, re-sign with the same key.
-	parsed, _ := jwt.Parse(tok, func(t *jwt.Token) (any, error) { return &priv.PublicKey, nil },
-		jwt.WithValidMethods([]string{"RS256"}))
-	claims := parsed.Claims.(jwt.MapClaims)
-	newTok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	newTok.Header["kid"] = "wrong-kid"
-	signed, _ := newTok.SignedString(priv)
-
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
-	req := bearerRequest(t, signed)
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection of wrong kid")
-	}
-}
-
-func TestBearerJWTResolver_WrongIss(t *testing.T) {
-	signer, priv := testSignerAndKey(t)
-	userID := uuid.New()
-
-	claims := jwt.MapClaims{
-		"iss":        "wrong-issuer",
-		"aud":        "datuplet-api",
-		"sub":        userID.String(),
-		"token_kind": "cli-api",
-		"exp":        time.Now().Add(time.Hour).Unix(),
-		"nbf":        time.Now().Unix(),
-		"iat":        time.Now().Unix(),
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = signer.KeyID
-	signed, _ := tok.SignedString(priv)
-
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
-	req := bearerRequest(t, signed)
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection of wrong iss")
-	}
-}
-
-func TestBearerJWTResolver_WrongAud(t *testing.T) {
-	signer, priv := testSignerAndKey(t)
-	userID := uuid.New()
-
-	claims := jwt.MapClaims{
-		"iss":        "datuplet-api",
-		"aud":        "datuplet-catalog", // wrong: catalog, not api
-		"sub":        userID.String(),
-		"token_kind": "cli-api",
-		"exp":        time.Now().Add(time.Hour).Unix(),
-		"nbf":        time.Now().Unix(),
-		"iat":        time.Now().Unix(),
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = signer.KeyID
-	signed, _ := tok.SignedString(priv)
-
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
-	req := bearerRequest(t, signed)
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection of wrong aud")
-	}
-}
-
-func TestBearerJWTResolver_WrongTokenKind(t *testing.T) {
-	signer, priv := testSignerAndKey(t)
-	userID := uuid.New()
-
-	claims := jwt.MapClaims{
-		"iss":        "datuplet-api",
-		"aud":        "datuplet-api",
-		"sub":        userID.String(),
-		"token_kind": "local-cli", // wrong kind
-		"exp":        time.Now().Add(time.Hour).Unix(),
-		"nbf":        time.Now().Unix(),
-		"iat":        time.Now().Unix(),
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = signer.KeyID
-	signed, _ := tok.SignedString(priv)
-
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
-	req := bearerRequest(t, signed)
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection of wrong token_kind")
-	}
-}
-
-func TestBearerJWTResolver_Expired(t *testing.T) {
-	signer, priv := testSignerAndKey(t)
-	userID := uuid.New()
-
-	// Expired by 2 minutes — outside the 60s leeway.
-	claims := jwt.MapClaims{
-		"iss":        "datuplet-api",
-		"aud":        "datuplet-api",
-		"sub":        userID.String(),
-		"token_kind": "cli-api",
-		"exp":        time.Now().Add(-2 * time.Minute).Unix(),
-		"nbf":        time.Now().Add(-3 * time.Minute).Unix(),
-		"iat":        time.Now().Add(-3 * time.Minute).Unix(),
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = signer.KeyID
-	signed, _ := tok.SignedString(priv)
-
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
-	req := bearerRequest(t, signed)
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection of expired token")
-	}
-}
-
-func TestBearerJWTResolver_SubNotUUID(t *testing.T) {
-	signer, priv := testSignerAndKey(t)
-
-	claims := jwt.MapClaims{
-		"iss":        "datuplet-api",
-		"aud":        "datuplet-api",
-		"sub":        "not-a-uuid",
-		"token_kind": "cli-api",
-		"exp":        time.Now().Add(time.Hour).Unix(),
-		"nbf":        time.Now().Unix(),
-		"iat":        time.Now().Unix(),
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = signer.KeyID
-	signed, _ := tok.SignedString(priv)
-
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{}})
-	req := bearerRequest(t, signed)
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection of non-UUID sub")
-	}
-}
-
-func TestBearerJWTResolver_UserNotFound(t *testing.T) {
-	signer, _ := testSignerAndKey(t)
-	userID := uuid.New()
-	// Pool with no users.
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{}})
-
-	req := bearerRequest(t, mintCLIAPIToken(t, signer, userID, time.Hour))
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection when user not found")
-	}
-}
-
-func TestBearerJWTResolver_UserDisabled(t *testing.T) {
-	signer, _ := testSignerAndKey(t)
-	userID := uuid.New()
-	now := time.Now()
-	pool := &fakeUserLookup{
-		users: map[uuid.UUID]*store.User{
-			userID: {ID: userID, DisabledAt: &now},
-		},
-	}
-	r := buildResolver(signer, pool)
-
-	req := bearerRequest(t, mintCLIAPIToken(t, signer, userID, time.Hour))
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection for disabled user")
 	}
 }
 
@@ -473,9 +192,137 @@ func (a *alwaysLoginResolver) UserFor(_ http.ResponseWriter, _ *http.Request) (*
 func (a *alwaysLoginResolver) Mode() string        { return a.mode }
 func (a *alwaysLoginResolver) SupportsLogin() bool { return true }
 
-// TestChainResolver_PrimaryDelegation asserts that Mode()/SupportsLogin()
-// delegate to Primary, NOT to the first resolver in Resolvers.
-func TestChainResolver_PrimaryDelegation(t *testing.T) {
+func TestBearerJWTResolver_ValidToken(t *testing.T) {
+	cases := []struct {
+		name   string
+		scheme string
+	}{
+		{"bearer_prefix", "Bearer "},
+		{"lower_case_bearer_prefix", "bearer "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			signer, _ := testSignerAndKey(t)
+			userID := uuid.New()
+			pool := &fakeUserLookup{
+				users: map[uuid.UUID]*store.User{
+					userID: {ID: userID},
+				},
+			}
+			r := buildResolver(signer, pool)
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", tc.scheme+mintCLIAPIToken(t, signer, userID, time.Hour))
+			user, ok, err := r.UserFor(httptest.NewRecorder(), req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !ok {
+				t.Fatalf("expected ok=true for %q prefix", tc.scheme)
+			}
+			if user == nil || user.ID != userID {
+				t.Errorf("user = %v, want id=%v", user, userID)
+			}
+		})
+	}
+}
+
+// TestBearerJWTResolver_RejectsInvalidToken: every claim/header the resolver
+// validates, broken one at a time against an otherwise valid cli-api token,
+// must be rejected as (nil, false, nil) — unauthenticated, not an error.
+func TestBearerJWTResolver_RejectsInvalidToken(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(c jwt.MapClaims)
+		hs256  bool   // sign with HS256 instead of RS256
+		kid    string // override the kid header ("" = the signer's)
+	}{
+		{name: "wrong_alg", hs256: true},
+		{name: "wrong_kid", kid: "wrong-kid"},
+		{name: "wrong_iss", mutate: func(c jwt.MapClaims) { c["iss"] = "wrong-issuer" }},
+		// wrong: catalog, not api
+		{name: "wrong_aud", mutate: func(c jwt.MapClaims) { c["aud"] = "datuplet-catalog" }},
+		{name: "wrong_token_kind", mutate: func(c jwt.MapClaims) { c["token_kind"] = "local-cli" }},
+		// Expired by 2 minutes — outside the 60s leeway.
+		{name: "expired", mutate: func(c jwt.MapClaims) {
+			c["exp"] = time.Now().Add(-2 * time.Minute).Unix()
+			c["nbf"] = time.Now().Add(-3 * time.Minute).Unix()
+			c["iat"] = time.Now().Add(-3 * time.Minute).Unix()
+		}},
+		{name: "sub_not_uuid", mutate: func(c jwt.MapClaims) { c["sub"] = "not-a-uuid" }},
+		// WithExpirationRequired enforcement.
+		{name: "no_exp", mutate: func(c jwt.MapClaims) { delete(c, "exp") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			signer, priv := testSignerAndKey(t)
+			userID := uuid.New()
+
+			claims := jwt.MapClaims{
+				"iss":        "datuplet-api",
+				"aud":        "datuplet-api",
+				"sub":        userID.String(),
+				"token_kind": "cli-api",
+				"exp":        time.Now().Add(time.Hour).Unix(),
+				"nbf":        time.Now().Unix(),
+				"iat":        time.Now().Unix(),
+			}
+			if tc.mutate != nil {
+				tc.mutate(claims)
+			}
+			var signed string
+			if tc.hs256 {
+				signed, _ = jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("secret"))
+			} else {
+				tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+				tok.Header["kid"] = signer.KeyID
+				if tc.kid != "" {
+					tok.Header["kid"] = tc.kid
+				}
+				signed, _ = tok.SignedString(priv)
+			}
+
+			r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
+			user, ok, err := r.UserFor(httptest.NewRecorder(), bearerRequest(t, signed))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ok || user != nil {
+				t.Errorf("expected rejection, got ok=%v user=%v", ok, user)
+			}
+		})
+	}
+}
+
+func TestBearerJWTResolver_RejectsUnusableUser(t *testing.T) {
+	now := time.Now()
+	userID := uuid.New()
+	cases := []struct {
+		name string
+		pool *fakeUserLookup
+	}{
+		{"user_not_found", &fakeUserLookup{users: map[uuid.UUID]*store.User{}}},
+		{"user_disabled", &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID, DisabledAt: &now}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			signer, _ := testSignerAndKey(t)
+			r := buildResolver(signer, tc.pool)
+			_, ok, err := r.UserFor(httptest.NewRecorder(), bearerRequest(t, mintCLIAPIToken(t, signer, userID, time.Hour)))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ok {
+				t.Error("expected rejection")
+			}
+		})
+	}
+}
+
+// TestChainResolver_Primary asserts that Mode()/SupportsLogin() delegate to
+// Primary, NOT to the first resolver in Resolvers, and that a nil Primary
+// falls back to the first resolver (backward compat).
+func TestChainResolver_Primary(t *testing.T) {
 	signer, _ := testSignerAndKey(t)
 	bearerR := &auth.BearerJWTResolver{
 		PublicKey: signer.Public(),
@@ -483,63 +330,32 @@ func TestChainResolver_PrimaryDelegation(t *testing.T) {
 		Pool:      &fakeUserLookup{users: map[uuid.UUID]*store.User{}},
 	}
 	cookieR := &alwaysLoginResolver{mode: "cluster"}
-
-	chain := &auth.ChainResolver{
-		Resolvers: []auth.UserResolver{bearerR, cookieR},
-		Primary:   cookieR,
-	}
-
-	if got := chain.Mode(); got != "cluster" {
-		t.Errorf("Mode() = %q, want %q", got, "cluster")
-	}
-	if got := chain.SupportsLogin(); !got {
-		t.Errorf("SupportsLogin() = false, want true (Primary=cookieR)")
-	}
-}
-
-// TestChainResolver_NoPrimaryFallsBackToFirst checks the nil-Primary fallback
-// still works (backward compat).
-func TestChainResolver_NoPrimaryFallsBackToFirst(t *testing.T) {
 	first := &alwaysLoginResolver{mode: "first-mode"}
 	second := &alwaysLoginResolver{mode: "second-mode"}
 
-	chain := &auth.ChainResolver{
-		Resolvers: []auth.UserResolver{first, second},
-		// Primary intentionally nil.
+	cases := []struct {
+		name      string
+		chain     *auth.ChainResolver
+		wantMode  string
+		wantLogin bool
+	}{
+		{"primary_delegation", &auth.ChainResolver{
+			Resolvers: []auth.UserResolver{bearerR, cookieR},
+			Primary:   cookieR,
+		}, "cluster", true},
+		{"no_primary_falls_back_to_first", &auth.ChainResolver{
+			// Primary intentionally nil.
+			Resolvers: []auth.UserResolver{first, second},
+		}, "first-mode", true},
 	}
-
-	if got := chain.Mode(); got != "first-mode" {
-		t.Errorf("Mode() = %q, want %q (no Primary → first)", got, "first-mode")
-	}
-}
-
-// TestBearerJWTResolver_NoExp asserts that a token missing the exp claim is
-// rejected (WithExpirationRequired enforcement).
-func TestBearerJWTResolver_NoExp(t *testing.T) {
-	signer, priv := testSignerAndKey(t)
-	userID := uuid.New()
-
-	// Construct a token with no exp claim at all.
-	claims := jwt.MapClaims{
-		"iss":        "datuplet-api",
-		"aud":        "datuplet-api",
-		"sub":        userID.String(),
-		"token_kind": "cli-api",
-		"iat":        time.Now().Unix(),
-		"nbf":        time.Now().Unix(),
-		// deliberately omitting "exp"
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = signer.KeyID
-	signed, _ := tok.SignedString(priv)
-
-	r := buildResolver(signer, &fakeUserLookup{users: map[uuid.UUID]*store.User{userID: {ID: userID}}})
-	req := bearerRequest(t, signed)
-	_, ok, err := r.UserFor(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Error("expected rejection of token with no exp claim")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.chain.Mode(); got != tc.wantMode {
+				t.Errorf("Mode() = %q, want %q", got, tc.wantMode)
+			}
+			if got := tc.chain.SupportsLogin(); got != tc.wantLogin {
+				t.Errorf("SupportsLogin() = %v, want %v", got, tc.wantLogin)
+			}
+		})
 	}
 }

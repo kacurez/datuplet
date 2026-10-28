@@ -28,7 +28,7 @@
 // poll every replica independently.
 //
 // The warehouse table is the SAME 100-row table scenarios_query_test.go seeds
-// (ensureQueryTable): namespace "<runPrefix>-api", table "data", schema
+// (ensureQueryTable): namespace "<runPrefix>-seed-api", table "data", schema
 // userId/id/title/body. The fixture app filters on the real `title` column.
 package e2e
 
@@ -87,7 +87,7 @@ func TestApps_ViewerAndSecurity(t *testing.T) {
 	ctx := context.Background()
 
 	// Reuse the query suite's seeded table + admin session + project id.
-	ns, table := ensureQueryTable(t)
+	ns, table, _ := ensureQueryTable(t)
 	if !appsSafeIdent(ns) || !appsSafeIdent(table) {
 		t.Fatalf("seeded ns/table are not identifier-safe (the fixture double-quotes them into SQL): ns=%q table=%q", ns, table)
 	}
@@ -671,7 +671,7 @@ func appsBundle(t *testing.T, fixture []byte, ns, table, version string) []byte 
 }
 
 // appsSafeIdent guards the ns/table before they are double-quoted into SQL by
-// the fixture. The seeded values are "<runPrefix>-api"/"data"; this rejects
+// the fixture. The seeded values are "<runPrefix>-seed-api"/"data"; this rejects
 // anything that could break out of an identifier quote.
 func appsSafeIdent(s string) bool {
 	if s == "" {

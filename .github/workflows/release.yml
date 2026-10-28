@@ -59,8 +59,8 @@ jobs:
     uses: ./.github/workflows/_release-services.yml
     secrets: inherit
 
-  # Component images: data-generator, sql-transform, stdout-writer,
-  # http-json-extractor, finnhub-extractor. Same UI shape as the
+  # Component images: data-generator, sql-transform,
+  # http-json-extractor. Same UI shape as the
   # services bucket.
   components:
     needs: verify-tag

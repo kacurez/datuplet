@@ -4,7 +4,7 @@
 // JWKS verifier (and onward to lakekeeper's OIDC validator). Both
 // cluster mode and local mode publish a long-lived RS256 keypair;
 // loadClusterSigner / LoadSigner pull the private half so the harness
-// can mint impersonation + run tokens against it directly.
+// can mint impersonation tokens against it directly.
 //
 // Cluster-mode fetch shells to kubectl rather than using a real K8s
 // client. That keeps the test framework dependency-light (the live e2e
@@ -82,7 +82,7 @@ func loadClusterSigner(ctx context.Context, keyID string) (*tokens.Signer, error
 }
 
 // MintTestUserImpersonation mints a short-lived impersonation JWT for
-// one of the hard-coded TestUsers (alice/bob/charlie/dora). The token
+// one of the hard-coded TestUsers (alice/bob). The token
 // is suitable for HTTP calls into pipeline-api's storage browse
 // endpoints AND onward to lakekeeper's iceberg REST surface — both
 // validate against the live JWKS.
@@ -93,7 +93,6 @@ func loadClusterSigner(ctx context.Context, keyID string) (*tokens.Signer, error
 //
 // Note the deliberate use of MintImpersonation (60-second TTL) rather
 // than MintRunToken: storage browse expects token_kind=impersonation.
-// For run tokens, see MintTestUserRunToken below.
 func MintTestUserImpersonation(ctx context.Context, signer *tokens.Signer, userID uuid.UUID) (tokens.ImpersonationToken, error) {
 	if signer == nil {
 		return "", errors.New("MintTestUserImpersonation: signer is required")
@@ -101,37 +100,6 @@ func MintTestUserImpersonation(ctx context.Context, signer *tokens.Signer, userI
 	user := &store.User{ID: userID, Email: testUserEmail(userID)}
 	authCtx := auth.WithCtxUser(ctx, user)
 	return tokens.MintImpersonation(authCtx, signer)
-}
-
-// MintTestUserRunToken mints a per-run RS256 JWT: one JWT per (run, audience),
-// `sub=<run-uuid>`, `actor=<user-uuid>`, `aud=datuplet-catalog`,
-// jti=run-tok-<run-uuid>.
-//
-// projectID is forwarded as the JWT `project_id` claim — pass
-// FGAHarness.LakekeeperProjectID. DG forwards it as the
-// x-project-id header on every lakekeeper REST call, so the value MUST
-// be the lakekeeper Project UUID, not the Datuplet project UUID.
-//
-// warehouse is forwarded as the JWT `warehouse` claim — pass
-// FGAHarness.WarehouseName. The JWT validator requires non-empty.
-//
-// runID is the run UUID; the harness typically generates a fresh one
-// per scenario via uuid.New().
-func MintTestUserRunToken(ctx context.Context, signer *tokens.Signer,
-	userID uuid.UUID, runID uuid.UUID, projectID, warehouse, pipelineName string,
-) (string, error) {
-	if signer == nil {
-		return "", errors.New("MintTestUserRunToken: signer is required")
-	}
-	user := &store.User{ID: userID, Email: testUserEmail(userID)}
-	authCtx := auth.WithCtxUser(ctx, user)
-	return tokens.MintRunToken(authCtx, signer, tokens.RunSpec{
-		RunID:        runID.String(),
-		ProjectID:    projectID,
-		Warehouse:    warehouse,
-		PipelineName: pipelineName,
-		Lifetime:     RunTokenLifetime,
-	})
 }
 
 // testUserEmail looks up the email for a UUID in the TestUsers

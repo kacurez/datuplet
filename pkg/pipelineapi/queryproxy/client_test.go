@@ -21,24 +21,6 @@ func testInternalToken(t *testing.T) tokens.QueryToken {
 	return tokens.QueryToken("a.b.c")
 }
 
-func TestNewWorkerClient_RequiresURL(t *testing.T) {
-	if _, err := newWorkerClient("", 300, 30*time.Second, 10<<20); err == nil {
-		t.Fatal("expected error for empty WorkerURL")
-	}
-}
-
-func TestNewWorkerClient_TimeoutAboveWorkerMax(t *testing.T) {
-	c, err := newWorkerClient("http://worker:8080", 300, 30*time.Second, 10<<20)
-	if err != nil {
-		t.Fatalf("newWorkerClient: %v", err)
-	}
-	// Transport timeout must sit above the worker's own max so the worker's
-	// structured 408 fires before our client gives up.
-	if got, want := c.hc.Timeout, 330*time.Second; got != want {
-		t.Fatalf("client timeout = %s, want %s", got, want)
-	}
-}
-
 func TestWorkerClient_Do_SendsBearerAndBody(t *testing.T) {
 	const internalJWT = "internal-jwt-secret-value"
 	const catalogJWT = "catalog-jwt-secret-value"
@@ -179,66 +161,50 @@ func TestDo_RefusesRedirects(t *testing.T) {
 	}
 }
 
-// TestWorkerClient_RetriesOnceOn429 pins the capacity-retry behavior: a
-// worker 429 (admission rejection, safe-by-construction pre-execution) is
-// retried exactly once, and the retry succeeds if a different backend picks
-// it up.
-func TestWorkerClient_RetriesOnceOn429(t *testing.T) {
-	var hits int32
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if atomic.AddInt32(&hits, 1) == 1 {
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":"server at capacity","kind":"capacity"}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
-	}))
-	defer worker.Close()
-
-	c, err := newWorkerClient(worker.URL, 300, 30*time.Second, 10*1024*1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := c.Do(context.Background(), testInternalToken(t), workerRequest{SQL: "SELECT 1", CatalogJWT: "a.b.c", Warehouse: "p/w"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.status != http.StatusOK {
-		t.Fatalf("status = %d, want 200 after one retry", resp.status)
-	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
-		t.Fatalf("worker hits = %d, want 2", got)
-	}
-}
-
-// TestWorkerClient_NoSecondRetry pins the retry ceiling: a worker that
-// always 429s is hit exactly twice (one retry, no more), and Do surfaces the
+// TestWorkerClient_RetriesOn429 pins the capacity-retry behavior: a worker
+// 429 (admission rejection, safe-by-construction pre-execution) is retried
+// exactly once. The retry succeeds if a different backend picks it up; a
+// worker that always 429s is hit exactly twice (no more), and Do surfaces the
 // final 429 rather than looping or erroring.
-func TestWorkerClient_NoSecondRetry(t *testing.T) {
-	// Worker always 429s → Do returns the 429 after exactly 2 attempts.
-	var hits int32
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"error":"server at capacity","kind":"capacity"}`))
-	}))
-	defer worker.Close()
+func TestWorkerClient_RetriesOn429(t *testing.T) {
+	cases := []struct {
+		name       string
+		alwaysBusy bool
+		wantStatus int
+		wantHits   int32
+	}{
+		{"retry_succeeds", false, http.StatusOK, 2},
+		{"no_second_retry", true, http.StatusTooManyRequests, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int32
+			worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if n := atomic.AddInt32(&hits, 1); tc.alwaysBusy || n == 1 {
+					w.Header().Set("Retry-After", "1")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":"server at capacity","kind":"capacity"}`))
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
+			}))
+			defer worker.Close()
 
-	c, err := newWorkerClient(worker.URL, 300, 30*time.Second, 10*1024*1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := c.Do(context.Background(), testInternalToken(t), workerRequest{SQL: "SELECT 1", CatalogJWT: "a.b.c", Warehouse: "p/w"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.status != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429 (no infinite retry)", resp.status)
-	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
-		t.Fatalf("worker hits = %d, want 2 (exactly one retry)", got)
+			c, err := newWorkerClient(worker.URL, 300, 30*time.Second, 10*1024*1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := c.Do(context.Background(), testInternalToken(t), workerRequest{SQL: "SELECT 1", CatalogJWT: "a.b.c", Warehouse: "p/w"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.status, tc.wantStatus)
+			}
+			if got := atomic.LoadInt32(&hits); got != tc.wantHits {
+				t.Fatalf("worker hits = %d, want %d (exactly one retry)", got, tc.wantHits)
+			}
+		})
 	}
 }

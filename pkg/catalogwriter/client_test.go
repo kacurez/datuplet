@@ -138,91 +138,77 @@ func writeParquet(t *testing.T, path string, val int64) string {
 }
 
 // ---------------------------------------------------------------------------
-// TestClient_DropTable_NoPurge
+// TestClient_DropTable_PurgeFlag
 // ---------------------------------------------------------------------------
 
-// TestClient_DropTable_NoPurge verifies that Client.DropTable sends
-// DELETE /v1/namespaces/{ns}/tables/{tbl}?purgeRequested=false.
-func TestClient_DropTable_NoPurge(t *testing.T) {
+// TestClient_DropTable_PurgeFlag verifies that Client.DropTable sends
+// DELETE /v1/namespaces/{ns}/tables/{tbl}?purgeRequested=false and
+// Client.PurgeTable sends purgeRequested=true when backed by a REST catalog.
+func TestClient_DropTable_PurgeFlag(t *testing.T) {
 	t.Parallel()
 
-	var capturedPath atomic.Value
-	hits := &atomic.Int64{}
+	tests := []struct {
+		name      string
+		token     string
+		call      func(*Client) error
+		wantQuery string
+	}{
+		{
+			name:  "DropTable does not request purge",
+			token: "tok-drop",
+			call: func(c *Client) error {
+				return c.DropTable(context.Background(), []string{"public", "events"})
+			},
+			wantQuery: "purgeRequested=false",
+		},
+		{
+			name:  "PurgeTable requests purge",
+			token: "tok-purge",
+			call: func(c *Client) error {
+				return c.PurgeTable(context.Background(), []string{"public", "events"})
+			},
+			wantQuery: "purgeRequested=true",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	cli := newRestClientFixture(t, "tok-drop", func(mux *http.ServeMux) {
-		// Catch all DELETE calls under /v1/namespaces/.
-		mux.HandleFunc("/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodDelete {
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				return
+			var capturedPath atomic.Value
+			hits := &atomic.Int64{}
+
+			cli := newRestClientFixture(t, tc.token, func(mux *http.ServeMux) {
+				// Catch all DELETE calls under /v1/namespaces/.
+				mux.HandleFunc("/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodDelete {
+						w.WriteHeader(http.StatusMethodNotAllowed)
+						return
+					}
+					p := r.URL.Path
+					if r.URL.RawQuery != "" {
+						p += "?" + r.URL.RawQuery
+					}
+					capturedPath.Store(p)
+					hits.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				})
+			})
+
+			if err := tc.call(cli); err != nil {
+				t.Fatalf("call: %v", err)
 			}
-			p := r.URL.Path
-			if r.URL.RawQuery != "" {
-				p += "?" + r.URL.RawQuery
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("expected 1 DELETE hit, got %d", got)
 			}
-			capturedPath.Store(p)
-			hits.Add(1)
-			w.WriteHeader(http.StatusNoContent)
+
+			path := capturedPath.Load().(string)
+			if !strings.Contains(path, tc.wantQuery) {
+				t.Fatalf("expected %s in %q", tc.wantQuery, path)
+			}
+			if !strings.Contains(path, "tables/events") {
+				t.Fatalf("expected tables/events in %q", path)
+			}
 		})
-	})
-
-	if err := cli.DropTable(context.Background(), []string{"public", "events"}); err != nil {
-		t.Fatalf("DropTable: %v", err)
-	}
-	if got := hits.Load(); got != 1 {
-		t.Fatalf("expected 1 DELETE hit, got %d", got)
-	}
-
-	path := capturedPath.Load().(string)
-	if !strings.Contains(path, "purgeRequested=false") {
-		t.Fatalf("expected purgeRequested=false in %q", path)
-	}
-	if !strings.Contains(path, "tables/events") {
-		t.Fatalf("expected tables/events in %q", path)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestClient_PurgeTable_RestCatalog
-// ---------------------------------------------------------------------------
-
-// TestClient_PurgeTable_RestCatalog verifies that Client.PurgeTable sends
-// DELETE .../tables/{tbl}?purgeRequested=true when backed by a REST catalog.
-func TestClient_PurgeTable_RestCatalog(t *testing.T) {
-	t.Parallel()
-
-	var capturedPath atomic.Value
-	hits := &atomic.Int64{}
-
-	cli := newRestClientFixture(t, "tok-purge", func(mux *http.ServeMux) {
-		mux.HandleFunc("/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodDelete {
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				return
-			}
-			p := r.URL.Path
-			if r.URL.RawQuery != "" {
-				p += "?" + r.URL.RawQuery
-			}
-			capturedPath.Store(p)
-			hits.Add(1)
-			w.WriteHeader(http.StatusNoContent)
-		})
-	})
-
-	if err := cli.PurgeTable(context.Background(), []string{"public", "events"}); err != nil {
-		t.Fatalf("PurgeTable: %v", err)
-	}
-	if got := hits.Load(); got != 1 {
-		t.Fatalf("expected 1 DELETE hit, got %d", got)
-	}
-
-	path := capturedPath.Load().(string)
-	if !strings.Contains(path, "purgeRequested=true") {
-		t.Fatalf("expected purgeRequested=true in %q", path)
-	}
-	if !strings.Contains(path, "tables/events") {
-		t.Fatalf("expected tables/events in %q", path)
 	}
 }
 
@@ -256,64 +242,64 @@ func TestClient_PurgeTable_NotRestCatalog_Error(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestClient_DropNamespace_HappyPath
+// TestClient_DropNamespace
 // ---------------------------------------------------------------------------
 
-// TestClient_DropNamespace_HappyPath verifies that Client.DropNamespace
-// sends DELETE /v1/namespaces/{ns} and succeeds on 204.
-func TestClient_DropNamespace_HappyPath(t *testing.T) {
+// TestClient_DropNamespace verifies that Client.DropNamespace sends
+// DELETE /v1/namespaces/{ns} and succeeds on 204, and that a 409 response
+// (namespace not empty) propagates as a non-nil error.
+func TestClient_DropNamespace(t *testing.T) {
 	t.Parallel()
 
-	var capturedPath atomic.Value
-	hits := &atomic.Int64{}
+	tests := []struct {
+		name    string
+		ns      string
+		status  int
+		wantErr bool
+	}{
+		{"204 succeeds", "myns", http.StatusNoContent, false},
+		{"409 namespace not empty is an error", "nonempty", http.StatusConflict, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	cli := newRestClientFixture(t, "tok-ns-drop", func(mux *http.ServeMux) {
-		mux.HandleFunc("/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodDelete {
-				w.WriteHeader(http.StatusMethodNotAllowed)
+			var capturedPath atomic.Value
+			hits := &atomic.Int64{}
+
+			cli := newRestClientFixture(t, "tok-ns", func(mux *http.ServeMux) {
+				mux.HandleFunc("/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodDelete {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					capturedPath.Store(r.URL.Path)
+					hits.Add(1)
+					w.WriteHeader(tc.status)
+					if tc.status == http.StatusConflict {
+						_, _ = fmt.Fprint(w, `{"error":{"message":"namespace not empty","type":"NamespaceNotEmptyException","code":409}}`)
+					}
+				})
+			})
+
+			err := cli.DropNamespace(context.Background(), []string{tc.ns})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("DropNamespace: expected error, got nil")
+				}
 				return
 			}
-			capturedPath.Store(r.URL.Path)
-			hits.Add(1)
-			w.WriteHeader(http.StatusNoContent)
-		})
-	})
-
-	if err := cli.DropNamespace(context.Background(), []string{"myns"}); err != nil {
-		t.Fatalf("DropNamespace: %v", err)
-	}
-	if got := hits.Load(); got != 1 {
-		t.Fatalf("expected 1 DELETE hit, got %d", got)
-	}
-
-	path := capturedPath.Load().(string)
-	if !strings.HasSuffix(path, "/namespaces/myns") {
-		t.Fatalf("DELETE path %q expected to end with /namespaces/myns", path)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestClient_DropNamespace_NonEmpty_Error
-// ---------------------------------------------------------------------------
-
-// TestClient_DropNamespace_NonEmpty_Error verifies that a 409 response from
-// the server (namespace not empty) propagates as a non-nil error.
-func TestClient_DropNamespace_NonEmpty_Error(t *testing.T) {
-	t.Parallel()
-
-	cli := newRestClientFixture(t, "tok-ns-conflict", func(mux *http.ServeMux) {
-		mux.HandleFunc("/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodDelete {
-				w.WriteHeader(http.StatusConflict)
-				_, _ = fmt.Fprint(w, `{"error":{"message":"namespace not empty","type":"NamespaceNotEmptyException","code":409}}`)
-				return
+			if err != nil {
+				t.Fatalf("DropNamespace: %v", err)
 			}
-			w.WriteHeader(http.StatusNotFound)
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("expected 1 DELETE hit, got %d", got)
+			}
+			path := capturedPath.Load().(string)
+			if !strings.HasSuffix(path, "/namespaces/"+tc.ns) {
+				t.Fatalf("DELETE path %q expected to end with /namespaces/%s", path, tc.ns)
+			}
 		})
-	})
-
-	if err := cli.DropNamespace(context.Background(), []string{"nonempty"}); err == nil {
-		t.Fatal("DropNamespace with 409: expected error, got nil")
 	}
 }
 

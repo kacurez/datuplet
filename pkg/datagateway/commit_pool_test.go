@@ -118,14 +118,6 @@ func TestCommitPool_CancelUnblocksInFlight(t *testing.T) {
 			t.Errorf("cancelled job %s reported no error", r.WriterID)
 		}
 	}
-}
-
-func TestCommitPool_DispatchAfterCancel(t *testing.T) {
-	pool := NewCommitPool(CommitPoolConfig{Workers: 1, MaxQueueSize: 4, CatalogFn: okCatalogFn,
-		CommitFn: func(context.Context, catalog.Catalog, icebergtable.Identifier, []string, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
-			return &icebergjob.CommitResult{}, nil
-		}})
-	pool.Cancel()
 	if err := pool.Dispatch(context.Background(), CommitJob{WriterID: "x", Namespace: "ns", Table: "t", DataPaths: []string{"p"}, Mode: icebergjob.WriteModeAppend, RunID: "r"}); err == nil {
 		t.Error("Dispatch after Cancel must error")
 	}
@@ -166,19 +158,11 @@ func TestCommitPool_ReuseAcrossSessions(t *testing.T) {
 	if len(got) != 1 || got[0].WriterID != "b" {
 		t.Fatalf("session2 results=%v want exactly [b]", got)
 	}
-}
-
-func TestCommitPool_WaitTwiceNoWork(t *testing.T) {
-	pool := NewCommitPool(CommitPoolConfig{Workers: 1, MaxQueueSize: 4, CatalogFn: okCatalogFn,
-		CommitFn: func(context.Context, catalog.Catalog, icebergtable.Identifier, []string, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
-			return &icebergjob.CommitResult{}, nil
-		}})
-	defer pool.Cancel()
-	if got := pool.Wait(context.Background()); len(got) != 0 {
-		t.Errorf("first wait results=%d want 0", len(got))
-	}
-	if got := pool.Wait(context.Background()); len(got) != 0 {
-		t.Errorf("second wait results=%d want 0", len(got))
+	// Waiting again with no dispatched work is empty, repeatedly.
+	for i := 0; i < 2; i++ {
+		if got := pool.Wait(context.Background()); len(got) != 0 {
+			t.Errorf("idle wait %d results=%d want 0", i, len(got))
+		}
 	}
 }
 

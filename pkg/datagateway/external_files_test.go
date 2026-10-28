@@ -43,6 +43,13 @@ func TestServerV2_ExternalFiles(t *testing.T) {
 
 	writerID := openResp.WriterId
 
+	// Peek at writer state before CloseWriter: no external files yet.
+	server.mu.Lock()
+	ws, ok := server.writers[writerID]
+	server.mu.Unlock()
+	require.True(t, ok)
+	assert.Empty(t, ws.externalFiles)
+
 	// Close writer with external files. Under the new contract, CloseWriter
 	// calls finalizeAndDispatch which attempts patchParquetFieldIDs. Since
 	// the mock backend does not contain the referenced parquet file, the call
@@ -65,6 +72,16 @@ func TestServerV2_ExternalFiles(t *testing.T) {
 		t.Errorf("expected 'patch parquet field IDs' in error, got: %v", closeErr)
 	}
 
+	// The CloseWriter path populates writer state (externalFiles, totalRows)
+	// before finalizeAndDispatch, so it is set even though the patch failed.
+	// The writer is still registered until Commit.
+	server.mu.Lock()
+	ws2, ok2 := server.writers[writerID]
+	server.mu.Unlock()
+	require.True(t, ok2, "writer must still be registered after a failed CloseWriter")
+	assert.Equal(t, int64(100), ws2.totalRows, "totalRows should be set before patch attempt")
+	assert.Len(t, ws2.externalFiles, 1, "externalFiles should be set before patch attempt")
+
 	// finalizeAndDispatch claims the writer (sets ws.committed=true) before
 	// attempting I/O, so even though patchParquetFieldIDs failed, the writer
 	// is already marked committed. Commit will see it as claimed (not in
@@ -75,66 +92,7 @@ func TestServerV2_ExternalFiles(t *testing.T) {
 
 	// Writers are cleared after Commit regardless of per-table outcome.
 	server.mu.Lock()
-	_, ok := server.writers[writerID]
+	_, stillThere := server.writers[writerID]
 	server.mu.Unlock()
-	assert.False(t, ok, "writer should be removed after Commit")
-}
-
-// TestServerV2_ExternalFiles_WriteStateSetBeforePatch verifies that writer state
-// (externalFiles, totalRows) is populated correctly before finalizeAndDispatch is
-// called — i.e., the CloseWriter path correctly sets writer state even though the
-// downstream patch call may fail.
-func TestServerV2_ExternalFiles_WriteStateSetBeforePatch(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	testSchema := &pb.Schema{
-		Columns: []*pb.ColumnDef{
-			{Name: "id", Type: "int64", Nullable: false},
-		},
-	}
-
-	openResp, err := server.OpenWriter(ctx, &pb.OpenWriterRequest{
-		Bucket:      "test_bucket",
-		Table:       "test_table2",
-		InputFormat: pb.DataFormat_FORMAT_CSV,
-		Schema:      testSchema,
-	})
-	require.NoError(t, err)
-	writerID := openResp.WriterId
-
-	// Peek at writer state before CloseWriter.
-	server.mu.Lock()
-	ws, ok := server.writers[writerID]
-	server.mu.Unlock()
-	require.True(t, ok)
-
-	// externalFiles not set yet.
-	assert.Empty(t, ws.externalFiles)
-
-	// Close with external files; the path sets ws.externalFiles before calling
-	// finalizeAndDispatch. Even though the downstream patch fails, the writer
-	// state fields are set.
-	_, closeErr := server.CloseWriter(ctx, &pb.CloseWriterRequest{
-		WriterId: writerID,
-		ExternalFiles: []*pb.ExternalDataFile{
-			{Path: "s3://bucket/data.parquet", RowCount: 50, SizeBytes: 500},
-		},
-	})
-	require.Error(t, closeErr) // expected: parquet file not in mock backend
-
-	// Writer state was populated before the error.
-	server.mu.Lock()
-	ws2, ok2 := server.writers[writerID]
-	server.mu.Unlock()
-	if ok2 {
-		assert.Equal(t, int64(50), ws2.totalRows, "totalRows should be set before patch attempt")
-		assert.Len(t, ws2.externalFiles, 1, "externalFiles should be set before patch attempt")
-	}
-	// (If ok2 is false the writer was already removed — also acceptable)
-
-	// Clean up.
-	server.Commit(ctx, &pb.CommitRequest{}) //nolint:errcheck
+	assert.False(t, stillThere, "writer should be removed after Commit")
 }

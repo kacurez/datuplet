@@ -9,9 +9,9 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/buffer"
-	"github.com/datuplet/datuplet/pkg/icebergjob"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
+	"github.com/datuplet/datuplet/pkg/icebergjob"
 )
 
 // setCommitPoolForTest injects a CommitPool for testing purposes.
@@ -151,109 +151,96 @@ func TestCloseWriter_PoolError(t *testing.T) {
 	}
 }
 
-// TestWriteModeForTable_BucketScoped verifies that two tables with the same name
-// in different buckets resolve to their own configured write modes — FULL_LOAD
-// must not bleed across buckets.
-func TestWriteModeForTable_BucketScoped(t *testing.T) {
-	s := &ServerV2{
-		config: &Config{
-			RunID: "r",
-			OutputTables: []OutputTableConfig{
-				{Bucket: "raw", Name: "events", WriteMode: "APPEND"},
-				{Bucket: "staging", Name: "events", WriteMode: "FULL_LOAD"},
+// TestWriteModeForTable verifies write-mode resolution. Two tables with the
+// same name in different buckets resolve to their own configured modes —
+// FULL_LOAD must not bleed across buckets — and no match yields "" (the caller
+// defaults to APPEND). The defaultBucket form (defaultBucket +
+// defaultWriteMode=FULL_LOAD, no explicit OutputTables) must replace data
+// (ReplaceDataFiles) on a second run, not accumulate duplicates (AddFiles).
+func TestWriteModeForTable(t *testing.T) {
+	type probe struct {
+		bucket, table string
+		want          icebergjob.WriteMode
+	}
+	tests := []struct {
+		name   string
+		config *Config
+		probes []probe
+	}{
+		{
+			name: "bucket scoped",
+			config: &Config{
+				RunID: "r",
+				OutputTables: []OutputTableConfig{
+					{Bucket: "raw", Name: "events", WriteMode: "APPEND"},
+					{Bucket: "staging", Name: "events", WriteMode: "FULL_LOAD"},
+				},
+			},
+			probes: []probe{
+				{"raw", "events", icebergjob.WriteModeAppend},
+				{"staging", "events", icebergjob.WriteModeFullLoad},
+				{"unknown", "events", ""}, // unknown bucket
+				{"raw", "nope", ""},       // unknown table
 			},
 		},
-	}
-
-	if got := s.writeModeForTable("raw", "events"); got != icebergjob.WriteModeAppend {
-		t.Errorf("raw.events = %q, want APPEND", got)
-	}
-	if got := s.writeModeForTable("staging", "events"); got != icebergjob.WriteModeFullLoad {
-		t.Errorf("staging.events = %q, want FULL_LOAD", got)
-	}
-	// Unknown bucket → empty (caller defaults to APPEND)
-	if got := s.writeModeForTable("unknown", "events"); got != "" {
-		t.Errorf("unknown.events = %q, want empty", got)
-	}
-	// Unknown table → empty
-	if got := s.writeModeForTable("raw", "nope"); got != "" {
-		t.Errorf("raw.nope = %q, want empty", got)
-	}
-}
-
-// TestWriteModeForTable_NoMatch returns empty when no entry matches.
-func TestWriteModeForTable_NoMatch(t *testing.T) {
-	s := &ServerV2{
-		config: &Config{
-			RunID: "r",
-			OutputTables: []OutputTableConfig{
-				{Bucket: "raw", Name: "orders", WriteMode: "FULL_LOAD"},
+		{
+			name: "table name matches but bucket differs",
+			config: &Config{
+				RunID: "r",
+				OutputTables: []OutputTableConfig{
+					{Bucket: "raw", Name: "orders", WriteMode: "FULL_LOAD"},
+				},
+			},
+			probes: []probe{{"staging", "orders", ""}},
+		},
+		{
+			name: "defaultBucket FULL_LOAD without OutputTables",
+			config: &Config{
+				RunID:            "r",
+				DefaultBucket:    "out",
+				DefaultWriteMode: "FULL_LOAD",
+			},
+			probes: []probe{
+				{"out", "orders", icebergjob.WriteModeFullLoad},
+				{"out", "users", icebergjob.WriteModeFullLoad},
+				{"other", "orders", ""}, // different bucket: no default-bucket match
 			},
 		},
-	}
-	// Table name matches but bucket differs.
-	if got := s.writeModeForTable("staging", "orders"); got != "" {
-		t.Errorf("staging.orders (not in config) = %q, want empty", got)
-	}
-}
-
-// TestWriteModeForTable_DefaultBucketFullLoad covers the common pipeline form:
-// defaultBucket + defaultWriteMode=FULL_LOAD with no explicit OutputTables.
-// A second run of such a pipeline must replace data (ReplaceDataFiles), not
-// accumulate duplicates (AddFiles).
-func TestWriteModeForTable_DefaultBucketFullLoad(t *testing.T) {
-	s := &ServerV2{
-		config: &Config{
-			RunID:            "r",
-			DefaultBucket:    "out",
-			DefaultWriteMode: "FULL_LOAD",
-			// Deliberate: no OutputTables — this is the defaultBucket form.
-		},
-	}
-
-	// Any table in the default bucket should resolve to FULL_LOAD.
-	if got := s.writeModeForTable("out", "orders"); got != icebergjob.WriteModeFullLoad {
-		t.Errorf("out.orders (default bucket FULL_LOAD) = %q, want WriteModeFullLoad", got)
-	}
-	if got := s.writeModeForTable("out", "users"); got != icebergjob.WriteModeFullLoad {
-		t.Errorf("out.users (default bucket FULL_LOAD) = %q, want WriteModeFullLoad", got)
-	}
-
-	// A table in a different bucket → no default-bucket match → "".
-	if got := s.writeModeForTable("other", "orders"); got != "" {
-		t.Errorf("other.orders (non-default bucket) = %q, want empty", got)
-	}
-
-	// Explicit OutputTables entry in the default bucket overrides the default.
-	sWithExplicit := &ServerV2{
-		config: &Config{
-			RunID:            "r",
-			DefaultBucket:    "out",
-			DefaultWriteMode: "FULL_LOAD",
-			OutputTables: []OutputTableConfig{
-				{Bucket: "out", Name: "archive", WriteMode: "APPEND"},
+		{
+			name: "explicit OutputTables entry overrides the default write mode",
+			config: &Config{
+				RunID:            "r",
+				DefaultBucket:    "out",
+				DefaultWriteMode: "FULL_LOAD",
+				OutputTables: []OutputTableConfig{
+					{Bucket: "out", Name: "archive", WriteMode: "APPEND"},
+				},
+			},
+			probes: []probe{
+				{"out", "archive", icebergjob.WriteModeAppend},
+				{"out", "orders", icebergjob.WriteModeFullLoad},
 			},
 		},
-	}
-	if got := sWithExplicit.writeModeForTable("out", "archive"); got != icebergjob.WriteModeAppend {
-		t.Errorf("out.archive (explicit APPEND overrides FULL_LOAD default) = %q, want WriteModeAppend", got)
-	}
-	// Other tables in same default bucket still get FULL_LOAD.
-	if got := sWithExplicit.writeModeForTable("out", "orders"); got != icebergjob.WriteModeFullLoad {
-		t.Errorf("out.orders (non-explicit, default bucket FULL_LOAD) = %q, want WriteModeFullLoad", got)
-	}
-
-	// Table not matching anything at all → "".
-	sNoDefault := &ServerV2{
-		config: &Config{
-			RunID: "r",
-			OutputTables: []OutputTableConfig{
-				{Bucket: "raw", Name: "events", WriteMode: "APPEND"},
+		{
+			name: "no default bucket and no match",
+			config: &Config{
+				RunID: "r",
+				OutputTables: []OutputTableConfig{
+					{Bucket: "raw", Name: "events", WriteMode: "APPEND"},
+				},
 			},
+			probes: []probe{{"unknown", "events", ""}},
 		},
 	}
-	if got := sNoDefault.writeModeForTable("unknown", "events"); got != "" {
-		t.Errorf("unknown.events (no default bucket, no match) = %q, want empty", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &ServerV2{config: tc.config}
+			for _, p := range tc.probes {
+				if got := s.writeModeForTable(p.bucket, p.table); got != p.want {
+					t.Errorf("%s.%s = %q, want %q", p.bucket, p.table, got, p.want)
+				}
+			}
+		})
 	}
 }
 

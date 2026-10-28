@@ -114,52 +114,46 @@ const passingSchema = `{
   }
 }`
 
-func TestLint_PassingFixture(t *testing.T) {
-	issues := Lint([]byte(passingSchema))
-	if len(issues) != 0 {
-		t.Fatalf("expected zero issues on passing fixture, got %d: %+v", len(issues), issues)
-	}
-}
-
-func TestLint_InvalidJSON(t *testing.T) {
-	issues := Lint([]byte(`{ not json `))
-	if !hasRule(issues, RuleInvalidJSON) {
-		t.Fatalf("expected %q issue, got %+v", RuleInvalidJSON, issues)
-	}
-}
-
-func TestLint_Rule1_MissingType(t *testing.T) {
-	// The `bad` property has no `type`.
-	schema := `{
+// TestLint covers every Form-Subset rule: each row lints one schema and asserts
+// the rule that must fire, the rules that must not, or a fully clean result.
+// Whatever the row, every issue must carry a human-readable path and message.
+func TestLint(t *testing.T) {
+	cases := []struct {
+		name      string
+		schema    string
+		wantRule  string   // an issue with this rule must be reported
+		forbid    []string // no issue may carry any of these rules
+		wantClean bool     // zero issues expected
+	}{
+		{name: "passing fixture is clean", schema: passingSchema, wantClean: true},
+		{name: "invalid JSON", schema: `{ not json `, wantRule: RuleInvalidJSON},
+		{
+			// The `bad` property has no `type`.
+			name: "rule1 missing type",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
     "bad": { "description": "no type here" }
   }
-}`
-	issues := Lint([]byte(schema))
-	if !hasRule(issues, RuleMissingType) {
-		t.Fatalf("expected %q issue, got %+v", RuleMissingType, issues)
-	}
-}
-
-func TestLint_Rule1_MultiTypeAccepted(t *testing.T) {
-	// A multi-type array must NOT trigger a missing/invalid-type issue.
-	schema := `{
+}`,
+			wantRule: RuleMissingType,
+		},
+		{
+			// A multi-type array must NOT trigger a missing/invalid-type issue.
+			name: "rule1 multi-type accepted",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
     "ok": { "type": ["string", "number"], "description": "multi-type" }
   }
-}`
-	issues := Lint([]byte(schema))
-	if hasRule(issues, RuleMissingType) {
-		t.Fatalf("multi-type array must be accepted, got %+v", issues)
-	}
-}
-
-func TestLint_Rule2_ForbiddenKeyword(t *testing.T) {
-	schema := `{
+}`,
+			forbid: []string{RuleMissingType},
+		},
+		{
+			name: "rule2 forbidden keyword",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
@@ -169,15 +163,12 @@ func TestLint_Rule2_ForbiddenKeyword(t *testing.T) {
       "oneOf": [{"const": "x"}]
     }
   }
-}`
-	issues := Lint([]byte(schema))
-	if !hasRule(issues, RuleForbiddenKeyword) {
-		t.Fatalf("expected %q issue, got %+v", RuleForbiddenKeyword, issues)
-	}
-}
-
-func TestLint_Rule2_ArrayOfArraysAccepted(t *testing.T) {
-	schema := `{
+}`,
+			wantRule: RuleForbiddenKeyword,
+		},
+		{
+			name: "rule2 array of arrays accepted",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
@@ -187,72 +178,57 @@ func TestLint_Rule2_ArrayOfArraysAccepted(t *testing.T) {
       "items": { "type": "array", "description": "inner" }
     }
   }
-}`
-	issues := Lint([]byte(schema))
-	if len(issues) != 0 {
-		t.Fatalf("array-of-arrays must lint clean, got %+v", issues)
-	}
-}
-
-func TestLint_Rule3_MissingDescription(t *testing.T) {
-	schema := `{
+}`,
+			wantClean: true,
+		},
+		{
+			name: "rule3 missing description",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
     "bad": { "type": "string" }
   }
-}`
-	issues := Lint([]byte(schema))
-	if !hasRule(issues, RuleMissingDescription) {
-		t.Fatalf("expected %q issue, got %+v", RuleMissingDescription, issues)
-	}
-}
-
-func TestLint_Rule3_EmptyDescription(t *testing.T) {
-	schema := `{
+}`,
+			wantRule: RuleMissingDescription,
+		},
+		{
+			name: "rule3 whitespace-only description",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
     "bad": { "type": "string", "description": "   " }
   }
-}`
-	issues := Lint([]byte(schema))
-	if !hasRule(issues, RuleMissingDescription) {
-		t.Fatalf("expected %q issue for whitespace-only description, got %+v", RuleMissingDescription, issues)
-	}
-}
-
-func TestLint_Rule4_RequiredWithDefault(t *testing.T) {
-	schema := `{
+}`,
+			wantRule: RuleMissingDescription,
+		},
+		{
+			name: "rule4 required with default",
+			schema: `{
   "type": "object",
   "description": "root",
   "required": ["k"],
   "properties": {
     "k": { "type": "string", "default": "x", "description": "d" }
   }
-}`
-	issues := Lint([]byte(schema))
-	if !hasRule(issues, RuleRequiredWithDefault) {
-		t.Fatalf("expected %q issue, got %+v", RuleRequiredWithDefault, issues)
-	}
-}
-
-func TestLint_Rule5_UnknownAnnotation(t *testing.T) {
-	schema := `{
+}`,
+			wantRule: RuleRequiredWithDefault,
+		},
+		{
+			name: "rule5 unknown annotation",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
     "bad": { "type": "string", "description": "d", "x-datuplet-bogus": true }
   }
-}`
-	issues := Lint([]byte(schema))
-	if !hasRule(issues, RuleUnknownAnnotation) {
-		t.Fatalf("expected %q issue, got %+v", RuleUnknownAnnotation, issues)
-	}
-}
-
-func TestLint_Rule5_ProducesNotRoot(t *testing.T) {
-	schema := `{
+}`,
+			wantRule: RuleUnknownAnnotation,
+		},
+		{
+			name: "rule5 produces not at root",
+			schema: `{
   "type": "object",
   "description": "root",
   "properties": {
@@ -265,41 +241,44 @@ func TestLint_Rule5_ProducesNotRoot(t *testing.T) {
       }
     }
   }
-}`
-	issues := Lint([]byte(schema))
-	if !hasRule(issues, RuleProducesNotRoot) {
-		t.Fatalf("expected %q issue, got %+v", RuleProducesNotRoot, issues)
-	}
-}
-
-func TestLint_Rule5_ProducesAtRootAccepted(t *testing.T) {
-	schema := `{
+}`,
+			wantRule: RuleProducesNotRoot,
+		},
+		{
+			name: "rule5 produces at root accepted",
+			schema: `{
   "type": "object",
   "description": "root",
   "x-datuplet-produces": "foo",
   "properties": {
     "foo": { "type": "string", "description": "d" }
   }
-}`
-	issues := Lint([]byte(schema))
-	if hasRule(issues, RuleProducesNotRoot) || hasRule(issues, RuleUnknownAnnotation) {
-		t.Fatalf("x-datuplet-produces at root must be accepted, got %+v", issues)
+}`,
+			forbid: []string{RuleProducesNotRoot, RuleUnknownAnnotation},
+		},
 	}
-}
-
-// Sanity: Issue paths are non-empty and human-readable.
-func TestLint_IssuePathPresent(t *testing.T) {
-	schema := `{ "type": "object", "description": "root", "properties": { "bad": { "type": "string" } } }`
-	issues := Lint([]byte(schema))
-	if len(issues) == 0 {
-		t.Fatal("expected at least one issue")
-	}
-	for _, i := range issues {
-		if strings.TrimSpace(i.Path) == "" {
-			t.Fatalf("issue has empty path: %+v", i)
-		}
-		if strings.TrimSpace(i.Message) == "" {
-			t.Fatalf("issue has empty message: %+v", i)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			issues := Lint([]byte(tc.schema))
+			if tc.wantClean && len(issues) != 0 {
+				t.Fatalf("expected zero issues, got %d: %+v", len(issues), issues)
+			}
+			if tc.wantRule != "" && !hasRule(issues, tc.wantRule) {
+				t.Fatalf("expected %q issue, got %+v", tc.wantRule, issues)
+			}
+			for _, rule := range tc.forbid {
+				if hasRule(issues, rule) {
+					t.Fatalf("did not want a %q issue, got %+v", rule, issues)
+				}
+			}
+			for _, i := range issues {
+				if strings.TrimSpace(i.Path) == "" {
+					t.Fatalf("issue has empty path: %+v", i)
+				}
+				if strings.TrimSpace(i.Message) == "" {
+					t.Fatalf("issue has empty message: %+v", i)
+				}
+			}
+		})
 	}
 }

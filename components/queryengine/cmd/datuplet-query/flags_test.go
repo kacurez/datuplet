@@ -7,26 +7,44 @@ import (
 	"testing"
 )
 
-func TestParseFlags_Defaults(t *testing.T) {
-	opts, err := parseFlags([]string{"--sql", "SELECT 1"})
-	if err != nil {
-		t.Fatalf("parseFlags: %v", err)
+func TestParseFlags(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr bool
+		check   func(t *testing.T, opts options)
+	}{
+		{
+			name: "defaults",
+			args: []string{"--sql", "SELECT 1"},
+			check: func(t *testing.T, opts options) {
+				if opts.SQL != "SELECT 1" {
+					t.Errorf("SQL = %q", opts.SQL)
+				}
+				if opts.Format != "table" {
+					t.Errorf("Format default = %q, want table", opts.Format)
+				}
+				if opts.MemoryLimit == "" {
+					t.Errorf("MemoryLimit should have a conservative local default")
+				}
+			},
+		},
+		{name: "invalid format", args: []string{"--sql", "SELECT 1", "--format", "xml"}, wantErr: true},
 	}
-	if opts.SQL != "SELECT 1" {
-		t.Errorf("SQL = %q", opts.SQL)
-	}
-	if opts.Format != "table" {
-		t.Errorf("Format default = %q, want table", opts.Format)
-	}
-	if opts.MemoryLimit == "" {
-		t.Errorf("MemoryLimit should have a conservative local default")
-	}
-}
-
-func TestParseFlags_InvalidFormat(t *testing.T) {
-	_, err := parseFlags([]string{"--sql", "SELECT 1", "--format", "xml"})
-	if err == nil {
-		t.Fatalf("expected error for invalid --format")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, err := parseFlags(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFlags: %v", err)
+			}
+			tc.check(t, opts)
+		})
 	}
 }
 

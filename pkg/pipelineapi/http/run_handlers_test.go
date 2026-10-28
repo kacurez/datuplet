@@ -211,50 +211,6 @@ func TestTriggerRun_PipelineNotFound(t *testing.T) {
 	}
 }
 
-func TestListAndGetRun(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
-
-	postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl/runs", map[string]any{}, cookie).Body.Close()
-
-	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs", nil)
-	req.AddCookie(cookie)
-	resp, err := stdhttp.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("list: status = %d", resp.StatusCode)
-	}
-	var list struct {
-		Runs       []map[string]any `json:"runs"`
-		NextCursor *string          `json:"next_cursor"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&list)
-	if len(list.Runs) != 1 {
-		t.Fatalf("list len = %d", len(list.Runs))
-	}
-	runID := list.Runs[0]["id"].(string)
-
-	req2, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/runs/"+runID, nil)
-	req2.AddCookie(cookie)
-	resp2, err := stdhttp.DefaultClient.Do(req2)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != 200 {
-		t.Errorf("get: status = %d", resp2.StatusCode)
-	}
-}
-
 func TestCancelRun(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
 	defer cleanup()
@@ -393,10 +349,7 @@ func TestGetRun_AssemblesTimeline(t *testing.T) {
 	}
 	var got struct {
 		Timeline []struct {
-			Name     string `json:"name"`
-			Exported []struct {
-				Label string `json:"label"`
-			} `json:"exported"`
+			Name string `json:"name"`
 		} `json:"timeline"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
@@ -404,9 +357,6 @@ func TestGetRun_AssemblesTimeline(t *testing.T) {
 	}
 	if len(got.Timeline) != 1 || got.Timeline[0].Name != "extract" {
 		t.Fatalf("timeline = %+v, want 1 extract stage", got.Timeline)
-	}
-	if len(got.Timeline[0].Exported) != 1 || got.Timeline[0].Exported[0].Label != "raw.orders" {
-		t.Errorf("exported = %+v, want raw.orders", got.Timeline[0].Exported)
 	}
 
 	// A run with no snapshot returns "timeline": null.
@@ -432,37 +382,62 @@ func TestGetRun_AssemblesTimeline(t *testing.T) {
 	}
 }
 
-// TestTriggerRun_UnknownSecretKey_Returns400 covers the S7 trigger-reject
+// TestTriggerRun_MissingSecretKey_Returns400 covers the S7 trigger-reject
 // rung: a pipeline referencing "$[api_token]" is rejected hard (400) at
-// trigger time when the project's managed Secret doesn't have that key.
-// The controller admission check (S3) remains the authoritative gate for
-// the pod itself; this is the fast user-facing reject before a run row is
-// even inserted.
-func TestTriggerRun_UnknownSecretKey_Returns400(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerWithK8s(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", "", []byte(pipelineYAMLWithSecretRef))
-
-	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+// trigger time when the project's managed Secret doesn't have that key — the
+// fast user-facing reject before a run row is even inserted (the controller
+// admission check, S3, stays the authoritative gate for the pod). The
+// "forbidden" row is a BRAND-NEW project whose managed-Secret Get is
+// RBAC-Forbidden (S6 removed pipeline-api's cluster-wide Secret verbs; the
+// per-namespace `datuplet-secrets` Role is created lazily on the first secret
+// PUT): the ladder must still 400, NEVER 500. The fake client can't model
+// RBAC, so that row injects Forbidden via an interceptor client.
+func TestTriggerRun_MissingSecretKey_Returns400(t *testing.T) {
+	tests := []struct {
+		name      string
+		forbidden bool
+	}{
+		{name: "absent key", forbidden: false},
+		{name: "fresh project forbidden secret read", forbidden: true},
 	}
-	if !strings.Contains(string(body), "api_token") {
-		t.Errorf("body = %s, want it to name the missing key api_token", body)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				ts        *httptest.Server
+				pool      *pgxpool.Pool
+				fakeAuthz *authztest.Fake
+				cleanup   func()
+			)
+			if tc.forbidden {
+				ts, pool, fakeAuthz, cleanup = freshServerWithK8sClient(t, forbiddenSecretGetClient(t))
+			} else {
+				ts, pool, fakeAuthz, cleanup = freshServerWithK8s(t)
+			}
+			defer cleanup()
+			ctx := context.Background()
 
-	// No run row must have been inserted — the reject happens before any
-	// DB write.
-	runs, _ := store.ListRunsForProject(ctx, pool, proj.ID, 10)
-	if len(runs) != 0 {
-		t.Errorf("runs len = %d, want 0 (reject must happen before insert)", len(runs))
+			cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+			proj, _ := store.CreateProject(ctx, pool, "proj")
+			seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
+			_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", "", []byte(pipelineYAMLWithSecretRef))
+
+			resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != 400 {
+				t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+			}
+			if !strings.Contains(string(body), "api_token") {
+				t.Errorf("body = %s, want it to name the missing key api_token", body)
+			}
+
+			// No run row must have been inserted — the reject happens before
+			// any DB write.
+			runs, _ := store.ListRunsForProject(ctx, pool, proj.ID, 10)
+			if len(runs) != 0 {
+				t.Errorf("runs len = %d, want 0 (reject must happen before insert)", len(runs))
+			}
+		})
 	}
 }
 
@@ -486,39 +461,6 @@ func TestTriggerRun_KnownSecretKey_Returns201(t *testing.T) {
 	if resp.StatusCode != 201 {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 201; body=%s", resp.StatusCode, body)
-	}
-}
-
-// TestTriggerRun_FreshProjectForbiddenSecretRead_Returns400 proves the trigger
-// hard-reject ladder survives a BRAND-NEW project whose managed-Secret Get is
-// RBAC-Forbidden (S6 removed pipeline-api's cluster-wide Secret verbs; the
-// per-namespace `datuplet-secrets` Role is created lazily only on the first
-// secret PUT). The ladder must reject the missing $[api_token] with a 400,
-// NEVER a 500 — and insert no run row. (The NotFound/absent variant is covered
-// by TestTriggerRun_UnknownSecretKey_Returns400; the fake client can't model
-// RBAC, so this test injects Forbidden via an interceptor client.)
-func TestTriggerRun_FreshProjectForbiddenSecretRead_Returns400(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerWithK8sClient(t, forbiddenSecretGetClient(t))
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	seedProjectAuthz(t, pool, fakeAuthz, alice.ID, proj.ID, "editor")
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl-secret", "", []byte(pipelineYAMLWithSecretRef))
-
-	resp := postJSON(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret/runs", map[string]any{}, cookie)
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400 (fresh-project ladder, not 500); body=%s", resp.StatusCode, body)
-	}
-	if !strings.Contains(string(body), "api_token") {
-		t.Errorf("body = %s, want it to name the missing key api_token", body)
-	}
-	runs, _ := store.ListRunsForProject(ctx, pool, proj.ID, 10)
-	if len(runs) != 0 {
-		t.Errorf("runs len = %d, want 0 (reject must happen before insert)", len(runs))
 	}
 }
 

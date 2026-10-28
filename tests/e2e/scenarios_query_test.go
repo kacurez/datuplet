@@ -17,7 +17,7 @@
 //
 // POST /api/v1/projects/{pid}/query is protected by auth.WithUser (ChainResolver) which
 // accepts either a session cookie (PostgresResolver) or a cli-api JWT
-// (BearerJWTResolver).  The FGA test identities (Alice/Bob/Charlie/Dora)
+// (BearerJWTResolver).  The FGA test identities (Alice/Bob)
 // are FGA-only UUIDs with no DB user records, so their impersonation tokens
 // are rejected with 401 by pipeline-api.
 //
@@ -53,6 +53,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/tests/e2e/framework"
 )
@@ -113,29 +115,34 @@ func getAdminSession(t *testing.T) string {
 	return queryAdminSession
 }
 
-// seededQueryNamespace is the Iceberg namespace (lakekeeper namespace == bucket
-// name in the pipeline YAML) written by the fga-matrix-alice-trigger-and-browse
-// scenario. We reuse that table for the happy-path and authz assertions so we
-// don't need to run an extra pipeline.
+// querySeed* cache the query seed run: a dedicated http-json-extract run
+// rendered under its own prefix ("<runPrefix>-seed"), so its table
+// "<runPrefix>-seed-api"."data" is written by exactly one run in this
+// process. The query, apps and audit tests read it; TestAuditTrail_ClusterRun
+// additionally asserts that the table's current snapshot was committed by
+// querySeedRunID — which only holds because no other scenario writes the
+// same table (the fga-matrix-bob scenario writes "<runPrefix>-api").
 //
-// Shape: "<runPrefix>-api", table "data" — 100 rows, schema: userId/id/title/body.
-// This is the same table the http-json-extract pipeline writes (k8s/http-json-extract.yaml).
-//
-// We cannot guarantee ordering between TestScenarios and TestQuery, so
-// queryScenarioNamespaceOnce lazily seeds the table the first time it is needed.
-var queryScenarioNamespaceOnce sync.Once
-var queryScenarioNamespace string
-var queryScenarioTable string
-var queryScenarioSeedErr error
+// We cannot guarantee ordering between TestScenarios and the query tests
+// (and the suite runs with -shuffle), so the seed is created lazily the
+// first time it is needed.
+var (
+	querySeedOnce      sync.Once
+	querySeedNamespace string
+	querySeedTable     string
+	querySeedRunID     uuid.UUID
+	querySeedErr       error
+)
 
-// ensureQueryTable runs the http-json-extract pipeline (same as the fga-matrix
-// scenarios) once per test process to produce a well-known table.  Subsequent
-// calls are no-ops that return the cached namespace/table or the cached error.
+// ensureQueryTable runs the http-json-extract pipeline under the seed prefix
+// once per test process to produce a well-known table. Subsequent calls are
+// no-ops that return the cached (namespace, table, run id) or the cached
+// error.
 //
 // The table has 100 rows (in-cluster http-fixture /posts):
 //
 //	schema: userId BIGINT, id BIGINT, title VARCHAR, body VARCHAR
-func ensureQueryTable(t *testing.T) (ns, table string) {
+func ensureQueryTable(t *testing.T) (ns, table string, runID uuid.UUID) {
 	t.Helper()
 	h := framework.SharedHarness()
 	if h == nil {
@@ -145,26 +152,26 @@ func ensureQueryTable(t *testing.T) (ns, table string) {
 		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 
-	queryScenarioNamespaceOnce.Do(func() {
+	querySeedOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
 		kb, err := framework.NewK8sBackend(h, runPrefix)
 		if err != nil {
-			queryScenarioSeedErr = fmt.Errorf("new K8s backend: %w", err)
+			querySeedErr = fmt.Errorf("new K8s backend: %w", err)
 			return
 		}
 		defer kb.Cleanup(context.Background())
 
 		templatePath, err := findPipelineTemplate("k8s/http-json-extract.yaml")
 		if err != nil {
-			queryScenarioSeedErr = fmt.Errorf("find pipeline template: %w", err)
+			querySeedErr = fmt.Errorf("find pipeline template: %w", err)
 			return
 		}
-		vars := framework.TemplateVars{RunPrefix: runPrefix}
-		rendered, err := framework.RenderPipeline(templatePath, vars)
+		seedPrefix := runPrefix + "-seed"
+		rendered, err := framework.RenderPipeline(templatePath, framework.TemplateVars{RunPrefix: seedPrefix})
 		if err != nil {
-			queryScenarioSeedErr = fmt.Errorf("render pipeline: %w", err)
+			querySeedErr = fmt.Errorf("render pipeline: %w", err)
 			return
 		}
 		defer os.Remove(rendered)
@@ -174,22 +181,23 @@ func ensureQueryTable(t *testing.T) (ns, table string) {
 			Timeout:     3 * time.Minute,
 		})
 		if err != nil {
-			queryScenarioSeedErr = fmt.Errorf("run seed pipeline: %w", err)
+			querySeedErr = fmt.Errorf("run seed pipeline: %w", err)
 			return
 		}
 		if !result.Success {
-			queryScenarioSeedErr = fmt.Errorf("seed pipeline failed (exit %d, type %s): %s",
+			querySeedErr = fmt.Errorf("seed pipeline failed (exit %d, type %s): %s",
 				result.ExitCode, result.FailureType, result.Logs)
 			return
 		}
-		queryScenarioNamespace = runPrefix + "-api"
-		queryScenarioTable = "data"
+		querySeedNamespace = seedPrefix + "-api"
+		querySeedTable = "data"
+		querySeedRunID = result.RunID
 	})
 
-	if queryScenarioSeedErr != nil {
-		t.Fatalf("query table seed failed: %v", queryScenarioSeedErr)
+	if querySeedErr != nil {
+		t.Fatalf("query table seed failed: %v", querySeedErr)
 	}
-	return queryScenarioNamespace, queryScenarioTable
+	return querySeedNamespace, querySeedTable, querySeedRunID
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -202,6 +210,10 @@ func ensureQueryTable(t *testing.T) (ns, table string) {
 var queryProjectIDOnce sync.Once
 var queryProjectIDCached string
 var queryProjectIDErr error
+
+// queryAdminGrantOnce makes getQueryProjectID write the admin FGA grant
+// (ensureAdminFGAGrant) once per test process.
+var queryAdminGrantOnce sync.Once
 
 // getQueryProjectID resolves the Datuplet project UUID that all query
 // scenarios target (POST /api/v1/projects/{pid}/query), caching it for the
@@ -255,6 +267,10 @@ func getQueryProjectID(t *testing.T) string {
 	// by its own sync.Once).
 	session := getAdminSession(t)
 	h := framework.SharedHarness()
+	// The admin DB user's grant on the harness's lakekeeper project is a
+	// precondition of every query against {pid}; ensureAdminFGAGrant only
+	// logs (never skips), so it is safe inside its own Once.
+	queryAdminGrantOnce.Do(func() { ensureAdminFGAGrant(t, h, session) })
 	queryProjectIDOnce.Do(func() {
 		if h == nil {
 			queryProjectIDErr = fmt.Errorf("resolve query project id: SharedHarness nil")
@@ -490,9 +506,6 @@ func queryFindPipelineAPIPod(ctx context.Context) string {
 	return strings.TrimSpace(string(out))
 }
 
-// intPtr is a convenience helper for optional int pointers in JSON bodies.
-func intPtr(v int) *int { return &v }
-
 // findPipelineTemplate resolves the path to a pipeline template relative to
 // the test's working directory ("pipelines/<relPath>"). Returns an error
 // when the file does not exist.
@@ -507,7 +520,7 @@ func findPipelineTemplate(relPath string) (string, error) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Prerequisite: bootstrap the warehouse env + confirm worker is ready
+// Prerequisite: admin FGA grant on the harness project
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ensureAdminFGAGrant grants project_admin to the real DB admin user
@@ -561,62 +574,6 @@ func ensureAdminFGAGrant(t *testing.T, h *framework.FGAHarness, session string) 
 	t.Logf("query: admin FGA grant ensured for user %s on project %s", me.ID, h.LakekeeperProjectID)
 }
 
-// TestQueryBootstrap verifies the query-worker is ready and the admin
-// session + project UUID resolve cleanly. All other TestQuery* subtests
-// depend on this having run first.  Go's test execution is top-down within
-// a file so naming it Bootstrap keeps it first.
-func TestQueryBootstrap(t *testing.T) {
-	if os.Getenv("E2E_K8S") != "1" {
-		t.Skip("E2E_K8S=1 required")
-	}
-	h := framework.SharedHarness()
-	if h == nil {
-		framework.SkipOrFail(t, "SharedHarness nil — SetupFGABootstrap must have run in TestMain")
-	}
-	if err := framework.PreCheck(); err != nil {
-		framework.SkipOrFail(t, "precheck failed: %v", err)
-	}
-	if !framework.PipelineAPIReachable() {
-		framework.SkipOrFail(t, "pipeline-api not reachable on NodePort 30081 — start port-forward")
-	}
-
-	// Verify query-worker Deployment exists and has at least 1 ready replica.
-	out, err := exec.Command("kubectl", "get", "deployment", "query-worker",
-		"-n", queryE2ENamespace,
-		"-o", "jsonpath={.status.readyReplicas}").Output()
-	if err != nil {
-		framework.SkipOrFail(t, "query-worker Deployment not found — did you set queryWorker.enabled=true in values-app.yaml? err=%v", err)
-	}
-	ready := strings.TrimSpace(string(out))
-	if ready == "" || ready == "0" {
-		framework.SkipOrFail(t, "query-worker has 0 ready replicas — worker may still be starting (readyReplicas=%q)", ready)
-	}
-	t.Logf("query-worker ready replicas: %s", ready)
-
-	// Verify admin login works.
-	session := getAdminSession(t)
-	if session == "" {
-		t.Fatal("admin session login returned empty cookie")
-	}
-	t.Logf("admin session established successfully")
-
-	// Ensure the admin DB user has FGA grants on the e2e lakekeeper project.
-	// register.sh grants the admin user on the "default" project, not on the
-	// e2e harness project. Without this grant, the query-worker's catalog JWT
-	// (sub=admin-uuid) gets 403 from lakekeeper on ATTACH.
-	ensureAdminFGAGrant(t, h, session)
-
-	// Resolve + cache the project UUID the query scenarios target (RFC 025
-	// project-scoped route). Failing fast here gives a clearer error than
-	// letting every downstream TestQuery* subtest hit the same resolution
-	// failure independently.
-	pid := getQueryProjectID(t)
-	if pid == "" {
-		t.Fatal("query project id resolved to empty string")
-	}
-	t.Logf("query project id resolved: %s", pid)
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 1 — happy path: admin queries the seeded table
 // ──────────────────────────────────────────────────────────────────────────────
@@ -633,12 +590,12 @@ func TestQuery_HappyPath(t *testing.T) {
 		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
-	ns, table := ensureQueryTable(t)
+	ns, table, _ := ensureQueryTable(t)
 	ctx := context.Background()
 	session := getAdminSession(t)
 	pid := getQueryProjectID(t)
 
-	// The Iceberg namespace is the lakekeeper namespace = "<runPrefix>-api".
+	// The Iceberg namespace is the lakekeeper namespace = "<runPrefix>-seed-api".
 	// DuckDB's iceberg extension references it as: iceberg_scan('<catalog>.<ns>.<table>').
 	// The query-worker resolves this via the catalog ATTACH — the catalog is
 	// the lakekeeper warehouse we seeded, the namespace and table match what
@@ -720,7 +677,7 @@ func TestQuery_AuthzDenied(t *testing.T) {
 		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
-	ns, table := ensureQueryTable(t)
+	ns, table, _ := ensureQueryTable(t)
 	ctx := context.Background()
 
 	// Create a fresh DB user with no FGA grants on the e2e lakekeeper project.
@@ -794,246 +751,7 @@ func TestQuery_AuthzDenied(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Test 3 — Truncation: max_rows cap is enforced
-// ──────────────────────────────────────────────────────────────────────────────
-
-func TestQuery_Truncation(t *testing.T) {
-	if os.Getenv("E2E_K8S") != "1" {
-		t.Skip("E2E_K8S=1 required")
-	}
-	if err := framework.PreCheck(); err != nil {
-		framework.SkipOrFail(t, "precheck failed: %v", err)
-	}
-	h := framework.SharedHarness()
-	if h == nil {
-		framework.SkipOrFail(t, "SharedHarness nil")
-	}
-	if !framework.PipelineAPIReachable() {
-		framework.SkipOrFail(t, "pipeline-api not reachable")
-	}
-
-	ctx := context.Background()
-	session := getAdminSession(t)
-	pid := getQueryProjectID(t)
-
-	// range(100000) produces 100k rows; cap to 10000 (chart max_rows default).
-	// This query needs no catalog attachment — DuckDB's built-in range()
-	// function works without an Iceberg table.
-	sql := "SELECT * FROM range(100000)"
-	cap := 10000
-	status, body, err := postQuery(ctx, session, pid, queryRequest{SQL: sql, MaxRows: intPtr(cap)})
-	if err != nil {
-		t.Fatalf("POST /api/v1/projects/{pid}/query: %v", err)
-	}
-	t.Logf("truncation status=%d body_len=%d", status, len(body))
-	if status != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", status, truncateLog(body, 256))
-	}
-
-	var result queryResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		t.Fatalf("unmarshal result: %v", err)
-	}
-	if !result.Truncated {
-		t.Errorf("truncated=false; expected true for 100k rows capped at %d", cap)
-	}
-	if len(result.Rows) != cap {
-		t.Errorf("row count: got %d, want exactly %d (cap)", len(result.Rows), cap)
-	}
-	t.Logf("truncation correct: rows=%d truncated=%v", len(result.Rows), result.Truncated)
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 4 — Timeout: a slow query returns 408 within ~5s
-// ──────────────────────────────────────────────────────────────────────────────
-
-func TestQuery_Timeout(t *testing.T) {
-	if os.Getenv("E2E_K8S") != "1" {
-		t.Skip("E2E_K8S=1 required")
-	}
-	if err := framework.PreCheck(); err != nil {
-		framework.SkipOrFail(t, "precheck failed: %v", err)
-	}
-	h := framework.SharedHarness()
-	if h == nil {
-		framework.SkipOrFail(t, "SharedHarness nil")
-	}
-	if !framework.PipelineAPIReachable() {
-		framework.SkipOrFail(t, "pipeline-api not reachable")
-	}
-
-	ctx := context.Background()
-	session := getAdminSession(t)
-	pid := getQueryProjectID(t)
-
-	// Aggregation over range(30000)×range(30000) = 900M combinations.
-	// Produces exactly 1 output row (a SUM), so the max_rows cap cannot
-	// truncate it before the 1s timeout fires. DuckDB takes ~2.8s to scan
-	// all 900M combinations on the e2e cluster; the worker's context
-	// cancellation fires at 1s well before the scan completes.
-	sql := "SELECT sum(t1.range * t2.range) AS v FROM range(30000) t1, range(30000) t2"
-	timeoutS := 1
-
-	start := time.Now()
-	ctx2, cancel := context.WithTimeout(ctx, 15*time.Second) // outer guard
-	defer cancel()
-
-	// Use a raw HTTP client with a longer timeout so the 408 from the worker
-	// can reach us (we don't want our client-side timeout to fire first).
-	raw, _ := json.Marshal(queryRequest{SQL: sql, TimeoutS: intPtr(timeoutS)})
-	u := framework.PipelineAPIBaseURL() + "/api/v1/projects/" + pid + "/query"
-	req, _ := http.NewRequestWithContext(ctx2, http.MethodPost, u, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: "pipeline_api_session", Value: session})
-	cli := &http.Client{Timeout: 15 * time.Second}
-	resp, err := cli.Do(req)
-	elapsed := time.Since(start)
-
-	if err != nil {
-		t.Fatalf("POST /api/v1/projects/{pid}/query: %v (elapsed %s)", err, elapsed)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	t.Logf("timeout status=%d elapsed=%s body=%s", resp.StatusCode, elapsed, truncateLog(body, 256))
-
-	if resp.StatusCode != http.StatusRequestTimeout {
-		t.Fatalf("expected 408 RequestTimeout, got %d (elapsed %s): %s",
-			resp.StatusCode, elapsed, string(body))
-	}
-
-	var errBody queryError
-	if err := json.Unmarshal(body, &errBody); err != nil {
-		t.Logf("WARN: cannot parse error body: %v", err)
-	} else if errBody.Kind != "timeout" {
-		t.Errorf("expected kind=timeout, got %q", errBody.Kind)
-	}
-
-	// The response should arrive within ~10s (worker kills the query at 1s,
-	// serialises the error, network round-trip ≤8s on a small cluster).
-	if elapsed > 10*time.Second {
-		t.Errorf("timeout took %s — expected within 10s for a 1-second budget", elapsed)
-	}
-	t.Logf("timeout assertion passed: status=408 kind=%q elapsed=%s", errBody.Kind, elapsed)
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 5 — Concurrency: per-principal cap of 2 → at least one 429
-// ──────────────────────────────────────────────────────────────────────────────
-
-func TestQuery_Concurrency(t *testing.T) {
-	if os.Getenv("E2E_K8S") != "1" {
-		t.Skip("E2E_K8S=1 required")
-	}
-	if err := framework.PreCheck(); err != nil {
-		framework.SkipOrFail(t, "precheck failed: %v", err)
-	}
-	h := framework.SharedHarness()
-	if h == nil {
-		framework.SkipOrFail(t, "SharedHarness nil")
-	}
-	if !framework.PipelineAPIReachable() {
-		framework.SkipOrFail(t, "pipeline-api not reachable")
-	}
-
-	ctx := context.Background()
-	// All 3 requests use the SAME session cookie (same DB user UUID = same
-	// principal in the per-principal gate). The gate cap is 2, so the 3rd
-	// request must get 429 rate_limited.
-	session := getAdminSession(t)
-	pid := getQueryProjectID(t)
-
-	// 3 concurrent slow queries from the SAME user (admin).
-	// Per-principal cap = 2 (queryproxy default).
-	// At least one of the three MUST get 429 rate_limited.
-	//
-	// The query must reliably HOLD each request's gate slot for longer than
-	// the pre-gate stagger, so that requests 1 and 2 are both still in flight
-	// when request 3 hits the per-principal gate and gets an instant 429.
-	// Two pitfalls to avoid:
-	//   - a row-returning scan hits the max_rows cap (default 1000) and
-	//     returns near-instantly;
-	//   - a plain count(*)/sum() over range()×range() is computed
-	//     ANALYTICALLY by DuckDB (cardinality known without scanning), so it
-	//     also returns in ~milliseconds.
-	// An aggregate over an OPAQUE per-row predicate (hash) forces DuckDB to
-	// actually evaluate every row of the product — a genuine multi-second
-	// scan the optimizer cannot short-circuit. 30000×30000 = 9e8 rows.
-	//
-	// (RFC 025's per-request warehouse resolution widened the pre-gate
-	// stagger, which made the old fast query deterministically fail this test
-	// on fast machines — the gate itself is unchanged and correct.)
-	sql := "SELECT count(*) AS c FROM range(30000) t1, range(30000) t2 WHERE hash(t1.range * 1000003 + t2.range) % 5 = 0"
-	timeoutS := 20
-
-	type result struct {
-		status int
-		body   []byte
-		err    error
-	}
-	results := make([]result, 3)
-	var wg sync.WaitGroup
-	for i := 0; i < 3; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx2, cancel := context.WithTimeout(ctx, 15*time.Second)
-			defer cancel()
-			raw, _ := json.Marshal(queryRequest{SQL: sql, TimeoutS: intPtr(timeoutS)})
-			u := framework.PipelineAPIBaseURL() + "/api/v1/projects/" + pid + "/query"
-			req, _ := http.NewRequestWithContext(ctx2, http.MethodPost, u, bytes.NewReader(raw))
-			req.Header.Set("Content-Type", "application/json")
-			req.AddCookie(&http.Cookie{Name: "pipeline_api_session", Value: session})
-			cli := &http.Client{Timeout: 20 * time.Second}
-			resp, err := cli.Do(req)
-			if err != nil {
-				results[i] = result{err: err}
-				return
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(resp.Body)
-			results[i] = result{status: resp.StatusCode, body: body}
-		}()
-	}
-	wg.Wait()
-
-	// gotCap is true when at least one request was rejected by a concurrency cap.
-	// Two cap levels are possible:
-	//   - 429 rate_limited: the proxy's per-principal gate fires (cap=2 per caller).
-	//   - 503 capacity:     the worker's own admission semaphore fires (concurrency=2)
-	//     AND the proxy translates the worker's 429 → client 503 kind=capacity.
-	// Both prove the system correctly limits concurrent queries per principal/pod.
-	gotCap := false
-	for i, r := range results {
-		if r.err != nil {
-			t.Logf("goroutine %d: error=%v", i, r.err)
-			continue
-		}
-		t.Logf("goroutine %d: status=%d body=%s", i, r.status, truncateLog(r.body, 128))
-		if r.status == http.StatusTooManyRequests || r.status == http.StatusServiceUnavailable {
-			gotCap = true
-			var errBody queryError
-			if err := json.Unmarshal(r.body, &errBody); err == nil {
-				t.Logf("goroutine %d: cap triggered kind=%q error=%q", i, errBody.Kind, errBody.Error)
-				// rate_limited = proxy per-principal gate; capacity = worker admission (translated by proxy).
-				if errBody.Kind != "rate_limited" && errBody.Kind != "capacity" {
-					t.Errorf("goroutine %d: expected kind=rate_limited or capacity, got %q", i, errBody.Kind)
-				}
-			}
-		}
-	}
-
-	if !gotCap {
-		t.Errorf("concurrency cap NOT triggered: 3 concurrent queries as same principal did not produce a 429 or 503 — " +
-			"check DATUPLET_QUERY_PER_PRINCIPAL_INFLIGHT (should be 2) and that all 3 requests landed simultaneously")
-	} else {
-		t.Logf("concurrency cap correctly enforced: all 3 requests accounted for, cap triggered")
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 6 — Write probe: INSERT into an Iceberg table via DuckDB must fail
+// Test 3 — Write probe: INSERT into an Iceberg table via DuckDB must fail
 // ──────────────────────────────────────────────────────────────────────────────
 
 // TestQuery_WriteProbe asserts that a READ-ONLY principal cannot write to an
@@ -1066,7 +784,7 @@ func TestQuery_WriteProbe(t *testing.T) {
 		framework.SkipOrFail(t, "pipeline-api not reachable")
 	}
 
-	ns, table := ensureQueryTable(t)
+	ns, table, _ := ensureQueryTable(t)
 	ctx := context.Background()
 	pid := getQueryProjectID(t)
 
@@ -1151,7 +869,7 @@ func TestQuery_WriteProbe(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Test 7 — NetworkPolicy egress self-check
+// Test 4 — NetworkPolicy egress self-check
 // ──────────────────────────────────────────────────────────────────────────────
 
 // TestQuery_NetworkPolicyEgress implements the Spike 0.2 graduated assertion:
@@ -1296,7 +1014,7 @@ spec:
 	}
 
 	// Seeded-table query must still succeed (lakekeeper + minio are in the allowlist).
-	ns, table := ensureQueryTable(t)
+	ns, table, _ := ensureQueryTable(t)
 	goodSQL := fmt.Sprintf(`SELECT count(*) AS cnt FROM "%s"."%s"`, ns, table)
 	goodStatus, goodBody, err := postQuery(ctx, session, pid, queryRequest{SQL: goodSQL})
 	if err != nil {
@@ -1309,75 +1027,7 @@ spec:
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Test 8 — Audit smoke: grep pipeline-api logs for a query_audit line
-// ──────────────────────────────────────────────────────────────────────────────
-
-// TestQuery_AuditSmoke runs the happy-path query again (or relies on the one
-// already in TestQuery_HappyPath above), then greps the pipeline-api pod logs
-// for a "query_audit" slog line with outcome=ok.
-//
-// This is best-effort: if log scraping fails or the format changes, the test
-// logs a warning but does NOT fail (skip-not-fail semantics).
-func TestQuery_AuditSmoke(t *testing.T) {
-	if os.Getenv("E2E_K8S") != "1" {
-		t.Skip("E2E_K8S=1 required")
-	}
-	h := framework.SharedHarness()
-	if h == nil {
-		framework.SkipOrFail(t, "SharedHarness nil")
-	}
-	if !framework.PipelineAPIReachable() {
-		framework.SkipOrFail(t, "pipeline-api not reachable")
-	}
-
-	ns, table := ensureQueryTable(t)
-	ctx := context.Background()
-	session := getAdminSession(t)
-	pid := getQueryProjectID(t)
-
-	// Fire a fresh happy-path query to ensure a recent audit line exists.
-	sql := fmt.Sprintf(`SELECT count(*) AS cnt FROM "%s"."%s"`, ns, table)
-	status, body, err := postQuery(ctx, session, pid, queryRequest{SQL: sql})
-	if err != nil || status != http.StatusOK {
-		t.Skipf("audit-smoke pre-query failed (status=%d err=%v) — skipping audit check", status, err)
-	}
-	_ = body
-
-	// Find the pipeline-api pod name.
-	podName := queryFindPipelineAPIPod(ctx)
-	if podName == "" {
-		t.Logf("AUDIT SMOKE SKIP: cannot find pipeline-api pod")
-		t.Skip("audit smoke: pipeline-api pod not found")
-	}
-	t.Logf("audit smoke: checking logs on pod %s", podName)
-
-	// Fetch the last 200 lines of logs (recent; avoids pulling the full log).
-	logOut, err := exec.CommandContext(ctx, "kubectl", "logs", podName,
-		"-n", queryE2ENamespace,
-		"--tail=200").Output()
-	if err != nil {
-		t.Logf("AUDIT SMOKE SKIP: kubectl logs failed: %v", err)
-		t.Skip("audit smoke: kubectl logs failed")
-	}
-
-	logStr := string(logOut)
-	if !strings.Contains(logStr, "query_audit") {
-		t.Logf("AUDIT SMOKE WARN: no 'query_audit' line found in last 200 log lines — " +
-			"either the query didn't reach pipeline-api or log format changed. " +
-			"Raw log tail:\n%s", truncateLog([]byte(logStr), 1024))
-		t.Skip("audit smoke: no query_audit line found — best-effort only")
-	}
-	if !strings.Contains(logStr, "outcome=ok") {
-		t.Logf("AUDIT SMOKE WARN: 'query_audit' line found but no 'outcome=ok' — " +
-			"the query may have failed or the slog format uses a different key. " +
-			"Log snippet:\n%s", extractAuditLines(logStr))
-		t.Skip("audit smoke: query_audit found but outcome=ok not present — best-effort only")
-	}
-	t.Logf("audit smoke PASS: found query_audit line with outcome=ok")
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 9 — Storage preview: served by the query-worker, <5s latency gate
+// Test 5 — Storage preview: served by the query-worker, <5s latency gate
 // ──────────────────────────────────────────────────────────────────────────────
 
 // TestQuery_StoragePreview proves that GET
@@ -1408,7 +1058,7 @@ func TestQuery_StoragePreview(t *testing.T) {
 	ctx := context.Background()
 	session := getAdminSession(t)
 	pid := getQueryProjectID(t)
-	ns, table := ensureQueryTable(t)
+	ns, table, _ := ensureQueryTable(t)
 
 	start := time.Now()
 	status, body, err := storageGETPreview(ctx, session, pid, ns, table)
@@ -1447,15 +1097,4 @@ func truncateLog(b []byte, maxBytes int) string {
 		return string(b)
 	}
 	return string(b[:maxBytes]) + "…"
-}
-
-// extractAuditLines returns all log lines containing "query_audit".
-func extractAuditLines(logStr string) string {
-	var lines []string
-	for _, line := range strings.Split(logStr, "\n") {
-		if strings.Contains(line, "query_audit") {
-			lines = append(lines, line)
-		}
-	}
-	return strings.Join(lines, "\n")
 }

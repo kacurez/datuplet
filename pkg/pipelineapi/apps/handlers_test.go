@@ -193,6 +193,7 @@ func TestPutApp_CreatesAppRegistersIdentityAndMovesDraft(t *testing.T) {
 	h := newAppsHarness(t)
 	bundle := []byte("export async function render(ctx) { return {}; }")
 
+	capture := captureAudit(t)
 	appID, hash := h.putApp("dash1", bundle)
 
 	if _, err := uuid.Parse(appID); err != nil {
@@ -218,6 +219,14 @@ func TestPutApp_CreatesAppRegistersIdentityAndMovesDraft(t *testing.T) {
 	if _, err := h.store.Resolve(context.Background(), h.projectID, "dash1", "production"); err == nil {
 		t.Fatal("production channel is set after a plain upload; want unset")
 	}
+	// The put_version audit record names the app and the stored version.
+	rec := capture.findAction(t, "put_version")
+	if got, _ := rec["app_id"].(string); got != appID {
+		t.Errorf("put_version app_id = %q, want %q", got, appID)
+	}
+	if got, _ := rec["version_hash"].(string); got != hash {
+		t.Errorf("put_version version_hash = %q, want %q", got, hash)
+	}
 }
 
 func TestPutApp_SecondUploadDoesNotReRegister(t *testing.T) {
@@ -233,16 +242,6 @@ func TestPutApp_SecondUploadDoesNotReRegister(t *testing.T) {
 	}
 	if len(h.ident.Calls) != 1 {
 		t.Fatalf("identity calls = %v, want a single Register across two uploads", h.ident.Calls)
-	}
-}
-
-func TestPutApp_IdempotentSameBundle(t *testing.T) {
-	h := newAppsHarness(t)
-	bundle := []byte("same bytes")
-	_, hash1 := h.putApp("dash1", bundle)
-	_, hash2 := h.putApp("dash1", bundle)
-	if hash1 != hash2 {
-		t.Fatalf("hashes differ for identical bundles: %q vs %q", hash1, hash2)
 	}
 }
 
@@ -409,9 +408,13 @@ func TestDeleteApp_UnregistersIdentityBeforeDeletingRows(t *testing.T) {
 	}
 	h.ident.Calls = nil // drop the Register from create
 
+	capture := captureAudit(t)
 	w := h.do(http.MethodDelete, h.appsPath("/dash1"), "")
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204 (body %s)", w.Code, w.Body.String())
+	}
+	if rec := capture.findAction(t, "delete_app"); rec["app_id"] != appID {
+		t.Errorf("delete_app app_id = %v, want %q", rec["app_id"], appID)
 	}
 
 	// Ordering proof: the probe recorded from inside Unregister saw the app

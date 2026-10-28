@@ -84,42 +84,54 @@ func TestFilesManifest_AppendConcurrent(t *testing.T) {
 	}
 }
 
-func TestFilesManifest_DeterministicTableOrder(t *testing.T) {
-	// Tables come back from Tables() alphabetically by "<ns>.<tbl>"
-	// regardless of append order. Within a table, paths preserve
-	// append order.
-	m := NewFilesManifest("run-1")
-	m.Append("zeta", "z", "s3://b/zeta/z/data/p1.parquet")
-	m.Append("alpha", "a", "s3://b/alpha/a/data/p1.parquet")
-	m.Append("alpha", "a", "s3://b/alpha/a/data/p2.parquet")
-	m.Append("alpha", "b", "s3://b/alpha/b/data/p1.parquet")
-
-	tables := m.Tables()
-	gotKeys := make([]string, 0, len(tables))
-	for _, tf := range tables {
-		gotKeys = append(gotKeys, tf.Namespace+"."+tf.Table)
+// Tables come back from Tables() alphabetically by "<ns>.<tbl>" regardless of
+// append order, paths within a table preserve append order, and an empty path
+// is ignored.
+func TestFilesManifest_Tables(t *testing.T) {
+	type app struct{ ns, tbl, path string }
+	tests := []struct {
+		name      string
+		appends   []app
+		wantKeys  []string
+		wantPaths map[string][]string // by "<ns>.<tbl>"
+	}{
+		{
+			name: "deterministic table order, append order within a table",
+			appends: []app{
+				{"zeta", "z", "s3://b/zeta/z/data/p1.parquet"},
+				{"alpha", "a", "s3://b/alpha/a/data/p1.parquet"},
+				{"alpha", "a", "s3://b/alpha/a/data/p2.parquet"},
+				{"alpha", "b", "s3://b/alpha/b/data/p1.parquet"},
+			},
+			wantKeys: []string{"alpha.a", "alpha.b", "zeta.z"},
+			wantPaths: map[string][]string{
+				"alpha.a": {"s3://b/alpha/a/data/p1.parquet", "s3://b/alpha/a/data/p2.parquet"},
+			},
+		},
+		{
+			name:     "empty path is skipped",
+			appends:  []app{{"ns", "tbl", ""}},
+			wantKeys: []string{},
+		},
 	}
-	wantKeys := []string{"alpha.a", "alpha.b", "zeta.z"}
-	if !equalStrings(gotKeys, wantKeys) {
-		t.Errorf("table key order = %v, want %v", gotKeys, wantKeys)
-	}
-
-	// Append order within "alpha.a" preserved.
-	gotPaths := tables[0].Paths
-	wantPaths := []string{
-		"s3://b/alpha/a/data/p1.parquet",
-		"s3://b/alpha/a/data/p2.parquet",
-	}
-	if !equalStrings(gotPaths, wantPaths) {
-		t.Errorf("alpha.a paths = %v, want %v", gotPaths, wantPaths)
-	}
-}
-
-func TestFilesManifest_EmptyPathSkipped(t *testing.T) {
-	m := NewFilesManifest("r")
-	m.Append("ns", "tbl", "")
-	if len(m.Tables()) != 0 {
-		t.Errorf("empty path should be ignored, got: %+v", m.Tables())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewFilesManifest("run-1")
+			for _, a := range tc.appends {
+				m.Append(a.ns, a.tbl, a.path)
+			}
+			tables := m.Tables()
+			gotKeys := make([]string, 0, len(tables))
+			for _, tf := range tables {
+				gotKeys = append(gotKeys, tf.Namespace+"."+tf.Table)
+				if want, ok := tc.wantPaths[tf.Namespace+"."+tf.Table]; ok && !equalStrings(tf.Paths, want) {
+					t.Errorf("%s.%s paths = %v, want %v", tf.Namespace, tf.Table, tf.Paths, want)
+				}
+			}
+			if !equalStrings(gotKeys, tc.wantKeys) {
+				t.Errorf("table key order = %v, want %v", gotKeys, tc.wantKeys)
+			}
+		})
 	}
 }
 
@@ -189,33 +201,45 @@ func TestFilesManifest_WriteJSONForTable_RoundTrip_LocalFS(t *testing.T) {
 	}
 }
 
-// TestFilesManifest_WriteJSONForTable_NoEntry: a (ns, tbl) with zero
-// Append calls returns wrote=false, no error. TableCommit's "missing
-// manifest entry → nothing to commit" path handles that downstream.
-func TestFilesManifest_WriteJSONForTable_NoEntry(t *testing.T) {
-	m := NewFilesManifest("r")
-	m.Append("ns", "tbl", "s3://b/ns/tbl/data/p.parquet")
-
-	b := backend.NewLocalBackend(backend.LocalConfig{})
-	wrote, err := m.WriteJSONForTable(context.Background(), b, "other", "missing", "file:///tmp/manifest.json")
-	if err != nil {
-		t.Fatalf("WriteJSONForTable on missing entry: err=%v want nil", err)
+// TestFilesManifest_WriteJSONForTable_EdgeCases: a (ns, tbl) with zero Append
+// calls returns wrote=false, no error (TableCommit's "missing manifest entry →
+// nothing to commit" path handles that downstream); a nil backend or empty
+// path is an error.
+func TestFilesManifest_WriteJSONForTable_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name      string
+		nilBack   bool
+		ns, tbl   string
+		path      string
+		wantError bool
+	}{
+		{name: "missing entry is not an error", ns: "other", tbl: "missing", path: "file:///tmp/manifest.json"},
+		{name: "nil backend errors", nilBack: true, ns: "ns", tbl: "tbl", path: "s3://b/ns/tbl/.run-state/r/files.json", wantError: true},
+		{name: "empty path errors", ns: "ns", tbl: "tbl", path: "", wantError: true},
 	}
-	if wrote {
-		t.Error("WriteJSONForTable on missing entry: wrote=true want false")
-	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewFilesManifest("r")
+			m.Append("ns", "tbl", "s3://b/ns/tbl/data/p.parquet")
 
-func TestFilesManifest_WriteJSONForTable_Errors(t *testing.T) {
-	m := NewFilesManifest("r")
-	m.Append("ns", "tbl", "s3://b/ns/tbl/data/p.parquet")
-
-	if _, err := m.WriteJSONForTable(context.Background(), nil, "ns", "tbl", "s3://b/ns/tbl/.run-state/r/files.json"); err == nil {
-		t.Errorf("nil backend: expected error, got nil")
-	}
-	b := backend.NewLocalBackend(backend.LocalConfig{})
-	if _, err := m.WriteJSONForTable(context.Background(), b, "ns", "tbl", ""); err == nil {
-		t.Errorf("empty path: expected error, got nil")
+			var b backend.StorageBackend
+			if !tc.nilBack {
+				b = backend.NewLocalBackend(backend.LocalConfig{})
+			}
+			wrote, err := m.WriteJSONForTable(context.Background(), b, tc.ns, tc.tbl, tc.path)
+			if tc.wantError {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err=%v want nil", err)
+			}
+			if wrote {
+				t.Error("wrote=true want false")
+			}
+		})
 	}
 }
 

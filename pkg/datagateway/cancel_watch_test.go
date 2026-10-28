@@ -50,42 +50,62 @@ func TestWatchCancelAnnotation_FiresOnTrue(t *testing.T) {
 	}
 }
 
-// TestWatchCancelAnnotation_HonoursContext makes sure ctx cancel
-// propagates so the gateway shutdown path can stop the watcher.
-func TestWatchCancelAnnotation_HonoursContext(t *testing.T) {
+// TestWatchCancelAnnotation_StopsWithContext makes sure ctx ends propagate so
+// the gateway shutdown path can stop the watcher, and that the no-K8s case
+// (path "") waits for ctx and returns ctx.Err() rather than firing immediately.
+func TestWatchCancelAnnotation_StopsWithContext(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	p := filepath.Join(dir, "annotations")
-	if err := os.WriteFile(p, []byte(""), 0o644); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name      string
+		emptyPath bool
+		// start returns the watcher ctx and a func that ends it.
+		start   func() (context.Context, func())
+		wantErr error // nil: any non-nil error
+	}{
+		{
+			name: "explicit cancel propagates",
+			start: func() (context.Context, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				return ctx, func() { time.Sleep(20 * time.Millisecond); cancel() }
+			},
+		},
+		{
+			name:      "empty path blocks until ctx deadline",
+			emptyPath: true,
+			start: func() (context.Context, func()) {
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				t.Cleanup(cancel)
+				return ctx, func() {}
+			},
+			wantErr: context.DeadlineExceeded,
+		},
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- WatchCancelAnnotation(ctx, p, 50*time.Millisecond)
-	}()
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("watcher returned nil; expected ctx.Err()")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("watcher did not honour ctx cancellation")
-	}
-}
-
-// TestWatchCancelAnnotation_EmptyPathBlocks confirms the no-K8s case:
-// when path is "" the watcher waits indefinitely for ctx and returns
-// ctx.Err() rather than firing immediately.
-func TestWatchCancelAnnotation_EmptyPathBlocks(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	err := WatchCancelAnnotation(ctx, "", 0)
-	if err != context.DeadlineExceeded {
-		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := ""
+			if !tc.emptyPath {
+				p = filepath.Join(t.TempDir(), "annotations")
+				if err := os.WriteFile(p, []byte(""), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, stop := tc.start()
+			done := make(chan error, 1)
+			go func() { done <- WatchCancelAnnotation(ctx, p, 50*time.Millisecond) }()
+			stop()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("watcher returned nil; expected ctx.Err()")
+				}
+				if tc.wantErr != nil && err != tc.wantErr {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("watcher did not honour ctx")
+			}
+		})
 	}
 }
 

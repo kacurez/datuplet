@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate/projectgatetest"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
@@ -72,19 +73,257 @@ func newHandler(t *testing.T, cfg Config) http.Handler {
 	return h
 }
 
-func TestHandler_RequiresWorkerURL(t *testing.T) {
-	// A valid Gate is supplied so the Gate-nil guard does not short-circuit
-	// before newWorkerClient's WorkerURL-empty check — this test must exercise
-	// the WorkerURL requirement specifically.
-	if _, err := Handler(Config{Gate: projectgatetest.AllowAll("p", "w")}, testSigner(t)); err == nil {
-		t.Fatal("expected error when WorkerURL is empty")
+// TestHandler_RequiresConfig: Handler refuses to construct without a worker
+// URL, a signer or a gate (newWorkerClient's WorkerURL-empty check runs
+// inside Handler, so the first row also covers the empty-URL constructor).
+func TestHandler_RequiresConfig(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfg    Config
+		signer func(t *testing.T) *tokens.Signer
+	}{
+		// A valid Gate is supplied so the Gate-nil guard does not
+		// short-circuit before newWorkerClient's WorkerURL-empty check.
+		{"empty_worker_url", Config{Gate: projectgatetest.AllowAll("p", "w")}, testSigner},
+		{"nil_signer", Config{WorkerURL: "http://worker"}, func(*testing.T) *tokens.Signer { return nil }},
+		{"nil_gate", Config{WorkerURL: "http://worker"}, testSigner},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Handler(tc.cfg, tc.signer(t)); err == nil {
+				t.Fatal("expected construction error")
+			}
+		})
 	}
 }
 
-func TestHandler_RequiresSigner(t *testing.T) {
-	if _, err := Handler(Config{WorkerURL: "http://worker"}, nil); err == nil {
-		t.Fatal("expected error when signer is nil")
+// TestHandler_ParamsForwardedVerbatim: the proxy forwards `params` blindly
+// (RFC 028 Q3 design decision) and relies on the worker's own ValidateParams
+// for the bad_request gate. The with_params case proves (1) the field reaches
+// the worker body at all, and (2) it survives the round trip as an exact
+// integer, not a float64 that has silently lost precision — which is why the
+// proxy's own body decoder needs its own UseNumber(), independent of the
+// worker's. The no_params case proves a request without `params` forwards a
+// body that omits the key entirely (json:"params,omitempty" keeps the wire
+// body identical to before Q3).
+func TestHandler_ParamsForwardedVerbatim(t *testing.T) {
+	const wantResult = `{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`
+	cases := []struct {
+		name    string
+		reqBody string
+		check   func(t *testing.T, gotBody []byte)
+	}{
+		{
+			"with_params",
+			`{"sql":"SELECT $n, $country, $active, $note","params":{"country":"DE","n":12345678901234567,"active":true,"note":null}}`,
+			func(t *testing.T, gotBody []byte) {
+				// Decode the bytes actually sent to the worker WITH UseNumber,
+				// so a 17-digit integer is compared exactly rather than
+				// through a float64 round trip (which would silently round it).
+				dec := json.NewDecoder(bytes.NewReader(gotBody))
+				dec.UseNumber()
+				var got workerRequest
+				if err := dec.Decode(&got); err != nil {
+					t.Fatalf("decode worker body: %v", err)
+				}
+				if got.Params == nil {
+					t.Fatalf("worker body carried no params at all: %s", gotBody)
+				}
+				if n, ok := got.Params["n"].(json.Number); !ok || n.String() != "12345678901234567" {
+					t.Fatalf("params[n] = %#v, want json.Number(12345678901234567) exactly", got.Params["n"])
+				}
+				if got.Params["country"] != "DE" {
+					t.Fatalf("params[country] = %#v, want %q", got.Params["country"], "DE")
+				}
+				if got.Params["active"] != true {
+					t.Fatalf("params[active] = %#v, want true", got.Params["active"])
+				}
+				if v, ok := got.Params["note"]; !ok || v != nil {
+					t.Fatalf("params[note] = %#v, want present-and-nil", v)
+				}
+			},
+		},
+		{
+			"no_params",
+			`{"sql":"SELECT 1"}`,
+			func(t *testing.T, gotBody []byte) {
+				if strings.Contains(string(gotBody), `"params"`) {
+					t.Fatalf("worker body must omit params entirely when absent: %s", gotBody)
+				}
+			},
+		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody []byte
+			worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				gotBody, err = io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("read worker body: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(wantResult))
+			}))
+			defer worker.Close()
+
+			h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, authedRequest(t, uuid.New(), tc.reqBody))
+
+			// Response passthrough is unaffected by the presence of params.
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if rec.Body.String() != wantResult {
+				t.Fatalf("body passthrough mismatch:\n got %q\nwant %q", rec.Body.String(), wantResult)
+			}
+			tc.check(t, gotBody)
+		})
+	}
+}
+
+// TestHandler_SecurityGates: requests that fail authentication, the
+// per-project gate, or project-id validation never reach the worker.
+func TestHandler_SecurityGates(t *testing.T) {
+	cases := []struct {
+		name string
+		gate func() *projectgate.Gate
+		req  func(t *testing.T) *http.Request
+		want int
+	}{
+		{
+			// No auth.WithCtxUser on this request → no user in ctx.
+			"unauthenticated",
+			func() *projectgate.Gate { return projectgatetest.AllowAll("p", "w") },
+			func(t *testing.T) *http.Request {
+				return httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
+			},
+			http.StatusUnauthorized,
+		},
+		{
+			"gate_forbidden",
+			func() *projectgate.Gate {
+				g := projectgatetest.AllowAll("p", "w")
+				g.Authorizer = projectgatetest.FakeAuthorizer{Allow: false}
+				return g
+			},
+			func(t *testing.T) *http.Request { return authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`) },
+			http.StatusForbidden,
+		},
+		{
+			"gate_invalid_pid",
+			func() *projectgate.Gate { return projectgatetest.AllowAll("p", "w") },
+			func(t *testing.T) *http.Request {
+				r := httptest.NewRequest(http.MethodPost, "/api/v1/projects/not-a-uuid/query", strings.NewReader(`{"sql":"SELECT 1"}`))
+				r.SetPathValue("pid", "not-a-uuid")
+				return r.WithContext(auth.WithCtxUser(r.Context(), &store.User{ID: uuid.New(), Email: "t@e.c"}))
+			},
+			http.StatusBadRequest,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				t.Error("worker must not be called for a request rejected before dispatch")
+			}))
+			defer worker.Close()
+			h := newHandler(t, Config{WorkerURL: worker.URL, Gate: tc.gate()})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, tc.req(t))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandler_PerPrincipal429WhenCapExhausted(t *testing.T) {
+	// Deterministic concurrency: the fake worker blocks on `release` once
+	// it is in-flight, signalling via `entered`. We drive the gate to its
+	// cap with blocked queries, then assert the next concurrent query from
+	// the SAME principal gets 429 rate_limited — no sleeps.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	// Wait for every in-flight request (including its deferred audit emit)
+	// before returning — otherwise the late emit fires after the NEXT test
+	// has swapped the global slog default, leaking this query's audit line
+	// into that test's captured buffer. Registered before closeRelease so
+	// (LIFO) the release runs first, even on t.Fatalf.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	// Deferred once-close so a t.Fatalf on any assertion below cannot leak
+	// the blocked worker goroutines past the test.
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer closeRelease()
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
+	}))
+	defer worker.Close()
+
+	counter := freshCounter()
+	cfg := Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w"), PerPrincipalInflight: 2}
+	h := newHandlerWithCounter(t, cfg, counter)
+	sub := uuid.New()
+
+	// Launch `cap` (2) concurrent queries; each blocks inside the worker.
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, authedRequest(t, sub, `{"sql":"SELECT 1"}`))
+		}()
+	}
+	// Wait until both are genuinely in-flight (gate holds 2 slots).
+	<-entered
+	<-entered
+
+	// Third concurrent query from the same principal: gate is full → 429.
+	buf := captureLogger(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest(t, sub, `{"sql":"SELECT 1"}`))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if k := decodeKind(rec.Body.Bytes()); k != "rate_limited" {
+		t.Fatalf("kind = %q, want rate_limited", k)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "2" {
+		t.Fatalf("Retry-After = %q, want 2", ra)
+	}
+
+	// Audit: no token is minted when the gate is full, so jti must be empty.
+	lines := auditLines(buf)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 query_audit line, got %d:\n%s", len(lines), buf.String())
+	}
+	if got := extractField(lines[0], "outcome"); got != "rate_limited" {
+		t.Errorf("outcome = %q, want rate_limited", got)
+	}
+	if jti := extractField(lines[0], "jti"); jti != "" {
+		t.Errorf("jti must be empty for rate_limited (no mint), got %q", jti)
+	}
+	if delta := counterDelta(counter, "rate_limited", 0); delta != 1 {
+		t.Errorf("counter[rate_limited] delta = %v, want 1", delta)
+	}
+
+	// A DIFFERENT principal is independent — should not be gated.
+	recOther := httptest.NewRecorder()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h.ServeHTTP(recOther, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
+	}()
+	<-entered // the other principal's query entered the worker (was admitted)
+
+	// Drain everything.
+	closeRelease()
 }
 
 func TestHandler_HappyPath_PassthroughBytes(t *testing.T) {
@@ -144,94 +383,6 @@ func TestHandler_HappyPath_PassthroughBytes(t *testing.T) {
 		if strings.Count(tok, ".") != 2 {
 			t.Fatalf("%s token is not a JWT: %q", name, tok)
 		}
-	}
-}
-
-func TestHandler_ParamsForwardedVerbatim(t *testing.T) {
-	// The proxy forwards `params` blindly (RFC 028 Q3 design decision) and
-	// relies on the worker's own ValidateParams for the bad_request gate.
-	// This test proves two things: (1) the field reaches the worker body at
-	// all, and (2) it survives the round trip as an exact integer, not a
-	// float64 that has silently lost precision — which is why the proxy's
-	// own body decoder needs its own UseNumber(), independent of the
-	// worker's.
-	var gotBody []byte
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		gotBody, err = io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read worker body: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
-	}))
-	defer worker.Close()
-
-	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
-	rec := httptest.NewRecorder()
-	const reqBody = `{"sql":"SELECT $n, $country, $active, $note","params":{"country":"DE","n":12345678901234567,"active":true,"note":null}}`
-	h.ServeHTTP(rec, authedRequest(t, uuid.New(), reqBody))
-
-	// Response passthrough is unaffected by the presence of params.
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	const wantResult = `{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`
-	if rec.Body.String() != wantResult {
-		t.Fatalf("body passthrough mismatch:\n got %q\nwant %q", rec.Body.String(), wantResult)
-	}
-
-	// Decode the bytes actually sent to the worker WITH UseNumber, so a
-	// 17-digit integer is compared exactly rather than through a float64
-	// round trip (which would silently round it).
-	dec := json.NewDecoder(bytes.NewReader(gotBody))
-	dec.UseNumber()
-	var got workerRequest
-	if err := dec.Decode(&got); err != nil {
-		t.Fatalf("decode worker body: %v", err)
-	}
-	if got.Params == nil {
-		t.Fatalf("worker body carried no params at all: %s", gotBody)
-	}
-	if n, ok := got.Params["n"].(json.Number); !ok || n.String() != "12345678901234567" {
-		t.Fatalf("params[n] = %#v, want json.Number(12345678901234567) exactly", got.Params["n"])
-	}
-	if got.Params["country"] != "DE" {
-		t.Fatalf("params[country] = %#v, want %q", got.Params["country"], "DE")
-	}
-	if got.Params["active"] != true {
-		t.Fatalf("params[active] = %#v, want true", got.Params["active"])
-	}
-	if v, ok := got.Params["note"]; !ok || v != nil {
-		t.Fatalf("params[note] = %#v, want present-and-nil", v)
-	}
-}
-
-func TestHandler_NoParams_Regression(t *testing.T) {
-	// A request with no `params` field must forward with a nil Params map
-	// (json:"params,omitempty" keeps the wire body identical to before Q3).
-	var gotBody []byte
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		gotBody, err = io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read worker body: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
-	}))
-	defer worker.Close()
-
-	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	if strings.Contains(string(gotBody), `"params"`) {
-		t.Fatalf("worker body must omit params entirely when absent: %s", gotBody)
 	}
 }
 
@@ -299,84 +450,6 @@ func TestHandler_MalformedAndEmptySQL(t *testing.T) {
 	}
 }
 
-func TestHandler_Unauthenticated(t *testing.T) {
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("worker should not be called for an unauthenticated request")
-	}))
-	defer worker.Close()
-	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
-
-	// No auth.WithCtxUser on this request → no user in ctx.
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, r)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", rec.Code)
-	}
-}
-
-func TestHandler_PerPrincipal429WhenCapExhausted(t *testing.T) {
-	// Deterministic concurrency: the fake worker blocks on `release` once
-	// it is in-flight, signalling via `entered`. We drive the gate to its
-	// cap with blocked queries, then assert the next concurrent query from
-	// the SAME principal gets 429 rate_limited — no sleeps.
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	// Deferred once-close so a t.Fatalf on any assertion below cannot leak
-	// the blocked worker goroutines past the test.
-	var releaseOnce sync.Once
-	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
-	defer closeRelease()
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		entered <- struct{}{}
-		<-release
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
-	}))
-	defer worker.Close()
-
-	cfg := Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w"), PerPrincipalInflight: 2}
-	h := newHandler(t, cfg)
-	sub := uuid.New()
-
-	// Launch `cap` (2) concurrent queries; each blocks inside the worker.
-	for i := 0; i < 2; i++ {
-		go func() {
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, authedRequest(t, sub, `{"sql":"SELECT 1"}`))
-		}()
-	}
-	// Wait until both are genuinely in-flight (gate holds 2 slots).
-	<-entered
-	<-entered
-
-	// Third concurrent query from the same principal: gate is full → 429.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, authedRequest(t, sub, `{"sql":"SELECT 1"}`))
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", rec.Code)
-	}
-	if k := decodeKind(rec.Body.Bytes()); k != "rate_limited" {
-		t.Fatalf("kind = %q, want rate_limited", k)
-	}
-	if ra := rec.Header().Get("Retry-After"); ra != "2" {
-		t.Fatalf("Retry-After = %q, want 2", ra)
-	}
-
-	// A DIFFERENT principal is independent — should not be gated.
-	recOther := httptest.NewRecorder()
-	otherDone := make(chan struct{})
-	go func() {
-		h.ServeHTTP(recOther, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
-		close(otherDone)
-	}()
-	<-entered // the other principal's query entered the worker (was admitted)
-
-	// Drain everything.
-	closeRelease()
-	<-otherDone
-}
-
 func TestHandler_TranslatesWorkerOutcomes(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -424,19 +497,6 @@ func TestHandler_TranslatesWorkerOutcomes(t *testing.T) {
 	}
 }
 
-func TestHandler_TransportErrorTo502(t *testing.T) {
-	// Worker URL points at a closed port → transport error.
-	h := newHandler(t, Config{WorkerURL: "http://127.0.0.1:1/", Gate: projectgatetest.AllowAll("p", "w")})
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", rec.Code)
-	}
-	if k := decodeKind(rec.Body.Bytes()); k != "internal" {
-		t.Fatalf("kind = %q, want internal", k)
-	}
-}
-
 func TestHandler_NeverLogsTokens(t *testing.T) {
 	// Capture slog output and assert no real JWT material leaks. We force
 	// the worker-401 path (which logs) and the transport-error path.
@@ -463,40 +523,5 @@ func TestHandler_NeverLogsTokens(t *testing.T) {
 	// SQL text must never be logged.
 	if strings.Contains(logs, "SECRET SQL 12345") {
 		t.Fatalf("logs leaked SQL text: %s", logs)
-	}
-}
-
-func TestHandler_GateForbidden(t *testing.T) {
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("worker must not be called when the gate denies")
-	}))
-	defer worker.Close()
-	g := projectgatetest.AllowAll("p", "w")
-	g.Authorizer = projectgatetest.FakeAuthorizer{Allow: false}
-	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: g})
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, authedRequest(t, uuid.New(), `{"sql":"SELECT 1"}`))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHandler_GateInvalidPID(t *testing.T) {
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
-	defer worker.Close()
-	h := newHandler(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")})
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/projects/not-a-uuid/query", strings.NewReader(`{"sql":"SELECT 1"}`))
-	r.SetPathValue("pid", "not-a-uuid")
-	r = r.WithContext(auth.WithCtxUser(r.Context(), &store.User{ID: uuid.New(), Email: "t@e.c"}))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, r)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-}
-
-func TestHandler_RequiresGate(t *testing.T) {
-	if _, err := Handler(Config{WorkerURL: "http://worker"}, testSigner(t)); err == nil {
-		t.Fatal("expected error when Gate is nil")
 	}
 }

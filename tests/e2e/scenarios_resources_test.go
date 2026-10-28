@@ -1,35 +1,22 @@
-// Package e2e — RFC 026 P3 Task T10: resource contract (default / clamp /
-// diff-gate) end-to-end coverage, plus the one-time platform-superadmin
-// bootstrap grant the API-mode scenarios depend on.
+// Package e2e — RFC 026 P3 Task T10: resource contract (default / diff-gate)
+// end-to-end coverage, plus the one-time platform-superadmin bootstrap grant
+// the API-mode scenarios depend on.
 //
 // The resource contract has two enforcement layers (RFC 026 §4.4, §4.6):
 //
-//   - Layer 1 (pipeline-api PUT policy): a pipeline whose component sets a
-//     resources block OVER the registry max is rejected pre-flight — 400 for a
-//     superadmin (TestResources_ClampedAtAdmission), 403 for a non-superadmin
-//     via the modification gate that wins over the over-max 400 by T6
-//     precedence (TestResources_OverMaxModificationRejected).
-//     TestResources_SuperadminPutSucceeds asserts the granted superadmin can
-//     PUT a within-max resources block where the non-superadmin is blocked.
+//   - Layer 1 (pipeline-api PUT policy): TestResources_PutGate drives
+//     pipeline-api's PUT as two identities — a non-superadmin is 403'd by the
+//     modification gate for ANY resources block (it wins over the over-max
+//     400 by T6 precedence); a superadmin is 400'd for an over-max block and
+//     accepted (204) for a within-max block.
 //
 //   - Layer 2 (controller admission): the registry resources.default lands on a
-//     component that sets none (TestResources_RegistryDefaultsApplied,
-//     reachable via the HTTP run path because a no-resources doc has nothing to
-//     reject). The controller's OVER-MAX CLAMP is the direct-kubectl defence-in-
-//     depth (validate.Policy is nil on that path — policy.go); it is unreachable
-//     from the HTTP surface this harness now drives (RFC 027 E2/E5), exactly as
-//     TestSecretsLadder's kubectl-admission "missing key" case was, and is
-//     covered by the controller's own unit tests (pkg/k8s/controllers/
-//     resource_clamp*_test.go). TestResources_ClampedAtAdmission therefore
-//     asserts the Layer-1 over-max PUT rejection — the only over-max behaviour
-//     the API path can exhibit — rather than a clamp-and-proceed run.
-//
-// These don't fit the declarative Scenario{}/Assertion{} shape in
-// scenarios_test.go: RegistryDefaultsApplied inspects Job container resources /
-// status.resolvedSpec directly, and the PUT-path tests drive pipeline-api's
-// HTTP PUT as distinct identities. They mirror TestRegistry_*
-// (scenarios_registry_test.go) and TestSecretsLadder
-// (scenarios_secrets_test.go) respectively.
+//     component that sets none — asserted by TestRegistry_UnpinnedResolvesStable
+//     (scenarios_registry_test.go), whose fixture sets no resources block. The
+//     controller's OVER-MAX CLAMP is the direct-kubectl defence-in-depth
+//     (validate.Policy is nil on that path — policy.go); it is unreachable from
+//     the HTTP surface this harness drives (RFC 027 E2/E5) and is covered by the
+//     controller's own unit tests (pkg/k8s/controllers/resource_clamp*_test.go).
 package e2e
 
 import (
@@ -103,95 +90,6 @@ func grantAdminSuperadmin() error {
 	return nil
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// (a) Registry defaults applied — kubectl path, component sets no resources.
-// ──────────────────────────────────────────────────────────────────────────
-
-func TestResources_RegistryDefaultsApplied(t *testing.T) {
-	h := registrySkipUnlessReady(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	kb, err := framework.NewK8sBackend(h, runPrefix)
-	if err != nil {
-		t.Fatalf("init K8s backend: %v", err)
-	}
-	defer kb.Cleanup(context.Background())
-	ns := kb.Namespace
-
-	rendered := renderRegistryFixture(t, "resource-default.yaml")
-
-	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
-	if err != nil {
-		t.Fatalf("run pipeline: %v", err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got failureType=%q message=%q logs=%s",
-			result.FailureType, result.StatusMessage, result.Logs)
-	}
-
-	prName := pipelineRunNameForRun(t, ns, result.RunID, 30*time.Second)
-	jobName := waitForComponentJob(t, ns, result.RunID, "gen", 60*time.Second)
-
-	// The built Job container carries the registry resources.default verbatim.
-	assertJobResource(t, ns, jobName, "limits", "cpu", framework.DataGeneratorDefaultLimCPU)
-	assertJobResource(t, ns, jobName, "limits", "memory", framework.DataGeneratorDefaultLimMemory)
-	assertJobResource(t, ns, jobName, "requests", "cpu", framework.DataGeneratorDefaultReqCPU)
-	assertJobResource(t, ns, jobName, "requests", "memory", framework.DataGeneratorDefaultReqMemory)
-
-	// The same default is frozen into status.resolvedSpec (admission snapshot).
-	assertResolvedResource(t, ns, prName, "limits", "cpu", framework.DataGeneratorDefaultLimCPU)
-	assertResolvedResource(t, ns, prName, "requests", "memory", framework.DataGeneratorDefaultReqMemory)
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// (c) Over-max resources → rejected pre-flight at PUT (Layer 1).
-//
-// resource-clamp.yaml sets a component resources block over the registry max
-// (cpu 4 > max 2, memory 1Gi > max 512Mi). Pre-RFC-027 the harness kubectl-
-// applied the CR and the controller CLAMPED it to max and proceeded (Layer 2).
-// The migrated harness drives pipeline-api, whose PUT policy rejects over-max
-// with a 400 naming every offending resources path ("exceeds registry max") —
-// before any run is created. RunPipeline surfaces the 400 as an error. The
-// clamp-and-proceed path is now the kubectl-only defence-in-depth, unit-covered
-// by pkg/k8s/controllers/resource_clamp*_test.go (see the file docstring).
-// ──────────────────────────────────────────────────────────────────────────
-
-func TestResources_ClampedAtAdmission(t *testing.T) {
-	h := registrySkipUnlessReady(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	kb, err := framework.NewK8sBackend(h, runPrefix)
-	if err != nil {
-		t.Fatalf("init K8s backend: %v", err)
-	}
-	defer kb.Cleanup(context.Background())
-
-	rendered := renderRegistryFixture(t, "resource-clamp.yaml")
-
-	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
-	if err == nil {
-		t.Fatalf("expected PUT pre-flight rejection for an over-max resources block, got success=%v", result != nil && result.Success)
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "status=400") {
-		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
-	}
-	if !strings.Contains(msg, "exceeds registry max") {
-		t.Errorf("rejection does not describe the over-max violation: %v", err)
-	}
-	// Both offending limits are named (cpu 4 > 2 and memory 1Gi > 512Mi).
-	if !strings.Contains(msg, "resources.limits.cpu") {
-		t.Errorf("rejection does not name the over-max cpu limit: %v", err)
-	}
-	if !strings.Contains(msg, "resources.limits.memory") {
-		t.Errorf("rejection does not name the over-max memory limit: %v", err)
-	}
-}
-
 // assertJobResource asserts the "component" container's resources.<kind>.<name>
 // on Job jobName equals want (kind ∈ {limits, requests}; name ∈ {cpu, memory}).
 func assertJobResource(t *testing.T, ns, jobName, kind, name, want string) {
@@ -221,7 +119,7 @@ func assertResolvedResource(t *testing.T, ns, prName, kind, name, want string) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// (b) + (d) API PUT diff-gate — non-superadmin blocked, superadmin allowed.
+// API PUT diff-gate — non-superadmin blocked, superadmin allowed.
 // ──────────────────────────────────────────────────────────────────────────
 
 const (
@@ -363,66 +261,85 @@ func ensureResourcesAPIFixture(t *testing.T) (projectID, adminSession, nonadminS
 	return resourcesAPIProjectID, getAdminSession(t), resourcesAPINonadminSession
 }
 
-// (b) A non-superadmin PUT that sets a component resources block above the
-// registry max is 403'd by the modification gate — NOT 400'd for over-max
-// (T6 precedence: the diff-gate runs before the over-max findings). The 403
-// body points the caller at superadmin.
-func TestResources_OverMaxModificationRejected(t *testing.T) {
+// TestResources_PutGate covers both halves of the T6 resources gate on PUT
+// /pipelines:
+//
+//   - nonadmin: any component resources block is a modification → 403 whose
+//     body points at superadmin. For the over-max doc this proves the
+//     modification gate beats the over-max 400 (T6 precedence: the diff-gate
+//     runs before the over-max findings); for the within-max doc it proves the
+//     gate is modification-based, not over-max-based.
+//   - superadmin over-max: bypasses the modification gate but is rejected
+//     pre-flight with a 400 naming every offending limit ("exceeds registry
+//     max"; cpu 4 > 2 and memory 1Gi > 512Mi).
+//   - superadmin within-max: accepted — 204, or 200 if the save carries
+//     non-blocking warnings.
+func TestResources_PutGate(t *testing.T) {
 	projectID, adminSession, nonadmin := ensureResourcesAPIFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	t.Cleanup(func() {
-		// The 403 stores nothing, but clean up defensively in case a prior run
-		// left the pipeline behind. Admin holds project_admin (data_admin).
+		// Rejected PUTs store nothing, but clean up defensively in case a prior
+		// run left a pipeline behind. Admin holds project_admin (data_admin).
 		_, _, _ = deletePipelineHTTP(context.Background(), adminSession, projectID, resourcesOverMaxName)
-	})
-
-	status, body, err := putPipelineHTTP(ctx, nonadmin, projectID, resourcesOverMaxName, []byte(resourcesOverMaxPipelineYAML))
-	if err != nil {
-		t.Fatalf("PUT /pipelines (nonadmin, over-max resources): %v", err)
-	}
-	if status != http.StatusForbidden {
-		t.Fatalf("PUT /pipelines (nonadmin, over-max resources): status=%d, want 403 (modification gate beats over-max 400); body=%s",
-			status, body)
-	}
-	if !strings.Contains(strings.ToLower(string(body)), "superadmin") {
-		t.Errorf("403 body does not mention superadmin: %s", body)
-	}
-}
-
-// (d) The granted superadmin can PUT a within-max resources block where the
-// non-superadmin is blocked. Covers both halves of the T6 gate.
-func TestResources_SuperadminPutSucceeds(t *testing.T) {
-	projectID, adminSession, nonadmin := ensureResourcesAPIFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	t.Cleanup(func() {
 		_, _, _ = deletePipelineHTTP(context.Background(), adminSession, projectID, resourcesWithinMaxName)
 	})
 
-	// Non-superadmin: even a within-max block is a modification → 403 +
-	// superadmin (the diff-gate is modification-based, not over-max-based).
-	status, body, err := putPipelineHTTP(ctx, nonadmin, projectID, resourcesWithinMaxName, []byte(resourcesWithinMaxPipelineYAML))
-	if err != nil {
-		t.Fatalf("PUT /pipelines (nonadmin, within-max resources): %v", err)
-	}
-	if status != http.StatusForbidden {
-		t.Fatalf("PUT /pipelines (nonadmin, within-max resources): status=%d, want 403 (modification gate); body=%s",
-			status, body)
-	}
-	if !strings.Contains(strings.ToLower(string(body)), "superadmin") {
-		t.Errorf("nonadmin 403 body does not mention superadmin: %s", body)
-	}
+	t.Run("nonadmin-403", func(t *testing.T) {
+		for _, tc := range []struct {
+			label, name, yaml string
+		}{
+			{"over-max resources", resourcesOverMaxName, resourcesOverMaxPipelineYAML},
+			{"within-max resources", resourcesWithinMaxName, resourcesWithinMaxPipelineYAML},
+		} {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			status, body, err := putPipelineHTTP(ctx, nonadmin, projectID, tc.name, []byte(tc.yaml))
+			cancel()
+			if err != nil {
+				t.Errorf("PUT /pipelines (nonadmin, %s): %v", tc.label, err)
+				continue
+			}
+			if status != http.StatusForbidden {
+				t.Errorf("PUT /pipelines (nonadmin, %s): status=%d, want 403 (modification gate); body=%s",
+					tc.label, status, body)
+				continue
+			}
+			if !strings.Contains(strings.ToLower(string(body)), "superadmin") {
+				t.Errorf("nonadmin 403 body (%s) does not mention superadmin: %s", tc.label, body)
+			}
+		}
+	})
 
-	// Superadmin: the same within-max block is accepted (bypasses the
-	// modification gate; within max so no over-max 400). 204, or 200 if the
-	// save carries non-blocking warnings.
-	status, body, err = putPipelineHTTP(ctx, adminSession, projectID, resourcesWithinMaxName, []byte(resourcesWithinMaxPipelineYAML))
-	if err != nil {
-		t.Fatalf("PUT /pipelines (superadmin, within-max resources): %v", err)
-	}
-	if status != http.StatusNoContent && status != http.StatusOK {
-		t.Fatalf("PUT /pipelines (superadmin, within-max resources): status=%d, want 204 or 200; body=%s",
-			status, body)
-	}
+	t.Run("superadmin-over-max-400", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		status, body, err := putPipelineHTTP(ctx, adminSession, projectID, resourcesOverMaxName, []byte(resourcesOverMaxPipelineYAML))
+		if err != nil {
+			t.Fatalf("PUT /pipelines (superadmin, over-max resources): %v", err)
+		}
+		if status != http.StatusBadRequest {
+			t.Fatalf("PUT /pipelines (superadmin, over-max resources): status=%d, want 400; body=%s", status, body)
+		}
+		msg := string(body)
+		if !strings.Contains(msg, "exceeds registry max") {
+			t.Errorf("rejection does not describe the over-max violation: %s", msg)
+		}
+		if !strings.Contains(msg, "resources.limits.cpu") {
+			t.Errorf("rejection does not name the over-max cpu limit: %s", msg)
+		}
+		if !strings.Contains(msg, "resources.limits.memory") {
+			t.Errorf("rejection does not name the over-max memory limit: %s", msg)
+		}
+	})
+
+	t.Run("superadmin-within-max-204", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		status, body, err := putPipelineHTTP(ctx, adminSession, projectID, resourcesWithinMaxName, []byte(resourcesWithinMaxPipelineYAML))
+		if err != nil {
+			t.Fatalf("PUT /pipelines (superadmin, within-max resources): %v", err)
+		}
+		if status != http.StatusNoContent && status != http.StatusOK {
+			t.Fatalf("PUT /pipelines (superadmin, within-max resources): status=%d, want 204 or 200; body=%s",
+				status, body)
+		}
+	})
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -169,63 +168,11 @@ func newComponentsFakeServer(t *testing.T, listBody, detailBody string, detailSt
 	return httptest.NewServer(mux)
 }
 
-func TestFetchComponentsListDecodesSummaryShape(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
-	defer srv.Close()
-
-	body, items, err := fetchComponentsList(context.Background(), srv.URL, "tok")
-	if err != nil {
-		t.Fatalf("fetchComponentsList: %v", err)
-	}
-	if len(items) != 2 {
-		t.Fatalf("len(items) = %d, want 2", len(items))
-	}
-	if items[0].Name != "data-generator" || items[0].IO.Outputs != "required" {
-		t.Errorf("items[0] = %+v, unexpected", items[0])
-	}
-	if items[1].Deprecated != true {
-		t.Errorf("items[1].Deprecated = %v, want true", items[1].Deprecated)
-	}
-	var raw []map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
-		t.Fatalf("raw body is not the passthrough JSON array: %v", err)
-	}
-}
-
-func TestFetchComponentDetailDecodesConfigSchema(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
-	defer srv.Close()
-
-	_, detail, err := fetchComponentDetail(context.Background(), srv.URL, "tok", "data-generator")
-	if err != nil {
-		t.Fatalf("fetchComponentDetail: %v", err)
-	}
-	if len(detail.Versions) != 2 {
-		t.Fatalf("len(Versions) = %d, want 2", len(detail.Versions))
-	}
-	if detail.Versions[1].ConfigSchema != `{"type":"object","v":1}` {
-		t.Errorf("ConfigSchema = %q, unexpected", detail.Versions[1].ConfigSchema)
-	}
-}
-
-func TestFetchComponentDetailNotFound(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, `{"error":"not found"}`, http.StatusNotFound)
-	defer srv.Close()
-
-	_, _, err := fetchComponentDetail(context.Background(), srv.URL, "tok", "nope")
-	if err == nil {
-		t.Fatal("expected error for 404, got nil")
-	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("error should mention 'not found': %v", err)
-	}
-}
-
 // --- CLI-layer: stdout rendering, via env-var headless auth ---
 
 // setHeadlessEnv points loadRemoteArgs at remote via the RFC 027 §7
 // headless env vars, bypassing ~/.datuplet entirely (mirrors
-// TestLoadRemoteArgs_HeadlessNoDatupletFileRead in remote_test.go).
+// TestLoadRemoteArgs_HeadlessFastPath in remote_test.go).
 func setHeadlessEnv(t *testing.T, remote string) {
 	t.Helper()
 	t.Setenv("HOME", "/nonexistent-for-test")
@@ -276,95 +223,91 @@ func TestRunComponentsListTableColumns(t *testing.T) {
 	}
 }
 
-func TestRunComponentsListJSONPassthrough(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+func TestRunComponents_JSONPassthrough(t *testing.T) {
+	tests := []struct {
+		name  string
+		run   func() error
+		check func(t *testing.T, out string)
+	}{
+		{
+			name: "list",
+			run:  func() error { return runComponentsList([]string{"--json"}) },
+			check: func(t *testing.T, out string) {
+				var items []componentSummaryJSON
+				if err := json.Unmarshal([]byte(out), &items); err != nil {
+					t.Fatalf("--json output is not valid JSON: %v\noutput: %s", err, out)
+				}
+				if len(items) != 2 {
+					t.Fatalf("len(items) = %d, want 2", len(items))
+				}
+			},
+		},
+		{
+			name: "get",
+			run:  func() error { return runComponentsGet([]string{"data-generator", "--json"}) },
+			check: func(t *testing.T, out string) {
+				var detail componentDetailJSON
+				if err := json.Unmarshal([]byte(out), &detail); err != nil {
+					t.Fatalf("--json output is not valid JSON: %v", err)
+				}
+				if detail.Name != "data-generator" {
+					t.Errorf("Name = %q, want data-generator", detail.Name)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
 
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runComponentsList([]string{"--json"})
-	})
-	if runErr != nil {
-		t.Fatalf("runComponentsList --json: %v", runErr)
-	}
-	var items []componentSummaryJSON
-	if err := json.Unmarshal([]byte(out), &items); err != nil {
-		t.Fatalf("--json output is not valid JSON: %v\noutput: %s", err, out)
-	}
-	if len(items) != 2 {
-		t.Fatalf("len(items) = %d, want 2", len(items))
+			var runErr error
+			out := captureStdout(t, func() { runErr = tc.run() })
+			if runErr != nil {
+				t.Fatalf("run --json: %v", runErr)
+			}
+			tc.check(t, out)
+		})
 	}
 }
 
-// TestRunComponentsGetSchemaOutputVerbatim pins the exact --schema
-// contract: the resolved version's configSchema bytes, verbatim, plus a
-// single trailing newline — nothing else (no headers, no extra text).
-func TestRunComponentsGetSchemaOutputVerbatim(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runComponentsGet([]string{"data-generator", "--schema"})
-	})
-	if runErr != nil {
-		t.Fatalf("runComponentsGet --schema: %v", runErr)
+// TestRunComponentsGetSchema pins the exact --schema contract: the resolved
+// version's configSchema bytes, verbatim, plus a single trailing newline —
+// nothing else (no headers, no extra text).
+func TestRunComponentsGetSchema(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		want    string
+		wantErr bool
+	}{
+		// defaultVersion v1.0.0's schema
+		{"default version verbatim", []string{"data-generator", "--schema"}, `{"type":"object","v":1}` + "\n", false},
+		{"explicit version", []string{"data-generator", "--version", "v0.9.0", "--schema"}, `{"type":"object"}` + "\n", false},
+		{"unknown version errors", []string{"data-generator", "--version", "v9.9.9", "--schema"}, "", true},
 	}
-	want := `{"type":"object","v":1}` + "\n" // defaultVersion v1.0.0's schema
-	if out != want {
-		t.Errorf("stdout = %q, want %q", out, want)
-	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
 
-func TestRunComponentsGetSchemaWithExplicitVersion(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runComponentsGet([]string{"data-generator", "--version", "v0.9.0", "--schema"})
-	})
-	if runErr != nil {
-		t.Fatalf("runComponentsGet --version --schema: %v", runErr)
-	}
-	want := `{"type":"object"}` + "\n"
-	if out != want {
-		t.Errorf("stdout = %q, want %q", out, want)
-	}
-}
-
-func TestRunComponentsGetSchemaUnknownVersionErrors(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runComponentsGet([]string{"data-generator", "--version", "v9.9.9", "--schema"})
-	if err == nil {
-		t.Fatal("expected error for unknown --version, got nil")
-	}
-}
-
-func TestRunComponentsGetJSONPassthrough(t *testing.T) {
-	srv := newComponentsFakeServer(t, componentsListFixture, componentDetailFixture, http.StatusOK)
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runComponentsGet([]string{"data-generator", "--json"})
-	})
-	if runErr != nil {
-		t.Fatalf("runComponentsGet --json: %v", runErr)
-	}
-	var detail componentDetailJSON
-	if err := json.Unmarshal([]byte(out), &detail); err != nil {
-		t.Fatalf("--json output is not valid JSON: %v", err)
-	}
-	if detail.Name != "data-generator" {
-		t.Errorf("Name = %q, want data-generator", detail.Name)
+			var runErr error
+			out := captureStdout(t, func() { runErr = runComponentsGet(tc.args) })
+			if tc.wantErr {
+				if runErr == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if runErr != nil {
+				t.Fatalf("runComponentsGet: %v", runErr)
+			}
+			if out != tc.want {
+				t.Errorf("stdout = %q, want %q", out, tc.want)
+			}
+		})
 	}
 }
 
@@ -382,17 +325,20 @@ func TestRunComponentsGetNotFound(t *testing.T) {
 	}
 }
 
-func TestRunComponentsGetJSONAndSchemaMutuallyExclusive(t *testing.T) {
-	err := runComponentsGet([]string{"data-generator", "--json", "--schema"})
-	if err == nil {
-		t.Fatal("expected error when both --json and --schema are set")
+func TestRunComponents_InvalidFlagCombosRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{"get --json and --schema are mutually exclusive", func() error { return runComponentsGet([]string{"data-generator", "--json", "--schema"}) }},
+		{"list does not support --schema", func() error { return runComponentsList([]string{"--schema"}) }},
 	}
-}
-
-func TestRunComponentsListRejectsSchema(t *testing.T) {
-	err := runComponentsList([]string{"--schema"})
-	if err == nil {
-		t.Fatal("expected error: list does not support --schema")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+		})
 	}
 }
 

@@ -5,25 +5,6 @@ import (
 	"testing"
 )
 
-func TestTypedConstructors_StringForm(t *testing.T) {
-	tests := []struct {
-		name string
-		obj  Object
-		want string
-	}{
-		{"ProjectObject", ProjectObject("abc-123"), "project:abc-123"},
-		{"NamespaceObject_simple", NamespaceObject("raw"), "namespace:raw"},
-		{"NamespaceObject_workspace", NamespaceObject("__workspace.abc123"), "namespace:__workspace.abc123"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.obj.String(); got != tc.want {
-				t.Errorf("String() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestNamespaceObject confirms the constructor preserves the namespace
 // name verbatim (no normalization — lakekeeper does not prefix namespace
 // IDs the way it does OIDC subjects).
@@ -106,22 +87,19 @@ func TestObject_TypeNotUserControllable(t *testing.T) {
 // TestObjectType_Constants ensures the type-name strings match lakekeeper's
 // shipped collaboration-4.3 model verbatim (no lakekeeper_ prefix).
 func TestObjectType_Constants(t *testing.T) {
-	if TypeProject != "project" {
-		t.Errorf("TypeProject = %q, want %q", TypeProject, "project")
+	cases := []struct{ name, got, want string }{
+		{"project", string(TypeProject), "project"},
+		{"warehouse", string(TypeWarehouse), "warehouse"},
+		{"namespace", string(TypeNamespace), "namespace"},
+		{"table", string(TypeTable), "table"},
+		{"view", string(TypeView), "view"},
+		{"user", string(TypeUser), "user"},
 	}
-	if TypeWarehouse != "warehouse" {
-		t.Errorf("TypeWarehouse = %q, want %q", TypeWarehouse, "warehouse")
-	}
-	if TypeNamespace != "namespace" {
-		t.Errorf("TypeNamespace = %q, want %q", TypeNamespace, "namespace")
-	}
-	if TypeTable != "table" {
-		t.Errorf("TypeTable = %q, want %q", TypeTable, "table")
-	}
-	if TypeView != "view" {
-		t.Errorf("TypeView = %q, want %q", TypeView, "view")
-	}
-	if TypeUser != "user" {
-		t.Errorf("TypeUser = %q, want %q", TypeUser, "user")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("Type%s = %q, want %q", tc.name, tc.got, tc.want)
+			}
+		})
 	}
 }

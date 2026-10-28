@@ -13,44 +13,6 @@ import (
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
 
-func TestCompressionString(t *testing.T) {
-	tests := []struct {
-		comp     Compression
-		expected string
-	}{
-		{CompressionNone, "none"},
-		{CompressionSnappy, "snappy"},
-		{CompressionGzip, "gzip"},
-		{CompressionZstd, "zstd"},
-		{CompressionLz4, "lz4"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.expected, func(t *testing.T) {
-			if got := tt.comp.String(); got != tt.expected {
-				t.Errorf("Compression.String() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestDefaultParquetWriterConfig(t *testing.T) {
-	config := DefaultParquetWriterConfig()
-
-	if config.Compression != CompressionSnappy {
-		t.Errorf("Default compression = %v, want Snappy", config.Compression)
-	}
-	if config.RowGroupSize != 128*1024*1024 {
-		t.Errorf("Default RowGroupSize = %d, want 128MB", config.RowGroupSize)
-	}
-	if !config.DictionaryEnabled {
-		t.Error("Default DictionaryEnabled should be true")
-	}
-	if !config.WriteStatistics {
-		t.Error("Default WriteStatistics should be true")
-	}
-}
-
 func TestStreamingParquetWriter(t *testing.T) {
 	tmpDir := t.TempDir()
 

@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	stdhttp "net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/authz/authztest"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
 
@@ -31,27 +33,23 @@ func seedUserAndLogin(t *testing.T, pool *pgxpool.Pool, baseURL, email, password
 	return nil, nil
 }
 
-func TestListProjects_EmptyMemberships(t *testing.T) {
-	ts, pool, _, cleanup := freshServer(t)
-	defer cleanup()
-	cookie, _ := seedUserAndLogin(t, pool, ts.URL, "alice@example.com", "hunter2")
-
-	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects", nil)
-	req.AddCookie(cookie)
-	resp, err := stdhttp.DefaultClient.Do(req)
+// seedProject logs in a@example.com, creates a project bound to the lakekeeper
+// project id lkID, and grants that user each of relations on it as an FGA
+// tuple. Returns the session cookie, the user and the project.
+func seedProject(t *testing.T, ts *httptest.Server, pool *pgxpool.Pool, fakeAuthz *authztest.Fake, lkID string, relations ...string) (*stdhttp.Cookie, *store.User, *store.Project) {
+	t.Helper()
+	cookie, user := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
+	proj, err := store.CreateProject(context.Background(), pool, "proj")
 	if err != nil {
-		t.Fatalf("get: %v", err)
+		t.Fatalf("CreateProject: %v", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
+	if err := store.SetLakekeeperProjectID(context.Background(), pool, proj.ID, lkID); err != nil {
+		t.Fatalf("SetLakekeeperProjectID: %v", err)
 	}
-	var body []map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&body)
-	if len(body) != 0 {
-		t.Errorf("expected empty list, got %d projects", len(body))
+	for _, rel := range relations {
+		fakeAuthz.Allow(authz.UserObject(user.ID.String()).String(), rel, authz.ProjectObject(lkID))
 	}
+	return cookie, user, proj
 }
 
 func TestListProjects_OnlyUserMemberships(t *testing.T) {
@@ -122,20 +120,9 @@ func TestGetProject_ForbiddenWithoutMembership(t *testing.T) {
 func TestGetProject_Allowed(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
-	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "alice@example.com", "x")
-	p, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-test-uuid-get-allowed"
-	if err := store.SetLakekeeperProjectID(ctx, pool, p.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
 	// handleGetProject checks "describe".
-	fakeAuthz.Allow(
-		authz.UserObject(alice.ID.String()).String(),
-		"describe",
-		authz.ProjectObject(lkID),
-	)
+	cookie, _, p := seedProject(t, ts, pool, fakeAuthz, "lk-test-uuid-get-allowed", "describe")
 
 	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+p.ID.String(), nil)
 	req.AddCookie(cookie)

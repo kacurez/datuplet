@@ -61,89 +61,53 @@ func (f *fakeMinioRemove) RemoveObjects(_ context.Context, _ string, objectsCh <
 	return errCh
 }
 
-// TestMinIOBackend_RemoveAll_PaginatesAndDeletes verifies that when
-// ListObjects returns more than batchSize objects, RemoveAll issues
-// multiple RemoveObjects calls (one per batch) with the correct keys.
-func TestMinIOBackend_RemoveAll_PaginatesAndDeletes(t *testing.T) {
+// TestMinIOBackend_RemoveAll_Batches verifies how removeAllObjects batches
+// deletes (batchSize = 1000): no objects means no RemoveObjects call and no
+// error; fewer than batchSize is one batch; batchSize+1 is one full batch plus
+// a remainder. Keys must be passed through in order.
+func TestMinIOBackend_RemoveAll_Batches(t *testing.T) {
 	t.Parallel()
 
-	// Build a list of 3 objects across 2 batches (batchSize = 1000 in prod,
-	// but we exercise the logic by having 3 objects and expecting a single
-	// flush + final flush — both happen in the same pass).
-	objects := []minio.ObjectInfo{
-		{Key: "ws/data/a.parquet"},
-		{Key: "ws/data/b.parquet"},
-		{Key: "ws/data/c.parquet"},
+	tests := []struct {
+		name        string
+		objects     int
+		wantBatches []int
+	}{
+		{"no objects, no RemoveObjects call", 0, nil},
+		{"3 objects fit in one batch", 3, []int{3}},
+		{"batchSize+1 objects: full batch plus remainder", 1001, []int{1000, 1}},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	fake := &fakeMinioRemove{objects: objects}
-	ctx := context.Background()
+			var wantKeys []string
+			objects := make([]minio.ObjectInfo, tc.objects)
+			for i := range objects {
+				objects[i] = minio.ObjectInfo{Key: fmt.Sprintf("ws/data/file%04d.parquet", i)}
+				wantKeys = append(wantKeys, objects[i].Key)
+			}
 
-	if err := removeAllObjects(ctx, fake, "mybucket", "ws/data"); err != nil {
-		t.Fatalf("removeAllObjects returned unexpected error: %v", err)
-	}
+			fake := &fakeMinioRemove{objects: objects}
+			if err := removeAllObjects(context.Background(), fake, "mybucket", "ws/data"); err != nil {
+				t.Fatalf("removeAllObjects returned unexpected error: %v", err)
+			}
 
-	// All 3 objects in one batch (< batchSize = 1000).
-	if len(fake.removedBatches) != 1 {
-		t.Fatalf("expected 1 RemoveObjects call, got %d", len(fake.removedBatches))
-	}
-
-	batch := fake.removedBatches[0]
-	if len(batch) != 3 {
-		t.Fatalf("expected 3 keys in batch, got %d", len(batch))
-	}
-
-	wantKeys := []string{"ws/data/a.parquet", "ws/data/b.parquet", "ws/data/c.parquet"}
-	for i, k := range wantKeys {
-		if batch[i] != k {
-			t.Errorf("batch[%d] = %q, want %q", i, batch[i], k)
-		}
-	}
-}
-
-// TestMinIOBackend_RemoveAll_TwoBatches verifies that exactly batchSize+1
-// objects results in two RemoveObjects calls (one full batch + one remainder).
-func TestMinIOBackend_RemoveAll_TwoBatches(t *testing.T) {
-	t.Parallel()
-
-	// Build batchSize+1 objects.
-	const batchSize = 1000
-	objects := make([]minio.ObjectInfo, batchSize+1)
-	for i := range objects {
-		objects[i] = minio.ObjectInfo{Key: fmt.Sprintf("ws/file%04d.parquet", i)}
-	}
-
-	fake := &fakeMinioRemove{objects: objects}
-	ctx := context.Background()
-
-	if err := removeAllObjects(ctx, fake, "mybucket", "ws"); err != nil {
-		t.Fatalf("removeAllObjects returned unexpected error: %v", err)
-	}
-
-	if len(fake.removedBatches) != 2 {
-		t.Fatalf("expected 2 RemoveObjects calls for %d objects, got %d", batchSize+1, len(fake.removedBatches))
-	}
-	if len(fake.removedBatches[0]) != batchSize {
-		t.Errorf("first batch: got %d keys, want %d", len(fake.removedBatches[0]), batchSize)
-	}
-	if len(fake.removedBatches[1]) != 1 {
-		t.Errorf("second batch: got %d keys, want 1", len(fake.removedBatches[1]))
-	}
-}
-
-// TestMinIOBackend_RemoveAll_NoObjects_NoError verifies that when ListObjects
-// returns an empty list, no RemoveObjects call is made and no error is returned.
-func TestMinIOBackend_RemoveAll_NoObjects_NoError(t *testing.T) {
-	t.Parallel()
-
-	fake := &fakeMinioRemove{objects: nil}
-	ctx := context.Background()
-
-	if err := removeAllObjects(ctx, fake, "mybucket", "nonexistent/prefix"); err != nil {
-		t.Errorf("removeAllObjects on empty list returned error: %v", err)
-	}
-
-	if len(fake.removedBatches) != 0 {
-		t.Errorf("expected 0 RemoveObjects calls, got %d", len(fake.removedBatches))
+			if len(fake.removedBatches) != len(tc.wantBatches) {
+				t.Fatalf("expected %d RemoveObjects calls, got %d", len(tc.wantBatches), len(fake.removedBatches))
+			}
+			var gotKeys []string
+			for i, batch := range fake.removedBatches {
+				if len(batch) != tc.wantBatches[i] {
+					t.Errorf("batch %d: got %d keys, want %d", i, len(batch), tc.wantBatches[i])
+				}
+				gotKeys = append(gotKeys, batch...)
+			}
+			for i, k := range wantKeys {
+				if i >= len(gotKeys) || gotKeys[i] != k {
+					t.Fatalf("key %d mismatch: got %v", i, gotKeys)
+				}
+			}
+		})
 	}
 }

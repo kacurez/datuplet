@@ -15,7 +15,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
@@ -184,70 +183,42 @@ func TestHandleCLIToken_Success(t *testing.T) {
 	if body.ExpiresAt == "" {
 		t.Error("expires_at is empty")
 	}
-
-	// Pin the JWT claim shape for the integration check between the HTTP
-	// handler and MintLocalCLIToken.
-	parser := jwt.NewParser()
-	parsed, _, err := parser.ParseUnverified(body.Token, jwt.MapClaims{})
-	if err != nil {
-		t.Fatalf("parse JWT: %v", err)
-	}
-	claims := parsed.Claims.(jwt.MapClaims)
-	if got, _ := claims["aud"].(string); got != tokens.TableTokenAudience {
-		t.Errorf("aud = %q, want %q", got, tokens.TableTokenAudience)
-	}
-	if got, _ := claims["token_kind"].(string); got != tokens.TokenKindLocalCLI {
-		t.Errorf("token_kind = %q, want %q", got, tokens.TokenKindLocalCLI)
-	}
-	if got, _ := claims["sub"].(string); got != body.UserID {
-		t.Errorf("sub = %q, want %q (user_id)", got, body.UserID)
-	}
 }
 
 // --- credential-failure paths return uniform 401 ---
 
-func TestHandleCLIToken_WrongPassword(t *testing.T) {
-	ts, pool, cleanup := freshCLITokenServer(t, true)
-	defer cleanup()
-	seedCLIUser(t, pool, "alice@example.com", "hunter2")
-
-	resp := postCLIToken(t, ts.URL, map[string]string{
-		"email":    "alice@example.com",
-		"password": "wrong",
-	})
-	defer resp.Body.Close()
-	if resp.StatusCode != 401 {
-		t.Errorf("status = %d, want 401", resp.StatusCode)
+func TestHandleCLIToken_CredentialFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		seedUser bool
+		disable  bool
+		email    string
+		password string
+	}{
+		{name: "wrong password", seedUser: true, email: "alice@example.com", password: "wrong"},
+		{name: "unknown email", email: "ghost@example.com", password: "anything"},
+		{name: "disabled user", seedUser: true, disable: true, email: "alice@example.com", password: "hunter2"},
 	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, cleanup := freshCLITokenServer(t, true)
+			defer cleanup()
+			if tc.seedUser {
+				seedCLIUser(t, pool, "alice@example.com", "hunter2")
+			}
+			if tc.disable {
+				disableUser(t, pool, "alice@example.com")
+			}
 
-func TestHandleCLIToken_UnknownEmail(t *testing.T) {
-	ts, _, cleanup := freshCLITokenServer(t, true)
-	defer cleanup()
-
-	resp := postCLIToken(t, ts.URL, map[string]string{
-		"email":    "ghost@example.com",
-		"password": "anything",
-	})
-	defer resp.Body.Close()
-	if resp.StatusCode != 401 {
-		t.Errorf("status = %d, want 401 (uniform with wrong-password)", resp.StatusCode)
-	}
-}
-
-func TestHandleCLIToken_DisabledUser(t *testing.T) {
-	ts, pool, cleanup := freshCLITokenServer(t, true)
-	defer cleanup()
-	seedCLIUser(t, pool, "alice@example.com", "hunter2")
-	disableUser(t, pool, "alice@example.com")
-
-	resp := postCLIToken(t, ts.URL, map[string]string{
-		"email":    "alice@example.com",
-		"password": "hunter2",
-	})
-	defer resp.Body.Close()
-	if resp.StatusCode != 401 {
-		t.Errorf("status = %d, want 401 (disabled users uniform with wrong-pw)", resp.StatusCode)
+			resp := postCLIToken(t, ts.URL, map[string]string{
+				"email":    tc.email,
+				"password": tc.password,
+			})
+			defer resp.Body.Close()
+			if resp.StatusCode != 401 {
+				t.Errorf("status = %d, want 401 (uniform across wrong password, unknown email and disabled user)", resp.StatusCode)
+			}
+		})
 	}
 }
 

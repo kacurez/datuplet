@@ -521,9 +521,8 @@ function renderMap(node, path, required, init, ctx) {
 // ---------------------------------------------------------------------------
 
 // Handles nodes whose `type` is an array of allowed types (spec: in-subset),
-// e.g. pandas-transform operations[].columns is ["array","object"] (array-of-
-// strings for select/drop, object-map for rename) and operations[].value is
-// ["string","number","boolean","array"]. Strategy: a small shape picker chooses
+// e.g. a `columns` property typed ["array","object"] (array-of-strings or an
+// object-map) or a `value` property typed ["string","number","boolean","array"]. Strategy: a small shape picker chooses
 // which type is active; the matching control is rendered into a slot. The active
 // type is auto-detected from the initial value's JS type, defaulting to the
 // first listed type when empty. read() reads only the active control, so the

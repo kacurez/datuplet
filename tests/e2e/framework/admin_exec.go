@@ -176,8 +176,8 @@ func resolveDatupletProjectID(ctx context.Context, h *FGAHarness) (string, error
 }
 
 // relationForTestUser returns the FGA project relation SetupFGABootstrap seeds
-// for a TestUser UUID ("project_admin" | "editor" | "viewer"), or "" if the
-// user has no grant (dora) / is unknown. Used to thread the run's REAL
+// for a TestUser UUID ("project_admin" | "editor"), or "" if the user is
+// unknown. Used to thread the run's REAL
 // (create-user-minted / seeded-admin) UUID into the same grant.
 func relationForTestUser(id TestUserID) string {
 	for _, u := range TestUsers {

@@ -274,32 +274,6 @@ func TestSink_WriteFailureIsStickyAndDropsNoRowsSilently(t *testing.T) {
 	}
 }
 
-func TestSink_BytesShippedAgreesWithWriterReceipts(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := NewSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, typedTestSchema(), WithBatchRows(3))
-
-	for i := 0; i < 7; i++ {
-		appendTypedRow(sink.Builder(), int64(i), float64(i)*2.5, i%2 == 0, fmt.Sprintf("v%d", i))
-		if err := sink.RowDone(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-
-	var want int64
-	for _, p := range fw.payloads {
-		want += int64(len(p))
-	}
-	if want == 0 {
-		t.Fatal("test setup produced no payloads")
-	}
-	if got := sink.BytesShipped(); got != want {
-		t.Fatalf("BytesShipped() = %d, want %d (sum of fake writer's received payload lengths)", got, want)
-	}
-}
-
 // --- appended in Fix Round 1 (close writer on sticky-failure Finish) ---
 
 // TestSink_FinishClosesWriterOnStickyWriteFailure proves Finish's
@@ -395,60 +369,67 @@ func TestSink_FinishAfterOpenFailureNeverAttemptsClose(t *testing.T) {
 	}
 }
 
-func TestSink_BytesShippedZeroForZeroRows(t *testing.T) {
-	sink := NewSink(context.Background(), func() (ChunkWriter, error) { return &fakeWriter{}, nil }, typedTestSchema(), WithBatchRows(4))
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
+// TestSink_BytesShipped pins BytesShipped() as exactly the bytes successfully
+// handed to the writer: it agrees with the writer's receipts across batches
+// and the final Finish flush, is zero when no rows were written, and is not
+// advanced by a batch that fails mid-flush (the IPC payload was already
+// serialized before ChunkWriter.Write was called) while an earlier, successful
+// flush still counts.
+func TestSink_BytesShipped(t *testing.T) {
+	cases := []struct {
+		name         string
+		batchRows    int
+		rows         int
+		failWriteOn  int // fail on the Nth writer Write call (0 = never)
+		failRow      int // index of the RowDone expected to fail with *WriteError (-1 = none)
+		wantPayloads int // exact payload count when non-zero
+		wantZero     bool
+	}{
+		{name: "agrees with writer receipts", batchRows: 3, rows: 7, failRow: -1},
+		{name: "zero for zero rows", batchRows: 4, rows: 0, failRow: -1, wantZero: true},
+		// First flush succeeds, the second flush's Write fails.
+		{name: "not advanced by failed write", batchRows: 2, rows: 4, failWriteOn: 2, failRow: 3, wantPayloads: 1},
 	}
-	if got := sink.BytesShipped(); got != 0 {
-		t.Fatalf("BytesShipped() = %d, want 0 for zero rows", got)
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fw := &fakeWriter{failWriteOn: tc.failWriteOn}
+			sink := NewSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, typedTestSchema(), WithBatchRows(tc.batchRows))
 
-// TestSink_BytesShippedNotAdvancedByFailedWrite proves BytesShipped() counts
-// only bytes successfully handed off: a batch that fails mid-flush (the IPC
-// payload was already serialized before ChunkWriter.Write was called) must
-// not advance the counter, while an earlier, successful flush must.
-func TestSink_BytesShippedNotAdvancedByFailedWrite(t *testing.T) {
-	fw := &fakeWriter{failWriteOn: 2} // first flush succeeds, second flush's Write fails
-	sink := NewSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, typedTestSchema(), WithBatchRows(2))
+			for i := 0; i < tc.rows; i++ {
+				appendTypedRow(sink.Builder(), int64(i), float64(i)*2.5, i%2 == 0, fmt.Sprintf("v%d", i))
+				err := sink.RowDone()
+				if i == tc.failRow {
+					var we *WriteError
+					if !errors.As(err, &we) {
+						t.Fatalf("RowDone(%d) want WriteError, got %v", i, err)
+					}
+				} else if err != nil {
+					t.Fatalf("RowDone(%d): %v", i, err)
+				}
+			}
+			if tc.failRow < 0 {
+				if _, _, err := sink.Finish(); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-	// First batch: flush succeeds -> BytesShipped must advance to the first
-	// payload's length.
-	appendTypedRow(sink.Builder(), 0, 0, true, "x")
-	if err := sink.RowDone(); err != nil {
-		t.Fatalf("RowDone(0): %v", err)
-	}
-	appendTypedRow(sink.Builder(), 1, 1, true, "x")
-	if err := sink.RowDone(); err != nil {
-		t.Fatalf("RowDone(1): %v", err)
-	}
-	if len(fw.payloads) != 1 {
-		t.Fatalf("payloads = %d, want 1 after first successful flush", len(fw.payloads))
-	}
-	afterSuccess := sink.BytesShipped()
-	if wantAfterSuccess := int64(len(fw.payloads[0])); afterSuccess != wantAfterSuccess {
-		t.Fatalf("BytesShipped() after successful flush = %d, want %d", afterSuccess, wantAfterSuccess)
-	}
-	if afterSuccess == 0 {
-		t.Fatal("test setup produced an empty first payload")
-	}
-
-	// Second batch: flush's Write call fails -> BytesShipped must NOT advance
-	// past the successful first flush, even though the failed batch's bytes
-	// were already serialized before Write was attempted.
-	appendTypedRow(sink.Builder(), 2, 2, true, "x")
-	if err := sink.RowDone(); err != nil {
-		t.Fatalf("RowDone(2) should succeed (batch not full yet), got: %v", err)
-	}
-	appendTypedRow(sink.Builder(), 3, 3, true, "x")
-	err := sink.RowDone()
-	var we *WriteError
-	if !errors.As(err, &we) {
-		t.Fatalf("RowDone(3) want WriteError, got %v", err)
-	}
-
-	if got := sink.BytesShipped(); got != afterSuccess {
-		t.Fatalf("BytesShipped() after failed write = %d, want unchanged %d (a failed write must not advance the counter)", got, afterSuccess)
+			var want int64
+			for _, p := range fw.payloads {
+				want += int64(len(p))
+			}
+			if tc.wantZero {
+				if want != 0 {
+					t.Fatalf("test setup: writer received %d bytes for zero rows", want)
+				}
+			} else if want == 0 {
+				t.Fatal("test setup produced no payloads")
+			}
+			if tc.wantPayloads != 0 && len(fw.payloads) != tc.wantPayloads {
+				t.Fatalf("payloads = %d, want %d", len(fw.payloads), tc.wantPayloads)
+			}
+			if got := sink.BytesShipped(); got != want {
+				t.Fatalf("BytesShipped() = %d, want %d (sum of the writer's received payload lengths; a failed write must not advance it)", got, want)
+			}
+		})
 	}
 }

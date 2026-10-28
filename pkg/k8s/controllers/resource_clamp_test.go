@@ -42,13 +42,53 @@ func TestApplyDefaultsThenClamp_NilSpec_ReturnsDefault(t *testing.T) {
 	eq(t, res.Resources.Requests, corev1.ResourceCPU, "1")
 }
 
-// (2) limits.cpu 4, Max cpu 2 → clamped to 2, Note mentions cpu.
-func TestApplyDefaultsThenClamp_LimitsCPUOverMax(t *testing.T) {
-	spec := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: qty("4")}}
-	res := applyDefaultsThenClamp(spec, corev1.ResourceRequirements{}, corev1.ResourceList{corev1.ResourceCPU: qty("2")})
-	eq(t, res.Resources.Limits, corev1.ResourceCPU, "2")
-	if !strings.Contains(res.Note, "cpu") {
-		t.Errorf("Note = %q, want it to mention cpu", res.Note)
+// (2)+(4)+(6) a limit or request above Max is clamped to Max and the Note names
+// the resource: limits.cpu 4 vs Max 2; requests.memory 3Gi vs Max 2Gi (limits
+// unset); ephemeral-storage proves the clamp covers the full ResourceList.
+func TestApplyDefaultsThenClamp_OverMaxClamped(t *testing.T) {
+	cases := []struct {
+		name     string
+		spec     *corev1.ResourceRequirements
+		max      corev1.ResourceList
+		requests bool // assert on Requests rather than Limits
+		res      corev1.ResourceName
+		want     string
+	}{
+		{
+			name: "limits cpu over max",
+			spec: &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: qty("4")}},
+			max:  corev1.ResourceList{corev1.ResourceCPU: qty("2")},
+			res:  corev1.ResourceCPU,
+			want: "2",
+		},
+		{
+			name:     "requests memory clamped to max",
+			spec:     &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: qty("3Gi")}},
+			max:      corev1.ResourceList{corev1.ResourceMemory: qty("2Gi")},
+			requests: true,
+			res:      corev1.ResourceMemory,
+			want:     "2Gi",
+		},
+		{
+			name: "ephemeral storage over max",
+			spec: &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: qty("10Gi")}},
+			max:  corev1.ResourceList{corev1.ResourceEphemeralStorage: qty("5Gi")},
+			res:  corev1.ResourceEphemeralStorage,
+			want: "5Gi",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := applyDefaultsThenClamp(tc.spec, corev1.ResourceRequirements{}, tc.max)
+			list := res.Resources.Limits
+			if tc.requests {
+				list = res.Resources.Requests
+			}
+			eq(t, list, tc.res, tc.want)
+			if !strings.Contains(res.Note, string(tc.res)) {
+				t.Errorf("Note = %q, want it to mention %s", res.Note, tc.res)
+			}
+		})
 	}
 }
 
@@ -66,16 +106,6 @@ func TestApplyDefaultsThenClamp_UnlistedNameStripped(t *testing.T) {
 	eq(t, res.Resources.Limits, corev1.ResourceCPU, "1")
 	if !strings.Contains(res.Note, "dropped nvidia.com/gpu") {
 		t.Errorf("Note = %q, want it to mention 'dropped nvidia.com/gpu'", res.Note)
-	}
-}
-
-// (4) requests.memory 3Gi clamped to Max 2Gi, limits.memory unset.
-func TestApplyDefaultsThenClamp_RequestsClampedToMax(t *testing.T) {
-	spec := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: qty("3Gi")}}
-	res := applyDefaultsThenClamp(spec, corev1.ResourceRequirements{}, corev1.ResourceList{corev1.ResourceMemory: qty("2Gi")})
-	eq(t, res.Resources.Requests, corev1.ResourceMemory, "2Gi")
-	if !strings.Contains(res.Note, "memory") {
-		t.Errorf("Note = %q, want it to mention memory", res.Note)
 	}
 }
 
@@ -103,14 +133,4 @@ func TestApplyDefaultsThenClamp_WithinMax_Unchanged(t *testing.T) {
 	}
 	eq(t, res.Resources.Limits, corev1.ResourceCPU, "1")
 	eq(t, res.Resources.Requests, corev1.ResourceCPU, "1")
-}
-
-// (6) ephemeral-storage over Max → clamped (full ResourceList, extended names).
-func TestApplyDefaultsThenClamp_EphemeralStorageOverMax(t *testing.T) {
-	spec := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: qty("10Gi")}}
-	res := applyDefaultsThenClamp(spec, corev1.ResourceRequirements{}, corev1.ResourceList{corev1.ResourceEphemeralStorage: qty("5Gi")})
-	eq(t, res.Resources.Limits, corev1.ResourceEphemeralStorage, "5Gi")
-	if !strings.Contains(res.Note, "ephemeral-storage") {
-		t.Errorf("Note = %q, want it to mention ephemeral-storage", res.Note)
-	}
 }

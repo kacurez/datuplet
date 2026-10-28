@@ -142,7 +142,7 @@ make deploy-local
 ```
 
 `make deploy-local` is image build + `install.sh`: it builds the five service
-images and the five built-in component images
+images and the three built-in component images
 (`docker-build-k8s build-components-local`), then runs
 `./scripts/install.sh --namespace datuplet -f-infra tests/local/values-local-infra.yaml -f-app tests/local/values-local-app.yaml`
 (`deploy-local-helm`), which sets `image.pullPolicy=IfNotPresent`,

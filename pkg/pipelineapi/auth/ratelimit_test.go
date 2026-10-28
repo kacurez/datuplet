@@ -7,21 +7,6 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 )
 
-// TestLimiter_AllowsUpToRate — the canonical positive test: the first N
-// requests in a window MUST succeed, request N+1 MUST be denied.
-func TestLimiter_AllowsUpToRate(t *testing.T) {
-	l := auth.NewLimiter(3, time.Minute)
-	const key = "1.2.3.4"
-	for i := 0; i < 3; i++ {
-		if !l.Allow(key) {
-			t.Errorf("Allow #%d: false, want true", i+1)
-		}
-	}
-	if l.Allow(key) {
-		t.Error("Allow #4: true, want false (over rate)")
-	}
-}
-
 // TestLimiter_ResetsAfterWindow — windows MUST be sliding/expiring; once
 // the window passes, the bucket refills. We use a small window so the
 // test is fast and deterministic.
@@ -41,41 +26,33 @@ func TestLimiter_ResetsAfterWindow(t *testing.T) {
 	}
 }
 
-// TestLimiter_DistinctKeysIndependent — limit is per-key. Two different
-// IPs MUST NOT share a bucket; otherwise NAT'd users would lock each
-// other out.
-func TestLimiter_DistinctKeysIndependent(t *testing.T) {
-	l := auth.NewLimiter(1, time.Minute)
-	if !l.Allow("a") || !l.Allow("b") {
-		t.Error("first request from each key should be allowed")
+// TestLimiter_Allow: the first N requests in a window MUST succeed and
+// request N+1 MUST be denied; the limit is per-key (two different IPs MUST
+// NOT share a bucket, otherwise NAT'd users would lock each other out); the
+// empty string is still a valid bucket key (matters when we fail-open on a
+// malformed RemoteAddr); and a misconfigured rate=0 produces a closed bucket,
+// better than uncapped since the operator would never realize the limiter is
+// broken.
+func TestLimiter_Allow(t *testing.T) {
+	cases := []struct {
+		name string
+		rate int
+		keys []string
+		want []bool
+	}{
+		{"allows_up_to_rate", 3, []string{"1.2.3.4", "1.2.3.4", "1.2.3.4", "1.2.3.4"}, []bool{true, true, true, false}},
+		{"distinct_keys_independent", 1, []string{"a", "b", "a", "b"}, []bool{true, true, false, false}},
+		{"empty_key_is_treated_normally", 2, []string{"", "", ""}, []bool{true, true, false}},
+		{"zero_rate_always_denies", 0, []string{"any"}, []bool{false}},
 	}
-	if l.Allow("a") {
-		t.Error("second from 'a' should be denied")
-	}
-	if l.Allow("b") {
-		t.Error("second from 'b' should be denied")
-	}
-}
-
-// TestLimiter_EmptyKeyIsTreatedNormally — empty string is still a valid
-// bucket key (matters when we fail-open on a malformed RemoteAddr).
-func TestLimiter_EmptyKeyIsTreatedNormally(t *testing.T) {
-	l := auth.NewLimiter(2, time.Minute)
-	if !l.Allow("") || !l.Allow("") {
-		t.Error("first two with empty key should be allowed")
-	}
-	if l.Allow("") {
-		t.Error("third with empty key should be denied")
-	}
-}
-
-// TestLimiter_ZeroRateAlwaysDenies — defensive guard: a misconfigured
-// `rate=0` produces a closed bucket. Better than uncapped since the
-// alternative (uncapped) means the operator never realizes the limiter
-// is broken.
-func TestLimiter_ZeroRateAlwaysDenies(t *testing.T) {
-	l := auth.NewLimiter(0, time.Minute)
-	if l.Allow("any") {
-		t.Error("zero rate should always deny")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := auth.NewLimiter(tc.rate, time.Minute)
+			for i, key := range tc.keys {
+				if got := l.Allow(key); got != tc.want[i] {
+					t.Errorf("Allow #%d (key %q) = %v, want %v", i+1, key, got, tc.want[i])
+				}
+			}
+		})
 	}
 }

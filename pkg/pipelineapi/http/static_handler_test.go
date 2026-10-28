@@ -28,71 +28,48 @@ func testUIDir(t *testing.T) string {
 	return dir
 }
 
-func TestUIStatic_ServesIndexAtRoot(t *testing.T) {
-	dir := testUIDir(t)
-	srv := apihttp.NewServer(nil).WithStaticDir(dir)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+// TestUIStatic_Serves covers the three success paths of GET /ui/*: the index
+// at the root, a real asset, and the SPA fallback for deep links.
+func TestUIStatic_Serves(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		wantBody   string
+		wantJSType bool // Content-Type must be a JS type, not HTML
+	}{
+		{name: "index at root", path: "/ui/", wantBody: "datuplet-test"},
+		// Must receive a JS MIME type, not HTML — otherwise the SPA fallback
+		// accidentally served index.html in place of the asset.
+		{name: "real file", path: "/ui/app.js", wantBody: "console.log", wantJSType: true},
+		// /ui/pipelines/foo doesn't exist in the test dir — must fall back to
+		// index.html so the client-side router can handle it.
+		{name: "SPA fallback for deep links", path: "/ui/pipelines/foo", wantBody: "datuplet-test"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := apihttp.NewServer(nil).WithStaticDir(testUIDir(t))
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
 
-	resp, err := stdhttp.Get(ts.URL + "/ui/")
-	if err != nil {
-		t.Fatalf("GET /ui/: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "datuplet-test") {
-		t.Errorf("body = %q, want to contain datuplet-test", body)
-	}
-}
-
-func TestUIStatic_ServesRealFile(t *testing.T) {
-	dir := testUIDir(t)
-	srv := apihttp.NewServer(nil).WithStaticDir(dir)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	resp, err := stdhttp.Get(ts.URL + "/ui/app.js")
-	if err != nil {
-		t.Fatalf("GET /ui/app.js: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "console.log") {
-		t.Errorf("body = %q, want app.js contents", body)
-	}
-	// Must receive a JS MIME type, not HTML — otherwise the SPA
-	// fallback accidentally served index.html in place of the asset.
-	ct := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(ct, "text/javascript") && !strings.HasPrefix(ct, "application/javascript") {
-		t.Errorf("Content-Type = %q, want a JS type", ct)
-	}
-}
-
-func TestUIStatic_SPAFallbackForDeepLinks(t *testing.T) {
-	dir := testUIDir(t)
-	srv := apihttp.NewServer(nil).WithStaticDir(dir)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	// /ui/pipelines/foo doesn't exist in the test dir — must fall back
-	// to index.html so the client-side router can handle it.
-	resp, err := stdhttp.Get(ts.URL + "/ui/pipelines/foo")
-	if err != nil {
-		t.Fatalf("GET /ui/pipelines/foo: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "datuplet-test") {
-		t.Errorf("body = %q, want SPA fallback to index.html", body)
+			resp, err := stdhttp.Get(ts.URL + tc.path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", tc.path, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status = %d", resp.StatusCode)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(body), tc.wantBody) {
+				t.Errorf("body = %q, want to contain %q", body, tc.wantBody)
+			}
+			if tc.wantJSType {
+				ct := resp.Header.Get("Content-Type")
+				if !strings.HasPrefix(ct, "text/javascript") && !strings.HasPrefix(ct, "application/javascript") {
+					t.Errorf("Content-Type = %q, want a JS type", ct)
+				}
+			}
+		})
 	}
 }
 

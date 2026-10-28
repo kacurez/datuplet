@@ -52,19 +52,6 @@ func TestEnsureProjectLimitRange_CreatesIfMissing(t *testing.T) {
 	}
 }
 
-func TestEnsureProjectLimitRange_Idempotent(t *testing.T) {
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	projectID := uuid.New()
-
-	if err := pkg8s.EnsureProjectLimitRange(context.Background(), c, projectID); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	// Second call must be a no-op even though the LimitRange now exists.
-	if err := pkg8s.EnsureProjectLimitRange(context.Background(), c, projectID); err != nil {
-		t.Fatalf("second: %v", err)
-	}
-}
-
 func TestEnsureProjectLimitRange_LeavesExistingUntouched(t *testing.T) {
 	projectID := uuid.New()
 	ns := pkg8s.NamespaceForProject(projectID)

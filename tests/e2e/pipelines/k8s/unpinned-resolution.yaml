@@ -4,7 +4,9 @@
 # prerelease entry and resolves to the only stable version registered for
 # data-generator: v0.0.1 (framework/components_bootstrap.go). The test
 # asserts the resolution is recorded verbatim in
-# PipelineRun.status.components[].
+# PipelineRun.status.components[]. No resources block is set, so the test
+# also asserts v0.0.1's registry resources.default lands on the component
+# Job container and in status.resolvedSpec.
 name: "{{.RunPrefix}}-unpinned-resolution"
 stages:
   - name: extract

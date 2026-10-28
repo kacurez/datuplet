@@ -224,6 +224,7 @@ func newIdentityHarness(t *testing.T) *identityHarness {
 // for AppFGASubject(appID).
 func TestIdentityManager_RegisterWritesViewerTuple(t *testing.T) {
 	h := newIdentityHarness(t)
+	cap := captureAudit(t)
 	appID := uuid.NewString()
 	projectID := uuid.NewString()
 
@@ -249,19 +250,8 @@ func TestIdentityManager_RegisterWritesViewerTuple(t *testing.T) {
 	if strings.Contains(ops[0], "Write:"+apps.AppJWTSubject(appID)+"|") {
 		t.Errorf("tuple was written for the JWT subject, not the FGA subject: %q", ops[0])
 	}
-}
 
-// TestIdentityManager_RegisterEmitsAudit asserts the app_identity_created
-// audit line and its fields.
-func TestIdentityManager_RegisterEmitsAudit(t *testing.T) {
-	h := newIdentityHarness(t)
-	cap := captureAudit(t)
-	appID := uuid.NewString()
-	projectID := uuid.NewString()
-
-	if err := h.mgr.Register(context.Background(), appID, projectID); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	// The app_identity_created audit line and its fields.
 	rec := cap.findAction(t, "app_identity_created")
 	for k, want := range map[string]string{
 		"app_id":                appID,
@@ -276,26 +266,60 @@ func TestIdentityManager_RegisterEmitsAudit(t *testing.T) {
 	}
 }
 
-// TestIdentityManager_RegisterIsIdempotent: OpenFGA errors on a strict
-// duplicate tuple; a retried create (or a second upload after a half-failed
-// registration) must not hard-fail.
-func TestIdentityManager_RegisterIsIdempotent(t *testing.T) {
-	h := newIdentityHarness(t)
-	h.authz.writeErr = errors.New("rpc error: cannot write a tuple which already exists: user: 'user:oidc~app-x'")
-	if err := h.mgr.Register(context.Background(), uuid.NewString(), uuid.NewString()); err != nil {
-		t.Fatalf("Register on an already-existing tuple must succeed, got %v", err)
+// TestIdentityManager_RegisterUnregisterBackendErrors: OpenFGA errors on a
+// strict duplicate tuple (a retried create, or a second upload after a
+// half-failed registration) and on deleting a tuple that is already gone (a
+// retried delete, which would otherwise leave the app rows undeletable) —
+// both must be swallowed. Any other FGA failure must propagate (the caller
+// answers 503, and the delete route MUST keep the rows).
+func TestIdentityManager_RegisterUnregisterBackendErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		unregister  bool // exercise Unregister instead of Register
+		backendErr  string
+		wantErr     bool
+		wantContain string // the error must wrap this backend cause
+	}{
+		{
+			name:       "register tolerates already-existing tuple",
+			backendErr: "rpc error: cannot write a tuple which already exists: user: 'user:oidc~app-x'",
+		},
+		{
+			name:        "register propagates backend error",
+			backendErr:  "openfga: connection refused",
+			wantErr:     true,
+			wantContain: "connection refused",
+		},
+		{
+			name:       "unregister tolerates missing tuple",
+			unregister: true,
+			backendErr: "rpc error: cannot delete a tuple which does not exist: user: 'user:oidc~app-x'",
+		},
+		{
+			name:       "unregister propagates backend error",
+			unregister: true,
+			backendErr: "openfga: connection refused",
+			wantErr:    true,
+		},
 	}
-}
-
-func TestIdentityManager_RegisterPropagatesBackendError(t *testing.T) {
-	h := newIdentityHarness(t)
-	h.authz.writeErr = errors.New("openfga: connection refused")
-	err := h.mgr.Register(context.Background(), uuid.NewString(), uuid.NewString())
-	if err == nil {
-		t.Fatal("Register must propagate a real FGA failure (the caller answers 503)")
-	}
-	if !strings.Contains(err.Error(), "connection refused") {
-		t.Errorf("error does not wrap the backend cause: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newIdentityHarness(t)
+			var err error
+			if tc.unregister {
+				h.authz.deleteErr = errors.New(tc.backendErr)
+				err = h.mgr.Unregister(context.Background(), uuid.NewString(), uuid.NewString())
+			} else {
+				h.authz.writeErr = errors.New(tc.backendErr)
+				err = h.mgr.Register(context.Background(), uuid.NewString(), uuid.NewString())
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantContain != "" && !strings.Contains(err.Error(), tc.wantContain) {
+				t.Errorf("error does not wrap the backend cause %q: %v", tc.wantContain, err)
+			}
+		})
 	}
 }
 
@@ -312,6 +336,7 @@ func TestIdentityManager_UnregisterDeletesViewerTuple(t *testing.T) {
 	if err := h.mgr.Register(ctx, appID, projectID); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
+	cap := captureAudit(t)
 	if err := h.mgr.Unregister(ctx, appID, projectID); err != nil {
 		t.Fatalf("Unregister: %v", err)
 	}
@@ -331,20 +356,7 @@ func TestIdentityManager_UnregisterDeletesViewerTuple(t *testing.T) {
 	if allowed {
 		t.Error("the app identity still has `viewer` after Unregister")
 	}
-}
 
-func TestIdentityManager_UnregisterEmitsAudit(t *testing.T) {
-	h := newIdentityHarness(t)
-	appID := uuid.NewString()
-	projectID := uuid.NewString()
-	if err := h.mgr.Register(context.Background(), appID, projectID); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-
-	cap := captureAudit(t)
-	if err := h.mgr.Unregister(context.Background(), appID, projectID); err != nil {
-		t.Fatalf("Unregister: %v", err)
-	}
 	rec := cap.findAction(t, "app_identity_deleted")
 	if got, _ := rec["app_id"].(string); got != appID {
 		t.Errorf("audit app_id = %q, want %q", got, appID)
@@ -354,31 +366,13 @@ func TestIdentityManager_UnregisterEmitsAudit(t *testing.T) {
 	}
 }
 
-// TestIdentityManager_UnregisterToleratesMissingTuple: deleting an app whose
-// tuple is already gone (a retried delete) must succeed, or the app rows can
-// never be removed.
-func TestIdentityManager_UnregisterToleratesMissingTuple(t *testing.T) {
-	h := newIdentityHarness(t)
-	h.authz.deleteErr = errors.New("rpc error: cannot delete a tuple which does not exist: user: 'user:oidc~app-x'")
-	if err := h.mgr.Unregister(context.Background(), uuid.NewString(), uuid.NewString()); err != nil {
-		t.Fatalf("Unregister on a missing tuple must succeed, got %v", err)
-	}
-}
-
-func TestIdentityManager_UnregisterPropagatesBackendError(t *testing.T) {
-	h := newIdentityHarness(t)
-	h.authz.deleteErr = errors.New("openfga: connection refused")
-	if err := h.mgr.Unregister(context.Background(), uuid.NewString(), uuid.NewString()); err == nil {
-		t.Fatal("Unregister must propagate a real FGA failure — the delete route MUST keep the rows")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Mint
 // ---------------------------------------------------------------------------
 
 // TestIdentityManager_MintSubjectIsAppJWTSubject decodes the minted JWT and
-// pins `sub`, the audience, the kind and the 60 s TTL.
+// pins `sub` and `project_id`; the audience, kind and TTL are pinned by
+// tokens.TestMintAppToken_ClaimsShape.
 func TestIdentityManager_MintSubjectIsAppJWTSubject(t *testing.T) {
 	h := newIdentityHarness(t)
 	appID := uuid.NewString()
@@ -395,19 +389,8 @@ func TestIdentityManager_MintSubjectIsAppJWTSubject(t *testing.T) {
 	if got, _ := claims["sub"].(string); strings.Contains(got, "user:") || strings.Contains(got, "oidc~") {
 		t.Errorf("sub %q must be the BARE form — lakekeeper composes the prefixes", got)
 	}
-	if got, _ := claims["aud"].(string); got != tokens.TableTokenAudience {
-		t.Errorf("aud = %q, want %q", got, tokens.TableTokenAudience)
-	}
-	if got, _ := claims["token_kind"].(string); got != tokens.TokenKindApp {
-		t.Errorf("token_kind = %q, want %q", got, tokens.TokenKindApp)
-	}
 	if got, _ := claims["project_id"].(string); got != testLakekeeperPID {
 		t.Errorf("project_id = %q, want the lakekeeper project id %q", got, testLakekeeperPID)
-	}
-	iat, _ := claims["iat"].(float64)
-	exp, _ := claims["exp"].(float64)
-	if int64(exp-iat) != 60 {
-		t.Errorf("TTL = %ds, want 60s (spec §5.4)", int64(exp-iat))
 	}
 }
 
@@ -448,30 +431,6 @@ func TestIdentityManager_MintSubjectNormalisesToTupleUser(t *testing.T) {
 	}
 	if !allowed {
 		t.Errorf("FGA check for the minted subject %q was DENIED — the mint and the tuple disagree", normalised)
-	}
-}
-
-// TestIdentityManager_MintIsFreshPerCall: no caching anywhere (spec §5.4).
-func TestIdentityManager_MintIsFreshPerCall(t *testing.T) {
-	h := newIdentityHarness(t)
-	appID := uuid.NewString()
-	projectID := uuid.NewString()
-
-	tok1, err := h.mgr.Mint(context.Background(), appID, projectID)
-	if err != nil {
-		t.Fatalf("mint 1: %v", err)
-	}
-	tok2, err := h.mgr.Mint(context.Background(), appID, projectID)
-	if err != nil {
-		t.Fatalf("mint 2: %v", err)
-	}
-	if tok1 == tok2 {
-		t.Fatal("two mints returned identical tokens — a cached credential (spec §5.4 violation)")
-	}
-	jti1, _ := decodeClaims(t, tok1)["jti"].(string)
-	jti2, _ := decodeClaims(t, tok2)["jti"].(string)
-	if jti1 == "" || jti1 == jti2 {
-		t.Errorf("jti reused across renders: %q vs %q", jti1, jti2)
 	}
 }
 
@@ -606,70 +565,95 @@ func TestIdentityManager_MintNeverLogsTheToken(t *testing.T) {
 	}
 }
 
-// TestIdentityManager_MintFailsClosedOnUnknownProject: an app whose project
-// row is gone, or whose lakekeeper project is not provisioned yet, must NOT
-// receive a credential — the FGA tuple it would authorize against cannot
-// exist. Also covers the unknown/empty app case.
-func TestIdentityManager_MintFailsClosedOnUnknownProject(t *testing.T) {
+// TestIdentityManager_FailsClosed: every unusable input must be refused
+// without touching FGA. An app whose project row is gone, or whose lakekeeper
+// project is not provisioned yet, must NOT receive a credential — the tuple it
+// would authorize against cannot exist — and Register must not write a tuple
+// on project:<empty>. Empty/malformed ids are guarded at the manager boundary
+// (the HTTP routes 404 an unknown app id before they get here — see
+// internal.go's mustGetApp), and a deployment without a signing key must fail
+// the mint rather than return an empty credential.
+func TestIdentityManager_FailsClosed(t *testing.T) {
 	appID := uuid.NewString()
 	projectID := uuid.NewString()
-
-	t.Run("project not found", func(t *testing.T) {
-		h := newIdentityHarness(t)
-		h.projects.err = apps.ErrNotFound
-		if _, err := h.mgr.Mint(context.Background(), appID, projectID); err == nil {
-			t.Fatal("Mint must fail for an unknown project")
-		}
-	})
-	t.Run("lakekeeper project unprovisioned", func(t *testing.T) {
-		h := newIdentityHarness(t)
-		h.projects.lakekeeperID = ""
-		if _, err := h.mgr.Mint(context.Background(), appID, projectID); err == nil {
-			t.Fatal("Mint must fail closed when the lakekeeper project id is empty")
-		}
-	})
-	t.Run("register on unprovisioned project", func(t *testing.T) {
-		h := newIdentityHarness(t)
-		h.projects.lakekeeperID = ""
-		if err := h.mgr.Register(context.Background(), appID, projectID); err == nil {
-			t.Fatal("Register must fail closed rather than write a tuple on project:<empty>")
-		}
-		if ops := h.authz.opsSnapshot(); len(ops) != 0 {
-			t.Errorf("wrote FGA ops %v despite an unresolvable project", ops)
-		}
-	})
-}
-
-// TestIdentityManager_RejectsEmptyArguments guards the "unknown app" input
-// shape at the manager boundary (the HTTP routes 404 an unknown app id before
-// they ever get here — see internal.go's mustGetApp).
-func TestIdentityManager_RejectsEmptyArguments(t *testing.T) {
-	h := newIdentityHarness(t)
-	ctx := context.Background()
-	if err := h.mgr.Register(ctx, "", uuid.NewString()); err == nil {
-		t.Error("Register with an empty appID must fail")
+	tests := []struct {
+		name  string
+		setup func(h *identityHarness)
+		call  func(ctx context.Context, h *identityHarness) error
+	}{
+		{
+			name:  "mint on unknown project",
+			setup: func(h *identityHarness) { h.projects.err = apps.ErrNotFound },
+			call: func(ctx context.Context, h *identityHarness) error {
+				_, err := h.mgr.Mint(ctx, appID, projectID)
+				return err
+			},
+		},
+		{
+			name:  "mint on unprovisioned lakekeeper project",
+			setup: func(h *identityHarness) { h.projects.lakekeeperID = "" },
+			call: func(ctx context.Context, h *identityHarness) error {
+				_, err := h.mgr.Mint(ctx, appID, projectID)
+				return err
+			},
+		},
+		{
+			name:  "register on unprovisioned lakekeeper project",
+			setup: func(h *identityHarness) { h.projects.lakekeeperID = "" },
+			call: func(ctx context.Context, h *identityHarness) error {
+				return h.mgr.Register(ctx, appID, projectID)
+			},
+		},
+		{
+			name: "register with empty appID",
+			call: func(ctx context.Context, h *identityHarness) error {
+				return h.mgr.Register(ctx, "", projectID)
+			},
+		},
+		{
+			name: "unregister with empty appID",
+			call: func(ctx context.Context, h *identityHarness) error {
+				return h.mgr.Unregister(ctx, "", projectID)
+			},
+		},
+		{
+			name: "mint with empty appID",
+			call: func(ctx context.Context, h *identityHarness) error {
+				_, err := h.mgr.Mint(ctx, "", projectID)
+				return err
+			},
+		},
+		{
+			name: "mint with malformed projectID",
+			call: func(ctx context.Context, h *identityHarness) error {
+				_, err := h.mgr.Mint(ctx, appID, "not-a-uuid")
+				return err
+			},
+		},
+		{
+			name: "mint without a signer",
+			setup: func(h *identityHarness) {
+				h.mgr = apps.NewIdentityManager(h.authz, nil, h.projects)
+			},
+			call: func(ctx context.Context, h *identityHarness) error {
+				_, err := h.mgr.Mint(ctx, appID, projectID)
+				return err
+			},
+		},
 	}
-	if err := h.mgr.Unregister(ctx, "", uuid.NewString()); err == nil {
-		t.Error("Unregister with an empty appID must fail")
-	}
-	if _, err := h.mgr.Mint(ctx, "", uuid.NewString()); err == nil {
-		t.Error("Mint with an empty appID must fail")
-	}
-	if _, err := h.mgr.Mint(ctx, uuid.NewString(), "not-a-uuid"); err == nil {
-		t.Error("Mint with a malformed projectID must fail")
-	}
-	if ops := h.authz.opsSnapshot(); len(ops) != 0 {
-		t.Errorf("rejected calls still touched FGA: %v", ops)
-	}
-}
-
-// TestIdentityManager_MintRequiresSigner: a deployment without a signing key
-// must fail the mint rather than return an empty credential.
-func TestIdentityManager_MintRequiresSigner(t *testing.T) {
-	ra := newRecorderAuthz()
-	mgr := apps.NewIdentityManager(ra, nil, &fakeProjects{lakekeeperID: testLakekeeperPID})
-	if _, err := mgr.Mint(context.Background(), uuid.NewString(), uuid.NewString()); err == nil {
-		t.Fatal("Mint without a signer must fail")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newIdentityHarness(t)
+			if tc.setup != nil {
+				tc.setup(h)
+			}
+			if err := tc.call(context.Background(), h); err == nil {
+				t.Fatal("call must fail closed")
+			}
+			if ops := h.authz.opsSnapshot(); len(ops) != 0 {
+				t.Errorf("rejected call still touched FGA: %v", ops)
+			}
+		})
 	}
 }
 

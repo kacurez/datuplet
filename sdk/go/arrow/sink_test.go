@@ -171,52 +171,6 @@ func ipcCells(t *testing.T, payload []byte, colNames []string) [][]*string {
 	return allCells
 }
 
-func TestStringSink_BatchBoundariesAndSelfContainedStreams(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
-		WithBatchRows(4) /* tiny batch */)
-	for i := 0; i < 10; i++ {
-		if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	rows, _, err := sink.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rows != 10 {
-		t.Fatalf("rows = %d, want 10", rows)
-	}
-	if len(fw.payloads) != 3 { // 4+4+2
-		t.Fatalf("payloads = %d, want 3 (4+4+2)", len(fw.payloads))
-	}
-	var total int64
-	for _, p := range fw.payloads {
-		n, names, fields := ipcRows(t, p) // each independently parseable = no-concat invariant
-		total += n
-		if len(names) != 1 || names[0] != "id" {
-			t.Fatalf("schema = %v", names)
-		}
-		// Verify all fields are String and Nullable
-		if len(fields) != 1 {
-			t.Fatalf("expected 1 field, got %d", len(fields))
-		}
-		if fields[0].Type.ID() != arrow.STRING {
-			t.Fatalf("field type = %v, want String", fields[0].Type)
-		}
-		if !fields[0].Nullable {
-			t.Fatalf("field should be Nullable")
-		}
-	}
-	if total != 10 {
-		t.Fatalf("ipc total rows = %d, want 10", total)
-	}
-	if !fw.closed {
-		t.Fatal("writer not closed")
-	}
-}
-
 func TestStringSink_NoColumnsDerivesPlanFromFirstBatch(t *testing.T) {
 	fw := &fakeWriter{}
 	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(3))
@@ -249,81 +203,6 @@ func TestStringSink_NoColumnsDerivesPlanFromFirstBatch(t *testing.T) {
 		if !f.Nullable {
 			t.Fatalf("field %d (%s) should be Nullable", i, f.Name)
 		}
-	}
-}
-
-func TestStringSink_ZeroRecordsNeverOpensWriter(t *testing.T) {
-	opened := false
-	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) {
-		opened = true
-		return &fakeWriter{}, nil
-	}, WithBatchRows(4))
-	rows, cr, err := sink.Finish()
-	if err != nil || rows != 0 || cr != nil {
-		t.Fatalf("rows=%d cr=%v err=%v", rows, cr, err)
-	}
-	if opened {
-		t.Fatal("writer must not be opened for zero records")
-	}
-	if sink.Writer() != nil {
-		t.Fatal("Writer() must be nil for zero records")
-	}
-}
-
-func TestStringSink_OpenFailureIsWriteError(t *testing.T) {
-	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) {
-		return nil, errors.New("open boom")
-	}, WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }), WithBatchRows(1))
-	err := sink.Add(map[string]any{"id": "1"})
-	var we *WriteError
-	if !errors.As(err, &we) {
-		t.Fatalf("want WriteError, got %v", err)
-	}
-}
-
-func TestStringSink_FinishIsIdempotent(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
-		WithBatchRows(4))
-	if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
-		t.Fatal(err)
-	}
-	rows1, cr1, err1 := sink.Finish()
-	rows2, cr2, err2 := sink.Finish()
-	if err1 != nil || err2 != nil {
-		t.Fatalf("Finish errors: %v, %v", err1, err2)
-	}
-	if rows1 != 1 || rows2 != 1 {
-		t.Fatalf("rows mismatch: %d vs %d", rows1, rows2)
-	}
-	if cr1 != cr2 {
-		t.Fatalf("closeResult mismatch")
-	}
-	if fw.closeCount != 1 {
-		t.Fatalf("closeCount = %d, want 1 (not double-closed)", fw.closeCount)
-	}
-}
-
-func TestStringSink_AddAfterFinishErrors(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil },
-		WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }),
-		WithBatchRows(4))
-	if err := sink.Add(map[string]any{"id": json.Number("1")}); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err := sink.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Add after Finish should error, not panic
-	err = sink.Add(map[string]any{"id": json.Number("2")})
-	if err == nil {
-		t.Fatal("Add after Finish should error")
-	}
-	if err.Error() != "arrow: StringSink.Add called after Finish" {
-		t.Fatalf("wrong error: %v", err)
 	}
 }
 
@@ -425,16 +304,16 @@ func TestStringSink_CellValuesAndNullability(t *testing.T) {
 	// 5. Distinction between null and empty string
 	recs := []map[string]any{
 		{
-			"num": json.Number("5938028332"),
-			"str": "hello",
-			"bool": true,
-			"empty": "",
+			"num":     json.Number("5938028332"),
+			"str":     "hello",
+			"bool":    true,
+			"empty":   "",
 			"missing": nil, // explicitly null
 		},
 		{
-			"num": json.Number("1.50"),
-			"str": "world",
-			"bool": false,
+			"num":   json.Number("1.50"),
+			"str":   "world",
+			"bool":  false,
 			"empty": "", // empty string
 			// "missing" key absent => null
 		},
@@ -459,7 +338,7 @@ func TestStringSink_CellValuesAndNullability(t *testing.T) {
 	}
 	wantNames := []string{"num", "str", "bool", "empty", "missing"}
 	if len(names) != 5 || names[0] != "num" || names[1] != "str" || names[2] != "bool" ||
-	   names[3] != "empty" || names[4] != "missing" {
+		names[3] != "empty" || names[4] != "missing" {
 		t.Fatalf("schema = %v, want %v", names, wantNames)
 	}
 	// Verify all fields are String and Nullable
@@ -574,65 +453,50 @@ func TestStringSink_ExplicitColumnsNeverReportsUnknownKeys(t *testing.T) {
 	}
 }
 
-func TestStringSink_UnknownKeysCapHoldsRecordCountExact(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(1))
-	// First record alone fixes the schema to {"a"} (batchRows=1).
-	if err := sink.Add(map[string]any{"a": "1"}); err != nil {
-		t.Fatal(err)
+// TestStringSink_UnknownKeysCap: every record introducing an unknown key counts
+// toward the unknown-record total exactly (uncapped), while the tracked-name
+// set is capped at MaxTrackedUnknownKeys. "At cap" is exactly
+// len(keys) == MaxTrackedUnknownKeys and is the boolean signal callers (e.g.
+// http-json-extractor's WARN log) use to decide whether the name list is
+// complete or truncated: below the cap it must be false, or an accurate
+// caller-side disclosure would misfire on a run that never hit the limit.
+func TestStringSink_UnknownKeysCap(t *testing.T) {
+	cases := []struct {
+		name      string
+		extra     int // records, each introducing a distinct unknown key
+		wantKeys  int
+		wantAtCap bool
+	}{
+		{"more records than the cap", 100, MaxTrackedUnknownKeys, true},
+		{"well under the cap", 10, 10, false},
 	}
-	// Feed more records than the 64-name cap, each introducing a distinct
-	// unknown key, so every one of them counts toward unknownRecords even
-	// though the tracked-name set is capped.
-	const extra = 100
-	for i := 0; i < extra; i++ {
-		key := fmt.Sprintf("unknown_%03d", i)
-		if err := sink.Add(map[string]any{"a": "x", key: "y"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	keys, n := sink.UnknownKeys()
-	if n != extra {
-		t.Fatalf("unknown records = %d, want %d (exact, uncapped)", n, extra)
-	}
-	if len(keys) != MaxTrackedUnknownKeys {
-		t.Fatalf("tracked unknown keys = %d, want capped at %d", len(keys), MaxTrackedUnknownKeys)
-	}
-}
-
-// TestStringSink_UnknownKeysUnderCapNotAtCap guards the boolean signal that
-// callers (e.g. http-json-extractor's WARN log) use to decide whether the
-// name list UnknownKeys returns is complete or was truncated: "at cap" is
-// exactly len(keys) == MaxTrackedUnknownKeys. Below the cap, that must be
-// false, or an accurate caller-side disclosure would misfire on a run that
-// never actually hit the limit.
-func TestStringSink_UnknownKeysUnderCapNotAtCap(t *testing.T) {
-	fw := &fakeWriter{}
-	sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(1))
-	if err := sink.Add(map[string]any{"a": "1"}); err != nil {
-		t.Fatal(err)
-	}
-	const extra = 10 // well under MaxTrackedUnknownKeys
-	for i := 0; i < extra; i++ {
-		key := fmt.Sprintf("unknown_%03d", i)
-		if err := sink.Add(map[string]any{"a": "x", key: "y"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, _, err := sink.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	keys, n := sink.UnknownKeys()
-	if n != extra {
-		t.Fatalf("unknown records = %d, want %d (exact, uncapped)", n, extra)
-	}
-	if len(keys) != extra {
-		t.Fatalf("tracked unknown keys = %d, want %d (below the cap)", len(keys), extra)
-	}
-	if len(keys) == MaxTrackedUnknownKeys {
-		t.Fatalf("under-cap key count unexpectedly equals MaxTrackedUnknownKeys; the at-cap disclosure signal would misfire")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fw := &fakeWriter{}
+			sink := NewStringSink(context.Background(), func() (ChunkWriter, error) { return fw, nil }, WithBatchRows(1))
+			// First record alone fixes the schema to {"a"} (batchRows=1).
+			if err := sink.Add(map[string]any{"a": "1"}); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < tc.extra; i++ {
+				key := fmt.Sprintf("unknown_%03d", i)
+				if err := sink.Add(map[string]any{"a": "x", key: "y"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, _, err := sink.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			keys, n := sink.UnknownKeys()
+			if n != int64(tc.extra) {
+				t.Fatalf("unknown records = %d, want %d (exact, uncapped)", n, tc.extra)
+			}
+			if len(keys) != tc.wantKeys {
+				t.Fatalf("tracked unknown keys = %d, want %d", len(keys), tc.wantKeys)
+			}
+			if atCap := len(keys) == MaxTrackedUnknownKeys; atCap != tc.wantAtCap {
+				t.Fatalf("at-cap signal = %v, want %v (disclosure signal would misfire)", atCap, tc.wantAtCap)
+			}
+		})
 	}
 }

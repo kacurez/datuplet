@@ -2,7 +2,6 @@ package datagateway
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -83,75 +82,58 @@ func writeStreamingFixtureParquet(t *testing.T, path string, values []int64, row
 	}
 }
 
+// OpenReader with FORMAT_ARROW_IPC routes to the streaming reader; ReadChunk
+// returns nil once the reader is exhausted (ReadChunk maps io.EOF to nil, so
+// any error, io.EOF included, is a failure) and every chunk is Arrow IPC with
+// the full row count.
 func TestOpenReader_FormatArrowIPC_RoutesToStreaming(t *testing.T) {
-	dir := t.TempDir()
-	fixture := filepath.Join(dir, "in.parquet")
-	writeStreamingFixtureParquet(t, fixture, []int64{1, 2, 3}, 2)
-
-	srv := newTestServerV2WithLocalBackend(t, dir)
-
-	// Use bucket = dir so that fmt.Sprintf("%s/%s", bucket, table) = absolute path to the file.
-	resp, err := srv.OpenReader(context.Background(), &pb.OpenReaderRequest{
-		Bucket:       dir,
-		Table:        "in.parquet",
-		OutputFormat: pb.DataFormat_FORMAT_ARROW_IPC,
-	})
-	if err != nil {
-		t.Fatalf("OpenReader: %v", err)
+	tests := []struct {
+		name         string
+		values       []int64
+		rowsPerGroup int
+	}{
+		{"3 rows in groups of 2", []int64{1, 2, 3}, 2},
+		{"6 rows, 3 row groups -> 3 chunks", []int64{1, 2, 3, 4, 5, 6}, 2},
+		{"1 row in a single group", []int64{42}, 10},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeStreamingFixtureParquet(t, filepath.Join(dir, "in.parquet"), tc.values, tc.rowsPerGroup)
 
-	stream := &mockReadChunkStream{ctx: context.Background()}
-	if err := srv.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream); err != nil {
-		t.Fatalf("ReadChunk: %v", err)
+			srv := newTestServerV2WithLocalBackend(t, dir)
+
+			// Use bucket = dir so that fmt.Sprintf("%s/%s", bucket, table) = absolute path to the file.
+			resp, err := srv.OpenReader(context.Background(), &pb.OpenReaderRequest{
+				Bucket:       dir,
+				Table:        "in.parquet",
+				OutputFormat: pb.DataFormat_FORMAT_ARROW_IPC,
+			})
+			if err != nil {
+				t.Fatalf("OpenReader: %v", err)
+			}
+
+			stream := &mockReadChunkStream{ctx: context.Background()}
+			err = srv.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream)
+			if err != nil {
+				t.Fatalf("ReadChunk: %v", err)
+			}
+
+			if len(stream.chunks) == 0 {
+				t.Fatal("expected at least one chunk, got none")
+			}
+			var totalRows int64
+			for _, chunk := range stream.chunks {
+				if chunk.Format != pb.DataFormat_FORMAT_ARROW_IPC {
+					t.Errorf("expected FORMAT_ARROW_IPC, got %v", chunk.Format)
+				}
+				totalRows += chunk.RowsInChunk
+			}
+			if totalRows != int64(len(tc.values)) {
+				t.Errorf("totalRows=%d, want %d", totalRows, len(tc.values))
+			}
+		})
 	}
-
-	if len(stream.chunks) == 0 {
-		t.Fatal("expected at least one chunk, got none")
-	}
-
-	var totalRows int64
-	for _, chunk := range stream.chunks {
-		if chunk.Format != pb.DataFormat_FORMAT_ARROW_IPC {
-			t.Errorf("expected FORMAT_ARROW_IPC, got %v", chunk.Format)
-		}
-		totalRows += chunk.RowsInChunk
-	}
-
-	if totalRows != 3 {
-		t.Errorf("totalRows=%d, want 3", totalRows)
-	}
-}
-
-func TestOpenReader_FormatArrowIPC_ChunksAreEOFTerminated(t *testing.T) {
-	dir := t.TempDir()
-	// 6 rows, 2 per row group → 3 row groups → 3 chunks
-	fixture := filepath.Join(dir, "multi.parquet")
-	writeStreamingFixtureParquet(t, fixture, []int64{1, 2, 3, 4, 5, 6}, 2)
-
-	srv := newTestServerV2WithLocalBackend(t, dir)
-
-	resp, err := srv.OpenReader(context.Background(), &pb.OpenReaderRequest{
-		Bucket:       dir,
-		Table:        "multi.parquet",
-		OutputFormat: pb.DataFormat_FORMAT_ARROW_IPC,
-	})
-	if err != nil {
-		t.Fatalf("OpenReader: %v", err)
-	}
-
-	stream := &mockReadChunkStream{ctx: context.Background()}
-	if err := srv.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream); err != nil {
-		t.Fatalf("ReadChunk: %v", err)
-	}
-
-	var totalRows int64
-	for _, chunk := range stream.chunks {
-		totalRows += chunk.RowsInChunk
-	}
-	if totalRows != 6 {
-		t.Errorf("totalRows=%d, want 6", totalRows)
-	}
-	// ReadChunk returns (no stream error) when the reader reaches EOF — confirmed above.
 }
 
 // TestOpenReader_FormatCSV_NotAffected verifies that non-ArrowIPC formats are
@@ -181,65 +163,5 @@ func TestOpenReader_FormatCSV_NotAffected(t *testing.T) {
 		if chunk.Format != pb.DataFormat_FORMAT_CSV {
 			t.Errorf("expected FORMAT_CSV, got %v", chunk.Format)
 		}
-	}
-}
-
-// TestParseDataFormat_ArrowIPCAlias ensures "arrow_ipc" is recognised as FORMAT_ARROW_IPC.
-func TestParseDataFormat_ArrowIPCAlias(t *testing.T) {
-	// After the fix, ParseDataFormat("arrow_ipc") must return FormatArrowIPC so
-	// the ReadChunk pass-through path works.
-	stream := &mockReadChunkStream{ctx: context.Background()}
-	_ = stream // suppress unused warning; actual validation below
-
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	// Use the backend reader that emits "arrow_ipc" format string — the streaming
-	// reader does this. Confirm protoToDataFormat round-trips correctly.
-	resp, err := server.OpenReader(context.Background(), &pb.OpenReaderRequest{
-		Bucket:       "raw",
-		Table:        "input",
-		OutputFormat: pb.DataFormat_FORMAT_ARROW_IPC,
-	})
-	if err != nil {
-		// The mock backend doesn't support streaming, but OpenReader should succeed
-		// (falls back to non-streaming path).
-		t.Logf("OpenReader with ARROW_IPC on mock backend: %v", err)
-		return
-	}
-	if resp == nil {
-		t.Fatal("expected non-nil response")
-	}
-}
-
-// Ensure the io.EOF path from ReadChunk is reached when streaming reader is exhausted.
-func TestOpenReader_FormatArrowIPC_IOEOFFromReader(t *testing.T) {
-	dir := t.TempDir()
-	fixture := filepath.Join(dir, "one.parquet")
-	writeStreamingFixtureParquet(t, fixture, []int64{42}, 10)
-
-	srv := newTestServerV2WithLocalBackend(t, dir)
-
-	resp, err := srv.OpenReader(context.Background(), &pb.OpenReaderRequest{
-		Bucket:       dir,
-		Table:        "one.parquet",
-		OutputFormat: pb.DataFormat_FORMAT_ARROW_IPC,
-	})
-	if err != nil {
-		t.Fatalf("OpenReader: %v", err)
-	}
-
-	stream := &mockReadChunkStream{ctx: context.Background()}
-	err = srv.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream)
-	if err != nil && err != io.EOF {
-		t.Fatalf("ReadChunk unexpected error: %v", err)
-	}
-
-	var totalRows int64
-	for _, chunk := range stream.chunks {
-		totalRows += chunk.RowsInChunk
-	}
-	if totalRows != 1 {
-		t.Errorf("totalRows=%d, want 1", totalRows)
 	}
 }

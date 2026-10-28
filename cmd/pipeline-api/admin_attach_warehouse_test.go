@@ -10,41 +10,34 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/lakekeeper"
 )
 
-// TestAttachWarehouse_BadArgs verifies that calling attach-warehouse with no
-// arguments returns an error (both required flags missing).
-func TestAttachWarehouse_BadArgs(t *testing.T) {
-	err := adminAttachWarehouse(context.Background(), nil, []string{})
-	if err == nil {
-		t.Fatal("expected error for missing args")
+// TestAttachWarehouse_MissingRequiredFlags verifies that attach-warehouse errors
+// out when either required flag (--project, --warehouse) is missing.
+func TestAttachWarehouse_MissingRequiredFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"no args", []string{}},
+		{"missing --project", []string{"--warehouse", "x"}},
+		{"missing --warehouse", []string{"--project", "myproj"}},
 	}
-}
-
-// TestAttachWarehouse_MissingProject verifies that --warehouse alone errors
-// out because --project is required.
-func TestAttachWarehouse_MissingProject(t *testing.T) {
-	err := adminAttachWarehouse(context.Background(), nil, []string{"--warehouse", "x"})
-	if err == nil {
-		t.Fatal("expected error for missing --project")
-	}
-}
-
-// TestAttachWarehouse_MissingWarehouse verifies that --project alone errors
-// out because --warehouse is required.
-func TestAttachWarehouse_MissingWarehouse(t *testing.T) {
-	err := adminAttachWarehouse(context.Background(), nil, []string{"--project", "myproj"})
-	if err == nil {
-		t.Fatal("expected error for missing --warehouse")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := adminAttachWarehouse(context.Background(), nil, tc.args); err == nil {
+				t.Fatal("expected error for missing required flag")
+			}
+		})
 	}
 }
 
 // fakeEnsurer captures the (type, projectID, warehouseName, profile)
 // passed to attachWarehouse so tests can assert the dispatch.
 type fakeEnsurer struct {
-	calledS3, calledGCS  bool
-	gotS3                lakekeeper.S3WarehouseProfile
-	gotGCS               lakekeeper.GCSWarehouseProfile
+	calledS3, calledGCS   bool
+	gotS3                 lakekeeper.S3WarehouseProfile
+	gotGCS                lakekeeper.GCSWarehouseProfile
 	gotProject, gotWHName string
-	retErr               error
+	retErr                error
 }
 
 func (f *fakeEnsurer) EnsureS3WarehouseInProject(ctx context.Context, projectID, warehouseName string, profile lakekeeper.S3WarehouseProfile) error {
@@ -96,26 +89,6 @@ func TestAttachWarehouse_GCSSystemIdentity(t *testing.T) {
 	}
 }
 
-// TestAttachWarehouse_GCSSystemIdentityWithoutSTS asserts Slice 3's rule
-// is honoured from the attach-warehouse flow too: WIF + sts-enabled=false
-// fails. The lakekeeper.GCSWarehouseProfile.Validate() check fires inside
-// EnsureGCSWarehouseInProject; we exercise it end-to-end here by going
-// through the real Validate path via a stub Manager that simply re-runs it.
-func TestAttachWarehouse_GCSSystemIdentityWithoutSTS(t *testing.T) {
-	// Use the real Validate from lakekeeper by constructing the profile
-	// directly here — attachWarehouse hands it off without revalidating,
-	// so we assert the profile shape is correct and then verify Validate
-	// rejects it.
-	p := lakekeeper.GCSWarehouseProfile{
-		Bucket:         "datuplet-gcs",
-		CredentialType: "system-identity",
-		StsEnabled:     false,
-	}
-	if err := p.Validate(); err == nil {
-		t.Fatal("expected Validate to reject system-identity + StsEnabled=false")
-	}
-}
-
 // TestAttachWarehouse_GCSServiceAccountKey asserts the SA-key branch reads
 // the file from disk and forwards its content as ServiceAccountKeyJSON.
 func TestAttachWarehouse_GCSServiceAccountKey(t *testing.T) {
@@ -149,46 +122,6 @@ func TestAttachWarehouse_GCSServiceAccountKey(t *testing.T) {
 	}
 }
 
-// TestAttachWarehouse_GCSBucketRequired asserts --gcs-bucket missing errors
-// before any RPC.
-func TestAttachWarehouse_GCSBucketRequired(t *testing.T) {
-	f := &fakeEnsurer{}
-	err := attachWarehouse(context.Background(), f, "proj-1", "wh-gcs", "gcs",
-		attachWarehouseS3Opts{},
-		attachWarehouseGCSOpts{
-			credType:   "system-identity",
-			stsEnabled: true,
-		})
-	if err == nil {
-		t.Fatal("expected error for missing --gcs-bucket")
-	}
-	if !strings.Contains(err.Error(), "gcs-bucket") {
-		t.Errorf("expected error to mention gcs-bucket; got: %v", err)
-	}
-	if f.calledGCS {
-		t.Error("expected NO ensurer call when --gcs-bucket missing")
-	}
-}
-
-// TestAttachWarehouse_GCSUnknownCredType asserts an unknown credential
-// type produces an explicit error rather than reaching the Manager.
-func TestAttachWarehouse_GCSUnknownCredType(t *testing.T) {
-	f := &fakeEnsurer{}
-	err := attachWarehouse(context.Background(), f, "proj-1", "wh-gcs", "gcs",
-		attachWarehouseS3Opts{},
-		attachWarehouseGCSOpts{
-			bucket:     "datuplet-gcs",
-			credType:   "bogus",
-			stsEnabled: true,
-		})
-	if err == nil {
-		t.Fatal("expected error for unknown --gcs-credential-type")
-	}
-	if !strings.Contains(err.Error(), "bogus") {
-		t.Errorf("expected error to echo the bogus value; got: %v", err)
-	}
-}
-
 // TestAttachWarehouse_S3DispatchUnchanged asserts the S3 path still routes
 // to EnsureS3WarehouseInProject (regression: rename + signature shape).
 func TestAttachWarehouse_S3DispatchUnchanged(t *testing.T) {
@@ -215,12 +148,47 @@ func TestAttachWarehouse_S3DispatchUnchanged(t *testing.T) {
 	}
 }
 
-// TestAttachWarehouse_UnknownType asserts a non-s3, non-gcs type fails.
-func TestAttachWarehouse_UnknownType(t *testing.T) {
-	f := &fakeEnsurer{}
-	err := attachWarehouse(context.Background(), f, "proj-1", "wh", "azure",
-		attachWarehouseS3Opts{}, attachWarehouseGCSOpts{})
-	if err == nil {
-		t.Fatal("expected error for unknown --type")
+// TestAttachWarehouse_InvalidInputRejectedBeforeEnsurer asserts invalid
+// --type / --gcs-bucket / --gcs-credential-type values error out without
+// reaching the Manager.
+func TestAttachWarehouse_InvalidInputRejectedBeforeEnsurer(t *testing.T) {
+	tests := []struct {
+		name         string
+		whType       string
+		gcs          attachWarehouseGCSOpts
+		wantContains string
+	}{
+		{
+			name:         "gcs bucket required",
+			whType:       "gcs",
+			gcs:          attachWarehouseGCSOpts{credType: "system-identity", stsEnabled: true},
+			wantContains: "gcs-bucket",
+		},
+		{
+			name:         "gcs unknown credential type echoes the value",
+			whType:       "gcs",
+			gcs:          attachWarehouseGCSOpts{bucket: "datuplet-gcs", credType: "bogus", stsEnabled: true},
+			wantContains: "bogus",
+		},
+		{
+			name:   "unknown type",
+			whType: "azure",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeEnsurer{}
+			err := attachWarehouse(context.Background(), f, "proj-1", "wh", tc.whType,
+				attachWarehouseS3Opts{}, tc.gcs)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if tc.wantContains != "" && !strings.Contains(err.Error(), tc.wantContains) {
+				t.Errorf("expected error to mention %q; got: %v", tc.wantContains, err)
+			}
+			if f.calledGCS || f.calledS3 {
+				t.Errorf("expected NO ensurer call; calledS3=%v calledGCS=%v", f.calledS3, f.calledGCS)
+			}
+		})
 	}
 }

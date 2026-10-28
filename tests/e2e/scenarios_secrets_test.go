@@ -203,12 +203,8 @@ func TestSecretsLadder(t *testing.T) {
 	defer kb.Cleanup(context.Background())
 
 	pipelinesDir, _ := filepath.Abs("pipelines")
-	testDataDir, _ := filepath.Abs("testdata")
 	templatePath := pipelinesDir + "/k8s/secrets-happy.yaml"
-	rendered, err := framework.RenderPipeline(templatePath, framework.TemplateVars{
-		RunPrefix:   runPrefix,
-		TestDataDir: testDataDir,
-	})
+	rendered, err := framework.RenderPipeline(templatePath, framework.TemplateVars{RunPrefix: runPrefix})
 	if err != nil {
 		t.Fatalf("render secrets-happy.yaml: %v", err)
 	}

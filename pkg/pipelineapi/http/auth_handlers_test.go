@@ -147,35 +147,39 @@ func TestLogin_Success(t *testing.T) {
 	}
 }
 
-func TestLogin_WrongPassword(t *testing.T) {
-	ts, pool, _, cleanup := freshServer(t)
-	defer cleanup()
-	seedUser(t, pool, "alice@example.com", "hunter2")
-
-	resp := postJSON(t, ts.URL+"/api/v1/auth/login",
-		map[string]string{"email": "alice@example.com", "password": "wrong"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 401 {
-		t.Errorf("status = %d, want 401", resp.StatusCode)
+// TestLogin_Failures covers login rejections: a wrong password and an unknown
+// email are the same uniform 401, and neither sets a session cookie.
+func TestLogin_Failures(t *testing.T) {
+	tests := []struct {
+		name     string
+		seedUser bool
+		email    string
+		password string
+	}{
+		{name: "wrong password", seedUser: true, email: "alice@example.com", password: "wrong"},
+		{name: "unknown email", email: "nobody@example.com", password: "x"},
 	}
-	for _, c := range resp.Cookies() {
-		if c.Name == auth.SessionCookieName {
-			t.Error("session cookie must not be set on login failure")
-		}
-	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, _, cleanup := freshServer(t)
+			defer cleanup()
+			if tc.seedUser {
+				seedUser(t, pool, "alice@example.com", "hunter2")
+			}
 
-func TestLogin_UnknownEmail_UniformError(t *testing.T) {
-	ts, _, _, cleanup := freshServer(t)
-	defer cleanup()
+			resp := postJSON(t, ts.URL+"/api/v1/auth/login",
+				map[string]string{"email": tc.email, "password": tc.password})
+			defer resp.Body.Close()
 
-	resp := postJSON(t, ts.URL+"/api/v1/auth/login",
-		map[string]string{"email": "nobody@example.com", "password": "x"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 401 {
-		t.Errorf("status = %d, want 401 (uniform with wrong-password)", resp.StatusCode)
+			if resp.StatusCode != 401 {
+				t.Errorf("status = %d, want 401", resp.StatusCode)
+			}
+			for _, c := range resp.Cookies() {
+				if c.Name == auth.SessionCookieName {
+					t.Error("session cookie must not be set on login failure")
+				}
+			}
+		})
 	}
 }
 

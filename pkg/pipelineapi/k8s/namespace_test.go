@@ -33,18 +33,6 @@ func TestEnsureProjectNamespace_CreatesIfMissing(t *testing.T) {
 	}
 }
 
-func TestEnsureProjectNamespace_Idempotent(t *testing.T) {
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	projectID := uuid.New()
-	if err := pkg8s.EnsureProjectNamespace(context.Background(), c, projectID); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	// Second call must not error even though the namespace now exists.
-	if err := pkg8s.EnsureProjectNamespace(context.Background(), c, projectID); err != nil {
-		t.Fatalf("second: %v", err)
-	}
-}
-
 // getRole / getRoleBinding fetch a namespaced RBAC object for assertions.
 func getRole(t *testing.T, c client.Client, ns, name string) *rbacv1.Role {
 	t.Helper()

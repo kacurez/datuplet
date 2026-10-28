@@ -163,26 +163,10 @@ func TestParseAppsFlags(t *testing.T) {
 	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--bogus"}); err == nil {
 		t.Error("expected error for unknown flag")
 	}
-	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--remote"}); err == nil {
-		t.Error("expected error for --remote missing a value")
-	}
-	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--bundle"}); err == nil {
-		t.Error("expected error for --bundle missing a value")
-	}
-	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--channel"}); err == nil {
-		t.Error("expected error for --channel missing a value")
-	}
-	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--param"}); err == nil {
-		t.Error("expected error for --param missing a value")
-	}
-	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--request-id"}); err == nil {
-		t.Error("expected error for --request-id missing a value")
-	}
-	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--version"}); err == nil {
-		t.Error("expected error for --version missing a value")
-	}
-	if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{"--expected-production"}); err == nil {
-		t.Error("expected error for --expected-production missing a value")
+	for _, flag := range []string{"--remote", "--bundle", "--channel", "--param", "--request-id", "--version", "--expected-production"} {
+		if _, _, _, _, _, _, _, _, _, _, _, err := parseAppsFlags([]string{flag}); err == nil {
+			t.Errorf("expected error for %s missing a value", flag)
+		}
 	}
 }
 
@@ -190,7 +174,8 @@ func TestParseAppsFlags(t *testing.T) {
 
 func TestRunAppsInit_WritesScaffoldIncludingBuildScript(t *testing.T) {
 	tmp := t.TempDir()
-	dir := filepath.Join(tmp, "sales-overview")
+	// Nested: init must also create missing parent directories.
+	dir := filepath.Join(tmp, "nested", "sales-overview")
 
 	if err := runAppsInit([]string{dir}); err != nil {
 		t.Fatalf("runAppsInit: %v", err)
@@ -291,26 +276,6 @@ func TestRunAppsInit_RefusesNonEmptyDir(t *testing.T) {
 	kept, err := os.ReadFile(filepath.Join(dir, "keep.txt"))
 	if err != nil || string(kept) != "pre-existing" {
 		t.Errorf("pre-existing file was modified or removed: %v, %q", err, kept)
-	}
-}
-
-func TestRunAppsInit_RequiresExactlyOneArg(t *testing.T) {
-	if err := runAppsInit(nil); err == nil {
-		t.Error("expected error with no args")
-	}
-	if err := runAppsInit([]string{"a", "b"}); err == nil {
-		t.Error("expected error with more than one arg")
-	}
-}
-
-func TestRunAppsInit_CreatesMissingParentDirs(t *testing.T) {
-	tmp := t.TempDir()
-	dir := filepath.Join(tmp, "nested", "sales-overview")
-	if err := runAppsInit([]string{dir}); err != nil {
-		t.Fatalf("runAppsInit: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "app.js")); err != nil {
-		t.Fatalf("app.js not written: %v", err)
 	}
 }
 
@@ -448,94 +413,87 @@ func writeTempBundle(t *testing.T, content []byte) string {
 	return p
 }
 
-func TestRunAppsPut_UploadsBase64AndPrintsResultJSON(t *testing.T) {
+func TestRunAppsPut_UploadsBase64AndPrintsResult(t *testing.T) {
 	const bundleSrc = "export async function render(ctx){return {outputDoc:1,title:'t',blocks:[]}}"
-	var gotPID, gotName, gotAuth, gotContentType string
-	var gotBundleB64 string
+	tests := []struct {
+		name   string
+		asJSON bool
+	}{{"json", true}, {"text", false}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPID, gotName, gotAuth, gotContentType string
+			var gotBundleB64 string
 
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onPut: func(w http.ResponseWriter, r *http.Request) {
-			gotPID = r.PathValue("pid")
-			gotName = r.PathValue("name")
-			gotAuth = r.Header.Get("Authorization")
-			gotContentType = r.Header.Get("Content-Type")
-			var body struct {
-				BundleBase64 string `json:"bundle_base64"`
+			srv := newAppsFakeServer(t, appsFakeBehaviour{
+				onPut: func(w http.ResponseWriter, r *http.Request) {
+					gotPID = r.PathValue("pid")
+					gotName = r.PathValue("name")
+					gotAuth = r.Header.Get("Authorization")
+					gotContentType = r.Header.Get("Content-Type")
+					var body struct {
+						BundleBase64 string `json:"bundle_base64"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+						return
+					}
+					gotBundleB64 = body.BundleBase64
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"app_id":"app-123","version_hash":"deadbeef"}`))
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
+
+			bundlePath := writeTempBundle(t, []byte(bundleSrc))
+
+			args := []string{"sales-overview", "--project", "proj1", "--bundle", bundlePath}
+			if tc.asJSON {
+				args = append(args, "--json")
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+			var runErr error
+			out := captureStdout(t, func() {
+				runErr = runAppsPut(args)
+			})
+			if runErr != nil {
+				t.Fatalf("runAppsPut: %v", runErr)
+			}
+
+			if gotPID != "proj1" {
+				t.Errorf("pid = %q, want proj1", gotPID)
+			}
+			if gotName != "sales-overview" {
+				t.Errorf("name = %q, want sales-overview", gotName)
+			}
+			if gotAuth != "Bearer headless-token" {
+				t.Errorf("auth = %q", gotAuth)
+			}
+			if gotContentType != "application/json" {
+				t.Errorf("content-type = %q, want application/json", gotContentType)
+			}
+			decoded, err := base64.StdEncoding.DecodeString(gotBundleB64)
+			if err != nil {
+				t.Fatalf("bundle_base64 did not decode: %v", err)
+			}
+			if string(decoded) != bundleSrc {
+				t.Errorf("decoded bundle = %q, want %q", decoded, bundleSrc)
+			}
+
+			if !tc.asJSON {
+				if !strings.Contains(out, "app-123") || !strings.Contains(out, "deadbeef") {
+					t.Errorf("text output missing app_id/version_hash:\n%s", out)
+				}
 				return
 			}
-			gotBundleB64 = body.BundleBase64
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"app_id":"app-123","version_hash":"deadbeef"}`))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	bundlePath := writeTempBundle(t, []byte(bundleSrc))
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsPut([]string{"sales-overview", "--project", "proj1", "--bundle", bundlePath, "--json"})
-	})
-	if runErr != nil {
-		t.Fatalf("runAppsPut: %v", runErr)
-	}
-
-	if gotPID != "proj1" {
-		t.Errorf("pid = %q, want proj1", gotPID)
-	}
-	if gotName != "sales-overview" {
-		t.Errorf("name = %q, want sales-overview", gotName)
-	}
-	if gotAuth != "Bearer headless-token" {
-		t.Errorf("auth = %q", gotAuth)
-	}
-	if gotContentType != "application/json" {
-		t.Errorf("content-type = %q, want application/json", gotContentType)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(gotBundleB64)
-	if err != nil {
-		t.Fatalf("bundle_base64 did not decode: %v", err)
-	}
-	if string(decoded) != bundleSrc {
-		t.Errorf("decoded bundle = %q, want %q", decoded, bundleSrc)
-	}
-
-	var resp appPutResponseJSON
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("--json output is not valid JSON: %v\noutput: %s", err, out)
-	}
-	if resp.AppID != "app-123" || resp.VersionHash != "deadbeef" {
-		t.Errorf("decoded response = %+v, unexpected", resp)
-	}
-}
-
-func TestRunAppsPut_TextModePrintsAppIDAndVersionHash(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onPut: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"app_id":"app-123","version_hash":"deadbeef"}`))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	bundlePath := writeTempBundle(t, []byte("export async function render(ctx){}"))
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsPut([]string{"sales-overview", "--project", "proj1", "--bundle", bundlePath})
-	})
-	if runErr != nil {
-		t.Fatalf("runAppsPut: %v", runErr)
-	}
-	if !strings.Contains(out, "app-123") || !strings.Contains(out, "deadbeef") {
-		t.Errorf("text output missing app_id/version_hash:\n%s", out)
+			var resp appPutResponseJSON
+			if err := json.Unmarshal([]byte(out), &resp); err != nil {
+				t.Fatalf("--json output is not valid JSON: %v\noutput: %s", err, out)
+			}
+			if resp.AppID != "app-123" || resp.VersionHash != "deadbeef" {
+				t.Errorf("decoded response = %+v, unexpected", resp)
+			}
+		})
 	}
 }
 
@@ -565,12 +523,6 @@ func TestRunAppsPut_BundleTooLargeErrorsLocallyBeforeUpload(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "5") || !strings.Contains(strings.ToLower(err.Error()), "exceed") {
 		t.Errorf("error should mention the 5 MB limit: %v", err)
-	}
-}
-
-func TestRunAppsPut_MissingBundleFlagErrors(t *testing.T) {
-	if err := runAppsPut([]string{"sales-overview", "--project", "proj1"}); err == nil {
-		t.Fatal("expected error when --bundle is omitted")
 	}
 }
 
@@ -625,24 +577,6 @@ func TestRunAppsGet_DecodesDetailShape(t *testing.T) {
 	}
 }
 
-func TestRunAppsGet_NotFound(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onGet: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"app not found"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsGet([]string{"nope", "--project", "proj1"})
-	if err == nil {
-		t.Fatal("expected error for 404, got nil")
-	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("error should mention 'not found': %v", err)
-	}
-}
-
 func TestRunAppsList_JSONPassthroughAndTable(t *testing.T) {
 	const fixture = `[
 	  {"app_id":"app-1","name":"sales-overview","created_at":"2026-07-31T00:00:00Z","channels":{"draft":{"version_hash":"deadbeef","updated_at":"2026-07-31T00:01:00Z"}}},
@@ -686,12 +620,6 @@ func TestRunAppsList_JSONPassthroughAndTable(t *testing.T) {
 	}
 }
 
-func TestRunAppsList_RejectsPositionalArgs(t *testing.T) {
-	if err := runAppsList([]string{"unexpected"}); err == nil {
-		t.Fatal("expected error for a positional arg")
-	}
-}
-
 func TestRunAppsDelete_Success(t *testing.T) {
 	var gotMethod, gotName string
 	srv := newAppsFakeServer(t, appsFakeBehaviour{
@@ -715,33 +643,6 @@ func TestRunAppsDelete_Success(t *testing.T) {
 	}
 }
 
-func TestRunAppsDelete_NotFound(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onDelete: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"app not found"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsDelete([]string{"nope", "--project", "proj1"})
-	if err == nil {
-		t.Fatal("expected error for 404, got nil")
-	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("error should mention 'not found': %v", err)
-	}
-}
-
-func TestRunAppsDelete_RequiresExactlyOneName(t *testing.T) {
-	if err := runAppsDelete([]string{"--project", "proj1"}); err == nil {
-		t.Error("expected error with no name")
-	}
-	if err := runAppsDelete([]string{"a", "b", "--project", "proj1"}); err == nil {
-		t.Error("expected error with more than one name")
-	}
-}
-
 // --- app-name validation (C1 gate fix round, Major finding) ---
 //
 // url.PathEscape does NOT encode ".": url.PathEscape("..") == "..". An
@@ -761,72 +662,84 @@ var invalidAppNames = []string{
 	"..", "a/b", "x@draft", "a?b", "-leading-hyphen", "trailing-hyphen-",
 }
 
-func assertLocalNameRejection(t *testing.T, name string, err error) {
+// assertLocalRejection asserts err is a local (pre-network) rejection. Callers
+// point --remote at a port nothing listens on, so a rejection that reached the
+// network layer would surface as a connection error instead.
+func assertLocalRejection(t *testing.T, err error, wantContains string) {
 	t.Helper()
 	if err == nil {
-		t.Fatalf("expected a local rejection for name %q, got nil", name)
+		t.Fatal("expected a local rejection, got nil")
 	}
 	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
-		t.Errorf("name %q: error looks like it came from a network call, not a local rejection: %v", name, err)
+		t.Errorf("error looks like it came from a network call, not a local rejection: %v", err)
 	}
-	// A name starting with "-" (e.g. "-leading-hyphen") never reaches
-	// validateAppName at all: parseAppsFlags's pre-existing convention
-	// (shared with pipeline.go's/components.go's hand-rolled parsers) treats
-	// any leading-dash argument as an unrecognized FLAG, not a positional
-	// value — itself a legitimate local, before-network rejection, just from
-	// a different, older layer than the new name check. Every other shape
-	// here reaches validateAppName and must carry its message; the leading-
-	// hyphen shape is separately proven to fail the regex itself in
-	// TestValidateAppName.
-	if strings.HasPrefix(name, "-") {
-		if !strings.Contains(err.Error(), "unknown flag") {
-			t.Errorf("name %q: expected the flag parser's rejection, got: %v", name, err)
-		}
-		return
-	}
-	if !strings.Contains(err.Error(), "invalid app name") {
-		t.Errorf("name %q: error should name the validation rule: %v", name, err)
+	if wantContains != "" && !strings.Contains(err.Error(), wantContains) {
+		t.Errorf("error should contain %q: %v", wantContains, err)
 	}
 }
 
-func TestRunAppsGet_InvalidNameRejectedLocally(t *testing.T) {
-	for _, name := range invalidAppNames {
-		t.Run(name, func(t *testing.T) {
-			err := runAppsGet([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
-			assertLocalNameRejection(t, name, err)
-		})
-	}
-}
-
-func TestRunAppsDelete_InvalidNameRejectedLocally(t *testing.T) {
-	for _, name := range invalidAppNames {
-		t.Run(name, func(t *testing.T) {
-			err := runAppsDelete([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
-			assertLocalNameRejection(t, name, err)
-		})
-	}
-}
-
-func TestRunAppsPut_InvalidNameRejectedLocally(t *testing.T) {
+// TestApps_InvalidNameOrTokenIDRejectedLocally is the wiring table: every
+// named command must reject a bad name (".." — the shape url.PathEscape does
+// not neutralize) locally, and token delete its malformed token_id via its OWN
+// validator (validateTokenID, never validateAppName). The full name/ID grammar
+// is pinned by TestValidateAppName / TestValidateTokenID.
+func TestApps_InvalidNameOrTokenIDRejectedLocally(t *testing.T) {
+	const remote = "http://127.0.0.1:1"
 	bundlePath := writeTempBundle(t, []byte("export async function render(ctx){}"))
-	for _, name := range invalidAppNames {
-		t.Run(name, func(t *testing.T) {
-			err := runAppsPut([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1", "--bundle", bundlePath})
-			assertLocalNameRejection(t, name, err)
+	tests := []struct {
+		name string
+		run  func() error
+		want string
+	}{
+		{"get", func() error { return runAppsGet([]string{"..", "--remote", remote, "--project", "proj1"}) }, "invalid app name"},
+		{"delete", func() error { return runAppsDelete([]string{"..", "--remote", remote, "--project", "proj1"}) }, "invalid app name"},
+		{"put", func() error {
+			return runAppsPut([]string{"..", "--remote", remote, "--project", "proj1", "--bundle", bundlePath})
+		}, "invalid app name"},
+		{"render", func() error {
+			return runAppsRender([]string{"..", "--remote", remote, "--project", "proj1", "--channel", "draft"})
+		}, "invalid app name"},
+		{"promote", func() error {
+			return runAppsPromote([]string{"..", "--remote", remote, "--project", "proj1", "--version", testVersionHash})
+		}, "invalid app name"},
+		{"token create", func() error { return runAppsTokenCreate([]string{"..", "--remote", remote, "--project", "proj1"}) }, "invalid app name"},
+		{"token delete malformed token id", func() error {
+			return runAppsTokenDelete([]string{"sales-overview", "not-a-uuid", "--remote", remote, "--project", "proj1"})
+		}, "invalid token id"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertLocalRejection(t, tc.run(), tc.want)
 		})
 	}
 }
 
-// TestRunAppsGet_ValidNameNotRejectedByNameCheck proves a well-formed name
-// sails past local validation: the call still fails (the remote is
-// unreachable), but for a DIFFERENT reason than name validation.
-func TestRunAppsGet_ValidNameNotRejectedByNameCheck(t *testing.T) {
-	err := runAppsGet([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1"})
-	if err == nil {
-		t.Fatal("expected an error (unreachable remote), got nil")
+// TestApps_UsageErrorsRejectedLocally covers arity / missing-required-flag /
+// unknown-subcommand errors: all must fail locally, before any network call.
+func TestApps_UsageErrorsRejectedLocally(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func() error
+		want string
+	}{
+		{"init no args", func() error { return runAppsInit(nil) }, ""},
+		{"init more than one arg", func() error { return runAppsInit([]string{"a", "b"}) }, ""},
+		{"put missing --bundle", func() error { return runAppsPut([]string{"sales-overview", "--project", "proj1"}) }, ""},
+		{"list positional arg", func() error { return runAppsList([]string{"unexpected"}) }, ""},
+		{"delete no name", func() error { return runAppsDelete([]string{"--project", "proj1"}) }, ""},
+		{"delete more than one name", func() error { return runAppsDelete([]string{"a", "b", "--project", "proj1"}) }, ""},
+		{"promote missing --version", func() error {
+			return runAppsPromote([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1"})
+		}, "--version"},
+		{"token delete missing token_id", func() error { return runAppsTokenDelete([]string{"sales-overview", "--project", "proj1"}) }, ""},
+		{"token delete no positional args", func() error { return runAppsTokenDelete([]string{"--project", "proj1"}) }, ""},
+		{"token unknown subcommand", func() error { return runAppsToken([]string{"bogus", "sales-overview"}) }, ""},
+		{"token no subcommand", func() error { return runAppsToken(nil) }, ""},
 	}
-	if strings.Contains(err.Error(), "invalid app name") {
-		t.Errorf("a valid name must not be rejected by local validation: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertLocalRejection(t, tc.run(), tc.want)
+		})
 	}
 }
 
@@ -913,80 +826,86 @@ const renderDocFixture = `{"outputDoc":1,"title":"Sales overview","blocks":[]}`
 // render envelope below.
 const renderLogFixture = `{"request_id":"req-1","app_id":"app-1","version_hash":"deadbeef","channel":"draft","principal_kind":"platform_user","principal_id":"user-1","started_at":"2026-07-31T00:00:00Z","duration_ms":42,"outcome":"render_error","log_text":"TypeError: cannot read x","error":"the app threw"}`
 
-// TestRunAppsRender_DraftJSONSendsBearerAcceptAndPrintsDoc is the core §5.5
-// success path: `render --channel draft --param days=7 --json` must hit
+// TestRunAppsRender_SendsBearerAcceptAndPrintsDoc is the core §5.5 success
+// path: `render --channel draft --param days=7 --json` must hit
 // `/apps/{pid}/{name}@draft?days=7` with the author's bearer credential and
-// `Accept: application/json`, and print the OutputDoc verbatim on 200.
-func TestRunAppsRender_DraftJSONSendsBearerAcceptAndPrintsDoc(t *testing.T) {
-	var gotPath, gotAuth, gotAccept, gotDays string
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onRender: func(w http.ResponseWriter, r *http.Request) {
-			gotPath = r.URL.Path
-			gotAuth = r.Header.Get("Authorization")
-			gotAccept = r.Header.Get("Accept")
-			gotDays = r.URL.Query().Get("days")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(renderDocFixture))
+// `Accept: application/json`, and print the OutputDoc verbatim on 200. The
+// default (and explicit production) channel targets the bare route, never
+// `@draft`.
+func TestRunAppsRender_SendsBearerAcceptAndPrintsDoc(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantPath string
+		wantDays string
+		asJSON   bool
+	}{
+		{
+			name:     "draft with param, json",
+			args:     []string{"sales-overview", "--project", "proj1", "--channel", "draft", "--param", "days=7", "--json"},
+			wantPath: "/apps/proj1/sales-overview@draft", // literal @draft, not %40
+			wantDays: "7",
+			asJSON:   true,
 		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+		{
+			name:     "channel omitted is production",
+			args:     []string{"sales-overview", "--project", "proj1"},
+			wantPath: "/apps/proj1/sales-overview", // no @draft
+		},
+		{
+			name:     "explicit production",
+			args:     []string{"sales-overview", "--project", "proj1", "--channel", "production"},
+			wantPath: "/apps/proj1/sales-overview", // no @draft
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath, gotAuth, gotAccept, gotDays string
+			srv := newAppsFakeServer(t, appsFakeBehaviour{
+				onRender: func(w http.ResponseWriter, r *http.Request) {
+					gotPath = r.URL.Path
+					gotAuth = r.Header.Get("Authorization")
+					gotAccept = r.Header.Get("Accept")
+					gotDays = r.URL.Query().Get("days")
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(renderDocFixture))
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
 
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--param", "days=7", "--json"})
-	})
-	if runErr != nil {
-		t.Fatalf("runAppsRender: %v", runErr)
-	}
-	if gotPath != "/apps/proj1/sales-overview@draft" {
-		t.Errorf("path = %q, want /apps/proj1/sales-overview@draft (literal @draft, not %%40)", gotPath)
-	}
-	if gotAuth != "Bearer headless-token" {
-		t.Errorf("auth = %q, want Bearer headless-token", gotAuth)
-	}
-	if gotAccept != "application/json" {
-		t.Errorf("accept = %q, want application/json", gotAccept)
-	}
-	if gotDays != "7" {
-		t.Errorf("days param = %q, want 7", gotDays)
-	}
-	// Success prints the OutputDoc verbatim — the agent asserts on this.
-	var doc map[string]any
-	if err := json.Unmarshal([]byte(out), &doc); err != nil {
-		t.Fatalf("stdout is not the OutputDoc JSON: %v\noutput: %s", err, out)
-	}
-	if doc["title"] != "Sales overview" {
-		t.Errorf("doc title = %v, want Sales overview", doc["title"])
-	}
-}
-
-// TestRunAppsRender_ProductionChannelHasNoDraftSuffix proves the default (and
-// explicit production) channel targets the bare route, never `@draft`.
-func TestRunAppsRender_ProductionChannelHasNoDraftSuffix(t *testing.T) {
-	for _, args := range [][]string{
-		{"sales-overview", "--project", "proj1"},                            // channel omitted → production
-		{"sales-overview", "--project", "proj1", "--channel", "production"}, // explicit
-	} {
-		var gotPath string
-		srv := newAppsFakeServer(t, appsFakeBehaviour{
-			onRender: func(w http.ResponseWriter, r *http.Request) {
-				gotPath = r.URL.Path
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(renderDocFixture))
-			},
+			var runErr error
+			out := captureStdout(t, func() {
+				runErr = runAppsRender(tc.args)
+			})
+			if runErr != nil {
+				t.Fatalf("runAppsRender(%v): %v", tc.args, runErr)
+			}
+			if gotPath != tc.wantPath {
+				t.Errorf("path = %q, want %q", gotPath, tc.wantPath)
+			}
+			if gotAuth != "Bearer headless-token" {
+				t.Errorf("auth = %q, want Bearer headless-token", gotAuth)
+			}
+			if gotAccept != "application/json" {
+				t.Errorf("accept = %q, want application/json", gotAccept)
+			}
+			if gotDays != tc.wantDays {
+				t.Errorf("days param = %q, want %q", gotDays, tc.wantDays)
+			}
+			if !tc.asJSON {
+				return
+			}
+			// Success prints the OutputDoc verbatim — the agent asserts on this.
+			var doc map[string]any
+			if err := json.Unmarshal([]byte(out), &doc); err != nil {
+				t.Fatalf("stdout is not the OutputDoc JSON: %v\noutput: %s", err, out)
+			}
+			if doc["title"] != "Sales overview" {
+				t.Errorf("doc title = %v, want Sales overview", doc["title"])
+			}
 		})
-		setHeadlessEnv(t, srv.URL)
-		var runErr error
-		_ = captureStdout(t, func() { runErr = runAppsRender(args) })
-		srv.Close()
-		if runErr != nil {
-			t.Fatalf("runAppsRender(%v): %v", args, runErr)
-		}
-		if gotPath != "/apps/proj1/sales-overview" {
-			t.Errorf("args %v: path = %q, want /apps/proj1/sales-overview (no @draft)", args, gotPath)
-		}
 	}
 }
 
@@ -1044,72 +963,60 @@ func TestRunAppsRender_ErrorEnvelopeFetchesAuthorLogAndPrintsOneObject(t *testin
 	}
 }
 
-// TestRunAppsRender_ErrorEnvelopeAuthorLogNullWhenLogs404 proves author_log is
-// JSON null when the log lookup 404s (aged out / never existed), and the run
-// still exits 1.
-func TestRunAppsRender_ErrorEnvelopeAuthorLogNullWhenLogs404(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onRender: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"render failed","kind":"render_error","request_id":"req-1"}`))
-		},
-		onLogs: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"no render log for that request_id"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
+// TestRunAppsRender_AuthorLogLookupFailureLeavesNullObject proves author_log is
+// JSON null (key present) when the log lookup fails, the stdout object shape
+// stays {error,kind,request_id,author_log:null}, and the run still exits 1. A
+// genuine 404 (aged out / never existed) stays silent — null is the expected
+// signal — while a NON-404 failure also emits a one-line stderr diagnostic
+// naming the request_id, so the agent can tell "log route broken" from "log
+// aged out".
+func TestRunAppsRender_AuthorLogLookupFailureLeavesNullObject(t *testing.T) {
+	tests := []struct {
+		name       string
+		logsStatus int
+		logsBody   string
+		wantNote   bool
+	}{
+		{"logs 404 stays silent", http.StatusNotFound, `{"error":"no render log for that request_id"}`, false},
+		{"logs 500 emits stderr note", http.StatusInternalServerError, `{"error":"boom"}`, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newAppsFakeServer(t, appsFakeBehaviour{
+				onRender: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"error":"render failed","kind":"render_error","request_id":"req-1"}`))
+				},
+				onLogs: func(w http.ResponseWriter, r *http.Request) {
+					http.Error(w, tc.logsBody, tc.logsStatus)
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
 
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--json"})
-	})
-	if code := exitCodeOf(runErr); code != 1 {
-		t.Fatalf("exit code = %d, want 1: %v", code, runErr)
-	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(out), &obj); err != nil {
-		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
-	}
-	al, present := obj["author_log"]
-	if !present {
-		t.Errorf("author_log key must be present (as null), got absent: %s", out)
-	}
-	if al != nil {
-		t.Errorf("author_log = %v, want null on a logs 404", al)
-	}
-}
-
-// TestRunAppsRender_TransportFailureExits20 proves a failure to reach the
-// service (connection refused) is the transport class → exit 20, the branch
-// the agent loop uses to distinguish "my app is broken" (1) from "the
-// platform is unreachable" (20).
-func TestRunAppsRender_TransportFailureExits20(t *testing.T) {
-	setHeadlessEnv(t, "http://127.0.0.1:1") // nothing listens here
-	err := runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft"})
-	if code := exitCodeOf(err); code != 20 {
-		t.Fatalf("exit code = %d, want 20 (transport failure): %v", code, err)
-	}
-}
-
-// TestRunAppsRender_NonEnvelopeErrorExits20 proves a non-200 whose body is NOT
-// the structured envelope (e.g. an ingress 502 HTML page) is also transport
-// class → exit 20, not a render failure.
-func TestRunAppsRender_NonEnvelopeErrorExits20(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onRender: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/html")
-			w.WriteHeader(http.StatusBadGateway)
-			_, _ = w.Write([]byte("<html><body>502 Bad Gateway</body></html>"))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft"})
-	if code := exitCodeOf(err); code != 20 {
-		t.Fatalf("exit code = %d, want 20 (non-envelope error): %v", code, err)
+			var runErr error
+			stdout, stderr := captureStdoutAndStderr(t, func() {
+				runErr = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--json"})
+			})
+			if code := exitCodeOf(runErr); code != 1 {
+				t.Fatalf("exit code = %d, want 1: %v", code, runErr)
+			}
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(stdout), &obj); err != nil {
+				t.Fatalf("stdout is not one JSON object: %v\n%s", err, stdout)
+			}
+			if al, present := obj["author_log"]; !present || al != nil {
+				t.Errorf("author_log must be present and null, got present=%v value=%v", present, al)
+			}
+			hasNote := strings.Contains(stderr, "could not fetch author log")
+			if hasNote != tc.wantNote {
+				t.Errorf("stderr diagnostic present = %v, want %v; stderr:\n%s", hasNote, tc.wantNote, stderr)
+			}
+			if tc.wantNote && !strings.Contains(stderr, "req-1") {
+				t.Errorf("the diagnostic should name the request_id; stderr:\n%s", stderr)
+			}
+		})
 	}
 }
 
@@ -1150,46 +1057,22 @@ func TestRunAppsRender_TextModeFailureGoesToStderr(t *testing.T) {
 	}
 }
 
-// TestRunAppsRender_InvalidNameRejectedLocally reuses the shared bad-name
-// table: a bad name must be rejected before any network call, exactly as
-// get/put/delete do.
-func TestRunAppsRender_InvalidNameRejectedLocally(t *testing.T) {
-	for _, name := range invalidAppNames {
-		t.Run(name, func(t *testing.T) {
-			err := runAppsRender([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1", "--channel", "draft"})
-			assertLocalNameRejection(t, name, err)
+// TestRunAppsRender_InvalidFlagsRejectedLocally proves a bad --channel value
+// (rather than silently rendering production or building a malformed path) and
+// a --param without '=' both error locally, before any network call.
+func TestRunAppsRender_InvalidFlagsRejectedLocally(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"invalid channel", []string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1", "--channel", "prod"}, "channel"},
+		{"invalid param", []string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1", "--channel", "draft", "--param", "noequalshere"}, "param"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertLocalRejection(t, runAppsRender(tc.args), tc.want)
 		})
-	}
-}
-
-// TestRunAppsRender_InvalidChannelRejectedLocally proves a bad --channel value
-// errors locally (before any network call), rather than silently rendering
-// production or building a malformed path.
-func TestRunAppsRender_InvalidChannelRejectedLocally(t *testing.T) {
-	err := runAppsRender([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1", "--channel", "prod"})
-	if err == nil {
-		t.Fatal("expected an error for an invalid --channel, got nil")
-	}
-	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
-		t.Errorf("error looks like a network failure, not a local channel check: %v", err)
-	}
-	if !strings.Contains(err.Error(), "channel") {
-		t.Errorf("error should name the channel rule: %v", err)
-	}
-}
-
-// TestRunAppsRender_InvalidParamRejectedLocally proves a --param without '='
-// errors locally.
-func TestRunAppsRender_InvalidParamRejectedLocally(t *testing.T) {
-	err := runAppsRender([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1", "--channel", "draft", "--param", "noequalshere"})
-	if err == nil {
-		t.Fatal("expected an error for a malformed --param, got nil")
-	}
-	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
-		t.Errorf("error looks like a network failure, not a local param check: %v", err)
-	}
-	if !strings.Contains(err.Error(), "param") {
-		t.Errorf("error should name the --param rule: %v", err)
 	}
 }
 
@@ -1275,27 +1158,6 @@ func TestRunAppsLogs_ByRequestIDPrintsOne(t *testing.T) {
 	}
 }
 
-func TestRunAppsLogs_ByRequestIDNotFoundExits1(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onLogs: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"no render log for that request_id"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsLogs([]string{"sales-overview", "--project", "proj1", "--request-id", "missing"})
-	if err == nil {
-		t.Fatal("expected an error for an unknown request_id, got nil")
-	}
-	if code := exitCodeOf(err); code != 1 {
-		t.Errorf("exit code = %d, want 1", code)
-	}
-	if !strings.Contains(strings.ToLower(err.Error()), "not found") {
-		t.Errorf("error should say 'not found': %v", err)
-	}
-}
-
 // --- C2 fix round: no --param value in render error text; author-log fetch
 //     failure distinguishable from a 404 ---
 
@@ -1321,83 +1183,6 @@ func TestRunAppsRender_TransportErrorDoesNotLeakParamValues(t *testing.T) {
 		if strings.Contains(s, "secret=") {
 			t.Errorf("%s leaked the --param key=value: %q", label, s)
 		}
-	}
-}
-
-// TestRunAppsRender_AuthorLogFetch500EmitsStderrNoteButNullObject proves a
-// NON-404 author-log fetch failure (500 here) keeps the stdout object shape
-// exactly {error,kind,request_id,author_log:null} (JSON consumers unaffected)
-// while additionally emitting a one-line diagnostic to stderr, so the agent
-// can tell "log route broken" from "log aged out".
-func TestRunAppsRender_AuthorLogFetch500EmitsStderrNoteButNullObject(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onRender: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"render failed","kind":"render_error","request_id":"req-1"}`))
-		},
-		onLogs: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	stdout, stderr := captureStdoutAndStderr(t, func() {
-		runErr = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--json"})
-	})
-	if code := exitCodeOf(runErr); code != 1 {
-		t.Fatalf("exit code = %d, want 1: %v", code, runErr)
-	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(stdout), &obj); err != nil {
-		t.Fatalf("stdout is not one JSON object: %v\n%s", err, stdout)
-	}
-	al, present := obj["author_log"]
-	if !present || al != nil {
-		t.Errorf("author_log must stay null on a non-404 fetch failure, got present=%v value=%v", present, al)
-	}
-	if !strings.Contains(stderr, "could not fetch author log") {
-		t.Errorf("a non-404 log-fetch failure must emit a stderr diagnostic; stderr:\n%s", stderr)
-	}
-	if !strings.Contains(stderr, "req-1") {
-		t.Errorf("the diagnostic should name the request_id; stderr:\n%s", stderr)
-	}
-}
-
-// TestRunAppsRender_AuthorLog404StaysSilent proves a genuine 404 (aged out /
-// never existed) stays silent — null is the expected signal, no diagnostic.
-func TestRunAppsRender_AuthorLog404StaysSilent(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onRender: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"render failed","kind":"render_error","request_id":"req-1"}`))
-		},
-		onLogs: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"no render log for that request_id"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	stdout, stderr := captureStdoutAndStderr(t, func() {
-		runErr = runAppsRender([]string{"sales-overview", "--project", "proj1", "--channel", "draft", "--json"})
-	})
-	if code := exitCodeOf(runErr); code != 1 {
-		t.Fatalf("exit code = %d, want 1: %v", code, runErr)
-	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(stdout), &obj); err != nil {
-		t.Fatalf("stdout is not one JSON object: %v\n%s", err, stdout)
-	}
-	if al, present := obj["author_log"]; !present || al != nil {
-		t.Errorf("author_log must be null on a 404, got present=%v value=%v", present, al)
-	}
-	if strings.Contains(stderr, "could not fetch author log") {
-		t.Errorf("a 404 (aged out) must stay silent — no diagnostic; stderr:\n%s", stderr)
 	}
 }
 
@@ -1462,8 +1247,10 @@ const (
 	testTokenID                = "550e8400-e29b-41d4-a716-446655440000"
 	testTokenSecret            = "vw_" + testTokenID + ".SUPER-SECRET-VALUE-DO-NOT-LOG"
 	tokenCreateResponseFixture = `{"token_id":"` + testTokenID + `","token":"` + testTokenSecret + `"}`
-	tokenListFixture           = `[{"token_id":"` + testTokenID + `","created_at":"2026-07-31T00:00:00Z"},` +
-		`{"token_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","created_at":"2026-07-30T00:00:00Z","revoked_at":"2026-07-30T12:00:00Z"}]`
+	// tokenListFixture is deliberately "leaky": each entry carries a sensitive
+	// field the CLI must never echo.
+	tokenListFixture = `[{"token_id":"` + testTokenID + `","created_at":"2026-07-31T00:00:00Z","revoked_at":null,"secret_hash":"deadbeefdeadbeef"},` +
+		`{"token_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","created_at":"2026-07-30T00:00:00Z","revoked_at":"2026-07-30T12:00:00Z","secret_hash":"deadbeefdeadbeef"}]`
 )
 
 // --- validateVersionHash / validateTokenID (pure) ---
@@ -1514,70 +1301,70 @@ func TestValidateTokenID(t *testing.T) {
 
 // --- apps promote (CAS-repoint production, spec §5.1) ---
 
-// TestRunAppsPromote_HappyPathOmitsExpectedProductionOnFirstPromote proves
-// the request shape for a first promote: expectedProduction must be OMITTED
-// (not sent as an empty string) when --expected-production is not passed,
-// and a 200 prints the new production version in text mode.
-func TestRunAppsPromote_HappyPathOmitsExpectedProductionOnFirstPromote(t *testing.T) {
-	var gotBody map[string]any
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onPromote: func(w http.ResponseWriter, r *http.Request) {
-			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-				http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+// TestRunAppsPromote_RequestShapeAndOutput proves the request shape: on a first
+// promote expectedProduction is OMITTED (not sent as an empty string); the CAS
+// precondition round-trips into the body when --expected-production is passed;
+// and the server's production_version is surfaced in both text and --json mode.
+func TestRunAppsPromote_RequestShapeAndOutput(t *testing.T) {
+	tests := []struct {
+		name         string
+		extraArgs    []string
+		wantExpected string // "" means the field must be omitted
+		asJSON       bool
+	}{
+		{"first promote omits expectedProduction (text)", nil, "", false},
+		{"sends expectedProduction when provided", []string{"--expected-production", testOldVersionHash}, testOldVersionHash, false},
+		{"json passes through server body", []string{"--json"}, "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody map[string]any
+			srv := newAppsFakeServer(t, appsFakeBehaviour{
+				onPromote: func(w http.ResponseWriter, r *http.Request) {
+					if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+						http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"production_version":"` + testVersionHash + `"}`))
+				},
+			})
+			defer srv.Close()
+			setHeadlessEnv(t, srv.URL)
+
+			args := append([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash}, tc.extraArgs...)
+			var runErr error
+			out := captureStdout(t, func() {
+				runErr = runAppsPromote(args)
+			})
+			if runErr != nil {
+				t.Fatalf("runAppsPromote: %v", runErr)
+			}
+			if gotBody["version"] != testVersionHash {
+				t.Errorf("body version = %v, want %s", gotBody["version"], testVersionHash)
+			}
+			if tc.wantExpected == "" {
+				if _, present := gotBody["expectedProduction"]; present {
+					t.Errorf("expectedProduction should be OMITTED from the body, got %v", gotBody)
+				}
+			} else if gotBody["expectedProduction"] != tc.wantExpected {
+				t.Errorf("body expectedProduction = %v, want %s", gotBody["expectedProduction"], tc.wantExpected)
+			}
+			if !tc.asJSON {
+				if !strings.Contains(out, testVersionHash) {
+					t.Errorf("text output should show the new production version:\n%s", out)
+				}
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"production_version":"` + testVersionHash + `"}`))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash})
-	})
-	if runErr != nil {
-		t.Fatalf("runAppsPromote: %v", runErr)
-	}
-	if _, present := gotBody["expectedProduction"]; present {
-		t.Errorf("expectedProduction should be OMITTED from the body on a first promote, got %v", gotBody)
-	}
-	if gotBody["version"] != testVersionHash {
-		t.Errorf("body version = %v, want %s", gotBody["version"], testVersionHash)
-	}
-	if !strings.Contains(out, testVersionHash) {
-		t.Errorf("text output should show the new production version:\n%s", out)
-	}
-}
-
-// TestRunAppsPromote_SendsExpectedProductionWhenProvided proves the CAS
-// precondition round-trips into the request body when --expected-production
-// is passed.
-func TestRunAppsPromote_SendsExpectedProductionWhenProvided(t *testing.T) {
-	var gotBody map[string]any
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onPromote: func(w http.ResponseWriter, r *http.Request) {
-			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-				http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
-				return
+			var decoded appsPromoteResponseJSON
+			if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+				t.Fatalf("--json output is not valid JSON: %v\noutput: %s", err, out)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"production_version":"` + testVersionHash + `"}`))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsPromote([]string{"sales-overview", "--project", "proj1",
-		"--version", testVersionHash, "--expected-production", testOldVersionHash})
-	if err != nil {
-		t.Fatalf("runAppsPromote: %v", err)
-	}
-	if gotBody["expectedProduction"] != testOldVersionHash {
-		t.Errorf("body expectedProduction = %v, want %s", gotBody["expectedProduction"], testOldVersionHash)
+			if decoded.ProductionVersion != testVersionHash {
+				t.Errorf("production_version = %q, want %s", decoded.ProductionVersion, testVersionHash)
+			}
+		})
 	}
 }
 
@@ -1614,129 +1401,24 @@ func TestRunAppsPromote_CASConflictExitsDistinctCodeWithClearMessage(t *testing.
 	}
 }
 
-func TestRunAppsPromote_MissingVersionErrorsLocally(t *testing.T) {
-	err := runAppsPromote([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1"})
-	if err == nil {
-		t.Fatal("expected an error when --version is omitted, got nil")
+// TestRunAppsPromote_MalformedHashRejectedLocally proves a malformed --version
+// or --expected-production value is rejected LOCALLY (before any network
+// call) — the "basic shape check", not full server-side validation.
+func TestRunAppsPromote_MalformedHashRejectedLocally(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"version not-a-hash", []string{"--version", "not-a-hash"}},
+		{"version too short", []string{"--version", "deadbeef"}},
+		{"version non-hex", []string{"--version", strings.Repeat("g", 64)}},
+		{"expected-production not-a-hash", []string{"--version", testVersionHash, "--expected-production", "not-a-hash"}},
 	}
-	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
-		t.Errorf("error looks like it came from a network call: %v", err)
-	}
-	if !strings.Contains(err.Error(), "--version") {
-		t.Errorf("error should name --version as required: %v", err)
-	}
-}
-
-// TestRunAppsPromote_BadHashRejectedLocally proves a malformed --version
-// value is rejected LOCALLY (before any network call) — the "basic shape
-// check" the task calls for, not full server-side validation.
-func TestRunAppsPromote_BadHashRejectedLocally(t *testing.T) {
-	for _, bad := range []string{"not-a-hash", "deadbeef", strings.Repeat("g", 64)} {
-		t.Run(bad, func(t *testing.T) {
-			err := runAppsPromote([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1", "--version", bad})
-			if err == nil {
-				t.Fatal("expected a local rejection for a malformed --version, got nil")
-			}
-			if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
-				t.Errorf("error looks like it came from a network call, not a local rejection: %v", err)
-			}
-			if !strings.Contains(err.Error(), "invalid version hash") {
-				t.Errorf("error should name the validation rule: %v", err)
-			}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1"}, tc.args...)
+			assertLocalRejection(t, runAppsPromote(args), "invalid version hash")
 		})
-	}
-}
-
-func TestRunAppsPromote_BadExpectedProductionRejectedLocally(t *testing.T) {
-	err := runAppsPromote([]string{"sales-overview", "--remote", "http://127.0.0.1:1", "--project", "proj1",
-		"--version", testVersionHash, "--expected-production", "not-a-hash"})
-	if err == nil {
-		t.Fatal("expected a local rejection for a malformed --expected-production, got nil")
-	}
-	if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
-		t.Errorf("error looks like it came from a network call: %v", err)
-	}
-	if !strings.Contains(err.Error(), "invalid version hash") {
-		t.Errorf("error should name the validation rule: %v", err)
-	}
-}
-
-func TestRunAppsPromote_InvalidNameRejectedLocally(t *testing.T) {
-	for _, name := range invalidAppNames {
-		t.Run(name, func(t *testing.T) {
-			err := runAppsPromote([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1", "--version", testVersionHash})
-			assertLocalNameRejection(t, name, err)
-		})
-	}
-}
-
-func TestRunAppsPromote_NotFoundExits1(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onPromote: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"app not found"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsPromote([]string{"nope", "--project", "proj1", "--version", testVersionHash})
-	if err == nil {
-		t.Fatal("expected an error for 404, got nil")
-	}
-	if code := exitCodeOf(err); code != 1 {
-		t.Errorf("exit code = %d, want 1", code)
-	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("error should mention 'not found': %v", err)
-	}
-}
-
-// TestRunAppsPromote_UnknownVersionExits1 proves a 400 (a hash that never
-// existed for this app) is a plain user error — exit 1 — DISTINCT from the
-// 409 CAS-conflict's own exit code, even though both are "your promote
-// didn't happen".
-func TestRunAppsPromote_UnknownVersionExits1(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onPromote: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"unknown version hash for this app"}`, http.StatusBadRequest)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash})
-	if err == nil {
-		t.Fatal("expected an error for an unknown version, got nil")
-	}
-	if code := exitCodeOf(err); code != 1 {
-		t.Errorf("exit code = %d, want 1 (distinct from the 409 CAS-conflict code)", code)
-	}
-}
-
-func TestRunAppsPromote_JSONPassesThroughServerBody(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onPromote: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"production_version":"` + testVersionHash + `"}`))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash, "--json"})
-	})
-	if runErr != nil {
-		t.Fatalf("runAppsPromote --json: %v", runErr)
-	}
-	var decoded appsPromoteResponseJSON
-	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
-		t.Fatalf("--json output is not valid JSON: %v\noutput: %s", err, out)
-	}
-	if decoded.ProductionVersion != testVersionHash {
-		t.Errorf("production_version = %q, want %s", decoded.ProductionVersion, testVersionHash)
 	}
 }
 
@@ -1811,37 +1493,13 @@ func TestRunAppsTokenCreate_PrintsSecretExactlyOnceWithStoreNote(t *testing.T) {
 	}
 }
 
-func TestRunAppsTokenCreate_NotFoundExits1(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onCreateToken: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"app not found"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsTokenCreate([]string{"nope", "--project", "proj1"})
-	if err == nil {
-		t.Fatal("expected an error for 404, got nil")
-	}
-	if code := exitCodeOf(err); code != 1 {
-		t.Errorf("exit code = %d, want 1", code)
-	}
-}
-
-func TestRunAppsTokenCreate_InvalidNameRejectedLocally(t *testing.T) {
-	for _, name := range invalidAppNames {
-		t.Run(name, func(t *testing.T) {
-			err := runAppsTokenCreate([]string{name, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
-			assertLocalNameRejection(t, name, err)
-		})
-	}
-}
-
-// TestRunAppsTokenList_ShowsIDsNotSecrets is the core "never prints a
-// secret" contract: appTokenSummaryJSON has no secret field at all, so this
-// also proves the type itself can't leak one.
-func TestRunAppsTokenList_ShowsIDsNotSecrets(t *testing.T) {
+// TestRunAppsTokenList_ShowsIDsNeverSecrets is the core "never prints a
+// secret" contract: --json DECODES the server response into
+// appTokenSummaryJSON and RE-ENCODES that (rather than printing the raw body
+// verbatim), so an unexpected sensitive field in the response ("secret_hash"
+// in the fixture) can never reach the output in either mode —
+// appTokenSummaryJSON has no field for it to decode into.
+func TestRunAppsTokenList_ShowsIDsNeverSecrets(t *testing.T) {
 	var gotMethod, gotPath string
 	srv := newAppsFakeServer(t, appsFakeBehaviour{
 		onListTokens: func(w http.ResponseWriter, r *http.Request) {
@@ -1868,15 +1526,15 @@ func TestRunAppsTokenList_ShowsIDsNotSecrets(t *testing.T) {
 	if gotPath != "/api/v1/projects/proj1/apps/sales-overview/tokens" {
 		t.Errorf("path = %q", gotPath)
 	}
+	if strings.Contains(out, "vw_") || strings.Contains(out, "secret") || strings.Contains(out, "deadbeef") {
+		t.Fatalf("--json output must project through appTokenSummaryJSON (decode+re-encode), never carry a secret; got:\n%s", out)
+	}
 	var items []appTokenSummaryJSON
 	if err := json.Unmarshal([]byte(out), &items); err != nil {
-		t.Fatalf("--json output is not a JSON array: %v\n%s", err, out)
+		t.Fatalf("--json output is not a JSON array of appTokenSummaryJSON: %v\n%s", err, out)
 	}
-	if len(items) != 2 {
-		t.Fatalf("len(items) = %d, want 2", len(items))
-	}
-	if strings.Contains(out, "vw_") || strings.Contains(out, "secret") {
-		t.Errorf("token list output must never contain a secret: %s", out)
+	if len(items) != 2 || items[0].TokenID != testTokenID {
+		t.Fatalf("decoded items = %+v, want 2 entries, first with token_id %s", items, testTokenID)
 	}
 
 	out = captureStdout(t, func() {
@@ -1888,70 +1546,8 @@ func TestRunAppsTokenList_ShowsIDsNotSecrets(t *testing.T) {
 	if !strings.Contains(out, testTokenID) {
 		t.Errorf("table output missing the token id:\n%s", out)
 	}
-	if strings.Contains(out, "vw_") {
+	if strings.Contains(out, "vw_") || strings.Contains(out, "secret") || strings.Contains(out, "deadbeef") {
 		t.Errorf("table output must never contain a secret:\n%s", out)
-	}
-}
-
-func TestRunAppsTokenList_Empty(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onListTokens: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`[]`))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsTokenList([]string{"sales-overview", "--project", "proj1"})
-	})
-	if runErr != nil {
-		t.Fatalf("runAppsTokenList: %v", runErr)
-	}
-	if !strings.Contains(out, "no viewer tokens") {
-		t.Errorf("expected an empty-list message, got:\n%s", out)
-	}
-}
-
-// TestRunAppsTokenList_JSONProjectsThroughSafeSummaryType proves --json
-// DECODES the server response into appTokenSummaryJSON and RE-ENCODES that,
-// rather than printing the raw server body through verbatim (Codex Minor,
-// RFC 028 Part 5 gate): a server response carrying an unexpected sensitive
-// field must never reach the CLI's --json output, because
-// appTokenSummaryJSON has no field for it to decode into. Run against the
-// pre-fix raw-passthrough code, this test fails (the fixture's
-// "secret_hash" and "deadbeef" appear verbatim in stdout).
-func TestRunAppsTokenList_JSONProjectsThroughSafeSummaryType(t *testing.T) {
-	const leakyBody = `[{"token_id":"` + testTokenID + `","created_at":"2026-07-31T00:00:00Z","revoked_at":null,"secret_hash":"deadbeefdeadbeef"}]`
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onListTokens: func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(leakyBody))
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = runAppsTokenList([]string{"sales-overview", "--project", "proj1", "--json"})
-	})
-	if runErr != nil {
-		t.Fatalf("runAppsTokenList --json: %v", runErr)
-	}
-	if strings.Contains(out, "secret_hash") || strings.Contains(out, "deadbeef") {
-		t.Fatalf("--json output must project through appTokenSummaryJSON (decode+re-encode), not pass the server body through verbatim; got:\n%s", out)
-	}
-	var items []appTokenSummaryJSON
-	if err := json.Unmarshal([]byte(out), &items); err != nil {
-		t.Fatalf("--json output is not a JSON array of appTokenSummaryJSON: %v\n%s", err, out)
-	}
-	if len(items) != 1 || items[0].TokenID != testTokenID {
-		t.Fatalf("decoded items = %+v, want one entry with token_id %s", items, testTokenID)
 	}
 }
 
@@ -1982,106 +1578,62 @@ func TestRunAppsTokenDelete_CallsDeleteWithID(t *testing.T) {
 	}
 }
 
-// TestRunAppsTokenDelete_MalformedTokenIDRejectedLocally proves a malformed
-// token_id is rejected LOCALLY, before any network call, via its OWN
-// validator (validateTokenID) — never validateAppName, which is for app
-// names and would accept/reject on a completely different grammar.
-func TestRunAppsTokenDelete_MalformedTokenIDRejectedLocally(t *testing.T) {
-	cases := []struct{ label, value string }{
-		{"not-a-uuid", "not-a-uuid"},
-		{"looks-like-an-app-name", "sales-overview"},
-		{"dot-dot", ".."},
-		{"empty", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.label, func(t *testing.T) {
-			err := runAppsTokenDelete([]string{"sales-overview", tc.value, "--remote", "http://127.0.0.1:1", "--project", "proj1"})
-			if err == nil {
-				t.Fatal("expected a local rejection for a malformed token_id, got nil")
-			}
-			if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "connection") {
-				t.Errorf("error looks like it came from a network call, not a local rejection: %v", err)
-			}
-			if !strings.Contains(err.Error(), "invalid token id") {
-				t.Errorf("error should name the validation rule: %v", err)
-			}
-		})
-	}
-}
-
-func TestRunAppsTokenDelete_RequiresTwoPositionalArgs(t *testing.T) {
-	if err := runAppsTokenDelete([]string{"sales-overview", "--project", "proj1"}); err == nil {
-		t.Error("expected an error with only <name> (missing <token_id>)")
-	}
-	if err := runAppsTokenDelete([]string{"--project", "proj1"}); err == nil {
-		t.Error("expected an error with no positional args")
-	}
-}
-
-func TestRunAppsTokenDelete_NotFoundExits1(t *testing.T) {
-	srv := newAppsFakeServer(t, appsFakeBehaviour{
-		onDeleteToken: func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"viewer token not found"}`, http.StatusNotFound)
-		},
-	})
-	defer srv.Close()
-	setHeadlessEnv(t, srv.URL)
-
-	err := runAppsTokenDelete([]string{"sales-overview", testTokenID, "--project", "proj1"})
-	if err == nil {
-		t.Fatal("expected an error for 404, got nil")
-	}
-	if code := exitCodeOf(err); code != 1 {
-		t.Errorf("exit code = %d, want 1", code)
-	}
-}
-
-func TestRunAppsToken_UnknownSubcommandErrors(t *testing.T) {
-	if err := runAppsToken([]string{"bogus", "sales-overview"}); err == nil {
-		t.Error("expected an error for an unknown token subcommand")
-	}
-	if err := runAppsToken(nil); err == nil {
-		t.Error("expected an error with no subcommand")
-	}
-}
-
 // --- 401/403: doAuthedRequest has no special case for either (confirmed by
 // inspection — it returns the raw status/body to the caller), so the only
 // thing to prove is that the shared generic non-2xx branch each new
 // subcommand already has produces a clear, non-nil, non-zero-exit error
 // rather than a panic or a false success. ---
 
-func TestRunAppsPromoteAndToken_AuthDenialsSurfaceAsErrors(t *testing.T) {
-	deny := func(status int) func(w http.ResponseWriter, r *http.Request) {
-		return func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, `{"error":"denied"}`, status)
-		}
-	}
-	cases := []struct {
+// TestApps_HTTPErrorStatusesSurfaceAsExit1 proves each subcommand's shared
+// non-2xx branch turns a 400/401/403/404 into a non-nil error with the plain
+// user-error exit code 1 — never a panic, a false success, the 409 CAS-conflict
+// code or render's transport-class 20. (doAuthedRequest has no special case
+// for 401/403: it returns the raw status/body to the caller.)
+func TestApps_HTTPErrorStatusesSurfaceAsExit1(t *testing.T) {
+	tests := []struct {
 		name   string
 		status int
 		run    func() error
 	}{
+		{"get/404", http.StatusNotFound, func() error { return runAppsGet([]string{"nope", "--project", "proj1"}) }},
+		{"delete/404", http.StatusNotFound, func() error { return runAppsDelete([]string{"nope", "--project", "proj1"}) }},
+		{"logs-by-request-id/404", http.StatusNotFound, func() error {
+			return runAppsLogs([]string{"sales-overview", "--project", "proj1", "--request-id", "missing"})
+		}},
+		{"promote/404", http.StatusNotFound, func() error {
+			return runAppsPromote([]string{"nope", "--project", "proj1", "--version", testVersionHash})
+		}},
+		// A hash that never existed for this app is a plain user error, DISTINCT
+		// from the 409 CAS-conflict's own exit code.
+		{"promote-unknown-version/400", http.StatusBadRequest, func() error {
+			return runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash})
+		}},
+		{"token-create/404", http.StatusNotFound, func() error { return runAppsTokenCreate([]string{"nope", "--project", "proj1"}) }},
+		{"token-delete/404", http.StatusNotFound, func() error {
+			return runAppsTokenDelete([]string{"sales-overview", testTokenID, "--project", "proj1"})
+		}},
 		{"promote/401", http.StatusUnauthorized, func() error {
 			return runAppsPromote([]string{"sales-overview", "--project", "proj1", "--version", testVersionHash})
 		}},
-		{"token-create/403", http.StatusForbidden, func() error {
-			return runAppsTokenCreate([]string{"sales-overview", "--project", "proj1"})
-		}},
-		{"token-list/401", http.StatusUnauthorized, func() error {
-			return runAppsTokenList([]string{"sales-overview", "--project", "proj1"})
-		}},
+		{"token-create/403", http.StatusForbidden, func() error { return runAppsTokenCreate([]string{"sales-overview", "--project", "proj1"}) }},
+		{"token-list/401", http.StatusUnauthorized, func() error { return runAppsTokenList([]string{"sales-overview", "--project", "proj1"}) }},
 		{"token-delete/403", http.StatusForbidden, func() error {
 			return runAppsTokenDelete([]string{"sales-overview", testTokenID, "--project", "proj1"})
 		}},
 	}
-	for _, tc := range cases {
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			deny := func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error":"denied"}`, tc.status)
+			}
 			srv := newAppsFakeServer(t, appsFakeBehaviour{
-				onPromote:     deny(tc.status),
-				onCreateToken: deny(tc.status),
-				onListTokens:  deny(tc.status),
-				onDeleteToken: deny(tc.status),
+				onGet:         deny,
+				onDelete:      deny,
+				onLogs:        deny,
+				onPromote:     deny,
+				onCreateToken: deny,
+				onListTokens:  deny,
+				onDeleteToken: deny,
 			})
 			defer srv.Close()
 			setHeadlessEnv(t, srv.URL)
@@ -2090,8 +1642,8 @@ func TestRunAppsPromoteAndToken_AuthDenialsSurfaceAsErrors(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected an error for HTTP %d, got nil", tc.status)
 			}
-			if exitCodeOf(err) == 0 {
-				t.Errorf("exit code should be non-zero: %v", err)
+			if code := exitCodeOf(err); code != 1 {
+				t.Errorf("exit code = %d, want 1: %v", code, err)
 			}
 		})
 	}

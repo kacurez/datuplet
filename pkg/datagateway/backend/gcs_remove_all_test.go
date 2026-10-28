@@ -85,18 +85,34 @@ func TestGCSBackend_RemoveAll_DeletesEach(t *testing.T) {
 	}
 }
 
-// TestGCSBackend_RemoveAll_NoObjects_NoError verifies the idempotent
-// no-op path: empty listing returns nil and never calls deleteObject.
-func TestGCSBackend_RemoveAll_NoObjects_NoError(t *testing.T) {
+// TestGCSBackend_RemoveAll_Edges covers the idempotent no-op path (empty
+// listing returns nil and never calls deleteObject) and the prefix
+// normalisation (a leading slash is stripped before listing; matches MinIO
+// RemoveAll).
+func TestGCSBackend_RemoveAll_Edges(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeGCSListDelete{}
-
-	if err := removeAllGCSObjects(context.Background(), fake, fake, "nonexistent/prefix"); err != nil {
-		t.Errorf("removeAllGCSObjects on empty: %v", err)
+	tests := []struct {
+		name        string
+		names       []string
+		prefix      string
+		wantDeletes int
+	}{
+		{"no objects is a no-op", nil, "nonexistent/prefix", 0},
+		{"leading slash prefix is stripped", []string{"/leading/slash/file"}, "/leading/slash", 1},
 	}
-	if len(fake.deletedKeys) != 0 {
-		t.Errorf("expected 0 deletes, got %d", len(fake.deletedKeys))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := &fakeGCSListDelete{names: tc.names}
+			if err := removeAllGCSObjects(context.Background(), fake, fake, tc.prefix); err != nil {
+				t.Fatalf("removeAllGCSObjects: %v", err)
+			}
+			if len(fake.deletedKeys) != tc.wantDeletes {
+				t.Errorf("expected %d deletes, got %d", tc.wantDeletes, len(fake.deletedKeys))
+			}
+		})
 	}
 }
 
@@ -117,25 +133,5 @@ func TestGCSBackend_RemoveAll_DeleteErrorPropagates(t *testing.T) {
 	}
 	if !errors.Is(err, want) {
 		t.Errorf("error = %v, want wraps %v", err, want)
-	}
-}
-
-// TestGCSBackend_RemoveAll_StripsLeadingSlash verifies the prefix
-// normalisation behaviour (matches MinIO RemoveAll).
-func TestGCSBackend_RemoveAll_StripsLeadingSlash(t *testing.T) {
-	t.Parallel()
-
-	fake := &fakeGCSListDelete{
-		names: []string{"/leading/slash/file"},
-	}
-
-	// Pass a leading-slash prefix; we expect the call to succeed and
-	// the single object to be deleted (the prefix is stripped before
-	// listing).
-	if err := removeAllGCSObjects(context.Background(), fake, fake, "/leading/slash"); err != nil {
-		t.Fatalf("removeAllGCSObjects: %v", err)
-	}
-	if len(fake.deletedKeys) != 1 {
-		t.Fatalf("expected 1 delete, got %d", len(fake.deletedKeys))
 	}
 }

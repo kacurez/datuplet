@@ -72,18 +72,6 @@ func (l *requestLog) record(r *http.Request) recordedRequest {
 	return rr
 }
 
-func (l *requestLog) count(path string) int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	n := 0
-	for _, r := range l.reqs {
-		if r.path == path {
-			n++
-		}
-	}
-	return n
-}
-
 func (l *requestLog) last(path string) (recordedRequest, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -108,97 +96,154 @@ const testServiceToken = "s3rvice-cred-abcdefghijklmnop"
 // ---------------------------------------------------------------------------
 
 func TestResolve_HappyPathAndHeader(t *testing.T) {
-	log := &requestLog{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/apps/proj-1/dash/resolve", func(w http.ResponseWriter, r *http.Request) {
-		log.record(r)
-		if got := r.URL.Query().Get("channel"); got != "production" {
-			t.Errorf("channel query = %q, want production", got)
-		}
-		writeJSONResp(w, http.StatusOK, map[string]string{"app_id": "app-1", "version_hash": strings.Repeat("a", 64)})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	got, err := c.Resolve(context.Background(), "proj-1", "dash", "production")
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
+	cases := []struct {
+		name        string
+		project     string
+		appName     string
+		channelIn   string
+		wantChannel string
+		appID       string
+		hashChar    string
+	}{
+		{"explicit channel", "proj-1", "dash", "production", "production", "app-1", "a"},
+		{"empty channel defaults to production", "p", "n", "", "production", "a", "b"},
 	}
-	want := Resolved{AppID: "app-1", VersionHash: strings.Repeat("a", 64)}
-	if got != want {
-		t.Errorf("Resolve = %+v, want %+v", got, want)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			log := &requestLog{}
+			path := "/internal/v1/apps/" + tc.project + "/" + tc.appName + "/resolve"
+			mux := http.NewServeMux()
+			mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+				log.record(r)
+				if got := r.URL.Query().Get("channel"); got != tc.wantChannel {
+					t.Errorf("channel query = %q, want %s", got, tc.wantChannel)
+				}
+				writeJSONResp(w, http.StatusOK, map[string]string{"app_id": tc.appID, "version_hash": strings.Repeat(tc.hashChar, 64)})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
 
-	req, ok := log.last("/internal/v1/apps/proj-1/dash/resolve")
-	if !ok {
-		t.Fatal("no request recorded")
-	}
-	if req.method != http.MethodGet {
-		t.Errorf("method = %s, want GET", req.method)
-	}
-	if got := req.headers.Get("Authorization"); got != "Bearer "+testServiceToken {
-		t.Errorf("Authorization = %q, want service token", got)
-	}
-}
+			c := NewAPIClient(srv.URL, testServiceToken)
+			defer c.Close()
 
-func TestResolve_EmptyChannelDefaultsToProduction(t *testing.T) {
-	log := &requestLog{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/apps/p/n/resolve", func(w http.ResponseWriter, r *http.Request) {
-		log.record(r)
-		writeJSONResp(w, http.StatusOK, map[string]string{"app_id": "a", "version_hash": strings.Repeat("b", 64)})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+			got, err := c.Resolve(context.Background(), tc.project, tc.appName, tc.channelIn)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			want := Resolved{AppID: tc.appID, VersionHash: strings.Repeat(tc.hashChar, 64)}
+			if got != want {
+				t.Errorf("Resolve = %+v, want %+v", got, want)
+			}
 
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	if _, err := c.Resolve(context.Background(), "p", "n", ""); err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
-	req, _ := log.last("/internal/v1/apps/p/n/resolve")
-	if got := req.query; !strings.Contains(got, "channel=production") {
-		t.Errorf("query = %q, want channel=production", got)
+			req, ok := log.last(path)
+			if !ok {
+				t.Fatal("no request recorded")
+			}
+			if req.method != http.MethodGet {
+				t.Errorf("method = %s, want GET", req.method)
+			}
+			if got := req.headers.Get("Authorization"); got != "Bearer "+testServiceToken {
+				t.Errorf("Authorization = %q, want service token", got)
+			}
+			if !strings.Contains(req.query, "channel="+tc.wantChannel) {
+				t.Errorf("query = %q, want channel=%s", req.query, tc.wantChannel)
+			}
+		})
 	}
 }
 
-func TestResolve_CachesWithin15sFakeClock(t *testing.T) {
-	log := &requestLog{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/apps/p/n/resolve", func(w http.ResponseWriter, r *http.Request) {
-		log.record(r)
-		writeJSONResp(w, http.StatusOK, map[string]string{"app_id": "a", "version_hash": strings.Repeat("c", 64)})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	clock := newFakeClock()
-	c := NewAPIClient(srv.URL, testServiceToken, WithClock(clock.Now))
-	defer c.Close()
-
+// TestCache_TTL15sFakeClock pins the 15s positive-cache contract shared by
+// Resolve, CheckTokenActive, VerifyToken (positive) and VerifySession: a
+// repeat call at 14s is a cache hit, a repeat call at 16s re-fetches.
+func TestCache_TTL15sFakeClock(t *testing.T) {
 	ctx := context.Background()
-	if _, err := c.Resolve(ctx, "p", "n", "production"); err != nil {
-		t.Fatalf("Resolve #1: %v", err)
+	cases := []struct {
+		name string
+		path string
+		resp any
+		call func(c *APIClient) error
+		// other, when set, is a call with a DIFFERENT cache key that must not
+		// share the first key's entry.
+		other func(c *APIClient) error
+	}{
+		{
+			name: "Resolve",
+			path: "/internal/v1/apps/p/n/resolve",
+			resp: map[string]string{"app_id": "a", "version_hash": strings.Repeat("c", 64)},
+			call: func(c *APIClient) error { _, err := c.Resolve(ctx, "p", "n", "production"); return err },
+		},
+		{
+			name: "CheckTokenActive",
+			path: "/internal/v1/viewer-tokens/active",
+			resp: map[string]bool{"active": true},
+			call: func(c *APIClient) error { _, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); return err },
+		},
+		{
+			name: "VerifyToken positive",
+			path: "/internal/v1/viewer-tokens/verify",
+			resp: map[string]bool{"ok": true},
+			call: func(c *APIClient) error {
+				ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "secret-1")
+				if err == nil && !ok {
+					return fmt.Errorf("VerifyToken = false, want true")
+				}
+				return err
+			},
+		},
+		{
+			name:  "VerifySession per session",
+			path:  "/internal/v1/sessions/verify",
+			resp:  map[string]any{"user_id": "u1", "project_member": true},
+			call:  func(c *APIClient) error { _, err := c.VerifySession(ctx, "proj-1", "session=abc", ""); return err },
+			other: func(c *APIClient) error { _, err := c.VerifySession(ctx, "proj-1", "session=xyz", ""); return err },
+		},
 	}
-	clock.Advance(14 * time.Second)
-	if _, err := c.Resolve(ctx, "p", "n", "production"); err != nil {
-		t.Fatalf("Resolve #2: %v", err)
-	}
-	if n := log.count("/internal/v1/apps/p/n/resolve"); n != 1 {
-		t.Errorf("upstream calls = %d, want 1 (cache hit at 14s)", n)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int32
+			mux := http.NewServeMux()
+			mux.HandleFunc(tc.path, func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				writeJSONResp(w, http.StatusOK, tc.resp)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
 
-	// Cross the 15s boundary: must re-fetch.
-	clock.Advance(2 * time.Second)
-	if _, err := c.Resolve(ctx, "p", "n", "production"); err != nil {
-		t.Fatalf("Resolve #3: %v", err)
-	}
-	if n := log.count("/internal/v1/apps/p/n/resolve"); n != 2 {
-		t.Errorf("upstream calls after 16s = %d, want 2 (TTL expired)", n)
+			clock := newFakeClock()
+			c := NewAPIClient(srv.URL, testServiceToken, WithClock(clock.Now))
+			defer c.Close()
+
+			if err := tc.call(c); err != nil {
+				t.Fatalf("call #1: %v", err)
+			}
+			clock.Advance(14 * time.Second)
+			if err := tc.call(c); err != nil {
+				t.Fatalf("call #2: %v", err)
+			}
+			if n := atomic.LoadInt32(&calls); n != 1 {
+				t.Errorf("upstream calls = %d, want 1 (cache hit at 14s)", n)
+			}
+
+			want := int32(2)
+			if tc.other != nil {
+				if err := tc.other(c); err != nil {
+					t.Fatalf("other-key call: %v", err)
+				}
+				if n := atomic.LoadInt32(&calls); n != 2 {
+					t.Errorf("upstream calls = %d, want 2 (a different key must not share the cache entry)", n)
+				}
+				want = 3
+			}
+
+			// Cross the 15s boundary for the first key: must re-fetch.
+			clock.Advance(2 * time.Second)
+			if err := tc.call(c); err != nil {
+				t.Fatalf("call #3: %v", err)
+			}
+			if n := atomic.LoadInt32(&calls); n != want {
+				t.Errorf("upstream calls after 16s = %d, want %d (TTL expired)", n, want)
+			}
+		})
 	}
 }
 
@@ -455,71 +500,23 @@ func TestBundle_DoesNotStampedeConcurrentCallers(t *testing.T) {
 	}
 }
 
-// TestBundle_CallerCannotCorruptCachedBytesByMutatingReturnedSlice is the
-// Finding-3 fix: Bundle must return a private copy, never the cache's own
-// backing array — otherwise a caller that reuses/mutates the returned slice
-// would corrupt what every other renderer subsequently reads for the same
-// content hash, defeating the entire point of a content-addressed,
-// supposedly-immutable cache.
-func TestBundle_CallerCannotCorruptCachedBytesByMutatingReturnedSlice(t *testing.T) {
-	data := []byte("original-bundle-bytes")
-	hash := mustSHA256Hex(data)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/bundles/"+hash, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	ctx := context.Background()
-	// First call is a cache MISS (fetches and populates the cache). The
-	// aliasing risk is on a HIT's return path, so mutate the result of the
-	// SECOND call instead — that is the one that comes straight out of
-	// bundleLRU.get.
-	if _, err := c.Bundle(ctx, hash); err != nil {
-		t.Fatal(err)
-	}
-	got, err := c.Bundle(ctx, hash) // cache HIT
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Corrupt the CALLER's copy in place.
-	for i := range got {
-		got[i] = 'X'
-	}
-
-	again, err := c.Bundle(ctx, hash) // another cache HIT
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(again) != string(data) {
-		t.Errorf("third Bundle() call = %q, want the untouched original %q "+
-			"(mutating a hit's returned slice must not have reached the cache)", again, data)
-	}
-}
-
-// TestBundle_PutDoesNotAliasCallerBuffer is the OTHER half of Finding 3:
-// even though Bundle's only current caller passes a fresh io.ReadAll
-// result, the LRU itself must not assume that — mutating the buffer AFTER
-// it was (hypothetically) handed to a cache must not be observable through
-// a later cache hit. Exercised directly against bundleLRU (the actual
-// aliasing boundary) rather than through Bundle, since Bundle's HTTP path
-// has no seam to inject a reused buffer.
-func TestBundle_PutDoesNotAliasCallerBuffer(t *testing.T) {
+// TestBundleLRU_ReturnsAndStoresPrivateCopies is the Finding-3 fix: the
+// cache must never alias a caller's buffer in either direction. Bundle
+// returns bundleLRU.get's result straight to callers, so a get that handed
+// out the backing array would let one renderer corrupt what every other
+// renderer reads for the same content hash; and put must not assume the
+// caller stops mutating the buffer it handed over. Exercised directly
+// against bundleLRU (the actual aliasing boundary).
+func TestBundleLRU_ReturnsAndStoresPrivateCopies(t *testing.T) {
 	lru := newBundleLRU(1024)
 	buf := []byte("bundle-data-owned-by-caller")
 	original := string(buf)
 	lru.put("some-hash", buf)
 
-	// Mutate the caller's buffer AFTER put returns.
+	// put-copy half: mutate the caller's buffer AFTER put returns.
 	for i := range buf {
 		buf[i] = 'Z'
 	}
-
 	got, ok := lru.get("some-hash")
 	if !ok {
 		t.Fatal("expected a cache hit")
@@ -527,68 +524,75 @@ func TestBundle_PutDoesNotAliasCallerBuffer(t *testing.T) {
 	if string(got) != original {
 		t.Errorf("cached value = %q, want %q (put must copy, not alias, the caller's slice)", got, original)
 	}
-}
 
-// TestBundle_RejectsBodyExceedingStructuralCap is the Finding-4 fix:
-// io.ReadAll on the bundle response must be bounded, so a buggy or hostile
-// internal endpoint cannot force an oversized allocation before the hash is
-// even checked.
-func TestBundle_RejectsBodyExceedingStructuralCap(t *testing.T) {
-	oversized := make([]byte, 200)
-	for i := range oversized {
-		oversized[i] = byte(i)
+	// get-copy half: corrupt the slice a hit returned.
+	for i := range got {
+		got[i] = 'X'
 	}
-	hash := mustSHA256Hex(oversized) // irrelevant: rejected on SIZE first
-	var calls int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/bundles/"+hash, func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(oversized)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	// Cap well below the fixture's 200 bytes.
-	c := NewAPIClient(srv.URL, testServiceToken, WithMaxBundleBytes(100))
-	defer c.Close()
-
-	if _, err := c.Bundle(context.Background(), hash); err == nil {
-		t.Fatal("expected an error for a body exceeding the structural cap")
+	again, ok := lru.get("some-hash")
+	if !ok {
+		t.Fatal("expected a second cache hit")
 	}
-	// A second call must not be served from cache either (the oversized
-	// read was never a valid entry to begin with).
-	if _, err := c.Bundle(context.Background(), hash); err == nil {
-		t.Fatal("expected the error again on a second call")
-	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
-		t.Errorf("upstream calls = %d, want 2 (an oversized body must never be cached)", n)
+	if string(again) != original {
+		t.Errorf("second get = %q, want the untouched original %q "+
+			"(mutating a hit's returned slice must not have reached the cache)", again, original)
 	}
 }
 
-func TestBundle_BodyAtExactCapIsAccepted(t *testing.T) {
-	data := make([]byte, 100)
-	for i := range data {
-		data[i] = byte(i)
+// TestBundle_StructuralCapBoundary is the Finding-4 fix: io.ReadAll on the
+// bundle response must be bounded, so a buggy or hostile internal endpoint
+// cannot force an oversized allocation before the hash is even checked. A
+// body exactly AT the cap is accepted.
+func TestBundle_StructuralCapBoundary(t *testing.T) {
+	const capBytes = 100
+	cases := []struct {
+		name     string
+		size     int
+		wantErr  bool
+		wantCall int32 // upstream calls after fetching twice
+	}{
+		{"body exceeding cap is rejected and never cached", 200, true, 2},
+		{"body at exact cap is accepted", capBytes, false, 1},
 	}
-	hash := mustSHA256Hex(data)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/bundles/"+hash, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := make([]byte, tc.size)
+			for i := range data {
+				data[i] = byte(i)
+			}
+			hash := mustSHA256Hex(data) // an oversized body is rejected on SIZE first
+			var calls int32
+			mux := http.NewServeMux()
+			mux.HandleFunc("/internal/v1/bundles/"+hash, func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
 
-	c := NewAPIClient(srv.URL, testServiceToken, WithMaxBundleBytes(100))
-	defer c.Close()
+			c := NewAPIClient(srv.URL, testServiceToken, WithMaxBundleBytes(capBytes))
+			defer c.Close()
 
-	got, err := c.Bundle(context.Background(), hash)
-	if err != nil {
-		t.Fatalf("body exactly AT the cap should be accepted: %v", err)
-	}
-	if len(got) != 100 {
-		t.Errorf("len = %d, want 100", len(got))
+			for i := 0; i < 2; i++ {
+				got, err := c.Bundle(context.Background(), hash)
+				if tc.wantErr {
+					if err == nil {
+						t.Fatalf("fetch #%d: expected an error for a body exceeding the structural cap", i+1)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("fetch #%d: body exactly AT the cap should be accepted: %v", i+1, err)
+				}
+				if len(got) != capBytes {
+					t.Errorf("len = %d, want %d", len(got), capBytes)
+				}
+			}
+			if n := atomic.LoadInt32(&calls); n != tc.wantCall {
+				t.Errorf("upstream calls = %d, want %d", n, tc.wantCall)
+			}
+		})
 	}
 }
 
@@ -618,49 +622,16 @@ func registerVerifyTokenFakeRoutes(mux *http.ServeMux, correctSecret string, act
 	})
 }
 
-func TestVerifyToken_PositiveCache15s(t *testing.T) {
-	var calls int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": true})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	clock := newFakeClock()
-	c := NewAPIClient(srv.URL, testServiceToken, WithClock(clock.Now))
-	defer c.Close()
-
-	ctx := context.Background()
-	ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "secret-1")
-	if err != nil || !ok {
-		t.Fatalf("VerifyToken = %v, %v; want true, nil", ok, err)
-	}
-	clock.Advance(14 * time.Second)
-	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "secret-1"); err != nil || !ok {
-		t.Fatalf("VerifyToken (cached) = %v, %v", ok, err)
-	}
-	if n := atomic.LoadInt32(&calls); n != 1 {
-		t.Errorf("calls = %d, want 1 (14s < 15s positive TTL)", n)
-	}
-
-	clock.Advance(2 * time.Second) // total 16s
-	if _, err := c.VerifyToken(ctx, "app-1", "tok-1", "secret-1"); err != nil {
-		t.Fatal(err)
-	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
-		t.Errorf("calls = %d, want 2 (positive TTL expired at 16s)", n)
-	}
-}
-
 // TestVerifyToken_InactiveTokenNegativeCache60s: the (app_id, token_id)-keyed
 // 60s negative cache applies ONLY when the token itself is inactive
 // (unknown/revoked/app-mismatched) — never for a wrong-secret guess against
 // a live token (that would be Finding 2's fix-round-2 defect: see
 // TestVerifyToken_CorrectSecretSucceedsAfterAPriorWrongGuess below). An
 // inactive token has no correct secret and thus no legitimate holder to
-// lock out, so sharing the 60s window across every secret is safe here.
+// lock out, so the cache keys on (app_id, token_id) ALONE: an attacker
+// varying the secret on every attempt cannot bypass it. See
+// TestVerifyToken_VaryingSecretsAgainstActiveTokenReachesUpstreamEachTime
+// for the deliberately different behavior against a LIVE token.
 func TestVerifyToken_InactiveTokenNegativeCache60s(t *testing.T) {
 	var verifyCalls, activeCalls int32
 	mux := http.NewServeMux()
@@ -675,6 +646,21 @@ func TestVerifyToken_InactiveTokenNegativeCache60s(t *testing.T) {
 	ctx := context.Background()
 	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "wrong-secret"); err != nil || ok {
 		t.Fatalf("VerifyToken = %v, %v; want false, nil", ok, err)
+	}
+
+	// Different secrets against the same inactive token share the entry.
+	const attempts = 10
+	for i := 0; i < attempts; i++ {
+		secret := fmt.Sprintf("guess-%d", i)
+		if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", secret); err != nil || ok {
+			t.Fatalf("attempt %d (secret %q): %v, %v; want false, nil", i, secret, ok, err)
+		}
+	}
+	if n := atomic.LoadInt32(&verifyCalls); n != 1 {
+		t.Errorf("verify calls for %d different secrets against an inactive token = %d, want exactly 1", attempts, n)
+	}
+	if n := atomic.LoadInt32(&activeCalls); n != 1 {
+		t.Errorf("active-check calls = %d, want exactly 1 (its own 15s cache absorbs the rest)", n)
 	}
 
 	// Still within the 60s negative TTL at 30s.
@@ -692,40 +678,6 @@ func TestVerifyToken_InactiveTokenNegativeCache60s(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&verifyCalls); n != 2 {
 		t.Errorf("verify calls = %d, want 2 (negative TTL expired at 65s)", n)
-	}
-}
-
-// TestVerifyToken_InactiveTokenNegativeCacheSharedAcrossDifferentSecrets is
-// the fix-round-2 replacement for the fix-round-1 test of the same shape:
-// for an INACTIVE token, the negative cache keys on (app_id, token_id)
-// ALONE, not the secret, so an attacker varying the secret on every attempt
-// against a token that is unknown/revoked/app-mismatched cannot bypass it.
-// This is safe specifically BECAUSE the token is inactive — see
-// TestVerifyToken_VaryingSecretsAgainstActiveTokenReachesUpstreamEachTime
-// for the deliberately different behavior against a LIVE token.
-func TestVerifyToken_InactiveTokenNegativeCacheSharedAcrossDifferentSecrets(t *testing.T) {
-	var verifyCalls, activeCalls int32
-	mux := http.NewServeMux()
-	registerVerifyTokenFakeRoutes(mux, "unused-correct-secret", false /* inactive */, &verifyCalls, &activeCalls)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	ctx := context.Background()
-	const attempts = 10
-	for i := 0; i < attempts; i++ {
-		secret := fmt.Sprintf("guess-%d", i)
-		if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", secret); err != nil || ok {
-			t.Fatalf("attempt %d (secret %q): %v, %v; want false, nil", i, secret, ok, err)
-		}
-	}
-	if n := atomic.LoadInt32(&verifyCalls); n != 1 {
-		t.Errorf("verify calls for %d different secrets against an inactive token = %d, want exactly 1", attempts, n)
-	}
-	if n := atomic.LoadInt32(&activeCalls); n != 1 {
-		t.Errorf("active-check calls = %d, want exactly 1 (its own 15s cache absorbs the rest)", n)
 	}
 }
 
@@ -827,33 +779,6 @@ func TestVerifyToken_PositiveEntryNeverKeyedWithoutSecret(t *testing.T) {
 	}
 }
 
-func TestVerifyToken_DifferentSecretsAreNotConflated(t *testing.T) {
-	// The server answers ok=true only for "correct-secret".
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/viewer-tokens/verify", func(w http.ResponseWriter, r *http.Request) {
-		var req verifyTokenRequestWire
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		writeJSONResp(w, http.StatusOK, map[string]bool{"ok": req.Secret == "correct-secret"})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	ctx := context.Background()
-	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "correct-secret"); err != nil || !ok {
-		t.Fatalf("correct secret: %v, %v", ok, err)
-	}
-	// A wrong secret for the SAME (app_id, token_id), presented right
-	// after a correct one was cached, must still be verified for REAL
-	// (and answer false) — not silently served "true" from a cache keyed
-	// only on (app_id, token_id).
-	if ok, err := c.VerifyToken(ctx, "app-1", "tok-1", "wrong-secret"); err != nil || ok {
-		t.Fatalf("wrong secret = %v, %v; want false, nil", ok, err)
-	}
-}
-
 func TestVerifyToken_RequestShape(t *testing.T) {
 	log := &requestLog{}
 	mux := http.NewServeMux()
@@ -939,41 +864,6 @@ func TestCheckTokenActive_RequestShapeAndServiceCredential(t *testing.T) {
 	}
 }
 
-func TestCheckTokenActive_CachesWithin15sFakeClock(t *testing.T) {
-	var calls int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/viewer-tokens/active", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		writeJSONResp(w, http.StatusOK, map[string]bool{"active": true})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	clock := newFakeClock()
-	c := NewAPIClient(srv.URL, testServiceToken, WithClock(clock.Now))
-	defer c.Close()
-
-	ctx := context.Background()
-	if _, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(14 * time.Second)
-	if _, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); err != nil {
-		t.Fatal(err)
-	}
-	if n := atomic.LoadInt32(&calls); n != 1 {
-		t.Errorf("calls = %d, want 1 (14s < 15s TTL)", n)
-	}
-
-	clock.Advance(2 * time.Second) // total 16s
-	if _, err := c.CheckTokenActive(ctx, "app-1", "tok-1"); err != nil {
-		t.Fatal(err)
-	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
-		t.Errorf("calls = %d, want 2 (TTL expired at 16s)", n)
-	}
-}
-
 func TestCheckTokenActive_FalseForRevokedUnknownOrMismatched(t *testing.T) {
 	// The fake server mirrors pipeline-api's actual "false, indistinguishably"
 	// contract: only exactly (app-1, tok-1) is active.
@@ -1007,158 +897,79 @@ func TestCheckTokenActive_FalseForRevokedUnknownOrMismatched(t *testing.T) {
 // VerifySession — the header hand-off
 // ---------------------------------------------------------------------------
 
-func TestVerifySession_ForwardsBearerInSeparateHeader(t *testing.T) {
-	log := &requestLog{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/sessions/verify", func(w http.ResponseWriter, r *http.Request) {
-		log.record(r)
-		writeJSONResp(w, http.StatusOK, map[string]any{"user_id": "user-1", "project_member": true})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+// TestVerifySession_ForwardsCredentialsByHeader pins the header hand-off: the
+// SERVICE credential always occupies Authorization, the caller's cookie is
+// forwarded verbatim, and the caller's bearer rides in the forwarding header
+// (verbatim, scheme prefix included) — which is never synthesized when the
+// caller carried none, and never carries the service token. A call with no
+// caller credential at all is "not signed in", not an error.
+func TestVerifySession_ForwardsCredentialsByHeader(t *testing.T) {
+	cases := []struct {
+		name       string
+		cookie     string
+		authz      string
+		resp       map[string]any
+		wantInfo   SessionInfo
+		wantCookie string
+		wantFwd    string // "" means the forwarding header must be absent
+	}{
+		{
+			name:     "bearer rides in the separate forwarding header",
+			authz:    "Bearer caller-cli-jwt",
+			resp:     map[string]any{"user_id": "user-1", "project_member": true},
+			wantInfo: SessionInfo{UserID: "user-1", ProjectMember: true},
+			wantFwd:  "Bearer caller-cli-jwt",
+		},
+		{
+			name:       "cookie forwarded and forwarding header omitted when no authz",
+			cookie:     "pipeline_api_session=abc123",
+			resp:       map[string]any{"user_id": "user-2", "project_member": false},
+			wantInfo:   SessionInfo{UserID: "user-2"},
+			wantCookie: "pipeline_api_session=abc123",
+		},
+		{
+			name:     "no credential at all: no error, zero info, service token never in forwarding header",
+			resp:     map[string]any{"user_id": "", "project_member": false},
+			wantInfo: SessionInfo{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			log := &requestLog{}
+			mux := http.NewServeMux()
+			mux.HandleFunc("/internal/v1/sessions/verify", func(w http.ResponseWriter, r *http.Request) {
+				log.record(r)
+				writeJSONResp(w, http.StatusOK, tc.resp)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
 
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
+			c := NewAPIClient(srv.URL, testServiceToken)
+			defer c.Close()
 
-	info, err := c.VerifySession(context.Background(), "proj-1", "", "Bearer caller-cli-jwt")
-	if err != nil {
-		t.Fatalf("VerifySession: %v", err)
-	}
-	if info != (SessionInfo{UserID: "user-1", ProjectMember: true}) {
-		t.Errorf("info = %+v", info)
-	}
+			info, err := c.VerifySession(context.Background(), "proj-1", tc.cookie, tc.authz)
+			if err != nil {
+				t.Fatalf("VerifySession: %v", err)
+			}
+			if info != tc.wantInfo {
+				t.Errorf("info = %+v, want %+v", info, tc.wantInfo)
+			}
 
-	req, _ := log.last("/internal/v1/sessions/verify")
-	// The SERVICE credential must occupy Authorization...
-	if got := req.headers.Get("Authorization"); got != "Bearer "+testServiceToken {
-		t.Errorf("Authorization = %q, want service token (never the caller's)", got)
-	}
-	// ...and the CALLER's credential must ride in the forwarding header,
-	// verbatim, including the "Bearer " scheme prefix.
-	if got := req.headers.Get(forwardedAuthorizationHeader); got != "Bearer caller-cli-jwt" {
-		t.Errorf("%s = %q, want the caller's bearer verbatim", forwardedAuthorizationHeader, got)
-	}
-}
-
-func TestVerifySession_ForwardsCookieAndOmitsForwardingHeaderWhenNoAuthz(t *testing.T) {
-	log := &requestLog{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/sessions/verify", func(w http.ResponseWriter, r *http.Request) {
-		log.record(r)
-		writeJSONResp(w, http.StatusOK, map[string]any{"user_id": "user-2", "project_member": false})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	if _, err := c.VerifySession(context.Background(), "proj-1", "pipeline_api_session=abc123", ""); err != nil {
-		t.Fatalf("VerifySession: %v", err)
-	}
-	req, _ := log.last("/internal/v1/sessions/verify")
-	if got := req.headers.Get("Cookie"); got != "pipeline_api_session=abc123" {
-		t.Errorf("Cookie = %q", got)
-	}
-	// Must NOT synthesize a forwarding header when the caller carried none.
-	if _, present := req.headers[forwardedAuthorizationHeader]; present {
-		t.Errorf("%s must be absent when authz is empty, got present", forwardedAuthorizationHeader)
-	}
-	// The service credential must still be the only thing in Authorization.
-	if got := req.headers.Get("Authorization"); got != "Bearer "+testServiceToken {
-		t.Errorf("Authorization = %q, want service token", got)
-	}
-}
-
-func TestVerifySession_NeverPutsServiceTokenInForwardingHeader(t *testing.T) {
-	// Regression guard for the exact P3 defect: calling VerifySession with
-	// no caller credential at all must never leak the service token into
-	// the forwarding header either.
-	log := &requestLog{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/sessions/verify", func(w http.ResponseWriter, r *http.Request) {
-		log.record(r)
-		writeJSONResp(w, http.StatusOK, map[string]any{"user_id": "", "project_member": false})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	if _, err := c.VerifySession(context.Background(), "proj-1", "", ""); err != nil {
-		t.Fatal(err)
-	}
-	req, _ := log.last("/internal/v1/sessions/verify")
-	if _, present := req.headers[forwardedAuthorizationHeader]; present {
-		t.Errorf("forwarding header must be absent, got %q", req.headers.Get(forwardedAuthorizationHeader))
-	}
-	if got := req.headers.Get("Authorization"); got != "Bearer "+testServiceToken {
-		t.Errorf("Authorization = %q, want ONLY the service token", got)
-	}
-}
-
-func TestVerifySession_CachesPerSessionWithin15s(t *testing.T) {
-	var calls int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/sessions/verify", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		writeJSONResp(w, http.StatusOK, map[string]any{"user_id": "u1", "project_member": true})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	clock := newFakeClock()
-	c := NewAPIClient(srv.URL, testServiceToken, WithClock(clock.Now))
-	defer c.Close()
-
-	ctx := context.Background()
-	if _, err := c.VerifySession(ctx, "proj-1", "session=abc", ""); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(14 * time.Second)
-	if _, err := c.VerifySession(ctx, "proj-1", "session=abc", ""); err != nil {
-		t.Fatal(err)
-	}
-	if n := atomic.LoadInt32(&calls); n != 1 {
-		t.Errorf("calls = %d, want 1 (cached at 14s)", n)
-	}
-
-	// A DIFFERENT session (different cookie) must NOT hit the same cache
-	// entry.
-	if _, err := c.VerifySession(ctx, "proj-1", "session=xyz", ""); err != nil {
-		t.Fatal(err)
-	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
-		t.Errorf("calls = %d, want 2 (different session must not share the cache entry)", n)
-	}
-
-	clock.Advance(2 * time.Second) // first session now at 16s
-	if _, err := c.VerifySession(ctx, "proj-1", "session=abc", ""); err != nil {
-		t.Fatal(err)
-	}
-	if n := atomic.LoadInt32(&calls); n != 3 {
-		t.Errorf("calls = %d, want 3 (first session's TTL expired)", n)
-	}
-}
-
-func TestVerifySession_NoSessionIsNotAnError(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/sessions/verify", func(w http.ResponseWriter, r *http.Request) {
-		writeJSONResp(w, http.StatusOK, map[string]any{"user_id": "", "project_member": false})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	info, err := c.VerifySession(context.Background(), "proj-1", "", "")
-	if err != nil {
-		t.Fatalf("VerifySession: %v", err)
-	}
-	if info.UserID != "" || info.ProjectMember {
-		t.Errorf("info = %+v, want zero value", info)
+			req, _ := log.last("/internal/v1/sessions/verify")
+			if got := req.headers.Get("Authorization"); got != "Bearer "+testServiceToken {
+				t.Errorf("Authorization = %q, want ONLY the service token (never the caller's)", got)
+			}
+			if got := req.headers.Get("Cookie"); got != tc.wantCookie {
+				t.Errorf("Cookie = %q, want %q", got, tc.wantCookie)
+			}
+			if tc.wantFwd == "" {
+				if _, present := req.headers[forwardedAuthorizationHeader]; present {
+					t.Errorf("%s must be absent, got %q", forwardedAuthorizationHeader, req.headers.Get(forwardedAuthorizationHeader))
+				}
+			} else if got := req.headers.Get(forwardedAuthorizationHeader); got != tc.wantFwd {
+				t.Errorf("%s = %q, want the caller's bearer verbatim %q", forwardedAuthorizationHeader, got, tc.wantFwd)
+			}
+		})
 	}
 }
 
@@ -1373,45 +1184,6 @@ func TestQuery_HitsInternalProjectsRouteWithAppJWTOnly(t *testing.T) {
 	}
 	if atomic.LoadInt32(&browserCalls) != 0 {
 		t.Error("Query must never hit the browser-facing /api/v1/projects/{pid}/query route")
-	}
-}
-
-func TestQuery_PropagatesContextCancellation(t *testing.T) {
-	// The handler blocks until EITHER the request context is cancelled (the
-	// behavior under test) OR a generous fallback fires — the fallback
-	// exists purely so the handler always returns and httptest.Server.Close
-	// never hangs; it is not part of the assertion (mirrors
-	// task-P5-report.md's documented fix for this exact flaky pattern:
-	// asserting the SERVER observed cancellation is unreliable on
-	// localhost socket teardown, so the deterministic assertion is "the
-	// CLIENT returns fast", not "the server's ctx fires").
-	const fallback = 3 * time.Second
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/projects/proj-1/query", func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-r.Context().Done():
-		case <-time.After(fallback):
-		}
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	c := NewAPIClient(srv.URL, testServiceToken)
-	defer c.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-
-	start := time.Now()
-	_, err := c.Query(ctx, "proj-1", "jwt", []byte(`{}`))
-	if err == nil {
-		t.Fatal("expected an error from a cancelled request")
-	}
-	if elapsed := time.Since(start); elapsed > fallback/2 {
-		t.Errorf("Query took %v to return after cancellation, want well under the %v fallback", elapsed, fallback)
 	}
 }
 

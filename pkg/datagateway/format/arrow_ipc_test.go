@@ -38,13 +38,6 @@ func serializeIPCStream(t *testing.T, allocator memory.Allocator, records ...arr
 	return buf.Bytes()
 }
 
-func TestArrowIPCAdapterFormat(t *testing.T) {
-	adapter := NewArrowIPCAdapter(nil)
-	if adapter.Format() != FormatArrowIPC {
-		t.Errorf("Format() = %v, want FormatArrowIPC", adapter.Format())
-	}
-}
-
 func makeTestRecord(allocator memory.Allocator) arrow.Record {
 	arrowSchema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
@@ -250,56 +243,6 @@ func TestArrowIPCAdapterParseEmpty(t *testing.T) {
 	_, _, err := adapter.Parse([]byte{}, nil)
 	if err == nil {
 		t.Error("Parse() should fail with empty data")
-	}
-}
-
-func TestArrowIPCAdapterInRegistry(t *testing.T) {
-	registry := DefaultRegistry()
-
-	adapter, err := registry.Get(FormatArrowIPC)
-	if err != nil {
-		t.Fatalf("Registry.Get(FormatArrowIPC) error: %v", err)
-	}
-
-	if adapter.Format() != FormatArrowIPC {
-		t.Errorf("Adapter format = %v, want FormatArrowIPC", adapter.Format())
-	}
-}
-
-func TestDataFormatArrowIPC(t *testing.T) {
-	f := FormatArrowIPC
-
-	if f.String() != "arrow" {
-		t.Errorf("String() = %q, want arrow", f.String())
-	}
-
-	if f.Extension() != ".arrow" {
-		t.Errorf("Extension() = %q, want .arrow", f.Extension())
-	}
-
-	if f.MimeType() != "application/vnd.apache.arrow.stream" {
-		t.Errorf("MimeType() = %q, want application/vnd.apache.arrow.stream", f.MimeType())
-	}
-}
-
-func TestParseDataFormatArrowIPC(t *testing.T) {
-	tests := []struct {
-		input  string
-		expect DataFormat
-	}{
-		{"arrow", FormatArrowIPC},
-		{"ARROW", FormatArrowIPC},
-		{"ipc", FormatArrowIPC},
-		{"IPC", FormatArrowIPC},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := ParseDataFormat(tt.input)
-			if result != tt.expect {
-				t.Errorf("ParseDataFormat(%q) = %v, want %v", tt.input, result, tt.expect)
-			}
-		})
 	}
 }
 

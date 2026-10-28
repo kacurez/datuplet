@@ -64,69 +64,43 @@ func cpuLimit(v string) *corev1.ResourceRequirements {
 	}
 }
 
-func TestResourcesModified_AddBlock(t *testing.T) {
-	oldP := pipelineWithResources("c1", nil)
-	newP := pipelineWithResources("c1", cpuLimit("2"))
-	if !resourcesModified(oldP, newP) {
-		t.Error("adding a resources block where old had none should count as modified")
+func TestResourcesModified(t *testing.T) {
+	tests := []struct {
+		name string
+		oldP *datupletv1.Pipeline
+		newP *datupletv1.Pipeline
+		want bool
+	}{
+		{"add block where old had none", pipelineWithResources("c1", nil), pipelineWithResources("c1", cpuLimit("2")), true},
+		{"alter limits.cpu", pipelineWithResources("c1", cpuLimit("1")), pipelineWithResources("c1", cpuLimit("2")), true},
+		{"remove existing block", pipelineWithResources("c1", cpuLimit("1")), pipelineWithResources("c1", nil), true},
+		// c1, which had resources, is gone.
+		{"component with resources removed", pipelineWithResources("c1", cpuLimit("1")), pipelineWithResources("c2", nil), true},
+		// "1" and "1000m" are the same quantity.
+		{"semantically equal quantities", pipelineWithResources("c1", cpuLimit("1")), pipelineWithResources("c1", cpuLimit("1000m")), false},
+		{"no resources on either side", pipelineWithResources("c1", nil), pipelineWithResources("c1", nil), false},
+		// Guards the bypass a bare-name key allowed: old has stage1/c1 with NO
+		// block and stage2/c1 WITH block R; a non-superadmin PUT copies R onto
+		// stage1/c1. Keying by (stage, name) must see stage1/c1 gaining a block;
+		// a bare-name key would collapse both c1 instances and miss it.
+		{
+			"cross-stage same name no bypass",
+			pipelineFromStages(
+				stageComp{stage: "stage1", name: "c1", rr: nil},
+				stageComp{stage: "stage2", name: "c1", rr: cpuLimit("2")},
+			),
+			pipelineFromStages(
+				stageComp{stage: "stage1", name: "c1", rr: cpuLimit("2")},
+				stageComp{stage: "stage2", name: "c1", rr: cpuLimit("2")},
+			),
+			true,
+		},
 	}
-}
-
-func TestResourcesModified_AlterBlock(t *testing.T) {
-	oldP := pipelineWithResources("c1", cpuLimit("1"))
-	newP := pipelineWithResources("c1", cpuLimit("2"))
-	if !resourcesModified(oldP, newP) {
-		t.Error("changing limits.cpu should count as modified")
-	}
-}
-
-func TestResourcesModified_RemoveBlock(t *testing.T) {
-	oldP := pipelineWithResources("c1", cpuLimit("1"))
-	newP := pipelineWithResources("c1", nil)
-	if !resourcesModified(oldP, newP) {
-		t.Error("removing an existing resources block should count as modified")
-	}
-}
-
-func TestResourcesModified_ComponentRemoved(t *testing.T) {
-	oldP := pipelineWithResources("c1", cpuLimit("1"))
-	newP := pipelineWithResources("c2", nil) // c1 (which had resources) gone
-	if !resourcesModified(oldP, newP) {
-		t.Error("removing a component that had resources should count as modified")
-	}
-}
-
-func TestResourcesModified_SemanticEqualUnchanged(t *testing.T) {
-	oldP := pipelineWithResources("c1", cpuLimit("1"))
-	newP := pipelineWithResources("c1", cpuLimit("1000m"))
-	if resourcesModified(oldP, newP) {
-		t.Error(`"1" and "1000m" are the same quantity — must NOT count as modified`)
-	}
-}
-
-func TestResourcesModified_BothNilUnchanged(t *testing.T) {
-	oldP := pipelineWithResources("c1", nil)
-	newP := pipelineWithResources("c1", nil)
-	if resourcesModified(oldP, newP) {
-		t.Error("no resources on either side must NOT count as modified")
-	}
-}
-
-// TestResourcesModified_CrossStageSameNameNoBypass guards the bypass a bare-name
-// key allowed: old has stage1/c1 with NO block and stage2/c1 WITH block R; a
-// non-superadmin PUT copies R onto stage1/c1. Keying by (stage, name) must see
-// stage1/c1 gaining a block and report modified — a bare-name key would collapse
-// both c1 instances and miss it.
-func TestResourcesModified_CrossStageSameNameNoBypass(t *testing.T) {
-	oldP := pipelineFromStages(
-		stageComp{stage: "stage1", name: "c1", rr: nil},
-		stageComp{stage: "stage2", name: "c1", rr: cpuLimit("2")},
-	)
-	newP := pipelineFromStages(
-		stageComp{stage: "stage1", name: "c1", rr: cpuLimit("2")},
-		stageComp{stage: "stage2", name: "c1", rr: cpuLimit("2")},
-	)
-	if !resourcesModified(oldP, newP) {
-		t.Error("adding a resources block to stage1/c1 must count as modified even though stage2/c1 already carries the same block")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resourcesModified(tc.oldP, tc.newP); got != tc.want {
+				t.Errorf("resourcesModified = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

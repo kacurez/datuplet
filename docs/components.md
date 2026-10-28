@@ -9,9 +9,8 @@ read its `schema.json` directly (pointers below) or fetch it live:
 datuplet components get <name> --schema
 ```
 
-Datuplet ships six built-in components — five with published images, plus
-`pandas-transform`, which exists as a ComponentDefinition template but has no
-published image yet (see its section below). Each runs as an ordinary
+Datuplet ships three built-in components (`data-generator`,
+`http-json-extractor`, `sql-transform`). Each runs as an ordinary
 container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
@@ -24,8 +23,7 @@ chart's `components.tag` (the release version; `v0.12.1` in this release).
 
 - `components/<name>/schema.json` — JSON Schema draft 2020-12, one per
   component, next to the code that parses the config. Schema and parser are
-  authored and updated together, in the same commit — a plain file works
-  identically for Go components and for `pandas-transform` (Python).
+  authored and updated together, in the same commit.
 - `make sync-component-schemas` copies each into
   `charts/datuplet-app/files/component-schemas/<name>.json`; the
   ComponentDefinition templates read them via `.Files.Get` rather than
@@ -118,16 +116,16 @@ type ComponentIO struct {
 - The catalog API (`GET /api/v1/components(/{name})`) always returns a
   resolved, never-empty `io: {inputs, outputs}` object per component.
 - UI gating: `inputs: none` hides the Inputs section entirely (extractors,
-  data-generator); `outputs: none` hides the Outputs section (stdout-writer).
+  data-generator); `outputs: none` hides the Outputs section.
 - Validation: declaring `inputs` on an `inputs: none` component is an error;
   omitting inputs on an `inputs: required` component is an error; symmetric
   for outputs.
 - `io` lives at the **definition** level, not per version — it declares what
   kind of component this is (extractor / transform / writer), which is
   identity, not per-version behavior.
-- Built-in IO declarations: data-generator / http-json-extractor /
-  finnhub-extractor are `{none, required}`; sql-transform / pandas-transform
-  are `{required, required}`; stdout-writer is `{required, none}`.
+- Built-in IO declarations: data-generator / http-json-extractor
+  are `{none, required}`; sql-transform
+  is `{required, required}`.
 
 ## What schema validation cannot catch
 
@@ -337,36 +335,6 @@ peak RSS.
 
 ---
 
-## finnhub-extractor
-
-Fetches market data from the [Finnhub](https://finnhub.io/) API. Requires a
-Finnhub API key.
-
-**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.12.1` · **Registry name:**
-`finnhub-extractor` · **IO:** `{inputs: none, outputs: required}`
-
-**Config schema:** [`components/finnhub-extractor/schema.json`](../components/finnhub-extractor/schema.json).
-`mode` selects the extraction (`quote`, `news`, `company-news`,
-`basic-financials`, `earnings`, `recommendations`, `insider-transactions`);
-each mode writes to a fixed, component-internal output table name (documented
-in the schema's `x-datuplet-doc` on `mode` — these names are not resolvable
-via `x-datuplet-produces`, so reference them directly when wiring a
-downstream stage's input).
-
-Set the key in the project's managed secrets (UI: Settings → Secrets, or the
-API):
-
-```bash
-curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"value":"<your-api-key>"}' \
-  https://<host>/api/v1/projects/$PROJECT_ID/secrets/finnhub_key
-```
-
-See [docs/secrets.md](secrets.md) for the full secret resolution flow.
-
----
-
 ## sql-transform
 
 Runs user-supplied SQL inside an embedded DuckDB engine. Inputs stream from the
@@ -401,89 +369,11 @@ the component.
 
 ---
 
-## pandas-transform
-
-> **Not yet shipped.** No image is published for this component (it's absent
-> from `_release-components.yml` and `docker-build-k8s`), so its
-> ComponentDefinition template is disabled by default
-> (`components.enablePandasTransform: false`, RFC 024 T6.3) until an image
-> exists.
-
-Applies a sequence of pandas operations to input data. Reads the input table as
-CSV from the Data Gateway, applies the operations in order, and writes the
-result back as CSV — no S3 or Lakekeeper credentials touch the component.
-
-**Image:** `ghcr.io/kacurez/pandas-transform:v0.12.1` · **Registry name:**
-`pandas-transform` · **IO:** `{inputs: required, outputs: required}`
-
-**Config schema:** [`components/pandas-transform/schema.json`](../components/pandas-transform/schema.json)
-(`x-datuplet-produces: "output_table"`).
-
-**Supported operations (applied in order):** `filter`, `select`, `sort`,
-`rename`, `drop`, `fillna` — see the schema's `operations[].type` enum and
-per-type `x-datuplet-doc` for fields.
-
-Only one input table is read (the first entry under `inputs.tables`). Unknown
-operation types and references to missing columns are logged as warnings and
-skipped rather than failing the run.
-
----
-
-## stdout-writer
-
-Reads input tables and prints them to stdout. For debugging only — no Iceberg
-output.
-
-**Image:** `ghcr.io/kacurez/stdout-writer:v0.12.1` · **Registry name:**
-`stdout-writer` · **IO:** `{inputs: required, outputs: none}`
-
-**Config schema:** [`components/stdout-writer/schema.json`](../components/stdout-writer/schema.json)
-(`format`: `csv` (default) or `json`).
-
-**Example pipeline** (PipelineDoc format, RFC 027 — see
-[docs/pipeline-api.md](pipeline-api.md)):
-
-```yaml
-name: debug-pipeline
-stages:
-  - name: generate
-    components:
-      - name: gen
-        component: data-generator
-        config:
-          tables:
-            - name: events
-              random:
-                schema: { id: int, value: double }
-                limit: { rowsCount: 10 }
-        outputs:
-          defaultBucket: raw
-          defaultWriteMode: APPEND
-  - name: print
-    components:
-      - name: printer
-        component: stdout-writer
-        inputs:
-          tables:
-            - bucket: raw
-              table: events
-        config:
-          format: json
-```
-
-View output in component logs:
-
-```bash
-kubectl logs -n datuplet <pod-name> -c component
-```
-
----
-
 ## Writing your own component
 
-Use the Go SDK (`sdk/go/`) or Python SDK (`sdk/python/`) to build a component.
-Both SDKs are ~200–300 LOC and expose three operations: `OpenWriter`,
-`WriteChunk` / `Write`, and `Close`. The SDKs handle gRPC connection, config
+Use the Go SDK (`sdk/go/`) to build a component.
+The SDK is ~200–300 LOC and exposes three operations: `OpenWriter`,
+`WriteChunk` / `Write`, and `Close`. The SDK handles gRPC connection, config
 resolution, and secret delivery from the Data Gateway sidecar.
 
 Go components can opt into writer-side Arrow output via the `sdk/go/arrow`
@@ -514,5 +404,4 @@ above, and register it as a `ComponentDefinition` with the appropriate `io`
 capability — see any built-in's chart template under
 `charts/datuplet-app/templates/components/` for the shape.
 
-See [`sdk/go/client.go`](../sdk/go/client.go) and
-[`sdk/python/client.py`](../sdk/python/client.py) for the entry points.
+See [`sdk/go/client.go`](../sdk/go/client.go) for the entry points.

@@ -1,10 +1,10 @@
 name: release-components
 
-# Reusable: builds + manifests the five built-in component images
-# (data-generator, sql-transform, stdout-writer, http-json-extractor,
-# finnhub-extractor). Each is a call to _release-image.yml. Called once
+# Reusable: builds + manifests the three built-in component images
+# (data-generator, sql-transform, http-json-extractor).
+# Each is a call to _release-image.yml. Called once
 # from release.yml as the `components` job; appears as a collapsible
-# group in the run-detail UI containing the five image rows.
+# group in the run-detail UI containing the three image rows.
 
 on:
   workflow_call:
@@ -28,13 +28,6 @@ jobs:
       dockerfile: components/sql-transform/Dockerfile
     secrets: inherit
 
-  stdout-writer:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: stdout-writer
-      dockerfile: components/stdout-writer/Dockerfile
-    secrets: inherit
-
   http-json-extractor:
     uses: ./.github/workflows/_release-image.yml
     with:
@@ -42,9 +35,3 @@ jobs:
       dockerfile: components/http-json-extractor/Dockerfile
     secrets: inherit
 
-  finnhub-extractor:
-    uses: ./.github/workflows/_release-image.yml
-    with:
-      name: finnhub-extractor
-      dockerfile: components/finnhub-extractor/Dockerfile
-    secrets: inherit

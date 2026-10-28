@@ -190,86 +190,58 @@ func TestHandleGetComponent_Detail(t *testing.T) {
 	}
 }
 
-func TestHandleListComponents_IODefaultsOptional(t *testing.T) {
-	ts, cleanup := newComponentsServer(newFakeComponentRegistry(componentDefFixture("http-fetch")))
-	defer cleanup()
-
-	resp, err := stdhttp.Get(ts.URL + "/api/v1/components")
-	if err != nil {
-		t.Fatalf("GET /api/v1/components: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var body []struct {
+// TestComponentsIO covers the io declaration on the list and detail
+// responses: a component without one defaults to optional/optional, an
+// explicit declaration is passed through.
+func TestComponentsIO(t *testing.T) {
+	type ioBody struct {
 		Name string `json:"name"`
 		IO   struct {
 			Inputs  string `json:"inputs"`
 			Outputs string `json:"outputs"`
 		} `json:"io"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
+	explicit := componentDefFixtureWithIO("data-generator", &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"})
+	tests := []struct {
+		name        string
+		def         datupletv1.ComponentDefinition
+		path        string
+		list        bool // the path returns an array of components
+		wantInputs  string
+		wantOutputs string
+	}{
+		{"list defaults to optional without io declaration", componentDefFixture("http-fetch"), "/api/v1/components", true, "optional", "optional"},
+		{"list passes explicit io through", explicit, "/api/v1/components", true, "none", "required"},
+		{"get passes explicit io through", explicit, "/api/v1/components/data-generator", false, "none", "required"},
 	}
-	if len(body) != 1 {
-		t.Fatalf("len(body) = %d, want 1", len(body))
-	}
-	if body[0].IO.Inputs != "optional" || body[0].IO.Outputs != "optional" {
-		t.Errorf("io = %+v, want optional/optional for a component without an io declaration", body[0].IO)
-	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, cleanup := newComponentsServer(newFakeComponentRegistry(tc.def))
+			defer cleanup()
 
-func TestHandleListComponents_IOExplicit(t *testing.T) {
-	def := componentDefFixtureWithIO("data-generator", &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"})
-	ts, cleanup := newComponentsServer(newFakeComponentRegistry(def))
-	defer cleanup()
+			resp, err := stdhttp.Get(ts.URL + tc.path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", tc.path, err)
+			}
+			defer resp.Body.Close()
 
-	resp, err := stdhttp.Get(ts.URL + "/api/v1/components")
-	if err != nil {
-		t.Fatalf("GET /api/v1/components: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var body []struct {
-		Name string `json:"name"`
-		IO   struct {
-			Inputs  string `json:"inputs"`
-			Outputs string `json:"outputs"`
-		} `json:"io"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(body) != 1 {
-		t.Fatalf("len(body) = %d, want 1", len(body))
-	}
-	if body[0].IO.Inputs != "none" || body[0].IO.Outputs != "required" {
-		t.Errorf("io = %+v, want none/required", body[0].IO)
-	}
-}
-
-func TestHandleGetComponent_IO(t *testing.T) {
-	def := componentDefFixtureWithIO("data-generator", &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"})
-	ts, cleanup := newComponentsServer(newFakeComponentRegistry(def))
-	defer cleanup()
-
-	resp, err := stdhttp.Get(ts.URL + "/api/v1/components/data-generator")
-	if err != nil {
-		t.Fatalf("GET /api/v1/components/data-generator: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var body struct {
-		Name string `json:"name"`
-		IO   struct {
-			Inputs  string `json:"inputs"`
-			Outputs string `json:"outputs"`
-		} `json:"io"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.IO.Inputs != "none" || body.IO.Outputs != "required" {
-		t.Errorf("io = %+v, want none/required", body.IO)
+			var got ioBody
+			if tc.list {
+				var body []ioBody
+				if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if len(body) != 1 {
+					t.Fatalf("len(body) = %d, want 1", len(body))
+				}
+				got = body[0]
+			} else if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.IO.Inputs != tc.wantInputs || got.IO.Outputs != tc.wantOutputs {
+				t.Errorf("io = %+v, want %s/%s", got.IO, tc.wantInputs, tc.wantOutputs)
+			}
+		})
 	}
 }
 

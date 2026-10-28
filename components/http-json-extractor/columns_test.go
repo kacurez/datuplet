@@ -53,38 +53,49 @@ func (f *fakeChunkWriter) Close(_ context.Context) (*sdk.CloseResult, error) {
 func (f *fakeChunkWriter) Bucket() string { return "raw" }
 func (f *fakeChunkWriter) Table() string  { return "t" }
 
-// TestFinishQuietly_ClosesAlreadyOpenedWriter covers Finding I1: a sink
-// that already flushed a batch (and so opened its writer) must have that
-// writer closed by finishQuietly, matching the case where sdk.Exit* runs
-// after the sink has written data but before the normal Finish() call.
-func TestFinishQuietly_ClosesAlreadyOpenedWriter(t *testing.T) {
-	fw := &fakeChunkWriter{}
-	sink := dgarrow.NewStringSink(context.Background(), func() (dgarrow.ChunkWriter, error) { return fw, nil },
-		dgarrow.WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }))
-	if err := sink.Add(map[string]any{"id": "1"}); err != nil {
-		t.Fatal(err)
+// TestFinishQuietly covers finishQuietly on both sink states. A sink that
+// already flushed a batch (and so opened its writer) must have that writer
+// closed even when sdk.Exit* runs before the normal Finish() call (Finding
+// I1); a sink that never received records (the fetchStream-failure case) must
+// be a harmless no-op that never opens a writer (StringSink's lazy-open
+// design). A repeat call must stay safe either way.
+func TestFinishQuietly(t *testing.T) {
+	cases := []struct {
+		name       string
+		addRecord  bool
+		wantOpened bool
+		wantClosed bool
+	}{
+		{name: "closes already opened writer", addRecord: true, wantOpened: true, wantClosed: true},
+		{name: "untouched sink opens no writer", addRecord: false, wantOpened: false, wantClosed: false},
 	}
-	finishQuietly(sink)
-	if !fw.closed {
-		t.Fatal("finishQuietly must close a writer the sink already opened")
-	}
-	// Idempotent: a later call (e.g. main's normal-path Finish, or another
-	// finishQuietly from a defer) must not panic or double-close incorrectly.
-	finishQuietly(sink)
-}
-
-// TestFinishQuietly_UntouchedSinkNoWriter covers the fetchStream-failure
-// case: finishQuietly on a sink that never received any records must be a
-// harmless no-op (no writer ever opened, per StringSink's lazy-open design).
-func TestFinishQuietly_UntouchedSinkNoWriter(t *testing.T) {
-	opened := false
-	sink := dgarrow.NewStringSink(context.Background(), func() (dgarrow.ChunkWriter, error) {
-		opened = true
-		return &fakeChunkWriter{}, nil
-	}, dgarrow.WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }))
-	finishQuietly(sink)
-	if opened {
-		t.Fatal("finishQuietly on an untouched sink must not open a writer")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fw := &fakeChunkWriter{}
+			opened := false
+			sink := dgarrow.NewStringSink(context.Background(), func() (dgarrow.ChunkWriter, error) {
+				opened = true
+				return fw, nil
+			}, dgarrow.WithColumns([]string{"id"}, func(rec map[string]any, _ int) any { return rec["id"] }))
+			if tc.addRecord {
+				if err := sink.Add(map[string]any{"id": "1"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			finishQuietly(sink)
+			if opened != tc.wantOpened {
+				t.Errorf("writer opened = %v, want %v", opened, tc.wantOpened)
+			}
+			if fw.closed != tc.wantClosed {
+				t.Errorf("writer closed = %v, want %v", fw.closed, tc.wantClosed)
+			}
+			// Idempotent: a later call (main's normal-path Finish, or another
+			// finishQuietly from a defer) must not panic or change the outcome.
+			finishQuietly(sink)
+			if opened != tc.wantOpened || fw.closed != tc.wantClosed {
+				t.Errorf("state changed after repeat call: opened=%v closed=%v", opened, fw.closed)
+			}
+		})
 	}
 }
 

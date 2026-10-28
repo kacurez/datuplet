@@ -59,41 +59,30 @@ func TestLoadConfig_Success(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_MissingCluster(t *testing.T) {
-	dir := writeDatupletDir(t, "", "tok")
-	_, err := loadConfig(dir)
-	if err == nil {
-		t.Fatalf("expected error for missing cluster.json")
+func TestLoadConfig_Errors(t *testing.T) {
+	cases := []struct {
+		name    string
+		cluster string
+		token   string
+		// wantHint, when set, must appear in the error (the login hint).
+		wantHint string
+	}{
+		{name: "missing cluster.json", cluster: "", token: "tok", wantHint: "datuplet login --remote"},
+		{name: "missing api-token", cluster: goodCluster, token: "", wantHint: "datuplet login --remote"},
+		// Empty projects: cannot qualify the warehouse.
+		{name: "no projects", cluster: `{"lakekeeper_url":"u","warehouse_name":"w","pipeline_api_url":"a","projects":[]}`, token: "tok"},
+		{name: "whitespace-only api-token", cluster: goodCluster, token: "   \n"},
 	}
-	if !strings.Contains(err.Error(), "datuplet login --remote") {
-		t.Errorf("error should suggest login, got: %v", err)
-	}
-}
-
-func TestLoadConfig_MissingAPIToken(t *testing.T) {
-	dir := writeDatupletDir(t, goodCluster, "")
-	_, err := loadConfig(dir)
-	if err == nil {
-		t.Fatalf("expected error for missing api-token")
-	}
-	if !strings.Contains(err.Error(), "datuplet login --remote") {
-		t.Errorf("error should suggest login, got: %v", err)
-	}
-}
-
-func TestLoadConfig_NoProjects(t *testing.T) {
-	cluster := `{"lakekeeper_url":"u","warehouse_name":"w","pipeline_api_url":"a","projects":[]}`
-	dir := writeDatupletDir(t, cluster, "tok")
-	_, err := loadConfig(dir)
-	if err == nil {
-		t.Fatalf("expected error for empty projects (cannot qualify warehouse)")
-	}
-}
-
-func TestLoadConfig_EmptyAPITokenFile(t *testing.T) {
-	dir := writeDatupletDir(t, goodCluster, "   \n")
-	_, err := loadConfig(dir)
-	if err == nil {
-		t.Fatalf("expected error for whitespace-only api-token")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeDatupletDir(t, tc.cluster, tc.token)
+			_, err := loadConfig(dir)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if tc.wantHint != "" && !strings.Contains(err.Error(), tc.wantHint) {
+				t.Errorf("error should contain %q, got: %v", tc.wantHint, err)
+			}
+		})
 	}
 }

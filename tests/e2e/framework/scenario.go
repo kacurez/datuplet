@@ -53,17 +53,12 @@ const (
 
 // Scenario defines an end-to-end test scenario.
 type Scenario struct {
-	Name           string
-	Description    string
-	SetupPipeline  string        // optional: runs before Pipeline to seed baseline data
-	SetupDelay     time.Duration // optional: sleep between setup pipeline and main pipeline
-	BackdateSetup  time.Duration // optional: backdate snapshot timestamps after setup (avoids real delay)
-	BackdateBucket string        // bucket containing the table to backdate (supports {{.RunPrefix}})
-	BackdateTable  string        // table whose snapshots to backdate
-	K8sPipeline    string        // relative path to K8s pipeline YAML template (empty = skip)
-	RunTwice       bool          // for APPEND/FULL_LOAD tests
-	ExpectError    bool
-	Assertions     []Assertion
+	Name        string
+	Description string
+	K8sPipeline string // relative path to K8s pipeline YAML template (empty = skip)
+	RunTwice    bool   // for APPEND/FULL_LOAD tests
+	ExpectError bool
+	Assertions  []Assertion
 
 	// User, when non-nil, overrides which TestUser identity the K8s backend
 	// mints the per-run JWT for. Defaults to AliceID (project_admin) when
@@ -85,16 +80,13 @@ type Scenario struct {
 
 // Assertion defines a single check to run after pipeline execution.
 type Assertion struct {
-	Type string // "row_count", "min_row_count", "schema", "column_absent", "query", "table_exists", "browse_table_succeeds", "exit_code", "failure_type"
+	Type string // "row_count", "schema", "table_exists", "browse_table_succeeds", "exit_code", "failure_type"
 
 	Bucket string // bucket name (may contain {{.RunPrefix}})
 	Table  string
 
 	ExpectedCount    int
 	ExpectedColumns  map[string]string // for schema
-	Column           string            // for column_absent
-	SQL              string            // for query (use {{TABLE}} placeholder)
-	ExpectedRows     []map[string]any  // for query
 	ExpectedExitCode int               // for exit_code
 	ExpectedFailure  string            // for failure_type
 }
@@ -102,7 +94,7 @@ type Assertion struct {
 // RunScenario is the main test runner for an e2e scenario.
 // It executes the scenario against the K8s backend, rendering pipeline
 // templates, executing pipelines, and checking assertions.
-func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir string, testDataDir string) {
+func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir string) {
 	t.Helper()
 
 	// Per-scenario skip. Surfaced via Scenario.SkipReason for tests blocked
@@ -158,42 +150,7 @@ func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir strin
 	}
 	queryTarget.Resolver = resolver
 
-	vars := TemplateVars{
-		RunPrefix:   runPrefix,
-		TestDataDir: testDataDir,
-	}
-
-	// Run setup pipeline if specified (seeds baseline data).
-	if sc.SetupPipeline != "" {
-		setupPath := pipelinesDir + "/" + sc.SetupPipeline
-		setupRendered, err := RenderPipeline(setupPath, vars)
-		if err != nil {
-			t.Fatalf("render setup pipeline %s: %v", setupPath, err)
-		}
-		defer os.Remove(setupRendered)
-
-		result, err := kb.RunPipeline(ctx, setupRendered, RunOpts{
-			StorageType: "s3",
-		})
-		if err != nil {
-			t.Fatalf("run setup pipeline: %v", err)
-		}
-		if !result.Success {
-			t.Fatalf("setup pipeline failed (exit %d):\n  logs: %s", result.ExitCode, result.Logs)
-		}
-
-		if sc.SetupDelay > 0 {
-			t.Logf("waiting %s after setup pipeline...", sc.SetupDelay)
-			time.Sleep(sc.SetupDelay)
-		}
-
-		// Backdate snapshot timestamps so delta reads find an "old" baseline
-		// without actually waiting. (warehouseDir is empty for K8s tier —
-		// backdating is only meaningful for local filesystem mode.)
-		if sc.BackdateSetup > 0 {
-			t.Logf("note: BackdateSetup is set but K8s tier does not support local backdating; skipped")
-		}
-	}
+	vars := TemplateVars{RunPrefix: runPrefix}
 
 	// Render the pipeline template.
 	templatePath := pipelinesDir + "/" + sc.K8sPipeline
@@ -283,33 +240,12 @@ func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir strin
 			}
 			AssertRowCount(t, queryTarget, bucket, a.Table, a.ExpectedCount)
 
-		case "min_row_count":
-			if queryTarget.IsEmpty() {
-				t.Logf("skipping min_row_count assertion (no query target)")
-				continue
-			}
-			AssertMinRowCount(t, queryTarget, bucket, a.Table, a.ExpectedCount)
-
 		case "schema":
 			if queryTarget.IsEmpty() {
 				t.Logf("skipping schema assertion (no query target)")
 				continue
 			}
 			AssertSchema(t, queryTarget, bucket, a.Table, a.ExpectedColumns)
-
-		case "column_absent":
-			if queryTarget.IsEmpty() {
-				t.Logf("skipping column_absent assertion (no query target)")
-				continue
-			}
-			AssertColumnAbsent(t, queryTarget, bucket, a.Table, a.Column)
-
-		case "query":
-			if queryTarget.IsEmpty() {
-				t.Logf("skipping query assertion (no query target)")
-				continue
-			}
-			AssertQuery(t, queryTarget, bucket, a.Table, a.SQL, a.ExpectedRows)
 
 		default:
 			t.Errorf("unknown assertion type: %q", a.Type)

@@ -66,7 +66,7 @@ use them. Build the same images `make deploy-local` builds on OrbStack, then
 
 ```bash
 # Build the five service images (pipeline-api, pipeline-observer,
-# pipeline-operator, gateway, query-worker) + the five built-in component
+# pipeline-operator, gateway, query-worker) + the three built-in component
 # images. `build-components-local` tags the built-ins at the chart's
 # `components.tag` (a stable vX.Y.Z, via COMPONENT_TAG).
 make docker-build-k8s build-components-local
@@ -82,9 +82,7 @@ for img in \
   datuplet/query-worker:latest \
   "datuplet/data-generator:$CTAG" \
   "datuplet/sql-transform:$CTAG" \
-  "datuplet/stdout-writer:$CTAG" \
   "datuplet/http-json-extractor:$CTAG" \
-  "datuplet/finnhub-extractor:$CTAG" \
 ; do
   kind load docker-image --name datuplet "$img"
 done
@@ -93,10 +91,6 @@ done
   -f-infra tests/local/values-local-infra.yaml \
   -f-app tests/local/values-local-app.yaml
 ```
-
-Note: the chart ships a sixth built-in, `pandas-transform`, with no local build
-target yet — don't use it on a local/kind cluster (it will ImagePullBackOff); the
-five built-ins above, including `http-json-extractor` used by the example, work fine.
 
 `tests/local/values-local-app.yaml` sets `image.pullPolicy=IfNotPresent` (so
 kubelet uses the kind-loaded image instead of trying to pull a non-existent

@@ -92,15 +92,13 @@ func TestArrowIPCParseReader_EmptyStreamErrors(t *testing.T) {
 	}
 }
 
-// TestJSONLParseReader_KnownSchema confirms the JSONL streaming path
-// (known schema) matches the buffered Parse path row-for-row.
-func TestJSONLParseReader_KnownSchema(t *testing.T) {
-	alloc := memory.NewGoAllocator()
-	adapter := NewJSONLAdapter(alloc, nil)
-
+// TestJSONLParseReader confirms the JSONL streaming path (known schema) matches
+// the buffered Parse path row-for-row, and that ParseReader falls back to
+// buffering + inference when no schema is supplied (first-chunk path).
+func TestJSONLParseReader(t *testing.T) {
 	jsonl := []byte(`{"id":1,"name":"a"}` + "\n" + `{"id":2,"name":"b"}` + "\n")
 
-	s, err := schema.NewSchema([]schema.ColumnDef{
+	known, err := schema.NewSchema([]schema.ColumnDef{
 		{Name: "id", Type: schema.TypeInt64, Nullable: true},
 		{Name: "name", Type: schema.TypeString, Nullable: true},
 	})
@@ -108,54 +106,50 @@ func TestJSONLParseReader_KnownSchema(t *testing.T) {
 		t.Fatalf("NewSchema: %v", err)
 	}
 
-	// Buffered baseline.
-	bufRec, _, err := adapter.Parse(jsonl, s)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
+	tests := []struct {
+		name   string
+		schema *schema.Schema
+	}{
+		{"known schema matches buffered Parse", known},
+		{"nil schema infers", nil},
 	}
-	defer bufRec.Release()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := NewJSONLAdapter(memory.NewGoAllocator(), nil)
 
-	// Streaming.
-	strRec, _, err := adapter.ParseReader(bytes.NewReader(jsonl), s)
-	if err != nil {
-		t.Fatalf("ParseReader: %v", err)
-	}
-	defer strRec.Release()
+			strRec, s, err := adapter.ParseReader(bytes.NewReader(jsonl), tc.schema)
+			if err != nil {
+				t.Fatalf("ParseReader: %v", err)
+			}
+			defer strRec.Release()
 
-	if strRec.NumRows() != bufRec.NumRows() {
-		t.Fatalf("row count mismatch: streaming %d vs buffered %d", strRec.NumRows(), bufRec.NumRows())
-	}
-	if strRec.NumRows() != 2 {
-		t.Fatalf("rows = %d, want 2", strRec.NumRows())
-	}
-	ids := strRec.Column(0).(*array.Int64)
-	if ids.Value(0) != 1 || ids.Value(1) != 2 {
-		t.Errorf("id values incorrect: %v", ids)
-	}
-	names := strRec.Column(1).(*array.String)
-	if names.Value(0) != "a" || names.Value(1) != "b" {
-		t.Errorf("name values incorrect")
-	}
-}
+			if s == nil || s.NumColumns() != 2 {
+				t.Fatalf("schema wrong: %+v", s)
+			}
+			if strRec.NumRows() != 2 {
+				t.Fatalf("rows = %d, want 2", strRec.NumRows())
+			}
+			if tc.schema == nil {
+				return
+			}
 
-// TestJSONLParseReader_NilSchemaInfers confirms ParseReader falls back to
-// buffering + inference when no schema is supplied (first-chunk path).
-func TestJSONLParseReader_NilSchemaInfers(t *testing.T) {
-	alloc := memory.NewGoAllocator()
-	adapter := NewJSONLAdapter(alloc, nil)
-
-	jsonl := []byte(`{"id":1,"name":"a"}` + "\n" + `{"id":2,"name":"b"}` + "\n")
-
-	rec, s, err := adapter.ParseReader(bytes.NewReader(jsonl), nil)
-	if err != nil {
-		t.Fatalf("ParseReader(nil schema): %v", err)
-	}
-	defer rec.Release()
-
-	if s == nil || s.NumColumns() != 2 {
-		t.Fatalf("inferred schema wrong: %+v", s)
-	}
-	if rec.NumRows() != 2 {
-		t.Errorf("rows = %d, want 2", rec.NumRows())
+			// Buffered baseline.
+			bufRec, _, err := adapter.Parse(jsonl, tc.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			defer bufRec.Release()
+			if strRec.NumRows() != bufRec.NumRows() {
+				t.Fatalf("row count mismatch: streaming %d vs buffered %d", strRec.NumRows(), bufRec.NumRows())
+			}
+			ids := strRec.Column(0).(*array.Int64)
+			if ids.Value(0) != 1 || ids.Value(1) != 2 {
+				t.Errorf("id values incorrect: %v", ids)
+			}
+			names := strRec.Column(1).(*array.String)
+			if names.Value(0) != "a" || names.Value(1) != "b" {
+				t.Errorf("name values incorrect")
+			}
+		})
 	}
 }

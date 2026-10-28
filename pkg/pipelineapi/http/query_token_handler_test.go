@@ -63,10 +63,9 @@ func TestQueryTokenHandler_PolicyOn_MintsQueryToken(t *testing.T) {
 	signer := mustNewSigner(t)
 	h := apihttp.NewLocalQueryMintHandler(signer, true) // policy ON
 
-	sub := uuid.New()
 	before := time.Now()
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, authedQueryTokenRequest(sub))
+	h.ServeHTTP(rec, authedQueryTokenRequest(uuid.New()))
 
 	if rec.Code != stdhttp.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -85,28 +84,13 @@ func TestQueryTokenHandler_PolicyOn_MintsQueryToken(t *testing.T) {
 		t.Fatal("expires_at is empty")
 	}
 
-	// Parse + verify the token against the signer's public key — assert the
-	// query-token claim shape the laptop-side engine relies on.
-	parsed, err := jwt.Parse(body.Token, func(*jwt.Token) (any, error) {
-		return signer.Public(), nil
-	})
+	// aud / token_kind / sub are pinned by tokens.TestMintQueryToken_ClaimsShape;
+	// only the handler-specific exp relationships are checked here.
+	parsed, _, err := jwt.NewParser().ParseUnverified(body.Token, jwt.MapClaims{})
 	if err != nil {
-		t.Fatalf("parse/verify JWT: %v", err)
+		t.Fatalf("parse JWT: %v", err)
 	}
 	claims := parsed.Claims.(jwt.MapClaims)
-	// Use GetAudience() rather than a bare string cast: jwt/v5 may surface `aud`
-	// as a single string or a []string depending on encoding, and GetAudience()
-	// normalizes both to jwt.ClaimStrings.
-	aud, _ := claims.GetAudience()
-	if len(aud) != 1 || aud[0] != tokens.TableTokenAudience {
-		t.Errorf("aud = %v, want [%q]", aud, tokens.TableTokenAudience)
-	}
-	if got, _ := claims["token_kind"].(string); got != tokens.TokenKindQuery {
-		t.Errorf("token_kind = %q, want %q", got, tokens.TokenKindQuery)
-	}
-	if got, _ := claims["sub"].(string); got != sub.String() {
-		t.Errorf("sub = %q, want %q", got, sub.String())
-	}
 	// exp present + within the MaxQueryTokenLifetime ceiling.
 	expF, ok := claims["exp"].(float64)
 	if !ok {

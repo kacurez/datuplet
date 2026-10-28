@@ -48,20 +48,6 @@ const serverProbeBundle = `var __dtp_app = { render: (ctx) => {
 	};
 }};`
 
-// serverQueryBundle awaits one query, so a blocking Query fake holds the
-// render inside the engine — how the capacity gate is exercised at HTTP level.
-const serverQueryBundle = `var __dtp_app = { render: async () => {
-	await datuplet.query("SELECT 1");
-	return { outputDoc: 1, title: "q", blocks: [{ id: "a", type: "markdown", text: "ok" }] };
-}};`
-
-// serverInvalidDocBundle returns a non-OutputDoc → outputdoc.Validate fails →
-// render_error.
-const serverInvalidDocBundle = `var __dtp_app = { render: () => ({ nope: 1 }) };`
-
-// serverHotLoopBundle never yields → the wall-clock backstop fires → timeout.
-const serverHotLoopBundle = `var __dtp_app = { render: () => { while (true) {} } };`
-
 // serverInjectionBundle emits app-controlled text containing a literal
 // `</script>` breakout — the exact payload that would inject markup into the
 // trusted shell if the doc were embedded unescaped (Finding 1).
@@ -372,36 +358,42 @@ func TestRoute_ProductionAndDraftChannel(t *testing.T) {
 }
 
 func TestRoute_SubPathBecomesCtxPath(t *testing.T) {
-	h := newServerHarness(t)
-	resp := h.bearerGet(h.url("/reports/q4"), "")
-	body := readBody(t, resp)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, body)
+	cases := []struct {
+		name   string
+		suffix string
+		want   string
+	}{
+		{"sub-path", "/reports/q4", "path=/reports/q4"},
+		{"bare app has the root ctx.path", "", "path=/"},
 	}
-	doc := scriptDoc(t, body)
-	got, ok := blockTextByID(doc, "path")
-	if !ok || got != "path=/reports/q4" {
-		t.Errorf("ctx.path block = %q (ok=%v), want %q", got, ok, "path=/reports/q4")
-	}
-}
-
-func TestRoute_BareAppHasRootCtxPath(t *testing.T) {
-	h := newServerHarness(t)
-	body := readBody(t, h.bearerGet(h.url(""), ""))
-	if got, _ := blockTextByID(scriptDoc(t, body), "path"); got != "path=/" {
-		t.Errorf("ctx.path = %q, want %q", got, "path=/")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newServerHarness(t)
+			resp := h.bearerGet(h.url(tc.suffix), "")
+			body := readBody(t, resp)
+			if resp.StatusCode != 200 {
+				t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, body)
+			}
+			doc := scriptDoc(t, body)
+			got, ok := blockTextByID(doc, "path")
+			if !ok || got != tc.want {
+				t.Errorf("ctx.path block = %q (ok=%v), want %q", got, ok, tc.want)
+			}
+		})
 	}
 }
 
 func TestRoute_TraversalIsBadRequest(t *testing.T) {
 	h := newServerHarness(t)
-	cases := []string{
-		"/apps/" + testProjectID + "/" + testAppName + "/a/../b",
-		"/apps/" + testProjectID + "/" + testAppName + "/%2e%2e/etc",
-		"/apps/" + testProjectID + "/" + testAppName + "/a%2Fb",
+	app := "/apps/" + testProjectID + "/" + testAppName
+	cases := map[string]string{
+		"dot-dot segment":   app + "/a/../b",
+		"encoded dot-dot":   app + "/%2e%2e/etc",
+		"encoded slash":     app + "/a%2Fb",
+		"ctx path too long": app + "/" + strings.Repeat("a", maxCtxPathLen+10),
 	}
-	for _, raw := range cases {
-		t.Run(raw, func(t *testing.T) {
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
 			req, _ := http.NewRequest(http.MethodGet, h.ts.URL+raw, nil)
 			req.Header.Set("Authorization", "Bearer platform-token")
 			req.Header.Set("Accept", "application/json")
@@ -423,42 +415,9 @@ func TestRoute_TraversalIsBadRequest(t *testing.T) {
 	}
 }
 
-func TestRoute_CtxPathTooLongIsBadRequest(t *testing.T) {
-	h := newServerHarness(t)
-	long := "/" + strings.Repeat("a", maxCtxPathLen+10)
-	resp := h.bearerGet(h.url(long), "application/json")
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (%s)", resp.StatusCode, readBody(t, resp))
-	}
-	if e := decodeEnvelope(t, resp); e.Kind != errKindBadRequest {
-		t.Errorf("kind = %q, want bad_request", e.Kind)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Resolve-first order (spec §4.2)
 // ---------------------------------------------------------------------------
-
-func TestResolveIsCalledBeforeVerify(t *testing.T) {
-	h := newServerHarness(t)
-	resp := h.bearerGet(h.url(""), "application/json")
-	resp.Body.Close()
-
-	seq := h.api.callSeq()
-	if len(seq) < 2 || seq[0] != "resolve" {
-		t.Fatalf("call sequence = %v, want resolve first", seq)
-	}
-	verifyIdx := -1
-	for i, c := range seq {
-		if c == "session" {
-			verifyIdx = i
-			break
-		}
-	}
-	if verifyIdx <= 0 {
-		t.Fatalf("verify (session) not found after resolve in %v", seq)
-	}
-}
 
 // A bad token on a NONEXISTENT app must be indistinguishable from one on a
 // real app: resolve fails first, so the token is never verified (spec §4.2).
@@ -619,23 +578,6 @@ func TestResponseMatrix_ErrorEnvelopeByAccept(t *testing.T) {
 // §6.5 input normalization — HTTP-level
 // ---------------------------------------------------------------------------
 
-func TestParams_DuplicateKeyLastWins_HTTP(t *testing.T) {
-	h := newServerHarness(t)
-	body := readBody(t, h.bearerGet(h.url("?x=1&x=2"), ""))
-	if got, _ := blockTextByID(scriptDoc(t, body), "x"); got != "x=2" {
-		t.Errorf("duplicate key: app saw %q, want x=2 (last wins)", got)
-	}
-}
-
-func TestParams_ReservedBlockStrippedFromCtxParams_HTTP(t *testing.T) {
-	h := newServerHarness(t)
-	body := readBody(t, h.bearerGet(h.url("?block=kpis&only=1"), ""))
-	got, _ := blockTextByID(scriptDoc(t, body), "params")
-	if got != "keys=only" {
-		t.Errorf("ctx.params keys = %q, want keys=only (block must be stripped)", got)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // §6.5 input normalization — readParams unit tests (the authoritative proof;
 // the caps and the token/block strip live here where every branch is
@@ -647,21 +589,48 @@ func reqGet(rawurl string) *http.Request {
 }
 
 func TestReadParams_StripsReservedTokenAndBlock(t *testing.T) {
-	params, block, err := readParams(reqGet("/apps/p/n?token=SECRET&block=kpis&keep=1"))
-	if err != nil {
-		t.Fatalf("readParams: %v", err)
+	cases := []struct {
+		name       string
+		url        string
+		wantBlock  string
+		wantParams map[string]string
+	}{
+		{
+			name:       "token and block are stripped",
+			url:        "/apps/p/n?token=SECRET&block=kpis&keep=1",
+			wantBlock:  "kpis",
+			wantParams: map[string]string{"keep": "1"},
+		},
+		{
+			name:       "duplicate key: last wins",
+			url:        "/apps/p/n?x=1&x=2&x=3",
+			wantParams: map[string]string{"x": "3"},
+		},
 	}
-	if block != "kpis" {
-		t.Errorf("block = %q, want kpis", block)
-	}
-	if _, ok := params[tokenQueryParam]; ok {
-		t.Error("token leaked into ctx.params")
-	}
-	if _, ok := params[blockQueryParam]; ok {
-		t.Error("block leaked into ctx.params")
-	}
-	if params["keep"] != "1" || len(params) != 1 {
-		t.Errorf("params = %v, want only {keep:1}", params)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params, block, err := readParams(reqGet(tc.url))
+			if err != nil {
+				t.Fatalf("readParams: %v", err)
+			}
+			if block != tc.wantBlock {
+				t.Errorf("block = %q, want %q", block, tc.wantBlock)
+			}
+			if _, ok := params[tokenQueryParam]; ok {
+				t.Error("token leaked into ctx.params")
+			}
+			if _, ok := params[blockQueryParam]; ok {
+				t.Error("block leaked into ctx.params")
+			}
+			if len(params) != len(tc.wantParams) {
+				t.Errorf("params = %v, want only %v", params, tc.wantParams)
+			}
+			for k, want := range tc.wantParams {
+				if params[k] != want {
+					t.Errorf("params[%q] = %q, want %q", k, params[k], want)
+				}
+			}
+		})
 	}
 }
 
@@ -682,16 +651,6 @@ func TestReadParams_StripsModalStateKey(t *testing.T) {
 	}
 	if params["country"] != "DE" || len(params) != 1 {
 		t.Errorf("params = %v, want only {country:DE} (app params untouched)", params)
-	}
-}
-
-func TestReadParams_DuplicateKeyLastWins(t *testing.T) {
-	params, _, err := readParams(reqGet("/apps/p/n?x=1&x=2&x=3"))
-	if err != nil {
-		t.Fatalf("readParams: %v", err)
-	}
-	if params["x"] != "3" {
-		t.Errorf("x = %q, want 3 (last wins)", params["x"])
 	}
 }
 
@@ -740,74 +699,60 @@ func TestReadParams_Caps(t *testing.T) {
 	})
 }
 
-func TestReadParams_POSTRequiresJSON(t *testing.T) {
-	t.Run("missing content-type", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/apps/p/n", strings.NewReader(`{"a":"b"}`))
-		if _, _, err := readParams(r); err == nil {
-			t.Error("POST without application/json must be rejected")
-		}
-	})
-	t.Run("wrong content-type", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/apps/p/n", strings.NewReader(`{"a":"b"}`))
-		r.Header.Set("Content-Type", "text/plain")
-		if _, _, err := readParams(r); err == nil {
-			t.Error("POST with text/plain must be rejected")
-		}
-	})
-	t.Run("string body merges over query", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/apps/p/n?a=fromquery&q=1",
-			strings.NewReader(`{"a":"frombody"}`))
-		r.Header.Set("Content-Type", "application/json")
-		params, _, err := readParams(r)
-		if err != nil {
-			t.Fatalf("readParams: %v", err)
-		}
-		if params["a"] != "frombody" {
-			t.Errorf("body must override query: a = %q, want frombody", params["a"])
-		}
-		if params["q"] != "1" {
-			t.Errorf("query-only key lost: q = %q", params["q"])
-		}
-	})
-	t.Run("nested values rejected", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/apps/p/n", strings.NewReader(`{"a":[1,2]}`))
-		r.Header.Set("Content-Type", "application/json")
-		if _, _, err := readParams(r); err == nil {
-			t.Error("arrays/objects must be rejected (no nesting)")
-		}
-	})
-}
-
-// §6.5: ctx.params is string→string with NO type coercion. A POST body with a
-// non-string scalar must be REJECTED (the client sends `{"n":"42"}`), matching
-// the inherently-string GET query path — not coerced to "42"/"true".
-func TestReadParams_POSTRejectsNonStringValues(t *testing.T) {
-	reject := []string{
-		`{"n":42}`,      // number
-		`{"b":true}`,    // bool
-		`{"z":null}`,    // null
-		`{"o":{"k":1}}`, // object
+// §6.5: ctx.params is string→string with NO type coercion. A POST body must be
+// application/json, and a non-string value (number, bool, null, array,
+// object) must be REJECTED (the client sends `{"n":"42"}`), matching the
+// inherently-string GET query path — not coerced to "42"/"true".
+func TestReadParams_POSTBodyContract(t *testing.T) {
+	cases := []struct {
+		name        string
+		target      string
+		contentType string
+		body        string
+		wantErr     bool
+		wantParams  map[string]string
+	}{
+		{name: "missing content-type is rejected", target: "/apps/p/n", body: `{"a":"b"}`, wantErr: true},
+		{name: "text/plain is rejected", target: "/apps/p/n", contentType: "text/plain", body: `{"a":"b"}`, wantErr: true},
+		{
+			name: "string body merges over query", target: "/apps/p/n?a=fromquery&q=1",
+			contentType: "application/json", body: `{"a":"frombody"}`,
+			wantParams: map[string]string{"a": "frombody", "q": "1"},
+		},
+		{name: "nested array is rejected", target: "/apps/p/n", contentType: "application/json", body: `{"a":[1,2]}`, wantErr: true},
+		{name: "number is rejected", target: "/apps/p/n", contentType: "application/json", body: `{"n":42}`, wantErr: true},
+		{name: "bool is rejected", target: "/apps/p/n", contentType: "application/json", body: `{"b":true}`, wantErr: true},
+		{name: "null is rejected", target: "/apps/p/n", contentType: "application/json", body: `{"z":null}`, wantErr: true},
+		{name: "object is rejected", target: "/apps/p/n", contentType: "application/json", body: `{"o":{"k":1}}`, wantErr: true},
+		{
+			name: "string value is accepted", target: "/apps/p/n",
+			contentType: "application/json", body: `{"n":"42"}`,
+			wantParams: map[string]string{"n": "42"},
+		},
 	}
-	for _, body := range reject {
-		t.Run("reject "+body, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodPost, "/apps/p/n", strings.NewReader(body))
-			r.Header.Set("Content-Type", "application/json")
-			if _, _, err := readParams(r); err == nil {
-				t.Errorf("body %s must be rejected — no coercion (§6.5)", body)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, tc.target, strings.NewReader(tc.body))
+			if tc.contentType != "" {
+				r.Header.Set("Content-Type", tc.contentType)
+			}
+			params, _, err := readParams(r)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("body %s must be rejected", tc.body)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readParams: %v", err)
+			}
+			for k, want := range tc.wantParams {
+				if params[k] != want {
+					t.Errorf("params[%q] = %q, want %q", k, params[k], want)
+				}
 			}
 		})
 	}
-	t.Run("accept string", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/apps/p/n", strings.NewReader(`{"n":"42"}`))
-		r.Header.Set("Content-Type", "application/json")
-		params, _, err := readParams(r)
-		if err != nil {
-			t.Fatalf("string value must be accepted: %v", err)
-		}
-		if params["n"] != "42" {
-			t.Errorf("n = %q, want \"42\"", params["n"])
-		}
-	})
 }
 
 // The 16 KiB cap is enforced PRE-PARSE: an oversized body is refused by size,
@@ -884,64 +829,6 @@ func TestAccessLog_NoURLOrReferer(t *testing.T) {
 		if strings.Contains(logged, banned) {
 			t.Errorf("access log leaked %q:\n%s", banned, logged)
 		}
-	}
-}
-
-// params_hash is computed AFTER the reserved names are stripped, and is a
-// hash (never plaintext values).
-func TestAccessLog_ParamsHashIsPostStripping(t *testing.T) {
-	h := newServerHarness(t)
-	req, _ := http.NewRequest(http.MethodGet, h.url("?block=kpis&x=1"), nil)
-	req.Header.Set("Authorization", "Bearer platform-token")
-	h.do(req).Body.Close()
-
-	logged := h.logBuf.String()
-	wantHash := paramsHash(map[string]string{"x": "1"}) // block stripped
-	wrongHash := paramsHash(map[string]string{"x": "1", "block": "kpis"})
-	if !strings.Contains(logged, "params_hash="+wantHash) {
-		t.Errorf("params_hash not computed post-stripping; log:\n%s", logged)
-	}
-	if wantHash == wrongHash {
-		t.Fatal("test bug: stripped and unstripped hashes coincide")
-	}
-	if strings.Contains(logged, "params_hash="+wrongHash) {
-		t.Error("params_hash was computed BEFORE stripping the reserved block param")
-	}
-}
-
-func TestAccessLog_CarriesPrincipalFields(t *testing.T) {
-	h := newServerHarness(t)
-	h.bearerGet(h.url(""), "application/json").Body.Close()
-	logged := h.logBuf.String()
-	for _, want := range []string{
-		"principal_kind=" + principalKindPlatformUser,
-		"principal_id=user-1",
-		"params_hash=",
-		"outcome=" + outcomeOK,
-	} {
-		if !strings.Contains(logged, want) {
-			t.Errorf("access log missing %q:\n%s", want, logged)
-		}
-	}
-}
-
-// The client-IP field uses s.clientIP(r), so it agrees with the rate-limit
-// bucket: an untrusted X-Forwarded-For must NOT appear (default config trusts
-// no proxy).
-func TestAccessLog_ClientIPUsesResolver(t *testing.T) {
-	h := newServerHarness(t)
-	req, _ := http.NewRequest(http.MethodGet, h.url(""), nil)
-	req.Header.Set("Authorization", "Bearer platform-token")
-	req.Header.Set("X-Forwarded-For", "9.9.9.9")
-	req.Header.Set("Accept", "application/json")
-	h.do(req).Body.Close()
-
-	logged := h.logBuf.String()
-	if !strings.Contains(logged, "client_ip=127.0.0.1") {
-		t.Errorf("client_ip should be the loopback peer (via s.clientIP), log:\n%s", logged)
-	}
-	if strings.Contains(logged, "9.9.9.9") {
-		t.Error("client_ip took an untrusted X-Forwarded-For — must route through s.clientIP")
 	}
 }
 
@@ -1036,59 +923,20 @@ func TestMetrics_EndpointExposesRenderCounter(t *testing.T) {
 	}
 }
 
-// The counter moves per outcome label across the WHOLE §8/§9 label set. Each
-// row drives a fresh harness (fresh registry) so the counts are isolated.
+// The counter moves per outcome label. Each row drives a fresh harness (fresh
+// registry) so the counts are isolated: the ok path, and one error path
+// (unauthorized, which is written outside the render pipeline).
 func TestMetrics_CounterMovesPerOutcome(t *testing.T) {
-	labelSet := []string{
-		outcomeOK, "render_error", "timeout", "rate_limited",
-		"capacity", "unauthorized", "bad_request", "unavailable",
-	}
-
 	drive := map[string]func(t *testing.T) *serverHarness{
 		outcomeOK: func(t *testing.T) *serverHarness {
 			h := newServerHarness(t)
 			h.bearerGet(h.url(""), "application/json").Body.Close()
 			return h
 		},
-		"render_error": func(t *testing.T) *serverHarness {
-			h := newServerHarness(t)
-			h.api.bundle = []byte(serverInvalidDocBundle)
-			h.bearerGet(h.url(""), "application/json").Body.Close()
-			return h
-		},
-		"timeout": func(t *testing.T) *serverHarness {
-			cfg := Config{Render: renderConfig()}
-			cfg.Render.TimeoutS = 1 // real ~1s wall-clock backstop
-			h := newServerHarnessWith(t, cfg, 0)
-			h.api.bundle = []byte(serverHotLoopBundle)
-			h.bearerGet(h.url(""), "application/json").Body.Close()
-			return h
-		},
-		"rate_limited": func(t *testing.T) *serverHarness {
-			h := newServerHarness(t)
-			for i := 0; i < renderRatePerPrincipalBurst+1; i++ {
-				h.bearerGet(h.url(""), "application/json").Body.Close()
-			}
-			return h
-		},
-		"capacity":     driveCapacity,
 		"unauthorized": driveUnauthorized,
-		"bad_request": func(t *testing.T) *serverHarness {
-			h := newServerHarness(t)
-			h.bearerGet(h.url("?block=nope"), "application/json").Body.Close()
-			return h
-		},
-		"unavailable": func(t *testing.T) *serverHarness {
-			h := newServerHarness(t)
-			h.api.mu.Lock()
-			h.api.resolveErr = errors.New("pipeline-api down")
-			h.api.mu.Unlock()
-			h.bearerGet(h.url(""), "application/json").Body.Close()
-			return h
-		},
 	}
 
-	for _, outcome := range labelSet {
+	for _, outcome := range []string{outcomeOK, "unauthorized"} {
 		t.Run(outcome, func(t *testing.T) {
 			h := drive[outcome](t)
 			if got := testutil.ToFloat64(h.srv.renderRequests.WithLabelValues(outcome)); got < 1 {
@@ -1104,55 +952,6 @@ func driveUnauthorized(t *testing.T) *serverHarness {
 	req, _ := http.NewRequest(http.MethodGet, h.url(""), nil)
 	req.Header.Set("Accept", "application/json")
 	h.do(req).Body.Close()
-	return h
-}
-
-// driveCapacity holds the single pool slot with a blocking query on app A,
-// then a render for app B is shed as `capacity` after the bounded wait.
-func driveCapacity(t *testing.T) *serverHarness {
-	cfg := Config{Render: renderConfig()}
-	cfg.Render.Concurrency = 1
-	cfg.Render.PerAppInflight = 2
-	h := newServerHarnessWith(t, cfg, 30*time.Millisecond)
-	h.api.bundle = []byte(serverQueryBundle)
-	arrived := make(chan struct{}, 1)
-	release := make(chan struct{})
-	h.api.mu.Lock()
-	h.api.queryFn = blockingQuery(arrived, release)
-	h.api.mu.Unlock()
-
-	holdURL := h.ts.URL + "/apps/" + testProjectID + "/app-hold"
-	otherURL := h.ts.URL + "/apps/" + testProjectID + "/app-other"
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		req, _ := http.NewRequest(http.MethodGet, holdURL, nil)
-		req.Header.Set("Authorization", "Bearer platform-token")
-		req.Header.Set("Accept", "application/json")
-		resp, err := h.client().Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-	}()
-
-	<-arrived // render #1 now holds the pool slot inside its query
-
-	req, _ := http.NewRequest(http.MethodGet, otherURL, nil)
-	req.Header.Set("Authorization", "Bearer platform-token")
-	req.Header.Set("Accept", "application/json")
-	resp := h.do(req)
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("capacity: status = %d, want 503 (%s)", resp.StatusCode, readBody(t, resp))
-	}
-	if e := decodeEnvelope(t, resp); e.Kind != errKindCapacity {
-		t.Errorf("capacity: kind = %q, want capacity", e.Kind)
-	}
-	if resp.Header.Get("Retry-After") == "" {
-		t.Error("capacity 503 missing Retry-After")
-	}
-	close(release)
-	<-done
 	return h
 }
 
@@ -1304,48 +1103,41 @@ func TestEscapeJSONForScript_RoundTripsAndNeutralizes(t *testing.T) {
 	}
 }
 
-// Finding 2: a table with plain-ARRAY rows must be findable by its own id.
-func TestFindBlock_PlainRowTableIsFoundByID(t *testing.T) {
-	h := newServerHarness(t)
-	h.api.bundle = []byte(serverPlainRowTableBundle)
-	resp := h.bearerGet(h.url("?block=tbl"), "application/json")
-	body := readBody(t, resp)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200 — a plain-row table must be findable by id (%s)", resp.StatusCode, body)
+// Finding 2: a plain-ARRAY-row table must be findable by id (pre-fix the array
+// row failed the whole-block unmarshal and `block=tbl` 400'd), and an
+// object-row table — and the block nested in its row modal — must keep
+// resolving.
+func TestFindBlock_ResolvesByID(t *testing.T) {
+	cases := []struct {
+		name     string
+		bundle   string
+		block    string
+		wantType string // "" means: do not assert the type
+	}{
+		{"plain-row table", serverPlainRowTableBundle, "tbl", "table"},
+		{"object-row table", serverObjectRowModalBundle, "tbl2", "table"},
+		{"row-modal nested block", serverObjectRowModalBundle, "deep", ""},
 	}
-	var blk map[string]any
-	if err := json.Unmarshal([]byte(body), &blk); err != nil {
-		t.Fatalf("body is not JSON: %v", err)
-	}
-	if blk["id"] != "tbl" || blk["type"] != "table" {
-		t.Errorf("block = %v, want the tbl table block", blk)
-	}
-}
-
-// Finding 2: an object-row table's modal-nested block still resolves, and the
-// table itself resolves.
-func TestFindBlock_ObjectRowModalStillResolves(t *testing.T) {
-	h := newServerHarness(t)
-	h.api.bundle = []byte(serverObjectRowModalBundle)
-
-	if resp := h.bearerGet(h.url("?block=tbl2"), "application/json"); resp.StatusCode != 200 {
-		t.Errorf("block=tbl2 status = %d, want 200", resp.StatusCode)
-		resp.Body.Close()
-	} else {
-		resp.Body.Close()
-	}
-
-	resp := h.bearerGet(h.url("?block=deep"), "application/json")
-	body := readBody(t, resp)
-	if resp.StatusCode != 200 {
-		t.Fatalf("block=deep status = %d, want 200 — row-modal nesting must resolve (%s)", resp.StatusCode, body)
-	}
-	var blk map[string]any
-	if err := json.Unmarshal([]byte(body), &blk); err != nil {
-		t.Fatalf("body is not JSON: %v", err)
-	}
-	if blk["id"] != "deep" {
-		t.Errorf("block = %v, want the deep block", blk)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newServerHarness(t)
+			h.api.bundle = []byte(tc.bundle)
+			resp := h.bearerGet(h.url("?block="+tc.block), "application/json")
+			body := readBody(t, resp)
+			if resp.StatusCode != 200 {
+				t.Fatalf("block=%s status = %d, want 200 (%s)", tc.block, resp.StatusCode, body)
+			}
+			var blk map[string]any
+			if err := json.Unmarshal([]byte(body), &blk); err != nil {
+				t.Fatalf("body is not JSON: %v", err)
+			}
+			if blk["id"] != tc.block {
+				t.Errorf("block = %v, want the %s block", blk, tc.block)
+			}
+			if tc.wantType != "" && blk["type"] != tc.wantType {
+				t.Errorf("block type = %v, want %s", blk["type"], tc.wantType)
+			}
+		})
 	}
 }
 

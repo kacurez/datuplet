@@ -118,7 +118,9 @@ func TestAsyncWriter_PropagatesError(t *testing.T) {
 	}
 }
 
-// TestAsyncWriter_CloseIdempotent ensures double-Close is a no-op.
+// TestAsyncWriter_CloseIdempotent ensures double-Close is a no-op, and that
+// callers can't resurrect a closed writer (a Write would hang on a closed
+// channel send).
 func TestAsyncWriter_CloseIdempotent(t *testing.T) {
 	a := newAsyncWriter(&fakeInner{}, 2, 1024)
 	if err := a.Close(); err != nil {
@@ -126,15 +128,6 @@ func TestAsyncWriter_CloseIdempotent(t *testing.T) {
 	}
 	if err := a.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
-	}
-}
-
-// TestAsyncWriter_RejectsWriteAfterClose makes sure callers can't
-// resurrect a closed writer (would hang on a closed channel send).
-func TestAsyncWriter_RejectsWriteAfterClose(t *testing.T) {
-	a := newAsyncWriter(&fakeInner{}, 2, 1024)
-	if err := a.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
 	}
 	if _, err := a.Write([]byte("after close")); err == nil {
 		t.Fatal("expected error writing after Close")

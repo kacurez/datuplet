@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -61,100 +60,89 @@ func parseRangeHeader(h string) (int64, int64, error) {
 	return start, end, nil
 }
 
-func TestMinIORangeReaderAt_ReadsContiguousBytes(t *testing.T) {
-	payload := []byte("0123456789abcdef")
-	g := &fakeObjectGetter{data: payload}
-	r := newMinIORangeReaderAt(context.Background(), g, "bucket", "key", int64(len(payload)))
-
-	buf := make([]byte, 4)
-	n, err := r.ReadAt(buf, 6)
-	if err != nil {
-		t.Fatalf("ReadAt: %v", err)
-	}
-	if n != 4 || !bytes.Equal(buf, []byte("6789")) {
-		t.Errorf("got %q (n=%d), want %q (n=4)", buf, n, "6789")
-	}
-	if len(g.calls) != 1 || g.calls[0] != (rangeCall{6, 9}) {
-		t.Errorf("expected single Range GET 6-9, got %+v", g.calls)
-	}
-}
-
-func TestMinIORangeReaderAt_TailReadReturnsEOF(t *testing.T) {
+// testRangeReaderAt is the shared range-reader contract for the MinIO and GCS
+// adapters. newReader builds a reader over payload (object size == len(payload))
+// and returns a func reporting the (offset, length) of every ranged GET the
+// adapter issued, so the Range-GET pattern can be asserted uniformly.
+func testRangeReaderAt(t *testing.T, newReader func(payload []byte) (io.ReaderAt, func() [][2]int64)) {
+	t.Helper()
 	payload := []byte("0123456789abcdef") // size 16
-	g := &fakeObjectGetter{data: payload}
-	r := newMinIORangeReaderAt(context.Background(), g, "bucket", "key", int64(len(payload)))
 
-	// Read final byte exactly: off=15, len=1 — n+off = 16 = size, expect EOF.
-	buf := make([]byte, 1)
-	n, err := r.ReadAt(buf, 15)
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("expected io.EOF on tail read, got %v", err)
+	tests := []struct {
+		name      string
+		bufLen    int // 0 = nil buffer
+		off       int64
+		wantN     int
+		wantEOF   bool
+		wantData  string
+		wantCalls [][2]int64
+	}{
+		{
+			name: "reads contiguous bytes", bufLen: 4, off: 6,
+			wantN: 4, wantData: "6789", wantCalls: [][2]int64{{6, 4}},
+		},
+		{
+			// Final byte exactly: off=15, len=1 — n+off = size, expect EOF.
+			name: "tail read returns EOF", bufLen: 1, off: 15,
+			wantN: 1, wantEOF: true, wantData: "f", wantCalls: [][2]int64{{15, 1}},
+		},
+		{
+			// off >= size: zero bytes, EOF, no GET.
+			name: "read past end returns EOF without a GET", bufLen: 4, off: 16,
+			wantN: 0, wantEOF: true,
+		},
+		{
+			// 32 bytes from offset 0; object is 16: length clamped to 16, EOF.
+			name: "overflowing read clamps and returns EOF", bufLen: 32, off: 0,
+			wantN: 16, wantEOF: true, wantData: string(payload), wantCalls: [][2]int64{{0, 16}},
+		},
+		{
+			// Zero-length p: (0, nil) without a degenerate GET.
+			name: "zero-length read is a no-op", bufLen: 0, off: 4,
+			wantN: 0,
+		},
 	}
-	if n != 1 || buf[0] != 'f' {
-		t.Errorf("got %q (n=%d), want %q (n=1)", buf, n, "f")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, calls := newReader(payload)
+			var buf []byte
+			if tc.bufLen > 0 {
+				buf = make([]byte, tc.bufLen)
+			}
+
+			n, err := r.ReadAt(buf, tc.off)
+			if tc.wantEOF != errors.Is(err, io.EOF) || (!tc.wantEOF && err != nil) {
+				t.Fatalf("ReadAt err = %v, want EOF=%v", err, tc.wantEOF)
+			}
+			if n != tc.wantN {
+				t.Errorf("n = %d, want %d", n, tc.wantN)
+			}
+			if got := string(buf[:n]); got != tc.wantData {
+				t.Errorf("data = %q, want %q", got, tc.wantData)
+			}
+			got := calls()
+			if len(got) != len(tc.wantCalls) {
+				t.Fatalf("GETs = %v, want %v", got, tc.wantCalls)
+			}
+			for i := range got {
+				if got[i] != tc.wantCalls[i] {
+					t.Errorf("GET %d = %v, want %v", i, got[i], tc.wantCalls[i])
+				}
+			}
+		})
 	}
 }
 
-func TestMinIORangeReaderAt_ReadPastEndReturnsEOF(t *testing.T) {
-	payload := []byte("0123456789abcdef")
-	g := &fakeObjectGetter{data: payload}
-	r := newMinIORangeReaderAt(context.Background(), g, "bucket", "key", int64(len(payload)))
-
-	// off >= size: zero bytes, EOF, no GET.
-	n, err := r.ReadAt(make([]byte, 4), int64(len(payload)))
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("expected io.EOF, got %v", err)
-	}
-	if n != 0 {
-		t.Errorf("expected n=0, got %d", n)
-	}
-	if len(g.calls) != 0 {
-		t.Errorf("expected zero GETs past end, got %d", len(g.calls))
-	}
-}
-
-func TestMinIORangeReaderAt_OverflowingReadClampsAndReturnsEOF(t *testing.T) {
-	payload := []byte("0123456789abcdef") // size 16
-	g := &fakeObjectGetter{data: payload}
-	r := newMinIORangeReaderAt(context.Background(), g, "bucket", "key", int64(len(payload)))
-
-	// Ask for 32 bytes from offset 0; object is 16. Expect end clamped to 15,
-	// 16 bytes copied, EOF returned.
-	buf := make([]byte, 32)
-	n, err := r.ReadAt(buf, 0)
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("expected io.EOF on overflowing read, got %v", err)
-	}
-	if n != 16 {
-		t.Errorf("expected n=16, got %d", n)
-	}
-	if !bytes.Equal(buf[:16], payload) {
-		t.Errorf("payload mismatch: got %q want %q", buf[:16], payload)
-	}
-	if len(g.calls) != 1 || g.calls[0] != (rangeCall{0, 15}) {
-		t.Errorf("expected Range 0-15, got %+v", g.calls)
-	}
-}
-
-func TestMinIORangeReaderAt_ZeroLengthReadIsNoOp(t *testing.T) {
-	payload := []byte("0123456789abcdef")
-	g := &fakeObjectGetter{data: payload}
-	r := newMinIORangeReaderAt(context.Background(), g, "bucket", "key", int64(len(payload)))
-
-	// Zero-length p: must return (0, nil) without issuing a degenerate GET.
-	n, err := r.ReadAt(nil, 4)
-	if err != nil || n != 0 {
-		t.Errorf("ReadAt(nil, 4): got (%d, %v), want (0, nil)", n, err)
-	}
-	if len(g.calls) != 0 {
-		t.Errorf("zero-length read should not issue any GETs, got %d", len(g.calls))
-	}
-}
-
-func TestMinIORangeReaderAt_Size(t *testing.T) {
-	g := &fakeObjectGetter{data: []byte("xyz")}
-	r := newMinIORangeReaderAt(context.Background(), g, "bucket", "key", 3)
-	if got := r.Size(); got != 3 {
-		t.Errorf("Size(): got %d, want 3", got)
-	}
+func TestMinIORangeReaderAt(t *testing.T) {
+	testRangeReaderAt(t, func(payload []byte) (io.ReaderAt, func() [][2]int64) {
+		g := &fakeObjectGetter{data: payload}
+		r := newMinIORangeReaderAt(context.Background(), g, "bucket", "key", int64(len(payload)))
+		return r, func() [][2]int64 {
+			var out [][2]int64
+			for _, c := range g.calls {
+				out = append(out, [2]int64{c.start, c.end - c.start + 1}) // Range header is inclusive
+			}
+			return out
+		}
+	})
 }

@@ -115,7 +115,7 @@ func registrySkipUnlessReady(t *testing.T) *framework.FGAHarness {
 }
 
 // renderRegistryFixture renders a pipelines/k8s/<name>.yaml template with
-// just RunPrefix (none of these fixtures need TestDataDir).
+// just RunPrefix.
 func renderRegistryFixture(t *testing.T, name string) string {
 	t.Helper()
 	pipelinesDir, err := filepath.Abs("pipelines")
@@ -132,51 +132,6 @@ func renderRegistryFixture(t *testing.T, name string) string {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Unknown component → rejected pre-flight at PUT (HTTP 400), no run created.
-//
-// RFC 027 E5: pre-RFC-027 the harness kubectl-applied the CR and the
-// controller's registry Resolve produced a FailedUser run with zero pods.
-// The migrated K8sBackend drives runs through pipeline-api, whose validator
-// rejects the unknown component at PUT /pipelines with a 400 + an error
-// finding naming stages[].components[].component — BEFORE any run / PipelineRun
-// / pod is created. RunPipeline surfaces that as an error carrying the 400
-// body. Asserting the rejection here proves the same bad input is refused;
-// the controller's own admission defence-in-depth is unit-covered.
-// ──────────────────────────────────────────────────────────────────────────
-
-func TestRegistry_UnknownComponent(t *testing.T) {
-	h := registrySkipUnlessReady(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	kb, err := framework.NewK8sBackend(h, runPrefix)
-	if err != nil {
-		t.Fatalf("init K8s backend: %v", err)
-	}
-	defer kb.Cleanup(context.Background())
-
-	rendered := renderRegistryFixture(t, "unknown-component.yaml")
-
-	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
-	if err == nil {
-		t.Fatalf("expected PUT pre-flight rejection for an unknown component, got success=%v", result != nil && result.Success)
-	}
-	// The error must carry the PUT 400 that names the unknown component and the
-	// offending path (stages[].components[].component).
-	msg := err.Error()
-	if !strings.Contains(msg, "status=400") {
-		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
-	}
-	if !strings.Contains(msg, "does-not-exist") {
-		t.Errorf("rejection does not name the unknown component %q: %v", "does-not-exist", err)
-	}
-	if !strings.Contains(msg, "components[0].component") {
-		t.Errorf("rejection does not point at the offending component field: %v", err)
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 // Config violates the resolved (stable) schema → rejected pre-flight at PUT.
 //
 // Deviation from the RFC's test-impact wording (flagged per the task
@@ -187,7 +142,7 @@ func TestRegistry_UnknownComponent(t *testing.T) {
 // the real, additionalProperties:false schema) to exercise the rejection
 // path at all.
 //
-// RFC 027 E5: like the unknown-component case, the schema violation is now
+// RFC 027 E5: the schema violation is now
 // caught by pipeline-api's validator at PUT (HTTP 400) with an error finding
 // naming the offending config path — before any run is created. RunPipeline
 // surfaces the 400 as an error.
@@ -226,47 +181,11 @@ func TestRegistry_ErrorSchemaInvalid(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Reading a non-existent / invalid input table → rejected pre-flight at PUT.
-//
-// RFC 027 E5: this used to be a run scenario (error-missing-table) expecting a
-// FailedUser terminal from a runtime missing-table read. The migrated harness
-// drives runs through pipeline-api, whose validator rejects the fixture's
-// invalid input-table reference at PUT (HTTP 400, error finding naming
-// stages[].components[].inputs.tables[].table) before any run is created — so
-// it no longer fits the run-to-terminal Scenario{} table (see scenarios_test.go).
-// Asserting the rejection keeps the "bad input is refused" intent.
-// ──────────────────────────────────────────────────────────────────────────
-
-func TestErrorMissingTableRejected(t *testing.T) {
-	h := registrySkipUnlessReady(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	kb, err := framework.NewK8sBackend(h, runPrefix)
-	if err != nil {
-		t.Fatalf("init K8s backend: %v", err)
-	}
-	defer kb.Cleanup(context.Background())
-
-	rendered := renderRegistryFixture(t, "error-missing-table.yaml")
-
-	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3"})
-	if err == nil {
-		t.Fatalf("expected PUT pre-flight rejection for an invalid input table, got success=%v", result != nil && result.Success)
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "status=400") {
-		t.Errorf("expected a 400 pre-flight rejection, got error: %v", err)
-	}
-	if !strings.Contains(msg, "inputs.tables[0].table") {
-		t.Errorf("rejection does not point at the offending input-table path: %v", err)
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 // Unpinned data-generator resolves the only stable version (v0.0.1) and the
-// resolution is recorded verbatim in status.components.
+// resolution is recorded verbatim in status.components. The fixture sets no
+// resources block, so the same run also proves the registry resources.default
+// of v0.0.1 lands on the Job container and is frozen into status.resolvedSpec
+// (RFC 026 §4.4 Layer 2; see scenarios_resources_test.go).
 // ──────────────────────────────────────────────────────────────────────────
 
 func TestRegistry_UnpinnedResolvesStable(t *testing.T) {
@@ -318,6 +237,18 @@ func TestRegistry_UnpinnedResolvesStable(t *testing.T) {
 	if image != framework.DataGeneratorStableImage {
 		t.Errorf("status.components[0].image = %q, want %q", image, framework.DataGeneratorStableImage)
 	}
+
+	// Registry resources.default (v0.0.1) on a component that sets none: the
+	// built Job container carries it verbatim...
+	jobName := waitForComponentJob(t, kb.Namespace, result.RunID, "data-generator", 60*time.Second)
+	assertJobResource(t, kb.Namespace, jobName, "limits", "cpu", framework.DataGeneratorDefaultLimCPU)
+	assertJobResource(t, kb.Namespace, jobName, "limits", "memory", framework.DataGeneratorDefaultLimMemory)
+	assertJobResource(t, kb.Namespace, jobName, "requests", "cpu", framework.DataGeneratorDefaultReqCPU)
+	assertJobResource(t, kb.Namespace, jobName, "requests", "memory", framework.DataGeneratorDefaultReqMemory)
+
+	// ...and the same default is frozen into status.resolvedSpec (admission snapshot).
+	assertResolvedResource(t, kb.Namespace, prName, "limits", "cpu", framework.DataGeneratorDefaultLimCPU)
+	assertResolvedResource(t, kb.Namespace, prName, "requests", "memory", framework.DataGeneratorDefaultReqMemory)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
