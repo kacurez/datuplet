@@ -291,58 +291,51 @@ func TestServiceToken_LoadFromFileAndEnv(t *testing.T) {
 // GET /internal/v1/apps/{pid}/{name}/resolve
 // ---------------------------------------------------------------------------
 
-func TestInternalResolve_HappyPath(t *testing.T) {
-	h := newInternalHarness(t)
-	appID, hash := h.seedApp("dash1", []byte("bundle-one"))
+// TestInternalResolve_Channels covers channel resolution: draft resolves right
+// after an upload, production is unset (404) until a promote, and a request
+// without a channel defaults to production.
+func TestInternalResolve_Channels(t *testing.T) {
+	tests := []struct {
+		name       string
+		promote    bool
+		query      string
+		wantStatus int
+	}{
+		{name: "draft", query: "?channel=draft", wantStatus: http.StatusOK},
+		{name: "production unset before promote", query: "?channel=production", wantStatus: http.StatusNotFound},
+		{name: "production after promote", promote: true, query: "?channel=production", wantStatus: http.StatusOK},
+		{name: "no channel defaults to production", promote: true, query: "", wantStatus: http.StatusOK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newInternalHarness(t)
+			appID, hash := h.seedApp("dash1", []byte("bundle-one"))
+			if tc.promote {
+				if err := h.store.Promote(context.Background(), appID, hash, ""); err != nil {
+					t.Fatalf("Promote: %v", err)
+				}
+			}
 
-	w := h.do(http.MethodGet, "/internal/v1/apps/"+h.projectID.String()+"/dash1/resolve?channel=draft", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
-	var got map[string]any
-	decodeBody(t, w, &got)
-	if len(got) != 2 {
-		t.Errorf("response keys = %v, want exactly {app_id, version_hash}", got)
-	}
-	if got["app_id"] != appID {
-		t.Errorf("app_id = %v, want %s", got["app_id"], appID)
-	}
-	if got["version_hash"] != hash {
-		t.Errorf("version_hash = %v, want %s", got["version_hash"], hash)
-	}
-
-	// production is unset until a promote -> 404, then resolves.
-	w = h.do(http.MethodGet, "/internal/v1/apps/"+h.projectID.String()+"/dash1/resolve?channel=production", "")
-	assertEnvelope(t, w, http.StatusNotFound, "app_not_found")
-
-	if err := h.store.Promote(context.Background(), appID, hash, ""); err != nil {
-		t.Fatalf("Promote: %v", err)
-	}
-	w = h.do(http.MethodGet, "/internal/v1/apps/"+h.projectID.String()+"/dash1/resolve?channel=production", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
-	got = nil
-	decodeBody(t, w, &got)
-	if got["version_hash"] != hash {
-		t.Errorf("production version_hash = %v, want %s", got["version_hash"], hash)
-	}
-}
-
-func TestInternalResolve_DefaultsToProduction(t *testing.T) {
-	h := newInternalHarness(t)
-	appID, hash := h.seedApp("dash1", []byte("bundle-one"))
-	if err := h.store.Promote(context.Background(), appID, hash, ""); err != nil {
-		t.Fatalf("Promote: %v", err)
-	}
-	w := h.do(http.MethodGet, "/internal/v1/apps/"+h.projectID.String()+"/dash1/resolve", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
-	var got map[string]any
-	decodeBody(t, w, &got)
-	if got["version_hash"] != hash {
-		t.Errorf("version_hash = %v, want %s", got["version_hash"], hash)
+			w := h.do(http.MethodGet, "/internal/v1/apps/"+h.projectID.String()+"/dash1/resolve"+tc.query, "")
+			if tc.wantStatus == http.StatusNotFound {
+				assertEnvelope(t, w, http.StatusNotFound, "app_not_found")
+				return
+			}
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			var got map[string]any
+			decodeBody(t, w, &got)
+			if len(got) != 2 {
+				t.Errorf("response keys = %v, want exactly {app_id, version_hash}", got)
+			}
+			if got["app_id"] != appID {
+				t.Errorf("app_id = %v, want %s", got["app_id"], appID)
+			}
+			if got["version_hash"] != hash {
+				t.Errorf("version_hash = %v, want %s", got["version_hash"], hash)
+			}
+		})
 	}
 }
 
@@ -358,15 +351,41 @@ func TestInternalResolve_UnknownApp404(t *testing.T) {
 	assertEnvelope(t, w, http.StatusNotFound, "app_not_found")
 }
 
-func TestInternalResolve_BadRequest(t *testing.T) {
-	h := newInternalHarness(t)
-	h.seedApp("dash1", []byte("bundle-one"))
+// TestInternal_BadRequest covers the 400 {kind: bad_request} envelope on each
+// internal route that parses caller input: a malformed id, a missing field
+// or an unparseable body is a client bug, never a 404 or a 5xx.
+func TestInternal_BadRequest(t *testing.T) {
+	newID := func() string { return uuid.New().String() }
+	tests := []struct {
+		name   string
+		method string
+		path   string // "{pid}" is replaced with the harness project id
+		body   string
+	}{
+		{"resolve non-uuid project", http.MethodGet, "/internal/v1/apps/not-a-uuid/dash1/resolve?channel=draft", ""},
+		{"resolve unknown channel", http.MethodGet, "/internal/v1/apps/{pid}/dash1/resolve?channel=staging", ""},
 
-	w := h.do(http.MethodGet, "/internal/v1/apps/not-a-uuid/dash1/resolve?channel=draft", "")
-	assertEnvelope(t, w, http.StatusBadRequest, "bad_request")
+		{"viewer-tokens/verify bad app_id", http.MethodPost, "/internal/v1/viewer-tokens/verify", `{"app_id":"nope","token_id":"` + newID() + `","secret":"s"}`},
+		{"viewer-tokens/verify bad token_id", http.MethodPost, "/internal/v1/viewer-tokens/verify", `{"app_id":"` + newID() + `","token_id":"nope","secret":"s"}`},
+		{"viewer-tokens/verify missing secret", http.MethodPost, "/internal/v1/viewer-tokens/verify", `{"app_id":"` + newID() + `","token_id":"` + newID() + `"}`},
+		{"viewer-tokens/verify not json", http.MethodPost, "/internal/v1/viewer-tokens/verify", `not json`},
 
-	w = h.do(http.MethodGet, "/internal/v1/apps/"+h.projectID.String()+"/dash1/resolve?channel=staging", "")
-	assertEnvelope(t, w, http.StatusBadRequest, "bad_request")
+		{"viewer-tokens/active bad app_id", http.MethodPost, "/internal/v1/viewer-tokens/active", `{"app_id":"nope","token_id":"` + newID() + `"}`},
+		{"viewer-tokens/active bad token_id", http.MethodPost, "/internal/v1/viewer-tokens/active", `{"app_id":"` + newID() + `","token_id":"nope"}`},
+		{"viewer-tokens/active not json", http.MethodPost, "/internal/v1/viewer-tokens/active", `not json`},
+
+		{"sessions/verify bad pid", http.MethodPost, "/internal/v1/sessions/verify", `{"pid":"nope"}`},
+		{"sessions/verify missing pid", http.MethodPost, "/internal/v1/sessions/verify", `{}`},
+		{"sessions/verify not json", http.MethodPost, "/internal/v1/sessions/verify", `garbage`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newInternalHarness(t)
+			h.seedApp("dash1", []byte("bundle-one"))
+			path := strings.ReplaceAll(tc.path, "{pid}", h.projectID.String())
+			assertEnvelope(t, h.do(tc.method, path, tc.body), http.StatusBadRequest, "bad_request")
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -467,19 +486,6 @@ func TestInternalViewerTokenVerify(t *testing.T) {
 	}
 }
 
-func TestInternalViewerTokenVerify_BadRequest(t *testing.T) {
-	h := newInternalHarness(t)
-	for _, body := range []string{
-		`{"app_id":"nope","token_id":"` + uuid.New().String() + `","secret":"s"}`,
-		`{"app_id":"` + uuid.New().String() + `","token_id":"nope","secret":"s"}`,
-		`{"app_id":"` + uuid.New().String() + `","token_id":"` + uuid.New().String() + `"}`,
-		`not json`,
-	} {
-		w := h.do(http.MethodPost, "/internal/v1/viewer-tokens/verify", body)
-		assertEnvelope(t, w, http.StatusBadRequest, "bad_request")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // POST /internal/v1/viewer-tokens/active
 // ---------------------------------------------------------------------------
@@ -542,18 +548,6 @@ func TestInternalTokenActive(t *testing.T) {
 	}
 }
 
-func TestInternalTokenActive_BadRequest(t *testing.T) {
-	h := newInternalHarness(t)
-	for _, body := range []string{
-		`{"app_id":"nope","token_id":"` + uuid.New().String() + `"}`,
-		`{"app_id":"` + uuid.New().String() + `","token_id":"nope"}`,
-		`not json`,
-	} {
-		w := h.do(http.MethodPost, "/internal/v1/viewer-tokens/active", body)
-		assertEnvelope(t, w, http.StatusBadRequest, "bad_request")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // POST /internal/v1/sessions/verify
 // ---------------------------------------------------------------------------
@@ -592,43 +586,62 @@ func TestInternalSessionsVerify_ForwardsCredentialHeaders(t *testing.T) {
 	}
 }
 
-func TestInternalSessionsVerify_NonMember(t *testing.T) {
-	h := newInternalHarness(t)
-	h.authz.allow = false
-	w := h.do(http.MethodPost, "/internal/v1/sessions/verify", fmt.Sprintf(`{"pid":%q}`, h.projectID.String()))
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+// TestInternalSessionsVerify_NotAMemberAnswers covers the honest "no" answers,
+// all of which are a 200 {project_member: false} — never an error:
+//   - a session user who lacks `describe` on the project;
+//   - no session at all (NOT a 401: on the internal surface 401 means exactly
+//     one thing, a bad service credential, and app-worker must be able to tell
+//     the two apart) — no FGA check may run for it;
+//   - a project that does not exist.
+func TestInternalSessionsVerify_NotAMemberAnswers(t *testing.T) {
+	tests := []struct {
+		name         string
+		setup        func(h *internalHarness)
+		pid          func(h *internalHarness) string
+		wantUserID   func(h *internalHarness) string // nil: not asserted
+		wantNoChecks bool
+	}{
+		{
+			name:       "non-member",
+			setup:      func(h *internalHarness) { h.authz.allow = false },
+			pid:        func(h *internalHarness) string { return h.projectID.String() },
+			wantUserID: func(h *internalHarness) string { return h.resolver.user.ID.String() },
+		},
+		{
+			name:         "no session",
+			setup:        func(h *internalHarness) { h.resolver.authed = false },
+			pid:          func(h *internalHarness) string { return h.projectID.String() },
+			wantUserID:   func(*internalHarness) string { return "" },
+			wantNoChecks: true,
+		},
+		{
+			name:  "unknown project",
+			setup: func(h *internalHarness) { h.projects.err = apps.ErrNotFound },
+			pid:   func(*internalHarness) string { return uuid.New().String() },
+		},
 	}
-	var got map[string]any
-	decodeBody(t, w, &got)
-	if got["user_id"] != h.resolver.user.ID.String() {
-		t.Errorf("user_id = %v, want the resolved user", got["user_id"])
-	}
-	if got["project_member"] != false {
-		t.Errorf("project_member = %v, want false", got["project_member"])
-	}
-}
-
-// No session at all is a 200 "nobody, not a member" — NOT a 401. On the
-// internal surface 401 means exactly one thing: the service credential is
-// bad. app-worker must be able to tell those two apart.
-func TestInternalSessionsVerify_NoSessionIsNotA401(t *testing.T) {
-	h := newInternalHarness(t)
-	h.resolver.authed = false
-	w := h.do(http.MethodPost, "/internal/v1/sessions/verify", fmt.Sprintf(`{"pid":%q}`, h.projectID.String()))
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
-	var got map[string]any
-	decodeBody(t, w, &got)
-	if got["user_id"] != "" {
-		t.Errorf("user_id = %v, want \"\"", got["user_id"])
-	}
-	if got["project_member"] != false {
-		t.Errorf("project_member = %v, want false", got["project_member"])
-	}
-	if len(h.authz.checked) != 0 {
-		t.Errorf("authz checks = %v, want none for an unauthenticated session", h.authz.checked)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newInternalHarness(t)
+			tc.setup(h)
+			w := h.do(http.MethodPost, "/internal/v1/sessions/verify", fmt.Sprintf(`{"pid":%q}`, tc.pid(h)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			var got map[string]any
+			decodeBody(t, w, &got)
+			if tc.wantUserID != nil {
+				if want := tc.wantUserID(h); got["user_id"] != want {
+					t.Errorf("user_id = %v, want %q", got["user_id"], want)
+				}
+			}
+			if got["project_member"] != false {
+				t.Errorf("project_member = %v, want false", got["project_member"])
+			}
+			if tc.wantNoChecks && len(h.authz.checked) != 0 {
+				t.Errorf("authz checks = %v, want none for an unauthenticated session", h.authz.checked)
+			}
+		})
 	}
 }
 
@@ -658,6 +671,7 @@ type bearerResolver struct {
 	user       *store.User
 	sawAuth    string
 	sawAuthSet bool
+	sawForward string
 	calls      int
 }
 
@@ -665,6 +679,7 @@ func (b *bearerResolver) UserFor(_ http.ResponseWriter, r *http.Request) (*store
 	b.calls++
 	b.sawAuth = r.Header.Get("Authorization")
 	_, b.sawAuthSet = r.Header["Authorization"]
+	b.sawForward = r.Header.Get(apps.ForwardedAuthorizationHeader)
 	if b.sawAuth != b.want {
 		return nil, false, nil
 	}
@@ -710,6 +725,11 @@ func TestInternalSessionsVerify_ForwardsBearerCredential(t *testing.T) {
 		t.Errorf("resolver saw Authorization = %q, want the forwarded caller credential %q",
 			br.sawAuth, userBearer)
 	}
+	// The forwarding header itself must not leak through to the resolver: only
+	// the Authorization it was translated into.
+	if br.sawForward != "" {
+		t.Errorf("resolver saw %s = %q, want it stripped", apps.ForwardedAuthorizationHeader, br.sawForward)
+	}
 	var got map[string]any
 	decodeBody(t, w, &got)
 	if got["user_id"] != br.user.ID.String() {
@@ -742,51 +762,6 @@ func TestInternalSessionsVerify_ServiceTokenNeverReachesResolver(t *testing.T) {
 	}
 }
 
-// The forwarding header itself must not leak through to the resolver: only
-// the Authorization it was translated into.
-func TestInternalSessionsVerify_StripsForwardingHeader(t *testing.T) {
-	h := newInternalHarness(t)
-	const userBearer = "Bearer user-cli-jwt-value"
-	var sawForward string
-	h.resolver = &recordingResolver{user: &store.User{ID: uuid.New()}, authed: true}
-	probe := &headerProbeResolver{inner: h.resolver, onCall: func(r *http.Request) {
-		sawForward = r.Header.Get(apps.ForwardedAuthorizationHeader)
-	}}
-	ih := &apps.InternalHandlers{
-		Store: h.store, Identity: h.ident, Authz: h.authz,
-		Projects: h.projects, Resolver: probe,
-		Token: mustServiceToken(t, testServiceToken),
-	}
-	mux := http.NewServeMux()
-	ih.RegisterInternal(mux)
-	h.mux = mux
-
-	w := h.doWithHeaders(http.MethodPost, "/internal/v1/sessions/verify",
-		fmt.Sprintf(`{"pid":%q}`, h.projectID.String()),
-		map[string]string{
-			"Authorization":                   "Bearer " + testServiceToken,
-			apps.ForwardedAuthorizationHeader: userBearer,
-		})
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
-	if sawForward != "" {
-		t.Errorf("resolver saw %s = %q, want it stripped", apps.ForwardedAuthorizationHeader, sawForward)
-	}
-}
-
-type headerProbeResolver struct {
-	inner  *recordingResolver
-	onCall func(*http.Request)
-}
-
-func (p *headerProbeResolver) UserFor(w http.ResponseWriter, r *http.Request) (*store.User, bool, error) {
-	p.onCall(r)
-	return p.inner.UserFor(w, r)
-}
-func (p *headerProbeResolver) Mode() string        { return "test" }
-func (p *headerProbeResolver) SupportsLogin() bool { return false }
-
 // Rewriting the credential must not mutate the caller's request header map —
 // http.Header is shared by reference, and the service-credential gate (plus
 // any middleware or logging after the handler) still reads Authorization.
@@ -811,30 +786,6 @@ func TestInternalSessionsVerify_DoesNotMutateRequestHeaders(t *testing.T) {
 	}
 	if got := r.Header.Get(apps.ForwardedAuthorizationHeader); got != userBearer {
 		t.Errorf("original request %s = %q, want it untouched", apps.ForwardedAuthorizationHeader, got)
-	}
-}
-
-func TestInternalSessionsVerify_BadRequest(t *testing.T) {
-	h := newInternalHarness(t)
-	for _, body := range []string{`{"pid":"nope"}`, `{}`, `garbage`} {
-		w := h.do(http.MethodPost, "/internal/v1/sessions/verify", body)
-		assertEnvelope(t, w, http.StatusBadRequest, "bad_request")
-	}
-}
-
-// An unknown project is "not a member", not an error: the honest answer to
-// "is this user a member of pid" for a pid that does not exist is no.
-func TestInternalSessionsVerify_UnknownProject(t *testing.T) {
-	h := newInternalHarness(t)
-	h.projects.err = apps.ErrNotFound
-	w := h.do(http.MethodPost, "/internal/v1/sessions/verify", fmt.Sprintf(`{"pid":%q}`, uuid.New().String()))
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
-	var got map[string]any
-	decodeBody(t, w, &got)
-	if got["project_member"] != false {
-		t.Errorf("project_member = %v, want false", got["project_member"])
 	}
 }
 
@@ -950,7 +901,9 @@ func TestInternalLogs_AppendsRecord(t *testing.T) {
 	requestID := uuid.New().String()
 
 	w := h.do(http.MethodPost, "/internal/v1/apps/"+appID+"/logs",
-		logBody(hash, map[string]any{"request_id": requestID, "outcome": "render_error", "error": "boom"}))
+		// A body echoing the path's app_id (the symmetric shape the author-route
+		// render-log JSON uses) is accepted.
+		logBody(hash, map[string]any{"request_id": requestID, "outcome": "render_error", "error": "boom", "app_id": appID}))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
@@ -1005,18 +958,6 @@ func TestInternalLogs_BadRequest(t *testing.T) {
 	// A malformed app_id in the PATH is a worker bug, not a missing app.
 	assertEnvelope(t, h.do(http.MethodPost, "/internal/v1/apps/not-a-uuid/logs", logBody(hash, nil)),
 		http.StatusBadRequest, "bad_request")
-}
-
-// A body echoing the path's app_id (the symmetric shape the author-route
-// render-log JSON uses) is accepted.
-func TestInternalLogs_AcceptsMatchingAppIDInBody(t *testing.T) {
-	h := newInternalHarness(t)
-	appID, hash := h.seedApp("dash1", []byte("bundle-one"))
-	w := h.do(http.MethodPost, "/internal/v1/apps/"+appID+"/logs",
-		logBody(hash, map[string]any{"app_id": appID}))
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
 }
 
 // log_text is capped (spec §7: ≤64 KiB per render) by truncation, so a

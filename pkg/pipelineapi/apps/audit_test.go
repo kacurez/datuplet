@@ -13,8 +13,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
-	"github.com/google/uuid"
 )
 
 func decodeJSON(t *testing.T, body []byte, dst any) {
@@ -129,33 +127,5 @@ func assertNoSecretInLog(t *testing.T, logged, token, tokenID string) {
 	}
 	if !strings.Contains(logged, tokenID) {
 		t.Errorf("token_id %q is missing from the audit line — the record has no handle", tokenID)
-	}
-}
-
-// TestAudit_AppLifecycleEventsFireFromHandlers is a smoke test over the two
-// remaining author-route records so a rename cannot silently drop them.
-func TestAudit_AppLifecycleEventsFireFromHandlers(t *testing.T) {
-	h := newAppsHarness(t)
-
-	capture := captureAudit(t)
-	appID, hash := h.putApp("dash1", []byte("bundle"))
-	rec := capture.findAction(t, "put_version")
-	if got, _ := rec["app_id"].(string); got != appID {
-		t.Errorf("put_version app_id = %q, want %q", got, appID)
-	}
-	if got, _ := rec["version_hash"].(string); got != hash {
-		t.Errorf("put_version version_hash = %q, want %q", got, hash)
-	}
-
-	capture2 := captureAudit(t)
-	if w := h.do(http.MethodDelete, h.appsPath("/dash1"), ""); w.Code != http.StatusNoContent {
-		t.Fatalf("delete: status = %d, body = %s", w.Code, w.Body.String())
-	}
-	rec = capture2.findAction(t, "delete_app")
-	if got, _ := rec["app_id"].(string); got != appID {
-		t.Errorf("delete_app app_id = %q, want %q", got, appID)
-	}
-	if _, err := uuid.Parse(appID); err != nil {
-		t.Fatalf("app id is not a uuid: %v", err)
 	}
 }

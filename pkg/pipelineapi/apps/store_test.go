@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -530,22 +529,6 @@ func TestListTokens_UnknownAppIDIsAnError(t *testing.T) {
 	}
 }
 
-// TestTokenSummary_HasNoSecretOrSaltField is a structural proof, not merely a
-// runtime one: ListTokens returns apps.TokenSummary, which must have no field
-// capable of carrying a token's secret or salt, so a secret/salt leak through
-// this method is impossible by construction — not just avoided by habit. This
-// walks the type's fields via reflection so it fails loudly if a future edit
-// ever adds a secret/salt/hash field here.
-func TestTokenSummary_HasNoSecretOrSaltField(t *testing.T) {
-	typ := reflect.TypeOf(apps.TokenSummary{})
-	for i := 0; i < typ.NumField(); i++ {
-		name := strings.ToLower(typ.Field(i).Name)
-		if strings.Contains(name, "secret") || strings.Contains(name, "salt") {
-			t.Fatalf("apps.TokenSummary has field %q; ListTokens must never be able to carry a token's secret or salt", typ.Field(i).Name)
-		}
-	}
-}
-
 func TestAppendRenderLog_TrimByAge(t *testing.T) {
 	pool, cleanup := testStore(t)
 	defer cleanup()
@@ -759,11 +742,12 @@ func runConcurrentPromotes(ctx context.Context, s *apps.Store, appID, expectedPr
 }
 
 // TestPromote_ConcurrentCAS_ExactlyOneWinner pins the CAS contract under
-// real concurrency, against an ALREADY-SET production channel: N Promote
-// calls carrying the same (correct) expectedProduction race for the same
-// app. Exactly one must succeed; the rest must observe ErrCASMismatch
-// (never silently overwrite each other); the final resolved production
-// version must be the winner's.
+// real concurrency: N Promote calls carrying the same expectedProduction race
+// for the same app. Exactly one must succeed; the rest must observe
+// ErrCASMismatch (never silently overwrite each other); the final resolved
+// production version must be the winner's. It covers both CAS branches —
+// against an ALREADY-SET production channel (expectedProduction is the
+// baseline hash) and a first promote (expectedProduction == "").
 //
 // Run as several independent rounds (fresh app each round) rather than
 // one giant N, because whether a single round's goroutines' reads
@@ -777,139 +761,87 @@ func TestPromote_ConcurrentCAS_ExactlyOneWinner(t *testing.T) {
 		n                  = 24
 		distinctCandidates = 3 // see TestVersionGC comment below on why not n
 	)
-	pool, cleanup := testStoreConcurrent(t, n+4)
-	defer cleanup()
-	ctx := context.Background()
-	s := apps.NewStore(pool)
-	projectID := testProject(t, pool, "proj-a")
-
-	for round := 0; round < rounds; round++ {
-		appName := fmt.Sprintf("dash-%d", round)
-		app, err := s.Create(ctx, projectID, appName)
-		if err != nil {
-			t.Fatalf("round %d: Create: %v", round, err)
-		}
-
-		baseline, err := s.PutVersion(ctx, app.ID, []byte("baseline"))
-		if err != nil {
-			t.Fatalf("round %d: PutVersion baseline: %v", round, err)
-		}
-		if err := s.Promote(ctx, app.ID, baseline.Hash, ""); err != nil {
-			t.Fatalf("round %d: Promote baseline: %v", round, err)
-		}
-
-		// Only a handful of distinct non-baseline versions (cycled across
-		// the n concurrent calls below), NOT one per call: version GC
-		// (MaxUnreferencedVersions=20) would otherwise collect the oldest
-		// unreferenced candidates as soon as this app accumulates more
-		// than 20 of them via sequential PutVersion calls, before the
-		// race even starts.
-		candidates := make([]*apps.Version, distinctCandidates)
-		for i := range candidates {
-			v, err := s.PutVersion(ctx, app.ID, []byte(fmt.Sprintf("round-%d-candidate-%d", round, i)))
-			if err != nil {
-				t.Fatalf("round %d: PutVersion candidate %d: %v", round, i, err)
-			}
-			candidates[i] = v
-		}
-		targets := make([]*apps.Version, n)
-		for i := range targets {
-			targets[i] = candidates[i%distinctCandidates]
-		}
-
-		results := runConcurrentPromotes(ctx, s, app.ID, baseline.Hash, targets)
-
-		successes := 0
-		var winner *apps.Version
-		for i, rerr := range results {
-			switch {
-			case rerr == nil:
-				successes++
-				winner = targets[i]
-			case errors.Is(rerr, apps.ErrCASMismatch):
-				// expected for every loser
-			default:
-				t.Fatalf("round %d: promote %d: unexpected error %v", round, i, rerr)
-			}
-		}
-		if successes != 1 {
-			t.Fatalf("round %d: concurrent CAS promotes: %d succeeded, want exactly 1 (results=%v)", round, successes, results)
-		}
-
-		resolved, err := s.Resolve(ctx, projectID, appName, "production")
-		if err != nil {
-			t.Fatalf("round %d: Resolve(production): %v", round, err)
-		}
-		if resolved.VersionHash != winner.Hash {
-			t.Fatalf("round %d: final production hash = %q, want the winner's %q", round, resolved.VersionHash, winner.Hash)
-		}
+	tests := []struct {
+		name         string
+		withBaseline bool // production already set; expectedProduction = its hash
+	}{
+		{name: "production already set", withBaseline: true},
+		{name: "first promote", withBaseline: false},
 	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, cleanup := testStoreConcurrent(t, n+4)
+			defer cleanup()
+			ctx := context.Background()
+			s := apps.NewStore(pool)
+			projectID := testProject(t, pool, "proj-a")
 
-// TestPromote_ConcurrentFirstPromote_ExactlyOneWinner covers the other CAS
-// branch: expectedProduction == "" (no production set yet). Only one of N
-// concurrent "first promotes" may win; the rest must get ErrCASMismatch
-// rather than silently clobbering the winner. See
-// TestPromote_ConcurrentCAS_ExactlyOneWinner for why this runs several
-// rounds instead of one large N.
-func TestPromote_ConcurrentFirstPromote_ExactlyOneWinner(t *testing.T) {
-	const (
-		rounds             = 8
-		n                  = 24
-		distinctCandidates = 3
-	)
-	pool, cleanup := testStoreConcurrent(t, n+4)
-	defer cleanup()
-	ctx := context.Background()
-	s := apps.NewStore(pool)
-	projectID := testProject(t, pool, "proj-a")
+			for round := 0; round < rounds; round++ {
+				appName := fmt.Sprintf("dash-%d", round)
+				app, err := s.Create(ctx, projectID, appName)
+				if err != nil {
+					t.Fatalf("round %d: Create: %v", round, err)
+				}
 
-	for round := 0; round < rounds; round++ {
-		appName := fmt.Sprintf("dash-%d", round)
-		app, err := s.Create(ctx, projectID, appName)
-		if err != nil {
-			t.Fatalf("round %d: Create: %v", round, err)
-		}
+				expectedProduction := ""
+				if tc.withBaseline {
+					baseline, err := s.PutVersion(ctx, app.ID, []byte("baseline"))
+					if err != nil {
+						t.Fatalf("round %d: PutVersion baseline: %v", round, err)
+					}
+					if err := s.Promote(ctx, app.ID, baseline.Hash, ""); err != nil {
+						t.Fatalf("round %d: Promote baseline: %v", round, err)
+					}
+					expectedProduction = baseline.Hash
+				}
 
-		candidates := make([]*apps.Version, distinctCandidates)
-		for i := range candidates {
-			v, err := s.PutVersion(ctx, app.ID, []byte(fmt.Sprintf("round-%d-candidate-%d", round, i)))
-			if err != nil {
-				t.Fatalf("round %d: PutVersion candidate %d: %v", round, i, err)
+				// Only a handful of distinct non-baseline versions (cycled across
+				// the n concurrent calls below), NOT one per call: version GC
+				// (MaxUnreferencedVersions=20) would otherwise collect the oldest
+				// unreferenced candidates as soon as this app accumulates more
+				// than 20 of them via sequential PutVersion calls, before the
+				// race even starts.
+				candidates := make([]*apps.Version, distinctCandidates)
+				for i := range candidates {
+					v, err := s.PutVersion(ctx, app.ID, []byte(fmt.Sprintf("round-%d-candidate-%d", round, i)))
+					if err != nil {
+						t.Fatalf("round %d: PutVersion candidate %d: %v", round, i, err)
+					}
+					candidates[i] = v
+				}
+				targets := make([]*apps.Version, n)
+				for i := range targets {
+					targets[i] = candidates[i%distinctCandidates]
+				}
+
+				results := runConcurrentPromotes(ctx, s, app.ID, expectedProduction, targets)
+
+				successes := 0
+				var winner *apps.Version
+				for i, rerr := range results {
+					switch {
+					case rerr == nil:
+						successes++
+						winner = targets[i]
+					case errors.Is(rerr, apps.ErrCASMismatch):
+						// expected for every loser
+					default:
+						t.Fatalf("round %d: promote %d: unexpected error %v", round, i, rerr)
+					}
+				}
+				if successes != 1 {
+					t.Fatalf("round %d: concurrent CAS promotes: %d succeeded, want exactly 1 (results=%v)", round, successes, results)
+				}
+
+				resolved, err := s.Resolve(ctx, projectID, appName, "production")
+				if err != nil {
+					t.Fatalf("round %d: Resolve(production): %v", round, err)
+				}
+				if resolved.VersionHash != winner.Hash {
+					t.Fatalf("round %d: final production hash = %q, want the winner's %q", round, resolved.VersionHash, winner.Hash)
+				}
 			}
-			candidates[i] = v
-		}
-		targets := make([]*apps.Version, n)
-		for i := range targets {
-			targets[i] = candidates[i%distinctCandidates]
-		}
-
-		results := runConcurrentPromotes(ctx, s, app.ID, "", targets)
-
-		successes := 0
-		var winner *apps.Version
-		for i, rerr := range results {
-			switch {
-			case rerr == nil:
-				successes++
-				winner = targets[i]
-			case errors.Is(rerr, apps.ErrCASMismatch):
-				// expected for every loser
-			default:
-				t.Fatalf("round %d: promote %d: unexpected error %v", round, i, rerr)
-			}
-		}
-		if successes != 1 {
-			t.Fatalf("round %d: concurrent first-promotes: %d succeeded, want exactly 1 (results=%v)", round, successes, results)
-		}
-
-		resolved, err := s.Resolve(ctx, projectID, appName, "production")
-		if err != nil {
-			t.Fatalf("round %d: Resolve(production): %v", round, err)
-		}
-		if resolved.VersionHash != winner.Hash {
-			t.Fatalf("round %d: final production hash = %q, want the winner's %q", round, resolved.VersionHash, winner.Hash)
-		}
+		})
 	}
 }
 

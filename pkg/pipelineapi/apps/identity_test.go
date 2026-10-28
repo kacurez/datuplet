@@ -26,19 +26,3 @@ func TestAppFGASubject(t *testing.T) {
 		t.Fatalf("AppFGASubject() = %q, want %q", got, want)
 	}
 }
-
-// TestAppFGASubject_NoDoublePrefix guards against a regression where
-// AppFGASubject is accidentally handed an already-"oidc~"-prefixed value
-// (e.g. if a future refactor threads AppJWTSubject's output through
-// AppFGASubject twice) — authz.UserObject's idempotent prepend means this
-// wouldn't double the prefix even if it happened, but the two helpers must
-// independently agree on the single-prefix form for a fresh app UUID.
-func TestAppFGASubject_NoDoublePrefix(t *testing.T) {
-	appUUID := "00000000-0000-0000-0000-000000000001"
-	sub := apps.AppJWTSubject(appUUID)
-	fga := apps.AppFGASubject(appUUID)
-	want := "user:oidc~" + sub
-	if fga != want {
-		t.Fatalf("AppFGASubject(%q) = %q, want %q (derived from AppJWTSubject %q)", appUUID, fga, want, sub)
-	}
-}

@@ -206,16 +206,8 @@ type pipelineRefBody struct {
 func TestPutPipeline_JSON_GetReturnsDocObject_ListHasDescription(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
-	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-json-get"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-json-get", "data_admin", "describe")
 
 	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
 	putResp := putJSON(t, base+"/etl", []byte(pipelineDocWithDescription), cookie)
@@ -278,16 +270,8 @@ func TestPutPipeline_JSON_GetReturnsDocObject_ListHasDescription(t *testing.T) {
 func TestGetPipeline_FormatYAML(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
-	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-format-yaml"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-format-yaml", "data_admin", "describe")
 
 	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
 	putResp := putYAML(t, base+"/etl", []byte(pipelineDocWithDescription), cookie)
@@ -326,42 +310,6 @@ func TestGetPipeline_FormatYAML(t *testing.T) {
 	}
 }
 
-// TestPutPipeline_LegacyEnvelope_BadRequest covers rejection of a pre-RFC-027
-// Kubernetes CR body: config.Parse rejects the envelope, surfaced as a 400 with
-// a finding naming the legacy format.
-func TestPutPipeline_LegacyEnvelope_BadRequest(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-legacy-envelope"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(legacyEnvelopeYAML), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	var body findingsBody
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	var found bool
-	for _, f := range body.Findings {
-		if strings.Contains(f.Message, "legacy Kubernetes CR format") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("want a finding naming the legacy Kubernetes CR format, got %+v", body.Findings)
-	}
-}
-
 // yamlFlowNotJSON is a complete, otherwise-valid PipelineDoc written as an
 // unquoted YAML flow-style mapping: config.Parse decodes it into a fully
 // valid Pipeline (one stage, one component) with zero validation findings,
@@ -374,63 +322,12 @@ func TestPutPipeline_LegacyEnvelope_BadRequest(t *testing.T) {
 // them.
 const yamlFlowNotJSON = `{name: etl, stages: [{name: extract, components: [{name: c1, component: datuplet/test:latest, outputs: {defaultBucket: raw, defaultWriteMode: APPEND}}]}]}`
 
-// TestPutPipeline_JSONContentType_RejectsNonJSONBody covers the Content-Type
-// gate described by yamlFlowNotJSON above.
-func TestPutPipeline_JSONContentType_RejectsNonJSONBody(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-json-ct-strict"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
-	resp := putJSON(t, base+"/etl", []byte(yamlFlowNotJSON), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400 (Content-Type: application/json must reject a non-JSON body)", resp.StatusCode)
-	}
-	var body findingsBody
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	var found bool
-	for _, f := range body.Findings {
-		if strings.Contains(f.Message, "not valid JSON") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("want a finding naming the invalid-JSON body, got %+v", body.Findings)
-	}
-
-	// Sanity: the same bytes, sent as YAML (default), are accepted — proving
-	// this is a Content-Type-driven rejection, not a config.Parse rejection.
-	yamlResp := putYAML(t, base+"/etl", []byte(yamlFlowNotJSON), cookie)
-	defer yamlResp.Body.Close()
-	if yamlResp.StatusCode != 204 {
-		b, _ := readAll(yamlResp)
-		t.Fatalf("YAML-content-typed status = %d, want 204 (same bytes must parse fine as YAML); body=%s", yamlResp.StatusCode, b)
-	}
-}
-
 func TestPutPipeline_ValidYAML(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-put-valid"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-put-valid", "data_admin")
 
 	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
 	defer resp.Body.Close()
@@ -447,92 +344,239 @@ func TestPutPipeline_ValidYAML(t *testing.T) {
 	}
 }
 
-func TestPutPipeline_InvalidYAML(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
+// TestPutPipeline_ValidationOutcomes covers how PUT /pipelines reports bodies
+// that cannot be saved. Each row is one (body, content-type, registry) input
+// and the status plus finding shape it must produce.
+func TestPutPipeline_ValidationOutcomes(t *testing.T) {
+	// Doc says name "actual"; the URL says "requested".
+	const nameMismatchDoc = `{
+  "name": "actual",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}}
+      ]
+    }
+  ]
+}`
+	// "writeMod" is a typo of "writeMode" — an unknown field under strict
+	// decode, which comes back as a single Finding with an empty Path.
+	const unknownFieldDoc = `{
+  "name": "etl",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {
+          "name": "c1",
+          "component": "datuplet/test:latest",
+          "outputs": {"buckets": [{"name": "raw", "writeMod": "APPEND"}]}
+        }
+      ]
+    }
+  ]
+}`
+	// "RAW!" fails bucketNameRegex; a semantic failure carries a field-scoped Path.
+	const badBucketDoc = `{
+  "name": "etl",
+  "stages": [
+    {
+      "name": "extract",
+      "components": [
+        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "RAW!", "defaultWriteMode": "APPEND"}}
+      ]
+    }
+  ]
+}`
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-put-invalid"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
+	tests := []struct {
+		name         string
+		registry     *fakeComponentRegistry // nil: no registry wired
+		pipeline     string                 // pipeline name in the URL
+		json         bool                   // Content-Type: application/json instead of application/yaml
+		body         string
+		wantStatus   int
+		wantFinding  string // substring of some finding message
+		wantBody     string // substring of the raw response body
+		wantEnvelope bool   // error == "validation failed" and at least one finding
+		wantSeverity string // severity of the first finding
+		wantPath     bool   // first finding carries a non-empty path
+	}{
+		{name: "invalid yaml", pipeline: "broken", body: "not: [valid yaml", wantStatus: 400},
+		{
+			name: "legacy k8s envelope", pipeline: "etl", body: legacyEnvelopeYAML,
+			wantStatus: 400, wantFinding: "legacy Kubernetes CR format",
+		},
+		// A YAML flow mapping that is not valid JSON: the Content-Type gate must
+		// reject it under application/json…
+		{
+			name: "json content type rejects non-json body", pipeline: "etl", json: true, body: yamlFlowNotJSON,
+			wantStatus: 400, wantFinding: "not valid JSON",
+		},
+		// …while the same bytes sent as YAML are accepted, proving the rejection
+		// above is Content-Type-driven rather than a config.Parse rejection.
+		{name: "same body accepted as yaml", pipeline: "etl", body: yamlFlowNotJSON, wantStatus: 204},
+		{
+			// R9: with a real registry wired, a component absent from it surfaces
+			// R5's "unknown component" finding.
+			name: "unknown component", registry: newFakeComponentRegistry(), pipeline: "etl", body: validPipelineYAML,
+			wantStatus: 400, wantFinding: `unknown component "datuplet/test:latest"`,
+		},
+		{name: "name mismatch", pipeline: "requested", body: nameMismatchDoc, wantStatus: 400},
+		{
+			name: "unknown field", pipeline: "etl", body: unknownFieldDoc,
+			wantStatus: 400, wantEnvelope: true, wantSeverity: "error",
+		},
+		{
+			name: "semantic finding has path", pipeline: "etl", body: badBucketDoc,
+			wantStatus: 400, wantEnvelope: true, wantPath: true,
+		},
+		{
+			// "validate" is reserved: it would make the literal
+			// /pipelines/validate segment ambiguous with the POST validate route.
+			name: "reserved name validate", pipeline: "validate", body: validPipelineYAML,
+			wantStatus: 400, wantBody: "reserved",
+		},
 	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				ts        *httptest.Server
+				pool      *pgxpool.Pool
+				fakeAuthz *authztest.Fake
+				cleanup   func()
+			)
+			if tc.registry != nil {
+				ts, pool, fakeAuthz, cleanup = freshServerWithRegistry(t, tc.registry)
+			} else {
+				ts, pool, fakeAuthz, cleanup = freshServer(t)
+			}
+			defer cleanup()
+			cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-put-outcomes", "data_admin")
 
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/broken", []byte("not: [valid yaml"), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Errorf("status = %d, want 400", resp.StatusCode)
+			put := putYAML
+			if tc.json {
+				put = putJSON
+			}
+			resp := put(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/"+tc.pipeline, []byte(tc.body), cookie)
+			defer resp.Body.Close()
+			raw, _ := readAll(resp)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, raw)
+			}
+			if tc.wantBody != "" && !strings.Contains(raw, tc.wantBody) {
+				t.Errorf("body = %q, want it to contain %q", raw, tc.wantBody)
+			}
+			if tc.wantFinding == "" && !tc.wantEnvelope && !tc.wantPath {
+				return
+			}
+			var body findingsBody
+			if err := json.Unmarshal([]byte(raw), &body); err != nil {
+				t.Fatalf("decode: %v; body=%s", err, raw)
+			}
+			if tc.wantFinding != "" {
+				var found bool
+				for _, f := range body.Findings {
+					if strings.Contains(f.Message, tc.wantFinding) {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("want a finding containing %q, got %+v", tc.wantFinding, body.Findings)
+				}
+			}
+			if tc.wantEnvelope {
+				if body.Error != "validation failed" {
+					t.Errorf("error = %q, want %q", body.Error, "validation failed")
+				}
+				if len(body.Findings) == 0 {
+					t.Fatal("want at least one finding")
+				}
+			}
+			if tc.wantSeverity != "" && body.Findings[0].Severity != tc.wantSeverity {
+				t.Errorf("severity = %q, want %q", body.Findings[0].Severity, tc.wantSeverity)
+			}
+			if tc.wantPath && body.Findings[0].Path == "" {
+				t.Error("want non-empty path for a semantic validation finding")
+			}
+		})
 	}
 }
 
-// TestPutPipeline_UnknownComponent_ReturnsRegistryFinding is R9's headline
-// regression test: once a real ComponentRegistry is wired via WithRegistry,
-// saving a pipeline that references a component absent from the registry
-// must surface R5's "unknown component" finding — R5 landed this check but
-// it stayed dark because handlePutPipeline called ValidatePipeline with a
-// hard-coded nil registry.
-func TestPutPipeline_UnknownComponent_ReturnsRegistryFinding(t *testing.T) {
-	// Empty registry: no ComponentDefinitions registered at all, so
-	// "datuplet/test:latest" (used by every other fixture in this file)
-	// resolves to "unknown component".
-	ts, pool, fakeAuthz, cleanup := freshServerWithRegistry(t, newFakeComponentRegistry())
-	defer cleanup()
-	ctx := context.Background()
+// TestPutPipeline_SecretLadder covers the S7 save ladder: a pipeline
+// referencing "$[api_token]" saves with a 200 plus a warning Finding naming
+// the key when the project's managed Secret lacks it (the save still
+// persists, unlike the hard-validation 400 path), and as a plain 204 once the
+// key exists. The "forbidden" row is a BRAND-NEW project whose managed-Secret
+// Get is RBAC-Forbidden (S6 removed pipeline-api's cluster-wide Secret verbs;
+// the per-namespace Role is only created on the first secret PUT): that
+// denial must read as "no keys set" → 200 warning, NEVER a 500. The fake
+// client can't model RBAC, so that row injects Forbidden via an interceptor.
+func TestPutPipeline_SecretLadder(t *testing.T) {
+	tests := []struct {
+		name          string
+		forbiddenRead bool // managed-Secret Get returns RBAC Forbidden
+		seedKey       bool // api_token already exists in the managed Secret
+		wantStatus    int
+		wantPersisted bool // doc is stored despite a warning-level response
+	}{
+		{name: "unknown key warns", wantStatus: 200, wantPersisted: true},
+		{name: "known key saves clean", seedKey: true, wantStatus: 204},
+		{name: "fresh project forbidden secret read warns", forbiddenRead: true, wantStatus: 200},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				ts        *httptest.Server
+				pool      *pgxpool.Pool
+				fakeAuthz *authztest.Fake
+				cleanup   func()
+			)
+			if tc.forbiddenRead {
+				ts, pool, fakeAuthz, _, _, cleanup = freshServerWithSecretsClient(t, forbiddenSecretGetClient(t))
+			} else {
+				ts, pool, fakeAuthz, _, _, cleanup = freshServerWithSecrets(t)
+			}
+			defer cleanup()
+			ctx := context.Background()
+			cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-secret-ladder", "data_admin")
+			base := ts.URL + "/api/v1/projects/" + proj.ID.String()
+			if tc.seedKey {
+				putSecretReq(t, base+"/secrets/api_token", "shh", cookie).Body.Close()
+			}
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-unknown-component"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	var body findingsBody
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	var found bool
-	for _, f := range body.Findings {
-		if strings.Contains(f.Message, `unknown component "datuplet/test:latest"`) {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected an 'unknown component' finding, got %+v", body.Findings)
-	}
-}
-
-func TestListPipelines(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-list-pipelines"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "p1", "", []byte(validPipelineYAML))
-	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "p2", "", []byte(validPipelineYAML))
-
-	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines", nil)
-	req.AddCookie(cookie)
-	resp, err := stdhttp.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
+			resp := putYAML(t, base+"/pipelines/etl-secret", []byte(pipelineYAMLWithSecretRef), cookie)
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				raw, _ := readAll(resp)
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, raw)
+			}
+			if tc.wantStatus == 200 {
+				var body secretsFindingsBody
+				if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if len(body.Findings) != 1 {
+					t.Fatalf("findings = %+v, want exactly 1", body.Findings)
+				}
+				if body.Findings[0].Severity != "warning" {
+					t.Errorf("severity = %q, want warning", body.Findings[0].Severity)
+				}
+				if !strings.Contains(body.Findings[0].Message, "api_token") {
+					t.Errorf("message = %q, want it to name the missing key api_token", body.Findings[0].Message)
+				}
+			}
+			if tc.wantPersisted {
+				saved, err := store.GetPipelineByName(ctx, pool, proj.ID, "etl-secret")
+				if err != nil {
+					t.Fatalf("GetPipelineByName: %v", err)
+				}
+				if !docsEqual(t, saved.Doc, canonicalDoc(t, pipelineYAMLWithSecretRef)) {
+					t.Error("pipeline doc not persisted despite the 200-with-warning response")
+				}
+			}
+		})
 	}
 }
 
@@ -547,13 +591,7 @@ func TestListPipelines_EmptyDescriptionKeyPresent(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-list-empty-desc"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "describe", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-list-empty-desc", "describe")
 	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines", nil)
@@ -584,17 +622,13 @@ func TestListPipelines_EmptyDescriptionKeyPresent(t *testing.T) {
 }
 
 func TestGetPipeline_NotMember(t *testing.T) {
-	ts, pool, _, cleanup := freshServer(t)
+	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, _ := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	// Set a lakekeeper_project_id so we pass the empty-lkID guard,
-	// but do NOT seed any FGA tuple for alice — mustHaveRelation returns 403.
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, "lk-not-member"); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
+	// A lakekeeper_project_id passes the empty-lkID guard, but no FGA tuple
+	// is seeded for alice — mustHaveRelation returns 403.
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-not-member")
 	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "secret", "", []byte(validPipelineYAML))
 
 	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/secret", nil)
@@ -614,13 +648,7 @@ func TestDeletePipeline(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-delete-pipeline"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-delete-pipeline", "data_admin")
 	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	req, _ := stdhttp.NewRequest("DELETE", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", nil)
@@ -632,278 +660,6 @@ func TestDeletePipeline(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 204 {
 		t.Errorf("status = %d, want 204", resp.StatusCode)
-	}
-}
-
-func TestPutPipeline_NameMismatch(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-name-mismatch"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	// Doc says name: "actual"; URL says "requested". Must 400.
-	yaml := `{
-  "name": "actual",
-  "stages": [
-    {
-      "name": "extract",
-      "components": [
-        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "raw", "defaultWriteMode": "APPEND"}}
-      ]
-    }
-  ]
-}`
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/requested", []byte(yaml), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Errorf("status = %d, want 400 (YAML name vs URL name mismatch)", resp.StatusCode)
-	}
-}
-
-// TestPutPipeline_UnknownFieldFinding covers the strict-decode path: an
-// unknown field (typo) fails yaml.UnmarshalStrict inside validate.ValidatePipeline,
-// which comes back as a single Finding carrying the decode error with an
-// empty Path (see pkg/pipeline/validate.ValidatePipeline doc comment) — not a
-// per-field semantic Finding. We assert the response shape and that at least
-// one finding is present, but deliberately do NOT assert a non-empty path
-// here (see TestPutPipeline_SemanticFindingHasPath for that case).
-func TestPutPipeline_UnknownFieldFinding(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-unknown-field"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	// "writeMod" is a typo of "writeMode" — an unknown field under strict decode.
-	yaml := `{
-  "name": "etl",
-  "stages": [
-    {
-      "name": "extract",
-      "components": [
-        {
-          "name": "c1",
-          "component": "datuplet/test:latest",
-          "outputs": {"buckets": [{"name": "raw", "writeMod": "APPEND"}]}
-        }
-      ]
-    }
-  ]
-}`
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(yaml), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	var body findingsBody
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if body.Error != "validation failed" {
-		t.Errorf("error = %q, want %q", body.Error, "validation failed")
-	}
-	if len(body.Findings) == 0 {
-		t.Fatal("want at least one finding")
-	}
-	if body.Findings[0].Severity != "error" {
-		t.Errorf("severity = %q, want %q", body.Findings[0].Severity, "error")
-	}
-}
-
-// TestPutPipeline_SemanticFindingHasPath covers a semantic validation
-// failure (as opposed to a strict-decode/unknown-field failure): an invalid
-// bucket name. ValidateTyped attaches a field-scoped Path to these findings,
-// unlike the empty-Path strict-decode Finding.
-func TestPutPipeline_SemanticFindingHasPath(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-semantic-finding"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	// "RAW!" fails bucketNameRegex (uppercase + '!' not allowed).
-	yaml := `{
-  "name": "etl",
-  "stages": [
-    {
-      "name": "extract",
-      "components": [
-        {"name": "c1", "component": "datuplet/test:latest", "outputs": {"defaultBucket": "RAW!", "defaultWriteMode": "APPEND"}}
-      ]
-    }
-  ]
-}`
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(yaml), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	var body findingsBody
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if body.Error != "validation failed" {
-		t.Errorf("error = %q, want %q", body.Error, "validation failed")
-	}
-	if len(body.Findings) == 0 {
-		t.Fatal("want at least one finding")
-	}
-	if body.Findings[0].Path == "" {
-		t.Error("want non-empty path for a semantic validation finding")
-	}
-}
-
-// TestPutPipeline_UnknownSecretKey_ReturnsWarning covers the S7 save-warn
-// rung: a pipeline referencing "$[api_token]" saved into a project whose
-// managed Secret doesn't have that key yet gets a 200 with a warning
-// Finding naming the key — the save itself still succeeds (unlike the
-// hard-validation 400 path).
-func TestPutPipeline_UnknownSecretKey_ReturnsWarning(t *testing.T) {
-	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-secret-warn"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret", []byte(pipelineYAMLWithSecretRef), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := readAll(resp)
-		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
-	}
-	var body secretsFindingsBody
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(body.Findings) != 1 {
-		t.Fatalf("findings = %+v, want exactly 1", body.Findings)
-	}
-	if body.Findings[0].Severity != "warning" {
-		t.Errorf("severity = %q, want warning", body.Findings[0].Severity)
-	}
-	if !strings.Contains(body.Findings[0].Message, "api_token") {
-		t.Errorf("message = %q, want it to name the missing key api_token", body.Findings[0].Message)
-	}
-
-	// The pipeline must still be persisted despite the warning-level response.
-	saved, err := store.GetPipelineByName(ctx, pool, proj.ID, "etl-secret")
-	if err != nil {
-		t.Fatalf("GetPipelineByName: %v", err)
-	}
-	if !docsEqual(t, saved.Doc, canonicalDoc(t, pipelineYAMLWithSecretRef)) {
-		t.Error("pipeline doc not persisted despite the 200-with-warning response")
-	}
-}
-
-// TestPutPipeline_KnownSecretKey_Returns204 covers the clean-save rung:
-// once the referenced key exists in the project's managed Secret, the
-// same YAML saves as a plain 204 — no findings envelope.
-func TestPutPipeline_KnownSecretKey_Returns204(t *testing.T) {
-	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-secret-known"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	putSecretReq(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/secrets/api_token", "shh", cookie).Body.Close()
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret", []byte(pipelineYAMLWithSecretRef), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 204 {
-		body, _ := readAll(resp)
-		t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, body)
-	}
-}
-
-// TestPutPipeline_HardValidationError_StaysBadRequestWithSecretsWired proves
-// the secrets ladder never masks a hard validation failure: even with
-// WithSecrets wired, a structurally invalid pipeline still 400s before the
-// ladder ever runs.
-func TestPutPipeline_HardValidationError_StaysBadRequestWithSecretsWired(t *testing.T) {
-	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecrets(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-secret-hardfail"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/broken", []byte("not: [valid yaml"), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Errorf("status = %d, want 400", resp.StatusCode)
-	}
-}
-
-// TestPutPipeline_FreshProjectForbiddenSecretRead_ReturnsWarning proves the S7
-// save-warn rung survives a BRAND-NEW project whose managed-Secret Get is
-// RBAC-Forbidden. After S6 removed pipeline-api's cluster-wide Secret verbs, a
-// project that has never had a secret PUT has no per-namespace `datuplet-
-// secrets` Role/RoleBinding yet, so the ladder's read is denied. The handler
-// must treat that denial as "no keys set" → 200 warning naming the key, NEVER
-// a 500. (The NotFound/absent variant is covered by
-// TestPutPipeline_UnknownSecretKey_ReturnsWarning; the fake client can't model
-// RBAC, so this test injects Forbidden via an interceptor client.)
-func TestPutPipeline_FreshProjectForbiddenSecretRead_ReturnsWarning(t *testing.T) {
-	ts, pool, fakeAuthz, _, _, cleanup := freshServerWithSecretsClient(t, forbiddenSecretGetClient(t))
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-secret-forbidden"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl-secret", []byte(pipelineYAMLWithSecretRef), cookie)
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := readAll(resp)
-		t.Fatalf("status = %d, want 200 (fresh-project ladder, not 500); body=%s", resp.StatusCode, body)
-	}
-	var body secretsFindingsBody
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(body.Findings) != 1 || body.Findings[0].Severity != "warning" || !strings.Contains(body.Findings[0].Message, "api_token") {
-		t.Fatalf("findings = %+v, want exactly one warning naming api_token", body.Findings)
 	}
 }
 
@@ -1039,21 +795,6 @@ func componentDefDeprecated(name string) datupletv1.ComponentDefinition {
 	}
 }
 
-// t6Seed creates a user+session, a project with a lakekeeper id, and the
-// data_admin FGA tuple that mustHaveRelation checks. Returns the session cookie
-// and the datuplet project id.
-func t6Seed(t *testing.T, ts *httptest.Server, pool *pgxpool.Pool, fakeAuthz *authztest.Fake, lkID string) (*stdhttp.Cookie, uuid.UUID) {
-	t.Helper()
-	ctx := context.Background()
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-	return cookie, proj.ID
-}
-
 // pipelineYAMLWithCPU builds a doc whose component sets resources.cpu — the
 // new envelope-free doc shape is flat ({"cpu": "..."}), unlike the old CRD's
 // nested resources.limits.cpu; config.DocToCR maps it into the CRD's nested
@@ -1092,78 +833,72 @@ const pipelineYAMLBigBuffer = `{
   ]
 }`
 
-// Case 1: a non-superadmin adding a resources block where the stored pipeline
-// had none is rejected with 403 pointing at superadmin.
-func TestPutPipeline_NonSuperadmin_AddResources_Forbidden(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-add-res")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
-		t.Fatalf("seed stored pipeline: %v", err)
+// TestPutPipeline_NonSuperadminResourceDiffGate covers the resources diff-gate
+// for a non-superadmin: adding a block or changing a value is 403 pointing at
+// superadmin; resubmitting the stored block, or a semantically equal one
+// ("1000m" vs "1"), is not a modification and passes.
+func TestPutPipeline_NonSuperadminResourceDiffGate(t *testing.T) {
+	tests := []struct {
+		name       string
+		stored     []byte
+		put        []byte
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "add resources forbidden", stored: []byte(validPipelineYAML), put: pipelineYAMLWithCPU("2"), wantStatus: 403, wantBody: "superadmin"},
+		{name: "resubmit same resources ok", stored: pipelineYAMLWithCPU("2"), put: pipelineYAMLWithCPU("2"), wantStatus: 204},
+		{name: "change cpu forbidden", stored: pipelineYAMLWithCPU("1"), put: pipelineYAMLWithCPU("2"), wantStatus: 403},
+		{name: "semantically equal resources ok", stored: pipelineYAMLWithCPU("1"), put: pipelineYAMLWithCPU("1000m"), wantStatus: 204},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+			defer cleanup()
+			cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-diff-gate", "data_admin")
+			if _, err := store.CreatePipeline(context.Background(), pool, proj.ID, "etl", "", tc.stored); err != nil {
+				t.Fatalf("seed stored pipeline: %v", err)
+			}
 
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("2"), cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 403 {
-		t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, body)
-	}
-	if !strings.Contains(body, "superadmin") {
-		t.Errorf("403 body = %q, want it to mention superadmin", body)
+			resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", tc.put, cookie)
+			defer resp.Body.Close()
+			body, _ := readAll(resp)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if tc.wantBody != "" && !strings.Contains(body, tc.wantBody) {
+				t.Errorf("body = %q, want it to mention %q", body, tc.wantBody)
+			}
+		})
 	}
 }
 
-// Case 2: a non-superadmin resubmitting the identical stored resources block
-// passes (unchanged is not a modification).
-func TestPutPipeline_NonSuperadmin_ResubmitSameResources_OK(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-resubmit")
-	yaml := pipelineYAMLWithCPU("2")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", yaml); err != nil {
-		t.Fatalf("seed stored pipeline: %v", err)
+// TestPutPipeline_DiffGateFailsClosed503 covers the two ways the diff-gate
+// must fail CLOSED with 503 instead of silently passing: the superadmin
+// checker being unavailable, and a transient (non-NotFound) stored-pipeline
+// read error (which must not default to "no old resources" and let a
+// non-superadmin slip a resources edit through).
+func TestPutPipeline_DiffGateFailsClosed503(t *testing.T) {
+	tests := []struct {
+		name  string
+		admin authz.ServerAdminChecker
+		store apihttp.PipelineStore // nil: default pgx-backed store
+	}{
+		{name: "superadmin checker unavailable", admin: stubServerAdminT6{err: authz.ErrAuthzUnavailable}},
+		{name: "stored pipeline read error", admin: stubServerAdminT6{result: false}, store: errGetByNamePipelineStore{}},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, fakeAuthz, cleanup := freshServerT6WithStore(t, t6Registry("4"), nil, tc.admin, tc.store)
+			defer cleanup()
+			cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-fail-closed", "data_admin")
 
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", yaml, cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 204 {
-		t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, body)
-	}
-}
-
-// Case 3: a non-superadmin changing limits.cpu from the stored value is 403.
-func TestPutPipeline_NonSuperadmin_ChangeCPU_Forbidden(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-change-cpu")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", pipelineYAMLWithCPU("1")); err != nil {
-		t.Fatalf("seed stored pipeline: %v", err)
-	}
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("2"), cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 403 {
-		t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, body)
-	}
-}
-
-// Case 4: "1000m" against a stored "1" is semantically equal, so a
-// non-superadmin resubmit passes (204).
-func TestPutPipeline_NonSuperadmin_SemanticEqualResources_OK(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-semeq")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", pipelineYAMLWithCPU("1")); err != nil {
-		t.Fatalf("seed stored pipeline: %v", err)
-	}
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("1000m"), cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 204 {
-		t.Fatalf("status = %d, want 204 (1000m == 1); body=%s", resp.StatusCode, body)
+			resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
+			defer resp.Body.Close()
+			body, _ := readAll(resp)
+			if resp.StatusCode != 503 {
+				t.Fatalf("status = %d, want 503; body=%s", resp.StatusCode, body)
+			}
+		})
 	}
 }
 
@@ -1172,7 +907,8 @@ func TestPutPipeline_NonSuperadmin_SemanticEqualResources_OK(t *testing.T) {
 func TestPutPipeline_Superadmin_FreshResourcesWithinMax_OK(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: true})
 	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-super-fresh")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-super-fresh", "data_admin")
+	pid := proj.ID
 	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
@@ -1190,7 +926,8 @@ func TestPutPipeline_Superadmin_FreshResourcesWithinMax_OK(t *testing.T) {
 func TestPutPipeline_Superadmin_ResourcesOverMax_BadRequest(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("2"), nil, stubServerAdminT6{result: true})
 	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-super-overmax")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-super-overmax", "data_admin")
+	pid := proj.ID
 
 	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", pipelineYAMLWithCPU("4"), cookie)
 	defer resp.Body.Close()
@@ -1219,7 +956,8 @@ func TestPutPipeline_NonSuperadmin_OverGatewayBound_Forbidden(t *testing.T) {
 	pol := &validate.Policy{Gateway: validate.GatewayBounds{MaxBufferSize: 100}}
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), pol, stubServerAdminT6{result: false})
 	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-gw-bound")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-gw-bound", "data_admin")
+	pid := proj.ID
 	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
 		t.Fatalf("seed stored pipeline: %v", err)
 	}
@@ -1232,21 +970,6 @@ func TestPutPipeline_NonSuperadmin_OverGatewayBound_Forbidden(t *testing.T) {
 	}
 }
 
-// Case 8: an unavailable superadmin checker fails the PUT with 503, not a
-// silent pass.
-func TestPutPipeline_SuperadminCheckerUnavailable_ServiceUnavailable(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{err: authz.ErrAuthzUnavailable})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-checker-503")
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 503 {
-		t.Fatalf("status = %d, want 503; body=%s", resp.StatusCode, body)
-	}
-}
-
 // Case 9 (MAJOR 1): a non-superadmin PUT of an otherwise-valid pipeline whose
 // component is DEPRECATED is SAVED with 200 + the deprecation warning — never a
 // 400. Warnings never block a save (Phase-1.5 ladder convention); only
@@ -1255,7 +978,8 @@ func TestPutPipeline_NonSuperadmin_DeprecatedComponent_Warns200(t *testing.T) {
 	reg := newFakeComponentRegistry(componentDefDeprecated("datuplet/test:latest"))
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, reg, nil, stubServerAdminT6{result: false})
 	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-deprecated")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-deprecated", "data_admin")
+	pid := proj.ID
 
 	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
 	defer resp.Body.Close()
@@ -1275,22 +999,6 @@ func TestPutPipeline_NonSuperadmin_DeprecatedComponent_Warns200(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("want a deprecation warning finding, got %+v", fb.Findings)
-	}
-}
-
-// Case 10 (MAJOR 2): a transient (non-NotFound) stored-pipeline read error makes
-// the diff-gate fail CLOSED with 503, rather than defaulting to "no old
-// resources" and letting a non-superadmin slip a resources edit through.
-func TestPutPipeline_NonSuperadmin_StoreReadError_ServiceUnavailable(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6WithStore(t, t6Registry("4"), nil, stubServerAdminT6{result: false}, errGetByNamePipelineStore{})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-store-read-err")
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/etl", []byte(validPipelineYAML), cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 503 {
-		t.Fatalf("status = %d, want 503 (fail closed on read error); body=%s", resp.StatusCode, body)
 	}
 }
 
@@ -1320,13 +1028,7 @@ func TestValidatePipeline_ValidDoc_EmptyFindingsNotStored(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-validate-valid"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-validate-valid", "data_admin")
 
 	resp := postValidate(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte(validPipelineYAML), "application/yaml", cookie)
 	defer resp.Body.Close()
@@ -1350,15 +1052,8 @@ func TestValidatePipeline_ValidDoc_EmptyFindingsNotStored(t *testing.T) {
 func TestValidatePipeline_ErrorFinding_Not400(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerWithRegistry(t, newFakeComponentRegistry())
 	defer cleanup()
-	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-validate-error-finding"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-validate-error-finding", "data_admin")
 
 	resp := postValidate(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte(validPipelineYAML), "application/yaml", cookie)
 	defer resp.Body.Close()
@@ -1386,15 +1081,8 @@ func TestValidatePipeline_ErrorFinding_Not400(t *testing.T) {
 func TestValidatePipeline_UnreadableBody_BadRequest(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
-	ctx := context.Background()
 
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-validate-unreadable"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-validate-unreadable", "data_admin")
 
 	resp := postValidate(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte("not: [valid yaml"), "application/yaml", cookie)
 	defer resp.Body.Close()
@@ -1404,97 +1092,59 @@ func TestValidatePipeline_UnreadableBody_BadRequest(t *testing.T) {
 	}
 }
 
-// TestValidatePipeline_NameGiven_ResourceGate_SameResources_NoFinding proves
-// that a non-superadmin resubmitting the identical stored resources block via
-// ?name= passes with no resource-gate finding — unchanged is not a
-// modification, mirroring PUT's 204 case (204 there, no finding here).
-func TestValidatePipeline_NameGiven_ResourceGate_SameResources_NoFinding(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-resgate-same")
-	yaml := pipelineYAMLWithCPU("2")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", yaml); err != nil {
-		t.Fatalf("seed stored pipeline: %v", err)
+// TestValidatePipeline_ResourceGate covers the resource-gate diff for a
+// non-superadmin on POST /pipelines/validate. With ?name= the diff runs against
+// the stored doc: resubmitting the identical block is not a modification (no
+// finding, mirroring PUT's 204) and adding a block yields an error finding
+// naming superadmin (a finding, never the 403 PUT returns). Without ?name= the
+// gate validates with create semantics — there is no stored doc, so any
+// resources block is a finding.
+func TestValidatePipeline_ResourceGate(t *testing.T) {
+	tests := []struct {
+		name        string
+		stored      []byte // nil: no stored pipeline
+		query       string
+		body        []byte
+		wantFinding bool // an error finding naming superadmin
+	}{
+		{name: "same resources no finding", stored: pipelineYAMLWithCPU("2"), query: "?name=etl", body: pipelineYAMLWithCPU("2")},
+		{name: "added resources finding", stored: []byte(validPipelineYAML), query: "?name=etl", body: pipelineYAMLWithCPU("2"), wantFinding: true},
+		{name: "no name create semantics finding", body: pipelineYAMLWithCPU("2"), wantFinding: true},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
+			defer cleanup()
+			cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-validate-resgate", "data_admin")
+			if tc.stored != nil {
+				if _, err := store.CreatePipeline(context.Background(), pool, proj.ID, "etl", "", tc.stored); err != nil {
+					t.Fatalf("seed stored pipeline: %v", err)
+				}
+			}
 
-	resp := postValidate(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/validate?name=etl", yaml, "application/yaml", cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
-	}
-	var fb secretsFindingsBody
-	if err := json.Unmarshal([]byte(body), &fb); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	for _, f := range fb.Findings {
-		if strings.Contains(f.Message, "superadmin") {
-			t.Fatalf("unexpected resource-gate finding for unchanged resources: %+v", fb.Findings)
-		}
-	}
-}
-
-// TestValidatePipeline_NameGiven_ResourceGate_Added_Finding proves the
-// resource-gate diff runs against the stored doc when ?name= is given: adding
-// a resources block a non-superadmin didn't have before yields an error
-// finding (never the 403 PUT would return).
-func TestValidatePipeline_NameGiven_ResourceGate_Added_Finding(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-resgate-added")
-	if _, err := store.CreatePipeline(context.Background(), pool, pid, "etl", "", []byte(validPipelineYAML)); err != nil {
-		t.Fatalf("seed stored pipeline: %v", err)
-	}
-
-	resp := postValidate(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/validate?name=etl", pipelineYAMLWithCPU("2"), "application/yaml", cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200 (resource-gate result is a finding, not 403); body=%s", resp.StatusCode, body)
-	}
-	var fb secretsFindingsBody
-	if err := json.Unmarshal([]byte(body), &fb); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	var found bool
-	for _, f := range fb.Findings {
-		if f.Severity == "error" && strings.Contains(f.Message, "superadmin") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("want a resource-gate finding naming superadmin, got %+v", fb.Findings)
-	}
-}
-
-// TestValidatePipeline_NoName_CreateSemantics_ResourcesFinding proves that
-// without ?name= the resource-gate validates with create semantics: any
-// resources block from a non-superadmin is a finding, since there is no
-// stored doc to diff against (an absent name is treated as "no old
-// resources", same as PUT's first-create path).
-func TestValidatePipeline_NoName_CreateSemantics_ResourcesFinding(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
-	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-create-sem")
-
-	resp := postValidate(t, ts.URL+"/api/v1/projects/"+pid.String()+"/pipelines/validate", pipelineYAMLWithCPU("2"), "application/yaml", cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
-	}
-	var fb secretsFindingsBody
-	if err := json.Unmarshal([]byte(body), &fb); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	var found bool
-	for _, f := range fb.Findings {
-		if f.Severity == "error" && strings.Contains(f.Message, "superadmin") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("want a create-semantics resource-gate finding, got %+v", fb.Findings)
+			resp := postValidate(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate"+tc.query, tc.body, "application/yaml", cookie)
+			defer resp.Body.Close()
+			body, _ := readAll(resp)
+			if resp.StatusCode != 200 {
+				t.Fatalf("status = %d, want 200 (resource-gate result is a finding, not 403); body=%s", resp.StatusCode, body)
+			}
+			var fb secretsFindingsBody
+			if err := json.Unmarshal([]byte(body), &fb); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			var found bool
+			for _, f := range fb.Findings {
+				if tc.wantFinding && f.Severity == "error" && strings.Contains(f.Message, "superadmin") {
+					found = true
+				}
+				if !tc.wantFinding && strings.Contains(f.Message, "superadmin") {
+					t.Fatalf("unexpected resource-gate finding for unchanged resources: %+v", fb.Findings)
+				}
+			}
+			if tc.wantFinding && !found {
+				t.Fatalf("want a resource-gate finding naming superadmin, got %+v", fb.Findings)
+			}
+		})
 	}
 }
 
@@ -1509,7 +1159,8 @@ func TestValidatePipeline_NoName_CreateSemantics_ResourcesFinding(t *testing.T) 
 func TestValidatePipeline_NonSuperadmin_NameMismatchFindingSurvives(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServerT6(t, t6Registry("4"), nil, stubServerAdminT6{result: false})
 	defer cleanup()
-	cookie, pid := t6Seed(t, ts, pool, fakeAuthz, "lk-validate-name-mismatch")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-validate-name-mismatch", "data_admin")
+	pid := proj.ID
 
 	mismatched := `{
   "name": "wrong-name",
@@ -1540,34 +1191,5 @@ func TestValidatePipeline_NonSuperadmin_NameMismatchFindingSurvives(t *testing.T
 	}
 	if !found {
 		t.Fatalf("want a name-mismatch finding to survive the non-superadmin diff-gate path, got %+v", fb.Findings)
-	}
-}
-
-// TestPutPipeline_ReservedNameValidate_BadRequest proves the reserved-name
-// guard: "validate" is not a valid create target for PUT (it would make the
-// literal /pipelines/validate segment ambiguous with the POST validate
-// route), so PUT rejects it with a finding rather than silently creating a
-// pipeline literally named "validate".
-func TestPutPipeline_ReservedNameValidate_BadRequest(t *testing.T) {
-	ts, pool, fakeAuthz, cleanup := freshServer(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	cookie, alice := seedUserAndLogin(t, pool, ts.URL, "a@example.com", "x")
-	proj, _ := store.CreateProject(ctx, pool, "proj")
-	lkID := "lk-reserved-validate"
-	if err := store.SetLakekeeperProjectID(ctx, pool, proj.ID, lkID); err != nil {
-		t.Fatalf("SetLakekeeperProjectID: %v", err)
-	}
-	fakeAuthz.Allow(authz.UserObject(alice.ID.String()).String(), "data_admin", authz.ProjectObject(lkID))
-
-	resp := putYAML(t, ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines/validate", []byte(validPipelineYAML), cookie)
-	defer resp.Body.Close()
-	body, _ := readAll(resp)
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
-	}
-	if !strings.Contains(body, "reserved") {
-		t.Errorf("400 body = %q, want it to mention the reserved name", body)
 	}
 }

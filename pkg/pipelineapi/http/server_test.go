@@ -77,22 +77,58 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
-// TestServer_StorageRoute_SoftDegrade asserts that a pipeline-api built
-// without WithStorage returns 503 on /api/v1/storage/*. The path doesn't
-// 404 because the server registers a catch-all handler under
-// /api/v1/storage/.
-func TestServer_StorageRoute_SoftDegrade(t *testing.T) {
-	srv := apihttp.NewServer(nil)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	resp, err := stdhttp.Get(ts.URL + "/api/v1/storage/projects/anything/tables")
-	if err != nil {
-		t.Fatalf("GET /api/v1/storage/...: %v", err)
+// TestServer_RoutesNotConfigured asserts every optional route block degrades
+// softly when its service is not wired: the storage catch-all answers 503
+// (the path never 404s because the server registers a catch-all under
+// /api/v1/storage/), while the query, RFC 028 author-apps and app-principal
+// query routes stay unregistered (404) rather than panic or fall through to
+// another handler.
+func TestServer_RoutesNotConfigured(t *testing.T) {
+	pid := uuid.NewString()
+	tests := []struct {
+		name       string
+		srv        *apihttp.Server
+		method     string
+		path       string
+		wantStatus int
+	}{
+		{"storage", apihttp.NewServer(nil), stdhttp.MethodGet, "/api/v1/storage/projects/anything/tables", stdhttp.StatusServiceUnavailable},
+		{"query", apihttp.NewServer(nil), stdhttp.MethodPost, "/api/v1/projects/" + pid + "/query", stdhttp.StatusNotFound},
+		{
+			"apps",
+			apihttp.NewServer(nil).
+				WithUserResolver(stubResolver{}).
+				WithAuthorizer(authztest.New()).
+				WithProjectReader(stubProjects{}),
+			stdhttp.MethodGet, "/api/v1/projects/" + pid + "/apps", stdhttp.StatusNotFound,
+		},
+		{"app query", apihttp.NewServer(nil), stdhttp.MethodPost, "/internal/v1/projects/" + pid + "/query", stdhttp.StatusNotFound},
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != stdhttp.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", resp.StatusCode)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(tc.srv.Handler())
+			defer ts.Close()
+
+			var body io.Reader
+			if tc.method == stdhttp.MethodPost {
+				body = strings.NewReader(`{"sql":"SELECT 1"}`)
+			}
+			req, err := stdhttp.NewRequest(tc.method, ts.URL+tc.path, body)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			if body != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			resp, err := stdhttp.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+		})
 	}
 }
 
@@ -146,26 +182,6 @@ func TestServer_StorageRoute_WithServiceWired(t *testing.T) {
 	}
 	if resp.StatusCode != stdhttp.StatusForbidden {
 		t.Errorf("status = %d, want 403 (real handler, empty authz fake denies)", resp.StatusCode)
-	}
-}
-
-// TestServer_QueryRoute_NotConfigured asserts that
-// POST /api/v1/projects/{pid}/query returns 404 when the query service is
-// not wired.
-func TestServer_QueryRoute_NotConfigured(t *testing.T) {
-	srv := apihttp.NewServer(nil)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	pid := uuid.NewString()
-	resp, err := stdhttp.Post(ts.URL+"/api/v1/projects/"+pid+"/query", "application/json", strings.NewReader(`{"sql":"SELECT 1"}`))
-	if err != nil {
-		t.Fatalf("POST /api/v1/projects/%s/query: %v", pid, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != stdhttp.StatusNotFound {
-		t.Errorf("status = %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -285,27 +301,6 @@ func (stubProjects) GetByID(_ context.Context, id uuid.UUID) (*apihttp.ProjectVi
 	return &apihttp.ProjectView{ID: id, LakekeeperProjectID: "bbbbbbbb-0000-0000-0000-000000000003"}, nil
 }
 
-// TestServer_AppRoutes_NotConfigured asserts the RFC 028 author routes stay
-// unregistered (404) until WithApps is wired — the same soft-degrade gate the
-// other optional route blocks use.
-func TestServer_AppRoutes_NotConfigured(t *testing.T) {
-	srv := apihttp.NewServer(nil).
-		WithUserResolver(stubResolver{}).
-		WithAuthorizer(authztest.New()).
-		WithProjectReader(stubProjects{})
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	resp, err := stdhttp.Get(ts.URL + "/api/v1/projects/" + uuid.NewString() + "/apps")
-	if err != nil {
-		t.Fatalf("GET .../apps: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != stdhttp.StatusNotFound {
-		t.Errorf("status = %d, want 404 (apps not wired)", resp.StatusCode)
-	}
-}
-
 // TestServer_AppRoutes_WithAppsWired asserts WithApps registers the author
 // routes behind auth.WithUser + the project-scoped FGA check: the empty authz
 // fake denies, so a 403 (not a 404) proves the real handler ran.
@@ -383,4 +378,3 @@ func TestServer_AppInternalRoutes(t *testing.T) {
 		})
 	}
 }
-
