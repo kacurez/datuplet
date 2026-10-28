@@ -83,14 +83,17 @@ func TestFinishQuietly(t *testing.T) {
 				}
 			}
 			finishQuietly(sink)
-			// Idempotent: a later call (main's normal-path Finish, or another
-			// finishQuietly from a defer) must not panic or double-close.
-			finishQuietly(sink)
 			if opened != tc.wantOpened {
 				t.Errorf("writer opened = %v, want %v", opened, tc.wantOpened)
 			}
 			if fw.closed != tc.wantClosed {
 				t.Errorf("writer closed = %v, want %v", fw.closed, tc.wantClosed)
+			}
+			// Idempotent: a later call (main's normal-path Finish, or another
+			// finishQuietly from a defer) must not panic or change the outcome.
+			finishQuietly(sink)
+			if opened != tc.wantOpened || fw.closed != tc.wantClosed {
+				t.Errorf("state changed after repeat call: opened=%v closed=%v", opened, fw.closed)
 			}
 		})
 	}

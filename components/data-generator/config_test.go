@@ -132,6 +132,12 @@ func TestParseAndValidate(t *testing.T) {
 			wantSubstr: []string{"rows"},
 		},
 		{
+			// Restores the deleted LiteralValidWithNullable: only test that a
+			// column with SOME nulls (but not all) passes ParseAndValidate.
+			name: "nullable column with some nulls accepted",
+			raw:  `{"tables":[{"name":"t","literal":{"columns":["id","name"],"rows":[[1,"alice"],[2,null]]}}]}`,
+		},
+		{
 			name:       "literal columns required",
 			raw:        `{"tables":[{"name":"t","literal":{"rows":[[1,"alice"]]}}]}`,
 			wantErr:    true,

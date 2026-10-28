@@ -44,12 +44,6 @@ func TestNewRNG_Deterministic(t *testing.T) {
 // TestGenerateValue checks each column type produces a non-nil value, and
 // that string/date/timestamp/uuid values have the documented format.
 func TestGenerateValue(t *testing.T) {
-	nonNil := func(v any) string {
-		if v == nil {
-			return "returned nil"
-		}
-		return ""
-	}
 	asString := func(v any) (string, string) {
 		s, ok := v.(string)
 		if !ok {
@@ -62,7 +56,8 @@ func TestGenerateValue(t *testing.T) {
 		typ   string
 		seed  [2]uint64
 		iters int
-		// check returns a failure message ("" when the value is fine).
+		// check returns a failure message ("" when the value is fine); nil
+		// means only the non-nil check below applies.
 		check func(v any) string
 	}{
 		{name: "string", typ: "string", seed: [2]uint64{7, 7}, iters: 50, check: func(v any) string {
@@ -107,12 +102,12 @@ func TestGenerateValue(t *testing.T) {
 			}
 			return ""
 		}},
-		{name: "int", typ: "int", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
-		{name: "long", typ: "long", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
-		{name: "float", typ: "float", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
-		{name: "double", typ: "double", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
-		{name: "boolean", typ: "boolean", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
-		{name: "now", typ: "now", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
+		{name: "int", typ: "int", seed: [2]uint64{42, 42}, iters: 1, check: nil},
+		{name: "long", typ: "long", seed: [2]uint64{42, 42}, iters: 1, check: nil},
+		{name: "float", typ: "float", seed: [2]uint64{42, 42}, iters: 1, check: nil},
+		{name: "double", typ: "double", seed: [2]uint64{42, 42}, iters: 1, check: nil},
+		{name: "boolean", typ: "boolean", seed: [2]uint64{42, 42}, iters: 1, check: nil},
+		{name: "now", typ: "now", seed: [2]uint64{42, 42}, iters: 1, check: nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -121,6 +116,9 @@ func TestGenerateValue(t *testing.T) {
 				v := generateValue(rng, tc.typ)
 				if v == nil {
 					t.Fatalf("type %q returned nil", tc.typ)
+				}
+				if tc.check == nil {
+					continue
 				}
 				if msg := tc.check(v); msg != "" {
 					t.Errorf("type %q: %s", tc.typ, msg)
