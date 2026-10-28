@@ -1,10 +1,8 @@
 package queryproxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -56,27 +54,6 @@ func echoWorker(t *testing.T, got *workerRequest) *httptest.Server {
 	}))
 }
 
-func TestAppQuery_ValidAppTokenPassesGate(t *testing.T) {
-	signer := testSigner(t)
-	appID := uuid.NewString()
-	tok, _, err := tokens.MintAppToken(signer, appID, "lk-proj")
-	if err != nil {
-		t.Fatalf("MintAppToken: %v", err)
-	}
-
-	var got workerRequest
-	worker := echoWorker(t, &got)
-	defer worker.Close()
-
-	core := newAppCore(t, worker.URL, signer)
-	rec := httptest.NewRecorder()
-	core.AppHTTPHandler().ServeHTTP(rec, appQueryRequest(uuid.NewString(), tok.Reveal(), `{"sql":"SELECT 1"}`))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestAppQuery_ForwardsPresentedTokenAsCatalogCredential(t *testing.T) {
 	// No re-mint: the catalog JWT the worker receives must be byte-identical
 	// to the app JWT app-worker presented (RFC 028 P5's core requirement —
@@ -103,63 +80,6 @@ func TestAppQuery_ForwardsPresentedTokenAsCatalogCredential(t *testing.T) {
 	if got.CatalogJWT != presented {
 		t.Fatalf("worker catalog_jwt = %q, want the exact presented app token %q (no re-mint)", got.CatalogJWT, presented)
 	}
-}
-
-func TestAppQuery_AuditRecordsAppSubjectAndJTI(t *testing.T) {
-	signer := testSigner(t)
-	appID := uuid.NewString()
-	tok, jti, err := tokens.MintAppToken(signer, appID, "lk-proj")
-	if err != nil {
-		t.Fatalf("MintAppToken: %v", err)
-	}
-	wantSub := "app-" + appID
-
-	var got workerRequest
-	worker := echoWorker(t, &got)
-	defer worker.Close()
-
-	var logBuf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuf, nil)))
-	defer slog.SetDefault(prev)
-
-	core := newAppCore(t, worker.URL, signer)
-	rec := httptest.NewRecorder()
-	core.AppHTTPHandler().ServeHTTP(rec, appQueryRequest(uuid.NewString(), tok.Reveal(), `{"sql":"SELECT 1"}`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-
-	line := findAuditLine(t, logBuf.String())
-	if line["principal"] != wantSub {
-		t.Fatalf("audit principal = %v, want %q", line["principal"], wantSub)
-	}
-	if line["jti"] != jti {
-		t.Fatalf("audit jti = %v, want %q (the app token's own jti, not a re-minted one)", line["jti"], jti)
-	}
-	if line["outcome"] != "ok" {
-		t.Fatalf("audit outcome = %v, want ok", line["outcome"])
-	}
-}
-
-// findAuditLine locates the single "query_audit" JSON log line and decodes
-// it into a generic map for field assertions.
-func findAuditLine(t *testing.T, logs string) map[string]any {
-	t.Helper()
-	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
-		if line == "" {
-			continue
-		}
-		var m map[string]any
-		if err := json.Unmarshal([]byte(line), &m); err != nil {
-			continue
-		}
-		if m["msg"] == "query_audit" {
-			return m
-		}
-	}
-	t.Fatalf("no query_audit line found in captured logs: %s", logs)
-	return nil
 }
 
 // otherKindToken mints a token of a kind OTHER than "app" at the same

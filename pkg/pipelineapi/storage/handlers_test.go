@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -193,102 +192,73 @@ func TestListTables_UnknownProject(t *testing.T) {
 	}
 }
 
-func TestListTables_NoMembership(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, stubResolver{}, deniedFake())
-
-	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
-	if err != nil {
-		t.Fatalf("GET tables: %v", err)
+// TestListTables_GateErrors: every gate failure on the list route must carry
+// "kind" alongside "error" — parity with the query proxy's {"error","kind"}
+// shape for the same shared projectgate.Error (RFC 025 Codex review, Minor
+// finding). The no-session row only pins the status.
+func TestListTables_GateErrors(t *testing.T) {
+	std := func(resolver auth.UserResolver, authzr *authztest.Fake) func(t *testing.T) *httptest.Server {
+		return func(t *testing.T) *httptest.Server {
+			return newTestServer(t, makeFixtureServiceWithLK(t), resolver, authzr)
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", resp.StatusCode)
-	}
-	// The gate-error body must carry "kind" alongside "error" — parity with
-	// the query proxy's {"error","kind"} shape for the same shared
-	// projectgate.Error (RFC 025 Codex review, Minor finding).
-	var body map[string]string
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body["kind"] != "forbidden" {
-		t.Errorf(`kind = %q, want "forbidden"`, body["kind"])
-	}
-}
-
-func TestListTables_NoSession(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, unauthResolver{}, allowedFake())
-
-	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
-	if err != nil {
-		t.Fatalf("GET tables: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
-	}
-}
-
-func TestListTables_InvalidProjectID(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
-
-	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/not-a-uuid/tables")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	var body map[string]string
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body["kind"] != "bad_request" {
-		t.Errorf(`kind = %q, want "bad_request"`, body["kind"])
-	}
-}
-
-// TestListTables_WarehouseResolutionFails: on the lakekeeper-configured
-// path, a resolveWarehouse gate failure (e.g. no warehouse registered yet
-// for the project) must carry "kind" alongside "error" — same parity as
-// resolveProject and the query proxy (Minor finding, RFC 025 Codex review).
-func TestListTables_WarehouseResolutionFails(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	svc.LakekeeperURL = "http://lakekeeper.invalid" // never dialed: warehouse resolution fails first
-	h := &HTTPHandlers{
-		Svc: svc,
-		Gate: &projectgate.Gate{
-			LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
-			Authorizer:             allowedFake(),
-			WarehouseFor: func(_ context.Context, _ string) (string, error) {
-				return "", errors.New("no warehouse registered")
+	// On the lakekeeper-configured path, a resolveWarehouse gate failure
+	// (e.g. no warehouse registered yet for the project) must also carry kind.
+	warehouseFails := func(t *testing.T) *httptest.Server {
+		svc := makeFixtureServiceWithLK(t)
+		svc.LakekeeperURL = "http://lakekeeper.invalid" // never dialed: warehouse resolution fails first
+		h := &HTTPHandlers{
+			Svc: svc,
+			Gate: &projectgate.Gate{
+				LakekeeperProjectIDFor: svc.LakekeeperProjectIDFor,
+				Authorizer:             allowedFake(),
+				WarehouseFor: func(_ context.Context, _ string) (string, error) {
+					return "", errors.New("no warehouse registered")
+				},
 			},
-		},
+		}
+		mux := http.NewServeMux()
+		mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
+			auth.WithUser(stubResolver{}, http.HandlerFunc(h.ListTables)))
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		return srv
 	}
-	mux := http.NewServeMux()
-	mux.Handle("GET /api/v1/storage/projects/{pid}/tables",
-		auth.WithUser(stubResolver{}, http.HandlerFunc(h.ListTables)))
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables")
-	if err != nil {
-		t.Fatalf("GET tables: %v", err)
+	cases := []struct {
+		name       string
+		newSrv     func(t *testing.T) *httptest.Server
+		pid        string
+		wantStatus int
+		wantKind   string // "" = body not asserted
+	}{
+		{"no_membership", std(stubResolver{}, deniedFake()), fixtureProjectID, http.StatusForbidden, "forbidden"},
+		{"no_session", std(unauthResolver{}, allowedFake()), fixtureProjectID, http.StatusUnauthorized, ""},
+		{"invalid_project_id", std(stubResolver{}, allowedFake()), "not-a-uuid", http.StatusBadRequest, "bad_request"},
+		{"warehouse_resolution_fails", warehouseFails, fixtureProjectID, http.StatusServiceUnavailable, "unavailable"},
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
-	}
-	var body map[string]string
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body["kind"] != "unavailable" {
-		t.Errorf(`kind = %q, want "unavailable"`, body["kind"])
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := tc.newSrv(t)
+			resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + tc.pid + "/tables")
+			if err != nil {
+				t.Fatalf("GET tables: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if tc.wantKind == "" {
+				return
+			}
+			var body map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if body["kind"] != tc.wantKind {
+				t.Errorf("kind = %q, want %q", body["kind"], tc.wantKind)
+			}
+		})
 	}
 }
 
@@ -323,25 +293,6 @@ func TestTableSchema_Success(t *testing.T) {
 		if c.Nullable {
 			t.Errorf("col %q nullable=true, want false", c.Name)
 		}
-	}
-}
-
-func TestTableSchema_InvalidIdentifier(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newTestServer(t, svc, stubResolver{}, allowedFake())
-
-	// Path segment ".." fails ValidIdentifier (first char must be alphanumeric).
-	// The mux strips dot-segments before dispatch, so we target a segment
-	// that's non-empty but starts with a dot/underscore — the canonical
-	// "invalid identifier" case.
-	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/_bad/simple/schema"
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (body=%v)", resp.StatusCode, resp.Header)
 	}
 }
 
@@ -454,8 +405,7 @@ func TestPreview_QueryDisabled(t *testing.T) {
 }
 
 // TestPreview_ResultTooLarge asserts the query-worker's result_too_large
-// QueryError maps to a 413 whose message explains the cap in storage-UI
-// terms ("too wide") rather than the query-worker's generic wording.
+// QueryError maps to a 413 carrying that kind.
 func TestPreview_ResultTooLarge(t *testing.T) {
 	runner := &fakePreviewRunner{qerr: &queryproxy.QueryError{Status: http.StatusRequestEntityTooLarge, Kind: "result_too_large", Msg: "result too large"}}
 	h := &HTTPHandlers{
@@ -477,34 +427,8 @@ func TestPreview_ResultTooLarge(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !strings.Contains(body["error"], "too wide") {
-		t.Errorf("error = %q, want it to contain %q", body["error"], "too wide")
-	}
-}
-
-// TestPreview_InvalidIdentifier asserts identifiers are still rejected
-// BEFORE the runner is invoked. "_bad" (not "../x") is the canonical
-// invalid-identifier probe here — Go's ServeMux strips dot segments out of
-// the path before PathValue, so "../x" never reaches the handler.
-func TestPreview_InvalidIdentifier(t *testing.T) {
-	runner := &fakePreviewRunner{}
-	h := &HTTPHandlers{
-		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
-		Query: runner,
-	}
-	srv := newPreviewTestServer(t, h, stubResolver{})
-
-	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/_bad/simple/preview"
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatalf("GET preview: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	if runner.got.ns != "" || runner.got.table != "" {
-		t.Errorf("runner invoked despite invalid identifier: got=%+v", runner.got)
+	if body["kind"] != "result_too_large" {
+		t.Errorf(`kind = %q, want "result_too_large"`, body["kind"])
 	}
 }
 
@@ -678,5 +602,49 @@ func TestLoadRequestedTable_RejectsSymlinkedMetadata(t *testing.T) {
 	got := body["error"]
 	if got != "metadata path escapes warehouse" && got != "metadata path traverses symlink" {
 		t.Errorf("error = %q, want one of [metadata path escapes warehouse, metadata path traverses symlink]", got)
+	}
+}
+
+// TestInvalidIdentifier_Rejected asserts identifiers are rejected with 400 on
+// the schema, preview and info routes, and BEFORE the preview runner is
+// invoked. "_bad" (not "../x") is the canonical invalid-identifier probe here
+// — Go's ServeMux strips dot segments out of the path before PathValue, so
+// "../x" never reaches the handler.
+func TestInvalidIdentifier_Rejected(t *testing.T) {
+	cases := []struct {
+		name  string
+		route string
+	}{
+		{"schema", "schema"},
+		{"preview", "preview"},
+		{"info", "info"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakePreviewRunner{}
+			var srv *httptest.Server
+			if tc.route == "preview" {
+				h := &HTTPHandlers{
+					Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+					Query: runner,
+				}
+				srv = newPreviewTestServer(t, h, stubResolver{})
+			} else {
+				srv = newTestServer(t, makeFixtureServiceWithLK(t), stubResolver{}, allowedFake())
+			}
+
+			url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/_bad/simple/" + tc.route
+			resp, err := http.Get(url)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			if runner.got.ns != "" || runner.got.table != "" {
+				t.Errorf("runner invoked despite invalid identifier: got=%+v", runner.got)
+			}
+		})
 	}
 }

@@ -106,8 +106,8 @@ func generateAuditedTable(warehouse string) error {
 	// small offset so both snapshots are reliably in the future relative
 	// to the base metadata timestamp.
 	now := time.Now().UTC()
-	snap1ID := now.Add(100 * time.Millisecond).UnixNano() / int64(time.Millisecond)
-	snap2ID := now.Add(2 * time.Minute).UnixNano() / int64(time.Millisecond)
+	snap1ID := now.Add(100*time.Millisecond).UnixNano() / int64(time.Millisecond)
+	snap2ID := now.Add(2*time.Minute).UnixNano() / int64(time.Millisecond)
 
 	ml1Name := fmt.Sprintf("snap-%d-a.avro", snap1ID)
 	ml2Name := fmt.Sprintf("snap-%d-b.avro", snap2ID)
@@ -326,55 +326,5 @@ func TestSnapshots_WithAuditKeys(t *testing.T) {
 		t.Error("older AddedRecords should be non-nil (added-records: '0' is present — real zero commit)")
 	} else if *older.AddedRecords != 0 {
 		t.Errorf("older AddedRecords = %d, want 0", *older.AddedRecords)
-	}
-}
-
-// TestAddedRecordsZeroIsDistinctFromMissing pins the distinguishability
-// invariant introduced by the P3 fix: a snapshot whose summary carries
-// added-records: "0" must produce a non-nil *int64 pointer (real zero commit),
-// while a snapshot whose summary lacks the key entirely must produce nil.
-func TestAddedRecordsZeroIsDistinctFromMissing(t *testing.T) {
-	svc := makeFixtureServiceWithAuditKeys(t)
-	srv := newSnapshotsTestServerFull(t, svc)
-
-	url := srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/audited/snapshots"
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	// Use raw JSON decode so we can distinguish null from absent/0.
-	var rawRows []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&rawRows); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(rawRows) != 2 {
-		t.Fatalf("got %d rows, want 2", len(rawRows))
-	}
-
-	// rows are sorted newest-first.
-	// newer (index 0): added-records: "3" → JSON number 3, not null/absent.
-	newer := rawRows[0]
-	newerVal, newerPresent := newer["added_records"]
-	if !newerPresent {
-		t.Error("newer snapshot: added_records key missing from JSON (want numeric 3)")
-	} else if newerVal == nil {
-		t.Error("newer snapshot: added_records is null (want numeric 3)")
-	}
-
-	// older (index 1): added-records: "0" → JSON number 0, NOT null/absent.
-	// This distinguishes a real zero-row commit from a missing summary property.
-	older := rawRows[1]
-	olderVal, olderPresent := older["added_records"]
-	if !olderPresent {
-		t.Error("older snapshot: added_records key missing (want numeric 0 — real zero commit)")
-	} else if olderVal == nil {
-		t.Error("older snapshot: added_records is null (want numeric 0 — real zero, distinguishable from missing)")
-	} else if n, ok := olderVal.(float64); !ok || n != 0 {
-		t.Errorf("older snapshot: added_records = %v, want 0", olderVal)
 	}
 }

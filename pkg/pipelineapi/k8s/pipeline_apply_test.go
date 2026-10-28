@@ -75,16 +75,20 @@ func TestApplyPipelineCRD_UpdatesWhenPresent(t *testing.T) {
 	}
 }
 
-func TestApplyPipelineCRD_RejectsNilDoc(t *testing.T) {
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, "ns", nil); err == nil {
-		t.Error("expected error for nil doc")
+func TestApplyPipelineCRD_RejectsInvalidDoc(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  *config.Pipeline
+	}{
+		{"nil_doc", nil},
+		{"unnamed_doc", &config.Pipeline{}},
 	}
-}
-
-func TestApplyPipelineCRD_RejectsUnnamedDoc(t *testing.T) {
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	if err := pkg8s.ApplyPipelineCRD(context.Background(), c, "ns", &config.Pipeline{}); err == nil {
-		t.Error("expected error for doc with no name")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
+			if err := pkg8s.ApplyPipelineCRD(context.Background(), c, "ns", tc.doc); err == nil {
+				t.Error("expected error")
+			}
+		})
 	}
 }

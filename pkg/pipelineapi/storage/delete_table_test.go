@@ -57,54 +57,6 @@ func deleteReq(t *testing.T, srv *httptest.Server, pid, ns, table string) *http.
 	return resp
 }
 
-// The destructive route must require data_admin, NOT the datuplet_member that
-// every read handler accepts. A user who can browse a table must not be able
-// to destroy it.
-func TestDeleteTable_MembershipAloneIsForbidden(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	// allowedFake grants ONLY datuplet_member — the read-path relation.
-	srv := newDeleteTestServer(t, svc, stubResolver{}, allowedFake())
-
-	resp := deleteReq(t, srv, fixtureProjectID, "raw", "simple")
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403 — datuplet_member must not authorize a delete", resp.StatusCode)
-	}
-}
-
-func TestDeleteTable_NonMemberIsForbidden(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newDeleteTestServer(t, svc, stubResolver{}, deniedFake())
-
-	resp := deleteReq(t, srv, fixtureProjectID, "raw", "simple")
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", resp.StatusCode)
-	}
-}
-
-func TestDeleteTable_Unauthenticated(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newDeleteTestServer(t, svc, unauthResolver{}, dataAdminFake())
-
-	resp := deleteReq(t, srv, fixtureProjectID, "raw", "simple")
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
-	}
-}
-
-// With data_admin granted but no lakekeeper configured, the handler must
-// refuse with 501 rather than falling back to the directory walker. There is
-// no safe walker delete path, and inventing one out of prefix removal is
-// precisely the class of bug this codebase avoids.
-func TestDeleteTable_WithoutLakekeeperIsNotImplemented(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t) // LakekeeperURL == ""
-	srv := newDeleteTestServer(t, svc, stubResolver{}, dataAdminFake())
-
-	resp := deleteReq(t, srv, fixtureProjectID, "raw", "simple")
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501 (no lakekeeper => refuse, never walker-delete)", resp.StatusCode)
-	}
-}
-
 // Identifier validation must run before any catalog work, so a traversal-ish
 // or malformed identifier is rejected as a 400 and never reaches lakekeeper.
 // Authorization is granted here so a 400 can only come from validation.
@@ -167,12 +119,36 @@ func TestIsTableGone(t *testing.T) {
 	}
 }
 
-func TestDeleteTable_InvalidProjectID(t *testing.T) {
-	svc := makeFixtureServiceWithLK(t)
-	srv := newDeleteTestServer(t, svc, stubResolver{}, dataAdminFake())
-
-	resp := deleteReq(t, srv, "not-a-uuid", "raw", "simple")
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+// TestDeleteTable_StatusCodes pins the gate/refusal outcomes of the
+// destructive route. The first row is the load-bearing one: the route must
+// require data_admin, NOT the datuplet_member that every read handler
+// accepts, so a user who can browse a table cannot destroy it. The 501 row
+// (data_admin granted, no lakekeeper configured) guards against ever
+// inventing a walker-based delete; there is no safe walker delete path.
+func TestDeleteTable_StatusCodes(t *testing.T) {
+	cases := []struct {
+		name     string
+		resolver auth.UserResolver
+		authzr   *authztest.Fake
+		pid      string
+		want     int
+	}{
+		// allowedFake grants ONLY datuplet_member — the read-path relation.
+		{"membership_alone_is_forbidden", stubResolver{}, allowedFake(), fixtureProjectID, http.StatusForbidden},
+		{"non_member_is_forbidden", stubResolver{}, deniedFake(), fixtureProjectID, http.StatusForbidden},
+		{"unauthenticated", unauthResolver{}, dataAdminFake(), fixtureProjectID, http.StatusUnauthorized},
+		{"invalid_project_id", stubResolver{}, dataAdminFake(), "not-a-uuid", http.StatusBadRequest},
+		// LakekeeperURL == "" in the fixture service: refuse, never walker-delete.
+		{"without_lakekeeper_is_not_implemented", stubResolver{}, dataAdminFake(), fixtureProjectID, http.StatusNotImplemented},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := makeFixtureServiceWithLK(t)
+			srv := newDeleteTestServer(t, svc, tc.resolver, tc.authzr)
+			resp := deleteReq(t, srv, tc.pid, "raw", "simple")
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
 	}
 }

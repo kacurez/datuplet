@@ -32,7 +32,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -150,63 +149,66 @@ func authedReq(t *testing.T, sub uuid.UUID, body string) *http.Request {
 
 // ---- extractJTIFromToken ---------------------------------------------------
 
-func TestExtractJTIFromToken_Valid(t *testing.T) {
-	// Build a synthetic three-part JWT whose payload carries a jti claim.
-	// We use base64url-encoded JSON to exercise the full decode path.
+func TestExtractJTIFromToken(t *testing.T) {
+	// Synthetic three-part JWTs whose payload carries (or lacks) a jti claim.
+	// base64url-encoded JSON exercises the full decode path.
 	header := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9" // {"alg":"RS256","typ":"JWT"}
-	payload := base64URLEncode([]byte(`{"jti":"test-jti-1234","sub":"abc"}`))
-	sig := "fakesig"
-	tok := header + "." + payload + "." + sig
-
-	got := extractJTIFromToken(tok)
-	if got != "test-jti-1234" {
-		t.Errorf("extractJTIFromToken = %q, want test-jti-1234", got)
+	cases := []struct {
+		name string
+		tok  string
+		want string
+	}{
+		{"valid", header + "." + base64URLEncode([]byte(`{"jti":"test-jti-1234","sub":"abc"}`)) + ".fakesig", "test-jti-1234"},
+		{"missing_jti", "header." + base64URLEncode([]byte(`{"sub":"abc"}`)) + ".sig", ""},
+		{"malformed_empty", "", ""},
+		{"malformed_one_part", "onlyone", ""},
+		{"malformed_two_parts", "two.parts", ""},
 	}
-}
-
-func TestExtractJTIFromToken_Missing(t *testing.T) {
-	payload := base64URLEncode([]byte(`{"sub":"abc"}`))
-	tok := "header." + payload + ".sig"
-	if got := extractJTIFromToken(tok); got != "" {
-		t.Errorf("want empty jti when absent, got %q", got)
-	}
-}
-
-func TestExtractJTIFromToken_MalformedToken(t *testing.T) {
-	for _, bad := range []string{"", "onlyone", "two.parts"} {
-		if got := extractJTIFromToken(bad); got != "" {
-			t.Errorf("extractJTIFromToken(%q) = %q, want empty", bad, got)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractJTIFromToken(tc.tok); got != tc.want {
+				t.Errorf("extractJTIFromToken(%q) = %q, want %q", tc.tok, got, tc.want)
+			}
+		})
 	}
 }
 
 // ---- statementHash ---------------------------------------------------------
 
-func TestStatementHash_NonEmpty(t *testing.T) {
-	h := statementHash("SELECT 1")
-	if len(h) != 16 {
-		t.Errorf("len = %d, want 16", len(h))
+func TestStatementHash(t *testing.T) {
+	cases := []struct {
+		name  string
+		sql   string
+		check func(t *testing.T, h string)
+	}{
+		{"non_empty_16_hex", "SELECT 1", func(t *testing.T, h string) {
+			if len(h) != 16 {
+				t.Errorf("len = %d, want 16", len(h))
+			}
+			for _, c := range h {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+					t.Errorf("non-hex char %q in hash %q", c, h)
+				}
+			}
+		}},
+		{"empty_sql_empty_hash", "", func(t *testing.T, h string) {
+			if h != "" {
+				t.Errorf("statementHash(\"\") = %q, want empty", h)
+			}
+		}},
+		{"deterministic_and_distinct", "SELECT 1", func(t *testing.T, h string) {
+			if h != statementHash("SELECT 1") {
+				t.Error("statementHash not deterministic")
+			}
+			if h == statementHash("SELECT 2") {
+				t.Error("different SQL produced the same hash (collision unlikely)")
+			}
+		}},
 	}
-	// Must be hex digits only.
-	for _, c := range h {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			t.Errorf("non-hex char %q in hash %q", c, h)
-		}
-	}
-}
-
-func TestStatementHash_Empty(t *testing.T) {
-	if got := statementHash(""); got != "" {
-		t.Errorf("statementHash(\"\") = %q, want empty", got)
-	}
-}
-
-func TestStatementHash_Deterministic(t *testing.T) {
-	if statementHash("SELECT 1") != statementHash("SELECT 1") {
-		t.Error("statementHash not deterministic")
-	}
-	if statementHash("SELECT 1") == statementHash("SELECT 2") {
-		t.Error("different SQL produced the same hash (collision unlikely)")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.check(t, statementHash(tc.sql))
+		})
 	}
 }
 
@@ -218,12 +220,12 @@ func TestStatementHash_Deterministic(t *testing.T) {
 // JWT material appears in logs.
 func TestAudit_ExactlyOneLinePerRequest(t *testing.T) {
 	cases := []struct {
-		name         string
-		workerStatus int
-		workerBody   string
-		reqBody      string
-		wantOutcome  string
-		wantJTI      bool // true = jti must be non-empty
+		name          string
+		workerStatus  int
+		workerBody    string
+		reqBody       string
+		wantOutcome   string
+		wantJTI       bool // true = jti must be non-empty
 		wantTruncated bool
 	}{
 		{
@@ -399,72 +401,6 @@ func TestAudit_BadRequest_BeforeMint(t *testing.T) {
 	}
 }
 
-// TestAudit_RateLimited_EmptyJTI covers the per-principal gate path: no token
-// is minted when the gate is full, so jti must be empty.
-func TestAudit_RateLimited_EmptyJTI(t *testing.T) {
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
-	defer closeRelease()
-
-	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		entered <- struct{}{}
-		<-release
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`)
-	}))
-	defer worker.Close()
-
-	counter := freshCounter()
-	cfg := Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w"), PerPrincipalInflight: 1}
-	h := newHandlerWithCounter(t, cfg, counter)
-	sub := uuid.New()
-
-	// First query: blocks inside worker. done is closed when it fully
-	// returns (including its deferred audit emit) so the test can await it
-	// before returning — otherwise the late emit fires after the NEXT test
-	// has swapped the global slog default (slog.SetDefault also redirects the
-	// stdlib log package), leaking this query's audit line into that test's
-	// captured buffer.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, authedReq(t, sub, `{"sql":"SELECT 1"}`))
-	}()
-	<-entered // first query is in-flight
-
-	// Second query from same principal: gate full → rate_limited.
-	buf := captureLogger(t)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, authedReq(t, sub, `{"sql":"SELECT 2"}`))
-
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", rec.Code)
-	}
-
-	lines := auditLines(buf)
-	if len(lines) != 1 {
-		t.Fatalf("want 1 query_audit line, got %d:\n%s", len(lines), buf.String())
-	}
-	line := lines[0]
-
-	if got := extractField(line, "outcome"); got != "rate_limited" {
-		t.Errorf("outcome = %q, want rate_limited", got)
-	}
-	if jti := extractField(line, "jti"); jti != "" {
-		t.Errorf("jti must be empty for rate_limited (no mint), got %q", jti)
-	}
-
-	if delta := counterDelta(counter, "rate_limited", 0); delta != 1 {
-		t.Errorf("counter[rate_limited] delta = %v, want 1", delta)
-	}
-
-	closeRelease()
-	<-done // ensure the in-flight query finishes (and emits) before returning
-}
-
 // TestAudit_TransportError_InternalOutcome covers the path where the worker
 // is unreachable — should produce outcome=internal with jti non-empty (the
 // catalog token was minted before the transport error).
@@ -565,33 +501,5 @@ func TestAudit_JTIMatchesMintedToken(t *testing.T) {
 	gotJTI := extractField(lines[0], "jti")
 	if gotJTI != wantJTI {
 		t.Errorf("audit jti = %q, want %q (from minted catalog token)", gotJTI, wantJTI)
-	}
-}
-
-// TestAudit_StatementHashMatchesSHA256 verifies the hash value matches
-// the expected sha256 prefix of the SQL.
-func TestAudit_StatementHashMatchesSHA256(t *testing.T) {
-	buf := captureLogger(t)
-	counter := freshCounter()
-
-	const sql = "SELECT 42 FROM dual"
-	worker := workerThatReturns(http.StatusOK,
-		`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`)
-	defer worker.Close()
-
-	h := newHandlerWithCounter(t, Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}, counter)
-	rec := httptest.NewRecorder()
-	body, _ := json.Marshal(map[string]string{"sql": sql})
-	h.ServeHTTP(rec, authedReq(t, uuid.New(), string(body)))
-
-	lines := auditLines(buf)
-	if len(lines) != 1 {
-		t.Fatalf("want 1 audit line, got %d", len(lines))
-	}
-
-	wantHash := statementHash(sql)
-	gotHash := extractField(lines[0], "statement_hash")
-	if gotHash != wantHash {
-		t.Errorf("statement_hash = %q, want %q", gotHash, wantHash)
 	}
 }

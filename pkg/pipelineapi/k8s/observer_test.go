@@ -61,76 +61,6 @@ func TestReconcileOne_MirrorsStatusAndParsesRV(t *testing.T) {
 	}
 }
 
-func TestReconcileOne_SkipsEmptyPhase(t *testing.T) {
-	runID := uuid.New()
-	pr := &datupletv1.PipelineRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "x", Namespace: "ns",
-			Labels:          map[string]string{"datuplet.io/run-id": runID.String()},
-			ResourceVersion: "1",
-		},
-		// empty phase
-	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
-	mu := &mockUpdater{applied: true}
-	reconcileFor(t, c, mu, "ns", "x")
-	if len(mu.calls) != 0 {
-		t.Errorf("empty-phase should skip; got %d calls", len(mu.calls))
-	}
-}
-
-func TestReconcileOne_SkipsDeletionTimestamp(t *testing.T) {
-	now := metav1.Now()
-	runID := uuid.New()
-	pr := &datupletv1.PipelineRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "x", Namespace: "ns",
-			DeletionTimestamp: &now,
-			// DeletionTimestamp requires at least one finalizer in the
-			// fake client — otherwise the object would be deleted.
-			Finalizers:      []string{"datuplet.io/keep"},
-			Labels:          map[string]string{"datuplet.io/run-id": runID.String()},
-			ResourceVersion: "1",
-		},
-		Status: datupletv1.PipelineRunStatus{Phase: "Running"},
-	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
-	mu := &mockUpdater{applied: true}
-	reconcileFor(t, c, mu, "ns", "x")
-	if len(mu.calls) != 0 {
-		t.Errorf("deletion-timestamp should skip; got %d calls", len(mu.calls))
-	}
-}
-
-func TestReconcileOne_SkipsMissingLabel(t *testing.T) {
-	pr := &datupletv1.PipelineRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "x", Namespace: "ns",
-			ResourceVersion: "1",
-			// no datuplet.io/run-id label
-		},
-		Status: datupletv1.PipelineRunStatus{Phase: "Running"},
-	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
-	mu := &mockUpdater{applied: true}
-	reconcileFor(t, c, mu, "ns", "x")
-	if len(mu.calls) != 0 {
-		t.Errorf("missing label should skip; got %d calls", len(mu.calls))
-	}
-}
-
-func TestReconcileOne_NoObjectNoCall(t *testing.T) {
-	// Object doesn't exist — NotFound path. reconcile returns cleanly
-	// without calling Update; coalesce.Forget is wired separately in
-	// Task 3 via the DeleteFunc handler.
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	mu := &mockUpdater{applied: true}
-	reconcileFor(t, c, mu, "ns", "gone")
-	if len(mu.calls) != 0 {
-		t.Errorf("missing object should not call Update; got %d", len(mu.calls))
-	}
-}
-
 func TestReconcileOne_ReturnsErrorOnUpdateFailureSoWorkqueueRetries(t *testing.T) {
 	// Regression for codex P1: under the informer path there's no
 	// guaranteed next event, so a swallowed Update error would leave
@@ -156,23 +86,57 @@ func TestReconcileOne_ReturnsErrorOnUpdateFailureSoWorkqueueRetries(t *testing.T
 	}
 }
 
-func TestReconcileOne_SkipsNonNumericResourceVersion(t *testing.T) {
-	// Defensive: metadata.resourceVersion is opaque per K8s spec.
-	// On non-decimal values we fail closed rather than writing with
-	// rv=0 (which would disable the SQL guard).
-	runID := uuid.New()
-	pr := &datupletv1.PipelineRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "x", Namespace: "ns",
-			Labels:          map[string]string{"datuplet.io/run-id": runID.String()},
-			ResourceVersion: "not-a-number",
-		},
-		Status: datupletv1.PipelineRunStatus{Phase: "Running"},
+// TestReconcileOne_Skips: objects the observer must never mirror result in no
+// Update call.
+func TestReconcileOne_Skips(t *testing.T) {
+	now := metav1.Now()
+	runLabel := func() map[string]string { return map[string]string{"datuplet.io/run-id": uuid.New().String()} }
+	cases := []struct {
+		name string
+		pr   *datupletv1.PipelineRun // nil = object does not exist
+	}{
+		{"empty_phase", &datupletv1.PipelineRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns", Labels: runLabel(), ResourceVersion: "1"},
+		}},
+		{"deletion_timestamp", &datupletv1.PipelineRun{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "x", Namespace: "ns",
+				DeletionTimestamp: &now,
+				// DeletionTimestamp requires at least one finalizer in the
+				// fake client — otherwise the object would be deleted.
+				Finalizers:      []string{"datuplet.io/keep"},
+				Labels:          runLabel(),
+				ResourceVersion: "1",
+			},
+			Status: datupletv1.PipelineRunStatus{Phase: "Running"},
+		}},
+		{"missing_run_id_label", &datupletv1.PipelineRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns", ResourceVersion: "1"},
+			Status:     datupletv1.PipelineRunStatus{Phase: "Running"},
+		}},
+		// Object doesn't exist — NotFound path. reconcile returns cleanly
+		// without calling Update; coalesce.Forget is wired separately via the
+		// DeleteFunc handler.
+		{"no_object", nil},
+		// metadata.resourceVersion is opaque per K8s spec. On non-decimal
+		// values we fail closed rather than writing with rv=0 (which would
+		// disable the SQL guard).
+		{"non_numeric_resource_version", &datupletv1.PipelineRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns", Labels: runLabel(), ResourceVersion: "not-a-number"},
+			Status:     datupletv1.PipelineRunStatus{Phase: "Running"},
+		}},
 	}
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithObjects(pr).Build()
-	mu := &mockUpdater{applied: true}
-	reconcileFor(t, c, mu, "ns", "x")
-	if len(mu.calls) != 0 {
-		t.Errorf("non-numeric rv should skip; got %d calls", len(mu.calls))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := fake.NewClientBuilder().WithScheme(pkg8s.Scheme())
+			if tc.pr != nil {
+				b = b.WithObjects(tc.pr)
+			}
+			mu := &mockUpdater{applied: true}
+			reconcileFor(t, b.Build(), mu, "ns", "x")
+			if len(mu.calls) != 0 {
+				t.Errorf("should skip; got %d calls", len(mu.calls))
+			}
+		})
 	}
 }

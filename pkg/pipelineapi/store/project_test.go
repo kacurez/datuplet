@@ -46,4 +46,3 @@ func TestGetProjectByID_Missing(t *testing.T) {
 		t.Errorf("expected ErrProjectNotFound, got: %v", err)
 	}
 }
-

@@ -17,130 +17,73 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
 
-// TestJoinNS exercises the multi-segment namespace flattening shape.
-// The handlers expose namespaces as "."-joined strings on the wire so
-// the JS UI doesn't need to understand iceberg-go's slice type.
-func TestJoinNS(t *testing.T) {
+// TestJoinNS_ShortName covers the identifier helpers. The handlers expose
+// namespaces as "."-joined strings on the wire so the JS UI doesn't need to
+// understand iceberg-go's slice type; the last segment is the table name.
+func TestJoinNS_ShortName(t *testing.T) {
 	cases := []struct {
-		name  string
-		ident icebergtable.Identifier
-		want  string
+		name     string
+		ident    icebergtable.Identifier
+		wantNS   string
+		wantName string
 	}{
-		{"single_ns", icebergtable.Identifier{"raw", "orders"}, "raw"},
-		{"multi_ns", icebergtable.Identifier{"raw", "events", "orders"}, "raw.events"},
-		{"empty", icebergtable.Identifier{}, ""},
-		{"name_only", icebergtable.Identifier{"orders"}, ""},
+		{"single_ns", icebergtable.Identifier{"raw", "orders"}, "raw", "orders"},
+		{"multi_ns", icebergtable.Identifier{"raw", "events", "orders"}, "raw.events", "orders"},
+		{"deep_ns", icebergtable.Identifier{"a", "b", "c", "tbl"}, "a.b.c", "tbl"},
+		{"empty", icebergtable.Identifier{}, "", ""},
+		{"name_only", icebergtable.Identifier{"orders"}, "", "orders"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := joinNS(tc.ident); got != tc.want {
-				t.Errorf("joinNS(%v) = %q, want %q", tc.ident, got, tc.want)
+			if got := joinNS(tc.ident); got != tc.wantNS {
+				t.Errorf("joinNS(%v) = %q, want %q", tc.ident, got, tc.wantNS)
+			}
+			if got := shortName(tc.ident); got != tc.wantName {
+				t.Errorf("shortName(%v) = %q, want %q", tc.ident, got, tc.wantName)
 			}
 		})
 	}
 }
 
-// TestShortName: the last segment of the identifier is the table name.
-func TestShortName(t *testing.T) {
-	cases := []struct {
-		name  string
-		ident icebergtable.Identifier
-		want  string
-	}{
-		{"single_ns", icebergtable.Identifier{"raw", "orders"}, "orders"},
-		{"multi_ns", icebergtable.Identifier{"a", "b", "c", "tbl"}, "tbl"},
-		{"empty", icebergtable.Identifier{}, ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := shortName(tc.ident); got != tc.want {
-				t.Errorf("shortName(%v) = %q, want %q", tc.ident, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestNewCatalogProxy_NilService rejects a nil Service so handlers
-// see a clean 500 instead of a nil-deref.
-func TestNewCatalogProxy_NilService(t *testing.T) {
-	_, err := newCatalogProxy(context.Background(), nil, "", "datuplet")
-	if err == nil {
-		t.Fatal("newCatalogProxy(nil): expected error, got nil")
-	}
-}
-
-// TestNewCatalogProxy_EmptyURL: a Service without LakekeeperURL must
-// surface as an error so handlers can fall back to the walker path
-// rather than dialling an empty URL.
-func TestNewCatalogProxy_EmptyURL(t *testing.T) {
-	svc := &Service{
-		LakekeeperURL: "",
-		Minter:        func(ctx context.Context) (tokens.ImpersonationToken, error) { return "tok", nil },
-	}
-	_, err := newCatalogProxy(context.Background(), svc, "", "datuplet")
-	if err == nil {
-		t.Fatal("newCatalogProxy(empty URL): expected error, got nil")
-	}
-}
-
-// TestNewCatalogProxy_NilMinter: Minter is REQUIRED. Both cluster + local
-// modes wire a real minter against pipeline-api's signing key; a nil
-// Minter is a configuration error and the proxy must refuse to construct
-// rather than silently fall back to anonymous calls.
-func TestNewCatalogProxy_NilMinter(t *testing.T) {
+// TestNewCatalogProxy_RejectsBadConfig: a nil Service, an empty LakekeeperURL
+// (so handlers fall back to the walker rather than dialling an empty URL) and
+// a nil Minter (a configuration error; never fall back to anonymous calls)
+// must all fail construction.
+func TestNewCatalogProxy_RejectsBadConfig(t *testing.T) {
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"defaults":{},"overrides":{}}`))
 	}))
 	defer stub.Close()
-	svc := &Service{LakekeeperURL: stub.URL, Minter: nil}
-	if _, err := newCatalogProxy(context.Background(), svc, "", "datuplet"); err == nil {
-		t.Fatal("newCatalogProxy(nil minter): expected error, got nil")
+	minter := func(ctx context.Context) (tokens.ImpersonationToken, error) { return "tok", nil }
+
+	cases := []struct {
+		name string
+		svc  *Service
+	}{
+		{"nil_service", nil},
+		{"empty_url", &Service{LakekeeperURL: "", Minter: minter}},
+		{"nil_minter", &Service{LakekeeperURL: stub.URL, Minter: nil}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := newCatalogProxy(context.Background(), tc.svc, "", "datuplet"); err == nil {
+				t.Fatal("newCatalogProxy: expected error, got nil")
+			}
+		})
 	}
 }
 
-// TestNewCatalogProxy_OK: a fully-wired Service returns a usable proxy.
-// The stub answers iceberg-go's config handshake with a minimal JSON
-// body; the handshake must include the bearer minted by the Minter.
+// TestNewCatalogProxy_OK: a fully-wired Service returns a usable proxy. The
+// stub answers iceberg-go's config handshake with a minimal JSON body; the
+// handshake must include the bearer minted by the Minter and, when projectID
+// is non-empty, the x-project-id header.
 func TestNewCatalogProxy_OK(t *testing.T) {
-	var seenAuth string
+	var seenAuth, seenProjectID string
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if seenAuth == "" {
 			seenAuth = r.Header.Get("Authorization")
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"defaults":{},"overrides":{}}`))
-	}))
-	defer stub.Close()
-
-	svc := &Service{
-		LakekeeperURL: stub.URL,
-		Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
-			return "impersonation-jwt-here", nil
-		},
-	}
-	p, err := newCatalogProxy(context.Background(), svc, "", "datuplet")
-	if err != nil {
-		t.Fatalf("newCatalogProxy: %v", err)
-	}
-	if p == nil || p.cli == nil {
-		t.Fatal("newCatalogProxy: nil proxy or client")
-	}
-	// The handshake should have attached the impersonation JWT.
-	if seenAuth == "" {
-		t.Skip("stub never received a request — iceberg-go didn't attempt the handshake")
-	}
-	want := "impersonation-jwt-here"
-	if got := seenAuth; len(got) < len(want) || got[len(got)-len(want):] != want {
-		t.Errorf("Authorization header = %q, want suffix %q", got, want)
-	}
-}
-
-// TestNewCatalogProxy_ProjectIDHeader: when projectID is non-empty the stub
-// must receive x-project-id on the initial handshake request.
-func TestNewCatalogProxy_ProjectIDHeader(t *testing.T) {
-	var seenProjectID string
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if seenProjectID == "" {
 			seenProjectID = r.Header.Get("x-project-id")
 		}
@@ -153,15 +96,22 @@ func TestNewCatalogProxy_ProjectIDHeader(t *testing.T) {
 	svc := &Service{
 		LakekeeperURL: stub.URL,
 		Minter: func(ctx context.Context) (tokens.ImpersonationToken, error) {
-			return "tok", nil
+			return "impersonation-jwt-here", nil
 		},
 	}
-	_, err := newCatalogProxy(context.Background(), svc, wantPID, "datuplet")
+	p, err := newCatalogProxy(context.Background(), svc, wantPID, "datuplet")
 	if err != nil {
 		t.Fatalf("newCatalogProxy: %v", err)
 	}
-	if seenProjectID == "" {
+	if p == nil || p.cli == nil {
+		t.Fatal("newCatalogProxy: nil proxy or client")
+	}
+	if seenAuth == "" && seenProjectID == "" {
 		t.Skip("stub never received a request — iceberg-go didn't attempt the handshake")
+	}
+	want := "impersonation-jwt-here"
+	if got := seenAuth; len(got) < len(want) || got[len(got)-len(want):] != want {
+		t.Errorf("Authorization header = %q, want suffix %q", got, want)
 	}
 	if seenProjectID != wantPID {
 		t.Errorf("x-project-id = %q, want %q", seenProjectID, wantPID)

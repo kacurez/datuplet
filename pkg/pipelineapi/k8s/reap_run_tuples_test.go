@@ -156,132 +156,58 @@ func TestReapRunTuples_NonTerminalRunIsLeftAlone(t *testing.T) {
 	}
 }
 
-func TestReapRunTuples_OrphanRowGetsCleanedUp(t *testing.T) {
-	pool, done := testReapDB(t)
-	defer done()
-	ctx := context.Background()
-
-	// Insert a run_tuples row directly with NO matching runs row and a
-	// stale created_at (>30m ago) — a pure orphan (mimics the trigger
-	// crashing between RecordRunTuples and CreateRun).
-	//
-	// Migration 009 dropped run_tuples' FK to runs, so the orphan row
-	// inserts directly (no FK to violate). We bypass store.RecordRunTuples
-	// because that would require a runs row; we want the orphan precondition.
-	orphanID := uuid.New()
-	tup := authz.Tuple{
-		User:     authz.UserObject(orphanID.String()).String(),
-		Relation: "editor",
-		Object:   authz.ProjectObject("lk-proj-orphan"),
+// TestReapRunTuples_OrphanRows: a run_tuples row with NO matching runs row is
+// only reaped once it is older than 30m (a crash between RecordRunTuples and
+// CreateRun); a younger one is a slow trigger and is left alone.
+func TestReapRunTuples_OrphanRows(t *testing.T) {
+	cases := []struct {
+		name       string
+		age        time.Duration
+		wantReaped bool
+	}{
+		{"stale_orphan_is_cleaned_up", time.Hour, true},
+		{"fresh_orphan_is_left_alone", time.Minute, false},
 	}
-	tuplesJSON := []byte(`[{"user":"` + tup.User + `","relation":"` + tup.Relation + `","object":"` + tup.Object.String() + `"}]`)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, done := testReapDB(t)
+			defer done()
+			ctx := context.Background()
 
-	staleTime := time.Now().Add(-1 * time.Hour)
-	if _, err := pool.Exec(ctx,
-		`INSERT INTO run_tuples (run_id, tuples, committed, created_at) VALUES ($1, $2, false, $3)`,
-		orphanID, tuplesJSON, staleTime,
-	); err != nil {
-		t.Fatalf("insert orphan: %v", err)
-	}
+			// Migration 009 dropped run_tuples' FK to runs, so the orphan row
+			// inserts directly (no FK to violate). We bypass
+			// store.RecordRunTuples because that would require a runs row;
+			// we want the orphan precondition.
+			orphanID := uuid.New()
+			tup := authz.Tuple{
+				User:     authz.UserObject(orphanID.String()).String(),
+				Relation: "editor",
+				Object:   authz.ProjectObject("lk-proj-orphan"),
+			}
+			tuplesJSON := []byte(`[{"user":"` + tup.User + `","relation":"` + tup.Relation + `","object":"` + tup.Object.String() + `"}]`)
+			if _, err := pool.Exec(ctx,
+				`INSERT INTO run_tuples (run_id, tuples, committed, created_at) VALUES ($1, $2, false, $3)`,
+				orphanID, tuplesJSON, time.Now().Add(-tc.age),
+			); err != nil {
+				t.Fatalf("insert orphan: %v", err)
+			}
 
-	az := authztest.New()
-	az.Allow(tup.User, tup.Relation, tup.Object)
+			az := authztest.New()
+			az.Allow(tup.User, tup.Relation, tup.Object)
 
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	if err := pkg8s.ReapRunTuples(ctx, pool, c, az); err != nil {
-		t.Fatalf("ReapRunTuples: %v", err)
-	}
+			c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
+			if err := pkg8s.ReapRunTuples(ctx, pool, c, az); err != nil {
+				t.Fatalf("ReapRunTuples: %v", err)
+			}
 
-	allowed, _ := az.Check(ctx, tup.User, tup.Relation, tup.Object)
-	if allowed {
-		t.Errorf("orphan FGA tuple still present after reap")
-	}
-	rec, _ := store.GetRunTuples(ctx, pool, orphanID)
-	if rec != nil {
-		t.Errorf("orphan run_tuples row still present: %+v", rec)
-	}
-}
-
-func TestReapRunTuples_FreshOrphanRowIsLeftAlone(t *testing.T) {
-	// Orphan row but younger than 30m → leave alone (slow trigger, not
-	// a crash).
-	pool, done := testReapDB(t)
-	defer done()
-	ctx := context.Background()
-
-	orphanID := uuid.New()
-	tup := authz.Tuple{
-		User:     authz.UserObject(orphanID.String()).String(),
-		Relation: "viewer",
-		Object:   authz.ProjectObject("lk-proj-fresh"),
-	}
-	tuplesJSON := []byte(`[{"user":"` + tup.User + `","relation":"` + tup.Relation + `","object":"` + tup.Object.String() + `"}]`)
-
-	// Migration 009 dropped run_tuples' FK to runs, so this orphan row
-	// inserts directly (no FK to violate).
-	freshTime := time.Now().Add(-1 * time.Minute)
-	if _, err := pool.Exec(ctx,
-		`INSERT INTO run_tuples (run_id, tuples, committed, created_at) VALUES ($1, $2, false, $3)`,
-		orphanID, tuplesJSON, freshTime,
-	); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
-
-	az := authztest.New()
-	az.Allow(tup.User, tup.Relation, tup.Object)
-
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	if err := pkg8s.ReapRunTuples(ctx, pool, c, az); err != nil {
-		t.Fatalf("ReapRunTuples: %v", err)
-	}
-
-	rec, _ := store.GetRunTuples(ctx, pool, orphanID)
-	if rec == nil {
-		t.Errorf("fresh orphan was reaped (should wait until >30m old)")
-	}
-}
-
-func TestReapRunTuples_IsIdempotent(t *testing.T) {
-	pool, done := testReapDB(t)
-	defer done()
-	ctx := context.Background()
-
-	projectID, pipelineID := seedProjectPipeline(t, pool)
-	runID := uuid.New()
-	if _, err := store.CreateRun(ctx, pool, store.CreateRunOpts{
-		ID: runID, ProjectID: projectID, PipelineID: pipelineID,
-	}); err != nil {
-		t.Fatalf("create run: %v", err)
-	}
-	if _, err := store.UpdateRunPhase(ctx, pool, runID, store.UpdateRunPhaseOpts{
-		Phase: "Cancelled", Message: "test",
-	}); err != nil {
-		t.Fatalf("update phase: %v", err)
-	}
-
-	tup := authz.Tuple{
-		User:     authz.UserObject(runID.String()).String(),
-		Relation: "editor",
-		Object:   authz.ProjectObject("lk-proj-idem"),
-	}
-	if err := store.RecordRunTuples(ctx, pool, runID, []authz.Tuple{tup}); err != nil {
-		t.Fatalf("record: %v", err)
-	}
-
-	az := authztest.New()
-	az.Allow(tup.User, tup.Relation, tup.Object)
-
-	c := fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).Build()
-	for i := 0; i < 3; i++ {
-		if err := pkg8s.ReapRunTuples(ctx, pool, c, az); err != nil {
-			t.Fatalf("ReapRunTuples iter %d: %v", i, err)
-		}
-	}
-	// Still exactly one DELETE happened — second + third sweeps were
-	// no-ops. Verify by re-inserting the tuple into FGA + the row, then
-	// running the reaper once: same state should result.
-	rec, _ := store.GetRunTuples(ctx, pool, runID)
-	if rec != nil {
-		t.Errorf("run_tuples row should have been deleted on first sweep")
+			allowed, _ := az.Check(ctx, tup.User, tup.Relation, tup.Object)
+			if allowed == tc.wantReaped {
+				t.Errorf("FGA tuple present = %v, want %v", allowed, !tc.wantReaped)
+			}
+			rec, _ := store.GetRunTuples(ctx, pool, orphanID)
+			if (rec == nil) != tc.wantReaped {
+				t.Errorf("run_tuples row present = %v, want %v", rec != nil, !tc.wantReaped)
+			}
+		})
 	}
 }

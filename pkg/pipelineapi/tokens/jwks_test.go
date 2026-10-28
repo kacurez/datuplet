@@ -11,7 +11,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
 
-func TestJWKSFromPublicKey_Shape(t *testing.T) {
+func TestJWKSFromPublicKey(t *testing.T) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
@@ -36,15 +36,7 @@ func TestJWKSFromPublicKey_Shape(t *testing.T) {
 	if k.N == "" || k.E == "" {
 		t.Errorf("N/E must be populated; got N=%q E=%q", k.N, k.E)
 	}
-}
 
-func TestJWKSFromPublicKey_Roundtrip(t *testing.T) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("gen: %v", err)
-	}
-
-	jwks := tokens.JWKSFromPublicKey(&priv.PublicKey, "kid-b")
 	// Marshal → unmarshal to check the JSON shape is stable.
 	buf, err := json.Marshal(jwks)
 	if err != nil {
@@ -54,7 +46,7 @@ func TestJWKSFromPublicKey_Roundtrip(t *testing.T) {
 	if err := json.Unmarshal(buf, &out); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(out.Keys) != 1 || out.Keys[0].Kid != "kid-b" {
+	if len(out.Keys) != 1 || out.Keys[0].Kid != "kid-a" {
 		t.Errorf("roundtrip failed: %+v", out)
 	}
 
@@ -63,8 +55,7 @@ func TestJWKSFromPublicKey_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode n: %v", err)
 	}
-	gotN := new(big.Int).SetBytes(nBytes)
-	if gotN.Cmp(priv.PublicKey.N) != 0 {
+	if gotN := new(big.Int).SetBytes(nBytes); gotN.Cmp(priv.PublicKey.N) != 0 {
 		t.Error("decoded modulus does not match original")
 	}
 
@@ -73,22 +64,24 @@ func TestJWKSFromPublicKey_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode e: %v", err)
 	}
-	gotE := new(big.Int).SetBytes(eBytes).Int64()
-	if int(gotE) != priv.PublicKey.E {
+	if gotE := new(big.Int).SetBytes(eBytes).Int64(); int(gotE) != priv.PublicKey.E {
 		t.Errorf("E mismatch: got %d, want %d", gotE, priv.PublicKey.E)
 	}
 }
 
-func TestJWKSFromPublicKey_NilKey(t *testing.T) {
-	got := tokens.JWKSFromPublicKey(nil, "kid")
-	if len(got.Keys) != 0 {
-		t.Errorf("nil pub: got %+v, want empty", got)
+func TestJWKSFromPublicKey_EmptyForInvalidKey(t *testing.T) {
+	cases := []struct {
+		name string
+		pub  *rsa.PublicKey
+	}{
+		{"nil_key", nil},
+		{"nil_n", &rsa.PublicKey{}},
 	}
-}
-
-func TestJWKSFromPublicKey_NilN(t *testing.T) {
-	got := tokens.JWKSFromPublicKey(&rsa.PublicKey{}, "kid")
-	if len(got.Keys) != 0 {
-		t.Errorf("nil N: got %+v, want empty", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tokens.JWKSFromPublicKey(tc.pub, "kid"); len(got.Keys) != 0 {
+				t.Errorf("got %+v, want empty", got)
+			}
+		})
 	}
 }

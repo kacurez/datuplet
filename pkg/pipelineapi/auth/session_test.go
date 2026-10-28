@@ -65,34 +65,6 @@ func TestCreateAndLookupSession(t *testing.T) {
 	}
 }
 
-func TestLookupSession_Expired(t *testing.T) {
-	pool, userID, cleanup := sessionTestDB(t)
-	defer cleanup()
-
-	var sid uuid.UUID
-	err := pool.QueryRow(context.Background(),
-		`INSERT INTO sessions(user_id, expires_at) VALUES ($1, now() - interval '1 minute') RETURNING id`,
-		userID,
-	).Scan(&sid)
-	if err != nil {
-		t.Fatalf("insert: %v", err)
-	}
-
-	if _, err := auth.LookupSession(context.Background(), pool, sid); err == nil {
-		t.Error("expected LookupSession to reject an expired session")
-	}
-}
-
-func TestLookupSession_Missing(t *testing.T) {
-	pool, _, cleanup := sessionTestDB(t)
-	defer cleanup()
-
-	_, err := auth.LookupSession(context.Background(), pool, uuid.New())
-	if err == nil {
-		t.Error("expected LookupSession to reject a nonexistent session")
-	}
-}
-
 func TestDeleteSession(t *testing.T) {
 	pool, userID, cleanup := sessionTestDB(t)
 	defer cleanup()
@@ -135,5 +107,34 @@ func TestTouchSession_ExtendsExpiry(t *testing.T) {
 	}
 	if !expiresAt.After(time.Now().Add(23 * time.Hour)) {
 		t.Errorf("expiry not extended; got %v", expiresAt)
+	}
+}
+
+func TestLookupSession_Rejects(t *testing.T) {
+	cases := []struct {
+		name string
+		sid  func(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) uuid.UUID
+	}{
+		{"expired", func(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) uuid.UUID {
+			var sid uuid.UUID
+			err := pool.QueryRow(context.Background(),
+				`INSERT INTO sessions(user_id, expires_at) VALUES ($1, now() - interval '1 minute') RETURNING id`,
+				userID,
+			).Scan(&sid)
+			if err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			return sid
+		}},
+		{"missing", func(*testing.T, *pgxpool.Pool, uuid.UUID) uuid.UUID { return uuid.New() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, userID, cleanup := sessionTestDB(t)
+			defer cleanup()
+			if _, err := auth.LookupSession(context.Background(), pool, tc.sid(t, pool, userID)); err == nil {
+				t.Error("expected LookupSession to reject the session")
+			}
+		})
 	}
 }
