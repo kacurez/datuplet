@@ -2,7 +2,6 @@ package datagateway
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,8 +83,9 @@ func writeStreamingFixtureParquet(t *testing.T, path string, values []int64, row
 }
 
 // OpenReader with FORMAT_ARROW_IPC routes to the streaming reader; ReadChunk
-// returns without a stream error once the reader is exhausted (io.EOF
-// terminates the stream) and every chunk is Arrow IPC with the full row count.
+// returns nil once the reader is exhausted (ReadChunk maps io.EOF to nil, so
+// any error, io.EOF included, is a failure) and every chunk is Arrow IPC with
+// the full row count.
 func TestOpenReader_FormatArrowIPC_RoutesToStreaming(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -115,8 +115,8 @@ func TestOpenReader_FormatArrowIPC_RoutesToStreaming(t *testing.T) {
 
 			stream := &mockReadChunkStream{ctx: context.Background()}
 			err = srv.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream)
-			if err != nil && err != io.EOF {
-				t.Fatalf("ReadChunk unexpected error: %v", err)
+			if err != nil {
+				t.Fatalf("ReadChunk: %v", err)
 			}
 
 			if len(stream.chunks) == 0 {

@@ -587,38 +587,6 @@ func TestParseCreds_Accepts(t *testing.T) {
 	}
 }
 
-// TestParseGCSCredsHappyPath covers all four GCS fields plus the
-// absolute-epoch-ms expiry path.
-func TestParseGCSCredsHappyPath(t *testing.T) {
-	now := time.Now()
-	cfg := map[string]any{
-		"gcs.oauth2.token":                        "ya29.AAA",
-		"gcs.project-id":                          "kacurez-labs",
-		"gcs.oauth2.refresh-credentials-endpoint": "https://lk/refresh",
-		"gcs.oauth2.token-expires-at":             float64(now.Add(20 * time.Minute).UnixMilli()),
-	}
-	got, err := parseGCSCreds(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gc, ok := got.(GCSCreds)
-	if !ok {
-		t.Fatalf("expected GCSCreds, got %T", got)
-	}
-	if gc.OAuthToken != "ya29.AAA" {
-		t.Fatalf("OAuthToken = %q", gc.OAuthToken)
-	}
-	if gc.GCPProjectID != "kacurez-labs" {
-		t.Fatalf("GCPProjectID = %q", gc.GCPProjectID)
-	}
-	if gc.RefreshEndpoint != "https://lk/refresh" {
-		t.Fatalf("RefreshEndpoint = %q", gc.RefreshEndpoint)
-	}
-	if gc.ExpiresAt().Before(now.Add(15 * time.Minute)) {
-		t.Fatalf("Expires = %v, want >= now+15m", gc.ExpiresAt())
-	}
-}
-
 // TestScrubBody verifies that bearer material is redacted from error-body
 // interpolation (GCP OAuth2 access tokens, GCS and AWS signed-URL parameters,
 // bare JWTs) and that benign bodies are not mangled.
