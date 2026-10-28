@@ -55,10 +55,9 @@ build-components: build-gateway ## Build all component Docker images
 	docker build -t datuplet/sql-transform:latest -f components/sql-transform/Dockerfile .
 	docker build -t datuplet/stdout-writer:latest -f components/stdout-writer/Dockerfile .
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
-	docker build -t datuplet/finnhub-extractor:latest -f components/finnhub-extractor/Dockerfile .
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
-# E2E-only component subset: skips finnhub-extractor (no scenario references it).
+# E2E-only component subset: builds only the components scenarios reference.
 # Keeps gateway as a build dep (sidecar is required for every run). RFC 010
 # scenarios (duckdb-etl, multi-table-join) need datuplet/sql-transform too.
 # RFC 022 Task 2.7: query-worker is needed for the query e2e scenarios.
@@ -107,7 +106,7 @@ K8S_NS ?= datuplet
 # (RFC 024 W3) overrides it to a port-forwarded address in the verify cluster.
 SMOKE_URL ?= http://localhost:30081
 build-components-local: build-components ## Build + tag built-in component images as datuplet/<name>:$(COMPONENT_TAG) for deploy-local
-	for c in data-generator sql-transform stdout-writer http-json-extractor finnhub-extractor; do \
+	for c in data-generator sql-transform stdout-writer http-json-extractor; do \
 	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
 	done
 

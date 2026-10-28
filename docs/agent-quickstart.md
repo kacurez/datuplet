@@ -67,7 +67,6 @@ datuplet components list
 NAME                     DISPLAY                  DEFAULT      IO                 DEPRECATED
 data-generator           Data Generator           v0.12.1       none/required      false
 sql-transform            SQL Transform            v0.12.1       required/required  false
-finnhub-extractor        Finnhub Extractor        v0.12.1       none/required      false
 http-json-extractor      HTTP JSON Extractor      v0.12.1       none/required      false
 stdout-writer            Stdout Writer            v0.12.1       required/none      false
 ```

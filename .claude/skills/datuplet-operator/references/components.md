@@ -24,13 +24,12 @@ component can sit in a pipeline:
 | `http-json-extractor` | none / required | Fetch JSON from an HTTP endpoint into a table; single-request or paginated. **The workhorse for ingesting an external API.** | `url` (required); `table_name`; pagination options |
 | `data-generator` | none / required | Generate random or literal rows inline from the pipeline itself — no external source. **Use for testing/bootstrapping a pipeline.** | `tables` (required): the tables + rows/columns to synthesize |
 | `sql-transform` | required / required | Run user SQL in an embedded DuckDB engine over the input tables and write result tables. Credentials-clean. **The workhorse for transform/aggregate/join.** | `sql` (required): `CREATE TABLE <out> AS SELECT …` |
-| `finnhub-extractor` | none / required | Fetch market data (quotes, news, financials, earnings, …) from the Finnhub API. | `mode` (required); `apiKey` (secret → `$[finnhub_key]`); `symbols`, `category`, `lookback_days`, `limit` |
 | `stdout-writer` | required / none | Read input tables and print to stdout. **Debugging only — no storage output.** | (minimal) |
 
 ## Choosing components for a goal
 
-- **"Get data from an API/source into Datuplet"** → `http-json-extractor` (or
-  `finnhub-extractor` for market data) in the first stage, writing to a `raw`
+- **"Get data from an API/source into Datuplet"** → `http-json-extractor` in the first
+  stage, writing to a `raw`
   bucket.
 - **"Aggregate / summarize / reshape"** → `sql-transform` in a later stage,
   reading the raw table(s), writing a summary table. Express the logic as

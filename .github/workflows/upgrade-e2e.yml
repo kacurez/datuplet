@@ -136,7 +136,6 @@ jobs:
             datuplet/query-worker:latest datuplet/app-worker:latest \
             "datuplet/data-generator:$CTAG" "datuplet/sql-transform:$CTAG" \
             "datuplet/stdout-writer:$CTAG" "datuplet/http-json-extractor:$CTAG" \
-            "datuplet/finnhub-extractor:$CTAG" \
           ; do kind load docker-image --name datuplet-e2e "$img"; done
           docker image prune --all --force || true
 

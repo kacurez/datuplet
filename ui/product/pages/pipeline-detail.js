@@ -544,7 +544,7 @@ export function renderEditor() {
 // ---- Inputs (RFC 027 U4) ---------------------------------------------------
 //
 // Rendered only when the component can consume tables at all (io.inputs !==
-// 'none' — data-generator / http-json-extractor / finnhub-extractor all
+// 'none' — data-generator / http-json-extractor both
 // declare 'none' and get no Inputs section, spec §6). Current inputs show as
 // chips; "+ Add input table…" opens a modal picker over two groups — tables
 // produced by earlier stages, and tables already in project storage.

@@ -188,8 +188,7 @@ that `author_name`/`author_email` are populated.
 ## Adapting these
 
 - **Different source:** change the extractor `config` (its schema via
-  `components get`); for market data use `finnhub-extractor` (its api token is a
-  secret → `$[finnhub_token]`).
+  `components get`).
 - **Incremental vs full:** `writeMode: APPEND` accumulates across runs;
   `FULL_LOAD` rebuilds. Match the business need.
 - **More transforms:** add stages; each new stage's `inputs` can read any table

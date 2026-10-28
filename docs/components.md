@@ -122,8 +122,8 @@ type ComponentIO struct {
 - `io` lives at the **definition** level, not per version — it declares what
   kind of component this is (extractor / transform / writer), which is
   identity, not per-version behavior.
-- Built-in IO declarations: data-generator / http-json-extractor /
-  finnhub-extractor are `{none, required}`; sql-transform
+- Built-in IO declarations: data-generator / http-json-extractor
+  are `{none, required}`; sql-transform
   is `{required, required}`; stdout-writer is `{required, none}`.
 
 ## What schema validation cannot catch
@@ -331,36 +331,6 @@ make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json \
 
 Real measured example: 200,000 rows streamed in 25 batches at roughly 94 MB
 peak RSS.
-
----
-
-## finnhub-extractor
-
-Fetches market data from the [Finnhub](https://finnhub.io/) API. Requires a
-Finnhub API key.
-
-**Image:** `ghcr.io/kacurez/finnhub-extractor:v0.12.1` · **Registry name:**
-`finnhub-extractor` · **IO:** `{inputs: none, outputs: required}`
-
-**Config schema:** [`components/finnhub-extractor/schema.json`](../components/finnhub-extractor/schema.json).
-`mode` selects the extraction (`quote`, `news`, `company-news`,
-`basic-financials`, `earnings`, `recommendations`, `insider-transactions`);
-each mode writes to a fixed, component-internal output table name (documented
-in the schema's `x-datuplet-doc` on `mode` — these names are not resolvable
-via `x-datuplet-produces`, so reference them directly when wiring a
-downstream stage's input).
-
-Set the key in the project's managed secrets (UI: Settings → Secrets, or the
-API):
-
-```bash
-curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"value":"<your-api-key>"}' \
-  https://<host>/api/v1/projects/$PROJECT_ID/secrets/finnhub_key
-```
-
-See [docs/secrets.md](secrets.md) for the full secret resolution flow.
 
 ---
 
