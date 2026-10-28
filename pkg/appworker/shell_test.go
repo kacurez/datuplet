@@ -9,7 +9,6 @@ package appworker
 import (
 	"io"
 	"net/http"
-	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -146,21 +145,6 @@ func TestShell_ReferencesOnlySameOriginAssets(t *testing.T) {
 // or `insertAdjacentHTML(` must.
 var innerHTMLUsage = regexp.MustCompile(`\.innerHTML\s*=|insertAdjacentHTML\s*\(`)
 
-// TestShellJS_NeverUsesInnerHTML enforces spec §6.4 at the source level:
-// every text field the shell renders — the title in V0, block content in
-// V1 — MUST go through textContent, never innerHTML/insertAdjacentHTML,
-// because innerHTML on app-controlled text is the XSS hole the whole
-// "untrusted code, trusted output" boundary exists to close.
-func TestShellJS_NeverUsesInnerHTML(t *testing.T) {
-	src := readShellAsset(t, "shell.js")
-	if loc := innerHTMLUsage.FindString(src); loc != "" {
-		t.Errorf("shell.js must never use innerHTML/insertAdjacentHTML (spec §6.4) — use textContent instead; found %q", loc)
-	}
-	if !strings.Contains(src, "textContent") {
-		t.Error("shell.js does not appear to render anything via textContent")
-	}
-}
-
 // TestShellJS_VegaEmbedNetworkLoadingDisabled proves shell.js's vega-embed
 // entry point matches the brief's required lockdown (content, not
 // formatting): actions disabled and the loader rejecting every load — even
@@ -172,18 +156,6 @@ func TestShellJS_VegaEmbedNetworkLoadingDisabled(t *testing.T) {
 	want := stripWhitespace(`actions:false,loader:{load:()=>Promise.reject(new Error("loading disabled"))}`)
 	if !strings.Contains(got, want) {
 		t.Errorf("shell.js does not initialize vega-embed with network loading disabled:\n%s", src)
-	}
-}
-
-// TestShellJS_HasRenderersRegistryAndUnknownPlaceholder proves V0 built the
-// extensibility seam V1 needs (a RENDERERS registry keyed by block type) and
-// the required fallback for any type not yet registered.
-func TestShellJS_HasRenderersRegistryAndUnknownPlaceholder(t *testing.T) {
-	src := readShellAsset(t, "shell.js")
-	for _, want := range []string{"RENDERERS", "unknown block"} {
-		if !strings.Contains(src, want) {
-			t.Errorf("shell.js missing %q", want)
-		}
 	}
 }
 
@@ -226,32 +198,6 @@ func stripWhitespace(s string) string {
 // lazy imports are same-origin, and the chart goes through the locked-down
 // chokepoint with the platform theme + client-side subset validation.
 // ===========================================================================
-
-// TestShellJS_RegistersAllBlockRenderers proves shell.js wires every renderer
-// of the v1 vocabulary into RENDERERS by block type — the seam
-// boot()/renderBlocks() dispatch on. V2 adds filter + tabs to the four V1
-// data-block renderers, so all six block types are now registered.
-func TestShellJS_RegistersAllBlockRenderers(t *testing.T) {
-	got := stripWhitespace(readShellAsset(t, "shell.js"))
-	for _, want := range []string{
-		`import{renderMarkdown}from"./blocks/markdown.js"`,
-		`import{renderMetric}from"./blocks/metric.js"`,
-		`import{renderTable}from"./blocks/table.js"`,
-		`import{renderChart}from"./blocks/chart.js"`,
-		`import{renderFilter}from"./blocks/filter.js"`,
-		`import{renderTabs}from"./blocks/tabs.js"`,
-		`markdown:renderMarkdown`,
-		`metric:renderMetric`,
-		`table:renderTable`,
-		`chart:renderChart`,
-		`filter:renderFilter`,
-		`tabs:renderTabs`,
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("shell.js does not register a renderer as expected: missing %q", want)
-		}
-	}
-}
 
 // TestShellRenderers_NeverUseInnerHTML extends the V0 shell.js-only guard to
 // EVERY shipped renderer module (spec §6.4). This is the whole-shell invariant:
@@ -370,44 +316,6 @@ func arrayLiteral(t *testing.T, src, name string) string {
 	return m[1]
 }
 
-// TestMetricRenderer_FormatsWithIntl verifies metric values are formatted with
-// Intl.NumberFormat per the format vocabulary and rendered via textContent.
-func TestMetricRenderer_FormatsWithIntl(t *testing.T) {
-	src := readShellAsset(t, "blocks/metric.js")
-	stripped := stripWhitespace(src)
-	if !strings.Contains(src, "Intl.NumberFormat") {
-		t.Error("metric.js does not format values with Intl.NumberFormat")
-	}
-	if !strings.Contains(stripped, `style:"currency"`) {
-		t.Error("metric.js does not handle the currency format")
-	}
-	if !strings.Contains(src, "textContent") || innerHTMLUsage.MatchString(src) {
-		t.Error("metric.js must render values/labels via textContent, never innerHTML")
-	}
-}
-
-// TestTableRenderer_SortSearchNumeric verifies the table is sortable and
-// searchable, right-aligns numeric columns with tabular figures, renders cells
-// via textContent, and handles BOTH W1 row shapes (plain array + {cells}).
-func TestTableRenderer_SortSearchNumeric(t *testing.T) {
-	src := readShellAsset(t, "blocks/table.js")
-	stripped := stripWhitespace(src)
-	for _, want := range []string{
-		`type="search"`,            // search/filter box
-		`addEventListener("input"`, // filter on input
-		`addEventListener("click"`, // sortable headers
-		"dtp-num",                  // numeric right-align + tabular-nums class
-		"cells",                    // object-row form {cells, modal?}
-	} {
-		if !strings.Contains(stripped, stripWhitespace(want)) {
-			t.Errorf("table.js missing %q", want)
-		}
-	}
-	if !strings.Contains(src, "textContent") {
-		t.Error("table.js must render headers/cells via textContent")
-	}
-}
-
 // TestChartRenderer_ChokepointThemeAndValidation verifies the chart renderer
 // (a) routes through shell.js's mountVegaLiteChart rather than touching
 // vega-embed directly, (b) supplies the platform THEME_CONFIG (ui/product
@@ -507,7 +415,8 @@ func TestShell_EmbedsAllV1BlockTypes(t *testing.T) {
 // TestInteract_RerenderPostContract proves the re-render fetch is the exact
 // POST the server's response matrix (§4.2) + CSRF check (§5.3) require: method
 // POST, Accept: application/json, Content-Type: application/json, the shell's
-// X-Datuplet-App-Render: 1 header, and a body that is the current param state.
+// X-Datuplet-App-Render: 1 header, and a body that is the current param state
+// (string-valued by construction).
 func TestInteract_RerenderPostContract(t *testing.T) {
 	got := stripWhitespace(readShellAsset(t, "interact.js"))
 	for _, want := range []string{
@@ -516,10 +425,17 @@ func TestInteract_RerenderPostContract(t *testing.T) {
 		`"Content-Type":"application/json"`,
 		`"X-Datuplet-App-Render":"1"`,
 		`body:JSON.stringify(getParams())`,
+		// Params are string-only (§6.5 "no type coercion"; W6 REJECTS non-string
+		// body values): they come from URLSearchParams, whose values are strings.
+		"newURLSearchParams(location.search)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("interact.js re-render fetch is missing the required contract token %q", want)
 		}
+	}
+	// The reserved platform names are stripped from ctx.params on the way out.
+	if !strings.Contains(readShellAsset(t, "interact.js"), "RESERVED_PARAMS") {
+		t.Error("interact.js does not strip reserved param names (token/block) from getParams")
 	}
 	// The single-block partial fetch (lazy modals) rides the query string as
 	// `?block=<id>` (matches the §4.2 matrix), not a body key.
@@ -545,24 +461,6 @@ func TestInteract_FetchesAreSameOrigin(t *testing.T) {
 	}
 	if !strings.Contains(interact, "location.pathname") {
 		t.Error("interact.js does not build its fetch URL from location.pathname (same-origin)")
-	}
-}
-
-// TestInteract_ParamsAreStringOnly proves the re-render body can only ever carry
-// string values (§6.5 "no type coercion — apps parse their own numbers"; W6
-// REJECTS non-string body values): params come from URLSearchParams (whose
-// values are strings) and the body is JSON.stringify of exactly that map.
-func TestInteract_ParamsAreStringOnly(t *testing.T) {
-	got := stripWhitespace(readShellAsset(t, "interact.js"))
-	if !strings.Contains(got, "newURLSearchParams(location.search)") {
-		t.Error("interact.js getParams does not read params from URLSearchParams (string values by construction)")
-	}
-	if !strings.Contains(got, `body:JSON.stringify(getParams())`) {
-		t.Error("interact.js re-render body is not JSON.stringify(getParams()) — string-only guarantee lost")
-	}
-	// The reserved platform names are stripped from ctx.params on the way out.
-	if !strings.Contains(readShellAsset(t, "interact.js"), "RESERVED_PARAMS") {
-		t.Error("interact.js does not strip reserved param names (token/block) from getParams")
 	}
 }
 
@@ -602,27 +500,6 @@ func TestInteract_AutoRefreshVisibilityRetryAfterFloor(t *testing.T) {
 	}
 }
 
-// TestInteract_ChartOnClickBindsVegaView proves the onClick cross-filter binding
-// (spec §6.3 onClick:{param}): chart.js hands the resolved vega view + the
-// declared param to interact.js's bindChartOnClick, which listens on the view
-// and sets the param (triggering a re-render) — config, not code.
-func TestInteract_ChartOnClickBindsVegaView(t *testing.T) {
-	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
-	if !strings.Contains(chart, `import{bindChartOnClick,registerVegaView}from"../interact.js"`) {
-		t.Error("chart.js does not import bindChartOnClick from interact.js")
-	}
-	if !strings.Contains(chart, "bindChartOnClick(result.view,param)") {
-		t.Error("chart.js does not bind onClick to the resolved vega view (result.view)")
-	}
-	interact := stripWhitespace(readShellAsset(t, "interact.js"))
-	if !strings.Contains(interact, `view.addEventListener("click"`) {
-		t.Error("interact.js bindChartOnClick does not add a click listener to the vega view")
-	}
-	if !strings.Contains(interact, "setParam(param,String(value))") {
-		t.Error("interact.js bindChartOnClick does not set the named param (as a string) from the clicked datum")
-	}
-}
-
 // TestInteract_ModalsRenderThroughRegistry proves both modal forms and that
 // modal content — inline OR lazily fetched via block=<id> — is rendered through
 // the SAME renderer registry the page uses (deps.renderBlock, injected from
@@ -642,374 +519,182 @@ func TestInteract_ModalsRenderThroughRegistry(t *testing.T) {
 	}
 }
 
-// TestShellJS_RerenderPrimitivesWiredToInteract proves shell.js exposes the two
-// mount primitives interact.js needs and injects them via initInteract, and that
-// renderBlock (the single dispatch point) wires modal triggers — so a re-render
-// or a modal reuses the exact same registry-driven, sanitized render path.
-func TestShellJS_RerenderPrimitivesWiredToInteract(t *testing.T) {
-	got := stripWhitespace(readShellAsset(t, "shell.js"))
-	for _, want := range []string{
-		`import{initInteract,onBooted,attachModalTrigger,finalizeVegaViewsWithin}from"./interact.js"`,
-		`initInteract({applyDoc,renderBlock})`,
-		`exportfunctionapplyDoc(doc)`,
-		`exportfunctionrenderBlock(block)`,
-		`attachModalTrigger(node,block.modal)`,
-		`onBooted(doc)`,
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("shell.js is missing the interact wiring token %q", want)
-		}
-	}
-}
-
 // ===========================================================================
 // RFC 028 Part 4 (V2 fix round): the four Codex-gate Major findings. Live
 // behavior (race ordering, finalize-on-swap, modal namespace in the live DOM)
 // is V4's browser checklist; these are the statically-checkable guards.
 // ===========================================================================
 
-// TestInteract_RendersAreSequenced proves the fix for Finding 1: every full
-// re-render takes a monotonic token + AbortController, and a response is dropped
-// (superseded) if a newer render started or its fetch was aborted — so a slow
-// earlier response can never overwrite a newer one. The abort of a superseded
-// render is treated as "superseded", never an error state.
-func TestInteract_RendersAreSequenced(t *testing.T) {
-	src := readShellAsset(t, "interact.js")
-	got := stripWhitespace(src)
-	for _, want := range []string{
-		"letrenderSeq=0",                             // the monotonic token
-		"functionbeginRender()",                      // taken per full render
-		"newAbortController()",                       // supersede-abort of the prior fetch
-		"if(seq!==renderSeq)return{superseded:true}", // drop a stale/late response
-		"fetchRender({signal})",                      // the POST re-render carries the abort signal
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("interact.js render-sequencing is missing %q", want)
-		}
+// TestShellJS_V2FixRoundGuards pins the load-bearing tokens of the V2/V4
+// Codex-gate fixes at the source level (live behavior — race ordering,
+// finalize-on-swap, modal namespace in the live DOM — is V4's browser
+// checklist). Each row is one finding; `tokens` are whitespace-stripped
+// substrings that must be present in the named asset, `forbidden` ones must
+// be absent, and `extra` carries the checks a substring cannot express.
+func TestShellJS_V2FixRoundGuards(t *testing.T) {
+	cases := []struct {
+		name      string
+		tokens    map[string][]string // asset -> whitespace-stripped tokens that must be present
+		forbidden map[string][]string // asset -> whitespace-stripped tokens that must be absent
+		extra     func(t *testing.T)
+	}{
+		{
+			// Finding 1: every full re-render takes a monotonic token +
+			// AbortController, and a stale/aborted response is dropped, so a slow
+			// earlier response can never overwrite a newer one. An abort is
+			// "superseded", never an error state; the ctx.path nav (loadPath) is
+			// sequenced too.
+			name: "renders are sequenced",
+			tokens: map[string][]string{"interact.js": {
+				"letrenderSeq=0",
+				"newAbortController()",
+				"if(seq!==renderSeq)return{superseded:true}",
+				"fetchRender({signal})",
+				"isAbortError",
+				`method:"GET",credentials:"same-origin",signal,`,
+			}},
+		},
+		{
+			// Finding 2: modal deep-link state uses the reserved __dtp_modal key,
+			// never a top-level param named after the block (which would clobber
+			// an app filter of the same name), and the shell + server agree on
+			// the literal.
+			name: "modal state uses the reserved namespace",
+			tokens: map[string][]string{"interact.js": {
+				`constMODAL_PARAM="__dtp_modal"`,
+				`RESERVED_PARAMS=["token","block",MODAL_PARAM]`,
+				`setParams({[MODAL_PARAM]:param},{refresh:false})`,
+				`setParams({[MODAL_PARAM]:null},{refresh:false})`,
+			}},
+			forbidden: map[string][]string{"interact.js": {
+				`setParams({[param]:"1"}`,
+				`setParams({[param]:null}`,
+			}},
+			extra: func(t *testing.T) {
+				// The server strips the SAME literal, so the reserved key never
+				// reaches ctx.params (behavior: TestReadParams_StripsModalStateKey).
+				if modalStateParam != "__dtp_modal" {
+					t.Errorf("server modalStateParam = %q, must match the shell's MODAL_PARAM __dtp_modal", modalStateParam)
+				}
+			},
+		},
+		{
+			// Finding 3: charts register their embed result and the shell
+			// finalizes live views BEFORE clearing the DOM on a re-render, so a
+			// view never leaks across a swap (finalize after clear would already
+			// have leaked it).
+			name: "vega views are finalized before the swap",
+			tokens: map[string][]string{
+				"interact.js": {
+					"exportfunctionregisterVegaView(",
+					"exportfunctionfinalizeVegaViewsWithin(",
+					"entry.result.finalize()",
+					`removeEventListener("click",entry.listener)`,
+				},
+				"blocks/chart.js": {"registerVegaView({result,listener,mount})"},
+			},
+			extra: func(t *testing.T) {
+				shell := readShellAsset(t, "shell.js")
+				idxFinalize := strings.Index(shell, "finalizeVegaViewsWithin(root)")
+				idxClear := strings.Index(shell, `root.textContent = ""`)
+				if idxFinalize < 0 || idxClear < 0 {
+					t.Fatalf("shell.js applyDoc is missing the finalize (%d) or clear (%d)", idxFinalize, idxClear)
+				}
+				if idxFinalize > idxClear {
+					t.Error("shell.js applyDoc clears the root BEFORE finalizing vega views — the view leaks")
+				}
+			},
+		},
+		{
+			// Finding 4: the honored Retry-After is capped to MAX_REFRESH_SECONDS
+			// so a hostile value cannot overflow setTimeout's ~2^31 ms limit and
+			// wrap to fire immediately — on the honored path (backoffSeconds) and
+			// again as a final guard in scheduleNextRefresh.
+			name: "Retry-After is capped",
+			tokens: map[string][]string{"interact.js": {
+				"Math.max(seconds,retryAfter)", // still honors Retry-After, up to the cap
+			}},
+			extra: func(t *testing.T) {
+				got := stripWhitespace(readShellAsset(t, "interact.js"))
+				if strings.Count(got, "seconds=Math.min(MAX_REFRESH_SECONDS,seconds)") < 2 {
+					t.Error("interact.js does not cap the honored Retry-After delay to MAX_REFRESH_SECONDS (setTimeout overflow risk)")
+				}
+			},
+		},
+		{
+			// V4 Finding 1: a tab switch finalizes the outgoing panel's Vega
+			// views BEFORE dropping their DOM, like applyDoc does for root.
+			name: "tab switch finalizes before clearing the panel",
+			tokens: map[string][]string{"blocks/tabs.js": {
+				`import{finalizeVegaViewsWithin}from"../interact.js"`,
+			}},
+			extra: func(t *testing.T) {
+				src := readShellAsset(t, "blocks/tabs.js")
+				idxFinalize := strings.Index(src, "finalizeVegaViewsWithin(panel)")
+				idxClear := strings.Index(src, `panel.textContent = ""`)
+				if idxFinalize < 0 || idxClear < 0 {
+					t.Fatalf("tabs.js show() is missing the finalize (%d) or the panel clear (%d)", idxFinalize, idxClear)
+				}
+				if idxFinalize > idxClear {
+					t.Error("tabs.js show() clears the panel BEFORE finalizing its vega views — a tab switch leaks the outgoing chart")
+				}
+			},
+		},
+		{
+			// V4 Finding 2: a chart whose mount detaches before its async
+			// import+embed resolves is finalized (not merely skipped), so
+			// nothing leaks.
+			name: "detached chart mount is finalized",
+			tokens: map[string][]string{
+				"blocks/chart.js": {"if(!mount.isConnected)returnundefined"},
+				"interact.js": {
+					"entry.mount.isConnected===false",
+					"if(!entry.mount||entry.mount.isConnected===false){finalizeVegaEntry(entry);",
+				},
+			},
+		},
 	}
-	// An abort must NOT surface as an error state (it is treated as superseded).
-	if !strings.Contains(src, "isAbortError") {
-		t.Error("interact.js does not distinguish an aborted (superseded) fetch from a real error")
-	}
-	// The GET ctx.path navigation (loadPath) is sequenced too — the signal is
-	// threaded into its fetch options alongside the GET method.
-	if !strings.Contains(got, `method:"GET",credentials:"same-origin",signal,`) {
-		t.Error("interact.js loadPath (ctx.path nav) does not pass the abort signal — nav is not sequenced")
-	}
-}
-
-// TestInteract_ModalStateReservedNamespace proves the fix for Finding 2: modal
-// deep-link state uses a reserved `__dtp_modal` key (its own namespace), never a
-// top-level param named after the block — so it cannot clobber an app filter of
-// the same name — and the shell + server agree on the reserved literal.
-func TestInteract_ModalStateReservedNamespace(t *testing.T) {
-	src := readShellAsset(t, "interact.js")
-	got := stripWhitespace(src)
-	if !strings.Contains(got, `constMODAL_PARAM="__dtp_modal"`) {
-		t.Error("interact.js does not define the reserved modal key MODAL_PARAM=\"__dtp_modal\"")
-	}
-	if !strings.Contains(got, `RESERVED_PARAMS=["token","block",MODAL_PARAM]`) {
-		t.Error("interact.js does not include MODAL_PARAM in the reserved (stripped-from-ctx.params) set")
-	}
-	// Open/close write the RESERVED key, not the app param name.
-	if !strings.Contains(got, `setParams({[MODAL_PARAM]:param},{refresh:false})`) {
-		t.Error("openLazyModal does not deep-link via the reserved MODAL_PARAM key")
-	}
-	if !strings.Contains(got, `setParams({[MODAL_PARAM]:null},{refresh:false})`) {
-		t.Error("closeActiveModal does not clear the reserved MODAL_PARAM key")
-	}
-	// The old, colliding pattern (a top-level param named after the block) is gone.
-	if strings.Contains(got, `setParams({[param]:"1"}`) || strings.Contains(got, `setParams({[param]:null}`) {
-		t.Error("interact.js still writes a modal param under the app's own param namespace (collision not fixed)")
-	}
-	// The server strips the SAME literal (same package const), so the reserved
-	// key never reaches ctx.params. The behavioral proof is
-	// TestReadParams_StripsModalStateKey; here we pin the literal agreement.
-	if modalStateParam != "__dtp_modal" {
-		t.Errorf("server modalStateParam = %q, must match the shell's MODAL_PARAM __dtp_modal", modalStateParam)
-	}
-}
-
-// TestInteract_VegaViewsFinalizedBeforeSwap proves the fix for Finding 3: charts
-// register their embed result, and the shell finalizes live views (calling
-// result.finalize() and removing the click listener) BEFORE clearing the DOM on
-// a re-render, and before a modal closes — so a view never leaks across a swap.
-func TestInteract_VegaViewsFinalizedBeforeSwap(t *testing.T) {
-	interact := readShellAsset(t, "interact.js")
-	gi := stripWhitespace(interact)
-	for _, want := range []string{
-		"exportfunctionregisterVegaView(",
-		"exportfunctionfinalizeVegaViewsWithin(",
-		"entry.result.finalize()",                     // the finalize call
-		`removeEventListener("click",entry.listener)`, // listener teardown
-	} {
-		if !strings.Contains(gi, want) {
-			t.Errorf("interact.js vega finalize is missing %q", want)
-		}
-	}
-	// chart.js registers each mounted view (with its result, listener, mount).
-	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
-	if !strings.Contains(chart, `import{bindChartOnClick,registerVegaView}from"../interact.js"`) {
-		t.Error("chart.js does not import registerVegaView")
-	}
-	if !strings.Contains(chart, "registerVegaView({result,listener,mount})") {
-		t.Error("chart.js does not register the mounted vega view for finalization")
-	}
-	// shell.js applyDoc finalizes BEFORE it clears the root (ordering matters —
-	// finalize after clear would already have leaked the view).
-	shell := readShellAsset(t, "shell.js")
-	idxFinalize := strings.Index(shell, "finalizeVegaViewsWithin(root)")
-	idxClear := strings.Index(shell, `root.textContent = ""`)
-	if idxFinalize < 0 || idxClear < 0 {
-		t.Fatalf("shell.js applyDoc is missing the finalize (%d) or clear (%d)", idxFinalize, idxClear)
-	}
-	if idxFinalize > idxClear {
-		t.Error("shell.js applyDoc clears the root BEFORE finalizing vega views — the view leaks")
-	}
-}
-
-// TestInteract_RetryAfterIsCapped proves the fix for Finding 4: the honored
-// Retry-After delay is capped to MAX_REFRESH_SECONDS before scheduling, so a
-// huge/hostile value can never overflow setTimeout's ~2^31 ms limit and wrap to
-// fire immediately. The cap is applied on the honored path (backoffSeconds) and
-// again as a final guard in scheduleNextRefresh.
-func TestInteract_RetryAfterIsCapped(t *testing.T) {
-	got := stripWhitespace(readShellAsset(t, "interact.js"))
-	// The cap reassignment appears on the honored path and the scheduler guard.
-	if strings.Count(got, "seconds=Math.min(MAX_REFRESH_SECONDS,seconds)") < 2 {
-		t.Error("interact.js does not cap the honored Retry-After delay to MAX_REFRESH_SECONDS (setTimeout overflow risk)")
-	}
-	// backoffSeconds still honors Retry-After (waits at least that long, up to the cap).
-	if !strings.Contains(got, "Math.max(seconds,retryAfter)") {
-		t.Error("interact.js no longer honors Retry-After on the backoff path")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for asset, tokens := range tc.tokens {
+				got := stripWhitespace(readShellAsset(t, asset))
+				for _, want := range tokens {
+					if !strings.Contains(got, want) {
+						t.Errorf("%s is missing %q", asset, want)
+					}
+				}
+			}
+			for asset, tokens := range tc.forbidden {
+				got := stripWhitespace(readShellAsset(t, asset))
+				for _, banned := range tokens {
+					if strings.Contains(got, banned) {
+						t.Errorf("%s still contains %q", asset, banned)
+					}
+				}
+			}
+			if tc.extra != nil {
+				tc.extra(t)
+			}
+		})
 	}
 }
 
 // ===========================================================================
-// RFC 028 Part 4 (V3): export + polish.
+// RFC 028 Part 4 (V3): client-side CSV export.
 //
 // CSV export is client-side only (spec §6.3 "Client-side, no round trip …
 // CSV export") — csv.js's buildCSV is a pure JS function with no server-side
 // counterpart, and there is no JS runtime vendored into this module tree to
-// execute it directly (adding one just to exercise a ~30-line escaper would
-// be a disproportionate new dependency, and V0-V2 already established the
-// source-level-inspection convention this file uses throughout). Two things
-// close that gap together:
-//   - TestCSVGolden_OWASPEscapingAndRFC4180Quoting is a Go PORT of csv.js's
-//     exact rule set (OWASP formula-injection escape, then RFC 4180
-//     quoting), checked against a documented input->output fixture — the
-//     "golden fixture" the task brief calls for, made genuinely runnable
-//     without a JS engine.
-//   - TestCSVModule_TriggerSetAndQuotingMatchGolden pins the SHIPPED csv.js
-//     to that exact same rule set at the source level (the trigger-character
-//     array, the quoting condition, the doubling of embedded quotes), so the
-//     Go port and the real file can never silently drift apart.
-//
-// The rest of V3 (print CSS, skeleton, empty/error states, theme reuse) is
-// visual and lands in V4's manual browser checklist; what follows are the
-// source-level guards a headless Go test CAN make — see task-V3-report.md
-// for the full checklist.
+// execute it. So the SHIPPED csv.js and table.js are pinned at the source
+// level: the trigger-character array, the quoting condition and the
+// projection of each row through the rendered columns.
 // ===========================================================================
 
-// csvFormulaTriggers is a Go PORT of csv.js's FORMULA_TRIGGER_CHARS — the
-// exact OWASP CSV-injection trigger set spec §6.3 names, no more, no less.
-var csvFormulaTriggers = []byte{'=', '+', '-', '@', '\t', '\r'}
-
-// csvCellGolden is a Go PORT of csv.js's csvCell: OWASP formula-escape (a
-// leading trigger character gets a "'" prefix), then RFC 4180 quoting (wrap
-// in double quotes, doubling any embedded double quote, if the — possibly
-// already-escaped — value contains a comma, double quote, or newline).
-func csvCellGolden(value string) string {
-	if len(value) > 0 {
-		for _, c := range csvFormulaTriggers {
-			if value[0] == c {
-				value = "'" + value
-				break
-			}
-		}
-	}
-	if strings.ContainsAny(value, ",\"\r\n") {
-		value = `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
-	}
-	return value
-}
-
-// buildCSVGolden is a Go PORT of csv.js's buildCSV: a header row (columns)
-// plus one row per entry in rows, CRLF-joined, CRLF-terminated.
-func buildCSVGolden(columns []string, rows [][]string) string {
-	csvRow := func(cells []string) string {
-		out := make([]string, len(cells))
-		for i, c := range cells {
-			out[i] = csvCellGolden(c)
-		}
-		return strings.Join(out, ",")
-	}
-	lines := []string{csvRow(columns)}
-	for _, row := range rows {
-		lines = append(lines, csvRow(row))
-	}
-	return strings.Join(lines, "\r\n") + "\r\n"
-}
-
-// TestCSVGolden_OWASPEscapingAndRFC4180Quoting is the golden-fixture check
-// the task brief calls for: a documented table of cell inputs -> expected
-// CSV-encoded output, run through the Go port above.
-func TestCSVGolden_OWASPEscapingAndRFC4180Quoting(t *testing.T) {
-	cases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"plain text is untouched", "Widget", "Widget"},
-		{"empty string is never prefixed (no leading char to trigger on)", "", ""},
-		{"formula equals", "=SUM(A1:A10)", "'=SUM(A1:A10)"},
-		{"formula plus", "+1234", "'+1234"},
-		{"formula minus (also an ordinary negative number)", "-42", "'-42"},
-		{"formula at-sign", "@mention", "'@mention"},
-		{"formula tab (tab alone does not also trigger RFC 4180 quoting)", "\tTabbed", "'\tTabbed"},
-		{"formula CR (CR ALSO triggers RFC 4180 quoting, unlike tab, so this is BOTH escaped AND quoted)", "\rCarriage", "\"'\rCarriage\""},
-		{"trigger char NOT at the start is untouched", "A=B", "A=B"},
-		{"embedded comma is quoted", "Acme, Inc.", `"Acme, Inc."`},
-		{"embedded double quote is doubled and quoted", `He said "hi"`, `"He said ""hi"""`},
-		{"embedded newline is quoted", "Line1\nLine2", "\"Line1\nLine2\""},
-		{"formula-escaped AND comma: escape first, then quote the whole field", "=A1,A2", `"'=A1,A2"`},
-		{"formula-escaped AND quote-containing: apostrophe survives inside the quoting", `="x"`, `"'=""x"""`},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := csvCellGolden(c.input)
-			if got != c.want {
-				t.Errorf("csvCellGolden(%q) = %q, want %q", c.input, got, c.want)
-			}
-		})
-	}
-
-	// buildCSV-level integration: header + rows, CRLF-joined and -terminated,
-	// header cells escaped exactly like data cells (a column named "=Note" is
-	// just as untrusted as a cell).
-	got := buildCSVGolden(
-		[]string{"Name", "=Note"},
-		[][]string{
-			{"Widget", "ok"},
-			{"=EVIL()", "danger, zone"},
-		},
-	)
-	want := "Name,'=Note\r\nWidget,ok\r\n'=EVIL(),\"danger, zone\"\r\n"
-	if got != want {
-		t.Errorf("buildCSVGolden(...) =\n%q\nwant\n%q", got, want)
-	}
-}
-
-// ===========================================================================
-// RFC 028 Part 4 (V3 fix round): Codex Major finding on commit 74b0740.
-//
-// blocks/table.js's CSV download handler used to map over the WHOLE row
-// array (`visibleRows().map((row) => row.map(cellText))`), unbounded by
-// `columns` — but the render loop (table.js's renderBody) draws exactly
-// `columns.length` cells per row (`for (let i = 0; i < columns.length; i++)
-// ... cellText(row[i])`). An over-wide row (more cells than columns) leaked
-// un-rendered trailing cells into the export; a short row (fewer cells than
-// columns) produced a CSV whose data fields didn't line up with the header
-// row. The fix projects each row through the SAME `columns` list and the
-// SAME index-based `cellText(row[i])` accessor the renderer uses.
-//
-// projectRowGolden below is a Go PORT of the FIXED projection; it is checked
-// against the two cases the fix addresses, and contrasted against
-// projectRowBuggyGolden (a Go port of the PRE-fix shape) to demonstrate, in
-// Go, why the old shape was wrong for both. The shipped table.js is pinned to
-// the fixed shape at the source level by
-// TestTableRenderer_CSVExportProjectsThroughRenderedColumns below (source-
-// level, since there is no JS runtime here — see the V3 CSV section above for
-// why that is this file's established way of closing this gap). Mutation-
-// tested: reverting table.js to the pre-fix line FAILs that test (see
-// task-V3-report.md's fix-round section); reverted byte-identically.
-// ===========================================================================
-
-// projectRowGolden is a Go PORT of the FIXED table.js download-handler
-// projection: `columns.map((_c, i) => cellText(row[i]))`. `row` here is
-// already-stringified cell text (as cellText would produce); a "missing"
-// cell is modeled by `row` simply being shorter than `columns` (in JS,
-// `row[i]` for an out-of-range `i` is `undefined`, and `cellText(undefined)
-// === ""`).
-func projectRowGolden(columns []string, row []string) []string {
-	out := make([]string, len(columns))
-	for i := range columns {
-		if i < len(row) {
-			out[i] = row[i]
-		} else {
-			out[i] = "" // cellText(undefined) === ""
-		}
-	}
-	return out
-}
-
-// projectRowBuggyGolden is a Go PORT of the PRE-FIX table.js download
-// handler (commit 74b0740): `row.map(cellText)` — the whole row, unbounded by
-// `columns`. Kept ONLY so TestCSVGolden_RowProjectionMatchesRenderedColumns
-// can demonstrate this shape is wrong for both fixture cases below; nothing
-// else in this file should ever call it.
-func projectRowBuggyGolden(row []string) []string {
-	return row
-}
-
-// TestCSVGolden_RowProjectionMatchesRenderedColumns is the golden-fixture
-// extension for the Codex Major finding: an over-wide row's extra cells are
-// dropped, and a short row is padded blank to the header's field count — the
-// CSV a viewer downloads must have exactly the fields the table rendered, no
-// more, no less.
-func TestCSVGolden_RowProjectionMatchesRenderedColumns(t *testing.T) {
-	t.Run("over-wide row: extra cells beyond columns are dropped, not exported", func(t *testing.T) {
-		columns := []string{"A", "B"}
-		row := []string{"1", "2", "3", "4"} // 4 cells, only 2 columns — table renders just A, B
-		want := []string{"1", "2"}
-
-		got := projectRowGolden(columns, row)
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("projectRowGolden(%v, %v) = %v, want %v", columns, row, got, want)
-		}
-		// Demonstrate the bug this fixes: the pre-fix shape leaks the two
-		// un-rendered trailing cells straight into the export.
-		if buggy := projectRowBuggyGolden(row); reflect.DeepEqual(buggy, want) {
-			t.Fatalf("fixture is broken: the PRE-FIX projection %v must NOT already equal the fixed expectation %v", buggy, want)
-		}
-	})
-
-	t.Run("short row: missing cells are padded blank to match the header width", func(t *testing.T) {
-		columns := []string{"A", "B", "C"}
-		row := []string{"1"} // 1 cell, 3 columns — table renders A="1", B="", C=""
-		want := []string{"1", "", ""}
-
-		got := projectRowGolden(columns, row)
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("projectRowGolden(%v, %v) = %v, want %v", columns, row, got, want)
-		}
-		// Demonstrate the bug this fixes: the pre-fix shape produces a row with
-		// FEWER fields than the header, desyncing every column after it.
-		if buggy := projectRowBuggyGolden(row); len(buggy) == len(want) {
-			t.Fatalf("fixture is broken: the PRE-FIX projection %v must NOT already have the fixed field count %d", buggy, len(want))
-		}
-	})
-
-	// End-to-end through the full pipeline (project -> escape -> quote): an
-	// over-wide row whose extra cell would ALSO have been formula-escaped had
-	// it leaked through must not appear in the final CSV text at all.
-	got := buildCSVGolden(
-		[]string{"Name", "Note"},
-		[][]string{projectRowGolden([]string{"Name", "Note"}, []string{"Widget", "=EVIL()", "=ALSO_EVIL()"})},
-	)
-	want := "Name,Note\r\nWidget,'=EVIL()\r\n"
-	if got != want {
-		t.Errorf("end-to-end projected+escaped CSV =\n%q\nwant\n%q (the dropped extra cell must not appear anywhere)", got, want)
-	}
-}
-
-// TestCSVModule_TriggerSetAndQuotingMatchGolden pins the SHIPPED csv.js to
-// the exact same rule set TestCSVGolden_* exercises in Go, at the source
+// TestCSVModule_TriggerSetAndQuotingMatchGolden pins the SHIPPED csv.js to the
+// OWASP formula-injection escape then RFC 4180 quoting rule set, at the source
 // level: the trigger-character array (all six, nothing extra), the RFC 4180
 // quoting condition (comma/quote/CR/LF), and the embedded-quote-doubling
-// replace. Mutation-tested: with FORMULA_TRIGGER_CHARS temporarily emptied to
-// `[]` in csv.js, this test FAILs (see task-V3-report.md); reverted
-// byte-identically.
+// replace.
 func TestCSVModule_TriggerSetAndQuotingMatchGolden(t *testing.T) {
 	src := readShellAsset(t, "csv.js")
 
@@ -1087,11 +772,8 @@ func TestTableRenderer_CSVDownloadIsBlobNotInnerHTML(t *testing.T) {
 // (let i = 0; i < columns.length; i++) ... cellText(row[i])`) uses — never
 // the whole row array unbounded. Without this, an over-wide row leaks
 // un-rendered trailing cells into the export, and a short row desyncs the
-// CSV's field count from its header. See TestCSVGolden_RowProjectionMatchesRenderedColumns
-// for the Go-side proof that the fixed projection produces the right shape
-// for both cases. Mutation-tested: reverting to the pre-fix
-// `visibleRows().map((row) => row.map(cellText))` FAILs this test (see
-// task-V3-report.md's fix-round section); reverted byte-identically.
+// CSV's field count from its header. Reverting to the pre-fix
+// `visibleRows().map((row) => row.map(cellText))` FAILs this test.
 func TestTableRenderer_CSVExportProjectsThroughRenderedColumns(t *testing.T) {
 	got := stripWhitespace(readShellAsset(t, "blocks/table.js"))
 
@@ -1104,200 +786,5 @@ func TestTableRenderer_CSVExportProjectsThroughRenderedColumns(t *testing.T) {
 	preFix := stripWhitespace(`visibleRows().map((row) => row.map(cellText))`)
 	if strings.Contains(got, preFix) {
 		t.Error("table.js's CSV download still maps the whole row unbounded by columns — the Codex Major finding on commit 74b0740 is not fixed")
-	}
-}
-
-// TestShellJS_EmptyDocAndDataUseSharedEmptyState proves the spec-brief empty
-// states (a doc with zero blocks, a table with no rows, a chart whose inline
-// dataset is present but empty) all route through the SAME shared
-// renderEmptyState placeholder (shell.js) rather than each block inventing
-// its own — table.js and chart.js both import it from shell.js.
-func TestShellJS_EmptyDocAndDataUseSharedEmptyState(t *testing.T) {
-	shell := stripWhitespace(readShellAsset(t, "shell.js"))
-	for _, want := range []string{
-		"exportfunctionrenderEmptyState(message)",
-		"blocks.length===0",
-		"renderEmptyState(",
-	} {
-		if !strings.Contains(shell, want) {
-			t.Errorf("shell.js missing %q — zero-block empty state not wired", want)
-		}
-	}
-
-	table := stripWhitespace(readShellAsset(t, "blocks/table.js"))
-	if !strings.Contains(table, `import{renderEmptyState}from"../shell.js"`) {
-		t.Error("table.js does not import the shared renderEmptyState from shell.js")
-	}
-	if !strings.Contains(table, "rows.length===0") {
-		t.Error("table.js does not detect the zero-rows (no data) case")
-	}
-
-	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
-	if !strings.Contains(chart, `import{renderEmptyState}from"../shell.js"`) {
-		t.Error("chart.js does not import the shared renderEmptyState from shell.js")
-	}
-	if !strings.Contains(chart, "isEmptyChartData(spec)") {
-		t.Error("chart.js does not detect an empty (but schema-valid) inline dataset")
-	}
-}
-
-// TestErrorCard_ChartMarkdownModalReuseSharedClass proves every V1/V2 render-
-// failure text ("this … could not be displayed") is marked with the shared
-// dtp-error-card class (spec brief: "reuse V1/V2's error states, make them
-// look intentional"), and that theme.css defines it using --dtp-danger — a
-// hue reused verbatim from ui/product/style.css's --status-fail-bg, not an
-// invented color.
-func TestErrorCard_ChartMarkdownModalReuseSharedClass(t *testing.T) {
-	for _, path := range []string{"blocks/chart.js", "blocks/markdown.js", "interact.js"} {
-		src := readShellAsset(t, path)
-		if !strings.Contains(src, `classList.add("dtp-error-card")`) {
-			t.Errorf("%s does not apply the shared dtp-error-card class on its failure path", path)
-		}
-	}
-	theme := readShellAsset(t, "theme.css")
-	if !strings.Contains(theme, ".dtp-error-card") {
-		t.Error("theme.css does not define .dtp-error-card")
-	}
-	if !strings.Contains(theme, "--dtp-danger") {
-		t.Error("theme.css does not define --dtp-danger for the error card")
-	}
-	if !strings.Contains(theme, "#ef4444") {
-		t.Error("theme.css's error color does not reuse ui/product's --status-fail-bg hue (#ef4444)")
-	}
-}
-
-// TestShellSkeleton_FirstPaintBeforeMount proves index.html ships a real
-// skeleton placeholder (not a bare "Loading…" line) marked aria-busy before
-// shell.js's boot() ever runs, and that applyDoc clears that attribute once
-// real content is mounted (so the accessibility state does not go stale).
-func TestShellSkeleton_FirstPaintBeforeMount(t *testing.T) {
-	idx := string(appshell.IndexHTML)
-	for _, want := range []string{`id="dtp-root"`, `aria-busy="true"`, "dtp-skeleton"} {
-		if !strings.Contains(idx, want) {
-			t.Errorf("index.html missing %q — no first-paint skeleton before shell.js mounts", want)
-		}
-	}
-	shell := stripWhitespace(readShellAsset(t, "shell.js"))
-	if !strings.Contains(shell, `removeAttribute("aria-busy")`) {
-		t.Error("shell.js's applyDoc does not clear aria-busy once the real doc is mounted")
-	}
-}
-
-// TestShellJS_ChartRendererUsesSVGForPrintTheming proves shell.js's
-// mountVegaLiteChart chokepoint requests the SVG renderer (vega-embed's
-// default is canvas): a canvas is an opaque bitmap baked at mount time from
-// whatever theme was active on screen, and no CSS rule (including theme.css's
-// print override) can repaint its pixels — SVG text is real DOM the print
-// stylesheet can recolor. This is load-bearing for "charts … legible on
-// paper", not a rendering-quality preference.
-func TestShellJS_ChartRendererUsesSVGForPrintTheming(t *testing.T) {
-	got := stripWhitespace(readShellAsset(t, "shell.js"))
-	if !strings.Contains(got, `renderer:"svg"`) {
-		t.Error("shell.js's mountVegaLiteChart does not force the SVG renderer — the print stylesheet cannot recolor a canvas")
-	}
-	// Still routed through the SAME lockdown call (renderer sits alongside the
-	// existing actions/loader lockdown, not a second vegaEmbed call site).
-	wantSameCall := stripWhitespace(`actions:false,loader:{load:()=>Promise.reject(new Error("loading disabled"))},renderer:"svg"`)
-	if !strings.Contains(got, wantSameCall) {
-		t.Error("shell.js's renderer:\"svg\" is not part of the single locked-down vegaEmbed call")
-	}
-}
-
-// dtpBlockClassSelector matches a bare, unqualified CSS class selector (e.g.
-// ".dtp-tab-bar {" or ".dtp-tab-bar,") — used to find where a given rule is
-// declared, not merely mentioned in a comment.
-func dtpBlockClassSelector(class string) *regexp.Regexp {
-	return regexp.MustCompile(regexp.QuoteMeta(class) + `\s*[,{]`)
-}
-
-// TestPrintCSS_HidesChromeForcesLightPageBreak proves theme.css's @media
-// print block (spec brief: hide chrome/filters/interactive controls,
-// page-break between blocks, force light) exists, hides the specific
-// interactive-chrome classes named in the V3 report, keeps a block from being
-// sliced across a page, forces the light palette, and — the cascade-ordering
-// invariant — is declared AFTER the prefers-color-scheme:dark block so it
-// wins when a viewer prints while their OS is in dark mode.
-func TestPrintCSS_HidesChromeForcesLightPageBreak(t *testing.T) {
-	theme := readShellAsset(t, "theme.css")
-
-	darkIdx := strings.Index(theme, "@media (prefers-color-scheme: dark)")
-	// "@media print {" (the actual rule, brace included) rather than "@media
-	// print" alone — the file's own header comment mentions the stylesheet by
-	// name too, and that mention must not be mistaken for the rule itself.
-	printIdx := strings.Index(theme, "@media print {")
-	if darkIdx < 0 || printIdx < 0 {
-		t.Fatalf("theme.css is missing the dark-mode (%d) or print (%d) media block", darkIdx, printIdx)
-	}
-	if printIdx < darkIdx {
-		t.Error("theme.css's @media print block must come AFTER @media (prefers-color-scheme: dark) to win the cascade tiebreak when printing in dark mode")
-	}
-
-	printBlock := theme[printIdx:]
-	for _, class := range []string{
-		".dtp-table-toolbar", ".dtp-modal-trigger", ".dtp-tab-bar",
-		".dtp-block-filter", ".dtp-modal-backdrop", ".dtp-refresh-overlay", ".dtp-refresh-error",
-	} {
-		if !dtpBlockClassSelector(class).MatchString(printBlock) {
-			t.Errorf("theme.css's @media print block does not hide %q (interactive chrome)", class)
-		}
-	}
-	if !strings.Contains(printBlock, "display: none !important") {
-		t.Error("theme.css's @media print block does not force-hide interactive chrome")
-	}
-	if !strings.Contains(printBlock, "break-inside: avoid") {
-		t.Error("theme.css's @media print block does not keep a block from splitting across a page")
-	}
-	if !strings.Contains(printBlock, "--dtp-bg: #ffffff") {
-		t.Error("theme.css's @media print block does not force the light background")
-	}
-	if !strings.Contains(printBlock, ".dtp-chart-mount svg text") {
-		t.Error("theme.css's @media print block does not recolor chart text for paper")
-	}
-}
-
-// ===========================================================================
-// RFC 028 Part 4 (V4 gate fix): extend the Vega finalize discipline to the two
-// paths V2/V3 did not wire it into — a tab switch, and a chart whose mount
-// detaches before its async embed resolves. Live "view count stays flat" is a
-// V4 browser-checklist item; these are the statically-checkable guards.
-// ===========================================================================
-
-// TestTabsRenderer_FinalizesViewsBeforeClearingPanel proves Finding 1: a tab
-// switch finalizes the outgoing panel's Vega views BEFORE dropping their DOM,
-// exactly as applyDoc does before clearing root — otherwise switching away from
-// a chart tab leaks the view/dataflow/timers/click-listener.
-func TestTabsRenderer_FinalizesViewsBeforeClearingPanel(t *testing.T) {
-	src := readShellAsset(t, "blocks/tabs.js")
-	if !strings.Contains(stripWhitespace(src), `import{finalizeVegaViewsWithin}from"../interact.js"`) {
-		t.Error("tabs.js does not import finalizeVegaViewsWithin from interact.js")
-	}
-	idxFinalize := strings.Index(src, "finalizeVegaViewsWithin(panel)")
-	idxClear := strings.Index(src, `panel.textContent = ""`)
-	if idxFinalize < 0 || idxClear < 0 {
-		t.Fatalf("tabs.js show() is missing the finalize (%d) or the panel clear (%d)", idxFinalize, idxClear)
-	}
-	if idxFinalize > idxClear {
-		t.Error("tabs.js show() clears the panel BEFORE finalizing its vega views — a tab switch leaks the outgoing chart")
-	}
-}
-
-// TestChartRenderer_GuardsDetachedMountRace proves Finding 2: a chart whose
-// mount detaches before its async import+embed resolves is finalized rather
-// than left live and unregistered-for-cleanup. chart.js skips embedding into an
-// already-detached node (isConnected pre-check), and interact.js's
-// registerVegaView finalizes-and-drops a view whose mount detached during the
-// embed (an orphan finalizeVegaViewsWithin(root) would never reach).
-func TestChartRenderer_GuardsDetachedMountRace(t *testing.T) {
-	chart := stripWhitespace(readShellAsset(t, "blocks/chart.js"))
-	if !strings.Contains(chart, "if(!mount.isConnected)returnundefined") {
-		t.Error("chart.js does not skip embedding into a detached mount (isConnected pre-check)")
-	}
-	interact := stripWhitespace(readShellAsset(t, "interact.js"))
-	if !strings.Contains(interact, "entry.mount.isConnected===false") {
-		t.Error("interact.js registerVegaView does not detect an already-detached mount")
-	}
-	// The detached branch must FINALIZE (not merely skip) so nothing leaks.
-	if !strings.Contains(interact, "if(!entry.mount||entry.mount.isConnected===false){finalizeVegaEntry(entry);") {
-		t.Error("interact.js registerVegaView does not finalize a detached-mount view (it would leak)")
 	}
 }

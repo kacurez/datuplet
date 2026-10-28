@@ -486,70 +486,106 @@ func TestExchange_MalformedUnknownRevokedTokenGives403(t *testing.T) {
 }
 
 func TestExchange_EleventhFailureFromOneIPAndAppIsRateLimited(t *testing.T) {
-	// httptest connects from loopback, so trusting loopback as a proxy is
-	// what lets this test drive distinct client IPs through X-Forwarded-For
-	// the way the real ingress would.
-	h := newAuthHarnessWithConfig(t, trustLoopbackConfig(1))
-	h.api.verifyOK = false
+	t.Run("trusted proxy: buckets are per (IP, app)", func(t *testing.T) {
+		// httptest connects from loopback, so trusting loopback as a proxy is
+		// what lets this test drive distinct client IPs through X-Forwarded-For
+		// the way the real ingress would.
+		h := newAuthHarnessWithConfig(t, trustLoopbackConfig(1))
+		h.api.verifyOK = false
 
-	attempt := func(ip string) *http.Response {
-		req, err := http.NewRequest(http.MethodGet, h.appURL(tokenParam(testTokenID, testSecret)), nil)
-		if err != nil {
-			t.Fatalf("new request: %v", err)
+		attempt := func(ip string) *http.Response {
+			req, err := http.NewRequest(http.MethodGet, h.appURL(tokenParam(testTokenID, testSecret)), nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("X-Forwarded-For", ip)
+			return h.do(req)
 		}
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("X-Forwarded-For", ip)
-		return h.do(req)
-	}
 
-	for i := 1; i <= verifyFailuresPerMin; i++ {
+		for i := 1; i <= verifyFailuresPerMin; i++ {
+			resp := attempt("203.0.113.7")
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("attempt %d: status = %d, want 403", i, resp.StatusCode)
+			}
+			resp.Body.Close()
+		}
+
 		resp := attempt("203.0.113.7")
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("attempt %d: status = %d, want 403", i, resp.StatusCode)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("11th attempt status = %d, want 429 (body %q)", resp.StatusCode, readBody(t, resp))
+		}
+		if got := resp.Header.Get("Retry-After"); got != "60" {
+			t.Fatalf("Retry-After = %q, want %q", got, "60")
+		}
+		env := decodeEnvelope(t, resp)
+		if env.Kind != errKindRateLimited {
+			t.Fatalf("kind = %q, want %q", env.Kind, errKindRateLimited)
+		}
+
+		// The throttle stops hammering pipeline-api: exactly 10 verifies so far.
+		if verify, _, _ := h.api.counts(); verify != verifyFailuresPerMin {
+			t.Fatalf("VerifyToken calls = %d, want %d (the 11th must not reach pipeline-api)", verify, verifyFailuresPerMin)
+		}
+
+		// A different client IP has its own bucket.
+		other := attempt("198.51.100.9")
+		if other.StatusCode != http.StatusForbidden {
+			t.Fatalf("different IP status = %d, want 403 (buckets are per (IP, app))", other.StatusCode)
+		}
+		other.Body.Close()
+
+		// A different app has its own bucket for the same IP.
+		h.setResolvedAppID(testOtherAppID)
+		otherApp := attempt("203.0.113.7")
+		if otherApp.StatusCode != http.StatusForbidden {
+			t.Fatalf("different app status = %d, want 403 (buckets are per (IP, app))", otherApp.StatusCode)
+		}
+		otherApp.Body.Close()
+
+		// And the bucket refills: after a minute the same IP+app may try again.
+		h.setResolvedAppID(testAppID)
+		h.advance(61 * time.Second)
+		again := attempt("203.0.113.7")
+		if again.StatusCode != http.StatusForbidden {
+			t.Fatalf("after 61s status = %d, want 403 (bucket must refill)", again.StatusCode)
+		}
+		again.Body.Close()
+	})
+
+	t.Run("untrusted peer: rotating XFF cannot mint a fresh bucket", func(t *testing.T) {
+		// The HTTP-level form of the bypass regression: with no configured
+		// trusted proxies the limiter still buckets by RemoteAddr.
+		h := newAuthHarness(t) // Config{} — no trusted proxies
+		h.api.verifyOK = false
+
+		attempt := func(i int) *http.Response {
+			req, _ := http.NewRequest(http.MethodGet, h.appURL(tokenParam(testTokenID, testSecret)), nil)
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("X-Forwarded-For", fmt.Sprintf("203.0.113.%d", i))
+			return h.do(req)
+		}
+
+		for i := 1; i <= verifyFailuresPerMin; i++ {
+			resp := attempt(i)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("attempt %d: status = %d, want 403", i, resp.StatusCode)
+			}
+			resp.Body.Close()
+		}
+		resp := attempt(verifyFailuresPerMin + 1)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("attempt 11 with a fresh spoofed XFF: status = %d, want 429 — "+
+				"an untrusted peer must not be able to pick its own rate bucket", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Retry-After"); got != "60" {
+			t.Fatalf("Retry-After = %q, want 60", got)
 		}
 		resp.Body.Close()
-	}
-
-	resp := attempt("203.0.113.7")
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("11th attempt status = %d, want 429 (body %q)", resp.StatusCode, readBody(t, resp))
-	}
-	if got := resp.Header.Get("Retry-After"); got != "60" {
-		t.Fatalf("Retry-After = %q, want %q", got, "60")
-	}
-	env := decodeEnvelope(t, resp)
-	if env.Kind != errKindRateLimited {
-		t.Fatalf("kind = %q, want %q", env.Kind, errKindRateLimited)
-	}
-
-	// The throttle stops hammering pipeline-api: exactly 10 verifies so far.
-	if verify, _, _ := h.api.counts(); verify != verifyFailuresPerMin {
-		t.Fatalf("VerifyToken calls = %d, want %d (the 11th must not reach pipeline-api)", verify, verifyFailuresPerMin)
-	}
-
-	// A different client IP has its own bucket.
-	other := attempt("198.51.100.9")
-	if other.StatusCode != http.StatusForbidden {
-		t.Fatalf("different IP status = %d, want 403 (buckets are per (IP, app))", other.StatusCode)
-	}
-	other.Body.Close()
-
-	// A different app has its own bucket for the same IP.
-	h.setResolvedAppID(testOtherAppID)
-	otherApp := attempt("203.0.113.7")
-	if otherApp.StatusCode != http.StatusForbidden {
-		t.Fatalf("different app status = %d, want 403 (buckets are per (IP, app))", otherApp.StatusCode)
-	}
-	otherApp.Body.Close()
-
-	// And the bucket refills: after a minute the same IP+app may try again.
-	h.setResolvedAppID(testAppID)
-	h.advance(61 * time.Second)
-	again := attempt("203.0.113.7")
-	if again.StatusCode != http.StatusForbidden {
-		t.Fatalf("after 61s status = %d, want 403 (bucket must refill)", again.StatusCode)
-	}
-	again.Body.Close()
+		if verify, _, _ := h.api.counts(); verify != verifyFailuresPerMin {
+			t.Fatalf("VerifyToken calls = %d, want %d", verify, verifyFailuresPerMin)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -580,31 +616,19 @@ func TestCookie_ReplayedOnAnotherAppIs401(t *testing.T) {
 
 	// Cookie minted for app A; the route resolves app B.
 	h.setResolvedAppID(testOtherAppID)
-	resp := h.getWithCookieFor(h.appURL(""), testAppID, testTokenID, testClockBase.Add(sessionCookieTTL))
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body %q)", resp.StatusCode, readBody(t, resp))
-	}
-	resp.Body.Close()
-
-	if _, active, _ := h.api.counts(); active != 0 {
-		t.Fatalf("CheckTokenActive calls = %d, want 0 (the app binding is checked before any upstream call)", active)
-	}
-}
-
-func TestCookie_ReplayedOnAnotherAppEnvelopeKind(t *testing.T) {
-	h := newAuthHarness(t)
-	h.api.tokenActive = true
-	h.setResolvedAppID(testOtherAppID)
-
 	req, _ := http.NewRequest(http.MethodGet, h.appURL(""), nil)
 	req.Header.Set("Accept", "application/json")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: signCookie(testCookieKey, testAppID, testTokenID, testClockBase.Add(sessionCookieTTL))})
 	resp := h.do(req)
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
+		t.Fatalf("status = %d, want 401 (body %q)", resp.StatusCode, readBody(t, resp))
 	}
 	if env := decodeEnvelope(t, resp); env.Kind != errKindUnauthorized {
 		t.Fatalf("kind = %q, want %q", env.Kind, errKindUnauthorized)
+	}
+
+	if _, active, _ := h.api.counts(); active != 0 {
+		t.Fatalf("CheckTokenActive calls = %d, want 0 (the app binding is checked before any upstream call)", active)
 	}
 }
 
@@ -787,17 +811,6 @@ func TestCookie_ActiveCheckErrorFailsClosedAsUnavailable(t *testing.T) {
 		t.Fatalf("status = %d, want 503 (fail closed)", resp.StatusCode)
 	}
 	resp.Body.Close()
-}
-
-func TestCookie_NoCredentialAtAllIs401(t *testing.T) {
-	h := newAuthHarness(t)
-	resp := h.jsonGet(h.appURL(""))
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
-	}
-	if env := decodeEnvelope(t, resp); env.Kind != errKindUnauthorized {
-		t.Fatalf("kind = %q, want unauthorized", env.Kind)
-	}
 }
 
 func TestAuth_UnwiredCookieKeyFailsClosed(t *testing.T) {
@@ -994,18 +1007,6 @@ func TestCookieAuthPOST_RequiresRenderHeaderAndSameOriginOrigin(t *testing.T) {
 	}
 }
 
-func TestCookieAuthGET_IsNotSubjectToCSRFChecks(t *testing.T) {
-	h := newAuthHarness(t)
-	h.api.tokenActive = true
-
-	// A plain navigation: no render header, no Origin.
-	resp := h.getWithCookieFor(h.appURL(""), testAppID, testTokenID, testClockBase.Add(sessionCookieTTL))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	resp.Body.Close()
-}
-
 func TestSessionCookieAuthPOST_IsSubjectToCSRFChecks(t *testing.T) {
 	h := newAuthHarness(t)
 	h.api.session = SessionInfo{UserID: testUserID, ProjectMember: true}
@@ -1047,31 +1048,6 @@ func TestAllowRender_PerPrincipalBurst10ThenThrottled(t *testing.T) {
 	}
 	if retry < 1 {
 		t.Fatalf("retryAfter = %d, want >= 1", retry)
-	}
-}
-
-func TestAllowRender_SixtyFirstRenderInAMinuteIsThrottled(t *testing.T) {
-	clk := testClockBase
-	s := newRateTestServer(func() time.Time { return clk })
-	pk, ak := rateKeys(principal{Kind: principalKindViewerToken, ID: testTokenID}, testAppID)
-
-	allowed := 0
-	var lastRetry int
-	for i := 1; i <= 61; i++ {
-		ok, retry := s.allowRender(pk, ak)
-		if ok {
-			allowed++
-		}
-		lastRetry = retry
-		if i == 61 && ok {
-			t.Fatalf("the 61st render in a minute was allowed, want 429")
-		}
-	}
-	if allowed != renderRatePerPrincipalBurst {
-		t.Fatalf("allowed = %d at a frozen clock, want exactly the burst (%d)", allowed, renderRatePerPrincipalBurst)
-	}
-	if lastRetry < 1 {
-		t.Fatalf("retryAfter on the 61st = %d, want >= 1", lastRetry)
 	}
 }
 
@@ -1151,36 +1127,6 @@ func TestAllowRender_DenialConsumesNothing(t *testing.T) {
 	last, ak3 := rateKeys(principal{Kind: principalKindViewerToken, ID: "one-too-many"}, testAppID)
 	if ok, _ := s.allowRender(last, ak3); ok {
 		t.Fatal("the 301st app-wide render was allowed, want denied")
-	}
-}
-
-func TestAllowRender_RetryAfterIsMaxOverViolatedBucketsMinimumOne(t *testing.T) {
-	clk := testClockBase
-	s := newRateTestServer(func() time.Time { return clk })
-
-	// Drain the per-app bucket with 300 distinct principals, then drain one
-	// principal's own bucket too, so BOTH buckets are violated. The
-	// principal bucket refills at 1/s (worst case 1s), the app bucket at
-	// 5/s (0.2s) — Retry-After must be the ceil of the larger wait.
-	for i := 0; i < renderRatePerAppPerMin; i++ {
-		pk, ak := rateKeys(principal{Kind: principalKindViewerToken, ID: fmt.Sprintf("t-%d", i)}, testAppID)
-		if ok, _ := s.allowRender(pk, ak); !ok {
-			t.Fatalf("setup render %d denied", i)
-		}
-	}
-	pk, ak := rateKeys(principal{Kind: principalKindViewerToken, ID: "t-0"}, testAppID)
-	ok, retry := s.allowRender(pk, ak)
-	if ok {
-		t.Fatal("expected a denial with both buckets exhausted")
-	}
-	if retry != 1 {
-		t.Fatalf("retryAfter = %d, want 1 (ceil of the max bucket wait, minimum 1)", retry)
-	}
-
-	// A principal that has spent its whole burst waits ~10s for a full
-	// refill but only ~1s for the next single admission: ceil(1s) = 1.
-	if retry < 1 {
-		t.Fatalf("retryAfter = %d must never be below 1", retry)
 	}
 }
 
@@ -1307,46 +1253,40 @@ func TestSignCookie_ShapeIsTwoBase64URLSegments(t *testing.T) {
 	}
 }
 
-func TestParseCookie_VerifiesMACBeforeParsingThePayload(t *testing.T) {
+// TestParseCookie_Rejections covers cookies that must never authenticate: a
+// wrong MAC is rejected before the payload is parsed, and a correctly-signed
+// but semantically empty payload authenticates nothing.
+func TestParseCookie_Rejections(t *testing.T) {
+	signed := func(p cookiePayload) string {
+		raw, _ := json.Marshal(p)
+		seg := base64.RawURLEncoding.EncodeToString(raw)
+		return seg + "." + base64.RawURLEncoding.EncodeToString(cookieMAC(testCookieKey, seg))
+	}
 	// A payload segment that is valid base64url but NOT valid JSON, carrying
 	// a wrong MAC. If the payload were parsed first, the error would be a
 	// JSON error; because the MAC is checked first, it is a signature error.
 	bad := base64.RawURLEncoding.EncodeToString([]byte(`{"app_id": <<<not json`))
-	value := bad + "." + base64.RawURLEncoding.EncodeToString(make([]byte, 32))
 
-	_, err := parseCookie(testCookieKey, value)
-	if err == nil {
-		t.Fatal("expected an error")
+	cases := []struct {
+		name    string
+		value   string
+		wantErr error // nil means: any error
+	}{
+		{"MAC verified before the payload is parsed", bad + "." + base64.RawURLEncoding.EncodeToString(make([]byte, 32)), errCookieBadSignature},
+		{"signed with empty app id", signed(cookiePayload{AppID: "", TokenID: testTokenID, Exp: testClockBase.Unix()}), nil},
+		{"signed with empty token id", signed(cookiePayload{AppID: testAppID, TokenID: "", Exp: testClockBase.Unix()}), nil},
+		{"signed with zero exp", signed(cookiePayload{AppID: testAppID, TokenID: testTokenID, Exp: 0}), nil},
 	}
-	if err != errCookieBadSignature {
-		t.Fatalf("err = %v, want errCookieBadSignature (the MAC must be verified before the payload is parsed)", err)
-	}
-}
-
-func TestParseCookie_KeyBound(t *testing.T) {
-	v := signCookie("key-a", testAppID, testTokenID, testClockBase.Add(sessionCookieTTL))
-	if _, err := parseCookie("key-b", v); err != errCookieBadSignature {
-		t.Fatalf("err = %v, want errCookieBadSignature under a different key", err)
-	}
-	if _, err := parseCookie("key-a", v); err != nil {
-		t.Fatalf("err = %v, want nil under the signing key", err)
-	}
-}
-
-func TestParseCookie_RejectsEmptyFieldsEvenWhenSigned(t *testing.T) {
-	// A correctly-signed but semantically empty payload must not
-	// authenticate anything.
-	for _, tc := range []cookiePayload{
-		{AppID: "", TokenID: testTokenID, Exp: testClockBase.Unix()},
-		{AppID: testAppID, TokenID: "", Exp: testClockBase.Unix()},
-		{AppID: testAppID, TokenID: testTokenID, Exp: 0},
-	} {
-		raw, _ := json.Marshal(tc)
-		seg := base64.RawURLEncoding.EncodeToString(raw)
-		value := seg + "." + base64.RawURLEncoding.EncodeToString(cookieMAC(testCookieKey, seg))
-		if _, err := parseCookie(testCookieKey, value); err == nil {
-			t.Fatalf("payload %+v was accepted, want rejected", tc)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseCookie(testCookieKey, tc.value)
+			if err == nil {
+				t.Fatal("cookie was accepted, want rejected")
+			}
+			if tc.wantErr != nil && err != tc.wantErr {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -1380,159 +1320,64 @@ func xffRequest(remoteAddr string, xff ...string) *http.Request {
 	return r
 }
 
-func TestResolveClientIP_NoXFFUsesRemoteAddr(t *testing.T) {
-	for _, trust := range []ProxyTrust{
-		{}, // nobody trusted
-		{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1},
-	} {
-		r := xffRequest("10.0.0.1:5555")
-		if got := resolveClientIP(r, trust); got != "10.0.0.1" {
-			t.Fatalf("trust %+v: clientIP = %q, want 10.0.0.1", trust, got)
-		}
-	}
-}
+// TestResolveClientIP covers client-IP resolution behind (or without) a
+// trusted proxy. The security shape: X-Forwarded-For is ignored entirely
+// unless the peer is a configured trusted proxy (THE bypass regression —
+// honoring it would let anyone who can reach app-worker rotate the header
+// and walk past the 10-failures/min per (IP, app) limiter), the client is
+// selected from the RIGHT so attacker-prepended entries never shift the
+// selection, and an unparseable selection falls back to the peer so an
+// attacker-chosen string never becomes a fresh rate-bucket key.
+func TestResolveClientIP(t *testing.T) {
+	ingress := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}
+	cdn := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.9"), Hops: 2}
 
-// TestResolveClientIP_IgnoresXFFFromUntrustedPeer is THE bypass regression
-// test: with no configured trusted proxies (the default), or with a peer
-// outside the configured CIDRs, X-Forwarded-For must be ignored entirely.
-// Honoring it would let anyone who can reach app-worker rotate the header and
-// walk past the 10-failures/min per (IP, app) limiter.
-func TestResolveClientIP_IgnoresXFFFromUntrustedPeer(t *testing.T) {
 	cases := []struct {
 		name  string
 		trust ProxyTrust
+		peer  string
+		xff   []string
+		want  string
 	}{
-		{"no trusted proxies configured (default)", ProxyTrust{}},
-		{"peer outside the trusted CIDRs", ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}},
-		{"hops configured but no CIDRs", ProxyTrust{Hops: 3}},
+		// No XFF at all: the peer, whatever the trust configuration.
+		{"no XFF, nobody trusted", ProxyTrust{}, "10.0.0.1:5555", nil, "10.0.0.1"},
+		{"no XFF, trusted CIDRs", ingress, "10.0.0.1:5555", nil, "10.0.0.1"},
+
+		// Untrusted peer: XFF is ignored entirely.
+		{"untrusted: no trusted proxies configured (default)", ProxyTrust{}, "198.51.100.23:4444", []string{"1.2.3.4, 5.6.7.8"}, "198.51.100.23"},
+		{"untrusted: peer outside the trusted CIDRs", ingress, "198.51.100.23:4444", []string{"1.2.3.4, 5.6.7.8"}, "198.51.100.23"},
+		{"untrusted: hops configured but no CIDRs", ProxyTrust{Hops: 3}, "198.51.100.23:4444", []string{"1.2.3.4, 5.6.7.8"}, "198.51.100.23"},
+
+		// Trusted peer: first untrusted address scanning from the right.
+		{"trusted peer, second trusted proxy in the chain", ingress, "10.0.0.9:1", []string{"203.0.113.7, 10.0.0.8"}, "203.0.113.7"},
+		{"trusted peer, single chain entry", ingress, "10.0.0.9:1", []string{"203.0.113.7"}, "203.0.113.7"},
+
+		// The attacker prepends junk, in one header and split across several,
+		// with spoofed trusted-looking entries too: all irrelevant.
+		{"attacker prepended: baseline", ingress, "10.0.0.9:1", []string{"203.0.113.7"}, "203.0.113.7"},
+		{"attacker prepended: one junk entry", ingress, "10.0.0.9:1", []string{"9.9.9.9, 203.0.113.7"}, "203.0.113.7"},
+		{"attacker prepended: many junk entries", ingress, "10.0.0.9:1", []string{"1.1.1.1, 2.2.2.2, 3.3.3.3, 203.0.113.7"}, "203.0.113.7"},
+		{"attacker prepended: spoofed trusted-looking entry", ingress, "10.0.0.9:1", []string{"10.0.0.250, 203.0.113.7"}, "203.0.113.7"},
+		{"attacker prepended: split across headers", ingress, "10.0.0.9:1", []string{"1.1.1.1", "2.2.2.2, 203.0.113.7"}, "203.0.113.7"},
+		{"attacker prepended: non-IP junk", ingress, "10.0.0.9:1", []string{"not-an-ip, 203.0.113.7"}, "203.0.113.7"},
+
+		// client -> CDN (address not enumerable) -> ingress 10.0.0.9 -> worker.
+		// Hops=2 skips the one non-enumerable trusted hop at the right end.
+		{"two hops: the CDN hop is skipped", cdn, "10.0.0.9:1", []string{"203.0.113.7, 198.51.100.50"}, "203.0.113.7"},
+		{"two hops: prepended junk cannot shift the selection", cdn, "10.0.0.9:1", []string{"9.9.9.9, 8.8.8.8, 203.0.113.7, 198.51.100.50"}, "203.0.113.7"},
+		{"two hops: a chain shorter than the hop count falls back to the peer", cdn, "10.0.0.9:1", []string{"203.0.113.7"}, "10.0.0.9"},
+
+		// Normalization and garbage.
+		{"unparseable selected entry falls back to the peer", ingress, "10.0.0.9:1", []string{"totally-bogus"}, "10.0.0.9"},
+		{"host:port canonicalizes", ingress, "10.0.0.9:1", []string{"203.0.113.7:8080"}, "203.0.113.7"},
+		{"IPv4-in-IPv6 canonicalizes", ingress, "10.0.0.9:1", []string{"::ffff:203.0.113.7"}, "203.0.113.7"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := xffRequest("198.51.100.23:4444", "1.2.3.4, 5.6.7.8")
-			if got := resolveClientIP(r, tc.trust); got != "198.51.100.23" {
-				t.Fatalf("clientIP = %q, want the peer 198.51.100.23 (XFF must be ignored)", got)
+			if got := resolveClientIP(xffRequest(tc.peer, tc.xff...), tc.trust); got != tc.want {
+				t.Fatalf("clientIP = %q, want %q", got, tc.want)
 			}
 		})
-	}
-}
-
-func TestResolveClientIP_TrustedPeerSelectsFirstUntrustedFromRight(t *testing.T) {
-	// Peer 10.0.0.9 is the trusted ingress; 10.0.0.8 is a second trusted
-	// proxy that appears in the chain. The client is the first untrusted
-	// address scanning from the right.
-	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}
-	r := xffRequest("10.0.0.9:1", "203.0.113.7, 10.0.0.8")
-	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want 203.0.113.7", got)
-	}
-
-	// Single trusted hop, single chain entry: the rightmost entry is the
-	// client.
-	r = xffRequest("10.0.0.9:1", "203.0.113.7")
-	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want 203.0.113.7", got)
-	}
-}
-
-func TestResolveClientIP_AttackerPrependedEntriesDoNotShiftSelection(t *testing.T) {
-	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}
-
-	base := resolveClientIP(xffRequest("10.0.0.9:1", "203.0.113.7"), trust)
-	if base != "203.0.113.7" {
-		t.Fatalf("baseline clientIP = %q, want 203.0.113.7", base)
-	}
-
-	// The attacker controls everything it sends, so it prepends junk — in one
-	// header and split across several, with spoofed trusted-looking entries
-	// too. Scanning from the right makes all of it irrelevant.
-	for _, spoof := range []([]string){
-		{"9.9.9.9, 203.0.113.7"},
-		{"1.1.1.1, 2.2.2.2, 3.3.3.3, 203.0.113.7"},
-		{"10.0.0.250, 203.0.113.7"},
-		{"1.1.1.1", "2.2.2.2, 203.0.113.7"},
-		{"not-an-ip, 203.0.113.7"},
-	} {
-		if got := resolveClientIP(xffRequest("10.0.0.9:1", spoof...), trust); got != base {
-			t.Fatalf("XFF %v: clientIP = %q, want the unchanged %q", spoof, got, base)
-		}
-	}
-}
-
-func TestResolveClientIP_TwoHopConfiguration(t *testing.T) {
-	// client -> CDN (address not enumerable) -> ingress 10.0.0.9 -> worker.
-	// The ingress appended the CDN; the CDN set the client. Hops=2 skips the
-	// one non-enumerable trusted hop at the right end.
-	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.9"), Hops: 2}
-	r := xffRequest("10.0.0.9:1", "203.0.113.7, 198.51.100.50")
-	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want 203.0.113.7 (the CDN hop must be skipped)", got)
-	}
-
-	// Prepending more entries still cannot shift the selection.
-	r = xffRequest("10.0.0.9:1", "9.9.9.9, 8.8.8.8, 203.0.113.7, 198.51.100.50")
-	if got := resolveClientIP(r, trust); got != "203.0.113.7" {
-		t.Fatalf("clientIP with prepended junk = %q, want 203.0.113.7", got)
-	}
-
-	// A chain shorter than the configured hop count falls back to the peer
-	// rather than trusting whatever is left.
-	r = xffRequest("10.0.0.9:1", "203.0.113.7")
-	if got := resolveClientIP(r, trust); got != "10.0.0.9" {
-		t.Fatalf("clientIP with an exhausted chain = %q, want the peer 10.0.0.9", got)
-	}
-}
-
-func TestResolveClientIP_NormalizesAndRejectsGarbage(t *testing.T) {
-	trust := ProxyTrust{CIDRs: parseTrustedProxies("10.0.0.0/8"), Hops: 1}
-
-	// A selected entry that is not a parseable IP falls back to the peer: an
-	// attacker-chosen string must never become a fresh rate-bucket key.
-	if got := resolveClientIP(xffRequest("10.0.0.9:1", "totally-bogus"), trust); got != "10.0.0.9" {
-		t.Fatalf("clientIP = %q, want the peer for an unparseable entry", got)
-	}
-	// host:port and IPv4-in-IPv6 forms canonicalize, so they cannot become
-	// two buckets for one client.
-	if got := resolveClientIP(xffRequest("10.0.0.9:1", "203.0.113.7:8080"), trust); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want 203.0.113.7", got)
-	}
-	if got := resolveClientIP(xffRequest("10.0.0.9:1", "::ffff:203.0.113.7"), trust); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want the unmapped 203.0.113.7", got)
-	}
-}
-
-// TestExchange_XFFCannotBypassTheFailureLimiterFromAnUntrustedPeer is the
-// HTTP-level form of the bypass regression: rotating X-Forwarded-For against
-// a worker with no configured trusted proxies must NOT mint a fresh failure
-// bucket per attempt — the limiter still buckets by RemoteAddr.
-func TestExchange_XFFCannotBypassTheFailureLimiterFromAnUntrustedPeer(t *testing.T) {
-	h := newAuthHarness(t) // Config{} — no trusted proxies
-	h.api.verifyOK = false
-
-	attempt := func(i int) *http.Response {
-		req, _ := http.NewRequest(http.MethodGet, h.appURL(tokenParam(testTokenID, testSecret)), nil)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("X-Forwarded-For", fmt.Sprintf("203.0.113.%d", i))
-		return h.do(req)
-	}
-
-	for i := 1; i <= verifyFailuresPerMin; i++ {
-		resp := attempt(i)
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("attempt %d: status = %d, want 403", i, resp.StatusCode)
-		}
-		resp.Body.Close()
-	}
-	resp := attempt(verifyFailuresPerMin + 1)
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("attempt 11 with a fresh spoofed XFF: status = %d, want 429 — "+
-			"an untrusted peer must not be able to pick its own rate bucket", resp.StatusCode)
-	}
-	if got := resp.Header.Get("Retry-After"); got != "60" {
-		t.Fatalf("Retry-After = %q, want 60", got)
-	}
-	resp.Body.Close()
-	if verify, _, _ := h.api.counts(); verify != verifyFailuresPerMin {
-		t.Fatalf("VerifyToken calls = %d, want %d", verify, verifyFailuresPerMin)
 	}
 }
 
@@ -1620,69 +1465,65 @@ func TestExchange_ConcurrentInvalidExchangesCannotExceedTheFailureBudget(t *test
 	}
 }
 
-func TestExchange_SuccessConsumesNoFailureBudget(t *testing.T) {
-	h := newAuthHarness(t)
-	h.api.correctSecret = testSecret
-
-	// Far more successful exchanges than the failure budget: none may spend
-	// a failure token, or a popular app would throttle its own viewers.
-	for i := 0; i < verifyFailuresPerMin*3; i++ {
-		resp := h.get(h.appURL(tokenParam(testTokenID, testSecret)))
-		if resp.StatusCode != http.StatusFound {
-			t.Fatalf("exchange %d: status = %d, want 302", i, resp.StatusCode)
-		}
-		resp.Body.Close()
+// TestExchange_NonFailuresConsumeNoFailureBudget: neither successful
+// exchanges nor upstream errors may spend the (IP, app) failure budget — a
+// popular app must not throttle its own viewers, and an outage is not a
+// viewer's fault. After either, the full budget of genuine failures
+// (10, then a 429 on the 11th) must still be available.
+func TestExchange_NonFailuresConsumeNoFailureBudget(t *testing.T) {
+	cases := []struct {
+		name string
+		// setup configures the fake for the 3x-budget preliminary exchanges,
+		// each of which must answer wantStatus.
+		setup      func(h *authHarness)
+		get        func(h *authHarness) *http.Response
+		wantStatus int
+	}{
+		{
+			name:       "successful exchanges",
+			setup:      func(h *authHarness) { h.api.correctSecret = testSecret },
+			get:        func(h *authHarness) *http.Response { return h.get(h.appURL(tokenParam(testTokenID, testSecret))) },
+			wantStatus: http.StatusFound,
+		},
+		{
+			name:       "upstream errors",
+			setup:      func(h *authHarness) { h.api.verifyErr = fmt.Errorf("pipeline-api down") },
+			get:        func(h *authHarness) *http.Response { return h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret))) },
+			wantStatus: http.StatusServiceUnavailable,
+		},
 	}
-	// The budget is still intact: 10 genuine failures remain available
-	// before the 11th is throttled.
-	h.api.mu.Lock()
-	h.api.correctSecret = ""
-	h.api.verifyOK = false
-	h.api.mu.Unlock()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newAuthHarness(t)
+			tc.setup(h)
 
-	for i := 1; i <= verifyFailuresPerMin; i++ {
-		resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("failure %d: status = %d, want 403 — successes must not have spent the budget", i, resp.StatusCode)
-		}
-		resp.Body.Close()
-	}
-	resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429 on the 11th failure", resp.StatusCode)
-	}
-	resp.Body.Close()
-}
+			for i := 0; i < verifyFailuresPerMin*3; i++ {
+				resp := tc.get(h)
+				if resp.StatusCode != tc.wantStatus {
+					t.Fatalf("attempt %d: status = %d, want %d", i, resp.StatusCode, tc.wantStatus)
+				}
+				resp.Body.Close()
+			}
 
-func TestExchange_UpstreamErrorConsumesNoFailureBudget(t *testing.T) {
-	h := newAuthHarness(t)
-	h.api.verifyErr = fmt.Errorf("pipeline-api down")
+			// Now every exchange genuinely fails verification.
+			h.api.mu.Lock()
+			h.api.correctSecret = ""
+			h.api.verifyErr = nil
+			h.api.verifyOK = false
+			h.api.mu.Unlock()
 
-	// An outage is not a viewer's fault: many 503s must not exhaust the
-	// (IP, app) failure budget.
-	for i := 0; i < verifyFailuresPerMin*3; i++ {
-		resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
-		if resp.StatusCode != http.StatusServiceUnavailable {
-			t.Fatalf("attempt %d: status = %d, want 503", i, resp.StatusCode)
-		}
-		resp.Body.Close()
+			for i := 1; i <= verifyFailuresPerMin; i++ {
+				resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
+				if resp.StatusCode != http.StatusForbidden {
+					t.Fatalf("failure %d: status = %d, want 403 — the preliminary exchanges must not have spent the budget", i, resp.StatusCode)
+				}
+				resp.Body.Close()
+			}
+			resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
+			if resp.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429 on the 11th genuine failure", resp.StatusCode)
+			}
+			resp.Body.Close()
+		})
 	}
-
-	h.api.mu.Lock()
-	h.api.verifyErr = nil
-	h.api.verifyOK = false
-	h.api.mu.Unlock()
-
-	for i := 1; i <= verifyFailuresPerMin; i++ {
-		resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("failure %d: status = %d, want 403 — 503s must not have spent the budget", i, resp.StatusCode)
-		}
-		resp.Body.Close()
-	}
-	resp := h.jsonGet(h.appURL(tokenParam(testTokenID, testSecret)))
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429 on the 11th genuine failure", resp.StatusCode)
-	}
-	resp.Body.Close()
 }

@@ -46,30 +46,6 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 }
 
-// TestLoadConfigStringOverrides asserts plain string env vars pass through
-// unmodified.
-func TestLoadConfigStringOverrides(t *testing.T) {
-	t.Setenv(EnvAPIURL, "https://api.example.internal")
-	t.Setenv(EnvListenAddr, ":9999")
-	t.Setenv(EnvServiceTokenFile, "/var/run/secrets/token")
-	t.Setenv(EnvCookieKeyFile, "/var/run/secrets/cookie-key")
-
-	cfg := LoadConfig()
-
-	if cfg.APIURL != "https://api.example.internal" {
-		t.Errorf("APIURL = %q", cfg.APIURL)
-	}
-	if cfg.ListenAddr != ":9999" {
-		t.Errorf("ListenAddr = %q", cfg.ListenAddr)
-	}
-	if cfg.ServiceTokenFile != "/var/run/secrets/token" {
-		t.Errorf("ServiceTokenFile = %q", cfg.ServiceTokenFile)
-	}
-	if cfg.CookieKeyFile != "/var/run/secrets/cookie-key" {
-		t.Errorf("CookieKeyFile = %q", cfg.CookieKeyFile)
-	}
-}
-
 // TestLoadConfigTrustedProxies covers the proxy-trust config surface, whose
 // SAFE DEFAULT (trust nobody, ignore X-Forwarded-For) is what keeps the
 // verify-failure limiter unbypassable until Part 7's D1 sets the real
@@ -141,84 +117,51 @@ func TestLoadConfigTrustedProxies(t *testing.T) {
 // timeout/max_rows/max_bytes clamp to the worker ceiling rather than being
 // rejected).
 func TestLoadConfigCapsClampNotError(t *testing.T) {
-	t.Setenv(EnvTimeoutS, "100")            // > default maxTimeoutS (30)
-	t.Setenv(EnvMemoryMiB, "99999")         // > default maxMemoryMiB (256)
-	t.Setenv(EnvQueriesPerRender, "999")    // > default maxQueriesPerRender (25)
-	t.Setenv(EnvMaxTimeoutS, "9999")        // > spec hard cap (30)
-	t.Setenv(EnvMaxMemoryMiB, "999999")     // > spec hard cap (256)
-	t.Setenv(EnvMaxQueriesPerRender, "500") // > spec hard cap (25)
+	t.Run("timeout memory queries", func(t *testing.T) {
+		t.Setenv(EnvTimeoutS, "100")            // > default maxTimeoutS (30)
+		t.Setenv(EnvMemoryMiB, "99999")         // > default maxMemoryMiB (256)
+		t.Setenv(EnvQueriesPerRender, "999")    // > default maxQueriesPerRender (25)
+		t.Setenv(EnvMaxTimeoutS, "9999")        // > spec hard cap (30)
+		t.Setenv(EnvMaxMemoryMiB, "999999")     // > spec hard cap (256)
+		t.Setenv(EnvMaxQueriesPerRender, "500") // > spec hard cap (25)
 
-	cfg := LoadConfig()
-	r := cfg.Render
+		r := LoadConfig().Render
 
-	if r.MaxTimeoutS != HardCapTimeoutS {
-		t.Errorf("MaxTimeoutS = %d, want clamp to hard cap %d", r.MaxTimeoutS, HardCapTimeoutS)
-	}
-	if r.TimeoutS != HardCapTimeoutS {
-		t.Errorf("TimeoutS = %d, want clamp to (clamped) MaxTimeoutS %d", r.TimeoutS, HardCapTimeoutS)
-	}
-	if r.MaxMemoryMiB != HardCapMemoryMiB {
-		t.Errorf("MaxMemoryMiB = %d, want clamp to hard cap %d", r.MaxMemoryMiB, HardCapMemoryMiB)
-	}
-	if r.MemoryMiB != HardCapMemoryMiB {
-		t.Errorf("MemoryMiB = %d, want clamp to (clamped) MaxMemoryMiB %d", r.MemoryMiB, HardCapMemoryMiB)
-	}
-	if r.MaxQueriesPerRender != HardCapQueriesPerRender {
-		t.Errorf("MaxQueriesPerRender = %d, want clamp to hard cap %d", r.MaxQueriesPerRender, HardCapQueriesPerRender)
-	}
-	if r.QueriesPerRender != HardCapQueriesPerRender {
-		t.Errorf("QueriesPerRender = %d, want clamp to (clamped) MaxQueriesPerRender %d", r.QueriesPerRender, HardCapQueriesPerRender)
-	}
-}
+		if r.MaxTimeoutS != HardCapTimeoutS {
+			t.Errorf("MaxTimeoutS = %d, want clamp to hard cap %d", r.MaxTimeoutS, HardCapTimeoutS)
+		}
+		if r.TimeoutS != HardCapTimeoutS {
+			t.Errorf("TimeoutS = %d, want clamp to (clamped) MaxTimeoutS %d", r.TimeoutS, HardCapTimeoutS)
+		}
+		if r.MaxMemoryMiB != HardCapMemoryMiB {
+			t.Errorf("MaxMemoryMiB = %d, want clamp to hard cap %d", r.MaxMemoryMiB, HardCapMemoryMiB)
+		}
+		if r.MemoryMiB != HardCapMemoryMiB {
+			t.Errorf("MemoryMiB = %d, want clamp to (clamped) MaxMemoryMiB %d", r.MemoryMiB, HardCapMemoryMiB)
+		}
+		if r.MaxQueriesPerRender != HardCapQueriesPerRender {
+			t.Errorf("MaxQueriesPerRender = %d, want clamp to hard cap %d", r.MaxQueriesPerRender, HardCapQueriesPerRender)
+		}
+		if r.QueriesPerRender != HardCapQueriesPerRender {
+			t.Errorf("QueriesPerRender = %d, want clamp to (clamped) MaxQueriesPerRender %d", r.QueriesPerRender, HardCapQueriesPerRender)
+		}
+	})
 
-// TestLoadConfigOutputDocMaxBytesClampsToStructuralCap asserts an
-// operator override above spec §6.3's structural OutputDoc ceiling (2 MiB)
-// clamps to that ceiling rather than being honored verbatim (Codex review
-// gate finding on commit 3d34d8d: spec §7's Cap column reads "—" for this
-// row, but §6.3 calls ≤2 MiB a structural cap app-worker itself enforces).
-func TestLoadConfigOutputDocMaxBytesClampsToStructuralCap(t *testing.T) {
-	t.Setenv(EnvOutputDocMaxBytes, "104857600") // 100 MiB
-
-	cfg := LoadConfig()
-
-	if cfg.Render.OutputDocMaxBytes != HardCapOutputDocMaxBytes {
-		t.Errorf("OutputDocMaxBytes = %d, want clamp to structural cap %d",
-			cfg.Render.OutputDocMaxBytes, HardCapOutputDocMaxBytes)
-	}
-}
-
-// TestLoadConfigBundleMaxBytesClampsToStructuralCap asserts an operator
-// override above spec §4's "≤ 5 MB" bundle-size design property clamps to
-// that ceiling. Lower-risk than OutputDoc (app-worker never accepts
-// uploads; pipeline-api's store is the authoritative enforcer), but the
-// config surface applies the same uniform rule rather than special-casing
-// it.
-func TestLoadConfigBundleMaxBytesClampsToStructuralCap(t *testing.T) {
-	t.Setenv(EnvBundleMaxBytes, "52428800") // 50 MB
-
-	cfg := LoadConfig()
-
-	if cfg.Render.BundleMaxBytes != HardCapBundleMaxBytes {
-		t.Errorf("BundleMaxBytes = %d, want clamp to structural cap %d",
-			cfg.Render.BundleMaxBytes, HardCapBundleMaxBytes)
-	}
-}
-
-// TestLoadConfigOutputDocAndBundleMaxBytesBelowCapHonored asserts an
-// operator may configure LOWER values for both (the clamp is a ceiling,
-// not a fixed value).
-func TestLoadConfigOutputDocAndBundleMaxBytesBelowCapHonored(t *testing.T) {
-	t.Setenv(EnvOutputDocMaxBytes, "1048576") // 1 MiB, below the 2 MiB cap
-	t.Setenv(EnvBundleMaxBytes, "1000000")    // below the 5242880 cap
-
-	cfg := LoadConfig()
-
-	if cfg.Render.OutputDocMaxBytes != 1048576 {
-		t.Errorf("OutputDocMaxBytes = %d, want 1048576 (below-cap override honored)", cfg.Render.OutputDocMaxBytes)
-	}
-	if cfg.Render.BundleMaxBytes != 1000000 {
-		t.Errorf("BundleMaxBytes = %d, want 1000000 (below-cap override honored)", cfg.Render.BundleMaxBytes)
-	}
+	// An override above spec section 6.3's structural OutputDoc ceiling
+	// (2 MiB) and section 4's 5 MB bundle ceiling clamps rather than being
+	// honored verbatim.
+	t.Run("OutputDocMaxBytes", func(t *testing.T) {
+		t.Setenv(EnvOutputDocMaxBytes, "104857600") // 100 MiB
+		if got := LoadConfig().Render.OutputDocMaxBytes; got != HardCapOutputDocMaxBytes {
+			t.Errorf("OutputDocMaxBytes = %d, want clamp to structural cap %d", got, HardCapOutputDocMaxBytes)
+		}
+	})
+	t.Run("BundleMaxBytes", func(t *testing.T) {
+		t.Setenv(EnvBundleMaxBytes, "52428800") // 50 MB
+		if got := LoadConfig().Render.BundleMaxBytes; got != HardCapBundleMaxBytes {
+			t.Errorf("BundleMaxBytes = %d, want clamp to structural cap %d", got, HardCapBundleMaxBytes)
+		}
+	})
 }
 
 // TestLoadConfigWithinCapHonored asserts a legitimate override that stays

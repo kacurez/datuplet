@@ -320,7 +320,8 @@ func TestRenderHappyPath(t *testing.T) {
 	api := newFakeRenderAPI([]byte(appendixABundle))
 	s := newRenderServer(t, api)
 
-	doc, rerr := s.render(context.Background(), testResolved(testAppID), "/",
+	ctx := withRequestID(context.Background(), "req-42")
+	doc, rerr := s.render(ctx, testResolved(testAppID), "/",
 		map[string]string{"region": "NA"}, testPrincipal())
 	if rerr != nil {
 		t.Fatalf("render error: %+v", rerr)
@@ -392,8 +393,8 @@ func TestRenderHappyPath(t *testing.T) {
 	if rec.PrincipalKind != principalKindViewerToken || rec.PrincipalID != "tok-1" {
 		t.Errorf("log principal = %q/%q", rec.PrincipalKind, rec.PrincipalID)
 	}
-	if rec.RequestID == "" {
-		t.Error("log record has no request_id")
+	if rec.RequestID != "req-42" {
+		t.Errorf("log request_id = %q, want the context's req-42", rec.RequestID)
 	}
 	if rec.StartedAt.IsZero() {
 		t.Error("log record has no started_at")
@@ -403,20 +404,6 @@ func TestRenderHappyPath(t *testing.T) {
 	}
 	if rec.Error != "" {
 		t.Errorf("error = %q, want empty on success", rec.Error)
-	}
-}
-
-func TestRenderUsesRequestIDFromContext(t *testing.T) {
-	api := newFakeRenderAPI([]byte(docOnlyBundle))
-	s := newRenderServer(t, api)
-
-	ctx := withRequestID(context.Background(), "req-42")
-	if _, rerr := s.render(ctx, testResolved(testAppID), "/", nil, testPrincipal()); rerr != nil {
-		t.Fatalf("render error: %+v", rerr)
-	}
-	_, _, logs := api.snapshot()
-	if len(logs) != 1 || logs[0].RequestID != "req-42" {
-		t.Fatalf("log request_id = %+v, want req-42", logs)
 	}
 }
 
@@ -439,47 +426,47 @@ func TestRenderWithoutQueriesDoesNotImpersonate(t *testing.T) {
 	}
 }
 
-// Two renders must mint two DIFFERENT tokens — never a cached one (P4 made the
-// jti cryptographically random precisely so concurrent renders are
-// individually attributable in query_audit).
-func TestRenderMintsAFreshTokenPerRender(t *testing.T) {
-	api := newFakeRenderAPI([]byte(appendixABundle))
-	s := newRenderServer(t, api)
-
-	for i := 0; i < 2; i++ {
-		if _, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal()); rerr != nil {
-			t.Fatalf("render %d error: %+v", i, rerr)
-		}
-	}
-	impersonations, queries, _ := api.snapshot()
-	if impersonations != 2 {
-		t.Errorf("Impersonate calls = %d, want 2 (one per render)", impersonations)
-	}
-	if len(queries) != 2 || queries[0].JWT == queries[1].JWT {
-		t.Errorf("query JWTs = %q/%q, want two distinct fresh mints", queries[0].JWT, queries[1].JWT)
-	}
-}
-
-// A render making several queries mints ONCE — the token is scoped to this
-// render and lives 60s, so re-minting per query would multiply audited mints
-// for no security gain.
-func TestRenderMintsOncePerRenderAcrossQueries(t *testing.T) {
-	bundle := []byte(`var __dtp_app = { render: async () => {
+// Every render mints its OWN impersonation token (never a cached one — P4
+// made the jti cryptographically random precisely so concurrent renders are
+// individually attributable in query_audit), but a render making several
+// queries mints ONCE: the token is scoped to this render and lives 60s, so
+// re-minting per query would multiply audited mints for no security gain.
+func TestRenderMintsOncePerRender(t *testing.T) {
+	threeQueries := `var __dtp_app = { render: async () => {
 		for (let i = 0; i < 3; i++) { await datuplet.query("SELECT " + i); }
 		return { outputDoc: 1, title: "t", blocks: [{ id: "a", type: "markdown", text: "ok" }] };
-	}};`)
-	api := newFakeRenderAPI(bundle)
-	s := newRenderServer(t, api)
+	}};`
+	cases := []struct {
+		name            string
+		bundle          string
+		renders         int
+		wantImpersonate int
+		wantQueries     int
+	}{
+		{"two renders mint two distinct fresh tokens", appendixABundle, 2, 2, 2},
+		{"several queries in one render mint once", threeQueries, 1, 1, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newFakeRenderAPI([]byte(tc.bundle))
+			s := newRenderServer(t, api)
 
-	if _, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal()); rerr != nil {
-		t.Fatalf("render error: %+v", rerr)
-	}
-	impersonations, queries, _ := api.snapshot()
-	if impersonations != 1 {
-		t.Errorf("Impersonate calls = %d, want 1", impersonations)
-	}
-	if len(queries) != 3 {
-		t.Errorf("Query calls = %d, want 3", len(queries))
+			for i := 0; i < tc.renders; i++ {
+				if _, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal()); rerr != nil {
+					t.Fatalf("render %d error: %+v", i, rerr)
+				}
+			}
+			impersonations, queries, _ := api.snapshot()
+			if impersonations != tc.wantImpersonate {
+				t.Errorf("Impersonate calls = %d, want %d", impersonations, tc.wantImpersonate)
+			}
+			if len(queries) != tc.wantQueries {
+				t.Fatalf("Query calls = %d, want %d", len(queries), tc.wantQueries)
+			}
+			if tc.renders > 1 && queries[0].JWT == queries[1].JWT {
+				t.Errorf("query JWTs = %q/%q, want two distinct fresh mints", queries[0].JWT, queries[1].JWT)
+			}
+		})
 	}
 }
 
@@ -511,43 +498,57 @@ func TestRenderQueryErrorCaughtByApp(t *testing.T) {
 	}
 }
 
-func TestRenderQueryTransportFailureIsUnavailable(t *testing.T) {
-	api := newFakeRenderAPI([]byte(kindEchoBundle))
-	api.queryFn = func(context.Context, string, string, []byte) (*http.Response, error) {
-		return nil, fmt.Errorf("dial tcp: connection refused")
+func TestRenderQueryInfraFailureIsUnavailable(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(api *fakeRenderAPI)
+		// check asserts the case-specific consequence on top of the shared
+		// "guest sees kind=unavailable" contract.
+		check func(t *testing.T, d renderedDoc, api *fakeRenderAPI)
+	}{
+		{
+			name: "query transport failure",
+			setup: func(api *fakeRenderAPI) {
+				api.queryFn = func(context.Context, string, string, []byte) (*http.Response, error) {
+					return nil, fmt.Errorf("dial tcp: connection refused")
+				}
+			},
+			check: func(t *testing.T, d renderedDoc, _ *fakeRenderAPI) {
+				// The guest must not learn app-worker's internal topology from the error.
+				if got := blockText(t, d, "m"); strings.Contains(got, "dial tcp") {
+					t.Errorf("guest message leaks transport detail: %q", got)
+				}
+			},
+		},
+		{
+			name: "impersonate failure (a 401 means OUR credential is wrong)",
+			setup: func(api *fakeRenderAPI) {
+				api.impersonateErr = &APIError{StatusCode: http.StatusUnauthorized, Kind: "unauthorized", Message: "bad service credential"}
+			},
+			check: func(t *testing.T, _ renderedDoc, api *fakeRenderAPI) {
+				_, queries, _ := api.snapshot()
+				if len(queries) != 0 {
+					t.Errorf("Query calls = %d, want 0 — no credential, no call", len(queries))
+				}
+			},
+		},
 	}
-	s := newRenderServer(t, api)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newFakeRenderAPI([]byte(kindEchoBundle))
+			tc.setup(api)
+			s := newRenderServer(t, api)
 
-	doc, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
-	if rerr != nil {
-		t.Fatalf("render error: %+v", rerr)
-	}
-	d := decodeDoc(t, doc)
-	if got := blockText(t, d, "k"); got != "kind=unavailable" {
-		t.Errorf("guest kind = %q, want unavailable", got)
-	}
-	// The guest must not learn app-worker's internal topology from the error.
-	if got := blockText(t, d, "m"); strings.Contains(got, "dial tcp") {
-		t.Errorf("guest message leaks transport detail: %q", got)
-	}
-}
-
-func TestRenderImpersonateFailureIsUnavailable(t *testing.T) {
-	api := newFakeRenderAPI([]byte(kindEchoBundle))
-	api.impersonateErr = &APIError{StatusCode: http.StatusUnauthorized, Kind: "unauthorized", Message: "bad service credential"}
-	s := newRenderServer(t, api)
-
-	doc, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
-	if rerr != nil {
-		t.Fatalf("render error: %+v", rerr)
-	}
-	d := decodeDoc(t, doc)
-	if got := blockText(t, d, "k"); got != "kind=unavailable" {
-		t.Errorf("guest kind = %q, want unavailable (a 401 means OUR credential is wrong)", got)
-	}
-	_, queries, _ := api.snapshot()
-	if len(queries) != 0 {
-		t.Errorf("Query calls = %d, want 0 — no credential, no call", len(queries))
+			doc, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
+			if rerr != nil {
+				t.Fatalf("render error: %+v", rerr)
+			}
+			d := decodeDoc(t, doc)
+			if got := blockText(t, d, "k"); got != "kind=unavailable" {
+				t.Errorf("guest kind = %q, want unavailable", got)
+			}
+			tc.check(t, d, api)
+		})
 	}
 }
 
@@ -910,36 +911,22 @@ func TestRenderInvalidDocIsRenderError(t *testing.T) {
 // 8. Chart specs: vegaspec.Validate must run on EVERY chart block
 // ---------------------------------------------------------------------------
 
-func TestRenderRejectsChartDataURLByPointer(t *testing.T) {
-	bundle := []byte(`var __dtp_app = { render: () => ({
-		outputDoc: 1, title: "t", blocks: [
-			{ id: "c", type: "chart", library: "vega-lite",
-			  spec: { mark: "bar", data: { url: "https://evil.example/x.json" } } }] }) };`)
-	api := newFakeRenderAPI(bundle)
-	s := newRenderServer(t, api)
-
-	doc, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
-	if rerr == nil {
-		t.Fatalf("data.url chart was ACCEPTED — the Vega subset is a security boundary\ndoc: %s", doc)
-	}
-	if rerr.Kind != string(errKindRenderError) {
-		t.Errorf("kind = %q, want render_error", rerr.Kind)
-	}
-	if !strings.Contains(rerr.Msg, "/blocks/0/spec") {
-		t.Errorf("msg = %q, want the offending JSON pointer", rerr.Msg)
-	}
-	if !strings.Contains(rerr.Msg, "url") {
-		t.Errorf("msg = %q, want the offending key named", rerr.Msg)
-	}
-}
-
-// A chart nested inside a tab, and one inside a modal, must be validated too —
-// otherwise a one-line nesting change smuggles an unvalidated spec through.
+// A chart with a data.url must be rejected wherever it sits: top level, inside
+// a tab, a block modal or a table-row modal — otherwise a one-line nesting
+// change smuggles an unvalidated spec through. The Vega subset is a security
+// boundary.
 func TestRenderValidatesNestedChartSpecs(t *testing.T) {
 	cases := map[string]struct {
 		bundle  string
 		pointer string
 	}{
+		"top level": {
+			bundle: `var __dtp_app = { render: () => ({
+				outputDoc: 1, title: "t", blocks: [
+					{ id: "c", type: "chart", library: "vega-lite",
+					  spec: { mark: "bar", data: { url: "https://evil.example/x.json" } } }] }) };`,
+			pointer: "/blocks/0/spec",
+		},
 		"inside a tab": {
 			bundle: `var __dtp_app = { render: () => ({
 				outputDoc: 1, title: "t", blocks: [
@@ -973,10 +960,16 @@ func TestRenderValidatesNestedChartSpecs(t *testing.T) {
 			s := newRenderServer(t, api)
 			doc, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
 			if rerr == nil {
-				t.Fatalf("nested data.url chart was ACCEPTED\ndoc: %s", doc)
+				t.Fatalf("data.url chart was ACCEPTED\ndoc: %s", doc)
+			}
+			if rerr.Kind != string(errKindRenderError) {
+				t.Errorf("kind = %q, want render_error", rerr.Kind)
 			}
 			if !strings.Contains(rerr.Msg, tc.pointer) {
-				t.Errorf("msg = %q, want pointer %q", rerr.Msg, tc.pointer)
+				t.Errorf("msg = %q, want the offending JSON pointer %q", rerr.Msg, tc.pointer)
+			}
+			if !strings.Contains(rerr.Msg, "url") {
+				t.Errorf("msg = %q, want the offending key named", rerr.Msg)
 			}
 		})
 	}
@@ -1008,25 +1001,52 @@ func TestRenderAcceptsValidChartSpec(t *testing.T) {
 
 func TestRenderClampsRefreshInterval(t *testing.T) {
 	cases := []struct {
-		name string
-		in   string
-		want int
+		name   string
+		bundle []byte
+		want   int
+		// wantErr marks a value that cannot be clamped: it must reach the
+		// validator and fail the render rather than being silently coerced.
+		wantErr bool
+		// check adds case-specific assertions on the rendered doc.
+		check func(t *testing.T, d renderedDoc)
 	}{
-		{"below the floor", "5", refreshIntervalMinS},
-		{"zero", "0", refreshIntervalMinS},
-		{"negative", "-30", refreshIntervalMinS},
-		{"above the ceiling", "99999", refreshIntervalMaxS},
-		{"in range is untouched", "60", 60},
-		{"at the floor", "15", 15},
-		{"at the ceiling", "3600", 3600},
+		{name: "below the floor", bundle: refreshBundle("5"), want: refreshIntervalMinS},
+		{name: "zero", bundle: refreshBundle("0"), want: refreshIntervalMinS},
+		{name: "negative", bundle: refreshBundle("-30"), want: refreshIntervalMinS},
+		{name: "above the ceiling", bundle: refreshBundle("99999"), want: refreshIntervalMaxS},
+		{name: "in range is untouched", bundle: refreshBundle("60"), want: 60},
+		{name: "at the floor", bundle: refreshBundle("15"), want: 15},
+		{name: "at the ceiling", bundle: refreshBundle("3600"), want: 3600},
+		{
+			name: "other fields are left intact",
+			bundle: []byte(`var __dtp_app = { render: () => ({
+		outputDoc: 1, title: "Ünïcode <b>&</b> title", refreshInterval: 1,
+		blocks: [{ id: "a", type: "markdown", text: "a<b>&c" }] }) };`),
+			want: refreshIntervalMinS,
+			check: func(t *testing.T, d renderedDoc) {
+				if d.Title != "Ünïcode <b>&</b> title" {
+					t.Errorf("title mangled by the clamp rewrite: %q", d.Title)
+				}
+				if got := blockText(t, d, "a"); got != "a<b>&c" {
+					t.Errorf("block text mangled by the clamp rewrite: %q", got)
+				}
+			},
+		},
+		{name: "non-integer is rejected, not coerced", bundle: refreshBundle(`"soon"`), wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			api := newFakeRenderAPI(refreshBundle(tc.in))
+			api := newFakeRenderAPI(tc.bundle)
 			s := newRenderServer(t, api)
 			doc, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
+			if tc.wantErr {
+				if rerr == nil || rerr.Kind != string(errKindRenderError) {
+					t.Fatalf("rerr = %+v, want render_error", rerr)
+				}
+				return
+			}
 			if rerr != nil {
-				t.Fatalf("refreshInterval %s failed the render (spec says CLAMP): %+v", tc.in, rerr)
+				t.Fatalf("refreshInterval failed the render (spec says CLAMP): %+v", rerr)
 			}
 			d := decodeDoc(t, doc)
 			if d.RefreshInterval == nil {
@@ -1035,45 +1055,14 @@ func TestRenderClampsRefreshInterval(t *testing.T) {
 			if *d.RefreshInterval != tc.want {
 				t.Errorf("refreshInterval = %d, want %d", *d.RefreshInterval, tc.want)
 			}
+			if tc.check != nil {
+				tc.check(t, d)
+			}
 			// The clamped doc must still be a valid OutputDoc.
 			if err := outputdoc.Validate(doc); err != nil {
 				t.Errorf("clamped doc fails validation: %v\ndoc: %s", err, doc)
 			}
 		})
-	}
-}
-
-func TestRenderLeavesOtherFieldsIntactWhenClamping(t *testing.T) {
-	bundle := []byte(`var __dtp_app = { render: () => ({
-		outputDoc: 1, title: "Ünïcode <b>&</b> title", refreshInterval: 1,
-		blocks: [{ id: "a", type: "markdown", text: "a<b>&c" }] }) };`)
-	api := newFakeRenderAPI(bundle)
-	s := newRenderServer(t, api)
-
-	doc, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
-	if rerr != nil {
-		t.Fatalf("render error: %+v", rerr)
-	}
-	d := decodeDoc(t, doc)
-	if d.Title != "Ünïcode <b>&</b> title" {
-		t.Errorf("title mangled by the clamp rewrite: %q", d.Title)
-	}
-	if got := blockText(t, d, "a"); got != "a<b>&c" {
-		t.Errorf("block text mangled by the clamp rewrite: %q", got)
-	}
-	if d.RefreshInterval == nil || *d.RefreshInterval != refreshIntervalMinS {
-		t.Errorf("refreshInterval = %v, want %d", d.RefreshInterval, refreshIntervalMinS)
-	}
-}
-
-// A non-integer refreshInterval cannot be clamped; it must reach the validator
-// rather than being silently coerced.
-func TestRenderNonIntegerRefreshIntervalIsRejected(t *testing.T) {
-	api := newFakeRenderAPI(refreshBundle(`"soon"`))
-	s := newRenderServer(t, api)
-	_, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
-	if rerr == nil || rerr.Kind != string(errKindRenderError) {
-		t.Fatalf("rerr = %+v, want render_error", rerr)
 	}
 }
 
@@ -1256,26 +1245,45 @@ func TestPerAppGateIsKeyedPerApp(t *testing.T) {
 // Bundle fetch + configuration failures
 // ---------------------------------------------------------------------------
 
-func TestRenderBundleFetchFailureIsUnavailable(t *testing.T) {
-	api := newFakeRenderAPI([]byte(docOnlyBundle))
-	api.bundleErr = fmt.Errorf("boom")
-	s := newRenderServer(t, api)
-
-	_, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
-	if rerr == nil || rerr.Kind != string(errKindUnavailable) {
-		t.Fatalf("rerr = %+v, want unavailable (spec §8: bundle fetch failure)", rerr)
+func TestRenderUnwiredOrBundleFetchFailureIsUnavailable(t *testing.T) {
+	cases := []struct {
+		name string
+		// run returns the render error and the API whose log to inspect (nil
+		// when the render path is unwired and nothing is logged).
+		run func(t *testing.T) (*appengine.RenderError, *fakeRenderAPI)
+	}{
+		{
+			name: "bundle fetch failure (spec §8)",
+			run: func(t *testing.T) (*appengine.RenderError, *fakeRenderAPI) {
+				api := newFakeRenderAPI([]byte(docOnlyBundle))
+				api.bundleErr = fmt.Errorf("boom")
+				s := newRenderServer(t, api)
+				_, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
+				return rerr, api
+			},
+		},
+		{
+			name: "render path unwired (no API)",
+			run: func(t *testing.T) (*appengine.RenderError, *fakeRenderAPI) {
+				s := NewServer(Config{Render: renderConfig()}, testEngine(t))
+				_, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
+				return rerr, nil
+			},
+		},
 	}
-	_, _, logs := api.snapshot()
-	if len(logs) != 1 || logs[0].Outcome != string(errKindUnavailable) {
-		t.Errorf("logged outcome = %+v, want unavailable", logs)
-	}
-}
-
-func TestRenderWithoutAPIIsUnavailable(t *testing.T) {
-	s := NewServer(Config{Render: renderConfig()}, testEngine(t))
-	_, rerr := s.render(context.Background(), testResolved(testAppID), "/", nil, testPrincipal())
-	if rerr == nil || rerr.Kind != string(errKindUnavailable) {
-		t.Fatalf("rerr = %+v, want unavailable when the render path is unwired", rerr)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rerr, api := tc.run(t)
+			if rerr == nil || rerr.Kind != string(errKindUnavailable) {
+				t.Fatalf("rerr = %+v, want unavailable", rerr)
+			}
+			if api != nil {
+				_, _, logs := api.snapshot()
+				if len(logs) != 1 || logs[0].Outcome != string(errKindUnavailable) {
+					t.Errorf("logged outcome = %+v, want unavailable", logs)
+				}
+			}
+		})
 	}
 }
 
