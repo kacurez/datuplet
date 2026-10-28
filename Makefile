@@ -57,7 +57,6 @@ build-components: build-gateway ## Build all component Docker images
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
 	docker build -t datuplet/finnhub-extractor:latest -f components/finnhub-extractor/Dockerfile .
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
-#   docker build -t datuplet/pandas-transform:latest -f components/pandas-transform/Dockerfile .
 
 # E2E-only component subset: skips finnhub-extractor (no scenario references it).
 # Keeps gateway as a build dep (sidecar is required for every run). RFC 010
@@ -97,7 +96,7 @@ build-component-data-generator: ## Build data-generator component image
 # and tag them datuplet/<name>:$(COMPONENT_TAG) — present in the local Docker
 # daemon, no GHCR pull. Runtime pull policy is IfNotPresent (the operator's
 # DATUPLET_RUNTIME_PULL_POLICY, wired from image.pullPolicy), so a local tag is
-# all K8s needs. Skips pandas-transform (no build wired anywhere yet).
+# all K8s needs.
 COMPONENT_TAG ?= v0.13.3
 
 # Namespace for the k8s-* developer-loop targets (deploy-local installs
@@ -357,11 +356,6 @@ clean-go-git-cache: ## Free disk space (Go build/test/fuzz cache + git gc; prese
 # Discovers modules dynamically rather than hardcoding paths so a new
 # components/*/ or sdk/*/ module doesn't silently get missed.
 #
-# tests/integration/go.mod is excluded: its go.mod is missing a
-# `replace github.com/datuplet/datuplet/sdk/go => ../../sdk/go` directive
-# and won't tidy until that's fixed. It is NOT run in CI today (see
-# .github/workflows/e2e.yml — only tests/e2e is exercised). Tracked as
-# a pre-existing repo cleanup, not blocking this PR.
 tidy: ## Run go mod tidy across every go.mod in the monorepo
 	@echo "Tidying root..."
 	@go mod tidy
@@ -370,13 +364,12 @@ tidy: ## Run go mod tidy across every go.mod in the monorepo
 	@# the tidy loop. Excluding .git / node_modules / vendor is hygiene.
 	@for mod in $$(find . -name go.mod -not -path ./go.mod \
 	    -not -path './.git/*' -not -path './node_modules/*' \
-	    -not -path './vendor/*' -not -path './.claude/*' \
-	    -not -path './tests/integration/go.mod'); do \
+	    -not -path './vendor/*' -not -path './.claude/*'); do \
 	  dir=$$(dirname $$mod); \
 	  echo "Tidying $$dir..."; \
 	  (cd $$dir && go mod tidy) || exit 1; \
 	done
-	@echo "✓ all modules tidy (tests/integration intentionally skipped)"
+	@echo "✓ all modules tidy"
 
 # RFC 027 §4.1: components/<name>/schema.json is the source of truth for
 # each built-in's configSchema; the chart templates read the synced copy via

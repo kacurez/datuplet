@@ -13,9 +13,7 @@ components/<name>/
 └── go.sum
 ```
 
-Python components follow the same shape (`main.py`, `pyproject.toml`,
-`schema.json`, `Dockerfile`) against `sdk/python`. Copy the closest existing
-component and edit — don't start from a blank file.
+Copy the closest existing component and edit — don't start from a blank file.
 
 ## The SDK contract (Go — `github.com/datuplet/datuplet/sdk/go`)
 
@@ -44,8 +42,7 @@ tables, write output tables, log, and signal status.
   - `sdk.ExitAppError("failed to connect to gateway: ...")` → exit **≥20**
     (FailedApplication).
   These print the `DUPLET_STATUS_MESSAGE:` prefix and exit with the contract code
-  so the run surfaces the right phase + message. (Python: `sdk/python/status.py`
-  → `fail_user()` / `fail_application()`.)
+  so the run surfaces the right phase + message.
 
 ## Minimal skeletons
 

@@ -26,7 +26,6 @@ component can sit in a pipeline:
 | `sql-transform` | required / required | Run user SQL in an embedded DuckDB engine over the input tables and write result tables. Credentials-clean. **The workhorse for transform/aggregate/join.** | `sql` (required): `CREATE TABLE <out> AS SELECT …` |
 | `finnhub-extractor` | none / required | Fetch market data (quotes, news, financials, earnings, …) from the Finnhub API. | `mode` (required); `apiKey` (secret → `$[finnhub_key]`); `symbols`, `category`, `lookback_days`, `limit` |
 | `stdout-writer` | required / none | Read input tables and print to stdout. **Debugging only — no storage output.** | (minimal) |
-| `pandas-transform` | required / required | Apply a sequence of pandas ops (filter/select/sort/rename/drop/fillna). May not be enabled on every deployment — check `components list`. | operation list |
 
 ## Choosing components for a goal
 

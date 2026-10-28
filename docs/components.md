@@ -9,9 +9,7 @@ read its `schema.json` directly (pointers below) or fetch it live:
 datuplet components get <name> --schema
 ```
 
-Datuplet ships six built-in components — five with published images, plus
-`pandas-transform`, which exists as a ComponentDefinition template but has no
-published image yet (see its section below). Each runs as an ordinary
+Datuplet ships five built-in components. Each runs as an ordinary
 container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
@@ -24,8 +22,7 @@ chart's `components.tag` (the release version; `v0.12.1` in this release).
 
 - `components/<name>/schema.json` — JSON Schema draft 2020-12, one per
   component, next to the code that parses the config. Schema and parser are
-  authored and updated together, in the same commit — a plain file works
-  identically for Go components and for `pandas-transform` (Python).
+  authored and updated together, in the same commit.
 - `make sync-component-schemas` copies each into
   `charts/datuplet-app/files/component-schemas/<name>.json`; the
   ComponentDefinition templates read them via `.Files.Get` rather than
@@ -126,8 +123,8 @@ type ComponentIO struct {
   kind of component this is (extractor / transform / writer), which is
   identity, not per-version behavior.
 - Built-in IO declarations: data-generator / http-json-extractor /
-  finnhub-extractor are `{none, required}`; sql-transform / pandas-transform
-  are `{required, required}`; stdout-writer is `{required, none}`.
+  finnhub-extractor are `{none, required}`; sql-transform
+  is `{required, required}`; stdout-writer is `{required, none}`.
 
 ## What schema validation cannot catch
 
@@ -401,34 +398,6 @@ the component.
 
 ---
 
-## pandas-transform
-
-> **Not yet shipped.** No image is published for this component (it's absent
-> from `_release-components.yml` and `docker-build-k8s`), so its
-> ComponentDefinition template is disabled by default
-> (`components.enablePandasTransform: false`, RFC 024 T6.3) until an image
-> exists.
-
-Applies a sequence of pandas operations to input data. Reads the input table as
-CSV from the Data Gateway, applies the operations in order, and writes the
-result back as CSV — no S3 or Lakekeeper credentials touch the component.
-
-**Image:** `ghcr.io/kacurez/pandas-transform:v0.12.1` · **Registry name:**
-`pandas-transform` · **IO:** `{inputs: required, outputs: required}`
-
-**Config schema:** [`components/pandas-transform/schema.json`](../components/pandas-transform/schema.json)
-(`x-datuplet-produces: "output_table"`).
-
-**Supported operations (applied in order):** `filter`, `select`, `sort`,
-`rename`, `drop`, `fillna` — see the schema's `operations[].type` enum and
-per-type `x-datuplet-doc` for fields.
-
-Only one input table is read (the first entry under `inputs.tables`). Unknown
-operation types and references to missing columns are logged as warnings and
-skipped rather than failing the run.
-
----
-
 ## stdout-writer
 
 Reads input tables and prints them to stdout. For debugging only — no Iceberg
@@ -481,8 +450,8 @@ kubectl logs -n datuplet <pod-name> -c component
 
 ## Writing your own component
 
-Use the Go SDK (`sdk/go/`) or Python SDK (`sdk/python/`) to build a component.
-Both SDKs are ~200–300 LOC and expose three operations: `OpenWriter`,
+Use the Go SDK (`sdk/go/`) to build a component.
+The SDK is ~200–300 LOC and exposes three operations: `OpenWriter`,
 `WriteChunk` / `Write`, and `Close`. The SDKs handle gRPC connection, config
 resolution, and secret delivery from the Data Gateway sidecar.
 
@@ -514,5 +483,4 @@ above, and register it as a `ComponentDefinition` with the appropriate `io`
 capability — see any built-in's chart template under
 `charts/datuplet-app/templates/components/` for the shape.
 
-See [`sdk/go/client.go`](../sdk/go/client.go) and
-[`sdk/python/client.py`](../sdk/python/client.py) for the entry points.
+See [`sdk/go/client.go`](../sdk/go/client.go) for the entry points.

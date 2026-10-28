@@ -85,7 +85,7 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
 - Four-chart Helm install: `datuplet-operators`, `datuplet-infra`, `datuplet-app`,
   `datuplet-lakekeeper` — each with its own upgrade cadence.
 - Streaming ETL via a Data Gateway sidecar (gRPC control + HTTP data) with
-  thin Go and Python SDKs.
+  a thin Go SDK.
 - Apache Iceberg table format on top of S3 / GCS / bundled MinIO.
 - `pipeline-api` HTTP control plane and browser UI for pipelines, runs, secrets,
   storage browse, and the registry-driven component catalog.

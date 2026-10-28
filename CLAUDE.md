@@ -18,8 +18,8 @@ behalf of each component, so component SDKs stay ~300 LOC per language.
 Data Gateway passes whatever URL it gets back verbatim; only the backend
 layer interprets URLs.
 
-Primary languages: Go (backend, operators, CLI), Python (SDK + a few
-scripts), YAML (K8s manifests), Shell (automation). TypeScript only in
+Primary languages: Go (backend, operators, CLI), YAML (K8s manifests),
+Shell (automation). TypeScript only in
 the browser UI.
 
 ## Commands
@@ -340,8 +340,7 @@ These are conventions a new contributor wouldn't infer from the code:
   only, signs viewer session cookies).
 - **Monorepo `go mod tidy`**: the repo has multiple Go modules
   (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`,
-  `utils/docker/install-duckdb-ext/`; `tests/integration/` is a parked
-  pre-RFC-021 module that `make tidy` and CI both skip).
+  `utils/docker/install-duckdb-ext/`).
   Tidying root in isolation drifts the others —
   their Docker builds + e2e enforce parity and fail CI. Always run
   `make tidy` (covers every module).
@@ -370,8 +369,7 @@ These are conventions a new contributor wouldn't infer from the code:
 | `pkg/appengine/` | WASM render engine — wazero host + QuickJS guest (`embed/engine.wasm`), OutputDoc/Vega-Lite-subset schema validation (RFC 028). |
 | `pkg/appworker/` | app-worker HTTP service: viewer/platform auth, render dispatch via `pkg/appengine`, render logs, rate limits (RFC 028). |
 | `pkg/lib/datalake/` | Metadata-only fallback I/O. NOT the data plane. |
-| `sdk/go/`, `sdk/python/` | Thin SDKs (~200 LOC each). |
-| `sdk/python-sandbox/` | Sandbox library (DuckDB + pre-signed URLs). |
+| `sdk/go/` | Thin Go SDK (~200 LOC). |
 | `components/` | Built-in extractors, transforms, writers. |
 | `ui/product/` | Browser SPA (vanilla ES modules). |
 | `ui/appshell/` | Viewer-facing shell app-worker serves alongside a render (OutputDoc → DOM, Vega-Lite embed, DOMPurify/marked) — distinct from `ui/product/`'s author-facing SPA (RFC 028). |

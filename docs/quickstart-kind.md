@@ -94,10 +94,6 @@ done
   -f-app tests/local/values-local-app.yaml
 ```
 
-Note: the chart ships a sixth built-in, `pandas-transform`, with no local build
-target yet — don't use it on a local/kind cluster (it will ImagePullBackOff); the
-five built-ins above, including `http-json-extractor` used by the example, work fine.
-
 `tests/local/values-local-app.yaml` sets `image.pullPolicy=IfNotPresent` (so
 kubelet uses the kind-loaded image instead of trying to pull a non-existent
 `datuplet/*:latest` from Docker Hub) and `components.registry=datuplet` (so the
