@@ -37,48 +37,49 @@ func TestMintQueryToken_Success(t *testing.T) {
 	}
 }
 
-func TestMintQueryToken_PolicyOff(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"error":"client-side query disabled; use the server query service","kind":"forbidden"}`))
-	}))
-	defer srv.Close()
-
-	_, err := mintQueryToken(context.Background(), srv.URL, "tok")
-	if err == nil {
-		t.Fatalf("expected error on 403 policy-off")
+func TestMintQueryToken_Errors(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		// wantSubstr, when set, must appear in the error.
+		wantSubstr string
+	}{
+		{
+			// The clear refusal message must surface (not a generic crash).
+			name:       "policy off 403 surfaces message",
+			status:     http.StatusForbidden,
+			body:       `{"error":"client-side query disabled; use the server query service","kind":"forbidden"}`,
+			wantSubstr: "client-side query disabled",
+		},
+		{
+			name:       "server error carries status",
+			status:     http.StatusInternalServerError,
+			body:       `{"error":"boom","kind":"internal"}`,
+			wantSubstr: "500",
+		},
+		{
+			name:   "empty token in 200 body",
+			status: http.StatusOK,
+			body:   `{"token":"","expires_at":"2099-01-01T00:05:00Z"}`,
+		},
 	}
-	// The clear refusal message must surface (not a generic crash).
-	if !strings.Contains(err.Error(), "client-side query disabled") {
-		t.Errorf("403 error must surface the policy-off message, got: %v", err)
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
 
-func TestMintQueryToken_ServerError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"boom","kind":"internal"}`))
-	}))
-	defer srv.Close()
-
-	_, err := mintQueryToken(context.Background(), srv.URL, "tok")
-	if err == nil {
-		t.Fatalf("expected error on 500")
-	}
-	if !strings.Contains(err.Error(), "500") {
-		t.Errorf("error should carry the status, got: %v", err)
-	}
-}
-
-func TestMintQueryToken_EmptyToken(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"token":"","expires_at":"2099-01-01T00:05:00Z"}`))
-	}))
-	defer srv.Close()
-
-	_, err := mintQueryToken(context.Background(), srv.URL, "tok")
-	if err == nil {
-		t.Fatalf("expected error on empty token in 200 body")
+			_, err := mintQueryToken(context.Background(), srv.URL, "tok")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if tc.wantSubstr != "" && !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error should contain %q, got: %v", tc.wantSubstr, err)
+			}
+		})
 	}
 }

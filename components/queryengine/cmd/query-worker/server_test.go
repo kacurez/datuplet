@@ -156,6 +156,19 @@ func doPost(t *testing.T, srv *queryServer, body any, token string) *httptest.Re
 	return w
 }
 
+// postRaw sends a POST /internal/query with a raw string body.
+func postRaw(t *testing.T, srv *queryServer, body, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/internal/query", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	return w
+}
+
 // decodeError decodes a {"error":...,"kind":...} response body.
 func decodeError(t *testing.T, body string) (errMsg, kind string) {
 	t.Helper()
@@ -204,41 +217,36 @@ func TestServer_ValidToken_Returns200(t *testing.T) {
 	}
 }
 
-// Test 2a: missing Authorization header → 401, runner NOT called.
-func TestServer_MissingToken_Returns401(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	body := map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
-	resp := doPost(t, srv, body, "" /* no token */)
-
-	if resp.Code != http.StatusUnauthorized {
-		t.Fatalf("want 401, got %d", resp.Code)
+// Missing / garbage Authorization → 401 kind=unauthorized, runner NOT called.
+// Security boundary: neither token shape may reach the runner.
+func TestServer_BadToken_Returns401(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token", token: ""},
+		{name: "garbage token", token: "not-a-jwt-at-all"},
 	}
-	_, kind := decodeError(t, resp.Body.String())
-	if kind != "unauthorized" {
-		t.Errorf("kind = %q, want unauthorized", kind)
-	}
-	if runner.wasCalled() {
-		t.Error("runner should NOT have been called on 401")
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			priv := genTestKey(t)
+			runner := &fakeRunner{result: echoResult}
+			srv := newTestServer(t, priv, runner, testWorkerCfg())
 
-// Test 2b: garbage token → 401, runner NOT called.
-func TestServer_GarbageToken_Returns401(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
+			body := map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
+			resp := doPost(t, srv, body, tc.token)
 
-	body := map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
-	resp := doPost(t, srv, body, "not-a-jwt-at-all")
-
-	if resp.Code != http.StatusUnauthorized {
-		t.Fatalf("want 401, got %d: %s", resp.Code, resp.Body.String())
-	}
-	if runner.wasCalled() {
-		t.Error("runner should NOT have been called on bad token")
+			if resp.Code != http.StatusUnauthorized {
+				t.Fatalf("want 401, got %d: %s", resp.Code, resp.Body.String())
+			}
+			_, kind := decodeError(t, resp.Body.String())
+			if kind != "unauthorized" {
+				t.Errorf("kind = %q, want unauthorized", kind)
+			}
+			if runner.wasCalled() {
+				t.Error("runner should NOT have been called on 401")
+			}
+		})
 	}
 }
 
@@ -293,146 +301,112 @@ func TestServer_SemaphoreFull_Returns429(t *testing.T) {
 	<-firstDone
 }
 
-// Test 4a: ErrTimeout from runner → 408 kind=timeout.
-func TestServer_RunnerTimeout_Returns408(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{err: fmt.Errorf("timeout: %w", queryengine.ErrTimeout)}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
-	resp := doPost(t, srv, body, token)
-
-	if resp.Code != http.StatusRequestTimeout {
-		t.Fatalf("want 408, got %d: %s", resp.Code, resp.Body.String())
+// Runner errors map to HTTP status + kind: ErrTimeout → 408, ErrResultTooLarge
+// → 413, any other error → 400 sql_error.
+func TestServer_RunnerErrorMapping(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		sql        string
+		wantStatus int
+		wantKind   string
+	}{
+		{"timeout", fmt.Errorf("timeout: %w", queryengine.ErrTimeout), "SELECT 1", http.StatusRequestTimeout, "timeout"},
+		{"result too large", fmt.Errorf("big: %w", queryengine.ErrResultTooLarge), "SELECT 1", http.StatusRequestEntityTooLarge, "result_too_large"},
+		{"plain error", errors.New("syntax error near 'SELEC'"), "SELEC 1", http.StatusBadRequest, "sql_error"},
 	}
-	_, kind := decodeError(t, resp.Body.String())
-	if kind != "timeout" {
-		t.Errorf("kind = %q, want timeout", kind)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			priv := genTestKey(t)
+			runner := &fakeRunner{err: tc.err}
+			srv := newTestServer(t, priv, runner, testWorkerCfg())
+
+			token := mintTestToken(t, priv)
+			body := map[string]any{"sql": tc.sql, "catalog_jwt": "a.b.c", "warehouse": "p/w"}
+			resp := doPost(t, srv, body, token)
+
+			if resp.Code != tc.wantStatus {
+				t.Fatalf("want %d, got %d: %s", tc.wantStatus, resp.Code, resp.Body.String())
+			}
+			_, kind := decodeError(t, resp.Body.String())
+			if kind != tc.wantKind {
+				t.Errorf("kind = %q, want %q", kind, tc.wantKind)
+			}
+		})
 	}
 }
 
-// Test 4b: ErrResultTooLarge from runner → 413 kind=result_too_large.
-func TestServer_RunnerResultTooLarge_Returns413(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{err: fmt.Errorf("big: %w", queryengine.ErrResultTooLarge)}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
+// Request limits: body values are clamped to the cfg ceilings; values under
+// the ceiling and absent/zero values behave as documented.
+func TestServer_RequestLimits(t *testing.T) {
+	cases := []struct {
+		name        string
+		cfg         func(c *workerConfig)
+		extra       map[string]any
+		wantTimeout time.Duration
+		wantRows    int
+		wantBytes   int
+	}{
+		{
+			name:        "timeout_s above ceiling clamped",
+			cfg:         func(c *workerConfig) { c.MaxTimeoutS = 300 },
+			extra:       map[string]any{"timeout_s": 9999},
+			wantTimeout: 300 * time.Second,
+			wantRows:    10000,
+			wantBytes:   10 * 1024 * 1024,
+		},
+		{
+			name:        "max_rows/max_bytes above ceilings clamped",
+			cfg:         func(c *workerConfig) { c.MaxRows = 1000; c.MaxBytes = 1024 * 1024 },
+			extra:       map[string]any{"max_rows": 999999, "max_bytes": 999999999},
+			wantTimeout: 300 * time.Second,
+			wantRows:    1000,
+			wantBytes:   1024 * 1024,
+		},
+		{
+			name:        "values under ceilings pass through",
+			cfg:         func(c *workerConfig) { c.MaxRows = 10000; c.MaxBytes = 10 * 1024 * 1024 },
+			extra:       map[string]any{"max_rows": 50, "max_bytes": 512},
+			wantTimeout: 300 * time.Second,
+			wantRows:    50,
+			wantBytes:   512,
+		},
+		{
+			name:        "timeout_s=0 uses default (cfg max)",
+			cfg:         func(c *workerConfig) { c.MaxTimeoutS = 120 },
+			extra:       map[string]any{"timeout_s": 0},
+			wantTimeout: 120 * time.Second,
+			wantRows:    10000,
+			wantBytes:   10 * 1024 * 1024,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			priv := genTestKey(t)
+			runner := &fakeRunner{result: echoResult}
+			cfg := testWorkerCfg()
+			tc.cfg(&cfg)
+			srv := newTestServer(t, priv, runner, cfg)
 
-	token := mintTestToken(t, priv)
-	body := map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
-	resp := doPost(t, srv, body, token)
-
-	if resp.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("want 413, got %d: %s", resp.Code, resp.Body.String())
-	}
-	_, kind := decodeError(t, resp.Body.String())
-	if kind != "result_too_large" {
-		t.Errorf("kind = %q, want result_too_large", kind)
-	}
-}
-
-// Test 4c: plain error from runner → 400 kind=sql_error.
-func TestServer_RunnerPlainError_Returns400(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{err: errors.New("syntax error near 'SELEC'")}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{"sql": "SELEC 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
-	resp := doPost(t, srv, body, token)
-
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", resp.Code, resp.Body.String())
-	}
-	_, kind := decodeError(t, resp.Body.String())
-	if kind != "sql_error" {
-		t.Errorf("kind = %q, want sql_error", kind)
-	}
-}
-
-// Test 5a: body timeout_s=9999 → runner receives Timeout==cfg.MaxTimeoutS.
-func TestServer_TimeoutClamped(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	cfg := testWorkerCfg()
-	cfg.MaxTimeoutS = 300
-	srv := newTestServer(t, priv, runner, cfg)
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{
-		"sql":         "SELECT 1",
-		"catalog_jwt": "a.b.c",
-		"warehouse":   "p/w",
-		"timeout_s":   9999,
-	}
-	resp := doPost(t, srv, body, token)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", resp.Code, resp.Body.String())
-	}
-	req := runner.lastReq()
-	wantTimeout := time.Duration(cfg.MaxTimeoutS) * time.Second
-	if req.Timeout != wantTimeout {
-		t.Errorf("Timeout = %v, want %v", req.Timeout, wantTimeout)
-	}
-}
-
-// Test 5b: max_rows/max_bytes clamped to cfg ceilings.
-func TestServer_MaxRowsMaxBytesClamped(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	cfg := testWorkerCfg()
-	cfg.MaxRows = 1000
-	cfg.MaxBytes = 1024 * 1024
-	srv := newTestServer(t, priv, runner, cfg)
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{
-		"sql":         "SELECT 1",
-		"catalog_jwt": "a.b.c",
-		"warehouse":   "p/w",
-		"max_rows":    999999,
-		"max_bytes":   999999999,
-	}
-	resp := doPost(t, srv, body, token)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", resp.Code, resp.Body.String())
-	}
-	req := runner.lastReq()
-	if req.MaxRows != cfg.MaxRows {
-		t.Errorf("MaxRows = %d, want %d (ceiling)", req.MaxRows, cfg.MaxRows)
-	}
-	if req.MaxBytes != cfg.MaxBytes {
-		t.Errorf("MaxBytes = %d, want %d (ceiling)", req.MaxBytes, cfg.MaxBytes)
-	}
-}
-
-// Test 5c: body values below ceiling pass through unchanged.
-func TestServer_MaxRowsMaxBytesUnderCeiling(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	cfg := testWorkerCfg()
-	cfg.MaxRows = 10000
-	cfg.MaxBytes = 10 * 1024 * 1024
-	srv := newTestServer(t, priv, runner, cfg)
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{
-		"sql":         "SELECT 1",
-		"catalog_jwt": "a.b.c",
-		"warehouse":   "p/w",
-		"max_rows":    50,
-		"max_bytes":   512,
-	}
-	resp := doPost(t, srv, body, token)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", resp.Code)
-	}
-	req := runner.lastReq()
-	if req.MaxRows != 50 {
-		t.Errorf("MaxRows = %d, want 50", req.MaxRows)
-	}
-	if req.MaxBytes != 512 {
-		t.Errorf("MaxBytes = %d, want 512", req.MaxBytes)
+			body := map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c", "warehouse": "p/w"}
+			for k, v := range tc.extra {
+				body[k] = v
+			}
+			resp := doPost(t, srv, body, mintTestToken(t, priv))
+			if resp.Code != http.StatusOK {
+				t.Fatalf("want 200, got %d: %s", resp.Code, resp.Body.String())
+			}
+			req := runner.lastReq()
+			if req.Timeout != tc.wantTimeout {
+				t.Errorf("Timeout = %v, want %v", req.Timeout, tc.wantTimeout)
+			}
+			if req.MaxRows != tc.wantRows {
+				t.Errorf("MaxRows = %d, want %d", req.MaxRows, tc.wantRows)
+			}
+			if req.MaxBytes != tc.wantBytes {
+				t.Errorf("MaxBytes = %d, want %d", req.MaxBytes, tc.wantBytes)
+			}
+		})
 	}
 }
 
@@ -467,52 +441,36 @@ func TestServer_BodyTooLarge(t *testing.T) {
 	}
 }
 
-// Test 7a: missing sql → 400.
-func TestServer_MissingSQL_Returns400(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{"catalog_jwt": "a.b.c", "warehouse": "p/w"}
-	resp := doPost(t, srv, body, token)
-
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", resp.Code, resp.Body.String())
+// Missing required fields and malformed JSON → 400 kind=bad_request, runner
+// NOT called.
+func TestServer_InvalidRequest_Returns400(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "missing sql", body: `{"catalog_jwt":"a.b.c","warehouse":"p/w"}`},
+		{name: "missing catalog_jwt", body: `{"sql":"SELECT 1","warehouse":"p/w"}`},
+		{name: "missing warehouse", body: `{"sql":"SELECT 1","catalog_jwt":"a.b.c"}`},
+		{name: "malformed JSON", body: "{not valid json"},
 	}
-	_, kind := decodeError(t, resp.Body.String())
-	if kind != "bad_request" {
-		t.Errorf("kind = %q, want bad_request", kind)
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			priv := genTestKey(t)
+			runner := &fakeRunner{result: echoResult}
+			srv := newTestServer(t, priv, runner, testWorkerCfg())
 
-// Test 7b: missing catalog_jwt → 400.
-func TestServer_MissingCatalogJWT_Returns400(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{"sql": "SELECT 1", "warehouse": "p/w"}
-	resp := doPost(t, srv, body, token)
-
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", resp.Code, resp.Body.String())
-	}
-}
-
-// Test 7c: missing warehouse → 400.
-func TestServer_MissingWarehouse_Returns400(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{"sql": "SELECT 1", "catalog_jwt": "a.b.c"}
-	resp := doPost(t, srv, body, token)
-
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", resp.Code, resp.Body.String())
+			w := postRaw(t, srv, tc.body, mintTestToken(t, priv))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+			}
+			_, kind := decodeError(t, w.Body.String())
+			if kind != "bad_request" {
+				t.Errorf("kind = %q, want bad_request", kind)
+			}
+			if runner.wasCalled() {
+				t.Error("runner should not be called on an invalid request")
+			}
+		})
 	}
 }
 
@@ -531,31 +489,6 @@ func TestServer_Healthz(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "ok") {
 		t.Errorf("want body containing 'ok', got %q", w.Body.String())
-	}
-}
-
-// Test 9: malformed JSON body → 400 kind=bad_request.
-func TestServer_MalformedJSON_Returns400(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	token := mintTestToken(t, priv)
-	req := httptest.NewRequest(http.MethodPost, "/internal/query", strings.NewReader("{not valid json"))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
-	}
-	_, kind := decodeError(t, w.Body.String())
-	if kind != "bad_request" {
-		t.Errorf("kind = %q, want bad_request", kind)
-	}
-	if runner.wasCalled() {
-		t.Error("runner should not be called on malformed JSON")
 	}
 }
 
@@ -714,83 +647,77 @@ func TestServer_RunnerError_LogAndBodyStripSQLEcho(t *testing.T) {
 
 // ---- RFC 028 Q2: bound parameters ----
 
-// TestServer_Params_ForwardedToRunner: a well-formed `params` object passes
-// validation and reaches the engine Request verbatim, with JSON numbers
-// decoded as json.Number (UseNumber) so the §6.1 integral/non-integral
-// distinction survives the decode.
-func TestServer_Params_ForwardedToRunner(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
+// RFC 028 Q2: a well-formed `params` object passes validation and reaches the
+// engine Request verbatim, with JSON numbers decoded as json.Number (UseNumber)
+// so the §6.1 integral/non-integral distinction survives the decode. A body
+// without `params` behaves exactly as before: a nil Params map and untouched
+// limit clamping.
+func TestServer_Params(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		check func(t *testing.T, resp *httptest.ResponseRecorder, req queryengine.Request)
+	}{
+		{
+			name: "forwarded to runner",
+			body: `{"sql":"SELECT $country AS c, $days AS d, $ratio AS r, $flag AS f, $nul AS n",` +
+				`"catalog_jwt":"a.b.c","warehouse":"p/w",` +
+				`"params":{"country":"DE","days":30,"ratio":1.5,"flag":true,"nul":null}}`,
+			check: func(t *testing.T, _ *httptest.ResponseRecorder, req queryengine.Request) {
+				got := req.Params
+				if len(got) != 5 {
+					t.Fatalf("Params = %#v, want 5 entries", got)
+				}
+				if got["country"] != "DE" {
+					t.Errorf("params[country] = %v (%T), want string \"DE\"", got["country"], got["country"])
+				}
+				if n, ok := got["days"].(json.Number); !ok || n.String() != "30" {
+					t.Errorf("params[days] = %v (%T), want json.Number(\"30\") — the decoder must UseNumber()", got["days"], got["days"])
+				}
+				if n, ok := got["ratio"].(json.Number); !ok || n.String() != "1.5" {
+					t.Errorf("params[ratio] = %v (%T), want json.Number(\"1.5\")", got["ratio"], got["ratio"])
+				}
+				if got["flag"] != true {
+					t.Errorf("params[flag] = %v (%T), want true", got["flag"], got["flag"])
+				}
+				if v, ok := got["nul"]; !ok || v != nil {
+					t.Errorf("params[nul] = %v (present=%v), want an explicit nil entry", v, ok)
+				}
+			},
+		},
+		{
+			name: "no params regression",
+			body: `{"sql":"SELECT 42","catalog_jwt":"hdr.pld.sig","warehouse":"proj/wh"}`,
+			check: func(t *testing.T, resp *httptest.ResponseRecorder, req queryengine.Request) {
+				var result queryengine.Result
+				if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
+					t.Fatalf("decode result: %v", err)
+				}
+				if len(result.Schema) != 1 || result.Schema[0].Name != "n" || len(result.Rows) != 1 {
+					t.Errorf("unexpected result: %+v", result)
+				}
+				if req.Params != nil {
+					t.Errorf("Params = %#v, want nil when the body carries no params field", req.Params)
+				}
+				// Timeout/rows/bytes clamping is untouched by the params wiring.
+				if req.Timeout != 300*time.Second || req.MaxRows != 10000 || req.MaxBytes != 10*1024*1024 {
+					t.Errorf("clamped limits drifted: %+v", req)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			priv := genTestKey(t)
+			runner := &fakeRunner{result: echoResult}
+			srv := newTestServer(t, priv, runner, testWorkerCfg())
 
-	token := mintTestToken(t, priv)
-	body := `{"sql":"SELECT $country AS c, $days AS d, $ratio AS r, $flag AS f, $nul AS n",` +
-		`"catalog_jwt":"a.b.c","warehouse":"p/w",` +
-		`"params":{"country":"DE","days":30,"ratio":1.5,"flag":true,"nul":null}}`
-
-	req := httptest.NewRequest(http.MethodPost, "/internal/query", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
-	}
-	got := runner.lastReq().Params
-	if len(got) != 5 {
-		t.Fatalf("Params = %#v, want 5 entries", got)
-	}
-	if got["country"] != "DE" {
-		t.Errorf("params[country] = %v (%T), want string \"DE\"", got["country"], got["country"])
-	}
-	if n, ok := got["days"].(json.Number); !ok || n.String() != "30" {
-		t.Errorf("params[days] = %v (%T), want json.Number(\"30\") — the decoder must UseNumber()", got["days"], got["days"])
-	}
-	if n, ok := got["ratio"].(json.Number); !ok || n.String() != "1.5" {
-		t.Errorf("params[ratio] = %v (%T), want json.Number(\"1.5\")", got["ratio"], got["ratio"])
-	}
-	if got["flag"] != true {
-		t.Errorf("params[flag] = %v (%T), want true", got["flag"], got["flag"])
-	}
-	if v, ok := got["nul"]; !ok || v != nil {
-		t.Errorf("params[nul] = %v (present=%v), want an explicit nil entry", v, ok)
-	}
-}
-
-// TestServer_NoParams_Regression: a body without `params` behaves exactly as
-// before — the engine Request carries a nil Params map and nothing else
-// changes. Reuses the shape of TestServer_ValidToken_Returns200.
-func TestServer_NoParams_Regression(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	srv := newTestServer(t, priv, runner, testWorkerCfg())
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{
-		"sql":         "SELECT 42",
-		"catalog_jwt": "hdr.pld.sig",
-		"warehouse":   "proj/wh",
-	}
-	resp := doPost(t, srv, body, token)
-
-	if resp.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", resp.Code, resp.Body.String())
-	}
-	var result queryengine.Result
-	if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
-		t.Fatalf("decode result: %v", err)
-	}
-	if len(result.Schema) != 1 || result.Schema[0].Name != "n" || len(result.Rows) != 1 {
-		t.Errorf("unexpected result: %+v", result)
-	}
-	if p := runner.lastReq().Params; p != nil {
-		t.Errorf("Params = %#v, want nil when the body carries no params field", p)
-	}
-	// Timeout/rows/bytes clamping is untouched by the params wiring.
-	req := runner.lastReq()
-	if req.Timeout != 300*time.Second || req.MaxRows != 10000 || req.MaxBytes != 10*1024*1024 {
-		t.Errorf("clamped limits drifted: %+v", req)
+			w := postRaw(t, srv, tc.body, mintTestToken(t, priv))
+			if w.Code != http.StatusOK {
+				t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+			}
+			tc.check(t, w, runner.lastReq())
+		})
 	}
 }
 
@@ -882,31 +809,5 @@ func TestServer_ParamsBindError_Returns400SQLError(t *testing.T) {
 	}
 	if !runner.wasCalled() {
 		t.Error("runner should have been called — the params shape was valid")
-	}
-}
-
-// Test 10: timeout_s=0 in body → runner receives cfg.MaxTimeoutS (default applies).
-func TestServer_ZeroTimeoutUsesDefault(t *testing.T) {
-	priv := genTestKey(t)
-	runner := &fakeRunner{result: echoResult}
-	cfg := testWorkerCfg()
-	cfg.MaxTimeoutS = 120
-	srv := newTestServer(t, priv, runner, cfg)
-
-	token := mintTestToken(t, priv)
-	body := map[string]any{
-		"sql":         "SELECT 1",
-		"catalog_jwt": "a.b.c",
-		"warehouse":   "p/w",
-		"timeout_s":   0, // zero → use max
-	}
-	resp := doPost(t, srv, body, token)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", resp.Code)
-	}
-	req := runner.lastReq()
-	wantTimeout := time.Duration(cfg.MaxTimeoutS) * time.Second
-	if req.Timeout != wantTimeout {
-		t.Errorf("Timeout = %v, want %v", req.Timeout, wantTimeout)
 	}
 }

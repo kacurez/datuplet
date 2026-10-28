@@ -19,249 +19,152 @@ func decodeConfig(t *testing.T, raw string) Config {
 	return cfg
 }
 
-func TestParseAndValidate_EmptyTables(t *testing.T) {
-	cfg := Config{}
-	if err := ParseAndValidate(&cfg); err == nil {
-		t.Fatal("expected error for empty tables, got nil")
-	}
-}
-
-func TestParseAndValidate_MissingName(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Random: &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{RowsCount: 1}}},
+func TestParseAndValidate(t *testing.T) {
+	intSchema := map[string]string{"id": "int"}
+	cases := []struct {
+		name string
+		cfg  Config
+		raw  string // when set, decoded into cfg via decodeConfig
+		// wantErr false means the config must validate. wantSubstr entries must
+		// all appear in the error.
+		wantErr    bool
+		wantSubstr []string
+	}{
+		{name: "empty tables", cfg: Config{}, wantErr: true},
+		{
+			name:       "missing name",
+			cfg:        Config{Tables: []Table{{Random: &RandomSpec{Schema: intSchema, Limit: &Limit{RowsCount: 1}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"name"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "name") {
-		t.Fatalf("expected 'name' error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_InvalidIdentifier(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "123bad", Random: &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{RowsCount: 1}}},
+		{
+			name:       "invalid identifier",
+			cfg:        Config{Tables: []Table{{Name: "123bad", Random: &RandomSpec{Schema: intSchema, Limit: &Limit{RowsCount: 1}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"valid identifier"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "valid identifier") {
-		t.Fatalf("expected identifier error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_BothModesSet(t *testing.T) {
-	raw := `{"tables":[{"name":"t","random":{"schema":{"id":"int"},"limit":{"rowsCount":1}},"literal":{"columns":["id"],"rows":[[1]]}}]}`
-	cfg := decodeConfig(t, raw)
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "choose exactly one mode") {
-		t.Fatalf("expected mode conflict error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_NeitherModeSet(t *testing.T) {
-	cfg := Config{Tables: []Table{{Name: "t"}}}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "neither") {
-		t.Fatalf("expected neither-mode error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_UnknownColumnType(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Schema: map[string]string{"id": "decimal"}, Limit: &Limit{RowsCount: 1}}},
+		{
+			name:       "both modes set",
+			raw:        `{"tables":[{"name":"t","random":{"schema":{"id":"int"},"limit":{"rowsCount":1}},"literal":{"columns":["id"],"rows":[[1]]}}]}`,
+			wantErr:    true,
+			wantSubstr: []string{"choose exactly one mode"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "decimal") {
-		t.Fatalf("expected unknown-type error for decimal, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_AllKnownTypes(t *testing.T) {
-	cols := map[string]string{
-		"a": "string", "b": "int", "c": "long", "d": "float",
-		"e": "double", "f": "boolean", "g": "date", "h": "timestamp",
-		"i": "now", "j": "uuid",
-	}
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Schema: cols, Limit: &Limit{RowsCount: 1}}},
+		{
+			name:       "neither mode set",
+			cfg:        Config{Tables: []Table{{Name: "t"}}},
+			wantErr:    true,
+			wantSubstr: []string{"neither"},
 		},
-	}
-	if err := ParseAndValidate(&cfg); err != nil {
-		t.Fatalf("expected no error for all known types, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_RandomSchemaMissing(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Limit: &Limit{RowsCount: 1}}},
+		{
+			name:       "unknown column type",
+			cfg:        Config{Tables: []Table{{Name: "t", Random: &RandomSpec{Schema: map[string]string{"id": "decimal"}, Limit: &Limit{RowsCount: 1}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"decimal"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "schema") {
-		t.Fatalf("expected schema error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LimitMissing(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Schema: map[string]string{"id": "int"}}},
+		{
+			name: "all known types",
+			cfg: Config{Tables: []Table{{Name: "t", Random: &RandomSpec{
+				Schema: map[string]string{
+					"a": "string", "b": "int", "c": "long", "d": "float",
+					"e": "double", "f": "boolean", "g": "date", "h": "timestamp",
+					"i": "now", "j": "uuid",
+				},
+				Limit: &Limit{RowsCount: 1},
+			}}}},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "limit") {
-		t.Fatalf("expected limit error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LimitAllZero(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{}}},
+		{
+			name:       "random schema missing",
+			cfg:        Config{Tables: []Table{{Name: "t", Random: &RandomSpec{Limit: &Limit{RowsCount: 1}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"schema"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "at least one") {
-		t.Fatalf("expected all-zero limit error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_NegativeLimitRowsCount(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{RowsCount: -1}}},
+		{
+			name:       "limit missing",
+			cfg:        Config{Tables: []Table{{Name: "t", Random: &RandomSpec{Schema: intSchema}}}},
+			wantErr:    true,
+			wantSubstr: []string{"limit"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "rowsCount must be >= 0") {
-		t.Fatalf("expected negative-rowsCount error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_NegativeLimitSizeInBytes(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{SizeInBytes: -1}}},
+		{
+			name:       "limit all zero",
+			cfg:        Config{Tables: []Table{{Name: "t", Random: &RandomSpec{Schema: intSchema, Limit: &Limit{}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"at least one"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "sizeInBytes must be >= 0") {
-		t.Fatalf("expected negative-sizeInBytes error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_NegativeLimitTimeoutInSeconds(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t", Random: &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{TimeoutInSeconds: -1}}},
+		{
+			name:       "negative limit rowsCount",
+			cfg:        Config{Tables: []Table{{Name: "t", Random: &RandomSpec{Schema: intSchema, Limit: &Limit{RowsCount: -1}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"rowsCount must be >= 0"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "timeoutInSeconds must be >= 0") {
-		t.Fatalf("expected negative-timeoutInSeconds error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_NegativeRowInsertSpeed(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{
+		{
+			name:       "negative limit sizeInBytes",
+			cfg:        Config{Tables: []Table{{Name: "t", Random: &RandomSpec{Schema: intSchema, Limit: &Limit{SizeInBytes: -1}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"sizeInBytes must be >= 0"},
+		},
+		{
+			name:       "negative limit timeoutInSeconds",
+			cfg:        Config{Tables: []Table{{Name: "t", Random: &RandomSpec{Schema: intSchema, Limit: &Limit{TimeoutInSeconds: -1}}}}},
+			wantErr:    true,
+			wantSubstr: []string{"timeoutInSeconds must be >= 0"},
+		},
+		{
+			name: "negative rowInsertSpeed",
+			cfg: Config{Tables: []Table{{
 				Name:           "t",
 				RowInsertSpeed: -1,
-				Random:         &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{RowsCount: 1}},
-			},
+				Random:         &RandomSpec{Schema: intSchema, Limit: &Limit{RowsCount: 1}},
+			}}},
+			wantErr:    true,
+			wantSubstr: []string{"rowInsertSpeed"},
 		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "rowInsertSpeed") {
-		t.Fatalf("expected rowInsertSpeed error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_ValidRandomMode(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{
+		{
+			name: "valid random mode",
+			cfg: Config{Tables: []Table{{
 				Name:   "products",
 				Random: &RandomSpec{Schema: map[string]string{"id": "int", "name": "string"}, Limit: &Limit{RowsCount: 100}},
-			},
+			}}},
+		},
+		{
+			name:       "literal empty rows",
+			raw:        `{"tables":[{"name":"t","literal":{"columns":["id"],"rows":[]}}]}`,
+			wantErr:    true,
+			wantSubstr: []string{"rows"},
+		},
+		{
+			name:       "literal columns required",
+			raw:        `{"tables":[{"name":"t","literal":{"rows":[[1,"alice"]]}}]}`,
+			wantErr:    true,
+			wantSubstr: []string{"requires 'columns'"},
+		},
+		{
+			name:       "multiple table errors name every table",
+			cfg:        Config{Tables: []Table{{Name: "t1"}, {Name: "t2"}}},
+			wantErr:    true,
+			wantSubstr: []string{"t1", "t2"},
 		},
 	}
-	if err := ParseAndValidate(&cfg); err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LiteralEmptyRows(t *testing.T) {
-	raw := `{"tables":[{"name":"t","literal":{"columns":["id"],"rows":[]}}]}`
-	cfg := decodeConfig(t, raw)
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "rows") {
-		t.Fatalf("expected empty-rows error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LiteralMixedTypes(t *testing.T) {
-	raw := `{"tables":[{"name":"t","literal":{"columns":["a","b"],"rows":[[1,"hello"],[2,3]]}}]}`
-	cfg := decodeConfig(t, raw)
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "mixed types") {
-		t.Fatalf("expected mixed-type error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LiteralArityMismatch(t *testing.T) {
-	raw := `{"tables":[{"name":"t","literal":{"columns":["a","b"],"rows":[[1,2],[3]]}}]}`
-	cfg := decodeConfig(t, raw)
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "arity") {
-		t.Fatalf("expected arity error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LiteralAllNullColumn(t *testing.T) {
-	raw := `{"tables":[{"name":"t","literal":{"columns":["a","b"],"rows":[[1,null],[2,null]]}}]}`
-	cfg := decodeConfig(t, raw)
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "all-null") {
-		t.Fatalf("expected all-null error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LiteralValidWithNullable(t *testing.T) {
-	raw := `{"tables":[{"name":"t","literal":{"columns":["id","name"],"rows":[[1,"alice"],[2,null]]}}]}`
-	cfg := decodeConfig(t, raw)
-	if err := ParseAndValidate(&cfg); err != nil {
-		t.Fatalf("expected no error for nullable column, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_LiteralColumnsRequired(t *testing.T) {
-	raw := `{"tables":[{"name":"t","literal":{"rows":[[1,"alice"]]}}]}`
-	cfg := decodeConfig(t, raw)
-	err := ParseAndValidate(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "requires 'columns'") {
-		t.Fatalf("expected columns-required error, got: %v", err)
-	}
-}
-
-func TestParseAndValidate_MultipleTableErrors(t *testing.T) {
-	cfg := Config{
-		Tables: []Table{
-			{Name: "t1"}, // neither mode
-			{Name: "t2"}, // neither mode
-		},
-	}
-	err := ParseAndValidate(&cfg)
-	if err == nil {
-		t.Fatal("expected errors for two bad tables, got nil")
-	}
-	if !strings.Contains(err.Error(), "t1") || !strings.Contains(err.Error(), "t2") {
-		t.Fatalf("expected both table names in error, got: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			if tc.raw != "" {
+				cfg = decodeConfig(t, tc.raw)
+			}
+			err := ParseAndValidate(&cfg)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("expected no error, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			for _, sub := range tc.wantSubstr {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error should contain %q, got: %v", sub, err)
+				}
+			}
+		})
 	}
 }

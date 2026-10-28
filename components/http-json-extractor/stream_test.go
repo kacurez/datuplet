@@ -17,6 +17,25 @@ func collect(t *testing.T, body, arrayPath string) ([]map[string]any, int, error
 	return got, n, err
 }
 
+// decoders are the two JSON implementations that must agree on shapes and
+// error text: decodeRecords is the streaming path, parseJSON the buffered one
+// (main.go).
+var decoders = []struct {
+	name string
+	run  func(t *testing.T, body, arrayPath string) ([]map[string]any, error)
+}{
+	{"stream", func(t *testing.T, body, arrayPath string) ([]map[string]any, error) {
+		got, n, err := collect(t, body, arrayPath)
+		if err == nil && n != len(got) {
+			t.Fatalf("decodeRecords returned n=%d but yielded %d records", n, len(got))
+		}
+		return got, err
+	}},
+	{"buffered", func(_ *testing.T, body, arrayPath string) ([]map[string]any, error) {
+		return parseJSON([]byte(body), arrayPath)
+	}},
+}
+
 func TestDecodeRecords_Shapes(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -34,20 +53,22 @@ func TestDecodeRecords_Shapes(t *testing.T) {
 		{"skips_non_objects", `[{"id":1},"noise",42,{"id":2}]`, "", 2, "id"},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, n, err := collect(t, tc.body, tc.arrayPath)
-			if err != nil {
-				t.Fatalf("decodeRecords error: %v", err)
-			}
-			if n != tc.wantLen || len(got) != tc.wantLen {
-				t.Fatalf("got n=%d len=%d, want %d", n, len(got), tc.wantLen)
-			}
-			if tc.wantLen > 0 {
-				if _, ok := got[0][tc.wantKey]; !ok {
-					t.Fatalf("first record missing key %q: %v", tc.wantKey, got[0])
+		for _, d := range decoders {
+			t.Run(tc.name+"/"+d.name, func(t *testing.T) {
+				got, err := d.run(t, tc.body, tc.arrayPath)
+				if err != nil {
+					t.Fatalf("%s error: %v", d.name, err)
 				}
-			}
-		})
+				if len(got) != tc.wantLen {
+					t.Fatalf("got %d records, want %d", len(got), tc.wantLen)
+				}
+				if tc.wantLen > 0 {
+					if _, ok := got[0][tc.wantKey]; !ok {
+						t.Fatalf("first record missing key %q: %v", tc.wantKey, got[0])
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -66,27 +87,34 @@ func TestDecodeRecords_UseNumber(t *testing.T) {
 	}
 }
 
-func TestDecodeRecords_Errors(t *testing.T) {
-	if _, _, err := collect(t, `not json`, ""); err == nil {
-		t.Fatal("expected error for invalid JSON")
-	}
-}
-
-// Exact error-text compatibility with parseJSON (main.go): a set array_path
-// that is missing or non-array must say "field '<k>' is not an array"; the
-// generic message is reserved for auto-detect finding nothing.
+// Error text is compatible between the two paths: a set array_path that is
+// missing or non-array must say "field '<k>' is not an array"; the generic
+// message is reserved for auto-detect finding nothing. Invalid JSON only has
+// to error (the wording differs by path).
 func TestDecodeRecords_ErrorText(t *testing.T) {
-	_, _, err := collect(t, `{"results":"not-an-array"}`, "results")
-	if err == nil || err.Error() != "field 'results' is not an array" {
-		t.Fatalf("non-array array_path: got %v", err)
+	cases := []struct {
+		name      string
+		body      string
+		arrayPath string
+		wantErr   string // "" = any error
+	}{
+		{"invalid_json", `not json`, "", ""},
+		{"non_array_array_path", `{"results":"not-an-array"}`, "results", "field 'results' is not an array"},
+		{"absent_array_path_key", `{"other":[{"x":1}]}`, "results", "field 'results' is not an array"},
+		{"autodetect_no_array", `{"no":"array here"}`, "", "no array found in JSON response, specify array_path in config"},
 	}
-	_, _, err = collect(t, `{"other":[{"x":1}]}`, "results") // key absent entirely
-	if err == nil || err.Error() != "field 'results' is not an array" {
-		t.Fatalf("absent array_path key: got %v", err)
-	}
-	_, _, err = collect(t, `{"no":"array here"}`, "")
-	if err == nil || err.Error() != "no array found in JSON response, specify array_path in config" {
-		t.Fatalf("auto-detect no array: got %v", err)
+	for _, tc := range cases {
+		for _, d := range decoders {
+			t.Run(tc.name+"/"+d.name, func(t *testing.T) {
+				_, err := d.run(t, tc.body, tc.arrayPath)
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if tc.wantErr != "" && err.Error() != tc.wantErr {
+					t.Fatalf("got %q, want %q", err.Error(), tc.wantErr)
+				}
+			})
+		}
 	}
 }
 

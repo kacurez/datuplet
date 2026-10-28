@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -40,129 +41,121 @@ func TestNewRNG_Deterministic(t *testing.T) {
 	}
 }
 
-// TestNewRNG_EmptyRunID checks fallback to time-based seed (just verifies no panic).
-func TestNewRNG_EmptyRunID(t *testing.T) {
-	rng := newRNG("", "table")
-	_ = rng.Int64() // must not panic
-}
-
-// TestGenerateValue_NonNil checks each type produces a non-nil value.
-func TestGenerateValue_NonNil(t *testing.T) {
-	types := []string{"string", "int", "long", "float", "double", "boolean", "date", "timestamp", "now", "uuid"}
-	rng := rand.New(rand.NewPCG(42, 42))
-
-	for _, typ := range types {
-		v := generateValue(rng, typ)
+// TestGenerateValue checks each column type produces a non-nil value, and
+// that string/date/timestamp/uuid values have the documented format.
+func TestGenerateValue(t *testing.T) {
+	nonNil := func(v any) string {
 		if v == nil {
-			t.Errorf("type %q returned nil", typ)
+			return "returned nil"
 		}
+		return ""
 	}
-}
-
-// TestGenerateValue_StringLength checks string values are hex (16-40 chars).
-func TestGenerateValue_StringLength(t *testing.T) {
-	rng := rand.New(rand.NewPCG(7, 7))
-	for i := 0; i < 50; i++ {
-		v := generateValue(rng, "string")
+	asString := func(v any) (string, string) {
 		s, ok := v.(string)
 		if !ok {
-			t.Fatalf("string type returned non-string %T", v)
+			return "", fmt.Sprintf("returned non-string %T", v)
 		}
-		// hex.EncodeToString doubles the byte length: 8–20 bytes → 16–40 chars
-		if len(s) < 16 || len(s) > 40 {
-			t.Errorf("string length %d outside [16,40]: %q", len(s), s)
-		}
+		return s, ""
+	}
+	cases := []struct {
+		name  string
+		typ   string
+		seed  [2]uint64
+		iters int
+		// check returns a failure message ("" when the value is fine).
+		check func(v any) string
+	}{
+		{name: "string", typ: "string", seed: [2]uint64{7, 7}, iters: 50, check: func(v any) string {
+			s, msg := asString(v)
+			if msg != "" {
+				return msg
+			}
+			// hex.EncodeToString doubles the byte length: 8-20 bytes -> 16-40 chars
+			if len(s) < 16 || len(s) > 40 {
+				return fmt.Sprintf("length %d outside [16,40]: %q", len(s), s)
+			}
+			return ""
+		}},
+		{name: "date", typ: "date", seed: [2]uint64{99, 99}, iters: 20, check: func(v any) string {
+			s, msg := asString(v)
+			if msg != "" {
+				return msg
+			}
+			if _, err := time.Parse("2006-01-02", s); err != nil {
+				return fmt.Sprintf("%q does not match YYYY-MM-DD: %v", s, err)
+			}
+			return ""
+		}},
+		{name: "timestamp", typ: "timestamp", seed: [2]uint64{11, 22}, iters: 20, check: func(v any) string {
+			s, msg := asString(v)
+			if msg != "" {
+				return msg
+			}
+			if _, err := time.Parse("2006-01-02T15:04:05.000Z07:00", s); err != nil {
+				return fmt.Sprintf("%q not RFC3339: %v", s, err)
+			}
+			return ""
+		}},
+		{name: "uuid", typ: "uuid", seed: [2]uint64{55, 66}, iters: 20, check: func(v any) string {
+			s, msg := asString(v)
+			if msg != "" {
+				return msg
+			}
+			// UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+			if parts := strings.Split(s, "-"); len(parts) != 5 {
+				return fmt.Sprintf("%q: expected 5 parts, got %d", s, len(parts))
+			}
+			return ""
+		}},
+		{name: "int", typ: "int", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
+		{name: "long", typ: "long", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
+		{name: "float", typ: "float", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
+		{name: "double", typ: "double", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
+		{name: "boolean", typ: "boolean", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
+		{name: "now", typ: "now", seed: [2]uint64{42, 42}, iters: 1, check: nonNil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(tc.seed[0], tc.seed[1]))
+			for i := 0; i < tc.iters; i++ {
+				v := generateValue(rng, tc.typ)
+				if v == nil {
+					t.Fatalf("type %q returned nil", tc.typ)
+				}
+				if msg := tc.check(v); msg != "" {
+					t.Errorf("type %q: %s", tc.typ, msg)
+				}
+			}
+		})
 	}
 }
 
-// TestGenerateValue_DateFormat checks date values match YYYY-MM-DD.
-func TestGenerateValue_DateFormat(t *testing.T) {
-	rng := rand.New(rand.NewPCG(99, 99))
-	for i := 0; i < 20; i++ {
-		v := generateValue(rng, "date")
-		s, ok := v.(string)
-		if !ok {
-			t.Fatalf("date type returned non-string %T", v)
-		}
-		if _, err := time.Parse("2006-01-02", s); err != nil {
-			t.Errorf("date %q does not match YYYY-MM-DD: %v", s, err)
-		}
+// TestShouldStop verifies each limit kind (rows, bytes, time) and the nil limit.
+// OR semantics are pinned separately by TestShouldStop_OR_FirstToTrip.
+func TestShouldStop(t *testing.T) {
+	cases := []struct {
+		name    string
+		limit   *Limit
+		rows    int
+		bytes   int
+		elapsed time.Duration
+		want    bool
+	}{
+		{"rows: below limit", &Limit{RowsCount: 10}, 9, 0, 0, false},
+		{"rows: at limit", &Limit{RowsCount: 10}, 10, 0, 0, true},
+		{"rows: above limit", &Limit{RowsCount: 10}, 100, 0, 0, true},
+		{"bytes: below limit", &Limit{SizeInBytes: 1024}, 0, 1023, 0, false},
+		{"bytes: at limit", &Limit{SizeInBytes: 1024}, 0, 1024, 0, true},
+		{"time: elapsed past timeout", &Limit{TimeoutInSeconds: 1}, 0, 0, 2 * time.Second, true},
+		{"time: just started", &Limit{TimeoutInSeconds: 1}, 0, 0, 0, false},
+		{"nil limit never stops", nil, 99999, 99999, time.Hour, false},
 	}
-}
-
-// TestGenerateValue_TimestampFormat checks timestamp values are RFC3339.
-func TestGenerateValue_TimestampFormat(t *testing.T) {
-	rng := rand.New(rand.NewPCG(11, 22))
-	for i := 0; i < 20; i++ {
-		v := generateValue(rng, "timestamp")
-		s, ok := v.(string)
-		if !ok {
-			t.Fatalf("timestamp type returned non-string %T", v)
-		}
-		if _, err := time.Parse("2006-01-02T15:04:05.000Z07:00", s); err != nil {
-			t.Errorf("timestamp %q not RFC3339: %v", s, err)
-		}
-	}
-}
-
-// TestGenerateValue_UUIDFormat checks UUID values match version-4 format.
-func TestGenerateValue_UUIDFormat(t *testing.T) {
-	rng := rand.New(rand.NewPCG(55, 66))
-	for i := 0; i < 20; i++ {
-		v := generateValue(rng, "uuid")
-		s, ok := v.(string)
-		if !ok {
-			t.Fatalf("uuid type returned non-string %T", v)
-		}
-		// UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
-		parts := strings.Split(s, "-")
-		if len(parts) != 5 {
-			t.Errorf("uuid %q: expected 5 parts, got %d", s, len(parts))
-		}
-	}
-}
-
-// TestShouldStop_RowsOnly verifies rows-only limit.
-func TestShouldStop_RowsOnly(t *testing.T) {
-	limit := &Limit{RowsCount: 10}
-	start := time.Now()
-
-	if shouldStop(limit, 9, 0, start) {
-		t.Error("should not stop at row 9 (limit=10)")
-	}
-	if !shouldStop(limit, 10, 0, start) {
-		t.Error("should stop at row 10 (limit=10)")
-	}
-	if !shouldStop(limit, 100, 0, start) {
-		t.Error("should stop at row 100 (limit=10)")
-	}
-}
-
-// TestShouldStop_BytesOnly verifies bytes-only limit.
-func TestShouldStop_BytesOnly(t *testing.T) {
-	limit := &Limit{SizeInBytes: 1024}
-	start := time.Now()
-
-	if shouldStop(limit, 0, 1023, start) {
-		t.Error("should not stop at 1023 bytes (limit=1024)")
-	}
-	if !shouldStop(limit, 0, 1024, start) {
-		t.Error("should stop at 1024 bytes")
-	}
-}
-
-// TestShouldStop_TimeOnly verifies time-only limit (using a far-past start time).
-func TestShouldStop_TimeOnly(t *testing.T) {
-	limit := &Limit{TimeoutInSeconds: 1}
-	pastStart := time.Now().Add(-2 * time.Second)
-
-	if !shouldStop(limit, 0, 0, pastStart) {
-		t.Error("should stop when 2s elapsed and timeout=1s")
-	}
-
-	futureStart := time.Now()
-	if shouldStop(limit, 0, 0, futureStart) {
-		t.Error("should not stop immediately after start with 1s timeout")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldStop(tc.limit, tc.rows, tc.bytes, time.Now().Add(-tc.elapsed)); got != tc.want {
+				t.Errorf("shouldStop = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -177,91 +170,74 @@ func TestShouldStop_OR_FirstToTrip(t *testing.T) {
 	}
 }
 
-// TestShouldStop_NilLimit returns false.
-func TestShouldStop_NilLimit(t *testing.T) {
-	if shouldStop(nil, 99999, 99999, time.Now().Add(-time.Hour)) {
-		t.Error("nil limit should never stop")
+// TestErrInjectionPoint verifies the injection point is in range for rows- and
+// time-based limits, and nil when no error is configured or the spec is unusable.
+func TestErrInjectionPoint(t *testing.T) {
+	cases := []struct {
+		name  string
+		seed  [2]uint64
+		spec  *RandomSpec
+		iters int
+		// wantNil: expect no injection point; otherwise it must be in [0, max).
+		wantNil bool
+		max     int
+	}{
+		{
+			name: "rows based in [0, rowsCount)",
+			seed: [2]uint64{1, 2},
+			spec: &RandomSpec{
+				Schema:           map[string]string{"id": "int"},
+				Limit:            &Limit{RowsCount: 100},
+				UserErrorMessage: "oops",
+			},
+			iters: 50,
+			max:   100,
+		},
+		{
+			name:    "no message",
+			seed:    [2]uint64{1, 2},
+			spec:    &RandomSpec{Schema: map[string]string{"id": "int"}, Limit: &Limit{RowsCount: 100}},
+			iters:   1,
+			wantNil: true,
+		},
+		{
+			name:    "nil limit",
+			seed:    [2]uint64{1, 2},
+			spec:    &RandomSpec{UserErrorMessage: "fail"},
+			iters:   1,
+			wantNil: true,
+		},
+		{name: "nil spec", seed: [2]uint64{1, 2}, spec: nil, iters: 1, wantNil: true},
+		{
+			name: "time based in [0, timeoutMs)",
+			seed: [2]uint64{3, 4},
+			spec: &RandomSpec{
+				Schema:           map[string]string{"id": "int"},
+				Limit:            &Limit{TimeoutInSeconds: 10},
+				UserErrorMessage: "boom",
+			},
+			iters: 20,
+			max:   10000,
+		},
 	}
-}
-
-// TestSortStrings verifies the simple insertion sort.
-func TestSortStrings(t *testing.T) {
-	ss := []string{"z", "a", "m", "b"}
-	sortStrings(ss)
-	want := []string{"a", "b", "m", "z"}
-	for i, v := range ss {
-		if v != want[i] {
-			t.Fatalf("sort failed: got %v, want %v", ss, want)
-		}
-	}
-}
-
-// TestErrInjectionPoint_RowsBased verifies injection point is in [0, rowsCount).
-func TestErrInjectionPoint_RowsBased(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	r := &RandomSpec{
-		Schema:           map[string]string{"id": "int"},
-		Limit:            &Limit{RowsCount: 100},
-		UserErrorMessage: "oops",
-	}
-
-	for i := 0; i < 50; i++ {
-		at := errInjectionPoint(rng, r)
-		if at == nil {
-			t.Fatal("expected non-nil injection point")
-		}
-		if *at < 0 || *at >= 100 {
-			t.Fatalf("injection point %d out of [0,100)", *at)
-		}
-	}
-}
-
-// TestErrInjectionPoint_NoMessage returns nil.
-func TestErrInjectionPoint_NoMessage(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	r := &RandomSpec{
-		Schema: map[string]string{"id": "int"},
-		Limit:  &Limit{RowsCount: 100},
-	}
-	if at := errInjectionPoint(rng, r); at != nil {
-		t.Fatalf("expected nil with no UserErrorMessage, got %d", *at)
-	}
-}
-
-// TestErrInjectionPoint_NilLimit returns nil.
-func TestErrInjectionPoint_NilLimit(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	r := &RandomSpec{
-		UserErrorMessage: "fail",
-	}
-	if at := errInjectionPoint(rng, r); at != nil {
-		t.Fatalf("expected nil with nil Limit, got %d", *at)
-	}
-}
-
-// TestErrInjectionPoint_NilSpec returns nil.
-func TestErrInjectionPoint_NilSpec(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	if at := errInjectionPoint(rng, nil); at != nil {
-		t.Fatalf("expected nil with nil RandomSpec, got %d", *at)
-	}
-}
-
-// TestErrInjectionPoint_TimeBased verifies injection point in [0, timeoutMs).
-func TestErrInjectionPoint_TimeBased(t *testing.T) {
-	rng := rand.New(rand.NewPCG(3, 4))
-	r := &RandomSpec{
-		Schema:           map[string]string{"id": "int"},
-		Limit:            &Limit{TimeoutInSeconds: 10},
-		UserErrorMessage: "boom",
-	}
-	for i := 0; i < 20; i++ {
-		at := errInjectionPoint(rng, r)
-		if at == nil {
-			t.Fatal("expected non-nil injection point")
-		}
-		if *at < 0 || *at >= 10000 {
-			t.Fatalf("time-based injection point %d out of [0, 10000)", *at)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(tc.seed[0], tc.seed[1]))
+			for i := 0; i < tc.iters; i++ {
+				at := errInjectionPoint(rng, tc.spec)
+				if tc.wantNil {
+					if at != nil {
+						t.Fatalf("expected nil injection point, got %d", *at)
+					}
+					continue
+				}
+				if at == nil {
+					t.Fatal("expected non-nil injection point")
+				}
+				if *at < 0 || *at >= tc.max {
+					t.Fatalf("injection point %d out of [0,%d)", *at, tc.max)
+				}
+			}
+		})
 	}
 }

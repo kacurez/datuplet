@@ -332,6 +332,14 @@ func TestValidateParams(t *testing.T) {
 			wantErr: "MAX_SAFE_INTEGER",
 		},
 		{
+			// 2^53+1.5 is not representable: it rounds to 9007199254740994,
+			// an integral value beyond the safe range.
+			name:    "integral float64 rounded above 2^53 (2^53+1.5)",
+			sql:     "SELECT * WHERE n = $n",
+			params:  map[string]any{"n": float64(1<<53) + 1.5},
+			wantErr: "MAX_SAFE_INTEGER",
+		},
+		{
 			name:    "huge integral float64 (1e300)",
 			sql:     "SELECT * WHERE n = $n",
 			params:  map[string]any{"n": 1e300},
@@ -691,138 +699,6 @@ func TestPlaceholderSpans(t *testing.T) {
 						t.Errorf("placeholderSpans[%d].offset = %d, want %d", i, s.offset, tt.wantSpan[i].offset)
 					}
 				}
-			}
-		})
-	}
-}
-
-// TestMaxSafeInteger validates the 2^53-1 boundary specifically
-func TestMaxSafeInteger(t *testing.T) {
-	maxSafe := int64(9007199254740991)       // 2^53 - 1
-	overSafe := int64(9007199254740992)      // 2^53
-	minSafe := int64(-9007199254740991)      // -(2^53 - 1)
-	underMinSafe := int64(-9007199254740992) // -(2^53)
-
-	tests := []struct {
-		name      string
-		sql       string
-		params    map[string]any
-		shouldErr bool
-	}{
-		{
-			name:      "max safe",
-			sql:       "SELECT * WHERE n = $n",
-			params:    map[string]any{"n": maxSafe},
-			shouldErr: false,
-		},
-		{
-			name:      "one over max safe",
-			sql:       "SELECT * WHERE n = $n",
-			params:    map[string]any{"n": overSafe},
-			shouldErr: true,
-		},
-		{
-			name:      "min safe (negative)",
-			sql:       "SELECT * WHERE n = $n",
-			params:    map[string]any{"n": minSafe},
-			shouldErr: false,
-		},
-		{
-			name:      "one under min safe (negative)",
-			sql:       "SELECT * WHERE n = $n",
-			params:    map[string]any{"n": underMinSafe},
-			shouldErr: true,
-		},
-		{
-			name:      "1<<53 as mentioned in brief",
-			sql:       "SELECT * WHERE n = $n",
-			params:    map[string]any{"n": int64(1 << 53)},
-			shouldErr: true,
-		},
-		{
-			name:      "-(1<<53) as mentioned in brief",
-			sql:       "SELECT * WHERE n = $n",
-			params:    map[string]any{"n": int64(-(1 << 53))},
-			shouldErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := ValidateParams(tt.sql, tt.params)
-			if tt.shouldErr && err == nil {
-				t.Errorf("ValidateParams should error for %v, got nil", tt.params["n"])
-			} else if !tt.shouldErr && err != nil {
-				t.Errorf("ValidateParams should not error for %v, got %v", tt.params["n"], err)
-			}
-		})
-	}
-}
-
-// TestFloatSafeInteger checks that float64 values at the boundary are handled
-// correctly. Per spec §6.1 the bind type is decided by the *value*: an integral
-// value (whatever its Go type or lexical form) must satisfy |n| ≤ 2^53−1; a
-// non-integral value binds as DOUBLE and is unbounded.
-func TestFloatSafeInteger(t *testing.T) {
-	tests := []struct {
-		name      string
-		value     float64
-		shouldErr bool
-	}{
-		{
-			name:      "normal float",
-			value:     3.14,
-			shouldErr: false,
-		},
-		{
-			name:      "non-integral float well inside the safe range",
-			value:     12345.75,
-			shouldErr: false,
-		},
-		{
-			name:      "integral float at max safe",
-			value:     float64(9007199254740991),
-			shouldErr: false,
-		},
-		{
-			// 2^53−0.5 is not representable: it rounds to 2^53, which is integral
-			// and outside the safe range, so it is rejected.
-			name:      "float64(1<<53)-0.5 rounds to 2^53 and is rejected",
-			value:     float64(1<<53) - 0.5,
-			shouldErr: true,
-		},
-		{
-			// Likewise 2^53+1.5 rounds to 9007199254740994.
-			name:      "float64(1<<53)+1.5 rounds to an integer and is rejected",
-			value:     float64(1<<53) + 1.5,
-			shouldErr: true,
-		},
-		{
-			name:      "float that is exactly 1<<53",
-			value:     float64(1 << 53),
-			shouldErr: true,
-		},
-		{
-			name:      "float that is exactly -(1<<53)",
-			value:     float64(-(1 << 53)),
-			shouldErr: true,
-		},
-		{
-			name:      "huge integral float",
-			value:     1e300,
-			shouldErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sql := "SELECT * WHERE n = $n"
-			params := map[string]any{"n": tt.value}
-			_, err := ValidateParams(sql, params)
-			if tt.shouldErr && err == nil {
-				t.Errorf("ValidateParams should error for float %v", tt.value)
-			} else if !tt.shouldErr && err != nil {
-				t.Errorf("ValidateParams should not error for float %v: %v", tt.value, err)
 			}
 		})
 	}
