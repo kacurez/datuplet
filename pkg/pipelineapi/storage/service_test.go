@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"context"
 	"testing"
+
+	"github.com/datuplet/datuplet/pkg/pipelineapi/tokens"
 )
 
 // TestNewForLakekeeper: constructor returns a usable Service when the
@@ -36,6 +39,46 @@ func TestNewForLakekeeper(t *testing.T) {
 			t.Fatalf("expected nil service for empty URL, got %+v", svc)
 		}
 	})
+}
+
+// TestWithLakekeeper: WithLakekeeper wires the minter, projectIDFor, and
+// warehouseResolver fields without overwriting unrelated Service fields.
+func TestWithLakekeeper(t *testing.T) {
+	svc, err := NewForLakekeeper("http://lakekeeper:8181/catalog")
+	if err != nil || svc == nil {
+		t.Fatalf("NewForLakekeeper: %v", err)
+	}
+	minterCalled := false
+	minter := func(_ context.Context) (tokens.ImpersonationToken, error) {
+		minterCalled = true
+		return "tok", nil
+	}
+	warehouseResolverCalled := false
+	warehouseResolver := func(_ context.Context, _ string) (string, error) {
+		warehouseResolverCalled = true
+		return "datuplet", nil
+	}
+
+	svc.WithLakekeeper("http://lakekeeper:8181/catalog", minter, nil, warehouseResolver)
+
+	if svc.Minter == nil {
+		t.Fatal("Minter not wired by WithLakekeeper")
+	}
+	if _, err := svc.Minter(context.Background()); err != nil {
+		t.Errorf("Minter returned error: %v", err)
+	}
+	if !minterCalled {
+		t.Error("Minter was not called")
+	}
+	if svc.WarehouseResolver == nil {
+		t.Fatal("WarehouseResolver not wired by WithLakekeeper")
+	}
+	if _, err := svc.WarehouseResolver(context.Background(), "any-lk-proj-id"); err != nil {
+		t.Errorf("WarehouseResolver returned error: %v", err)
+	}
+	if !warehouseResolverCalled {
+		t.Error("WarehouseResolver was not called")
+	}
 }
 
 // TestNewFromEnv: filesystem mode still works (used by tests and
