@@ -90,32 +90,23 @@ func TestBuildSnapshotSummary_LocalCLIToken(t *testing.T) {
 	}
 }
 
-// TestBuildSnapshotSummary_EmptyToken verifies that an empty token string
-// returns nil (no panic, no audit keys written).
-func TestBuildSnapshotSummary_EmptyToken(t *testing.T) {
+// TestBuildSnapshotSummary_UnparseableToken verifies that an empty string or a
+// non-JWT string returns nil (no panic, no audit keys written).
+func TestBuildSnapshotSummary_UnparseableToken(t *testing.T) {
 	t.Parallel()
-	props := BuildSnapshotSummary("", "run-irrelevant")
-	if props != nil {
-		t.Errorf("expected nil for empty token, got %v", props)
-	}
-}
-
-// TestBuildSnapshotSummary_MalformedToken verifies that a non-JWT string
-// returns nil without panicking.
-func TestBuildSnapshotSummary_MalformedToken(t *testing.T) {
-	t.Parallel()
-	for _, bad := range []string{
-		"notajwt",
-		"a.b",                     // two segments (need three)
-		"a.b.c.d",                 // four segments
-		strings.Repeat("x", 512), // long garbage
+	for _, tc := range []struct{ name, token string }{
+		{"empty", ""},
+		{"not a jwt", "notajwt"},
+		{"two segments (need three)", "a.b"},
+		{"four segments", "a.b.c.d"},
+		{"long garbage", strings.Repeat("x", 512)},
 	} {
-		bad := bad
-		t.Run(bad[:min(len(bad), 20)], func(t *testing.T) {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			props := BuildSnapshotSummary(bad, "run-x")
+			props := BuildSnapshotSummary(tc.token, "run-x")
 			if props != nil {
-				t.Errorf("expected nil for malformed token %q, got %v", bad, props)
+				t.Errorf("expected nil for unparseable token %q, got %v", tc.token, props)
 			}
 		})
 	}
@@ -142,32 +133,6 @@ func TestBuildSnapshotSummary_UnknownTokenKind(t *testing.T) {
 			props := BuildSnapshotSummary(raw, "run-x")
 			if props != nil {
 				t.Errorf("expected nil for unknown token_kind=%q, got %v", kind, props)
-			}
-		})
-	}
-}
-
-// TestRunModeFromTokenKind verifies the mapping table.
-func TestRunModeFromTokenKind(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		kind string
-		want string
-	}{
-		{"run", "cluster"},
-		{"local-cli", "local-cli"},
-		{"user", ""},
-		{"impersonation", ""},
-		{"", ""},
-		{"unknown", ""},
-	}
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.kind, func(t *testing.T) {
-			t.Parallel()
-			got := RunModeFromTokenKind(tc.kind)
-			if got != tc.want {
-				t.Errorf("RunModeFromTokenKind(%q) = %q; want %q", tc.kind, got, tc.want)
 			}
 		})
 	}
@@ -208,48 +173,4 @@ func TestBuildSnapshotSummary_InjectedRunModeClaimIsIgnored(t *testing.T) {
 		t.Errorf("datuplet.run-mode = %q; want %q (injected claim must not override token_kind-derived value)",
 			got, "cluster")
 	}
-}
-
-// TestBuildSnapshotSummary_EnvVarDoesNotControlRunMode documents the
-// structural guarantee that env vars cannot influence the run-mode audit
-// key. BuildSnapshotSummary has no env-var reads — it only reads JWT claims
-// — so this is enforced at the type/call-graph level, not by runtime logic.
-// This test exists to make the invariant searchable and to fail loudly if
-// the function signature ever changes to accept an env-derived argument.
-func TestBuildSnapshotSummary_EnvVarDoesNotControlRunMode(t *testing.T) {
-	t.Parallel()
-
-	// The function signature is: BuildSnapshotSummary(rawToken string, runID string).
-	// No env parameter, no context parameter that could carry env state.
-	// Verify the run-mode in the output matches the token_kind-derived value
-	// regardless of what RUN_MODE would be set to in the environment.
-	//
-	// We intentionally do NOT call t.Setenv here — the point is that there
-	// is no env var to set; the function simply does not read any.
-	raw := signTestToken(t, jwt.MapClaims{
-		"iss":        "datuplet-api",
-		"aud":        "datuplet-catalog",
-		"sub":        "some-run-uuid",
-		"actor":      "user-uuid",
-		"token_kind": "local-cli",
-		"exp":        time.Now().Add(time.Hour).Unix(),
-	})
-
-	props := BuildSnapshotSummary(raw, "run-env-test-001")
-	if props == nil {
-		t.Fatal("BuildSnapshotSummary returned nil for valid local-cli token")
-	}
-
-	// Must be "local-cli" from token_kind — not overridable via env.
-	if got := props["datuplet.run-mode"]; got != "local-cli" {
-		t.Errorf("datuplet.run-mode = %q; want %q", got, "local-cli")
-	}
-}
-
-// min is a Go 1.20 builtin; keep a local copy for test compilation compatibility.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

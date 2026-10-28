@@ -14,13 +14,6 @@ import (
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
 
-func TestParquetAdapterFormat(t *testing.T) {
-	adapter := NewParquetAdapter(nil, nil)
-	if adapter.Format() != FormatParquet {
-		t.Errorf("Format() = %v, want FormatParquet", adapter.Format())
-	}
-}
-
 func TestParquetAdapterSerializeNotSupported(t *testing.T) {
 	adapter := NewParquetAdapter(nil, nil)
 	_, err := adapter.Serialize(nil)

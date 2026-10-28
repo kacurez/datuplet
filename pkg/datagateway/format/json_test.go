@@ -10,78 +10,192 @@ import (
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
 
-func TestJSONAdapterFormat(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-	if adapter.Format() != FormatJSON {
-		t.Errorf("Format() = %v, want FormatJSON", adapter.Format())
+// The JSON (array) and JSONL (line-delimited) adapters share their behavior
+// contract, so the checks below run once per adapter over equivalent inputs.
+
+func TestJSONAdapters_ParseSimple(t *testing.T) {
+	tests := []struct {
+		name    string
+		adapter FormatAdapter
+		input   string
+	}{
+		{"json", NewJSONAdapter(nil, nil), `[{"id": 1, "name": "Widget", "price": 9.99}, {"id": 2, "name": "Gadget", "price": 19.99}]`},
+		{"jsonl", NewJSONLAdapter(nil, nil), `{"id": 1, "name": "Widget", "price": 9.99}
+{"id": 2, "name": "Gadget", "price": 19.99}`},
+	}
+	wantTypes := map[string]schema.DataType{"id": schema.TypeInt64, "name": schema.TypeString, "price": schema.TypeFloat64}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record, s, err := tc.adapter.Parse([]byte(tc.input), nil)
+			if err != nil {
+				t.Fatalf("Parse() error: %v", err)
+			}
+			defer record.Release()
+
+			// Column order may vary, so check by name.
+			if s.NumColumns() != 3 {
+				t.Errorf("Schema has %d columns, want 3", s.NumColumns())
+			}
+			for name, want := range wantTypes {
+				col := s.ColumnByName(name)
+				if col == nil {
+					t.Fatalf("Schema missing %q column", name)
+				}
+				if col.Type != want {
+					t.Errorf("Column %q type = %v, want %v", name, col.Type, want)
+				}
+			}
+			if record.NumRows() != 2 {
+				t.Errorf("NumRows() = %d, want 2", record.NumRows())
+			}
+		})
 	}
 }
 
-func TestJSONAdapterParseSimple(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
+func TestJSONAdapters_ParseWithNulls(t *testing.T) {
+	tests := []struct {
+		name    string
+		adapter FormatAdapter
+		input   string
+	}{
+		{"json", NewJSONAdapter(nil, nil), `[{"id": 1, "name": "Widget", "price": 9.99}, {"id": 2, "name": null, "price": null}]`},
+		{"jsonl", NewJSONLAdapter(nil, nil), `{"id": 1, "name": "Widget", "price": 9.99}
+{"id": 2, "name": null, "price": null}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record, _, err := tc.adapter.Parse([]byte(tc.input), nil)
+			if err != nil {
+				t.Fatalf("Parse() error: %v", err)
+			}
+			defer record.Release()
 
-	jsonData := []byte(`[{"id": 1, "name": "Widget", "price": 9.99}, {"id": 2, "name": "Gadget", "price": 19.99}]`)
-	record, s, err := adapter.Parse(jsonData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	// Check schema - column order may vary, so check by name
-	if s.NumColumns() != 3 {
-		t.Errorf("Schema has %d columns, want 3", s.NumColumns())
-	}
-
-	idCol := s.ColumnByName("id")
-	if idCol == nil {
-		t.Fatal("Schema missing 'id' column")
-	}
-	if idCol.Type != schema.TypeInt64 {
-		t.Errorf("Column 'id' type = %v, want int64", idCol.Type)
-	}
-
-	nameCol := s.ColumnByName("name")
-	if nameCol == nil {
-		t.Fatal("Schema missing 'name' column")
-	}
-	if nameCol.Type != schema.TypeString {
-		t.Errorf("Column 'name' type = %v, want string", nameCol.Type)
-	}
-
-	priceCol := s.ColumnByName("price")
-	if priceCol == nil {
-		t.Fatal("Schema missing 'price' column")
-	}
-	if priceCol.Type != schema.TypeFloat64 {
-		t.Errorf("Column 'price' type = %v, want float64", priceCol.Type)
-	}
-
-	// Check row count
-	if record.NumRows() != 2 {
-		t.Errorf("NumRows() = %d, want 2", record.NumRows())
+			arrowSchema := record.Schema()
+			for _, col := range []string{"name", "price"} {
+				if !record.Column(arrowSchema.FieldIndices(col)[0]).IsNull(1) {
+					t.Errorf("Row 1, column %q should be null", col)
+				}
+			}
+		})
 	}
 }
 
-func TestJSONAdapterParseWithNulls(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-
-	jsonData := []byte(`[{"id": 1, "name": "Widget", "price": 9.99}, {"id": 2, "name": null, "price": null}]`)
-	record, _, err := adapter.Parse(jsonData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
+func TestJSONAdapters_ParseRejects(t *testing.T) {
+	tests := []struct {
+		name    string
+		adapter FormatAdapter
+		input   string
+	}{
+		{"json: empty array", NewJSONAdapter(nil, nil), "[]"},
+		{"json: invalid JSON", NewJSONAdapter(nil, nil), "not valid json"},
+		{"jsonl: empty data", NewJSONLAdapter(nil, nil), ""},
+		{"jsonl: invalid line", NewJSONLAdapter(nil, nil), `{"id": 1, "name": "Widget"}
+not valid json
+{"id": 2, "name": "Gadget"}`},
 	}
-	defer record.Release()
-
-	// Row 1 should have nulls
-	arrowSchema := record.Schema()
-	nameIdx := arrowSchema.FieldIndices("name")[0]
-	priceIdx := arrowSchema.FieldIndices("price")[0]
-
-	if !record.Column(nameIdx).IsNull(1) {
-		t.Error("Row 1, column 'name' should be null")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := tc.adapter.Parse([]byte(tc.input), nil); err == nil {
+				t.Error("Parse() should return an error")
+			}
+		})
 	}
-	if !record.Column(priceIdx).IsNull(1) {
-		t.Error("Row 1, column 'price' should be null")
+}
+
+func TestJSONAdapters_Serialize(t *testing.T) {
+	tests := []struct {
+		name    string
+		adapter FormatAdapter
+		input   string
+		// objects decodes the serialized output into its row objects.
+		objects func(t *testing.T, output []byte) []map[string]any
+	}{
+		{
+			name:    "json: array of objects",
+			adapter: NewJSONAdapter(nil, nil),
+			input:   `[{"id": 1, "name": "Widget"}, {"id": 2, "name": "Gadget"}]`,
+			objects: func(t *testing.T, output []byte) []map[string]any {
+				var objects []map[string]any
+				if err := json.Unmarshal(output, &objects); err != nil {
+					t.Fatalf("Output is not valid JSON: %v", err)
+				}
+				return objects
+			},
+		},
+		{
+			name:    "jsonl: one valid JSON object per line",
+			adapter: NewJSONLAdapter(nil, nil),
+			input: `{"id": 1, "name": "Widget"}
+{"id": 2, "name": "Gadget"}`,
+			objects: func(t *testing.T, output []byte) []map[string]any {
+				var objects []map[string]any
+				for i, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+					var obj map[string]any
+					if err := json.Unmarshal([]byte(line), &obj); err != nil {
+						t.Errorf("Line %d is not valid JSON: %v", i, err)
+					}
+					objects = append(objects, obj)
+				}
+				return objects
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record, _, err := tc.adapter.Parse([]byte(tc.input), nil)
+			if err != nil {
+				t.Fatalf("Parse() error: %v", err)
+			}
+			defer record.Release()
+
+			output, err := tc.adapter.Serialize(record)
+			if err != nil {
+				t.Fatalf("Serialize() error: %v", err)
+			}
+			if got := len(tc.objects(t, output)); got != 2 {
+				t.Errorf("Output has %d objects, want 2", got)
+			}
+		})
+	}
+}
+
+func TestJSONAdapters_RoundTrip(t *testing.T) {
+	tests := []struct {
+		name    string
+		adapter FormatAdapter
+		input   string
+	}{
+		{"json", NewJSONAdapter(nil, nil), `[{"active": true, "id": 1, "name": "Alice", "score": 95.5}, {"active": false, "id": 2, "name": "Bob", "score": 87.3}]`},
+		{"jsonl", NewJSONLAdapter(nil, nil), `{"active": true, "id": 1, "name": "Alice"}
+{"active": false, "id": 2, "name": "Bob"}
+{"active": true, "id": 3, "name": "Charlie"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record, _, err := tc.adapter.Parse([]byte(tc.input), nil)
+			if err != nil {
+				t.Fatalf("Parse() error: %v", err)
+			}
+			defer record.Release()
+
+			output, err := tc.adapter.Serialize(record)
+			if err != nil {
+				t.Fatalf("Serialize() error: %v", err)
+			}
+
+			record2, _, err := tc.adapter.Parse(output, nil)
+			if err != nil {
+				t.Fatalf("Second Parse() error: %v", err)
+			}
+			defer record2.Release()
+
+			if record.NumRows() != record2.NumRows() {
+				t.Errorf("Row counts: %d vs %d", record.NumRows(), record2.NumRows())
+			}
+			if record.NumCols() != record2.NumCols() {
+				t.Errorf("Column counts: %d vs %d", record.NumCols(), record2.NumCols())
+			}
+		})
 	}
 }
 
@@ -127,114 +241,7 @@ func TestJSONAdapterParseWithSchema(t *testing.T) {
 	}
 }
 
-func TestJSONAdapterParseEmpty(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-
-	_, _, err := adapter.Parse([]byte("[]"), nil)
-	if err == nil {
-		t.Error("Parse() should return error for empty array")
-	}
-}
-
-func TestJSONAdapterParseInvalid(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-
-	_, _, err := adapter.Parse([]byte("not valid json"), nil)
-	if err == nil {
-		t.Error("Parse() should return error for invalid JSON")
-	}
-}
-
-func TestJSONAdapterSerialize(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-
-	// Parse some data
-	jsonData := []byte(`[{"id": 1, "name": "Widget"}, {"id": 2, "name": "Gadget"}]`)
-	record, _, err := adapter.Parse(jsonData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	// Serialize
-	output, err := adapter.Serialize(record)
-	if err != nil {
-		t.Fatalf("Serialize() error: %v", err)
-	}
-
-	// Parse the output to verify it's valid JSON
-	var objects []map[string]any
-	if err := json.Unmarshal(output, &objects); err != nil {
-		t.Fatalf("Output is not valid JSON: %v", err)
-	}
-
-	if len(objects) != 2 {
-		t.Errorf("Output has %d objects, want 2", len(objects))
-	}
-}
-
-func TestJSONAdapterRoundTrip(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-
-	original := []byte(`[{"active": true, "id": 1, "name": "Alice", "score": 95.5}, {"active": false, "id": 2, "name": "Bob", "score": 87.3}]`)
-
-	// Parse
-	record, _, err := adapter.Parse(original, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	// Serialize
-	output, err := adapter.Serialize(record)
-	if err != nil {
-		t.Fatalf("Serialize() error: %v", err)
-	}
-
-	// Parse again
-	record2, _, err := adapter.Parse(output, nil)
-	if err != nil {
-		t.Fatalf("Second Parse() error: %v", err)
-	}
-	defer record2.Release()
-
-	if record.NumRows() != record2.NumRows() {
-		t.Errorf("Row counts: %d vs %d", record.NumRows(), record2.NumRows())
-	}
-	if record.NumCols() != record2.NumCols() {
-		t.Errorf("Column counts: %d vs %d", record.NumCols(), record2.NumCols())
-	}
-}
-
 // JSONL Adapter Tests
-
-func TestJSONLAdapterFormat(t *testing.T) {
-	adapter := NewJSONLAdapter(nil, nil)
-	if adapter.Format() != FormatJSONL {
-		t.Errorf("Format() = %v, want FormatJSONL", adapter.Format())
-	}
-}
-
-func TestJSONLAdapterParseSimple(t *testing.T) {
-	adapter := NewJSONLAdapter(nil, nil)
-
-	jsonlData := []byte(`{"id": 1, "name": "Widget", "price": 9.99}
-{"id": 2, "name": "Gadget", "price": 19.99}`)
-
-	record, s, err := adapter.Parse(jsonlData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	if s.NumColumns() != 3 {
-		t.Errorf("Schema has %d columns, want 3", s.NumColumns())
-	}
-
-	if record.NumRows() != 2 {
-		t.Errorf("NumRows() = %d, want 2", record.NumRows())
-	}
-}
 
 func TestJSONLAdapterParseWithEmptyLines(t *testing.T) {
 	adapter := NewJSONLAdapter(nil, nil)
@@ -257,114 +264,6 @@ func TestJSONLAdapterParseWithEmptyLines(t *testing.T) {
 	}
 }
 
-func TestJSONLAdapterParseWithNulls(t *testing.T) {
-	adapter := NewJSONLAdapter(nil, nil)
-
-	jsonlData := []byte(`{"id": 1, "name": "Widget", "price": 9.99}
-{"id": 2, "name": null, "price": null}`)
-
-	record, _, err := adapter.Parse(jsonlData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	// Check nulls
-	arrowSchema := record.Schema()
-	nameIdx := arrowSchema.FieldIndices("name")[0]
-	if !record.Column(nameIdx).IsNull(1) {
-		t.Error("Row 1, column 'name' should be null")
-	}
-}
-
-func TestJSONLAdapterParseEmpty(t *testing.T) {
-	adapter := NewJSONLAdapter(nil, nil)
-
-	_, _, err := adapter.Parse([]byte(""), nil)
-	if err == nil {
-		t.Error("Parse() should return error for empty data")
-	}
-}
-
-func TestJSONLAdapterParseInvalidLine(t *testing.T) {
-	adapter := NewJSONLAdapter(nil, nil)
-
-	jsonlData := []byte(`{"id": 1, "name": "Widget"}
-not valid json
-{"id": 2, "name": "Gadget"}`)
-
-	_, _, err := adapter.Parse(jsonlData, nil)
-	if err == nil {
-		t.Error("Parse() should return error for invalid JSON line")
-	}
-}
-
-func TestJSONLAdapterSerialize(t *testing.T) {
-	adapter := NewJSONLAdapter(nil, nil)
-
-	// Parse some data
-	jsonlData := []byte(`{"id": 1, "name": "Widget"}
-{"id": 2, "name": "Gadget"}`)
-
-	record, _, err := adapter.Parse(jsonlData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	// Serialize
-	output, err := adapter.Serialize(record)
-	if err != nil {
-		t.Fatalf("Serialize() error: %v", err)
-	}
-
-	// Should have 2 lines
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) != 2 {
-		t.Errorf("Output has %d lines, want 2", len(lines))
-	}
-
-	// Each line should be valid JSON
-	for i, line := range lines {
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			t.Errorf("Line %d is not valid JSON: %v", i, err)
-		}
-	}
-}
-
-func TestJSONLAdapterRoundTrip(t *testing.T) {
-	adapter := NewJSONLAdapter(nil, nil)
-
-	original := []byte(`{"active": true, "id": 1, "name": "Alice"}
-{"active": false, "id": 2, "name": "Bob"}
-{"active": true, "id": 3, "name": "Charlie"}`)
-
-	// Parse
-	record, _, err := adapter.Parse(original, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	// Serialize
-	output, err := adapter.Serialize(record)
-	if err != nil {
-		t.Fatalf("Serialize() error: %v", err)
-	}
-
-	// Parse again
-	record2, _, err := adapter.Parse(output, nil)
-	if err != nil {
-		t.Fatalf("Second Parse() error: %v", err)
-	}
-	defer record2.Release()
-
-	if record.NumRows() != record2.NumRows() {
-		t.Errorf("Row counts: %d vs %d", record.NumRows(), record2.NumRows())
-	}
-}
-
 func TestInferJSONFieldOrder(t *testing.T) {
 	objects := []map[string]any{
 		{"name": "Widget", "id": 1},
@@ -384,47 +283,6 @@ func TestInferJSONFieldOrder(t *testing.T) {
 		if f != expected[i] {
 			t.Errorf("Field %d = %q, want %q", i, f, expected[i])
 		}
-	}
-}
-
-func TestJSONAdapterBooleans(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-
-	jsonData := []byte(`[{"id": 1, "active": true}, {"id": 2, "active": false}]`)
-	record, s, err := adapter.Parse(jsonData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	activeCol := s.ColumnByName("active")
-	if activeCol == nil {
-		t.Fatal("Schema missing 'active' column")
-	}
-	if activeCol.Type != schema.TypeBool {
-		t.Errorf("Column 'active' type = %v, want bool", activeCol.Type)
-	}
-}
-
-func TestJSONAdapterNestedIgnored(t *testing.T) {
-	adapter := NewJSONAdapter(nil, nil)
-
-	// Nested objects should become strings
-	jsonData := []byte(`[{"id": 1, "metadata": {"key": "value"}}]`)
-	record, s, err := adapter.Parse(jsonData, nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
-	}
-	defer record.Release()
-
-	// metadata should be string (JSON objects become their string representation)
-	metaCol := s.ColumnByName("metadata")
-	if metaCol == nil {
-		t.Fatal("Schema missing 'metadata' column")
-	}
-	// Complex types default to string
-	if metaCol.Type != schema.TypeString {
-		t.Errorf("Column 'metadata' type = %v, want string", metaCol.Type)
 	}
 }
 

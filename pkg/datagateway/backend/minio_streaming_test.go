@@ -177,8 +177,9 @@ func TestMinIOStreaming_ContextCancellation(t *testing.T) {
 	}
 }
 
-// Close is idempotent. Calling Close twice must not panic and must return
-// the same error both times.
+// Close is idempotent: calling it twice must not panic and must return the
+// same (nil) error both times. Write-after-Close must not panic either; the
+// pipe writer rejects further writes with io.ErrClosedPipe.
 func TestMinIOStreaming_CloseIdempotent(t *testing.T) {
 	api := &fakeMinioPutAPI{}
 	w := openStreamingMinIOWriter(context.Background(), api, "bucket", "key.parquet")
@@ -187,17 +188,6 @@ func TestMinIOStreaming_CloseIdempotent(t *testing.T) {
 	second := w.Close()
 	if first != nil || second != nil {
 		t.Fatalf("Close returned errors: first=%v second=%v", first, second)
-	}
-}
-
-// Write-after-Close must not panic. The pipe writer rejects further writes
-// with io.ErrClosedPipe.
-func TestMinIOStreaming_WriteAfterCloseRejected(t *testing.T) {
-	api := &fakeMinioPutAPI{}
-	w := openStreamingMinIOWriter(context.Background(), api, "bucket", "key.parquet")
-	_, _ = w.Write([]byte("hello"))
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
 	}
 	if _, err := w.Write([]byte("after close")); err == nil {
 		t.Error("Write after Close should return an error")

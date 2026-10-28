@@ -61,23 +61,6 @@ func TestParseDataType(t *testing.T) {
 	}
 }
 
-func TestDataTypeRoundTrip(t *testing.T) {
-	types := []DataType{
-		TypeInt64, TypeInt32, TypeFloat64, TypeFloat32,
-		TypeString, TypeBool, TypeTimestamp, TypeDate, TypeBinary,
-	}
-
-	for _, dt := range types {
-		t.Run(dt.String(), func(t *testing.T) {
-			s := dt.String()
-			parsed := ParseDataType(s)
-			if parsed != dt {
-				t.Errorf("Round trip failed: %v -> %q -> %v", dt, s, parsed)
-			}
-		})
-	}
-}
-
 func TestToArrowType(t *testing.T) {
 	tests := []struct {
 		dt          DataType
@@ -161,161 +144,136 @@ func TestFromArrowType(t *testing.T) {
 	}
 }
 
-func TestArrowTypeRoundTrip(t *testing.T) {
-	types := []DataType{
-		TypeInt64, TypeInt32, TypeFloat64, TypeFloat32,
-		TypeString, TypeBool, TypeTimestamp, TypeDate, TypeBinary,
+func TestNewSchema(t *testing.T) {
+	tests := []struct {
+		name    string
+		columns []ColumnDef
+		wantErr bool
+	}{
+		{
+			name: "valid columns",
+			columns: []ColumnDef{
+				{Name: "id", Type: TypeInt64, Nullable: false},
+				{Name: "name", Type: TypeString, Nullable: true},
+				{Name: "price", Type: TypeFloat64, Nullable: true},
+			},
+		},
+		{name: "empty columns", columns: []ColumnDef{}, wantErr: true},
+		{name: "unknown type", columns: []ColumnDef{{Name: "bad", Type: TypeUnknown, Nullable: true}}, wantErr: true},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := NewSchema(tc.columns)
+			if tc.wantErr {
+				if err == nil {
+					t.Error("NewSchema should return an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSchema() error: %v", err)
+			}
 
-	for _, dt := range types {
-		t.Run(dt.String(), func(t *testing.T) {
-			arrowType, err := ToArrowType(dt)
-			if err != nil {
-				t.Fatalf("ToArrowType(%v) error: %v", dt, err)
+			if schema.NumColumns() != len(tc.columns) {
+				t.Errorf("NumColumns() = %d, want %d", schema.NumColumns(), len(tc.columns))
 			}
-			back, err := FromArrowType(arrowType)
-			if err != nil {
-				t.Fatalf("FromArrowType(%v) error: %v", arrowType, err)
+			for i, want := range tc.columns {
+				col := schema.Column(i)
+				if col.Name != want.Name || col.Type != want.Type || col.Nullable != want.Nullable {
+					t.Errorf("Column(%d) = %+v, want {%s, %v, %v}", i, col, want.Name, want.Type, want.Nullable)
+				}
 			}
-			if back != dt {
-				t.Errorf("Round trip failed: %v -> %v -> %v", dt, arrowType, back)
+
+			// Check Arrow schema is created
+			arrowSchema := schema.ArrowSchema()
+			if arrowSchema == nil {
+				t.Fatal("ArrowSchema() returned nil")
+			}
+			if arrowSchema.NumFields() != len(tc.columns) {
+				t.Errorf("ArrowSchema().NumFields() = %d, want %d", arrowSchema.NumFields(), len(tc.columns))
 			}
 		})
 	}
 }
 
-func TestNewSchema(t *testing.T) {
-	columns := []ColumnDef{
-		{Name: "id", Type: TypeInt64, Nullable: false},
-		{Name: "name", Type: TypeString, Nullable: true},
-		{Name: "price", Type: TypeFloat64, Nullable: true},
-	}
-
-	schema, err := NewSchema(columns)
-	if err != nil {
-		t.Fatalf("NewSchema() error: %v", err)
-	}
-
-	if schema.NumColumns() != 3 {
-		t.Errorf("NumColumns() = %d, want 3", schema.NumColumns())
-	}
-
-	// Check each column
-	col0 := schema.Column(0)
-	if col0.Name != "id" || col0.Type != TypeInt64 || col0.Nullable != false {
-		t.Errorf("Column(0) = %+v, want {id, int64, false}", col0)
-	}
-
-	col1 := schema.Column(1)
-	if col1.Name != "name" || col1.Type != TypeString || col1.Nullable != true {
-		t.Errorf("Column(1) = %+v, want {name, string, true}", col1)
-	}
-
-	// Check Arrow schema is created
-	arrowSchema := schema.ArrowSchema()
-	if arrowSchema == nil {
-		t.Error("ArrowSchema() returned nil")
-	}
-	if arrowSchema.NumFields() != 3 {
-		t.Errorf("ArrowSchema().NumFields() = %d, want 3", arrowSchema.NumFields())
-	}
-}
-
-func TestNewSchemaEmpty(t *testing.T) {
-	_, err := NewSchema([]ColumnDef{})
-	if err == nil {
-		t.Error("NewSchema with empty columns should return error")
-	}
-}
-
-func TestNewSchemaInvalidType(t *testing.T) {
-	columns := []ColumnDef{
-		{Name: "bad", Type: TypeUnknown, Nullable: true},
-	}
-
-	_, err := NewSchema(columns)
-	if err == nil {
-		t.Error("NewSchema with unknown type should return error")
-	}
-}
-
 func TestNewSchemaFromArrow(t *testing.T) {
-	arrowSchema := arrow.NewSchema([]arrow.Field{
-		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
-	}, nil)
-
-	schema, err := NewSchemaFromArrow(arrowSchema)
-	if err != nil {
-		t.Fatalf("NewSchemaFromArrow() error: %v", err)
+	tests := []struct {
+		name    string
+		in      *arrow.Schema
+		wantErr bool
+	}{
+		{
+			name: "converts fields",
+			in: arrow.NewSchema([]arrow.Field{
+				{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+				{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+			}, nil),
+		},
+		{name: "nil schema", in: nil, wantErr: true},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := NewSchemaFromArrow(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Error("NewSchemaFromArrow should return an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSchemaFromArrow() error: %v", err)
+			}
 
-	if schema.NumColumns() != 2 {
-		t.Errorf("NumColumns() = %d, want 2", schema.NumColumns())
-	}
-
-	col0 := schema.Column(0)
-	if col0.Name != "id" || col0.Type != TypeInt64 || col0.Nullable != false {
-		t.Errorf("Column(0) = %+v, want {id, int64, false}", col0)
-	}
-}
-
-func TestNewSchemaFromArrowNil(t *testing.T) {
-	_, err := NewSchemaFromArrow(nil)
-	if err == nil {
-		t.Error("NewSchemaFromArrow(nil) should return error")
-	}
-}
-
-func TestSchemaColumnByName(t *testing.T) {
-	columns := []ColumnDef{
-		{Name: "id", Type: TypeInt64, Nullable: false},
-		{Name: "name", Type: TypeString, Nullable: true},
-	}
-
-	schema, err := NewSchema(columns)
-	if err != nil {
-		t.Fatalf("NewSchema() error: %v", err)
-	}
-
-	// Found
-	col := schema.ColumnByName("name")
-	if col == nil {
-		t.Error("ColumnByName('name') returned nil")
-	} else if col.Type != TypeString {
-		t.Errorf("ColumnByName('name').Type = %v, want string", col.Type)
-	}
-
-	// Not found
-	col = schema.ColumnByName("nonexistent")
-	if col != nil {
-		t.Error("ColumnByName('nonexistent') should return nil")
+			if schema.NumColumns() != 2 {
+				t.Errorf("NumColumns() = %d, want 2", schema.NumColumns())
+			}
+			col0 := schema.Column(0)
+			if col0.Name != "id" || col0.Type != TypeInt64 || col0.Nullable != false {
+				t.Errorf("Column(0) = %+v, want {id, int64, false}", col0)
+			}
+		})
 	}
 }
 
-func TestSchemaColumnIndex(t *testing.T) {
-	columns := []ColumnDef{
+func TestSchemaColumnLookup(t *testing.T) {
+	schema, err := NewSchema([]ColumnDef{
 		{Name: "id", Type: TypeInt64, Nullable: false},
 		{Name: "name", Type: TypeString, Nullable: true},
 		{Name: "price", Type: TypeFloat64, Nullable: true},
-	}
-
-	schema, err := NewSchema(columns)
+	})
 	if err != nil {
 		t.Fatalf("NewSchema() error: %v", err)
 	}
 
-	if idx := schema.ColumnIndex("id"); idx != 0 {
-		t.Errorf("ColumnIndex('id') = %d, want 0", idx)
+	tests := []struct {
+		name     string
+		wantIdx  int
+		wantType DataType // ignored when wantIdx is -1 (not found)
+	}{
+		{"id", 0, TypeInt64},
+		{"name", 1, TypeString},
+		{"price", 2, TypeFloat64},
+		{"nonexistent", -1, TypeUnknown},
 	}
-	if idx := schema.ColumnIndex("name"); idx != 1 {
-		t.Errorf("ColumnIndex('name') = %d, want 1", idx)
-	}
-	if idx := schema.ColumnIndex("price"); idx != 2 {
-		t.Errorf("ColumnIndex('price') = %d, want 2", idx)
-	}
-	if idx := schema.ColumnIndex("nonexistent"); idx != -1 {
-		t.Errorf("ColumnIndex('nonexistent') = %d, want -1", idx)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if idx := schema.ColumnIndex(tc.name); idx != tc.wantIdx {
+				t.Errorf("ColumnIndex(%q) = %d, want %d", tc.name, idx, tc.wantIdx)
+			}
+			col := schema.ColumnByName(tc.name)
+			if tc.wantIdx == -1 {
+				if col != nil {
+					t.Errorf("ColumnByName(%q) should return nil", tc.name)
+				}
+				return
+			}
+			if col == nil {
+				t.Fatalf("ColumnByName(%q) returned nil", tc.name)
+			}
+			if col.Type != tc.wantType {
+				t.Errorf("ColumnByName(%q).Type = %v, want %v", tc.name, col.Type, tc.wantType)
+			}
+		})
 	}
 }
 

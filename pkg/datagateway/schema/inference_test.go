@@ -37,403 +37,134 @@ func TestTypeInferrer_IsNull(t *testing.T) {
 	}
 }
 
-func TestTypeInferrer_InferValueType_Bool(t *testing.T) {
+func TestTypeInferrer_InferValueType(t *testing.T) {
 	ti := NewTypeInferrer(nil)
 
 	tests := []struct {
-		value    string
-		expected DataType
+		name   string
+		values []string
+		want   DataType
 	}{
-		{"true", TypeBool},
-		{"TRUE", TypeBool},
-		{"True", TypeBool},
-		{"false", TypeBool},
-		{"FALSE", TypeBool},
-		{"False", TypeBool},
-		{"yes", TypeBool},
-		{"YES", TypeBool},
-		{"no", TypeBool},
-		{"NO", TypeBool},
-		{"y", TypeBool},
-		{"Y", TypeBool},
-		{"n", TypeBool},
-		{"N", TypeBool},
+		{"bool", []string{"true", "TRUE", "True", "false", "FALSE", "False", "yes", "YES", "no", "NO", "y", "Y", "n", "N"}, TypeBool},
 		// "1" and "0" should be detected as int64, not bool
-		{"1", TypeInt64},
-		{"0", TypeInt64},
+		{"1 and 0 are int64, not bool", []string{"1", "0"}, TypeInt64},
+		{"int64", []string{"0", "1", "123", "-456", "9223372036854775807" /* max */, "-9223372036854775808" /* min */, "999999999999"}, TypeInt64},
+		{"float64", []string{"1.5", "-3.14", "0.0", ".5", "1e10", "1.5e-3", "-2.5E+10", "3.14159265359"}, TypeFloat64},
+		{"timestamp", []string{
+			"2024-01-15T10:30:00Z", "2024-01-15T10:30:00+05:00", "2024-01-15T10:30:00",
+			"2024-01-15 10:30:00", "2024-01-15T10:30:00.000", "2024-01-15 10:30:00.000",
+		}, TypeTimestamp},
+		{"date", []string{"2024-01-15", "2024-1-5", "01/15/2024", "15/01/2024", "2024/01/15"}, TypeDate},
+		{"string", []string{"hello", "Hello World", "foo bar baz", "abc123", "123abc", "user@example.com", "https://example.com"}, TypeString},
+		{"null tokens are unknown", []string{"", "null", "NULL", "NA"}, TypeUnknown},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			if got := ti.InferValueType(tt.value); got != tt.expected {
-				t.Errorf("InferValueType(%q) = %v, want %v", tt.value, got, tt.expected)
+		t.Run(tt.name, func(t *testing.T) {
+			for _, v := range tt.values {
+				if got := ti.InferValueType(v); got != tt.want {
+					t.Errorf("InferValueType(%q) = %v, want %v", v, got, tt.want)
+				}
 			}
 		})
 	}
 }
 
-func TestTypeInferrer_InferValueType_Int64(t *testing.T) {
-	ti := NewTypeInferrer(nil)
-
+func TestInferSchema(t *testing.T) {
 	tests := []struct {
-		value    string
-		expected DataType
+		name         string
+		headers      []string
+		rows         [][]string
+		wantTypes    []DataType
+		wantNullable []bool // when non-nil, per-column nullability
 	}{
-		{"0", TypeInt64},
-		{"1", TypeInt64},
-		{"123", TypeInt64},
-		{"-456", TypeInt64},
-		{"9223372036854775807", TypeInt64},  // max int64
-		{"-9223372036854775808", TypeInt64}, // min int64
-		{"999999999999", TypeInt64},
+		{
+			name:         "all same type",
+			headers:      []string{"id", "count"},
+			rows:         [][]string{{"1", "100"}, {"2", "200"}, {"3", "300"}},
+			wantTypes:    []DataType{TypeInt64, TypeInt64},
+			wantNullable: []bool{false, false},
+		},
+		{
+			name:      "mixed int/float widens to float64",
+			headers:   []string{"value"},
+			rows:      [][]string{{"1"}, {"2.5"}, {"3"}},
+			wantTypes: []DataType{TypeFloat64},
+		},
+		{
+			name:         "empty values make columns nullable",
+			headers:      []string{"name", "age"},
+			rows:         [][]string{{"Alice", "30"}, {"Bob", ""}, {"", "25"}},
+			wantTypes:    []DataType{TypeString, TypeInt64},
+			wantNullable: []bool{true, true},
+		},
+		{
+			name:         "all nulls default to nullable string",
+			headers:      []string{"empty"},
+			rows:         [][]string{{""}, {"null"}, {"NA"}},
+			wantTypes:    []DataType{TypeString},
+			wantNullable: []bool{true},
+		},
+		{
+			name:      "bool column",
+			headers:   []string{"active"},
+			rows:      [][]string{{"true"}, {"false"}, {"TRUE"}, {"FALSE"}},
+			wantTypes: []DataType{TypeBool},
+		},
+		{
+			name:      "date column",
+			headers:   []string{"date"},
+			rows:      [][]string{{"2024-01-01"}, {"2024-06-15"}, {"2024-12-31"}},
+			wantTypes: []DataType{TypeDate},
+		},
+		{
+			name:      "timestamp column",
+			headers:   []string{"timestamp"},
+			rows:      [][]string{{"2024-01-01T10:00:00Z"}, {"2024-06-15T12:30:00Z"}, {"2024-12-31T23:59:59Z"}},
+			wantTypes: []DataType{TypeTimestamp},
+		},
+		{
+			name:      "mixed int/string falls back to string",
+			headers:   []string{"mixed"},
+			rows:      [][]string{{"123"}, {"hello"}, {"456"}},
+			wantTypes: []DataType{TypeString},
+		},
+		{
+			// When bool values (true/false) are mixed with numbers, result should be string
+			name:      "bool mixed with numeric falls back to string",
+			headers:   []string{"value"},
+			rows:      [][]string{{"true"}, {"123"}, {"false"}},
+			wantTypes: []DataType{TypeString},
+		},
+		{
+			// With no data, all columns default to string and nullable
+			name:         "no rows defaults to nullable string",
+			headers:      []string{"col1", "col2"},
+			rows:         [][]string{},
+			wantTypes:    []DataType{TypeString, TypeString},
+			wantNullable: []bool{true, true},
+		},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			if got := ti.InferValueType(tt.value); got != tt.expected {
-				t.Errorf("InferValueType(%q) = %v, want %v", tt.value, got, tt.expected)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := InferSchema(tc.headers, tc.rows)
+			if err != nil {
+				t.Fatalf("InferSchema() error: %v", err)
+			}
+			if schema.NumColumns() != len(tc.wantTypes) {
+				t.Fatalf("NumColumns() = %d, want %d", schema.NumColumns(), len(tc.wantTypes))
+			}
+			for i, want := range tc.wantTypes {
+				if got := schema.Column(i).Type; got != want {
+					t.Errorf("Column %d (%s) type = %v, want %v", i, tc.headers[i], got, want)
+				}
+			}
+			for i, want := range tc.wantNullable {
+				if got := schema.Column(i).Nullable; got != want {
+					t.Errorf("Column %d (%s) nullable = %v, want %v", i, tc.headers[i], got, want)
+				}
 			}
 		})
-	}
-}
-
-func TestTypeInferrer_InferValueType_Float64(t *testing.T) {
-	ti := NewTypeInferrer(nil)
-
-	tests := []struct {
-		value    string
-		expected DataType
-	}{
-		{"1.5", TypeFloat64},
-		{"-3.14", TypeFloat64},
-		{"0.0", TypeFloat64},
-		{".5", TypeFloat64},
-		{"1e10", TypeFloat64},
-		{"1.5e-3", TypeFloat64},
-		{"-2.5E+10", TypeFloat64},
-		{"3.14159265359", TypeFloat64},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			if got := ti.InferValueType(tt.value); got != tt.expected {
-				t.Errorf("InferValueType(%q) = %v, want %v", tt.value, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestTypeInferrer_InferValueType_Timestamp(t *testing.T) {
-	ti := NewTypeInferrer(nil)
-
-	tests := []struct {
-		value    string
-		expected DataType
-	}{
-		{"2024-01-15T10:30:00Z", TypeTimestamp},
-		{"2024-01-15T10:30:00+05:00", TypeTimestamp},
-		{"2024-01-15T10:30:00", TypeTimestamp},
-		{"2024-01-15 10:30:00", TypeTimestamp},
-		{"2024-01-15T10:30:00.000", TypeTimestamp},
-		{"2024-01-15 10:30:00.000", TypeTimestamp},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			if got := ti.InferValueType(tt.value); got != tt.expected {
-				t.Errorf("InferValueType(%q) = %v, want %v", tt.value, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestTypeInferrer_InferValueType_Date(t *testing.T) {
-	ti := NewTypeInferrer(nil)
-
-	tests := []struct {
-		value    string
-		expected DataType
-	}{
-		{"2024-01-15", TypeDate},
-		{"2024-1-5", TypeDate},
-		{"01/15/2024", TypeDate},
-		{"15/01/2024", TypeDate},
-		{"2024/01/15", TypeDate},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			if got := ti.InferValueType(tt.value); got != tt.expected {
-				t.Errorf("InferValueType(%q) = %v, want %v", tt.value, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestTypeInferrer_InferValueType_String(t *testing.T) {
-	ti := NewTypeInferrer(nil)
-
-	tests := []struct {
-		value    string
-		expected DataType
-	}{
-		{"hello", TypeString},
-		{"Hello World", TypeString},
-		{"foo bar baz", TypeString},
-		{"abc123", TypeString},
-		{"123abc", TypeString},
-		{"user@example.com", TypeString},
-		{"https://example.com", TypeString},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			if got := ti.InferValueType(tt.value); got != tt.expected {
-				t.Errorf("InferValueType(%q) = %v, want %v", tt.value, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestTypeInferrer_InferValueType_Null(t *testing.T) {
-	ti := NewTypeInferrer(nil)
-
-	tests := []struct {
-		value    string
-		expected DataType
-	}{
-		{"", TypeUnknown},
-		{"null", TypeUnknown},
-		{"NULL", TypeUnknown},
-		{"NA", TypeUnknown},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.value, func(t *testing.T) {
-			if got := ti.InferValueType(tt.value); got != tt.expected {
-				t.Errorf("InferValueType(%q) = %v, want %v", tt.value, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestInferSchema_AllSameType(t *testing.T) {
-	headers := []string{"id", "count"}
-	rows := [][]string{
-		{"1", "100"},
-		{"2", "200"},
-		{"3", "300"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	if schema.NumColumns() != 2 {
-		t.Errorf("NumColumns() = %d, want 2", schema.NumColumns())
-	}
-
-	col0 := schema.Column(0)
-	if col0.Type != TypeInt64 {
-		t.Errorf("Column 'id' type = %v, want int64", col0.Type)
-	}
-	if col0.Nullable {
-		t.Error("Column 'id' should not be nullable")
-	}
-
-	col1 := schema.Column(1)
-	if col1.Type != TypeInt64 {
-		t.Errorf("Column 'count' type = %v, want int64", col1.Type)
-	}
-}
-
-func TestInferSchema_MixedNumericTypes(t *testing.T) {
-	headers := []string{"value"}
-	rows := [][]string{
-		{"1"},
-		{"2.5"},
-		{"3"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col := schema.Column(0)
-	if col.Type != TypeFloat64 {
-		t.Errorf("Mixed int/float column type = %v, want float64", col.Type)
-	}
-}
-
-func TestInferSchema_NullHandling(t *testing.T) {
-	headers := []string{"name", "age"}
-	rows := [][]string{
-		{"Alice", "30"},
-		{"Bob", ""},
-		{"", "25"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col0 := schema.Column(0)
-	if !col0.Nullable {
-		t.Error("Column 'name' should be nullable (has empty value)")
-	}
-	if col0.Type != TypeString {
-		t.Errorf("Column 'name' type = %v, want string", col0.Type)
-	}
-
-	col1 := schema.Column(1)
-	if !col1.Nullable {
-		t.Error("Column 'age' should be nullable (has empty value)")
-	}
-	if col1.Type != TypeInt64 {
-		t.Errorf("Column 'age' type = %v, want int64", col1.Type)
-	}
-}
-
-func TestInferSchema_AllNulls(t *testing.T) {
-	headers := []string{"empty"}
-	rows := [][]string{
-		{""},
-		{"null"},
-		{"NA"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col := schema.Column(0)
-	if col.Type != TypeString {
-		t.Errorf("All-null column type = %v, want string (default)", col.Type)
-	}
-	if !col.Nullable {
-		t.Error("All-null column should be nullable")
-	}
-}
-
-func TestInferSchema_BoolColumn(t *testing.T) {
-	headers := []string{"active"}
-	rows := [][]string{
-		{"true"},
-		{"false"},
-		{"TRUE"},
-		{"FALSE"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col := schema.Column(0)
-	if col.Type != TypeBool {
-		t.Errorf("Bool column type = %v, want bool", col.Type)
-	}
-}
-
-func TestInferSchema_DateColumn(t *testing.T) {
-	headers := []string{"date"}
-	rows := [][]string{
-		{"2024-01-01"},
-		{"2024-06-15"},
-		{"2024-12-31"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col := schema.Column(0)
-	if col.Type != TypeDate {
-		t.Errorf("Date column type = %v, want date", col.Type)
-	}
-}
-
-func TestInferSchema_TimestampColumn(t *testing.T) {
-	headers := []string{"timestamp"}
-	rows := [][]string{
-		{"2024-01-01T10:00:00Z"},
-		{"2024-06-15T12:30:00Z"},
-		{"2024-12-31T23:59:59Z"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col := schema.Column(0)
-	if col.Type != TypeTimestamp {
-		t.Errorf("Timestamp column type = %v, want timestamp", col.Type)
-	}
-}
-
-func TestInferSchema_MixedTypesToString(t *testing.T) {
-	headers := []string{"mixed"}
-	rows := [][]string{
-		{"123"},
-		{"hello"},
-		{"456"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col := schema.Column(0)
-	if col.Type != TypeString {
-		t.Errorf("Mixed int/string column type = %v, want string", col.Type)
-	}
-}
-
-func TestInferSchema_BoolMixedWithNumeric(t *testing.T) {
-	// When bool values (true/false) are mixed with numbers, result should be string
-	headers := []string{"value"}
-	rows := [][]string{
-		{"true"},
-		{"123"},
-		{"false"},
-	}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	col := schema.Column(0)
-	if col.Type != TypeString {
-		t.Errorf("Bool+numeric column type = %v, want string", col.Type)
-	}
-}
-
-func TestInferSchema_EmptyRows(t *testing.T) {
-	headers := []string{"col1", "col2"}
-	rows := [][]string{}
-
-	schema, err := InferSchema(headers, rows)
-	if err != nil {
-		t.Fatalf("InferSchema() error: %v", err)
-	}
-
-	// With no data, all columns should default to string and nullable
-	for i := 0; i < schema.NumColumns(); i++ {
-		col := schema.Column(i)
-		if col.Type != TypeString {
-			t.Errorf("Column %d type = %v, want string", i, col.Type)
-		}
-		if !col.Nullable {
-			t.Errorf("Column %d should be nullable (no data)", i)
-		}
 	}
 }
 
@@ -487,91 +218,78 @@ func TestInferSchema_RealWorldCSV(t *testing.T) {
 }
 
 func TestInferSchemaFromJSON(t *testing.T) {
-	objects := []map[string]interface{}{
-		{"id": 1, "name": "Alice", "active": true},
-		{"id": 2, "name": "Bob", "active": false},
-		{"id": 3, "name": "Charlie", "active": true},
+	tests := []struct {
+		name         string
+		objects      []map[string]interface{}
+		wantErr      bool
+		wantCols     int
+		wantTypes    map[string]DataType
+		wantNullable map[string]bool
+	}{
+		{
+			name: "simple objects",
+			objects: []map[string]interface{}{
+				{"id": 1, "name": "Alice", "active": true},
+				{"id": 2, "name": "Bob", "active": false},
+				{"id": 3, "name": "Charlie", "active": true},
+			},
+			wantCols:  3,
+			wantTypes: map[string]DataType{"id": TypeInt64, "name": TypeString, "active": TypeBool},
+		},
+		{
+			name: "missing fields are nullable",
+			objects: []map[string]interface{}{
+				{"id": 1, "name": "Alice"},
+				{"id": 2}, // missing name
+				{"id": 3, "name": "Charlie", "extra": "value"},
+			},
+			wantCols:     3, // id, name, extra
+			wantNullable: map[string]bool{"name": true},
+		},
+		{
+			name: "nil values are nullable",
+			objects: []map[string]interface{}{
+				{"id": 1, "value": nil},
+				{"id": 2, "value": "hello"},
+			},
+			wantTypes:    map[string]DataType{"value": TypeString},
+			wantNullable: map[string]bool{"value": true},
+			wantCols:     2,
+		},
+		{name: "empty objects", objects: []map[string]interface{}{}, wantErr: true},
 	}
-
-	schema, err := InferSchemaFromJSON(objects)
-	if err != nil {
-		t.Fatalf("InferSchemaFromJSON() error: %v", err)
-	}
-
-	if schema.NumColumns() != 3 {
-		t.Errorf("NumColumns() = %d, want 3", schema.NumColumns())
-	}
-
-	// Check columns exist (order is alphabetical)
-	if col := schema.ColumnByName("id"); col == nil {
-		t.Error("Column 'id' not found")
-	} else if col.Type != TypeInt64 {
-		t.Errorf("Column 'id' type = %v, want int64", col.Type)
-	}
-
-	if col := schema.ColumnByName("name"); col == nil {
-		t.Error("Column 'name' not found")
-	} else if col.Type != TypeString {
-		t.Errorf("Column 'name' type = %v, want string", col.Type)
-	}
-
-	if col := schema.ColumnByName("active"); col == nil {
-		t.Error("Column 'active' not found")
-	} else if col.Type != TypeBool {
-		t.Errorf("Column 'active' type = %v, want bool", col.Type)
-	}
-}
-
-func TestInferSchemaFromJSON_MissingFields(t *testing.T) {
-	objects := []map[string]interface{}{
-		{"id": 1, "name": "Alice"},
-		{"id": 2},                        // missing name
-		{"id": 3, "name": "Charlie", "extra": "value"},
-	}
-
-	schema, err := InferSchemaFromJSON(objects)
-	if err != nil {
-		t.Fatalf("InferSchemaFromJSON() error: %v", err)
-	}
-
-	// Should have 3 columns: id, name, extra
-	if schema.NumColumns() != 3 {
-		t.Errorf("NumColumns() = %d, want 3", schema.NumColumns())
-	}
-
-	// name should be nullable (missing in one object)
-	if col := schema.ColumnByName("name"); col != nil && !col.Nullable {
-		t.Error("Column 'name' should be nullable (missing in some objects)")
-	}
-}
-
-func TestInferSchemaFromJSON_Empty(t *testing.T) {
-	objects := []map[string]interface{}{}
-
-	_, err := InferSchemaFromJSON(objects)
-	if err == nil {
-		t.Error("InferSchemaFromJSON with empty objects should return error")
-	}
-}
-
-func TestInferSchemaFromJSON_NilValues(t *testing.T) {
-	objects := []map[string]interface{}{
-		{"id": 1, "value": nil},
-		{"id": 2, "value": "hello"},
-	}
-
-	schema, err := InferSchemaFromJSON(objects)
-	if err != nil {
-		t.Fatalf("InferSchemaFromJSON() error: %v", err)
-	}
-
-	if col := schema.ColumnByName("value"); col != nil {
-		if !col.Nullable {
-			t.Error("Column 'value' should be nullable (has nil)")
-		}
-		if col.Type != TypeString {
-			t.Errorf("Column 'value' type = %v, want string", col.Type)
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := InferSchemaFromJSON(tc.objects)
+			if tc.wantErr {
+				if err == nil {
+					t.Error("InferSchemaFromJSON should return an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("InferSchemaFromJSON() error: %v", err)
+			}
+			if schema.NumColumns() != tc.wantCols {
+				t.Errorf("NumColumns() = %d, want %d", schema.NumColumns(), tc.wantCols)
+			}
+			for name, want := range tc.wantTypes {
+				col := schema.ColumnByName(name)
+				if col == nil {
+					t.Errorf("Column %q not found", name)
+				} else if col.Type != want {
+					t.Errorf("Column %q type = %v, want %v", name, col.Type, want)
+				}
+			}
+			for name, want := range tc.wantNullable {
+				col := schema.ColumnByName(name)
+				if col == nil {
+					t.Errorf("Column %q not found", name)
+				} else if col.Nullable != want {
+					t.Errorf("Column %q nullable = %v, want %v", name, col.Nullable, want)
+				}
+			}
+		})
 	}
 }
 

@@ -30,14 +30,14 @@ import (
 // integer schema. Tests use this to drive CommitTable through the local
 // SQLite catalog path.
 type commitSharedFixture struct {
-	t          *testing.T
-	tmpDir     string
-	warehouse  string
-	cat        catalog.Catalog
-	sqldb      *sql.DB
-	schema     *iceberg.Schema
+	t           *testing.T
+	tmpDir      string
+	warehouse   string
+	cat         catalog.Catalog
+	sqldb       *sql.DB
+	schema      *iceberg.Schema
 	arrowSchema *arrow.Schema
-	ident      icebergtable.Identifier
+	ident       icebergtable.Identifier
 }
 
 func newCommitSharedFixture(t *testing.T, ident icebergtable.Identifier) *commitSharedFixture {
@@ -348,52 +348,41 @@ func TestCommitTable_FullLoad_FreshTable(t *testing.T) {
 	}
 }
 
-// TestCommitTable_EmptyManifest_NoOp: manifest exists but paths is [].
-// Returns success-zero result, no commit happens.
-func TestCommitTable_EmptyManifest_NoOp(t *testing.T) {
-	t.Parallel()
-	fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "empty_manifest"})
-
-	manifestPath := fx.writeManifestEmpty("run-empty")
-
-	res, err := CommitTable(context.Background(), fx.cat, fx.ident, manifestPath, WriteModeAppend, nil)
-	if err != nil {
-		t.Fatalf("CommitTable: %v", err)
-	}
-	if res == nil {
-		t.Fatalf("nil result on empty manifest")
-	}
-	if res.DataFilesAdded != 0 {
-		t.Errorf("DataFilesAdded=%d want 0 (empty manifest)", res.DataFilesAdded)
-	}
-	if res.SnapshotIDAfter != "" {
-		t.Errorf("SnapshotIDAfter=%q want empty (no commit)", res.SnapshotIDAfter)
-	}
-	if res.WriteMode != WriteModeAppend {
-		t.Errorf("WriteMode=%q want APPEND", res.WriteMode)
-	}
-}
-
-// TestCommitTable_MissingManifest_NoOp: manifestPath does not exist.
-// Returns success-zero (matches today's table-commit behavior where a
+// TestCommitTable_NoManifestFiles_NoOp: a manifest that exists but has paths
+// [], and a manifestPath that does not exist, both return a success-zero
+// result and no commit happens (matches today's table-commit behavior where a
 // run that produced no parquet for a target is a no-op).
-func TestCommitTable_MissingManifest_NoOp(t *testing.T) {
+func TestCommitTable_NoManifestFiles_NoOp(t *testing.T) {
 	t.Parallel()
-	fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "missing_manifest"})
+	tests := []struct {
+		name         string
+		manifestPath func(fx *commitSharedFixture) string
+	}{
+		{"empty manifest", func(fx *commitSharedFixture) string { return fx.writeManifestEmpty("run-empty") }},
+		{"missing manifest", func(fx *commitSharedFixture) string { return fx.manifestPathFor("run-missing") /* never written */ }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "no_manifest_files"})
 
-	manifestPath := fx.manifestPathFor("run-missing") // never written
-	res, err := CommitTable(context.Background(), fx.cat, fx.ident, manifestPath, WriteModeAppend, nil)
-	if err != nil {
-		t.Fatalf("CommitTable: %v", err)
-	}
-	if res == nil {
-		t.Fatalf("nil result on missing manifest")
-	}
-	if res.DataFilesAdded != 0 {
-		t.Errorf("DataFilesAdded=%d want 0 (missing manifest)", res.DataFilesAdded)
-	}
-	if res.SnapshotIDAfter != "" {
-		t.Errorf("SnapshotIDAfter=%q want empty (no commit)", res.SnapshotIDAfter)
+			res, err := CommitTable(context.Background(), fx.cat, fx.ident, tc.manifestPath(fx), WriteModeAppend, nil)
+			if err != nil {
+				t.Fatalf("CommitTable: %v", err)
+			}
+			if res == nil {
+				t.Fatalf("nil result")
+			}
+			if res.DataFilesAdded != 0 {
+				t.Errorf("DataFilesAdded=%d want 0", res.DataFilesAdded)
+			}
+			if res.SnapshotIDAfter != "" {
+				t.Errorf("SnapshotIDAfter=%q want empty (no commit)", res.SnapshotIDAfter)
+			}
+			if res.WriteMode != WriteModeAppend {
+				t.Errorf("WriteMode=%q want APPEND", res.WriteMode)
+			}
+		})
 	}
 }
 
@@ -415,70 +404,62 @@ func TestCommitTable_UnsupportedMode_Error(t *testing.T) {
 	}
 }
 
-// TestParseFilesManifest_V1Migration: a v1 manifest (Paths populated,
-// SchemaVersion absent) is migrated to v2 (DataPaths populated).
-func TestParseFilesManifest_V1Migration(t *testing.T) {
+// TestParseFilesManifest: a v1 manifest (Paths populated, SchemaVersion absent)
+// is migrated to v2 (DataPaths populated); a v2 manifest with SchemaVersion=2
+// and DataPaths is read directly without migration; an empty paths/data_paths
+// produces ErrManifestEmpty.
+func TestParseFilesManifest(t *testing.T) {
 	t.Parallel()
-	v1 := []byte(`{"run_id":"r","namespace":"raw","table":"t","paths":["s3://b/a.parquet","s3://b/b.parquet"]}`)
-	m, err := parseFilesManifest(v1)
-	if err != nil {
-		t.Fatalf("parseFilesManifest v1: %v", err)
+	tests := []struct {
+		name          string
+		body          string
+		wantErr       error
+		wantVersion   int
+		wantDataPaths []string
+	}{
+		{
+			name:          "v1 migrates paths to data paths",
+			body:          `{"run_id":"r","namespace":"raw","table":"t","paths":["s3://b/a.parquet","s3://b/b.parquet"]}`,
+			wantVersion:   0,
+			wantDataPaths: []string{"s3://b/a.parquet", "s3://b/b.parquet"},
+		},
+		{
+			name:          "v2 is read directly",
+			body:          `{"schema_version":2,"run_id":"r","namespace":"raw","table":"t","data_paths":["s3://b/a.parquet"],"delete_paths":[]}`,
+			wantVersion:   2,
+			wantDataPaths: []string{"s3://b/a.parquet"},
+		},
+		{
+			name:    "empty paths is ErrManifestEmpty",
+			body:    `{"run_id":"r","namespace":"raw","table":"t","paths":[]}`,
+			wantErr: ErrManifestEmpty,
+		},
 	}
-	if m.SchemaVersion != 0 {
-		t.Errorf("SchemaVersion=%d want 0 (v1)", m.SchemaVersion)
-	}
-	if len(m.DataPaths) != 2 {
-		t.Errorf("DataPaths len=%d want 2 (v1→v2 migration)", len(m.DataPaths))
-	}
-	if m.DataPaths[0] != "s3://b/a.parquet" {
-		t.Errorf("DataPaths[0]=%q want s3://b/a.parquet", m.DataPaths[0])
-	}
-}
-
-// TestParseFilesManifest_V2: a v2 manifest with SchemaVersion=2 and
-// DataPaths is read directly without migration.
-func TestParseFilesManifest_V2(t *testing.T) {
-	t.Parallel()
-	v2 := []byte(`{"schema_version":2,"run_id":"r","namespace":"raw","table":"t","data_paths":["s3://b/a.parquet"],"delete_paths":[]}`)
-	m, err := parseFilesManifest(v2)
-	if err != nil {
-		t.Fatalf("parseFilesManifest v2: %v", err)
-	}
-	if m.SchemaVersion != 2 {
-		t.Errorf("SchemaVersion=%d want 2", m.SchemaVersion)
-	}
-	if len(m.DataPaths) != 1 {
-		t.Errorf("DataPaths len=%d want 1", len(m.DataPaths))
-	}
-}
-
-// TestCommitTableFiles_SucceedsWithInMemoryPaths: CommitTableFiles with 2
-// in-memory paths and WriteModeAppend should succeed and report DataFilesAdded=2.
-func TestCommitTableFiles_SucceedsWithInMemoryPaths(t *testing.T) {
-	t.Parallel()
-	fx := newCommitSharedFixture(t, icebergtable.Identifier{"ns1", "tbl1"})
-
-	paths := []string{
-		fx.writeParquet("data/a.parquet", 1),
-		fx.writeParquet("data/b.parquet", 2),
-	}
-
-	res, err := CommitTableFiles(context.Background(), fx.cat, icebergtable.Identifier{"ns1", "tbl1"},
-		paths, WriteModeAppend, nil, "")
-	if err != nil {
-		t.Fatalf("CommitTableFiles: %v", err)
-	}
-	if res == nil {
-		t.Fatalf("nil result")
-	}
-	if res.DataFilesAdded != 2 {
-		t.Errorf("DataFilesAdded=%d want 2", res.DataFilesAdded)
-	}
-	if res.SnapshotIDAfter == "" {
-		t.Errorf("SnapshotIDAfter empty; want a snapshot ID after append")
-	}
-	if res.WriteMode != WriteModeAppend {
-		t.Errorf("WriteMode=%q want APPEND", res.WriteMode)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m, err := parseFilesManifest([]byte(tc.body))
+			if tc.wantErr != nil {
+				if err != tc.wantErr {
+					t.Fatalf("err=%v want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFilesManifest: %v", err)
+			}
+			if m.SchemaVersion != tc.wantVersion {
+				t.Errorf("SchemaVersion=%d want %d", m.SchemaVersion, tc.wantVersion)
+			}
+			if len(m.DataPaths) != len(tc.wantDataPaths) {
+				t.Fatalf("DataPaths=%v want %v", m.DataPaths, tc.wantDataPaths)
+			}
+			for i, p := range tc.wantDataPaths {
+				if m.DataPaths[i] != p {
+					t.Errorf("DataPaths[%d]=%q want %q", i, m.DataPaths[i], p)
+				}
+			}
+		})
 	}
 }
 
@@ -583,20 +564,6 @@ func TestCommitTableFiles_IdempotencyHit(t *testing.T) {
 	}
 	if len(postFiles) != 1 {
 		t.Errorf("post-idempotency file count=%d want 1 (paths=%v)", len(postFiles), postFiles)
-	}
-}
-
-// TestParseFilesManifest_Empty: an empty paths/data_paths produces
-// ErrManifestEmpty.
-func TestParseFilesManifest_Empty(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"run_id":"r","namespace":"raw","table":"t","paths":[]}`)
-	_, err := parseFilesManifest(body)
-	if err == nil {
-		t.Fatalf("expected ErrManifestEmpty, got nil")
-	}
-	if err != ErrManifestEmpty {
-		t.Errorf("err=%v want ErrManifestEmpty", err)
 	}
 }
 

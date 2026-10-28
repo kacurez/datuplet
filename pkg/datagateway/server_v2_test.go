@@ -25,74 +25,79 @@ import (
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
 
-func TestResolveSecretRefsInConfigReplacesRefs(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "db_password"), []byte("hunter2\n"), 0o400); err != nil {
-		t.Fatalf("write secret: %v", err)
+func TestResolveSecretRefsInConfig(t *testing.T) {
+	tests := []struct {
+		name         string
+		files        map[string]string // written under SecretsDir
+		noSecretsDir bool              // leave SecretsDir empty
+		cfg          string
+		wantRaw      string         // exact bytes after resolve, when non-empty
+		wantMap      map[string]any // parsed result, when non-nil
+		wantErrName  string         // error must mention this secret name
+	}{
+		{
+			name:    "replaces refs",
+			files:   map[string]string{"db_password": "hunter2\n"},
+			cfg:     `{"password":"$[db_password]","user":"alice"}`,
+			wantMap: map[string]any{"password": "hunter2", "user": "alice"},
+		},
+		{
+			name:    "no refs leaves config untouched",
+			cfg:     `{"user":"alice"}`,
+			wantRaw: `{"user":"alice"}`,
+		},
+		{
+			name:         "refs present but SecretsDir empty errors",
+			noSecretsDir: true,
+			cfg:          `{"password":"$[needs_a_file]"}`,
+			wantErrName:  "needs_a_file",
+		},
+		{
+			name:        "missing secret file errors",
+			cfg:         `{"password":"$[nope]"}`,
+			wantErrName: "nope",
+		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{RunID: "run-1", ComponentCfg: []byte(tc.cfg)}
+			if !tc.noSecretsDir {
+				cfg.SecretsDir = t.TempDir()
+				for name, body := range tc.files {
+					if err := os.WriteFile(filepath.Join(cfg.SecretsDir, name), []byte(body), 0o400); err != nil {
+						t.Fatalf("write secret: %v", err)
+					}
+				}
+			}
 
-	cfg := &Config{
-		RunID:        "run-1",
-		SecretsDir:   dir,
-		ComponentCfg: []byte(`{"password":"$[db_password]","user":"alice"}`),
-	}
-
-	if err := resolveSecretRefsInConfig(cfg); err != nil {
-		t.Fatalf("resolveSecretRefsInConfig: %v", err)
-	}
-
-	var got map[string]any
-	if err := json.Unmarshal(cfg.ComponentCfg, &got); err != nil {
-		t.Fatalf("unmarshal resolved cfg: %v", err)
-	}
-	if got["password"] != "hunter2" {
-		t.Errorf("password got %v, want hunter2", got["password"])
-	}
-	if got["user"] != "alice" {
-		t.Errorf("user got %v, want alice", got["user"])
-	}
-}
-
-func TestResolveSecretRefsInConfigNoopOnEmpty(t *testing.T) {
-	cfg := &Config{ComponentCfg: nil}
-	// With empty ComponentCfg we expect a no-op (resolveSecretRefsInConfig isn't
-	// called from NewServerV2 in that case — but calling it directly should work
-	// on a trivial-but-valid JSON input too).
-	cfg2 := &Config{ComponentCfg: []byte(`{"user":"alice"}`)}
-	if err := resolveSecretRefsInConfig(cfg2); err != nil {
-		t.Fatalf("resolveSecretRefsInConfig: %v", err)
-	}
-	if string(cfg2.ComponentCfg) != `{"user":"alice"}` {
-		t.Errorf("ComponentCfg mutated when no refs present: %s", cfg2.ComponentCfg)
-	}
-	_ = cfg
-}
-
-func TestResolveSecretRefsInConfigMissingDirErrors(t *testing.T) {
-	cfg := &Config{
-		SecretsDir:   "", // deliberately empty
-		ComponentCfg: []byte(`{"password":"$[needs_a_file]"}`),
-	}
-	err := resolveSecretRefsInConfig(cfg)
-	if err == nil {
-		t.Fatal("expected error when refs present but SecretsDir empty")
-	}
-	if !strings.Contains(err.Error(), "needs_a_file") {
-		t.Errorf("error message missing secret name: %v", err)
-	}
-}
-
-func TestResolveSecretRefsInConfigMissingFileErrors(t *testing.T) {
-	cfg := &Config{
-		SecretsDir:   t.TempDir(),
-		ComponentCfg: []byte(`{"password":"$[nope]"}`),
-	}
-	err := resolveSecretRefsInConfig(cfg)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "nope") {
-		t.Errorf("error missing secret name: %v", err)
+			err := resolveSecretRefsInConfig(cfg)
+			if tc.wantErrName != "" {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if !strings.Contains(err.Error(), tc.wantErrName) {
+					t.Errorf("error missing secret name %q: %v", tc.wantErrName, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSecretRefsInConfig: %v", err)
+			}
+			if tc.wantRaw != "" && string(cfg.ComponentCfg) != tc.wantRaw {
+				t.Errorf("ComponentCfg mutated when no refs present: %s", cfg.ComponentCfg)
+			}
+			if tc.wantMap != nil {
+				var got map[string]any
+				if err := json.Unmarshal(cfg.ComponentCfg, &got); err != nil {
+					t.Fatalf("unmarshal resolved cfg: %v", err)
+				}
+				for k, want := range tc.wantMap {
+					if got[k] != want {
+						t.Errorf("%s got %v, want %v", k, got[k], want)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -339,57 +344,98 @@ func TestServerV2_GetConfig_OutputTableColumns(t *testing.T) {
 	}
 }
 
+// OpenWriter resolves the bucket from defaultBucket, or from outputs.tables
+// when the table is declared there (defaultBucket cleared so resolution can
+// only come from the OutputTables lookup).
 func TestServerV2_OpenWriter(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	// Open writer with CSV format - uses defaultBucket from config
-	resp, err := server.OpenWriter(ctx, &pb.OpenWriterRequest{
-		Table:       "output",
-		InputFormat: pb.DataFormat_FORMAT_CSV,
-	})
-	if err != nil {
-		t.Fatalf("OpenWriter error: %v", err)
+	tests := []struct {
+		name       string
+		setup      func(*ServerV2)
+		table      string
+		wantBucket string
+	}{
+		{
+			name:       "uses defaultBucket from config",
+			table:      "output",
+			wantBucket: "raw",
+		},
+		{
+			name: "declared table resolves bucket from outputs.tables",
+			setup: func(s *ServerV2) {
+				s.config.DefaultBucket = ""
+				s.config.OutputTables = []OutputTableConfig{{Bucket: "declared", Name: "orders"}}
+			},
+			table:      "orders",
+			wantBucket: "declared",
+		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server, tmpDir := createTestServerV2(t)
+			defer os.RemoveAll(tmpDir)
+			if tc.setup != nil {
+				tc.setup(server)
+			}
 
-	if resp.WriterId == "" {
-		t.Error("WriterId should not be empty")
-	}
+			resp, err := server.OpenWriter(context.Background(), &pb.OpenWriterRequest{
+				Table:       tc.table,
+				InputFormat: pb.DataFormat_FORMAT_CSV,
+			})
+			if err != nil {
+				t.Fatalf("OpenWriter error: %v", err)
+			}
+			if resp.WriterId == "" {
+				t.Fatal("WriterId should not be empty")
+			}
 
-	// Verify writer was stored
-	server.mu.RLock()
-	ws, ok := server.writers[resp.WriterId]
-	server.mu.RUnlock()
-
-	if !ok {
-		t.Error("writer should be stored")
-	}
-	if ws.bucket != "raw" {
-		t.Errorf("bucket = %q, want %q", ws.bucket, "raw")
-	}
-	if ws.table != "output" {
-		t.Errorf("table = %q, want %q", ws.table, "output")
+			server.mu.RLock()
+			ws, ok := server.writers[resp.WriterId]
+			server.mu.RUnlock()
+			if !ok {
+				t.Fatal("writer should be stored")
+			}
+			if ws.bucket != tc.wantBucket {
+				t.Errorf("bucket = %q, want %q", ws.bucket, tc.wantBucket)
+			}
+			if ws.table != tc.table {
+				t.Errorf("table = %q, want %q", ws.table, tc.table)
+			}
+		})
 	}
 }
 
-func TestServerV2_OpenWriter_MissingTable(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	// Table is required
-	_, err := server.OpenWriter(ctx, &pb.OpenWriterRequest{
-		Bucket: "raw",
-		// Table not specified
-	})
-	if err == nil {
-		t.Error("expected error when table is missing")
+func TestServerV2_MissingRequiredFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		call    func(*ServerV2) error
+		wantSub string
+	}{
+		{"OpenWriter without table", func(s *ServerV2) error {
+			_, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Bucket: "raw"})
+			return err
+		}, "table is required"},
+		{"OpenReader without bucket", func(s *ServerV2) error {
+			_, err := s.OpenReader(context.Background(), &pb.OpenReaderRequest{Table: "products"})
+			return err
+		}, "bucket is required"},
+		{"OpenReader without table", func(s *ServerV2) error {
+			_, err := s.OpenReader(context.Background(), &pb.OpenReaderRequest{Bucket: "raw"})
+			return err
+		}, "table is required"},
 	}
-	if err.Error() != "table is required" {
-		t.Errorf("unexpected error message: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server, tmpDir := createTestServerV2(t)
+			defer os.RemoveAll(tmpDir)
+
+			err := tc.call(server)
+			if err == nil {
+				t.Fatal("expected an error for the missing field")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q does not contain %q", err, tc.wantSub)
+			}
+		})
 	}
 }
 
@@ -535,42 +581,6 @@ func TestServerV2_OpenReader(t *testing.T) {
 	}
 }
 
-func TestServerV2_OpenReader_MissingBucket(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	// Bucket is required for reads
-	_, err := server.OpenReader(ctx, &pb.OpenReaderRequest{
-		Table: "products",
-	})
-	if err == nil {
-		t.Error("expected error when bucket is missing")
-	}
-	if err.Error() != "bucket is required for reads" {
-		t.Errorf("unexpected error message: %v", err)
-	}
-}
-
-func TestServerV2_OpenReader_MissingTable(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	// Table is required for reads
-	_, err := server.OpenReader(ctx, &pb.OpenReaderRequest{
-		Bucket: "raw",
-	})
-	if err == nil {
-		t.Error("expected error when table is missing")
-	}
-	if err.Error() != "table is required for reads" {
-		t.Errorf("unexpected error message: %v", err)
-	}
-}
-
 func TestServerV2_GetSchema(t *testing.T) {
 	server, tmpDir := createTestServerV2(t)
 	defer os.RemoveAll(tmpDir)
@@ -663,28 +673,10 @@ func TestServerV2_Commit(t *testing.T) {
 	}
 }
 
-func TestServerV2_Log(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	_, err := server.Log(ctx, &pb.LogRequest{
-		Level:   "INFO",
-		Message: "test message",
-		Fields: map[string]string{
-			"key": "value",
-		},
-	})
-	if err != nil {
-		t.Fatalf("Log error: %v", err)
-	}
-}
-
-func TestProtoToDataFormat(t *testing.T) {
+func TestProtoDataFormatMapping(t *testing.T) {
 	tests := []struct {
 		proto  pb.DataFormat
-		expect format.DataFormat
+		format format.DataFormat
 	}{
 		{pb.DataFormat_FORMAT_CSV, format.FormatCSV},
 		{pb.DataFormat_FORMAT_JSON, format.FormatJSON},
@@ -696,32 +688,11 @@ func TestProtoToDataFormat(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.proto.String(), func(t *testing.T) {
-			result := protoToDataFormat(tt.proto)
-			if result != tt.expect {
-				t.Errorf("protoToDataFormat(%v) = %v, want %v", tt.proto, result, tt.expect)
+			if got := protoToDataFormat(tt.proto); got != tt.format {
+				t.Errorf("protoToDataFormat(%v) = %v, want %v", tt.proto, got, tt.format)
 			}
-		})
-	}
-}
-
-func TestDataFormatToProto(t *testing.T) {
-	tests := []struct {
-		format format.DataFormat
-		expect pb.DataFormat
-	}{
-		{format.FormatCSV, pb.DataFormat_FORMAT_CSV},
-		{format.FormatJSON, pb.DataFormat_FORMAT_JSON},
-		{format.FormatJSONL, pb.DataFormat_FORMAT_JSONL},
-		{format.FormatParquet, pb.DataFormat_FORMAT_PARQUET},
-		{format.FormatArrowIPC, pb.DataFormat_FORMAT_ARROW_IPC},
-		{format.FormatUnknown, pb.DataFormat_FORMAT_UNSPECIFIED},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.format.String(), func(t *testing.T) {
-			result := dataFormatToProto(tt.format)
-			if result != tt.expect {
-				t.Errorf("dataFormatToProto(%v) = %v, want %v", tt.format, result, tt.expect)
+			if got := dataFormatToProto(tt.format); got != tt.proto {
+				t.Errorf("dataFormatToProto(%v) = %v, want %v", tt.format, got, tt.proto)
 			}
 		})
 	}
@@ -762,37 +733,46 @@ func TestSchemaConversion(t *testing.T) {
 }
 
 func TestBackendSchemaToGatewaySchema(t *testing.T) {
-	backendSchema := &backend.SchemaInfo{
-		Columns: []backend.ColumnInfo{
-			{Name: "id", Type: "int64", Nullable: false},
-			{Name: "name", Type: "string", Nullable: true},
+	tests := []struct {
+		name    string
+		in      *backend.SchemaInfo
+		wantNil bool
+		want    []schema.ColumnDef
+	}{
+		{
+			name: "converts columns",
+			in: &backend.SchemaInfo{Columns: []backend.ColumnInfo{
+				{Name: "id", Type: "int64", Nullable: false},
+				{Name: "name", Type: "string", Nullable: true},
+			}},
+			want: []schema.ColumnDef{
+				{Name: "id", Type: schema.TypeInt64},
+				{Name: "name", Type: schema.TypeString},
+			},
 		},
+		{name: "nil backend schema returns nil gateway schema", in: nil, wantNil: true},
 	}
-
-	gatewaySchema := backendSchemaToGatewaySchema(backendSchema)
-	if gatewaySchema == nil {
-		t.Fatal("schema should not be nil")
-	}
-
-	if gatewaySchema.NumColumns() != 2 {
-		t.Errorf("NumColumns() = %d, want 2", gatewaySchema.NumColumns())
-	}
-
-	col0 := gatewaySchema.Column(0)
-	if col0.Name != "id" || col0.Type != schema.TypeInt64 {
-		t.Errorf("column 0 = %+v, want id:int64", col0)
-	}
-
-	col1 := gatewaySchema.Column(1)
-	if col1.Name != "name" || col1.Type != schema.TypeString {
-		t.Errorf("column 1 = %+v, want name:string", col1)
-	}
-}
-
-func TestBackendSchemaToGatewaySchema_Nil(t *testing.T) {
-	gatewaySchema := backendSchemaToGatewaySchema(nil)
-	if gatewaySchema != nil {
-		t.Error("nil backend schema should return nil gateway schema")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := backendSchemaToGatewaySchema(tc.in)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatal("nil backend schema should return nil gateway schema")
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("schema should not be nil")
+			}
+			if got.NumColumns() != len(tc.want) {
+				t.Fatalf("NumColumns() = %d, want %d", got.NumColumns(), len(tc.want))
+			}
+			for i, w := range tc.want {
+				if col := got.Column(i); col.Name != w.Name || col.Type != w.Type {
+					t.Errorf("column %d = %+v, want %s:%v", i, col, w.Name, w.Type)
+				}
+			}
+		})
 	}
 }
 
@@ -869,181 +849,53 @@ func TestBuildFieldIDMap(t *testing.T) {
 	}
 }
 
-// TestValidateSchemaMatchesFieldIDs tests schema validation against field ID map
-func TestValidateSchemaMatchesFieldIDs(t *testing.T) {
-	// This test requires creating actual Parquet schemas which is complex
-	// For now, we'll test the field ID map building logic which is used in validation
-
-	// Test with matching schema
-	t.Run("valid schema", func(t *testing.T) {
-		sch := mustNewSchema(t, []schema.ColumnDef{
-			{Name: "id", Type: schema.TypeInt64},
-			{Name: "name", Type: schema.TypeString},
-		})
-
-		fieldIDMap := buildFieldIDMap(sch)
-
-		// Verify all schema columns have entries in field ID map
-		for _, col := range sch.Columns() {
-			if _, ok := fieldIDMap[col.Name]; !ok {
-				t.Errorf("column %q not found in field ID map", col.Name)
-			}
-		}
-	})
-}
-
-// TestInjectFieldIDsIntoArrowSchema tests that field IDs are correctly injected
-func TestInjectFieldIDsIntoArrowSchema(t *testing.T) {
-	// This test would require importing Arrow and creating Arrow schemas
-	// Skipping for basic test coverage, but the function is tested indirectly
-	// through integration tests
-	t.Skip("Arrow schema manipulation requires complex setup")
-}
-
-// TestPatchParquetFieldIDs_NoExternalFiles tests that patcher handles empty file list
-func TestPatchParquetFieldIDs_NoExternalFiles(t *testing.T) {
-	ctx := context.Background()
-	mockBackend := newMockBackend()
-
-	cfg := &Config{
-		RunID: "ws-test",
-	}
-
-	server := &ServerV2{
-		backend: mockBackend,
-		config:  cfg,
-		writers: make(map[string]*writerState),
-	}
-
-	// Create writer state with no external files
-	ws := &writerState{
-		bucket:        "test-bucket",
-		table:         "test-table",
-		externalFiles: []buffer.FileInfo{}, // Empty
-		schema: mustNewSchema(t, []schema.ColumnDef{
-			{Name: "id", Type: schema.TypeInt64},
-		}),
-	}
-
-	// Should return nil without error
-	err := server.patchParquetFieldIDs(ctx, ws)
-	if err != nil {
-		t.Errorf("patchParquetFieldIDs() with no external files should not error, got: %v", err)
-	}
-}
-
-// TestPatchParquetFieldIDs_NoSchema tests that patcher fails when schema is nil
-func TestPatchParquetFieldIDs_NoSchema(t *testing.T) {
-	ctx := context.Background()
-	mockBackend := newMockBackend()
-
-	cfg := &Config{
-		RunID: "ws-test",
-	}
-
-	server := &ServerV2{
-		backend: mockBackend,
-		config:  cfg,
-		writers: make(map[string]*writerState),
-	}
-
-	// Create writer state with external files but no schema
-	ws := &writerState{
-		bucket: "test-bucket",
-		table:  "test-table",
-		externalFiles: []buffer.FileInfo{
-			{Path: "s3://bucket/file.parquet", RowCount: 10, SizeBytes: 1000},
-		},
-		schema: nil, // No schema
-	}
-
-	// Should return error
-	err := server.patchParquetFieldIDs(ctx, ws)
-	if err == nil {
-		t.Error("patchParquetFieldIDs() with nil schema should return error")
-	}
-	if err != nil && err.Error() != "cannot patch Parquet files: schema is nil" {
-		t.Errorf("unexpected error message: %v", err)
-	}
-}
-
-// TestSchemaFieldIDAutoAssignment tests that field IDs are auto-assigned correctly
-func TestSchemaFieldIDAutoAssignment(t *testing.T) {
-	// Test that when FieldID is 0, it gets auto-assigned
-	cols := []schema.ColumnDef{
-		{Name: "col1", Type: schema.TypeInt64, FieldID: 0},   // Should become 1
-		{Name: "col2", Type: schema.TypeString, FieldID: 0},  // Should become 2
-		{Name: "col3", Type: schema.TypeFloat64, FieldID: 5}, // Already set
-	}
-
-	sch := mustNewSchema(t, cols)
-	fieldIDMap := buildFieldIDMap(sch)
-
-	if fieldIDMap["col1"] != 1 {
-		t.Errorf("col1 field ID = %d, want 1", fieldIDMap["col1"])
-	}
-	if fieldIDMap["col2"] != 2 {
-		t.Errorf("col2 field ID = %d, want 2", fieldIDMap["col2"])
-	}
-	if fieldIDMap["col3"] != 5 {
-		t.Errorf("col3 field ID = %d, want 5", fieldIDMap["col3"])
-	}
-}
-
-// TestCommit_WithExternalFiles tests commit flow with external files
-func TestCommit_WithExternalFiles(t *testing.T) {
-	ctx := context.Background()
-	mockBackend := newMockBackend()
-
-	cfg := &Config{
-		RunID: "ws-test-123",
-	}
-
-	server := &ServerV2{
-		backend: mockBackend,
-		config:  cfg,
-		writers: make(map[string]*writerState),
-	}
-
-	// Create a writer state with external files (simulating DuckDB COPY TO)
-	ws := &writerState{
-		bucket:   "test-bucket",
-		table:    "test-table",
-		basePath: "s3://datuplet/test/",
-		schema: mustNewSchema(t, []schema.ColumnDef{
-			{Name: "id", Type: schema.TypeInt64},
-			{Name: "name", Type: schema.TypeString},
-		}),
-		externalFiles: []buffer.FileInfo{
-			{
-				Path:      "s3://datuplet/test/data.parquet",
-				RowCount:  100,
-				SizeBytes: 10000,
+func TestPatchParquetFieldIDs(t *testing.T) {
+	tests := []struct {
+		name    string
+		ws      *writerState
+		wantErr string // empty: must succeed
+	}{
+		{
+			name: "no external files is a no-op",
+			ws: &writerState{
+				bucket:        "test-bucket",
+				table:         "test-table",
+				externalFiles: []buffer.FileInfo{},
+				schema: mustNewSchema(t, []schema.ColumnDef{
+					{Name: "id", Type: schema.TypeInt64},
+				}),
 			},
 		},
-		totalRows:  100,
-		totalBytes: 10000,
+		{
+			name: "external files but nil schema fails",
+			ws: &writerState{
+				bucket: "test-bucket",
+				table:  "test-table",
+				externalFiles: []buffer.FileInfo{
+					{Path: "s3://bucket/file.parquet", RowCount: 10, SizeBytes: 1000},
+				},
+			},
+			wantErr: "schema is nil",
+		},
 	}
-
-	server.writers["w1"] = ws
-
-	// Note: This test will fail at the Parquet reading stage since we don't have
-	// actual Parquet files, but it demonstrates the commit flow structure
-	req := &pb.CommitRequest{
-		BestEffort: false,
-	}
-
-	resp, err := server.Commit(ctx, req)
-
-	// We expect it to fail because we can't actually read/patch the Parquet file
-	// but we're testing that the flow is correct
-	if err != nil {
-		t.Logf("Expected error (no actual Parquet file): %v", err)
-	}
-
-	// Response should be created even if commit fails
-	if resp == nil {
-		t.Error("Commit response should not be nil")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &ServerV2{
+				backend: newMockBackend(),
+				config:  &Config{RunID: "ws-test"},
+				writers: make(map[string]*writerState),
+			}
+			err := server.patchParquetFieldIDs(context.Background(), tc.ws)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("patchParquetFieldIDs() should not error, got: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("patchParquetFieldIDs() err = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

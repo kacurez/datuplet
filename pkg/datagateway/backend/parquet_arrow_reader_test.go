@@ -17,77 +17,57 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 )
 
-func TestParquetArrowReader_SingleFile_TwoRowGroups(t *testing.T) {
-	dir := t.TempDir()
-	file := filepath.Join(dir, "in.parquet")
-	writeFixtureParquet(t, file, []int64{1, 2, 3, 4, 5}, 2 /* rowsPerGroup */)
+func TestParquetArrowReader_TotalRows(t *testing.T) {
+	tests := []struct {
+		name  string
+		files [][]int64 // one fixture parquet per entry
+	}{
+		{"single file, two row groups", [][]int64{{1, 2, 3, 4, 5}}},
+		{"two files, total rows summed", [][]int64{{1, 2, 3}, {10, 20}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var paths []string
+			var wantRows int64
+			for i, values := range tc.files {
+				p := filepath.Join(dir, fmt.Sprintf("%d.parquet", i))
+				writeFixtureParquet(t, p, values, 2 /* rowsPerGroup */)
+				paths = append(paths, p)
+				wantRows += int64(len(values))
+			}
 
-	schema := &SchemaInfo{Columns: []ColumnInfo{{Name: "id", Type: "int64", Nullable: false}}}
-	r, err := NewParquetArrowReader(context.Background(), []string{file}, schema)
-	if err != nil {
-		t.Fatalf("NewParquetArrowReader: %v", err)
-	}
-	defer r.Close()
+			schema := &SchemaInfo{Columns: []ColumnInfo{{Name: "id", Type: "int64", Nullable: false}}}
+			r, err := NewParquetArrowReader(context.Background(), paths, schema)
+			if err != nil {
+				t.Fatalf("NewParquetArrowReader: %v", err)
+			}
+			defer r.Close()
 
-	var totalRows int64
-	chunkCount := 0
-	for {
-		chunk, err := r.ReadChunk()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("ReadChunk: %v", err)
-		}
-		if chunk.Format != "arrow_ipc" {
-			t.Fatalf("expected arrow_ipc format, got %q", chunk.Format)
-		}
-		totalRows += chunk.RowsInChunk
-		chunkCount++
+			var totalRows int64
+			chunkCount := 0
+			for {
+				chunk, err := r.ReadChunk()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("ReadChunk: %v", err)
+				}
+				if chunk.Format != "arrow_ipc" {
+					t.Fatalf("expected arrow_ipc format, got %q", chunk.Format)
+				}
+				totalRows += chunk.RowsInChunk
+				chunkCount++
+			}
+			if totalRows != wantRows {
+				t.Errorf("totalRows = %d, want %d", totalRows, wantRows)
+			}
+			if chunkCount < 1 {
+				t.Errorf("chunkCount = %d, want at least 1", chunkCount)
+			}
+		})
 	}
-	if totalRows != 5 {
-		t.Errorf("totalRows = %d, want 5", totalRows)
-	}
-	// 5 rows / 2 per group = 3 groups; with BatchSize=64K and only 5 rows we get one batch per group
-	if chunkCount < 1 {
-		t.Errorf("chunkCount = %d, want at least 1", chunkCount)
-	}
-}
-
-func TestParquetArrowReader_TwoFiles_TotalRowsCorrect(t *testing.T) {
-	dir := t.TempDir()
-	f1 := filepath.Join(dir, "1.parquet")
-	f2 := filepath.Join(dir, "2.parquet")
-	writeFixtureParquet(t, f1, []int64{1, 2, 3}, 2)
-	writeFixtureParquet(t, f2, []int64{10, 20}, 2)
-
-	schema := &SchemaInfo{Columns: []ColumnInfo{{Name: "id", Type: "int64", Nullable: false}}}
-	r, err := NewParquetArrowReader(context.Background(), []string{f1, f2}, schema)
-	if err != nil {
-		t.Fatalf("NewParquetArrowReader: %v", err)
-	}
-	defer r.Close()
-
-	var totalRows int64
-	sawIsLast := false
-	for {
-		chunk, err := r.ReadChunk()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("ReadChunk: %v", err)
-		}
-		totalRows += chunk.RowsInChunk
-		if chunk.IsLast {
-			sawIsLast = true
-		}
-	}
-	if totalRows != 5 {
-		t.Errorf("totalRows = %d, want 5", totalRows)
-	}
-	// IsLast may be true on the last chunk OR EOF may be the terminator — either is acceptable.
-	_ = sawIsLast
 }
 
 func TestParquetArrowReader_EmptyFileList_ReturnsError(t *testing.T) {
