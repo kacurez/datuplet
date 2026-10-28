@@ -22,12 +22,83 @@ Primary languages: Go (backend, operators, CLI), Python (SDK + a few
 scripts), YAML (K8s manifests), Shell (automation). TypeScript only in
 the browser UI.
 
+## Commands
+
+`make help` lists every target. The ones that matter day to day:
+
+| Task | Command |
+|------|---------|
+| Build binaries | `make build` (→ `bin/datuplet`), `make build-pipeline-api`, `make build-operators` |
+| Unit tests | `make test` (`go test -v ./...`) |
+| One test | `go test ./pkg/datagateway/ -run TestName -v` |
+| Lint | `make lint` — `go vet` + `deadcode` + lakekeeper-chart golden-render diff |
+| Tidy all modules | `make tidy` (never a bare `go mod tidy`; see Non-obvious conventions) |
+| Schema sync | `make sync-component-schemas`, `make sync-appshell-schema` (both CI drift-checked) |
+| Full e2e | `make e2e-k8s` — build images, helm-install into `datuplet-e2e`, run suite, tear down |
+| Release prep | `make bump-version VERSION=X.Y.Z` (maintainer only) |
+
+Test gates — `go test ./...` must stay green on a bare machine:
+
+- DB-backed tests under `pkg/pipelineapi/{apps,auth,db,http,k8s,store}` skip
+  unless `TEST_DATABASE_URL` points at a Postgres, e.g.
+  `postgres://postgres:test@localhost:55432/test?sslmode=disable`.
+- `//go:build integration` tests need Docker (testcontainers). CI runs
+  `go test -tags=integration ./pkg/datagateway/backend/... ./pkg/datupleticeio/...`
+  (fake-gcs-server). `pkg/pipelineapi/authz` has an OpenFGA test under the
+  same tag that CI does not run.
+- The e2e suite (`tests/e2e/`, its own module) gates on `E2E_K8S=1`; without
+  it every scenario SKIPs. `E2E_REQUIRE=1` turns a bootstrap failure into a
+  hard fail. Assertions shell out to the `duckdb` CLI — a missing binary once
+  produced fake-green CI, so check `duckdb --version` first.
+  `make e2e-k8s-deploy` skips the image build when images are already on the
+  cluster. `scripts/e2e-port-forward.sh <ns>` is what actually runs the suite
+  (sets `E2E_K8S=1` + the three `DATUPLET_*_URL`s, then `go test ./...`);
+  copy that invocation and add `-run TestName` to rerun one scenario against
+  a deployed e2e stack.
+
+OrbStack dev loop (namespace `datuplet`; `K8S_NS=datuplet-e2e` retargets):
+
+- `make deploy-local` builds every image and installs the four charts +
+  `scripts/register.sh`; `make deploy-local-helm` skips the image build;
+  `make undeploy-local` removes it all.
+- After code changes: `make k8s-rebuild-services` (gateway image),
+  `make k8s-rebuild-operators` (operator image + CRDs + rollout restart),
+  `make k8s-rebuild-all`. After a CRD change always `make k8s-reload-crds`
+  — helm installs CRDs on first install only and never upgrades them.
+- `make k8s-retry-simple|k8s-retry-duckdb|k8s-retry-full` delete all
+  PipelineRuns and re-run an example pipeline; `make k8s-smoke` probes
+  health + OIDC via NodePort 30081.
+- Component work without a cluster:
+  `make extractor-local CONFIG=cmd/mock-datagateway/example-nyc311.json`
+  runs http-json-extractor against `cmd/mock-datagateway` and reports rows +
+  peak RSS.
+- `make engine-wasm` rebuilds the committed `pkg/appengine/embed/engine.wasm`.
+
+## CI contract
+
+`.github/workflows/pr.yml` runs on every PR and push to `main`:
+
+1. `go vet ./...`, `go test -count=1 ./...`, then the `integration`-tagged
+   GCS/datupleticeio tests.
+2. `helm dependency build` + `helm lint` + `helm template`, once per chart.
+3. `scripts/verify-versions.sh` — chart versions and component tag in sync.
+4. `make sync-component-schemas` + `git diff --exit-code` on the chart copies.
+5. `make sync-appshell-schema` + `git diff --exit-code ui/appshell/vegaspec.schema.json`.
+
+Not in PR CI, so run them yourself before a PR: `deadcode` and the chart
+golden-render diff (both only in `make lint`), and the OpenFGA integration
+test. The e2e suite runs in `e2e.yml` on the same triggers; `upgrade-e2e.yml`
+runs on pushes to `main`, label-gated PRs, or manual dispatch;
+`fga-version-check.yml` fires only on FGA model/values changes;
+`release*.yml` is maintainer territory.
+
 ## Working style
 
 - Sketch a 2-3 bullet plan before non-trivial changes; explore with
   `grep` / `find`, don't guess at paths.
 - One logical commit per task. `go build ./... && go test ./...` (or at
-  least the touched package) before every commit.
+  least the touched package) before every commit; `make lint` before opening
+  a PR (CI runs vet + test only, not `deadcode`).
 - Keep diffs minimal — no scope creep, no premature abstraction, no
   comments that restate the code.
 - Chart/operator/controller changes need `make e2e-k8s` against an
@@ -45,6 +116,23 @@ the browser UI.
   publish exactly as committed).
 - Applies to partial-progress checkpoints too: land via PR, not direct push.
 
+## Code reviews + plan workflow
+
+- **Codex is the reviewer** for every review gate — per-task and the final
+  whole-branch gate — never a generic Claude subagent. Run it in-session via
+  the codex plugin's companion runner (the `codex:codex-cli-runtime` skill
+  has the call); give it the task brief, the implementer's report and a diff.
+- **Findings are presented, not auto-fixed.** On Critical/Important findings
+  stop and show them to the maintainer; no fix is dispatched without
+  approval, and Codex re-reviews after approved fixes. A clean review
+  proceeds without a check-in; Minors go to a ledger rolled up at the final
+  gate. The final gate runs before `git push` / `gh pr create`.
+- **Specs and plans are committed** under `docs/superpowers/specs/` and
+  `docs/superpowers/plans/` as `YYYY-MM-DD-<slug>.md` (brainstorm → spec →
+  plan). Plan execution is subagent-driven — one task per subagent, Codex
+  review after each — on one feature branch ending in one draft PR, and it
+  starts only on the maintainer's explicit go.
+
 ## Documentation pointers
 
 - User-facing entries: [README.md](README.md), [docs/install.md](docs/install.md),
@@ -58,6 +146,16 @@ the browser UI.
   [docs/fga-model-upgrades.md](docs/fga-model-upgrades.md).
 - Dependency bumps: [docs/dependency-upgrades.md](docs/dependency-upgrades.md).
 - Honesty list: [docs/known-limitations.md](docs/known-limitations.md).
+- Operating + debugging: [docs/agent-quickstart.md](docs/agent-quickstart.md)
+  (the CLI agent loop, written for scripts and agents),
+  [docs/troubleshooting.md](docs/troubleshooting.md).
+- Feature docs: [docs/secrets.md](docs/secrets.md),
+  [docs/user-apps.md](docs/user-apps.md) (RFC 028),
+  [docs/ad-hoc-query.md](docs/ad-hoc-query.md).
+- Project skills (committed in `.claude/skills/`): `datuplet-operator` for
+  building, running and debugging pipelines from the CLI, and
+  `datuplet-component-author` for adding a new component — use the skill
+  rather than hand-rolling either.
 - Proto definitions: `api/proto/`; main service is
   `api/proto/gateway/v2/gateway.proto`. Generated Go is checked in alongside.
 
@@ -237,7 +335,9 @@ These are conventions a new contributor wouldn't infer from the code:
   pipeline-api's `/internal/v1/*` routes) and `cookie-hmac-key` (app-worker
   only, signs viewer session cookies).
 - **Monorepo `go mod tidy`**: the repo has multiple Go modules
-  (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`).
+  (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`,
+  `utils/docker/install-duckdb-ext/`; `tests/integration/` is a parked
+  pre-RFC-021 module that `make tidy` and CI both skip).
   Tidying root in isolation drifts the others —
   their Docker builds + e2e enforce parity and fail CI. Always run
   `make tidy` (covers every module).
@@ -259,6 +359,9 @@ These are conventions a new contributor wouldn't infer from the code:
 | `cmd/pipeline-operator/` | Operator binary. |
 | `cmd/pipeline-observer/` | Standalone informer; mirrors PipelineRun status to DB. |
 | `cmd/pipeline-api/` | HTTP server + admin subcommands. |
+| `cmd/datuplet/` | CLI (`login`, `pipeline`, `trigger`, `runs`, `components`, `storage`, `query`, `apps`); `docs/agent-quickstart.md` is built on it. |
+| `cmd/app-worker/` | app-worker binary (RFC 028). |
+| `cmd/mock-datagateway/` | In-process fake gateway for `make extractor-local`; example configs alongside. |
 | `pkg/pipelineapi/` | HTTP handlers, auth, authz, runbackend, store, storage UI. |
 | `pkg/appengine/` | WASM render engine — wazero host + QuickJS guest (`embed/engine.wasm`), OutputDoc/Vega-Lite-subset schema validation (RFC 028). |
 | `pkg/appworker/` | app-worker HTTP service: viewer/platform auth, render dispatch via `pkg/appengine`, render logs, rate limits (RFC 028). |
@@ -271,3 +374,7 @@ These are conventions a new contributor wouldn't infer from the code:
 | `charts/` | Four Helm charts: `datuplet-operators`, `-infra`, `-app`, `-lakekeeper`. |
 | `utils/docker/` | Dockerfiles for all services. |
 | `examples/pipelines/` | Example PipelineDocs, envelope-free (CI-guarded; RFC 027). |
+| `scripts/` | `install.sh` / `upgrade.sh` (the single install path), `register.sh`, `verify-versions.sh` (CI), `e2e-port-forward.sh`. |
+| `tests/e2e/` | K8s e2e suite (own module); `framework/` bootstraps ComponentDefinitions + FGA, `manifests/` is the hermetic HTTP fixture. |
+| `charts/datuplet-lakekeeper/_render/` | Golden `helm template` outputs diffed by `make chart-render-check`. |
+| `docs/superpowers/` | Committed design specs + implementation plans (see Code reviews + plan workflow). |
