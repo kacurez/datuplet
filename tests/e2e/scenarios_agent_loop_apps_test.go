@@ -164,7 +164,7 @@ func TestAgentLoop_UserApps(t *testing.T) {
 
 	// Reuse the same seeded 100-row warehouse table every other apps/query
 	// scenario in this suite reads (ensureQueryTable, scenarios_query_test.go).
-	ns, table := ensureQueryTable(t)
+	ns, table, _ := ensureQueryTable(t)
 	if !appsSafeIdent(ns) || !appsSafeIdent(table) {
 		t.Fatalf("seeded ns/table are not identifier-safe: ns=%q table=%q", ns, table)
 	}

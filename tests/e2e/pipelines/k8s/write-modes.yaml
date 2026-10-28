@@ -1,0 +1,23 @@
+# Write-modes scenario (run twice by the harness, RunTwice): two extractors in
+# one stage read the same 100-row fixture. The FULL_LOAD output still holds 100
+# rows after the second run (replace); the APPEND output holds 200 (accumulate).
+name: "{{.RunPrefix}}-write-modes"
+stages:
+  - name: extract
+    components:
+      - name: full-load-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-full"
+          defaultWriteMode: FULL_LOAD
+      - name: append-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+        outputs:
+          defaultBucket: "{{.RunPrefix}}-append"
+          defaultWriteMode: APPEND

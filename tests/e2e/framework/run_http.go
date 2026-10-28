@@ -55,9 +55,10 @@ const (
 // Production run-identity is the authenticated caller, so a per-user authz
 // scenario must drive the API AS that user. Alice maps to the seeded DB admin
 // (the account register.sh creates); Bob maps to a dedicated DB login user the
-// backend provisions on first use. Charlie/Dora are not exercised over the HTTP
-// run path (their negative-authz paths are covered at the unit level — see the
-// fga-matrix note in scenarios_test.go), so this returns ok=false for them. The
+// backend provisions on first use. Viewer / no-grant identities are not
+// exercised over the HTTP run path (their negative-authz paths are covered at
+// the unit level — see the fga-matrix note in scenarios_test.go), so any other
+// UUID returns ok=false. The
 // mechanism is deliberately a lookup table so adding a row is the only change
 // needed to extend it.
 func apiCredsFor(userID uuid.UUID) (email, password string, ok bool) {

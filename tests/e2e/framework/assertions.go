@@ -163,25 +163,6 @@ func AssertRowCount(t *testing.T, target QueryTarget, bucket, table string, expe
 	}
 }
 
-// AssertMinRowCount verifies the table has at least minCount rows.
-func AssertMinRowCount(t *testing.T, target QueryTarget, bucket, table string, minCount int) {
-	t.Helper()
-	rows, err := duckdbQuery(target, bucket, table, "SELECT COUNT(*) AS cnt FROM {{TABLE}}")
-	if err != nil {
-		t.Fatalf("row count query failed for %s/%s: %v", bucket, table, err)
-	}
-	if len(rows) == 0 {
-		t.Fatalf("row count query returned no rows for %s/%s", bucket, table)
-	}
-	cnt, err := toInt(rows[0]["cnt"])
-	if err != nil {
-		t.Fatalf("failed to parse row count for %s/%s: %v (raw: %v)", bucket, table, err, rows[0]["cnt"])
-	}
-	if cnt < minCount {
-		t.Fatalf("row count too low for %s/%s: got %d, want at least %d", bucket, table, cnt, minCount)
-	}
-}
-
 // AssertSchema verifies that the expected columns exist with the expected types.
 // The expectedColumns map is col_name -> expected_type. An empty type string skips the type check.
 func AssertSchema(t *testing.T, target QueryTarget, bucket, table string, expectedColumns map[string]string) {
@@ -208,51 +189,6 @@ func AssertSchema(t *testing.T, target QueryTarget, bucket, table string, expect
 		}
 		if wantType != "" && !strings.EqualFold(gotType, wantType) {
 			t.Errorf("column %q type mismatch in %s/%s: got %q, want %q", col, bucket, table, gotType, wantType)
-		}
-	}
-}
-
-// AssertColumnAbsent verifies that the given column does NOT exist in the table.
-func AssertColumnAbsent(t *testing.T, target QueryTarget, bucket, table, column string) {
-	t.Helper()
-	rows, err := duckdbQuery(target, bucket, table, "DESCRIBE SELECT * FROM {{TABLE}}")
-	if err != nil {
-		t.Fatalf("schema query failed for %s/%s: %v", bucket, table, err)
-	}
-
-	for _, row := range rows {
-		name, _ := row["column_name"].(string)
-		if strings.EqualFold(name, column) {
-			t.Fatalf("column %q should not exist in %s/%s but it does", column, bucket, table)
-		}
-	}
-}
-
-// AssertQuery runs an arbitrary SQL query and compares results.
-// Values are compared via fmt.Sprintf("%v") for simplicity.
-func AssertQuery(t *testing.T, target QueryTarget, bucket, table, sql string, expected []map[string]any) {
-	t.Helper()
-	rows, err := duckdbQuery(target, bucket, table, sql)
-	if err != nil {
-		t.Fatalf("query failed for %s/%s: %v", bucket, table, err)
-	}
-
-	if len(rows) != len(expected) {
-		t.Fatalf("query result row count mismatch for %s/%s: got %d, want %d\n  SQL: %s\n  got: %v",
-			bucket, table, len(rows), len(expected), sql, rows)
-	}
-
-	for i, wantRow := range expected {
-		gotRow := rows[i]
-		for k, wantVal := range wantRow {
-			gotVal, ok := gotRow[k]
-			if !ok {
-				t.Errorf("row %d: key %q missing in result", i, k)
-				continue
-			}
-			if fmt.Sprintf("%v", gotVal) != fmt.Sprintf("%v", wantVal) {
-				t.Errorf("row %d: key %q mismatch: got %v, want %v", i, k, gotVal, wantVal)
-			}
 		}
 	}
 }

@@ -1,8 +1,8 @@
 // Package e2e — audit-trail e2e test.
 //
-// TestAuditTrail_ClusterRun triggers a K8s pipeline run, waits for it
-// to succeed, loads the resulting iceberg table via the lakekeeper REST
-// catalog, and asserts that the current snapshot's Summary.Properties
+// TestAuditTrail_ClusterRun reuses the query seed run (ensureQueryTable,
+// scenarios_query_test.go), loads the seeded iceberg table via the lakekeeper
+// REST catalog, and asserts that the current snapshot's Summary.Properties
 // contains the four datuplet.* audit keys written by icebergjob's
 // BuildSnapshotSummary helper.
 //
@@ -14,24 +14,28 @@ package e2e
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/tests/e2e/framework"
 )
 
-// TestAuditTrail_ClusterRun triggers the explicit-tables pipeline and
-// asserts that the committed snapshot's Summary.Properties contains:
+// TestAuditTrail_ClusterRun asserts that the seed run's committed snapshot's
+// Summary.Properties contains:
 //
 //   - datuplet.run-mode    == "cluster"
 //   - datuplet.pipeline-api == "datuplet-api"
 //   - datuplet.actor       non-empty (triggering user UUID)
 //   - datuplet.run-id      == run UUID minted for this run
+//
+// The seed table is written only by the seed run (its own "<runPrefix>-seed"
+// prefix), so the current snapshot is the seed run's commit regardless of
+// test order.
 func TestAuditTrail_ClusterRun(t *testing.T) {
 	if os.Getenv("E2E_K8S") != "1" {
 		t.Skip("E2E_K8S=1 required")
@@ -45,44 +49,14 @@ func TestAuditTrail_ClusterRun(t *testing.T) {
 		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	// Build K8s backend.
-	kb, err := framework.NewK8sBackend(h, runPrefix)
-	if err != nil {
-		t.Fatalf("init K8s backend: %v", err)
-	}
-	defer kb.Cleanup(context.Background())
-
-	// Render the explicit-tables-k8s pipeline template.
-	pipelinesDir, _ := filepath.Abs("pipelines")
-	templatePath := filepath.Join(pipelinesDir, "k8s/explicit-tables.yaml")
-	vars := framework.TemplateVars{RunPrefix: runPrefix}
-	rendered, err := framework.RenderPipeline(templatePath, vars)
-	if err != nil {
-		t.Fatalf("render pipeline template: %v", err)
-	}
-	defer os.Remove(rendered)
-
-	// Run the pipeline and capture the run-id.
-	result, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{
-		StorageType: "s3",
-		Timeout:     3 * time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("run pipeline: %v", err)
-	}
-	if !result.Success {
-		t.Fatalf("pipeline failed (exit %d, type %s):\n  logs: %s",
-			result.ExitCode, result.FailureType, result.Logs)
-	}
-
-	runID := result.RunID
-	if runID.String() == "00000000-0000-0000-0000-000000000000" {
+	namespace, tableName, runID := ensureQueryTable(t)
+	if runID == uuid.Nil {
 		t.Fatal("RunID is zero — K8sBackend did not populate result.RunID")
 	}
-	t.Logf("pipeline succeeded, run-id=%s", runID)
+	t.Logf("seed run succeeded, run-id=%s", runID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	// Build lakekeeper catalog client using alice's impersonation token.
 	tp := func(ctx context.Context) (string, error) {
@@ -103,10 +77,7 @@ func TestAuditTrail_ClusterRun(t *testing.T) {
 		t.Fatalf("open lakekeeper catalog: %v", err)
 	}
 
-	// Load the table written by the pipeline.
-	namespace := runPrefix + "-staging"
-	tableName := "posts"
-
+	// Load the table written by the seed run.
 	tbl, err := cli.Catalog.LoadTable(ctx, catalog.ToIdentifier(namespace, tableName))
 	if err != nil {
 		t.Fatalf("LoadTable %s.%s: %v", namespace, tableName, err)

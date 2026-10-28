@@ -7,9 +7,7 @@ import (
 
 // TemplateVars holds variables available in pipeline YAML templates.
 type TemplateVars struct {
-	RunPrefix    string
-	TestDataDir  string
-	WarehouseDir string
+	RunPrefix string
 }
 
 // RenderPipeline reads a Go text/template pipeline YAML, executes it with the

@@ -36,8 +36,7 @@ image:
 #
 # RFC 025: the warehouse is resolved per request from the project-scoped
 # route (POST /api/v1/projects/{pid}/query) — no bootstrap-ordering env patch
-# is needed. TestQueryBootstrap verifies the worker is ready and skips the
-# query suite if it is not.
+# is needed. The TestQuery_* scenarios fail if the worker is not serving.
 queryWorker:
   enabled: true
   image:

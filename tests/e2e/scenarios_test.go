@@ -12,20 +12,17 @@
 //
 // K8s is the only supported deployment tier.
 //
-// # FGA-matrix scenarios
+// # FGA-matrix scenario
 //
-// Four test identities are seeded at fixture init (TestMain → SetupFGABootstrap):
+// Two test identities are seeded at fixture init (TestMain → SetupFGABootstrap):
 //
-//	alice   project_admin  trigger + browse
+//	alice   project_admin  trigger + browse (default identity of every scenario)
 //	bob     editor         trigger + browse (via data_admin chain)
-//	charlie viewer         browse only; trigger → 403
-//	dora    (no grants)    403 everywhere
 //
-// alice + bob positive paths are exercised as standard K8s scenarios in the
-// scenarios slice (kubectl-apply trigger + lakekeeper browse). The charlie
-// (viewer) and dora (no-grants) negative-authz paths are covered at the unit
-// level in pkg/pipelineapi/http (mustHaveRelation → 403); they are not
-// e2e-covered — see the note above the fga-matrix scenarios below.
+// bob's positive path is exercised by the fga-matrix-bob scenario below. The
+// viewer and no-grant negative-authz paths are covered at the unit level in
+// pkg/pipelineapi/http (mustHaveRelation → 403); see the note above the
+// fga-matrix scenario below.
 package e2e
 
 import (
@@ -39,124 +36,30 @@ import (
 
 var scenarios = []framework.Scenario{
 	// ============================================
-	// Basic extract scenarios
+	// Write modes
 	// ============================================
 	{
-		Name:        "explicit-tables",
-		Description: "Extract posts to an explicitly named table (K8s)",
-		K8sPipeline: "k8s/explicit-tables.yaml",
-		Assertions: []framework.Assertion{
-			{Type: "table_exists", Bucket: "{{.RunPrefix}}-staging", Table: "posts"},
-			{Type: "row_count", Bucket: "{{.RunPrefix}}-staging", Table: "posts", ExpectedCount: 100},
-		},
-	},
-	{
-		Name:        "full-load-mode",
-		Description: "FULL_LOAD: run twice, second replaces data (K8s)",
-		K8sPipeline: "k8s/full-load-mode.yaml",
+		// One pipeline, two extractors in one stage: FULL_LOAD replaces (still
+		// 100 rows after two runs) while APPEND accumulates (200 rows).
+		Name:        "write-modes",
+		Description: "FULL_LOAD replaces and APPEND accumulates across two runs (K8s)",
+		K8sPipeline: "k8s/write-modes.yaml",
 		RunTwice:    true,
 		Assertions: []framework.Assertion{
-			{Type: "row_count", Bucket: "{{.RunPrefix}}-raw", Table: "data", ExpectedCount: 100},
-		},
-	},
-	{
-		Name:        "append-mode",
-		Description: "APPEND: run twice, data accumulates (K8s)",
-		K8sPipeline: "k8s/append-mode.yaml",
-		RunTwice:    true,
-		// Pre-existing K8s cancel-watch race observed under RunTwice=true:
-		// the second run's gateway sidecar starts in a pod whose kubelet-
-		// projected /etc/podinfo/annotations file briefly carries a stale
-		// `datuplet.io/cancel="true"` from the previous run's teardown
-		// (operator patches cancel=true on cancel/delete; downward-API
-		// projection can be observed by the new pod before kubelet
-		// refreshes). The cancel-watch fires, GracefulStop runs, and the
-		// component container can't dial gateway:50051 → exit 20.
-		// Cancel propagation should be scoped to a pod-UID match, not
-		// just the run label.
-		SkipReason: "K8s cancel-watch race under RunTwice: stale datuplet.io/cancel=\"true\" annotation projected to second-run pod, gateway shuts down before component can dial. Cancel propagation scoping to pod-UID is a known open improvement.",
-		Assertions: []framework.Assertion{
-			{Type: "row_count", Bucket: "{{.RunPrefix}}-raw", Table: "data", ExpectedCount: 200},
-		},
-	},
-	// TODO: drop-processor skipped — Parquet field_id mismatch after drop processor
-	// with JSON input format. Columns ARE dropped correctly but CloseWriter fails due to
-	// schema field_id conflict between inferred schema and written records. Works fine on
-	// the old Docker tier with CSV format. Needs fix in gateway's drop processor field_id
-	// handling.
-	// {
-	// 	Name:        "drop-processor",
-	// 	Description: "Drop processor removes title and body columns (K8s)",
-	// 	K8sPipeline: "k8s/drop-processor.yaml",
-	// 	Assertions: []framework.Assertion{
-	// 		{Type: "row_count", Bucket: "{{.RunPrefix}}-raw", Table: "data", ExpectedCount: 100},
-	// 		{Type: "schema", Bucket: "{{.RunPrefix}}-raw", Table: "data",
-	// 			ExpectedColumns: map[string]string{
-	// 				"userId": "",
-	// 				"id":     "",
-	// 			}},
-	// 		{Type: "column_absent", Bucket: "{{.RunPrefix}}-raw", Table: "data", Column: "title"},
-	// 		{Type: "column_absent", Bucket: "{{.RunPrefix}}-raw", Table: "data", Column: "body"},
-	// 	},
-	// },
-	{
-		Name:        "multi-component-stage",
-		Description: "Two extractors (posts + users) in one stage (K8s)",
-		K8sPipeline: "k8s/multi-component-stage.yaml",
-		Assertions: []framework.Assertion{
-			{Type: "table_exists", Bucket: "{{.RunPrefix}}-multi", Table: "posts"},
-			{Type: "row_count", Bucket: "{{.RunPrefix}}-multi", Table: "posts", ExpectedCount: 100},
-			{Type: "table_exists", Bucket: "{{.RunPrefix}}-multi", Table: "users"},
-			{Type: "row_count", Bucket: "{{.RunPrefix}}-multi", Table: "users", ExpectedCount: 10},
-			{Type: "schema", Bucket: "{{.RunPrefix}}-multi", Table: "users",
-				ExpectedColumns: map[string]string{
-					"id":       "",
-					"name":     "",
-					"email":    "",
-					"username": "",
-				}},
-		},
-	},
-	{
-		Name:        "http-json-extract",
-		Description: "Extract JSON data from an HTTP API endpoint",
-		K8sPipeline: "k8s/http-json-extract.yaml",
-		Assertions: []framework.Assertion{
-			{Type: "min_row_count", Bucket: "{{.RunPrefix}}-api", Table: "data", ExpectedCount: 10},
-			{Type: "schema", Bucket: "{{.RunPrefix}}-api", Table: "data",
-				ExpectedColumns: map[string]string{
-					"userId": "",
-					"id":     "",
-					"title":  "",
-					"body":   "",
-				}},
+			{Type: "row_count", Bucket: "{{.RunPrefix}}-full", Table: "data", ExpectedCount: 100},
+			{Type: "row_count", Bucket: "{{.RunPrefix}}-append", Table: "data", ExpectedCount: 200},
 		},
 	},
 
 	// ============================================
-	// DuckDB ETL scenarios
+	// Multi-stage ETL
 	// ============================================
-	{
-		Name:        "duckdb-etl",
-		Description: "Full ETL on K8s: http-json extract + DuckDB aggregate by userId",
-		K8sPipeline: "k8s/duckdb-etl.yaml",
-		// DuckDB COPY TO output is naturally unstamped, which is what
-		// iceberg-go's AddFiles requires.
-		Assertions: []framework.Assertion{
-			{Type: "table_exists", Bucket: "{{.RunPrefix}}-etl", Table: "user_summary"},
-			{Type: "row_count", Bucket: "{{.RunPrefix}}-etl", Table: "user_summary", ExpectedCount: 10},
-			{Type: "schema", Bucket: "{{.RunPrefix}}-etl", Table: "user_summary",
-				ExpectedColumns: map[string]string{
-					"userId":     "",
-					"post_count": "",
-				}},
-		},
-	},
 	{
 		Name:        "multi-table-join",
 		Description: "DuckDB join: posts + users on K8s",
 		K8sPipeline: "k8s/multi-table-join.yaml",
-		// Same field_id handling as duckdb-etl applies here.
+		// DuckDB COPY TO output is naturally unstamped, which is what
+		// iceberg-go's AddFiles requires.
 		Assertions: []framework.Assertion{
 			{Type: "row_count", Bucket: "{{.RunPrefix}}-joined", Table: "post_details", ExpectedCount: 100},
 			{Type: "schema", Bucket: "{{.RunPrefix}}-joined", Table: "post_details",
@@ -190,12 +93,11 @@ var scenarios = []framework.Scenario{
 			{Type: "failure_type", ExpectedFailure: "FailedUser"},
 		},
 	},
-	// error-missing-table is no longer a run scenario: under RFC 027 the
-	// pipeline-api validator rejects its invalid input-table reference at PUT
-	// (HTTP 400) before any run is created, so it cannot reach a terminal
-	// failure phase the declarative Scenario{} shape asserts on. It is covered
-	// as a PUT pre-flight rejection by TestErrorMissingTableRejected in
-	// scenarios_registry_test.go (RFC 027 E5).
+	// PUT-time validator rejections (an invalid pipeline is refused with HTTP
+	// 400 before any run is created, so it cannot reach the terminal failure
+	// phase this declarative Scenario{} shape asserts on) are covered by
+	// TestRegistry_ErrorSchemaInvalid in scenarios_registry_test.go and by the
+	// validate steps of TestAgentLoop_SchemaToVerify.
 
 	// Secret handling ($[name] resolution via the managed write-only secrets
 	// API) is exercised by TestSecretsLadder in scenarios_secrets_test.go —
@@ -204,51 +106,39 @@ var scenarios = []framework.Scenario{
 	// run, which don't fit the declarative Scenario{} shape used here.
 
 	// ============================================================
-	// FGA-grant-matrix scenarios
+	// FGA-grant-matrix scenario
 	//
-	// These scenarios assert per-user authorization outcomes against
-	// the FGA model. The grant matrix is:
+	// alice (project_admin) is the default identity of every other
+	// scenario, so only bob (editor, data_admin chain) gets a dedicated
+	// scenario: it triggers a pipeline run and then asserts the resulting
+	// table is browsable. The run authenticates as bob via
+	// K8sBackend.RunAsUser = User.
 	//
-	//   alice   → project_admin  (data_admin chain: trigger + browse)
-	//   bob     → editor         (data_admin chain: trigger + browse)
-	//   charlie → viewer         (browse only; trigger 403s)
-	//   dora    → no grants      (403 everywhere)
-	//
-	// alice + bob: exercised here as standard K8s scenarios that
-	// trigger a pipeline run (via kubectl apply) and then assert the
-	// resulting table is browsable. The per-run JWT is minted for
-	// their respective identities via K8sBackend.RunAsUser = User.
-	//
-	// charlie + dora (negative paths): the pipeline-api HTTP trigger
+	// Negative paths (viewer / no-grant): the pipeline-api HTTP trigger
 	// endpoint (POST /api/v1/projects/:pid/pipelines/:name/runs) returning
-	// 403 for viewer / no-grant users is exercised by mustHaveRelation
-	// handler unit tests in pkg/pipelineapi/http, not by an e2e scenario:
-	// the e2e negative-trigger path needs a cli-api Bearer JWT (or session
-	// cookie) whose subject is a Datuplet DB user row whose UUID matches the
-	// FGA-seeded test-user UUID — infrastructure this harness does not have
-	// (create-user mints a random UUID; the only test-user token helper
-	// mints an impersonation/datuplet-catalog token the REST resolver
-	// rejects). See docs/superpowers/plans for the RFC 024 W7 decision.
+	// 403 is exercised by mustHaveRelation handler unit tests in
+	// pkg/pipelineapi/http, not by an e2e scenario: the e2e negative-trigger
+	// path needs a cli-api Bearer JWT (or session cookie) whose subject is a
+	// Datuplet DB user row whose UUID matches the FGA-seeded test-user UUID —
+	// infrastructure this harness does not have (create-user mints a random
+	// UUID; the only test-user token helper mints an
+	// impersonation/datuplet-catalog token the REST resolver rejects). See
+	// docs/superpowers/plans for the RFC 024 W7 decision.
 	// ============================================================
-	{
-		Name:        "fga-matrix-alice-trigger-and-browse",
-		Description: "alice (project_admin) triggers a pipeline and browses the result — both succeed",
-		// Use the http-json fixture which works without local CSV test
-		// data and produces a stable 100-row output (in-cluster http-fixture posts).
-		K8sPipeline: "k8s/http-json-extract.yaml",
-		User:        framework.AliceID,
-		Assertions: []framework.Assertion{
-			{Type: "min_row_count", Bucket: "{{.RunPrefix}}-api", Table: "data", ExpectedCount: 10},
-			{Type: "browse_table_succeeds", Bucket: "{{.RunPrefix}}-api", Table: "data"},
-		},
-	},
 	{
 		Name:        "fga-matrix-bob-trigger-and-browse",
 		Description: "bob (editor, data_admin chain) triggers a pipeline and browses the result — both succeed",
 		K8sPipeline: "k8s/http-json-extract.yaml",
 		User:        framework.BobID,
 		Assertions: []framework.Assertion{
-			{Type: "min_row_count", Bucket: "{{.RunPrefix}}-api", Table: "data", ExpectedCount: 10},
+			{Type: "row_count", Bucket: "{{.RunPrefix}}-api", Table: "data", ExpectedCount: 100},
+			{Type: "schema", Bucket: "{{.RunPrefix}}-api", Table: "data",
+				ExpectedColumns: map[string]string{
+					"userId": "",
+					"id":     "",
+					"title":  "",
+					"body":   "",
+				}},
 			{Type: "browse_table_succeeds", Bucket: "{{.RunPrefix}}-api", Table: "data"},
 		},
 	},
@@ -256,16 +146,15 @@ var scenarios = []framework.Scenario{
 
 func TestScenarios(t *testing.T) {
 	// K8s is the only supported deployment tier.
-	// FGA-aware test users (alice/bob/charlie/dora) are seeded at
-	// fixture init via TestMain → SetupFGABootstrap; per-test users
-	// are bound via K8sBackend.RunAsUser.
+	// FGA-aware test users (alice/bob) are seeded at fixture init via
+	// TestMain → SetupFGABootstrap; per-test users are bound via
+	// K8sBackend.RunAsUser.
 
 	pipelinesDir, _ := filepath.Abs("pipelines")
-	testDataDir, _ := filepath.Abs("testdata")
 
 	for _, sc := range scenarios {
 		t.Run(sc.Name, func(t *testing.T) {
-			framework.RunScenario(t, sc, runPrefix, pipelinesDir, testDataDir)
+			framework.RunScenario(t, sc, runPrefix, pipelinesDir)
 		})
 	}
 }
@@ -291,7 +180,6 @@ func TestBigDataJoinProof(t *testing.T) {
 		t.Skip("E2E_K8S=1 required (big-data join proof is K8s-only)")
 	}
 	pipelinesDir, _ := filepath.Abs("pipelines")
-	testDataDir, _ := filepath.Abs("testdata")
 	sc := framework.Scenario{
 		Name:        "large-input-join",
 		Description: "Big-data join proof: ~400MB facts JOIN 10-row dimensions under 256Mi ephemeral-storage cap",
@@ -311,5 +199,5 @@ func TestBigDataJoinProof(t *testing.T) {
 				}},
 		},
 	}
-	framework.RunScenario(t, sc, runPrefix, pipelinesDir, testDataDir)
+	framework.RunScenario(t, sc, runPrefix, pipelinesDir)
 }
