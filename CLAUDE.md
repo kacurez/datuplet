@@ -118,6 +118,10 @@ runs on pushes to `main`, label-gated PRs, or manual dispatch;
 
 ## Code reviews + plan workflow
 
+- **[REVIEW.md](REVIEW.md) steers every review** — human, local
+  `/code-review`, or Codex: failure modes per area, paths to skip,
+  Important/Nit/Pre-existing labels, the three-round cap, and the risk
+  tiers that decide how much checking a PR gets before merge.
 - **Codex is the reviewer** for every review gate — per-task and the final
   whole-branch gate — never a generic Claude subagent. Run it in-session via
   the codex plugin's companion runner (the `codex:codex-cli-runtime` skill
