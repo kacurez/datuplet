@@ -310,3 +310,63 @@ The controller should route two judgement calls to the maintainer before Task 3.
 
 1. **D5 class table does not fit 2.0 for four rows.** `ATTACH 'quack:…' (TOKEN …)`, `ATTACH 'quack:…' (TYPE quack)`, `CONNECT 'quack:…'` and `CONNECT 'postgres:…'` deny at the **FS layer** (`Permission Error: File system LocalFileSystem has been disabled by configuration`), not with an extension-named message. D5's `extensionUnavailable` predicate (extension name AND a not-loaded phrase) would fail all four. The deny is real and layered: the explicit extension-file load is refused by `disabled_filesystems`, and quack is not linked. But Task 3 needs an approved class for these rows, for example an FS-layer class plus the listener counter. Weakening the predicate silently would be an anti-goal.
 2. **New statically linked surface in 2.0.0: `tpch` + `tpcds`**, reachable post-lock (`CALL dbgen(sf=…)`, `CALL dsdgen(sf=…)`, `tpch_queries()`, `tpcds_queries()`). It has no FS or network reach; it is in-memory generation bounded by `memory_limit`, `max_temp_directory_size` and the request timeout. It is still new user-reachable capability. The deny-matrix header says new capability surface must be reconciled on every bump. Options: accept it and pin it in the inventory test as present-by-design, or deny it, which would require a posture change, the only way the `lock()` list may grow per D5.
+
+## Cluster verification
+
+**Date:** 2026-10-29 (Task 7). OrbStack Kubernetes `v1.36.5+orb1`, arm64, docker 29.8.2. Images built from `feat/duckdb-2.0` at `67a93d7`–`6531e82` (no code changes in between). Local DuckDB CLI for the e2e assertions: `v1.4.1`.
+
+### e2e gate
+
+**Run 1: `make e2e-k8s` PASS** (suite `ok ... tests/e2e 303.164s`, teardown ran). Every test passed except the two expected skips:
+
+- PASS: `TestK8sFixturesAreValidDocs` (+9), `TestAgentLoop_UserApps`, `TestAgentLoop_SchemaToVerify`, `TestApps_ViewerAndSecurity` (+13), `TestAuditTrail_ClusterRun`, `TestQuery_LocalMint_Enabled`, **`TestQuery_HappyPath`**, `TestQuery_AuthzDenied`, **`TestQuery_WriteProbe`** (viewer write denied by S3 `403 AccessDenied`), **`TestQuery_StoragePreview`** (881 ms, 4 columns, 100 rows), `TestRegistry_ErrorSchemaInvalid`, `TestRegistry_UnpinnedResolvesStable`, `TestRegistry_Freeze_MidRunMutation`, `TestResources_PutGate` (+3), `TestSecretsLadder`, `TestScenarios/write-modes`, **`TestScenarios/multi-table-join`**, `TestScenarios/fga-matrix-bob-trigger-and-browse`.
+- SKIP: `TestQuery_NetworkPolicyEgress` (expected on OrbStack: "NetworkPolicy unenforced on this cluster"), `TestScenarios/error-bad-config` (pre-existing permanent skip, `scenarios_test.go:82-92`), and `TestBigDataJoinProof` (opt-in: needs `RFC011_BIG_DATA_PROOF=1`, which `make e2e-k8s` never sets).
+- The query-worker image's offline `verify` stage passed on every build: `OK: INSTALL iceberg / OK: LOAD iceberg / OK: INSTALL httpfs / OK: LOAD httpfs`.
+
+**Run 2: `RFC011_BIG_DATA_PROOF=1 make e2e-k8s-deploy`** (same images). Every other result was identical to run 1. **`TestBigDataJoinProof` FAILED at pipeline PUT, before any component ran**:
+
+```
+PUT pipeline "e2e-7124-manual-large-input-join": status=400 body={"error":"validation failed","findings":[{"path":"stages[1].components[0].resources","message":"resource \"memory\" is not allowed for component sql-transform (not listed in registry max)","severity":"error"}]}
+```
+
+This is pre-existing and unrelated to DuckDB. The fixture `tests/e2e/pipelines/k8s/manual-large-input-join.yaml` sets `resources: {memory: 2Gi}` on sql-transform, but the e2e bootstrap's sql-transform ComponentDefinition declares no `max`, so the RFC 026 resource gate rejects the doc. It was not fixed. **The big-data join on DuckDB 2.0 is therefore not verified on a cluster.**
+
+### Kept stack (`make deploy-local`, namespace `datuplet`)
+
+**Baseline `examples/pipelines/etl-duckdb.yaml` (`duckdb-transform`, run `5de2e743`): Succeeded.** The run took 28 s. sql-transform exited 0 (`sql-transform completed (1 inputs, 1 outputs)`), and the gateway logged `commit ok for etl.user_summary ... files=1 rows=10`. `datuplet query --sql 'SELECT count(*) FROM etl.user_summary'` returned **10**, and `raw.data` returned 100. `make k8s-retry-duckdb` was not used: it is pre-existing broken because it `kubectl apply`s an envelope-free PipelineDoc.
+
+**Untyped-NULL probe (`duckdb-null-probe` → `etl.null_probe`, SQL `... NULL AS probe_null ...`, run `20d1f465`): FailedApplication.** sql-transform exited 20 in stage `transform`, with the same result on both Job attempts:
+
+```
+write output etl.null_probe: WriteChunk: HTTP write failed: 500 Internal Server Error - {"error":"failed to parse input: failed to convert schema: field \"probe_null\": unsupported Arrow type: null","code":"PROCESS_ERROR"}
+```
+
+The DuckDB 2.0 output keeps `probe_null` NULL-typed, so it reaches the Data Gateway as Arrow type `null`. The gateway's Arrow→Datuplet type mapping rejects that type (`pkg/datagateway/format/parquet.go:81` wrapping `pkg/datagateway/schema/types.go:253`) before any writer or table exists. `DESCRIBE etl.null_probe` returns `Catalog Error: Table with name null_probe does not exist!`, so nothing was written or committed. The component was not patched; how to handle this is the maintainer's decision. An explicit cast such as `CAST(NULL AS VARCHAR)` is the obvious user-side workaround, but it was not tested.
+
+**query-worker RSS baseline (D9).** `kubectl top` is unavailable on OrbStack (`Metrics API not available`), so memory was read from the pod's cgroup v2 files and `/proc/1/status`. The pod's limit is 1Gi.
+
+- The representative query was a `raw.data` ⋈ `etl.user_summary` GROUP BY. It ran three times, each in 0.35–0.79 s and returning 10 rows.
+- Sampling `memory.current` every 2 s gave a maximum of **188.1 MiB** (anon 24.3 MiB, file 162.3 MiB).
+- The lifetime cgroup **`memory.peak` was 208.3 MiB**, including page cache. Before the pod's first query it was 63.2 MiB.
+- The lifetime process **peak RSS (`VmHWM`) was 100.6 MiB**.
+- No DuckDB 1.5.3 figure was measured on this machine for comparison.
+
+**Image IDs.**
+
+| image | e2e runs (Step 1) | kept stack |
+|---|---|---|
+| `datuplet/query-worker` | `sha256:7e1b2dcadf13…` | `sha256:5000cb585a30…` |
+| `datuplet/sql-transform` | `sha256:295d8aae787f…` | `sha256:15701a1a40a6…` (`:v0.13.3`) |
+| `datuplet/gateway` | `sha256:6fd7a51314fb…` | `sha256:01de9a2c67c2…` |
+| `datuplet/http-json-extractor` | `sha256:d03e5c390558…` | `sha256:f5c6d5d644c0…` (`:v0.13.3`) |
+| `datuplet/data-generator` | `sha256:77acbc8f4bf7…` | `sha256:386c6d35bc63…` (`:v0.13.3`) |
+| `datuplet/pipeline-api` | `sha256:a37db676396e…` | `sha256:aa9d1278f769…` |
+| `datuplet/pipeline-operator` | `sha256:ce58f442d55a…` | `sha256:15bc18b61b73…` |
+| `datuplet/pipeline-observer` | `sha256:f7ef87cb68d7…` | `sha256:faed51e7ce0d…` |
+| `datuplet/app-worker` | `sha256:d5f5ffe2c2e5…` | `sha256:14288f4ae11c…` |
+
+**Environment incidents (not DuckDB):**
+
+- **Disk.** The first `make deploy-local` failed in the image build with `ResourceExhausted`. The host disk was 97% full (13 GiB free), which put the node under DiskPressure, and the kubelet garbage-collected the e2e images. The retry rebuilt everything once the pressure cleared.
+- **Observer.** The local stack's `pipeline-observer` could not reach OrbStack's API endpoint at `:26443`. `tests/local/values-local-app.yaml` lacks the `apiServerEgressPorts` entry that `tests/e2e/values-app.yaml` has, so `datuplet runs` showed the runs as stuck `Pending`. The controller patched the NetworkPolicy live (maintainer-approved), and run phases were read from the PipelineRun CRs.
+- **Stale credentials.** After a host sleep and node restart, the first NULL-probe attempt (run `745f2e19`) and the first count queries failed with `InvalidAccessKeyId` on vended S3 credentials. The pure-Go gateway failed in stage `extract` the same way, so the cause is not DuckDB. The errors cleared on their own within about two minutes with no restarts, and the probe was re-run unchanged.
