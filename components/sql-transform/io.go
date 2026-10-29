@@ -215,8 +215,11 @@ var nullTypeRe = regexp.MustCompile(`(?i)(?:"NULL"|\bNULL\b)(?:\[\]|\s*[,)]|$)`)
 // already-sanitized identifier) whose type is or contains the untyped NULL
 // type. DuckDB 2.0 keeps `SELECT NULL AS x` as type NULL (1.5 made it
 // INTEGER); Iceberg has no NULL type, so such a column cannot be written.
+// It describes a SELECT rather than the bare name: DuckDB rewrites a bare
+// `DESCRIBE tables|databases|schemas|variables` to SHOW, and the SELECT form
+// resolves the name through the same search path COPY uses.
 func nullTypedColumns(ctx context.Context, conn *sql.Conn, table string) ([]string, error) {
-	rows, err := conn.QueryContext(ctx, "DESCRIBE "+table)
+	rows, err := conn.QueryContext(ctx, "DESCRIBE SELECT * FROM "+table)
 	if err != nil {
 		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
 	}

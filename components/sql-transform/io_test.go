@@ -55,6 +55,10 @@ func TestNullTypedColumns(t *testing.T) {
 		{"struct field named NULL", "t9", "SELECT {'NULL': 1} AS s", nil},
 		{"struct with NULL field then typed field", "t10", "SELECT {'a': NULL, 'b': 1} AS s", []string{"s"}},
 		{"struct field named NULL with list type", "t11", "SELECT {'NULL': [1]} AS s", nil},
+		{"reserved name tables", "tables", "SELECT 1 AS id, NULL AS n", []string{"n"}},
+		{"reserved name databases, no NULL", "databases", "SELECT 1 AS d", nil},
+		{"reserved name schemas", "schemas", "SELECT NULL AS s, [NULL] AS l", []string{"s", "l"}},
+		{"reserved name variables", "variables", "SELECT NULL AS v", []string{"v"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -69,6 +73,28 @@ func TestNullTypedColumns(t *testing.T) {
 				t.Errorf("nullTypedColumns(%s) = %v, want %v", tc.table, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestNullTypedColumnsResolvesLikeCopy(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestConn(t)
+	for _, ddl := range []string{
+		"CREATE TEMP TABLE tmp_out AS SELECT NULL AS x, 1 AS y",
+		"CREATE VIEW v_out AS SELECT NULL AS z",
+	} {
+		if _, err := conn.ExecContext(ctx, ddl); err != nil {
+			t.Fatalf("ddl %q: %v", ddl, err)
+		}
+	}
+	for table, want := range map[string][]string{"tmp_out": {"x"}, "v_out": {"z"}} {
+		got, err := nullTypedColumns(ctx, conn, table)
+		if err != nil {
+			t.Fatalf("nullTypedColumns(%s): %v", table, err)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("nullTypedColumns(%s) = %v, want %v", table, got, want)
+		}
 	}
 }
 
