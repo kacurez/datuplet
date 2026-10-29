@@ -1,7 +1,7 @@
 # DuckDB 2.0 upgrade — design
 
 **Date:** 2026-10-28
-**Status:** rev 3 (after two Codex rounds — see "Revision notes" at the end)
+**Status:** rev 4 (after the spike and three Codex rounds — see "Revision notes" at the end)
 **Risk tier (REVIEW.md):** High — `.github/workflows/e2e.yml` is a CODEOWNERS
 path, and `components/queryengine` lockdown is a sandbox-posture path.
 Before merge: green PR CI, `/code-review max`, `/security-review` on the
@@ -181,36 +181,75 @@ locks configuration, so Quack is reachable only if the Go bindings
 **Inventory (pre-lock).** `TestStaticallyLinkedExtensions` opens a fresh
 engine with `openEngine` only (no `lock()`, because `duckdb_extensions()`
 is a documented post-lock deny) and reads
-`SELECT extension_name FROM duckdb_extensions() WHERE install_mode = 'STATICALLY_LINKED'`.
-It asserts `json`, `parquet`, `core_functions` (and `icu` if the spike
-shows it linked) are present and `quack`, `httpfs`, `iceberg`, `postgres`,
-`mysql` are absent, and logs the whole list so a bindings bump shows the
-diff. `install_mode` distinguishes linked-in extensions from ones merely
-installed on the developer's machine.
+`SELECT extension_name FROM duckdb_extensions() WHERE install_mode = 'STATICALLY_LINKED' ORDER BY 1`.
+It asserts the **exact** static set the spike measured on 2.0.0 —
+`autocomplete, core_functions, icu, json, parquet, tpcds, tpch` — so any
+growth or shrink on a later bindings bump fails loudly, and separately
+asserts `quack`, `httpfs`, `iceberg`, `postgres_scanner`, `mysql_scanner`
+absent from that set (the canonical row names; no row is called
+`postgres` or `mysql`, so those literals would pass vacuously). It logs
+the whole list. `install_mode` distinguishes linked-in extensions from
+ones merely installed on the developer's machine.
+
+`tpch` and `tpcds` are new in 2.0.0 (1.5.3 linked
+`autocomplete, core_functions, icu, json, parquet`) and their functions
+(`dbgen`, `dsdgen`, `tpch_queries()`, `tpcds_queries()`) are reachable
+post-lock. They are **accepted as present-by-design**: in-memory data
+generation with no file or network reach, bounded by `memory_limit`,
+`max_temp_directory_size` and the request timeout; a statically linked
+extension has no runtime off-switch, so denying it would need a custom
+`libduckdb` build (out of scope). The test comment and
+`docs/known-limitations.md` say so; the PR body flags it for the
+maintainer.
 
 **Deny rows (post-lock), with explicit layer predicates.** A new
-`TestLockdownDenyQuack` (own file, own `quackProbe{name, stmt, class}`
+`TestLockdownDenyQuack` (own file, own `quackProbe{name, stmt, class, subject}`
 table so the existing matrix stays untouched) requires every row to error
 **and** the error to satisfy its row's *deny class* — a predicate that
 names the layer, the same role `wantFSLayer` plays for the FS layer.
 Matching the protocol name alone is not a proof (a parser error quoting
-`quack_query`, or a credential error mentioning Quack, would pass). Three
-classes:
+`quack_query`, or a credential error mentioning Quack, would pass). Four
+classes; the "must match" phrases are the verbatim 2.0.0 texts the spike
+recorded (`## Quack probe (warmed engine)`):
 
-| Class | Must match (case-insensitive) | Must NOT match |
-|-------|-------------------------------|----------------|
-| `extensionUnavailable` | the extension name **and** an "extension not loaded / cannot be autoloaded / install and load" phrase (exact regex taken from the spike's recorded 2.0 text) | `connection refused`, `connect`, `timed out`, `unauthori[sz]ed`, `invalid token`, `parser error`, `syntax error` |
-| `secretTypeAbsent` | `quack` **and** an "unknown / unregistered secret type" phrase | same reject list |
-| `configLocked` | `lock` (lock_configuration refusal) | same reject list |
+| Class | Must match (case-insensitive) | Must NOT match (reject list, every class) |
+|-------|-------------------------------|-------------------------------------------|
+| `fsLayer` | `LocalFileSystem has been disabled` | `connection refused`, `could not connect`, `failed to connect`, `connection reset`, `timed out`, `unauthori[sz]ed`, `invalid token`, `parser error`, `syntax error` |
+| `extensionUnavailable` | the subject name **and** `but it exists in the <subject> extension` (DuckDB's not-loaded / autoload-off text) | same |
+| `secretTypeAbsent` | `secret type 'quack' does not exist` | same |
+| `configLocked` | `the configuration has been locked` | same |
+
+The reject list names transport, credential and parse failures by their
+specific phrases; a bare `connect` is deliberately absent, because a
+diagnostic may echo the offending `CONNECT` statement (2.0 appends a
+`LINE 1: …` context line to some errors) without any socket having been
+opened — the listener, not a word, is the network proof.
+
+Why `fsLayer` exists: for the four prefix-routed statements below, DuckDB
+maps the `quack:` / `postgres:` prefix to its extension and attempts an
+**explicit load of the extension file from the local extension directory,
+even with `autoload_known_extensions=false`**; on the locked engine that
+file read is what the disabled LocalFileSystem refuses, and the error
+does not name the extension. The deny is two-layered (not linked, and the
+load path is closed); the class names the layer that actually fires. A
+companion pre-lock subtest `layer-naming` runs the same four statements
+on an extension-posture-only engine (FS enabled, no `lock()`, no
+`disabled_filesystems`, `extension_directory` pointed at an empty temp
+dir so a developer's locally installed extensions cannot change the
+outcome, cwd moved to a temp dir) and pins the underlying text
+`Extension "quack" is an existing extension` /
+`Extension "postgres_scanner" is an existing extension`, so the layer
+behind the FS deny is named rather than inferred; it also asserts the
+cwd stayed file-free and the listener saw no connection.
 
 Rows:
 
 | Statement | Class |
 |-----------|-------|
-| `ATTACH 'quack:127.0.0.1:<port>' AS q (TOKEN 'x')` | extensionUnavailable (`quack`) |
-| `ATTACH 'quack:127.0.0.1:<port>' AS q (TYPE quack)` | extensionUnavailable (`quack`) |
-| `CONNECT 'quack:127.0.0.1:<port>'` | extensionUnavailable (`quack`) |
-| `CONNECT 'postgres:host=127.0.0.1 port=<port>'` | extensionUnavailable (`postgres`; remote pushdown needs the postgres extension) |
+| `ATTACH 'quack:127.0.0.1:<port>' AS q (TOKEN 'x')` | fsLayer (prefix-routed extension load refused; `layer-naming` pins `quack`) |
+| `ATTACH 'quack:127.0.0.1:<port>' AS q (TYPE quack)` | fsLayer (same) |
+| `CONNECT 'quack:127.0.0.1:<port>'` | fsLayer (same) |
+| `CONNECT 'postgres:host=127.0.0.1 port=<port>'` | fsLayer (same; `layer-naming` pins `postgres_scanner`) |
 | `FROM quack_query('quack:127.0.0.1:<port>', 'SELECT 1', token = 'x')` | extensionUnavailable (`quack`) |
 | `CREATE SECRET qs (TYPE quack, TOKEN 'x', SCOPE 'quack:127.0.0.1')` | secretTypeAbsent — secret creation itself stays permitted (lock-exempt manager); the proof is that the *type* is unregistered |
 | `SET s3_enable_deprecated_url_parameters = true` (warmed engine only; the setting exists only with httpfs loaded) | configLocked |
@@ -218,18 +257,27 @@ Rows:
 Every row runs on **both** the cold `lockedEngine` and the
 production-warmed `lockedEngineViaAttach` (httpfs loaded, secret manager
 initialised, as in production). Each statement runs under a 10 s context
-timeout. `<port>` is a loopback `net.Listener` on `127.0.0.1:0` owned by
-the subtest; an `Accept` goroutine counts and closes every connection;
-after the rows the test closes the listener, **waits for the goroutine**
-and asserts zero accepted connections. A negative-control subtest dials
-the listener itself and asserts the counter reads one, proving the
-detector works. The warmed subtest skips only when iceberg/httpfs cannot
-be installed, and `QE_REQUIRE_WARMED=1` turns that skip into a failure;
-the security gate (Task 3 Step 2, Task 8) runs with it set, so warmed
-coverage can never be lost silently. If the spike finds `quack`
-statically linked, the rows fail at the predicate or listener and the
-finding is escalated to the maintainer before any posture change (the
-only way the `lock()` list may grow).
+timeout. `<port>` is a loopback `*net.TCPListener` on `127.0.0.1:0` owned
+by the subtest. There is **no accept goroutine**: the proof is a
+**drain barrier**. After each statement returns, the test calls
+`drain(200 ms)` — `SetDeadline(now+200 ms)`, then `Accept` in a loop
+(count and close each connection) until the deadline error — and
+requires the count to be 0. A TCP handshake completes in the kernel
+without any `Accept` call, so a connection DuckDB opened during the
+statement is sitting in the accept queue when the statement returns and
+the drain accepts it; closing the listener first (the rev-3 design)
+could discard that backlog. A negative-control subtest dials the listener
+itself and then runs the same `drain`, asserting one accepted connection,
+proving the barrier sees queued connections. The warmed engine is
+mandatory at the gate: `lockedEngineViaAttach` itself (not a separate
+preflight) turns its iceberg/httpfs-unavailable `t.Skipf` into `t.Fatalf`
+when `QE_REQUIRE_WARMED=1`, and Task 8 runs the whole queryengine suite
+with it set and `-v`, asserting zero `--- SKIP` lines, so warmed coverage
+can never be lost silently. The spike found neither `quack` nor
+`postgres_scanner` linked; if a later bump links either, the inventory
+test and the rows fail together and the finding is escalated to the
+maintainer before any posture change (the only way the `lock()` list may
+grow).
 
 ### D6. Error-text assertions
 The PEG parser and the ICU rewrite may reword errors. Policy: assert on
@@ -319,7 +367,7 @@ The baker binary is still not in the final image (it lives in `verify`).
 | `quack` statically linked → new egress path from the sandbox | D5 inventory + listener-backed rows; escalate, never quietly patch `lock()`. |
 | Component modules untested in PR CI | Every task runs `go test -tags duckdb_arrow ./...` in the touched module; lockdown matrix run before push; e2e builds images in CI. |
 | Baked extension path changes (`…/v2.0.0/…`) | D12 executes the runtime INSTALL/LOAD offline at build time in both images. |
-| ICU now an extension; timezone functions in user SQL | Inventory asserts what is linked; if `icu` is not, the spike report says so and the sql-transform README notes `LOAD icu` is needed (it is not baked). |
+| ICU now an extension; timezone functions in user SQL | Spike: `icu` is statically linked and loaded on 2.0.0 (as on 1.5.3); the inventory pins it; the README says no `LOAD icu` is needed. |
 | Untyped NULL output columns | D3 probe on the cluster; maintainer decision if it fails hard. |
 | Homebrew CLI on laptops stays 1.4.x | Assertions need only `iceberg_scan` + `SELECT`; both versions read iceberg-go output. |
 
@@ -328,8 +376,8 @@ The baker binary is still not in the final image (it lives in `verify`).
 | Check | Where | Command |
 |-------|-------|---------|
 | Builds | each module | `CGO_ENABLED=1 go build -tags duckdb_arrow ./...` |
-| queryengine unit + lockdown | local | `go test -tags duckdb_arrow -count=1 ./...` in `components/queryengine` |
-| queryengine integration | local, Docker | `go test -tags 'duckdb_arrow integration' -count=1 -run TestAttachIntegration ./...` (also runs `runLockdownDenyIntegration`) |
+| queryengine unit + lockdown | local | `QE_REQUIRE_WARMED=1 CGO_ENABLED=1 go test -tags duckdb_arrow -count=1 -v ./...` in `components/queryengine`, zero `--- SKIP` lines (the gate form); without the variable on a laptop that cannot install iceberg/httpfs |
+| queryengine integration | local, Docker | `go test -tags 'duckdb_arrow integration' -count=1 -run TestAttachIntegration ./...` (also runs `runLockdownDenyIntegration`); the fixture's server and `mc` images are the chart's pinned `pgsty/silo` (MinIO's community images are gone; pre-existing break fixed in Task 2) |
 | Images + offline INSTALL | local Docker | `make build-component-sql-transform build-component-datuplet-query` and the query-worker build; the `verify` stage is the gate |
 | Tidy / lint | repo | `make tidy && git diff --exit-code`, `make lint` |
 | OpenFGA integration | local, Docker | `go test -tags=integration -count=1 ./pkg/pipelineapi/authz/...` (CLAUDE.md: not in CI) |
@@ -339,7 +387,7 @@ The baker binary is still not in the final image (it lives in `verify`).
 ## Left to the builder
 
 - The exact `wantMarker` words, taken from the spike's recorded error text
-  (expected: `quack`, `postgres`, `lock`).
+  (2.0.0 texts: `LocalFileSystem has been disabled`, `but it exists in the quack extension`, `secret type 'quack' does not exist`, `the configuration has been locked`).
 - The hyphenated namespace fixture's name and table in `integration_test.go`
   (must sort before `qe`).
 - Any assertion update in `engine_test.go` (the "status result set for
@@ -378,3 +426,22 @@ the kept-stack run uses the `datuplet` CLI (the Make retry target is
 pre-existing broken); D12's marker lives in `/tmp`; the NULL probe writes
 its own `etl.null_probe` table; `main.go` header items 1 and 2 and the
 README empty-input paragraph now state the placeholder-view semantics.
+
+rev 4 (2026-10-29, after the spike — commit 324d979 — and Codex review of
+rev 3: 4 Important / 1 Nit): the four prefix-routed Quack rows deny at the
+FS layer on 2.0 (prefix-routed explicit extension-file load refused by
+`disabled_filesystems`), so D5 gains a `fsLayer` class and a pre-lock
+`layer-naming` subtest that pins the extension name; the listener is a
+deadline **drain barrier** run after every statement (the rev-3
+close-then-wait could discard the kernel accept backlog); the reject list
+drops bare `connect`; `lockedEngineViaAttach` itself enforces
+`QE_REQUIRE_WARMED=1` and the gate asserts zero `--- SKIP` lines; the
+inventory pins the exact 2.0.0 static set (`tpch`/`tpcds` newly linked,
+accepted as present-by-design) under the canonical `postgres_scanner` /
+`mysql_scanner` names; `icu` is linked, so no `LOAD icu` note; the
+integration fixture's dead MinIO images are swapped for the chart's
+`pgsty/silo` pin; cluster queries use `datuplet query --sql`; the README
+`UNION ALL` example is withdrawn (it cannot supply columns the first
+branch fails to bind). REVIEW.md's three-round cap applies: no fourth
+doc round; the harness is judged as code in Task 3's review, and the
+"is the approach wrong?" question is put to the maintainer in the PR.

@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Revision 4** — after the spike (Task 1, commit `324d979`) and Codex round 3 (4 Important, 1 Nit): the four prefix-routed Quack rows deny at the FS layer on 2.0 and get a `fsLayer` class plus a pre-lock `layer-naming` subtest; the listener is a deadline **drain barrier** (no goroutine) run after every statement; `lockedEngineViaAttach` itself enforces `QE_REQUIRE_WARMED=1`; the reject list drops bare `connect`; the inventory pins the exact 2.0.0 static set (`tpch`/`tpcds` accepted as present-by-design) and the canonical `postgres_scanner`/`mysql_scanner` names; Task 2 swaps the integration fixture's dead MinIO images for the chart's `pgsty/silo` pin; `icu` is linked, so the README `LOAD icu` note is dropped; Task 7 uses `datuplet query --sql`; the README `UNION ALL` example is removed; Task 8 asserts zero SKIPs. REVIEW.md's three-round cap: no fourth doc round — the harness is judged as code in Task 3's review and the approach question goes to the maintainer in the PR.
+
 **Revision 3** — rev 1 was reviewed by Codex (7 Important, 3 Nit): the spike commits only its report and the bump lands green in Task 2; the extension inventory runs pre-lock; a Docker `verify` stage executes the offline `INSTALL/LOAD` inside the image build (Task 4); the cluster task keeps a stack alive for the probes; the final gate adds the OpenFGA integration test; `DEFAULT_SCHEMA` is dropped; docs wording comes from `io.go` and documents the existing resource knobs. Rev 2 was reviewed again (5 Important, 1 Nit): the Quack rows now assert a deny-class predicate with a reject list, the listener is drained and a negative control proves it, `QE_REQUIRE_WARMED=1` makes the warmed run mandatory at the gate; the integration fixture replaces the bare `posts` assertion with bare `probe` and seeds one row; the kept-stack run uses the `datuplet` CLI (not the broken `make k8s-retry-duckdb`); the NULL probe writes its own `etl.null_probe` table; `main.go` header items 1 and 2 are both corrected and the README states the empty-input placeholder semantics.
 
 **Goal:** Move `components/sql-transform`, `components/queryengine` and `utils/docker/install-duckdb-ext` from DuckDB 1.5.3 to DuckDB 2.0.0 LTS, keep the query-worker lockdown provably closed against 2.0's Quack surface, make the image build prove offline extension loading, pin the e2e CLI to 2.0.0, and document the SQL dialect changes users will see.
@@ -10,7 +12,7 @@
 
 **Tech Stack:** Go 1.25.7 (CGO, `-tags duckdb_arrow`), `github.com/duckdb/duckdb-go/v2 v2.20000.0`, Docker BuildKit (`RUN --network=none`, host-network integration tests), OrbStack k8s for e2e, Codex (via `codex-companion.mjs`) as the reviewer.
 
-**Spec:** `docs/superpowers/specs/2026-10-28-duckdb-2-upgrade-design.md` (rev 3) — the plan argues from it; executors read both.
+**Spec:** `docs/superpowers/specs/2026-10-28-duckdb-2-upgrade-design.md` (rev 4) — the plan argues from it; executors read both.
 
 ## Execution model
 
@@ -45,7 +47,7 @@ node "$HOME/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-compani
 - Never a bare `go mod tidy`; always `make tidy` from the repo root, then `git diff --exit-code` on every `go.mod`/`go.sum` outside the three modules (they must not move).
 - Every build/test in a component module runs with `CGO_ENABLED=1 go <build|test> -tags duckdb_arrow` from that module's directory; PR CI does not run these, so they run here.
 - **Every commit is green**: `go build` + the touched module's test suite pass before `git commit` (CLAUDE.md). No "fix it in the next task".
-- Deny rows are never weakened, and a new deny row always names its layer (`wantFSLayer` or a non-empty `marker`). A row that stops erroring on 2.0, or a Quack row whose listener receives a connection, is escalated to the maintainer, not patched.
+- Deny rows are never weakened, and a new deny row always names its layer (`wantFSLayer` or a `denyClass`). A row that stops erroring on 2.0, or a Quack row whose listener receives a connection, is escalated to the maintainer, not patched.
 - `duckdb_extensions()` is never queried on a locked engine (documented deny at `lockdown_deny_test.go:350`); the inventory runs on an `openEngine`-only engine.
 - The catalog JWT lives only inside `CREATE SECRET`; it never appears in the ATTACH statement text or in any error wrap.
 - No compatibility shims: no `SET lambda_syntax`, `regex_match_operator_semantics`, `error_on_division_by_zero`, `legacy_parser`, `enable_legacy_parser` anywhere. No new async-I/O settings (`async_threads`, `read_ahead_depth`, `http_client_pool_capacity`).
@@ -58,7 +60,7 @@ node "$HOME/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-compani
 Inputs the spec implies but no existing test exercises; each is pinned to
 the task that owns the code.
 
-1. **Any Quack entry point on a locked engine opens no socket** — the loopback listener in Task 3 must receive zero connections across all rows, on both the cold and the warmed engine.
+1. **Any Quack entry point on a locked engine opens no socket** — the loopback listener's drain barrier in Task 3 must count zero connections after every row, on both the cold and the warmed engine.
 2. **A hyphenated namespace that sorts first** must resolve bare and two-part names after ATTACH (the `USE lk."<schema>"` quoting path). → Task 2 integration fixture.
 3. **`INSTALL/LOAD iceberg, httpfs` inside the final image with no network** must succeed under the runtime user and HOME. → Task 4 `verify` stage; a mis-baked image fails the build.
 4. **An untyped `NULL` output column in sql-transform** (`SELECT NULL AS x`) now has type `NULL`; the Data Gateway must commit it or fail as FailedUser, never FailedApplication. → Task 7 probe; a hard failure is a maintainer decision recorded in the report, not patched.
@@ -139,7 +141,7 @@ git commit -m "docs: DuckDB 2.0 spike report (build, test deltas, extension inve
 - Modify: `components/queryengine/engine_test.go:60-66` only if the report lists a result-shape change
 - Modify: `components/queryengine/lockdown_deny_test.go` only for rows the report classifies *error-text reword* (marker-based matching, spec D6)
 - Modify: `components/queryengine/lockdown_deny_integration_test.go:43` comment if `iceberg_schema_properties` changed
-- Modify: `components/queryengine/integration_test.go` (namespace fixture near line 65)
+- Modify: `components/queryengine/integration_test.go` (namespace fixture near line 65; fixture images at lines 237 and 355)
 
 **Interfaces:**
 - Consumes: spike report `## Findings for Task 2`, `## ATTACH URI`.
@@ -167,6 +169,10 @@ In `integration_test.go` add constants `probeNamespace = "a-hyphen"`, `probeTabl
 - the post-lock positive control on `lk."qe"."posts"` = 7 — unchanged.
 Grep the rest of the test (the `Run`-entrypoint section after the lock) for any other **bare** `posts` reference and qualify it as `"qe".posts`. Keep `runLockdownDenyIntegration` wiring untouched.
 
+- [ ] **Step 4a: Fixture images (pre-existing break, spike `## ATTACH URI`)**
+
+MinIO deleted its community images, so `TestAttachIntegration` cannot pull `minio/minio:RELEASE.2024-12-18T13-15-44Z` (line 237) or `minio/mc` (line 355) on any branch. Replace both with the chart's pinned drop-in, copied verbatim from `charts/datuplet-infra/values.yaml:99-103`: `docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z@sha256:7bb2aff6b89efe1cb1303c10fc21d579447434ed06649ac9ec05a5e2dbf30ad7` (same `server /data --address :<port>` command; `mc` is bundled, so the `makeBucket` `--entrypoint sh` + `mc alias set …` script is unchanged). Update the `makeBucket` doc comment ("one-shot minio/mc container" → "one-shot silo container, which bundles mc"). Do not alias images with `docker tag`; the pin must work on a clean machine.
+
 - [ ] **Step 5: Run everything, then commit**
 
 Run: `cd components/queryengine && CGO_ENABLED=1 go test -tags duckdb_arrow -count=1 ./...`
@@ -190,12 +196,12 @@ git commit -m "chore(deps): DuckDB 2.0.0 LTS (duckdb-go v2.20000.0); queryengine
 **Files:**
 - Create: `components/queryengine/lockdown_quack_test.go`
 - Create: `components/queryengine/lockdown_static_ext_test.go`
-- Modify: `components/queryengine/lockdown_deny_test.go:16-17` (posture baseline comment → "DuckDB 2.0.0 (duckdb-go/v2 v2.20000.0)")
+- Modify: `components/queryengine/lockdown_deny_test.go:16-17` (posture baseline comment → "DuckDB 2.0.0 (duckdb-go/v2 v2.20000.0)") and `:99-101` (`lockedEngineViaAttach`: `t.Skipf` → `t.Fatalf` when `QE_REQUIRE_WARMED=1`)
 - Modify (**only** on the maintainer's go after an escalation): `components/queryengine/engine_open.go` `lock()`
 
 **Interfaces:**
 - Consumes: spike report `## Findings for Task 3`, `## Statically linked extensions`, `## Quack probe (warmed engine)`; helpers `lockedEngine(t) (*engine, string)` and `lockedEngineViaAttach(t) (*engine, string)` from `lockdown_deny_test.go`.
-- Produces: `TestLockdownDenyQuack`, `TestStaticallyLinkedExtensions`.
+- Produces: `TestLockdownDenyQuack`, `TestStaticallyLinkedExtensions`; `lockedEngineViaAttach` honours `QE_REQUIRE_WARMED`.
 
 - [ ] **Step 1: Write `lockdown_quack_test.go` (failing first if any row passes)**
 
@@ -208,32 +214,39 @@ git commit -m "chore(deps): DuckDB 2.0.0 LTS (duckdb-go v2.20000.0); queryengine
 type denyClass int
 
 const (
-	classExtensionUnavailable denyClass = iota // extension not loaded and cannot be autoloaded/installed
+	classFSLayer              denyClass = iota // prefix-routed extension-file load refused by disabled_filesystems
+	classExtensionUnavailable                  // extension not loaded and cannot be autoloaded/installed
 	classSecretTypeAbsent                      // CREATE SECRET with an unregistered TYPE
 	classConfigLocked                          // lock_configuration refused a SET
 )
 
 // rejectRe: an error matching any of these is a transport/credential/parse
-// failure, never a posture deny, whatever else it says.
-var rejectRe = regexp.MustCompile(`(?i)(connection refused|connect|timed out|unauthori[sz]ed|invalid token|parser error|syntax error)`)
+// failure, never a posture deny, whatever else it says. No bare "connect":
+// a diagnostic may echo the CONNECT statement without opening a socket; the
+// listener is the network proof.
+var rejectRe = regexp.MustCompile(`(?i)(connection refused|could not connect|failed to connect|connection reset|timed out|unauthori[sz]ed|invalid token|parser error|syntax error)`)
 
-// classRe: exact phrases copied from the spike report's recorded 2.0 text
-// (## Quack probe). Each must name the layer, e.g. "not loaded"/"autoload"/
-// "install and load", "unknown secret type", "configuration has been locked".
-var classRe = map[denyClass]*regexp.Regexp{ /* filled from the spike report */ }
+// classRe: verbatim phrases from the spike report (## Quack probe). The
+// subject (quack) is checked separately where set.
+var classRe = map[denyClass]*regexp.Regexp{
+	classFSLayer:              regexp.MustCompile(`(?i)LocalFileSystem has been disabled`),
+	classExtensionUnavailable: regexp.MustCompile(`(?i)but it exists in the \w+ extension`),
+	classSecretTypeAbsent:     regexp.MustCompile(`(?i)secret type 'quack' does not exist`),
+	classConfigLocked:         regexp.MustCompile(`(?i)the configuration has been locked`),
+}
 
 type quackProbe struct {
 	name, stmt string
 	class      denyClass
-	subject    string // extension or type name the error must also name: "quack" or "postgres"
+	subject    string // extension/type name the error must ALSO contain ("" = none; fsLayer text never names it)
 	warmOnly   bool   // only on lockedEngineViaAttach (setting exists only with httpfs loaded)
 }
 
 var quackProbes = []quackProbe{
-	{"attach-token", "ATTACH 'quack:127.0.0.1:<port>' AS q (TOKEN 'x')", classExtensionUnavailable, "quack", false},
-	{"attach-type-quack", "ATTACH 'quack:127.0.0.1:<port>' AS q (TYPE quack)", classExtensionUnavailable, "quack", false},
-	{"connect-quack", "CONNECT 'quack:127.0.0.1:<port>'", classExtensionUnavailable, "quack", false},
-	{"connect-postgres", "CONNECT 'postgres:host=127.0.0.1 port=<port>'", classExtensionUnavailable, "postgres", false},
+	{"attach-token", "ATTACH 'quack:127.0.0.1:<port>' AS q (TOKEN 'x')", classFSLayer, "", false},
+	{"attach-type-quack", "ATTACH 'quack:127.0.0.1:<port>' AS q (TYPE quack)", classFSLayer, "", false},
+	{"connect-quack", "CONNECT 'quack:127.0.0.1:<port>'", classFSLayer, "", false},
+	{"connect-postgres", "CONNECT 'postgres:host=127.0.0.1 port=<port>'", classFSLayer, "", false},
 	{"quack-query", "SELECT * FROM quack_query('quack:127.0.0.1:<port>', 'SELECT 1', token = 'x')", classExtensionUnavailable, "quack", false},
 	{"secret-type-quack", "CREATE SECRET qs (TYPE quack, TOKEN 'x', SCOPE 'quack:127.0.0.1')", classSecretTypeAbsent, "quack", false},
 	{"set-s3-deprecated-url-params", "SET s3_enable_deprecated_url_parameters = true", classConfigLocked, "", true},
@@ -243,33 +256,47 @@ var quackProbes = []quackProbe{
 // !rejectRe.Match, classRe[class].Match, and (subject == "" || contains subject).
 func denied(err error, p quackProbe) (ok bool, why string)
 
-// quackListener owns one loopback listener per subtest: Accept goroutine
-// counts and closes every connection; Close() closes the listener and
-// WAITS for the goroutine (sync.WaitGroup) before Count() is read.
-type quackListener struct{ /* ln net.Listener; accepted atomic.Int32; wg sync.WaitGroup */ }
+// quackListener owns one loopback *net.TCPListener per subtest. No accept
+// goroutine: drain is the barrier. A completed TCP handshake waits in the
+// kernel accept queue until Accept is called, so draining AFTER the statement
+// returned sees every connection the statement opened; closing first could
+// discard the backlog.
+type quackListener struct{ ln *net.TCPListener }
 
+// newQuackListener: net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}); t.Cleanup(ln.Close).
 func newQuackListener(t *testing.T) *quackListener
 func (l *quackListener) Port() string
-func (l *quackListener) Close() (accepted int32)
+// drain: SetDeadline(now+d), then Accept in a loop (close each conn, count)
+// until the deadline error; returns the count.
+func (l *quackListener) drain(d time.Duration) int
 
-// TestLockdownDenyQuack has three subtests:
-//   "listener-detects-connection": net.Dial the listener, Close → accepted == 1 (negative control).
-//   "cold":   e, _ := lockedEngine(t); run every non-warmOnly probe.
-//   "warmed": pre-flight INSTALL/LOAD iceberg+httpfs on a throwaway openEngine;
-//             on failure t.Fatalf if os.Getenv("QE_REQUIRE_WARMED") == "1", else t.Skipf;
-//             then e, _ := lockedEngineViaAttach(t); run every probe.
+// layerNamingEngine: openEngine + the extension posture only
+// (autoinstall_known_extensions=false, autoload_known_extensions=false,
+// allow_community_extensions=false), NO disabled_filesystems, NO lock();
+// SET extension_directory = t.TempDir() (empty, so a developer's locally
+// installed quack cannot change the outcome); t.Chdir(t.TempDir()) so a stray
+// local DB file would be visible.
+func layerNamingEngine(t *testing.T) *engine
+
+// TestLockdownDenyQuack subtests:
+//   "listener-detects-connection": net.Dial the listener, then drain(200ms) == 1 (negative control, same barrier).
+//   "layer-naming": layerNamingEngine; the four classFSLayer statements must error and the text must
+//        contain `Extension "quack" is an existing extension` (rows 1-3) /
+//        `Extension "postgres_scanner" is an existing extension` (row 4); cwd stays empty; drain == 0.
+//   "cold":   e, _ := lockedEngine(t); every non-warmOnly probe.
+//   "warmed": e, _ := lockedEngineViaAttach(t); every probe (the helper Fatalfs under QE_REQUIRE_WARMED=1).
 // Each probe: ctx, cancel := context.WithTimeout(ctx, 10*time.Second);
 // _, err := e.conn.ExecContext(ctx, strings.ReplaceAll(p.stmt, "<port>", l.Port()));
-// cancel(); require denied(err, p). After the rows: require l.Close() == 0.
+// cancel(); require denied(err, p); require l.drain(200*time.Millisecond) == 0.
 func TestLockdownDenyQuack(t *testing.T)
 ```
 
-Fill `classRe` from the spike report's verbatim text so each regex names the layer phrase 2.0 actually emits; keep `rejectRe` as written. If the spike shows a statement failing in a transport or credential class, that is an escalation (the statement reached the network), not a regex to loosen.
+The regexes above are the spike's recorded 2.0.0 texts; keep `rejectRe` as written. If a row's error matches `rejectRe`, or `drain` returns non-zero, that is an escalation (the statement reached the network or failed for the wrong reason), not a regex to loosen. In `lockdown_deny_test.go:99-101` change `lockedEngineViaAttach` so the INSTALL/LOAD failure is `t.Fatalf` when `os.Getenv("QE_REQUIRE_WARMED") == "1"` and `t.Skipf` otherwise (same message); no separate preflight.
 
 - [ ] **Step 2: Run it (warmed coverage mandatory)**
 
 Run: `cd components/queryengine && set -o pipefail && QE_REQUIRE_WARMED=1 CGO_ENABLED=1 go test -tags duckdb_arrow -count=1 -run 'TestLockdownDenyQuack' -v ./... 2>&1 | grep -E '^\s*--- (PASS|FAIL|SKIP)'`
-Expected: `listener-detects-connection`, every `cold/*` and every `warmed/*` line is `--- PASS`; no `SKIP`. A row that **succeeds**, a row whose error is rejected as transport/credential, or a listener count above zero: stop, write the report with the exact output; the orchestrator escalates. Do not touch `lock()`.
+Expected: `listener-detects-connection`, every `layer-naming/*`, `cold/*` and `warmed/*` line is `--- PASS`; no `SKIP`. A row that **succeeds**, a row whose error is rejected as transport/credential, or a listener count above zero: stop, write the report with the exact output; the orchestrator escalates. Do not touch `lock()`.
 
 - [ ] **Step 3: Write `lockdown_static_ext_test.go`**
 
@@ -281,9 +308,15 @@ Expected: `listener-detects-connection`, every `cold/*` and every `warmed/*` lin
 func TestStaticallyLinkedExtensions(t *testing.T) {
 	// e, _ := openEngine(ctx, Request{TempDir: t.TempDir()}); defer e.Close()
 	// rows := SELECT extension_name FROM duckdb_extensions() WHERE install_mode = 'STATICALLY_LINKED' ORDER BY 1
-	mustHave := []string{"core_functions", "json", "parquet"}   // add "icu" if the spike report shows it linked
-	mustNotHave := []string{"quack", "httpfs", "iceberg", "postgres", "mysql"}
-	// assert each mustHave present, each mustNotHave absent; t.Logf the full list
+	// Exact set the spike measured on 2.0.0 (1.5.3 lacked tpcds/tpch). tpch/tpcds are
+	// accepted as present-by-design: in-memory generation, no FS/network reach, bounded by
+	// memory_limit / max_temp_directory_size / the request timeout (spec D5). Any growth or
+	// shrink fails here so a bindings bump reconciles it on purpose.
+	wantStatic := []string{"autocomplete", "core_functions", "icu", "json", "parquet", "tpcds", "tpch"}
+	// Canonical duckdb_extensions() names: there is no row called "postgres" or "mysql".
+	mustNotHave := []string{"quack", "httpfs", "iceberg", "postgres_scanner", "mysql_scanner"}
+	// assert rows == wantStatic (exact, order-insensitive) and no mustNotHave name among them;
+	// t.Logf the full list
 }
 ```
 
@@ -460,7 +493,7 @@ column keeps type `NULL`; `X'…'`/`B'…'` literals are BLOB/BITSTRING;
 `MERGE INTO` raises on a doubly matched target row.
 ```
 
-Append `Time-zone functions need \`LOAD icu\` first; the extension is not baked into the component image.` only if the spike report says `icu` is **not** statically linked.
+The spike report shows `icu` statically linked and loaded on 2.0.0 (as on 1.5.3): append `ICU collations and time-zone functions work without \`LOAD icu\`; the extension is statically linked into the engine.` Do not add a `LOAD icu` note.
 
 Replace the "Inputs → DuckDB views" paragraph and its 3-item list (lines 41-45) with:
 
@@ -475,7 +508,7 @@ Replace the "Inputs → DuckDB views" paragraph and its 3-item list (lines 41-45
 Replace the "Empty-input semantics" paragraph (line 161) with:
 
 ```markdown
-When a declared input has no data files for the current run (first incremental window, upstream extractor produced nothing), the gateway closes the stream with no chunks and the component registers a zero-row placeholder view (`CREATE VIEW <view_name> AS SELECT * FROM (SELECT 1) WHERE 1=0`). The placeholder does **not** carry the input's columns: `SELECT count(*) FROM <view_name>` works and yields 0, but SQL that names a column of the empty input fails at bind time with a column-not-found error — the same outcome as referencing a missing column on a real table. If a pipeline can legitimately see an empty input, write SQL that tolerates it (for example `UNION ALL` with a typed empty `SELECT`).
+When a declared input has no data files for the current run (first incremental window, upstream extractor produced nothing), the gateway closes the stream with no chunks and the component registers a zero-row placeholder view (`CREATE VIEW <view_name> AS SELECT * FROM (SELECT 1) WHERE 1=0`). The placeholder does **not** carry the input's columns: `SELECT count(*) FROM <view_name>` works and yields 0, but SQL that names a column of the empty input fails at bind time with a column-not-found error — the same outcome as referencing a missing column on a real table. If a pipeline can legitimately see an empty input, make the producing stage always emit its schema; a `UNION ALL` with a typed empty `SELECT` does not help, because the first branch still fails to bind the missing column.
 ```
 
 Replace "Architecture" item 1 (line 167) with:
@@ -489,6 +522,7 @@ Replace "Architecture" item 1 (line 167) with:
 - `components/sql-transform/main.go` header items 1 **and** 2 (lines 6-13; item 1 still says Arrow IPC / `FORMAT_ARROW_IPC`) → `1. Opens each declared input via the DataGateway SDK with FORMAT_PARQUET and takes the gateway's HTTP read endpoint from the reply (gRPC's 64 MiB message cap rules it out for large source files).` and `2. GETs the stream chunk by chunk, streaming each response body to its own parquet file on local ephemeral disk (one HTTP read buffer resident), and exposes the chunk set to user SQL as a DuckDB view over read_parquet(...); an input with no data files gets a zero-row placeholder view. The disk-stage replaces an earlier in-memory CREATE TABLE AS SELECT * FROM <arrow_view> that OOM'd on multi-GB inputs and needed a multi-scan workaround for duckdb/duckdb#19040.` (keep the comment's line wrapping style).
 - `docs/ad-hoc-query.md`, end of "## Server query service": `The engine is DuckDB 2.0.0; see the CHANGELOG entry for the dialect changes versus 1.5.`
 - `docs/known-limitations.md`, "## Ad-hoc SQL query": `**Async read-ahead shares `memory_limit`.** DuckDB 2.0 keeps multiple object-storage reads in flight; the read-ahead budget is bounded by the same `memory_limit` the worker sets, so a wide scan can spill earlier than on 1.5. No separate knob is exposed.`
+- `docs/known-limitations.md`, same section, next line: `**Statically linked `tpch`/`tpcds` are reachable post-lock.** DuckDB 2.0.0 links the benchmark generators into the engine (`dbgen`, `dsdgen`, `tpch_queries()`, `tpcds_queries()`). They generate data in memory only, with no file or network reach, bounded by `memory_limit`, `max_temp_directory_size` and the request timeout; a statically linked extension has no runtime off-switch. `TestStaticallyLinkedExtensions` pins the exact linked set.`
 - `docs/dependency-upgrades.md`, "## Go modules …": `- DuckDB (duckdb-go/v2): since 2.0 the static libraries resolve from the `go.duckdb.org/libduckdb/*` module path; a GOPROXY allowlist must include it. Bump `components/sql-transform`, `components/queryengine` and `utils/docker/install-duckdb-ext` together, run the queryengine suite locally (`-tags duckdb_arrow`; PR CI does not), and let the images' `verify` stage prove the baked extensions still load offline.`
 - `CLAUDE.md` sql-transform bullet: replace "Inputs stream from Data Gateway via Arrow IPC and are materialized into a DuckDB table before user SQL runs (workaround for duckdb-go's GROUP BY / JOIN / UNION ALL bug against registered Arrow streams)." with "Inputs arrive from Data Gateway as parquet chunks over its HTTP read endpoint, are streamed to local temp files and exposed to user SQL as `read_parquet` views (bounded RAM; a one-shot stream cannot be scanned twice)."
 
@@ -532,11 +566,11 @@ make deploy-local
 datuplet pipeline put -f examples/pipelines/etl-duckdb.yaml
 datuplet trigger duckdb-transform
 ```
-then `datuplet runs` (or the run-wait form the `datuplet-operator` skill shows) until the run is terminal. Expected: Succeeded, and `datuplet query 'SELECT count(*) FROM etl.user_summary'` returns 10. This is sql-transform on 2.0 outside the e2e harness. `make k8s-retry-duckdb` is **not** used: it `kubectl apply`s the envelope-free PipelineDoc and fails (pre-existing; note it as Pre-existing in the report, do not fix).
+then `datuplet runs` (or the run-wait form the `datuplet-operator` skill shows) until the run is terminal. Expected: Succeeded, and `datuplet query --sql 'SELECT count(*) FROM etl.user_summary'` returns 10. This is sql-transform on 2.0 outside the e2e harness. `make k8s-retry-duckdb` is **not** used: it `kubectl apply`s the envelope-free PipelineDoc and fails (pre-existing; note it as Pre-existing in the report, do not fix).
 
 - [ ] **Step 3: Untyped NULL probe (Review Focus 4) — its own output table**
 
-Write `/tmp/etl-duckdb-null.yaml` from `examples/pipelines/etl-duckdb.yaml` with: `name: duckdb-null-probe`; stage 2 output `- name: null_probe`, `bucket: "etl"`, `writeMode: FULL_LOAD` (replacing `user_summary`); SQL `CREATE TABLE null_probe AS SELECT "userId", COUNT(*) AS post_count, NULL AS probe_null FROM data GROUP BY "userId" ORDER BY "userId";`. A distinct table is required: the gateway reuses an existing table's schema (`pkg/datagateway/lakekeeper/lakekeeper.go:150`), so writing into `user_summary` would never exercise schema creation from a NULL-typed column. Then `datuplet pipeline put -f /tmp/etl-duckdb-null.yaml` + `datuplet trigger duckdb-null-probe` + wait. Record under `## Cluster verification`: Succeeded with `datuplet query 'DESCRIBE etl.null_probe'` (the `probe_null` type), or the failure class and message. Do **not** patch the component; a FailedApplication is a maintainer decision.
+Write `/tmp/etl-duckdb-null.yaml` from `examples/pipelines/etl-duckdb.yaml` with: `name: duckdb-null-probe`; stage 2 output `- name: null_probe`, `bucket: "etl"`, `writeMode: FULL_LOAD` (replacing `user_summary`); SQL `CREATE TABLE null_probe AS SELECT "userId", COUNT(*) AS post_count, NULL AS probe_null FROM data GROUP BY "userId" ORDER BY "userId";`. A distinct table is required: the gateway reuses an existing table's schema (`pkg/datagateway/lakekeeper/lakekeeper.go:150`), so writing into `user_summary` would never exercise schema creation from a NULL-typed column. Then `datuplet pipeline put -f /tmp/etl-duckdb-null.yaml` + `datuplet trigger duckdb-null-probe` + wait. Record under `## Cluster verification`: Succeeded with `datuplet query --sql 'DESCRIBE etl.null_probe'` (the `probe_null` type), or the failure class and message. Do **not** patch the component; a FailedApplication is a maintainer decision.
 
 - [ ] **Step 4: RSS baseline (spec D9)**
 
@@ -558,7 +592,7 @@ git commit -m "docs: DuckDB 2.0 cluster verification results"
 
 Run: `make lint && make tidy && git diff --exit-code` → clean.
 Run: `go test -tags=integration -count=1 ./pkg/pipelineapi/authz/...` → PASS (Docker).
-Run: `cd components/queryengine && QE_REQUIRE_WARMED=1 CGO_ENABLED=1 go test -tags duckdb_arrow -count=1 ./...` → PASS with no SKIP in `TestLockdownDenyQuack`.
+Run: `cd components/queryengine && set -o pipefail && QE_REQUIRE_WARMED=1 CGO_ENABLED=1 go test -tags duckdb_arrow -count=1 -v ./... 2>&1 | tee /tmp/qe-gate.txt | tail -5` → `ok` for all three packages; then `grep -c -- '--- SKIP' /tmp/qe-gate.txt` → `0` (the spike measured 0 SKIP on a warm laptop; any SKIP is a lost row).
 
 - [ ] **Step 2: Local reviews per REVIEW.md High tier**
 
