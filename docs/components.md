@@ -337,10 +337,11 @@ peak RSS.
 
 ## sql-transform
 
-Runs user-supplied SQL inside an embedded DuckDB engine. Inputs stream from the
-Data Gateway via Arrow IPC and are materialized into DuckDB tables before the SQL
-runs. Outputs are written back through the Data Gateway; no S3 credentials touch
-the component.
+Runs user-supplied SQL inside an embedded DuckDB engine. Inputs arrive from the
+Data Gateway as parquet chunks over its HTTP read endpoint, are staged on the
+component's ephemeral disk and exposed to the SQL as `read_parquet` views.
+Outputs are written back through the Data Gateway; no S3 credentials touch the
+component.
 
 **Image:** `ghcr.io/kacurez/sql-transform:v0.12.1` · **Registry name:**
 `sql-transform` · **IO:** `{inputs: required, outputs: required}`
