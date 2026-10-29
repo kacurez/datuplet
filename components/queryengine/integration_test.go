@@ -62,9 +62,9 @@ const (
 	// PG_ENCRYPTION_KEY is mandatory for lakekeeper; any non-empty value works
 	// for a throwaway fixture.
 	lkEncryptionKey = "qe-it-throwaway-encryption-key"
-	seedNamespace = "qe"
-	seedTable     = "posts"
-	seedRowCount  = 7
+	seedNamespace   = "qe"
+	seedTable       = "posts"
+	seedRowCount    = 7
 
 	// probeNamespace is a hyphenated namespace that sorts BEFORE seedNamespace,
 	// so attachCatalog's `USE lk."<first namespace>"` selects it and bare

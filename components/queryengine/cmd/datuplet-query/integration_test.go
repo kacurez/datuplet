@@ -60,6 +60,12 @@ const (
 	// returns this so realMain's queryengine.Run attaches with a well-formed
 	// token (attachCatalog's shape guard rejects malformed ones).
 	dummyCatalogJWT = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJxZSJ9.c2ln"
+	// siloImage is the S3 server + mc image for the fixture: the pinned
+	// drop-in from charts/datuplet-infra/values.yaml (MinIO's community
+	// images no longer pull). It serves `server /data --address :<port>` and
+	// bundles mc, so one image covers both the server and makeBucket. Keep the
+	// value identical to siloImage in components/queryengine/integration_test.go.
+	siloImage = "docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z@sha256:7bb2aff6b89efe1cb1303c10fc21d579447434ed06649ac9ec05a5e2dbf30ad7"
 )
 
 func TestDatupletQueryIntegration(t *testing.T) {
@@ -225,7 +231,7 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 
 	runDetachedEnv(t, "dq-it-minio",
 		[]string{"MINIO_ROOT_USER=" + minioRootUser, "MINIO_ROOT_PASSWORD=" + minioRootPassword},
-		"minio/minio:RELEASE.2024-12-18T13-15-44Z",
+		siloImage,
 		"server", "/data", "--address", fmt.Sprintf(":%d", f.minioPort))
 	waitHTTP(ctx, t, fmt.Sprintf("%s/minio/health/live", f.minioEndpoint()))
 	makeBucket(ctx, t, f)
@@ -311,6 +317,8 @@ func waitPostgres(ctx context.Context, t *testing.T, port int) {
 	t.Fatalf("timed out waiting for postgres on :%d", port)
 }
 
+// makeBucket creates the warehouse bucket via a one-shot silo container, which
+// bundles mc.
 func makeBucket(ctx context.Context, t *testing.T, f *fixture) {
 	t.Helper()
 	script := fmt.Sprintf(
@@ -318,7 +326,7 @@ func makeBucket(ctx context.Context, t *testing.T, f *fixture) {
 		f.minioEndpoint(), minioRootUser, minioRootPassword, minioBucket)
 	if out, err := exec.CommandContext(ctx, "docker", "run", "--rm", "--name", "dq-it-mc",
 		"--network", "host", "--entrypoint", "sh",
-		"minio/mc", "-c", script).CombinedOutput(); err != nil {
+		siloImage, "-c", script).CombinedOutput(); err != nil {
 		t.Fatalf("create bucket: %v\n%s", err, out)
 	}
 }
