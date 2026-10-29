@@ -198,7 +198,7 @@ post-lock. They write into the CURRENT catalog, which on the production
 engine is the attached lakekeeper catalog `lk` (rev 5: the earlier
 "in-memory, no file or network reach" premise was measured on an
 unattached engine). The catalog is attached `READ_ONLY`, so against `lk`
-they fail before any catalog request; aimed at the `memory` catalog they
+they fail before any catalog write request; aimed at the `memory` catalog they
 still generate data in RAM, bounded by `memory_limit`,
 `max_temp_directory_size` and the request timeout. A statically linked
 extension has no runtime off-switch, so removing them would need a custom
@@ -465,4 +465,19 @@ runs the deny matrix against an in-process fake REST catalog that accepts
 every commit (a leak would succeed), with a negative control that drops
 `READ_ONLY` and must see the write reach the catalog; the integration
 write probe is now a hard assertion (INSERT / UPDATE / DELETE /
-`iceberg_rewrite_data_files` refused by the read-only attach).
+`iceberg_rewrite_data_files` refused by the read-only attach); those
+integration assertions are compile-checked only and await a live run.
+
+rev 5 addendum (2026-10-29): `lock_configuration` does not block ATTACH,
+so post-lock user SQL could ATTACH the catalog a second time, without
+`READ_ONLY`, reusing the stored bearer secret `lk_tok`, and write through
+it (`POST /v1/namespaces`, `/v1/transactions/commit`, stage-create).
+`attachCatalog` now runs `DROP SECRET lk_tok` once the ATTACH (and `USE`)
+succeeded, before `lock()`; the attached catalog keeps its own credential
+state, and the fake catalog's `Authorization` headers prove post-drop
+reads still carry the bearer. Residual, out of scope: a user holding their
+own valid catalog JWT can attach it writable, but they already have that
+lakekeeper access and FGA governs it; real lakekeeper rejects
+unauthenticated clients. Wording narrowed to what the tests prove: DuckDB
+rejects the listed statements before any catalog write request — binding
+may still read catalog metadata and storage.

@@ -138,6 +138,16 @@ func TestAttachIntegration(t *testing.T) {
 	}
 	assertCount(ctx, t, e, `SELECT count(*) FROM lk."qe"."posts"`, seedRowCount, "post-lock")
 
+	// attachCatalog dropped the bearer secret before lock(): post-lock user SQL
+	// cannot ATTACH the catalog again (writable, without READ_ONLY) with it.
+	reattach := "ATTACH '" + fx.projectID + "/" + fx.warehouseName + "' AS lk2 (TYPE ICEBERG, URI '" +
+		fx.catalogURL() + "', SECRET " + catalogSecretName + ", ACCESS_DELEGATION_MODE 'vended_credentials')"
+	if _, err := e.conn.ExecContext(ctx, reattach); err == nil {
+		t.Fatal("SECURITY HOLE: post-lock ATTACH with the stored catalog secret SUCCEEDED; attachCatalog must drop it")
+	} else if !strings.Contains(err.Error(), "No ICEBERG secret by the name of '"+catalogSecretName+"'") {
+		t.Fatalf("post-lock re-ATTACH must fail for want of the dropped secret, got: %v", err)
+	}
+
 	// RFC 022 Task 1.5 (h): exercise the PUBLIC Run entrypoint against the same
 	// live fixture (the same single provision — Run opens its OWN engine and
 	// attaches per-engine, which is fine). This proves the catalog-attached read

@@ -8,8 +8,10 @@
 // current catalog lk (stage-create POSTs to lakekeeper), and 2.0's
 // iceberg_rollback_to_snapshot / set_iceberg_table_properties reached
 // /v1/transactions/commit — metadata-only writes the read-only vended STS
-// credentials cannot stop. attachCatalog therefore attaches READ_ONLY; this file
-// is the proof that DuckDB refuses every such write before a catalog request.
+// credentials cannot stop. attachCatalog therefore attaches READ_ONLY and drops
+// the bearer secret before lock(); this file proves that DuckDB refuses the listed
+// writes before any catalog WRITE request (binding may still issue reads), and
+// that the catalog cannot be attached again with the stored token.
 //
 // The fake iceberg-REST catalog ACCEPTS every mutation with 200: a leak must show
 // up as a SUCCESS plus a recorded mutation, never hide behind a 403 that a real
@@ -41,9 +43,10 @@ import (
 type fakeCatalog struct {
 	srv *httptest.Server
 
-	mu   sync.Mutex
-	reqs []string
-	muts int
+	mu    sync.Mutex
+	reqs  []string
+	auths []string // Authorization header of reqs[i]
+	muts  int
 }
 
 func fakeTableMetadata() map[string]any {
@@ -106,6 +109,7 @@ func newFakeCatalog(t *testing.T) *fakeCatalog {
 	fc.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fc.mu.Lock()
 		fc.reqs = append(fc.reqs, r.Method+" "+r.URL.Path)
+		fc.auths = append(fc.auths, r.Header.Get("Authorization"))
 		mutating := r.Method != http.MethodGet && r.Method != http.MethodHead
 		if mutating {
 			fc.muts++
@@ -150,6 +154,12 @@ func (fc *fakeCatalog) requests() []string {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	return slices.Clone(fc.reqs)
+}
+
+func (fc *fakeCatalog) authorizations() []string {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	return slices.Clone(fc.auths)
 }
 
 // requireIcebergExtensions mirrors lockedEngineViaAttach's pre-flight: skip when
@@ -205,9 +215,9 @@ func queryInt(t *testing.T, conn *sql.Conn, stmt string) int64 {
 
 var readOnlyDeny = regexp.MustCompile(`(?i)attached in read-only mode`)
 
-// TestLockdownDenyAttachedReadOnly: every catalog write on the attached, locked
-// engine must be refused by the READ_ONLY attach, with zero mutating requests
-// reaching the catalog. Do not loosen the error predicate to make a row pass: a
+// TestLockdownDenyAttachedReadOnly: each listed catalog write on the attached,
+// locked engine must be refused by the READ_ONLY attach (or, for the re-ATTACH
+// rows, by the dropped secret), with zero mutating requests reaching the catalog. Do not loosen the error predicate to make a row pass: a
 // row that denies for another reason (bind error, 404) proves nothing about the
 // read-only guard and belongs out of the matrix.
 func TestLockdownDenyAttachedReadOnly(t *testing.T) {
@@ -223,14 +233,33 @@ func TestLockdownDenyAttachedReadOnly(t *testing.T) {
 		t.Fatal("SECURITY: catalog lk is attached read-write; attachCatalog must pass READ_ONLY")
 	}
 
+	// attachCatalog drops the bearer secret before lock(): post-lock user SQL
+	// must find nothing to ATTACH the catalog again with.
+	if n := queryInt(t, e.conn, "SELECT count(*) FROM duckdb_secrets() WHERE name = '"+catalogSecretName+"'"); n != 0 {
+		t.Errorf("SECURITY: secret %s still exists post-lock (%d); attachCatalog must drop it", catalogSecretName, n)
+	}
+
 	// Positive controls: catalog reads and session-local writes stay usable, so
 	// the denies below are the read-only guard, not a broken attach.
+	postDrop := len(fc.requests())
 	if n := queryInt(t, e.conn, "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lk'"); n != 1 {
 		t.Fatalf("duckdb_tables() on lk = %d, want 1", n)
 	}
 	if n := queryInt(t, e.conn, "SELECT count(*) FROM iceberg_snapshots('lk.ns.t')"); n != 2 {
 		t.Fatalf("iceberg_snapshots('lk.ns.t') = %d rows, want 2", n)
 	}
+	// Dropping the secret must not drop the token from the live attachment: every
+	// catalog request the reads above made (all after the drop) carries the bearer.
+	reqs, auths := fc.requests()[postDrop:], fc.authorizations()[postDrop:]
+	if len(reqs) == 0 {
+		t.Fatal("positive-control reads issued no catalog request; the bearer check below would be vacuous")
+	}
+	for i, r := range reqs {
+		if auths[i] != "Bearer "+dummyAttachJWT {
+			t.Fatalf("post-drop catalog request %q carried Authorization %q, want the attach bearer", r, auths[i])
+		}
+	}
+	t.Logf("post-drop catalog requests, all with the attach bearer: %s", strings.Join(reqs, ", "))
 	if _, err := e.conn.ExecContext(ctx, "CREATE TEMP TABLE tt AS SELECT 1 AS a"); err != nil {
 		t.Fatalf("CREATE TEMP TABLE: %v", err)
 	}
@@ -249,23 +278,41 @@ func TestLockdownDenyAttachedReadOnly(t *testing.T) {
 		t.Fatalf("positive controls issued %d mutating catalog request(s): %v", m, fc.requests())
 	}
 
+	// Re-ATTACH: lock_configuration does not block ATTACH, so with lk_tok stored a
+	// user could attach the catalog again as lk2 WITHOUT READ_ONLY and write
+	// through it. The ATTACH must fail for want of the dropped secret, and the
+	// lk2 write after it must fail (any error) with zero mutations.
+	//
+	// Not a row: ATTACH ... (AUTHORIZATION_TYPE 'none') binds against this fake,
+	// which serves unauthenticated clients. Real lakekeeper rejects them (401), and
+	// user SQL cannot read the run's JWT (allow_unredacted_secrets=false, and after
+	// the drop the secret no longer exists). A user who already holds their own
+	// valid catalog JWT could attach it writable, but they already have that
+	// lakekeeper access directly and FGA governs it — out of scope for the engine.
 	// iceberg_truncate / iceberg_bucket are absent on purpose: on 2.0.0 they are
 	// SCALAR partition transforms (width, value), not catalog writes.
-	deny := []struct{ name, stmt string }{
-		{"dbgen-current-catalog", "CALL dbgen(sf=0.001)"},
-		{"dbgen-catalog-lk", "CALL dbgen(sf=0.001, catalog := 'lk', schema := 'ns')"},
-		{"dsdgen-current-catalog", "CALL dsdgen(sf=0.001)"},
-		{"iceberg_rollback_to_snapshot", "SELECT * FROM iceberg_rollback_to_snapshot('lk.ns.t', 1001)"},
-		{"set_iceberg_table_properties", "CALL set_iceberg_table_properties('lk.ns.t', MAP {'k': 'v'})"},
-		{"remove_iceberg_table_properties", "CALL remove_iceberg_table_properties('lk.ns.t', ['k'])"},
-		{"set_iceberg_schema_properties", "CALL set_iceberg_schema_properties('lk.ns', MAP {'k': 'v'})"},
-		{"remove_iceberg_schema_properties", "CALL remove_iceberg_schema_properties('lk.ns', ['k'])"},
-		{"insert", "INSERT INTO lk.ns.t VALUES (1)"},
-		{"create-table", "CREATE TABLE lk.ns.x (a INT)"},
-		{"ctas-bare-name", "CREATE TABLE y AS SELECT 1 AS a"},
-		{"drop-table", "DROP TABLE lk.ns.t"},
-		{"create-schema", "CREATE SCHEMA lk.newns"},
-		{"alter-table", "ALTER TABLE lk.ns.t ADD COLUMN b INT"},
+	noSecret := regexp.MustCompile(`(?i)no iceberg secret by the name of 'lk_tok'`)
+	anyErr := regexp.MustCompile(`.`)
+	deny := []struct {
+		name, stmt string
+		want       *regexp.Regexp // nil = readOnlyDeny
+	}{
+		{"reattach-with-stored-secret", "ATTACH 'proj/wh' AS lk2 (TYPE ICEBERG, URI '" + fc.srv.URL + "', SECRET lk_tok, ACCESS_DELEGATION_MODE 'vended_credentials')", noSecret},
+		{"reattach-write", "CREATE SCHEMA lk2.evil", anyErr},
+		{"dbgen-current-catalog", "CALL dbgen(sf=0.001)", nil},
+		{"dbgen-catalog-lk", "CALL dbgen(sf=0.001, catalog := 'lk', schema := 'ns')", nil},
+		{"dsdgen-current-catalog", "CALL dsdgen(sf=0.001)", nil},
+		{"iceberg_rollback_to_snapshot", "SELECT * FROM iceberg_rollback_to_snapshot('lk.ns.t', 1001)", nil},
+		{"set_iceberg_table_properties", "CALL set_iceberg_table_properties('lk.ns.t', MAP {'k': 'v'})", nil},
+		{"remove_iceberg_table_properties", "CALL remove_iceberg_table_properties('lk.ns.t', ['k'])", nil},
+		{"set_iceberg_schema_properties", "CALL set_iceberg_schema_properties('lk.ns', MAP {'k': 'v'})", nil},
+		{"remove_iceberg_schema_properties", "CALL remove_iceberg_schema_properties('lk.ns', ['k'])", nil},
+		{"insert", "INSERT INTO lk.ns.t VALUES (1)", nil},
+		{"create-table", "CREATE TABLE lk.ns.x (a INT)", nil},
+		{"ctas-bare-name", "CREATE TABLE y AS SELECT 1 AS a", nil},
+		{"drop-table", "DROP TABLE lk.ns.t", nil},
+		{"create-schema", "CREATE SCHEMA lk.newns", nil},
+		{"alter-table", "ALTER TABLE lk.ns.t ADD COLUMN b INT", nil},
 	}
 	for _, p := range deny {
 		t.Run(p.name, func(t *testing.T) {
@@ -274,8 +321,13 @@ func TestLockdownDenyAttachedReadOnly(t *testing.T) {
 			if err == nil {
 				t.Fatalf("SECURITY HOLE: %q SUCCEEDED on the read-only attached catalog.\n  stmt: %s", p.name, p.stmt)
 			}
-			if !readOnlyDeny.MatchString(err.Error()) {
-				t.Fatalf("%q must be refused by the READ_ONLY attach, got a different error: %v", p.name, err)
+			t.Logf("denied: %v", err)
+			want := p.want
+			if want == nil {
+				want = readOnlyDeny
+			}
+			if !want.MatchString(err.Error()) {
+				t.Fatalf("%q must be refused with %s, got a different error: %v", p.name, want, err)
 			}
 			if after := fc.mutations(); after != before {
 				t.Fatalf("SECURITY: %q issued %d mutating catalog request(s) before erroring", p.name, after-before)
@@ -286,7 +338,7 @@ func TestLockdownDenyAttachedReadOnly(t *testing.T) {
 	if m := fc.mutations(); m != 0 {
 		t.Fatalf("SECURITY: %d mutating catalog request(s) reached the catalog: %v", m, fc.requests())
 	}
-	reqs := fc.requests()
+	reqs = fc.requests()
 	paths := []string{}
 	for _, r := range reqs {
 		if !slices.Contains(paths, r) {

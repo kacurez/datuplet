@@ -34,11 +34,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`duckdb-go/v2 v2.20000.0`, was 1.5.3). The e2e DuckDB CLI is pinned to
   2.0.0, and both DuckDB images now prove at build time that the baked
   `iceberg`/`httpfs` extensions load offline. `query-worker` and
-  `datuplet-query` now attach the lakekeeper catalog `READ_ONLY`, so writes —
-  including DuckDB 2.0's `iceberg_rollback_to_snapshot` /
-  `set_iceberg_table_properties` and the statically linked `dbgen` / `dsdgen`
-  — are refused by the engine before any catalog request; lakekeeper's FGA
-  grant remains the authorization of record. User-visible SQL dialect
+  `datuplet-query` now attach the lakekeeper catalog `READ_ONLY` and drop its
+  bearer secret before locking the engine, so the tested writes — including
+  DuckDB 2.0's `iceberg_rollback_to_snapshot` /
+  `set_iceberg_table_properties`, the statically linked `dbgen` / `dsdgen`,
+  and a second writable ATTACH with the stored token — are refused by the
+  engine before any catalog write request (binding may still read); lakekeeper's
+  FGA grant remains the authorization of record. User-visible SQL dialect
   changes, per the
   [DuckDB 2.0 migration guide](https://duckdb.org/docs/2.0/operations_manual/migration.html):
   `~`/`!~` now match partially; `!` (factorial) binds tighter; the

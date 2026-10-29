@@ -122,17 +122,19 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 	// nil-UUID default project → 401/403). We pass it verbatim.
 	//
 	// READ_ONLY: the ad-hoc query surface (query-worker, datuplet-query, the
-	// storage preview, app renders) is read-only by product definition, so the
-	// engine refuses every write to lk before any catalog or storage request is
-	// issued: INSERT/UPDATE/DELETE/MERGE, CREATE/DROP/ALTER, the iceberg
-	// extension's catalog-mutating table functions (iceberg_rollback_to_snapshot,
-	// set_iceberg_table_properties, iceberg_rewrite_data_files, ...) and the
+	// storage preview, app renders) is read-only by product definition, so
+	// DuckDB refuses writes to lk before issuing any catalog write request
+	// (stage-create, commit, namespace create): INSERT, CREATE/DROP/ALTER, the
+	// iceberg extension's catalog-mutating table functions
+	// (iceberg_rollback_to_snapshot, set/remove_iceberg_*_properties) and the
 	// statically linked dbgen/dsdgen, which write into the CURRENT catalog — lk
-	// after the USE below. Without it those reached lakekeeper's stage-create
-	// and /v1/transactions/commit endpoints on the locked engine. This is defence
-	// in depth: lakekeeper's FGA grant and the vended credentials remain the
-	// per-principal authorization of record. TestLockdownDenyAttachedReadOnly
-	// proves the refusal.
+	// after the USE below. Binding such a statement may still READ catalog
+	// metadata and storage. Without READ_ONLY those writes reached lakekeeper's
+	// stage-create and /v1/transactions/commit endpoints on the locked engine.
+	// TestLockdownDenyAttachedReadOnly proves exactly its listed statements
+	// against a fake catalog; UPDATE/DELETE/iceberg_rewrite_data_files are only
+	// asserted by the integration test. This is defence in depth: lakekeeper's
+	// FGA grant and the vended credentials remain the authorization of record.
 	attach := fmt.Sprintf(
 		"ATTACH '%s' AS %s (TYPE ICEBERG, URI '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials', READ_ONLY)",
 		escapeSQL(r.Warehouse), catalogAlias, escapeSQL(r.LakekeeperURL), catalogSecretName,
@@ -175,6 +177,15 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 		// resolve; fully-qualified lk.<ns>.<table> always works regardless.
 	default:
 		return fmt.Errorf("list catalog %s namespaces: %w", catalogAlias, err)
+	}
+
+	// lock_configuration does not block ATTACH: while the bearer secret is
+	// stored, post-lock user SQL could ATTACH the catalog again without
+	// READ_ONLY (SECRET lk_tok) and write through it. The attached catalog keeps
+	// its own credential state, so lk keeps working after the drop. The statement
+	// is a constant and carries no token.
+	if _, err := e.conn.ExecContext(ctx, "DROP SECRET "+catalogSecretName); err != nil {
+		return fmt.Errorf("DROP SECRET %s: %w", catalogSecretName, err)
 	}
 
 	return nil

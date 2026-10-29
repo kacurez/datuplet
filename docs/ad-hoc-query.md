@@ -26,13 +26,18 @@ server query service.
 
 Read-only is enforced in two independent layers.
 
-- **Engine.** The lakekeeper catalog is attached `READ_ONLY`, so DuckDB refuses
-  every statement that would modify it before any catalog or storage request is
-  made: INSERT / UPDATE / DELETE / MERGE, CREATE / DROP / ALTER, the iceberg
-  extension's catalog-mutating table functions (such as
-  `iceberg_rollback_to_snapshot`, `set_iceberg_table_properties` and
-  `iceberg_rewrite_data_files`), and the statically linked `dbgen` / `dsdgen`
-  generators aimed at the catalog.
+- **Engine.** The lakekeeper catalog is attached `READ_ONLY` and its bearer
+  secret is dropped before the engine is locked, so user SQL cannot modify the
+  catalog through the engine nor attach it again with the stored token. DuckDB
+  rejects writes before issuing any catalog write request (stage-create,
+  commit, namespace create); binding such a statement may still read catalog
+  metadata and storage. Proven against a fake catalog for the statements in
+  `TestLockdownDenyAttachedReadOnly`: INSERT, CREATE / DROP / ALTER, the
+  iceberg extension's `iceberg_rollback_to_snapshot` and
+  `set/remove_iceberg_*_properties`, the statically linked `dbgen` / `dsdgen`
+  aimed at the catalog, and a re-ATTACH with the stored secret. UPDATE, DELETE
+  and `iceberg_rewrite_data_files` are asserted by the integration test, which
+  awaits a live run.
 - **Catalog.** Lakekeeper's FGA grant decides what the principal may do: a
   viewer receives read-only vended credentials and lakekeeper rejects its
   commits.
