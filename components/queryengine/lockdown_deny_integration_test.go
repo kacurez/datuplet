@@ -40,7 +40,7 @@ func runLockdownDenyIntegration(ctx context.Context, t *testing.T, e *engine, en
 	// parse. Verbatim 1.5.3: "Permission Error: File system LocalFileSystem has
 	// been disabled by configuration".
 	//
-	// NOTE (fix 13, DuckDB 1.5.3): iceberg_schema_properties EXISTS in this
+	// NOTE (fix 13, DuckDB 2.0.0): iceberg_schema_properties EXISTS in this
 	// extension build but does NOT take a metadata path — against a local '/tmp/x'
 	// it denies at the CATALOG layer ("Schema with name /tmp/x does not exist"),
 	// never reaching the FS. It is therefore NOT a meaningful FS-layer deny row

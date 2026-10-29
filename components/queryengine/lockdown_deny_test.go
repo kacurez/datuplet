@@ -13,8 +13,9 @@
 // RE-RUN THIS MATRIX ON EVERY duckdb-go VERSION BUMP. New DuckDB versions add
 // capability surface (new table functions, new filesystem readers, new
 // extensions). A capability that lands between releases and is NOT covered here
-// is an untested escalation path. Proven posture baseline: DuckDB 1.5.3
-// (duckdb-go/v2 v2.10503.0), graduated from the RFC 022 Phase 0 lockdown spike.
+// is an untested escalation path. Proven posture baseline: DuckDB 2.0.0
+// (duckdb-go/v2 v2.20000.0), re-proven 2026-10-28; graduated from the RFC 022
+// Phase 0 lockdown spike.
 //
 // NOTE on duckdb_extensions(): calling duckdb_extensions() post-lock ERRORS,
 // because it reads the on-disk extension directory through the (now disabled)
@@ -78,7 +79,9 @@ func lockedEngine(t *testing.T) (*engine, string) {
 // would prove an artifact — cold manager + disabled FS, or unloaded httpfs —
 // not the real allowed/denied behaviour production exercises. Skips (not fails)
 // when iceberg/httpfs are unavailable (offline plain-CI without the extensions
-// pre-baked): the warm-up replay is meaningless without them.
+// pre-baked): the warm-up replay is meaningless without them. With
+// QE_REQUIRE_WARMED=1 it fails instead, so a gate run cannot lose warmed
+// coverage silently.
 //
 // Returns the locked engine and its temp dir (callers may assert it stays
 // file-free).
@@ -93,11 +96,15 @@ func lockedEngineViaAttach(t *testing.T) (*engine, string) {
 	t.Cleanup(func() { _ = e.Close() })
 
 	// Pre-flight the extensions explicitly so an offline environment SKIPS here
-	// (rather than failing inside attachCatalog). On a warm laptop / CI image the
-	// extensions are already resident, so these are no-ops; attachCatalog repeats
-	// the INSTALL/LOAD harmlessly.
+	// (rather than failing inside attachCatalog), or FAILS under
+	// QE_REQUIRE_WARMED=1. On a warm laptop / CI image the extensions are already
+	// resident, so these are no-ops; attachCatalog repeats the INSTALL/LOAD
+	// harmlessly.
 	for _, s := range []string{"INSTALL iceberg", "LOAD iceberg", "INSTALL httpfs", "LOAD httpfs"} {
 		if _, err := e.conn.ExecContext(ctx, s); err != nil {
+			if os.Getenv("QE_REQUIRE_WARMED") == "1" {
+				t.Fatalf("iceberg/httpfs unavailable (%s: %v); attach-warmed probe needs them", s, err)
+			}
 			t.Skipf("iceberg/httpfs unavailable (%s: %v); attach-warmed probe needs them", s, err)
 		}
 	}
