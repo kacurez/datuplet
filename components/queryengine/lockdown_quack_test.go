@@ -46,35 +46,47 @@ const (
 // listener is the network proof.
 var rejectRe = regexp.MustCompile(`(?i)(connection refused|could not connect|failed to connect|connection reset|timed out|unauthori[sz]ed|invalid token|parser error|syntax error)`)
 
-// classRe: verbatim phrases from the spike report (## Quack probe). The
-// subject (quack) is checked separately where set.
+// classRe: verbatim phrases from the spike report (## Quack probe).
+// classExtensionUnavailable is deliberately absent: its class phrase is bound
+// to the row's subject (subjectExtensionRe), so another extension's name
+// cannot satisfy it.
 var classRe = map[denyClass]*regexp.Regexp{
-	classFSLayer:              regexp.MustCompile(`(?i)LocalFileSystem has been disabled`),
-	classExtensionUnavailable: regexp.MustCompile(`(?i)but it exists in the \w+ extension`),
-	classSecretTypeAbsent:     regexp.MustCompile(`(?i)secret type 'quack' does not exist`),
-	classConfigLocked:         regexp.MustCompile(`(?i)the configuration has been locked`),
+	classFSLayer:          regexp.MustCompile(`(?i)LocalFileSystem has been disabled`),
+	classSecretTypeAbsent: regexp.MustCompile(`(?i)secret type 'quack' does not exist`),
+	classConfigLocked:     regexp.MustCompile(`(?i)the configuration has been locked`),
+}
+
+// subjectExtensionRe matches DuckDB's not-loaded text for an object that lives
+// in the subject extension. The subject is quoted into the pattern rather than
+// searched for on its own, because the error may echo the statement (which
+// names quack_query) and so contain "quack" whatever extension it blames.
+func subjectExtensionRe(subject string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)but it exists in the ` + regexp.QuoteMeta(subject) + ` extension`)
 }
 
 type quackProbe struct {
 	name, stmt string
 	class      denyClass
-	subject    string // extension/type name the error must ALSO contain ("" = none; fsLayer text never names it)
+	subject    string // extension the error must say holds the missing object ("" = none; fsLayer text never names it)
+	names      string // verbatim phrase the error must also contain, naming the refused object ("" = none)
 	warmOnly   bool   // only on lockedEngineViaAttach (setting exists only with httpfs loaded)
 }
 
 var quackProbes = []quackProbe{
-	{"attach-token", "ATTACH 'quack:127.0.0.1:<port>' AS q (TOKEN 'x')", classFSLayer, "", false},
-	{"attach-type-quack", "ATTACH 'quack:127.0.0.1:<port>' AS q (TYPE quack)", classFSLayer, "", false},
-	{"connect-quack", "CONNECT 'quack:127.0.0.1:<port>'", classFSLayer, "", false},
-	{"connect-postgres", "CONNECT 'postgres:host=127.0.0.1 port=<port>'", classFSLayer, "", false},
-	{"quack-query", "SELECT * FROM quack_query('quack:127.0.0.1:<port>', 'SELECT 1', token = 'x')", classExtensionUnavailable, "quack", false},
-	{"secret-type-quack", "CREATE SECRET qs (TYPE quack, TOKEN 'x', SCOPE 'quack:127.0.0.1')", classSecretTypeAbsent, "quack", false},
-	{"set-s3-deprecated-url-params", "SET s3_enable_deprecated_url_parameters = true", classConfigLocked, "", true},
+	{"attach-token", "ATTACH 'quack:127.0.0.1:<port>' AS q (TOKEN 'x')", classFSLayer, "", "", false},
+	{"attach-type-quack", "ATTACH 'quack:127.0.0.1:<port>' AS q (TYPE quack)", classFSLayer, "", "", false},
+	{"connect-quack", "CONNECT 'quack:127.0.0.1:<port>'", classFSLayer, "", "", false},
+	{"connect-postgres", "CONNECT 'postgres:host=127.0.0.1 port=<port>'", classFSLayer, "", "", false},
+	{"quack-query", "SELECT * FROM quack_query('quack:127.0.0.1:<port>', 'SELECT 1', token = 'x')", classExtensionUnavailable, "quack", `Table Function with name "quack_query" is not in the catalog`, false},
+	{"secret-type-quack", "CREATE SECRET qs (TYPE quack, TOKEN 'x', SCOPE 'quack:127.0.0.1')", classSecretTypeAbsent, "quack", "", false},
+	{"set-s3-deprecated-url-params", "SET s3_enable_deprecated_url_parameters = true", classConfigLocked, "", "", true},
 }
 
 // denied reports whether err proves the row's class: err != nil,
-// !rejectRe.Match, classRe[class].Match, and (subject == "" || contains subject).
-// why says which condition failed.
+// !rejectRe.Match, the class marker matches (for classExtensionUnavailable,
+// the subject-bound phrase), subjectExtensionRe(subject) matches when subject
+// is set, and the error contains names when set. why says which condition
+// failed.
 func denied(err error, p quackProbe) (ok bool, why string) {
 	if err == nil {
 		return false, "statement SUCCEEDED"
@@ -83,11 +95,25 @@ func denied(err error, p quackProbe) (ok bool, why string) {
 	if m := rejectRe.FindString(msg); m != "" {
 		return false, fmt.Sprintf("transport/credential/parse failure (%q), not a posture deny", m)
 	}
-	if re := classRe[p.class]; !re.MatchString(msg) {
-		return false, fmt.Sprintf("error lacks the class marker %s", re)
+	switch re, found := classRe[p.class]; {
+	case found:
+		if !re.MatchString(msg) {
+			return false, fmt.Sprintf("error lacks the class marker %s", re)
+		}
+	case p.class == classExtensionUnavailable:
+		if p.subject == "" {
+			return false, "extensionUnavailable row has no subject to bind its class phrase to"
+		}
+	default:
+		return false, fmt.Sprintf("no class marker for class %d", p.class)
 	}
-	if p.subject != "" && !strings.Contains(msg, p.subject) {
-		return false, fmt.Sprintf("error does not name %q", p.subject)
+	if p.subject != "" {
+		if re := subjectExtensionRe(p.subject); !re.MatchString(msg) {
+			return false, fmt.Sprintf("error lacks %s", re)
+		}
+	}
+	if p.names != "" && !strings.Contains(msg, p.names) {
+		return false, fmt.Sprintf("error does not contain %q", p.names)
 	}
 	return true, ""
 }
@@ -273,4 +299,61 @@ func TestLockdownDenyQuack(t *testing.T) {
 		e, _ := lockedEngineViaAttach(t)
 		runRows(t, e, true)
 	})
+}
+
+// TestDeniedPredicate pins the predicate itself on synthetic errors: it must
+// accept each row's recorded 2.0.0 deny (first line, verbatim from the spike
+// report's ## Quack probe) and reject a success, a transport failure, and a
+// diagnostic that blames the wrong extension or names the wrong object.
+func TestDeniedPredicate(t *testing.T) {
+	const fsLayerText = `Permission Error: File system LocalFileSystem has been disabled by configuration`
+	spikeFirstLine := map[string]string{
+		"attach-token":                 fsLayerText,
+		"attach-type-quack":            fsLayerText,
+		"connect-quack":                fsLayerText,
+		"connect-postgres":             fsLayerText,
+		"quack-query":                  `Catalog Error: Table Function with name "quack_query" is not in the catalog, but it exists in the quack extension.`,
+		"secret-type-quack":            `Invalid Input Error: Secret type 'quack' does not exist, but it exists in the quack extension.`,
+		"set-s3-deprecated-url-params": `Invalid Input Error: Cannot change configuration option ""s3_enable_deprecated_url_parameters"" - the configuration has been locked`,
+	}
+	const transportText = `IO Error: Could not connect to server error for HTTP HEAD to 'http://127.0.0.1:1/x.parquet'`
+
+	type predicateCase struct {
+		name, row string
+		err       error
+		accept    bool
+	}
+	var cases []predicateCase
+	for _, p := range quackProbes {
+		line, ok := spikeFirstLine[p.name]
+		if !ok {
+			t.Fatalf("row %q has no recorded spike text", p.name)
+		}
+		cases = append(cases,
+			predicateCase{"accept-spike-text/" + p.name, p.name, errors.New(line), true},
+			predicateCase{"reject-nil/" + p.name, p.name, nil, false},
+			predicateCase{"reject-transport/" + p.name, p.name, errors.New(transportText), false},
+		)
+	}
+	cases = append(cases,
+		predicateCase{"reject-wrong-extension/quack-query", "quack-query",
+			errors.New(`Catalog Error: Table Function with name "quack_query" is not in the catalog, but it exists in the httpfs extension.`), false},
+		predicateCase{"reject-secret-type-text/quack-query", "quack-query",
+			errors.New(spikeFirstLine["secret-type-quack"]), false},
+		predicateCase{"reject-fs-layer-text/quack-query", "quack-query",
+			errors.New(fsLayerText), false},
+	)
+
+	rows := make(map[string]quackProbe, len(quackProbes))
+	for _, p := range quackProbes {
+		rows[p.name] = p
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ok, why := denied(c.err, rows[c.row])
+			if ok != c.accept {
+				t.Errorf("denied = %v (%s), want %v\n  err: %v", ok, why, c.accept, c.err)
+			}
+		})
+	}
 }
