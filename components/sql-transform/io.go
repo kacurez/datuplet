@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
@@ -200,6 +201,52 @@ func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir
 	return isLast, n, nil
 }
 
+// nullTypeRe matches DuckDB's untyped-NULL type name as a whole word, top-level
+// or nested. DuckDB 2.0 prints it quoted: `"NULL"`, `"NULL"[]`,
+// `STRUCT(a "NULL")`, `MAP(VARCHAR, "NULL")`. It is applied to `column_type`
+// only, so a column NAME containing "null" is safe. Known limit: a STRUCT
+// field literally named `null` (`STRUCT("null" INTEGER)`) also matches.
+var nullTypeRe = regexp.MustCompile(`(?i)\bNULL\b`)
+
+// nullTypedColumns returns, in column order, the columns of `table` (an
+// already-sanitized identifier) whose type is or contains the untyped NULL
+// type. DuckDB 2.0 keeps `SELECT NULL AS x` as type NULL (1.5 made it
+// INTEGER); Iceberg has no NULL type, so such a column cannot be written.
+func nullTypedColumns(ctx context.Context, conn *sql.Conn, table string) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, "DESCRIBE "+table)
+	if err != nil {
+		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	dcols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+	}
+	// DESCRIBE yields column_name, column_type, null, key, default, extra;
+	// only the first two matter, so scan the rest into throwaway values.
+	var name, typ string
+	dest := make([]any, len(dcols))
+	dest[0], dest[1] = &name, &typ
+	for i := 2; i < len(dest); i++ {
+		dest[i] = new(any)
+	}
+
+	var hits []string
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+		}
+		if nullTypeRe.MatchString(typ) {
+			hits = append(hits, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+	}
+	return hits, nil
+}
+
 // writeOutput materializes one DuckDB table to local parquet then streams
 // it to DG via OpenWriter + WriteChunk. The DG writer handles parquet
 // re-emission to the iceberg target prefix using lakekeeper-vended creds
@@ -216,6 +263,23 @@ func writeOutput(ctx context.Context, conn *sql.Conn, client *sdk.Client, workdi
 	srcTable, err := sanitizeIdent(out.Name)
 	if err != nil {
 		return 0, fmt.Errorf("output %s.%s: %w", out.Bucket, out.Table, err)
+	}
+
+	// Pre-flight: Iceberg has no NULL type, so the gateway rejects the Arrow
+	// null column COPY would emit (HTTP 500 -> exit 20). Catch it here, before
+	// anything is staged, as the user-fixable problem it is (exit 1).
+	nullCols, err := nullTypedColumns(ctx, conn, srcTable)
+	if err != nil {
+		return 0, fmt.Errorf("output %s.%s: inspect column types: %w", out.Bucket, out.Table, err)
+	}
+	if len(nullCols) > 0 {
+		also := ""
+		if len(nullCols) > 1 {
+			also = fmt.Sprintf(" (also: %s)", strings.Join(nullCols[1:], ", "))
+		}
+		return 0, asUserErr(fmt.Errorf(
+			"output %s.%s: column %q has type NULL — DuckDB 2.0 keeps an untyped NULL as type NULL (1.5 made it INTEGER) and Iceberg has no NULL type; cast it explicitly, e.g. CAST(NULL AS VARCHAR) AS %q%s",
+			out.Bucket, out.Table, nullCols[0], nullCols[0], also))
 	}
 
 	// Stage parquet locally so we can stream chunks to DG.

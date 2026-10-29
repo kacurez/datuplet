@@ -39,7 +39,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `~`/`!~` now match partially; `!` (factorial) binds tighter; the
   single-arrow lambda `x -> …` is disabled (use `lambda x : …`); integer
   `//` and `%` by zero raise instead of returning NULL; an untyped `NULL`
-  column keeps type `NULL` instead of `INTEGER`; `X'…'`/`B'…'` literals are
+  column keeps type `NULL` instead of `INTEGER` (sql-transform now rejects
+  such an output column before the write with a FailedUser message naming the
+  cast to apply; on 1.5 it silently became INTEGER); `X'…'`/`B'…'` literals are
   BLOB/BITSTRING; `MERGE INTO` raises when one target row matches twice;
   S3 settings in URL query parameters are ignored (use secrets). No
   compatibility flags are set in either engine.
