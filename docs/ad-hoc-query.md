@@ -34,6 +34,8 @@ staging PUT or commit. Do not rely on engine-level write blocking.
 
 ## Server query service
 
+The engine is DuckDB 2.0.0; see the CHANGELOG entry for the dialect changes versus 1.5.
+
 ### Enabling
 
 The query service is **on by default** (`queryWorker.enabled: true`) — a

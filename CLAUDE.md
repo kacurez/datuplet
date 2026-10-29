@@ -306,10 +306,10 @@ These are conventions a new contributor wouldn't infer from the code:
   bypasses Stringer — reviewers catch that one.
 - **`sql-transform` component**: runs user SQL inside an embedded DuckDB
   engine and is **credentials-clean** — it never holds S3, GCS, or
-  lakekeeper credentials. Inputs stream from Data Gateway via Arrow IPC
-  and are materialized into a DuckDB table before user SQL runs (workaround
-  for duckdb-go's GROUP BY / JOIN / UNION ALL bug against registered Arrow
-  streams). Outputs run `COPY <name> TO '<staged>.parquet'` and stream
+  lakekeeper credentials. Inputs arrive from Data Gateway as parquet chunks
+  over its HTTP read endpoint, are streamed to local temp files and exposed to
+  user SQL as `read_parquet` views (bounded RAM; a one-shot stream cannot be
+  scanned twice). Outputs run `COPY <name> TO '<staged>.parquet'` and stream
   the file back via the SDK.
 - **FGA model versioning**: `fgaModel.version` in
   `datuplet-app/values.yaml` and `platform.fgaModelVersion` in

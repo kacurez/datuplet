@@ -57,3 +57,5 @@ checklist per dependency — what CI cannot see.
 ## Go modules / Dockerfile bases / GitHub Actions
 Grouped weekly Renovate PRs; `make tidy` discipline applies (multi-module
 repo). Gate: PR suite + e2e.
+
+- DuckDB (duckdb-go/v2): since 2.0 the static libraries resolve from the `go.duckdb.org/libduckdb/*` module path; a GOPROXY allowlist must include it. Bump `components/sql-transform`, `components/queryengine` and `utils/docker/install-duckdb-ext` together, run the queryengine suite locally (`-tags duckdb_arrow`; PR CI does not), and let the images' `verify` stage prove the baked extensions still load offline.

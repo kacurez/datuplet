@@ -34,15 +34,31 @@ A Datuplet component that runs user-supplied SQL inside an embedded DuckDB engin
 
 The SQL string contains zero environment-specific values: no S3 URLs, no bucket prefixes, no run IDs. Inputs and outputs are referenced by their declared logical name only.
 
+## DuckDB engine
+
+The component embeds DuckDB **2.0.0** (`duckdb-go/v2 v2.20000.0`). Engine
+resources are set from `config` (all optional): `memory` (DuckDB
+`memory_limit`, default `1GB`), `max_temp_size` (`max_temp_directory_size`,
+default `6GB`, a hard cap on spill), `threads` (default `2`), `temp_directory`
+(default `/tmp/duckdb-spill`). No other DuckDB settings are exposed and no
+compatibility flags are set, so the 2.0 dialect applies as documented in the
+[migration guide](https://duckdb.org/docs/2.0/operations_manual/migration.html):
+`~`/`!~` match partially; `!` binds tighter; `x -> …` lambdas are disabled
+(`lambda x : …`); integer `//` and `%` by zero raise; an untyped `NULL`
+column keeps type `NULL`; `X'…'`/`B'…'` literals are BLOB/BITSTRING;
+`MERGE INTO` raises on a doubly matched target row. ICU collations and
+time-zone functions work without `LOAD icu`; the extension is statically
+linked into the engine.
+
 ## How inputs and outputs map to SQL
 
 The component is a thin shell around DuckDB. Before your SQL runs, the component pre-registers each declared input as a **DuckDB view**. After your SQL completes, the component reads back each declared output by **selecting from a DuckDB table or view your SQL created** and streams the rows to DG.
 
-**Inputs → DuckDB views.** Each declared input is registered as a DuckDB view. `<view_name>` is `logicalName` if set, otherwise the physical `table`. Inputs stream from DataGateway directly into DuckDB via the Arrow extension's `arrow_scan` registration — no parquet files are written to the component's local disk. Internally:
+**Inputs → DuckDB views.** Each declared input is registered as a DuckDB view. `<view_name>` is `logicalName` if set, otherwise the physical `table`. Inputs are fetched from DataGateway as parquet and staged on the component's ephemeral disk; only one HTTP read buffer is in memory at a time. Internally:
 
-1. Component opens an `OpenReader(FORMAT_ARROW_IPC)` on the input.
-2. SDK wraps the gRPC stream as an `array.RecordReader`.
-3. Component calls `Arrow.RegisterView(reader, viewName)` and runs the user SQL.
+1. Component opens an `OpenReader(FORMAT_PARQUET)` on the input and takes the gateway's HTTP read endpoint from the reply (gRPC's 64 MiB message cap rules it out for large source files).
+2. It `GET`s the stream chunk by chunk, streaming each response body to its own parquet file under the work dir (`io.Copy`, ~32 KiB resident), until the gateway sets `X-Datuplet-Is-Last`.
+3. It runs `CREATE VIEW <view_name> AS SELECT * FROM read_parquet([<chunk files>])` and then the user SQL; DuckDB scans the staged files lazily, row group by row group.
 
 Your SQL then uses `<view_name>` directly:
 
@@ -63,7 +79,7 @@ config:
     JOIN prod ON o.product_id = prod.id;
 ```
 
-No parquet files are written to the component's local disk; the input streams from DG into DuckDB via the Arrow IPC stream.
+Each input's parquet chunks are staged on the component's local ephemeral disk and read lazily through `read_parquet`; nothing beyond one HTTP read buffer is resident in memory.
 
 **Outputs → DuckDB CREATE TABLE.** For each `outputs.tables[]` entry, the component runs (roughly):
 
@@ -105,7 +121,7 @@ Iceberg-side: each `outputs.tables[]` entry's `(bucket, name)` is the **physical
 
 **What if I create extra DuckDB tables that aren't declared as outputs?** They're discarded when the component exits — DuckDB is in-memory (with optional spill to `/tmp/duckdb-spill`). Use them freely as intermediates.
 
-**What if an input has zero rows?** The view is registered as a 0-row view shaped to the input schema; SQL that joins/aggregates against it still resolves columns and naturally produces empty output.
+**What if an input has zero rows?** The view is a zero-row placeholder that does not carry the input's columns; naming one of them fails at bind time. See [Empty-input semantics](#empty-input-semantics).
 
 ## Inputs
 
@@ -158,13 +174,13 @@ outputs:
 
 ## Empty-input semantics
 
-When a declared input table has zero rows for the current run (first incremental window, upstream extractor produced no rows, etc.), DG's streaming reader emits a 0-row Arrow record batch shaped to the input schema. DuckDB's `arrow_scan` registers it as a view that resolves columns but yields no rows. Downstream `JOIN` / aggregation SQL still resolves columns and naturally produces empty output.
+When a declared input has no data files for the current run (first incremental window, upstream extractor produced nothing), the gateway closes the stream with no chunks and the component registers a zero-row placeholder view (`CREATE VIEW <view_name> AS SELECT * FROM (SELECT 1) WHERE 1=0`). The placeholder does **not** carry the input's columns: `SELECT count(*) FROM <view_name>` works and yields 0, but SQL that names a column of the empty input fails at bind time with a column-not-found error — the same outcome as referencing a missing column on a real table. If a pipeline can legitimately see an empty input, make the producing stage always emit its schema; a `UNION ALL` with a typed empty `SELECT` does not help, because the first branch still fails to bind the missing column.
 
 ## Architecture (for the curious)
 
 The component is intentionally creds-clean. Per-step:
 
-1. **Inputs.** For each declared input, DG opens the input via `OpenReader(FORMAT_ARROW_IPC)` and row-group-streams parquet→arrow IPC. The SDK's `sdk/go/arrow.NewReader` wraps the gRPC stream as an `array.RecordReader`. The component calls `arrow.RegisterView(reader, viewName)` to register the input as a DuckDB view via the arrow_scan extension. **No parquet files touch the component's local disk.**
+1. **Inputs.** For each declared input the component opens `OpenReader(FORMAT_PARQUET)`, drains the gateway's HTTP read endpoint chunk by chunk into local parquet files, and registers `CREATE VIEW … AS SELECT * FROM read_parquet([...])`. **Parquet bytes are staged on the component's ephemeral disk; nothing but one HTTP read buffer is resident.**
 2. **SQL.** The user's SQL string runs verbatim against the view set. DuckDB executes it in-process; intermediate `CREATE TABLE …` statements stay in DuckDB local memory or spill to `/tmp/duckdb-spill` (configurable via `config.temp_directory`).
 3. **Outputs.** For each declared output, the component runs `COPY <sdk-name> TO '<staged>.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY)`, reads the staged parquet, and streams it to DG via `OpenWriterToBucket` + `WriteChunk` + `Close`. DG re-emits the parquet to the iceberg target prefix using lakekeeper-vended STS creds, and writes the per-target `files.json` as an audit breadcrumb.
 4. **Commit.** Inline in the DG sidecar, outside the component. CloseWriter dispatches the writer's parquet paths to the DG's in-process commit pool, which calls `icebergjob.CommitTableFiles`: it opens an iceberg transaction, calls `txn.AddFiles` (APPEND) or `txn.ReplaceDataFiles` (FULL_LOAD), and commits via lakekeeper. There is no separate commit Job. 409 conflicts retry via `catalogwriter.RetryOnConflict`.
@@ -177,7 +193,7 @@ The component process never holds production S3 credentials; DG's `pkg/catalogwr
 config:
   sql: |
     …
-  threads: 4                  # DuckDB SET threads=N (default 4)
+  threads: 4                  # DuckDB SET threads=N (default 2)
   temp_directory: /tmp/spill  # DuckDB spill-to-disk dir (default /tmp/duckdb-spill)
 ```
 
@@ -196,4 +212,4 @@ config:
 - Column-predicate `sinceDays` is wired through CRD + DG config but not yet honoured by the lakekeeper read path; DG soft-skips and reads the full snapshot. Tracked as a follow-up.
 - Schema evolution: an output `CREATE TABLE` whose schema diverges from the existing iceberg target's schema fails at `txn.AddFiles` time as `FailedUser`. No auto-evolve.
 - Partitioned writes: DG's writer doesn't currently re-partition output rows by the target's partition spec. Lands with the partitioned-writes follow-up.
-- Memory: streaming inputs no longer require ephemeral storage for input data; only DuckDB's spill (configurable via `temp_directory`) touches the pod's ephemeral disk. POC posture; document via pod resource requests.
+- Memory: input parquet chunks are staged on the component's ephemeral disk (not held in RAM), and DuckDB's spill (configurable via `temp_directory`) shares that disk; only one HTTP read buffer is resident for input data. POC posture; size pod resource requests and ephemeral storage accordingly.

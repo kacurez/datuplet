@@ -351,9 +351,10 @@ the component.
 
 **Key points:**
 
-- Inputs stream from the Data Gateway via Arrow IPC and are materialized into
-  DuckDB in-memory tables before the user SQL runs. This is load-bearing: DuckDB's
-  `arrow_scan` extension does not support multi-pass reads on a streaming source.
+- Inputs arrive from the Data Gateway as parquet chunks over its HTTP read
+  endpoint, are staged on the component's ephemeral disk and exposed to the user
+  SQL as `read_parquet` views (bounded RAM; a one-shot stream cannot be scanned
+  twice, so nothing is materialized in memory).
 - The SQL `CREATE TABLE <name>` must match the `outputs.tables[].name` (or its
   `logicalName` if set); `logicalName` on inputs overrides the view name used in SQL.
 - `writeMode: FULL_LOAD` replaces the entire Iceberg table; `APPEND` adds rows.

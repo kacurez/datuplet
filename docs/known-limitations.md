@@ -232,6 +232,10 @@ manifest walk. A table written by a foreign writer that omits those properties
 reports `null` for both (the UI renders "—"); the `data_files[]` list is no
 longer returned.
 
+**Async read-ahead shares `memory_limit`.** DuckDB 2.0 keeps multiple object-storage reads in flight; the read-ahead budget is bounded by the same `memory_limit` the worker sets, so a wide scan can spill earlier than on 1.5. No separate knob is exposed.
+
+**Statically linked `tpch`/`tpcds` are reachable post-lock.** DuckDB 2.0.0 links the benchmark generators into the engine (`dbgen`, `dsdgen`, `tpch_queries()`, `tpcds_queries()`). They generate data in memory only, with no file or network reach, bounded by `memory_limit`, `max_temp_directory_size` and the request timeout; a statically linked extension has no runtime off-switch. `TestStaticallyLinkedExtensions` pins the exact linked set.
+
 ---
 
 ## Pipeline config (schema-first, RFC 027)

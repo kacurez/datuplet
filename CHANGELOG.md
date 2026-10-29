@@ -30,6 +30,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **DuckDB 2.0.0 LTS** in `sql-transform`, `query-worker` and `datuplet-query`
+  (`duckdb-go/v2 v2.20000.0`, was 1.5.3). The e2e DuckDB CLI is pinned to
+  2.0.0, and both DuckDB images now prove at build time that the baked
+  `iceberg`/`httpfs` extensions load offline. User-visible SQL dialect
+  changes, per the
+  [DuckDB 2.0 migration guide](https://duckdb.org/docs/2.0/operations_manual/migration.html):
+  `~`/`!~` now match partially; `!` (factorial) binds tighter; the
+  single-arrow lambda `x -> …` is disabled (use `lambda x : …`); integer
+  `//` and `%` by zero raise instead of returning NULL; an untyped `NULL`
+  column keeps type `NULL` instead of `INTEGER`; `X'…'`/`B'…'` literals are
+  BLOB/BITSTRING; `MERGE INTO` raises when one target row matches twice;
+  S3 settings in URL query parameters are ignored (use secrets). No
+  compatibility flags are set in either engine.
 - Unit and e2e test suites consolidated into table-driven tests; the e2e
   suite keeps one scenario per deployment behaviour.
 - **Bundled object store image is now `docker.io/pgsty/silo`** (Pigsty's

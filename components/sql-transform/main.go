@@ -3,14 +3,16 @@
 // Package main is the sql-transform component.
 //
 // The component:
-//   1. Opens an arrow IPC stream for each declared input via the DataGateway SDK
-//      (FORMAT_ARROW_IPC). DG row-group-streams parquet → arrow internally.
-//   2. Stream-writes each input's Arrow batches to a temp parquet file on local
-//      ephemeral disk (bounded RAM — only one batch alive at a time) and exposes
-//      it to user SQL as a DuckDB view via `read_parquet(...)`. The disk-stage
-//      replaces an earlier in-memory `CREATE TABLE AS SELECT * FROM <arrow_view>`
-//      that OOM'd on multi-GB inputs and required a multi-scan workaround for
-//      duckdb/duckdb#19040.
+//   1. Opens each declared input via the DataGateway SDK with
+//      FORMAT_PARQUET and takes the gateway's HTTP read endpoint from the reply
+//      (gRPC's 64 MiB message cap rules it out for large source files).
+//   2. GETs the stream chunk by chunk, streaming each response body to its own
+//      parquet file on local ephemeral disk (one HTTP read buffer resident), and
+//      exposes the chunk set to user SQL as a DuckDB view over
+//      `read_parquet(...)`. An input with no data files gets a zero-row
+//      placeholder view. The disk-stage replaces an earlier in-memory
+//      `CREATE TABLE AS SELECT * FROM <arrow_view>` that OOM'd on multi-GB
+//      inputs and needed a multi-scan workaround for duckdb/duckdb#19040.
 //   3. Executes the user-supplied SQL inside DuckDB.
 //   4. Streams each declared output back through the SDK's OpenWriter +
 //      WriteChunk path so DG owns parquet emission to the iceberg target
