@@ -8,8 +8,10 @@
 // inside the query-worker resolve the locally-cached copy — treated as a no-op
 // network download — instead of hitting the network at runtime.
 //
-// This binary is NEVER shipped in the final image; it lives only in the builder
-// stage.
+// The same binary also runs in the Dockerfiles' `verify` stage, under the
+// runtime user and HOME with no network, to prove the baked extensions load
+// offline. It is NEVER shipped in the final image; it lives only in the builder
+// and `verify` stages.
 package main
 
 import (
