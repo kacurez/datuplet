@@ -65,11 +65,24 @@ const (
 	seedNamespace = "qe"
 	seedTable     = "posts"
 	seedRowCount  = 7
+
+	// probeNamespace is a hyphenated namespace that sorts BEFORE seedNamespace,
+	// so attachCatalog's `USE lk."<first namespace>"` selects it and bare
+	// names resolve there. It proves the quoted-identifier USE path (a hyphen
+	// is not a bare identifier) and holds one row, distinct from seedRowCount.
+	probeNamespace = "a-hyphen"
+	probeTable     = "probe"
+	probeRowCount  = 1
 	// dummyCatalogJWT is a structurally valid (but unsigned) JWT shape: three
 	// base64url segments. attachCatalog's shape guard rejects malformed tokens
 	// before any SQL is built, so the fixture must use a well-formed shape.
 	// lakekeeper authn is disabled here, so it is never actually validated.
 	dummyCatalogJWT = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJxZSJ9.c2ln"
+	// siloImage is the S3 server + mc image for the fixture: the pinned
+	// drop-in from charts/datuplet-infra/values.yaml (MinIO's community
+	// images no longer pull). It serves `server /data --address :<port>` and
+	// bundles mc, so one image covers both the server and makeBucket.
+	siloImage = "docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z@sha256:7bb2aff6b89efe1cb1303c10fc21d579447434ed06649ac9ec05a5e2dbf30ad7"
 )
 
 func TestAttachIntegration(t *testing.T) {
@@ -83,8 +96,10 @@ func TestAttachIntegration(t *testing.T) {
 	fx := provision(ctx, t)
 	defer fx.teardown()
 
-	// --- Seed: namespace "qe", table "posts", seedRowCount committed rows. ---
+	// --- Seed: namespace "qe", table "posts", seedRowCount committed rows;
+	// namespace "a-hyphen", table "probe", probeRowCount committed rows. ---
 	seedPostsTable(ctx, t, fx)
+	seedProbeTable(ctx, t, fx)
 
 	// --- Attach + read via the production lifecycle: open → attach → lock. ---
 	engineTempDir := t.TempDir()
@@ -105,11 +120,16 @@ func TestAttachIntegration(t *testing.T) {
 	// (a) fully-qualified lk."qe"."posts" resolves to the seeded row count.
 	assertCount(ctx, t, e, `SELECT count(*) FROM lk."qe"."posts"`, seedRowCount, "fully-qualified")
 
-	// (b) two-part "qe".posts resolves post-USE (USE lk."qe" made lk current).
+	// (b) two-part "qe".posts resolves post-USE (USE lk."a-hyphen" made lk
+	// current, so the schema qualifier selects "qe" within it).
 	assertCount(ctx, t, e, `SELECT count(*) FROM "qe".posts`, seedRowCount, "two-part")
 
-	// (c) bare posts resolves post-USE (current schema is lk."qe").
-	assertCount(ctx, t, e, `SELECT count(*) FROM posts`, seedRowCount, "bare")
+	// (c) bare probe resolves post-USE: "a-hyphen" sorts before "qe", so
+	// attachCatalog ran USE lk."a-hyphen" and bare names resolve there.
+	assertCount(ctx, t, e, `SELECT count(*) FROM probe`, probeRowCount, "bare")
+
+	// (c2) two-part with a quoted hyphenated schema.
+	assertCount(ctx, t, e, `SELECT count(*) FROM "a-hyphen".probe`, probeRowCount, "two-part-hyphen")
 
 	// Regression / Spike 0.2 positive control: the count read STILL works after
 	// the lockdown posture is applied.
@@ -234,7 +254,7 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 	// 2. MinIO + bucket.
 	runDetachedEnv(t, "qe-it-minio",
 		[]string{"MINIO_ROOT_USER=" + minioRootUser, "MINIO_ROOT_PASSWORD=" + minioRootPassword},
-		"minio/minio:RELEASE.2024-12-18T13-15-44Z",
+		siloImage,
 		"server", "/data",
 		"--address", fmt.Sprintf(":%d", f.minioPort),
 	)
@@ -343,7 +363,8 @@ func waitPostgres(ctx context.Context, t *testing.T, port int) {
 	t.Fatalf("timed out waiting for postgres on :%d", port)
 }
 
-// makeBucket creates the warehouse bucket via a one-shot minio/mc container.
+// makeBucket creates the warehouse bucket via a one-shot silo container, which
+// bundles mc.
 func makeBucket(ctx context.Context, t *testing.T, f *fixture) {
 	t.Helper()
 	script := fmt.Sprintf(
@@ -352,7 +373,7 @@ func makeBucket(ctx context.Context, t *testing.T, f *fixture) {
 	)
 	out, err := exec.CommandContext(ctx, "docker", "run", "--rm", "--name", "qe-it-mc",
 		"--network", "host", "--entrypoint", "sh",
-		"minio/mc", "-c", script).CombinedOutput()
+		siloImage, "-c", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("create bucket: %v\n%s", err, out)
 	}
@@ -490,6 +511,59 @@ func seedPostsTable(ctx context.Context, t *testing.T, f *fixture) {
 		t.Fatalf("Commit: %v", err)
 	}
 	t.Logf("seeded %d rows into %s.%s", seedRowCount, seedNamespace, seedTable)
+}
+
+// seedProbeTable creates namespace "a-hyphen" + table "probe" through
+// lakekeeper with the same (id, title) schema as "posts" and commits
+// probeRowCount rows.
+func seedProbeTable(ctx context.Context, t *testing.T, f *fixture) {
+	t.Helper()
+	cl, err := catalogwriter.NewClient(ctx, catalogwriter.ClientConfig{
+		Name:          "qe-it",
+		URI:           f.catalogURL(),
+		Warehouse:     f.projectID + "/" + f.warehouseName,
+		TokenProvider: func(context.Context) (string, error) { return dummyCatalogJWT, nil },
+	})
+	if err != nil {
+		t.Fatalf("catalogwriter.NewClient: %v", err)
+	}
+
+	if err := cl.Catalog.CreateNamespace(ctx, icebergtable.Identifier{probeNamespace}, iceberg.Properties{}); err != nil {
+		t.Fatalf("CreateNamespace %q: %v", probeNamespace, err)
+	}
+
+	icebergSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "title", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	tbl, err := cl.Catalog.CreateTable(ctx, icebergtable.Identifier{probeNamespace, probeTable}, icebergSchema)
+	if err != nil {
+		t.Fatalf("CreateTable %s.%s: %v", probeNamespace, probeTable, err)
+	}
+
+	md1 := arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"1"})
+	md2 := arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"2"})
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false, Metadata: md1},
+		{Name: "title", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: md2},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	b.Field(0).(*array.Int64Builder).Append(1)
+	b.Field(1).(*array.StringBuilder).Append("probe-1")
+	rec := b.NewRecord()
+	defer rec.Release()
+
+	txn := tbl.NewTransaction()
+	arrowTable := array.NewTableFromRecords(rec.Schema(), []arrow.Record{rec})
+	defer arrowTable.Release()
+	if err := txn.AppendTable(ctx, arrowTable, int64(probeRowCount), nil); err != nil {
+		t.Fatalf("AppendTable: %v", err)
+	}
+	if _, err := txn.Commit(ctx); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	t.Logf("seeded %d rows into %s.%s", probeRowCount, probeNamespace, probeTable)
 }
 
 // buildSeedRecord builds an Arrow record with field-ids matching the iceberg

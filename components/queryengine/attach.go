@@ -50,11 +50,12 @@ const catalogAlias = "lk"
 const catalogSecretName = "lk_tok"
 
 // attachCatalog wires the embedded DuckDB engine to a lakekeeper iceberg-REST
-// catalog using the canonical form proven by RFC 022 Spike 0.1 (lakekeeper
-// v0.12.1 + DuckDB 1.5.3 iceberg ext). It MUST run after openEngine and BEFORE
-// lock(): ATTACH needs mutable config, and the first secret op initializes
-// DuckDB's secret manager via the local stored-secrets dir — which lock()'s
-// disabled_filesystems would block.
+// catalog using the canonical form proven by RFC 022 Spike 0.1 and re-proven on
+// DuckDB 2.0.0 (lakekeeper v0.12.1 + DuckDB 2.0.0 iceberg ext, spike report
+// 2026-10-28). It MUST run after openEngine and BEFORE lock(): ATTACH needs
+// mutable config, and the first secret op initializes DuckDB's secret manager
+// via the local stored-secrets dir — which lock()'s disabled_filesystems would
+// block.
 //
 // SECURITY: the catalog JWT is embedded as a SQL literal in CREATE SECRET.
 // No error or log line below ever includes a statement string that carries the
@@ -120,7 +121,7 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 	// x-project-id header, so a bare name resolves against lakekeeper's
 	// nil-UUID default project → 401/403). We pass it verbatim.
 	attach := fmt.Sprintf(
-		"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials')",
+		"ATTACH '%s' AS %s (TYPE ICEBERG, URI '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials')",
 		escapeSQL(r.Warehouse), catalogAlias, escapeSQL(r.LakekeeperURL), catalogSecretName,
 	)
 	if _, err := e.conn.ExecContext(ctx, attach); err != nil {
@@ -138,9 +139,10 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 	// there is nothing to resolve, and fully-qualified lk.<ns>.<table> always
 	// works regardless.
 	//
-	// duckdb_schemas() exposes the owning catalog as `database_name` in this
-	// DuckDB build (1.5.3); `catalog_name` from the spike note is not a column
-	// here. Filter on database_name == the attach alias.
+	// duckdb_schemas() exposes the owning catalog as `database_name` on DuckDB
+	// 2.0.0 (alongside new parent_schema / parent_schema_oid columns, unused
+	// here); `catalog_name` from the spike note is not a column. Filter on
+	// database_name == the attach alias.
 	var schema string
 	// catalogAlias is a package constant ("lk"), not caller input — this concat
 	// is injection-safe by construction.
