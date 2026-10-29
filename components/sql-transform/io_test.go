@@ -51,6 +51,10 @@ func TestNullTypedColumns(t *testing.T) {
 		{"map with NULL value", "t7", "SELECT MAP {'k': NULL} AS m", []string{"m"}},
 		{"name contains null", "t5", "SELECT 1 AS nullable_id", nil},
 		{"two hits keep column order", "t6", "SELECT NULL AS a, 1 AS b, NULL AS c", []string{"a", "c"}},
+		{"struct field named null", "t8", "SELECT {'null': 1} AS s", nil},
+		{"struct field named NULL", "t9", "SELECT {'NULL': 1} AS s", nil},
+		{"struct with NULL field then typed field", "t10", "SELECT {'a': NULL, 'b': 1} AS s", []string{"s"}},
+		{"struct field named NULL with list type", "t11", "SELECT {'NULL': [1]} AS s", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

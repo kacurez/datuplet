@@ -201,12 +201,15 @@ func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir
 	return isLast, n, nil
 }
 
-// nullTypeRe matches DuckDB's untyped-NULL type name as a whole word, top-level
-// or nested. DuckDB 2.0 prints it quoted: `"NULL"`, `"NULL"[]`,
-// `STRUCT(a "NULL")`, `MAP(VARCHAR, "NULL")`. It is applied to `column_type`
-// only, so a column NAME containing "null" is safe. Known limit: a STRUCT
-// field literally named `null` (`STRUCT("null" INTEGER)`) also matches.
-var nullTypeRe = regexp.MustCompile(`(?i)\bNULL\b`)
+// nullTypeRe matches DuckDB's untyped-NULL type name, top-level or nested, but
+// only in a TYPE position: followed by `[]`, a comma, a closing parenthesis or
+// the end of the string. DuckDB 2.0 prints it quoted: `"NULL"`, `"NULL"[]`,
+// `STRUCT(a "NULL")`, `MAP(VARCHAR, "NULL")`, `STRUCT(a "NULL", b INTEGER)`.
+// A struct field NAME is always followed by whitespace and its type
+// (`STRUCT("null" INTEGER)`), so a field literally named null does not match.
+// It is applied to `column_type` only, so a column NAME containing "null" is
+// safe too.
+var nullTypeRe = regexp.MustCompile(`(?i)(?:"NULL"|\bNULL\b)(?:\[\]|\s*[,)]|$)`)
 
 // nullTypedColumns returns, in column order, the columns of `table` (an
 // already-sanitized identifier) whose type is or contains the untyped NULL
