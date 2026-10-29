@@ -64,9 +64,10 @@ func TestStaticallyLinkedExtensions(t *testing.T) {
 	}
 	rows.Close()
 
-	// Exact set the spike measured on 2.0.0 (1.5.3 lacked tpcds/tpch). tpch/tpcds are
-	// accepted as present-by-design: in-memory generation, no FS/network reach, bounded by
-	// memory_limit / max_temp_directory_size / the request timeout (spec D5). Any growth or
+	// Exact set the spike measured on 2.0.0 (1.5.3 lacked tpcds/tpch). dbgen/dsdgen write into
+	// the CURRENT catalog — the attached lk — which is READ_ONLY, so they fail there before any
+	// request (TestLockdownDenyAttachedReadOnly); aimed at `memory` they generate in RAM, bounded
+	// by memory_limit / max_temp_directory_size / the request timeout (spec D5). Any growth or
 	// shrink fails here so a bindings bump reconciles it on purpose.
 	wantStatic := []string{"autocomplete", "core_functions", "icu", "json", "parquet", "tpcds", "tpch"}
 	// Canonical duckdb_extensions() names: there is no row called "postgres" or "mysql".

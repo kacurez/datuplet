@@ -1,7 +1,7 @@
 # DuckDB 2.0 upgrade — design
 
 **Date:** 2026-10-28
-**Status:** rev 4 (after the spike and three Codex rounds — see "Revision notes" at the end)
+**Status:** rev 5 (after the spike, three Codex rounds and `/code-review max` — see "Revision notes" at the end)
 **Risk tier (REVIEW.md):** High — `.github/workflows/e2e.yml` is a CODEOWNERS
 path, and `components/queryengine` lockdown is a sandbox-posture path.
 Before merge: green PR CI, `/code-review max`, `/security-review` on the
@@ -194,13 +194,17 @@ ones merely installed on the developer's machine.
 `tpch` and `tpcds` are new in 2.0.0 (1.5.3 linked
 `autocomplete, core_functions, icu, json, parquet`) and their functions
 (`dbgen`, `dsdgen`, `tpch_queries()`, `tpcds_queries()`) are reachable
-post-lock. They are **accepted as present-by-design**: in-memory data
-generation with no file or network reach, bounded by `memory_limit`,
-`max_temp_directory_size` and the request timeout; a statically linked
-extension has no runtime off-switch, so denying it would need a custom
+post-lock. They write into the CURRENT catalog, which on the production
+engine is the attached lakekeeper catalog `lk` (rev 5: the earlier
+"in-memory, no file or network reach" premise was measured on an
+unattached engine). The catalog is attached `READ_ONLY`, so against `lk`
+they fail before any catalog request; aimed at the `memory` catalog they
+still generate data in RAM, bounded by `memory_limit`,
+`max_temp_directory_size` and the request timeout. A statically linked
+extension has no runtime off-switch, so removing them would need a custom
 `libduckdb` build (out of scope). The test comment and
-`docs/known-limitations.md` say so; the PR body flags it for the
-maintainer.
+`docs/known-limitations.md` say so; `TestLockdownDenyAttachedReadOnly`
+proves the refusal.
 
 **Deny rows (post-lock), with explicit layer predicates.** A new
 `TestLockdownDenyQuack` (own file, own `quackProbe{name, stmt, class, subject}`
@@ -445,3 +449,20 @@ integration fixture's dead MinIO images are swapped for the chart's
 branch fails to bind). REVIEW.md's three-round cap applies: no fourth
 doc round; the harness is judged as code in Task 3's review, and the
 "is the approach wrong?" question is put to the maintainer in the PR.
+
+rev 5 (2026-10-29, after `/code-review max`): two review findings on the
+attached, locked engine. `CALL dbgen()` / `dsdgen()` create their tables
+in the current catalog — the attached `lk` — and issued stage-create
+POSTs to lakekeeper (the in-memory premise in D5 was measured on an
+unattached engine); and 2.0's iceberg catalog-mutating table functions
+(`iceberg_rollback_to_snapshot`, `set_iceberg_table_properties`) reached
+`/v1/transactions/commit`, a metadata-only write the read-only vended
+credentials cannot stop. Decision: `attachCatalog` attaches the catalog
+`READ_ONLY` — the ad-hoc query surface is read-only by product
+definition, so this is defence in depth and lakekeeper's FGA grant stays
+the authorization of record. A new `TestLockdownDenyAttachedReadOnly`
+runs the deny matrix against an in-process fake REST catalog that accepts
+every commit (a leak would succeed), with a negative control that drops
+`READ_ONLY` and must see the write reach the catalog; the integration
+write probe is now a hard assertion (INSERT / UPDATE / DELETE /
+`iceberg_rewrite_data_files` refused by the read-only attach).

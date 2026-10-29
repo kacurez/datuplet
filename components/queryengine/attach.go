@@ -120,8 +120,21 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 	// (Spike 0.1 §1 — the extension's /v1/config handshake sends no
 	// x-project-id header, so a bare name resolves against lakekeeper's
 	// nil-UUID default project → 401/403). We pass it verbatim.
+	//
+	// READ_ONLY: the ad-hoc query surface (query-worker, datuplet-query, the
+	// storage preview, app renders) is read-only by product definition, so the
+	// engine refuses every write to lk before any catalog or storage request is
+	// issued: INSERT/UPDATE/DELETE/MERGE, CREATE/DROP/ALTER, the iceberg
+	// extension's catalog-mutating table functions (iceberg_rollback_to_snapshot,
+	// set_iceberg_table_properties, iceberg_rewrite_data_files, ...) and the
+	// statically linked dbgen/dsdgen, which write into the CURRENT catalog — lk
+	// after the USE below. Without it those reached lakekeeper's stage-create
+	// and /v1/transactions/commit endpoints on the locked engine. This is defence
+	// in depth: lakekeeper's FGA grant and the vended credentials remain the
+	// per-principal authorization of record. TestLockdownDenyAttachedReadOnly
+	// proves the refusal.
 	attach := fmt.Sprintf(
-		"ATTACH '%s' AS %s (TYPE ICEBERG, URI '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials')",
+		"ATTACH '%s' AS %s (TYPE ICEBERG, URI '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials', READ_ONLY)",
 		escapeSQL(r.Warehouse), catalogAlias, escapeSQL(r.LakekeeperURL), catalogSecretName,
 	)
 	if _, err := e.conn.ExecContext(ctx, attach); err != nil {

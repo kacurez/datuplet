@@ -17,6 +17,10 @@
 // (duckdb-go/v2 v2.20000.0), re-proven 2026-10-28; graduated from the RFC 022
 // Phase 0 lockdown spike.
 //
+// Writes THROUGH an attached catalog (dbgen/dsdgen into the current catalog, the
+// 2.0 iceberg catalog-mutating functions, DDL/DML on lk) are proven refused by the
+// READ_ONLY attach in lockdown_deny_attached_test.go.
+//
 // NOTE on duckdb_extensions(): calling duckdb_extensions() post-lock ERRORS,
 // because it reads the on-disk extension directory through the (now disabled)
 // LocalFileSystem. Production code must NEVER call duckdb_extensions() after

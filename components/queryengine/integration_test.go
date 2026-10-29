@@ -143,9 +143,10 @@ func TestAttachIntegration(t *testing.T) {
 	// attaches per-engine, which is fine). This proves the catalog-attached read
 	// path through Run end-to-end, plus the MaxRows cap on a real iceberg scan.
 	//
-	// ORDERING CONTRACT: must run before runLockdownDenyIntegration (its INSERT
-	// probe mutates the table off seedRowCount); do not add t.Parallel() to
-	// either. The count assertions here must see the pristine seeded table.
+	// ORDERING CONTRACT: must run before runLockdownDenyIntegration; do not add
+	// t.Parallel() to either. Its write probes are refused by the READ_ONLY
+	// attach today, but if that guard ever regressed they would mutate the table
+	// off seedRowCount — the count assertions here must see the pristine table.
 	runPublicEntrypointIntegration(ctx, t, fx)
 
 	// RFC 022 Task 1.4 (D): post-attach, post-lock deny additions that require
