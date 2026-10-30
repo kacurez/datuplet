@@ -30,6 +30,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **DuckDB 2.0.0 LTS** in `sql-transform`, `query-worker` and `datuplet-query`
+  (`duckdb-go/v2 v2.20000.0`, was 1.5.3). The e2e DuckDB CLI is pinned to
+  2.0.0, and both DuckDB images now prove at build time that the baked
+  `iceberg`/`httpfs` extensions load offline. `query-worker` and
+  `datuplet-query` now attach the lakekeeper catalog `READ_ONLY` and drop its
+  bearer secret before locking the engine, so the tested writes — including
+  DuckDB 2.0's `iceberg_rollback_to_snapshot` /
+  `set_iceberg_table_properties`, the statically linked `dbgen` / `dsdgen`,
+  and a second writable ATTACH with the stored token — are refused by the
+  engine before any catalog write request (binding may still read); lakekeeper's
+  FGA grant remains the authorization of record. User-visible SQL dialect
+  changes, per the
+  [DuckDB 2.0 migration guide](https://duckdb.org/docs/2.0/operations_manual/migration.html):
+  `~`/`!~` now match partially; `!` (factorial) binds tighter; the
+  single-arrow lambda `x -> …` is disabled (use `lambda x : …`); by-zero
+  integer `//` and `%`, DECIMAL `//` and `%`, and FLOAT/DOUBLE `//` raise
+  instead of returning NULL (DOUBLE `%` by zero returns NaN); an untyped `NULL`
+  column keeps type `NULL` instead of `INTEGER` (sql-transform now rejects
+  such an output column before the write with a FailedUser message naming the
+  cast to apply; on 1.5 it silently became INTEGER); `X'…'`/`B'…'` literals are
+  BLOB/BITSTRING; `MERGE INTO` raises when one target row matches twice;
+  S3 settings in URL query parameters are ignored (use secrets). No
+  compatibility flags are set in either engine.
 - Unit and e2e test suites consolidated into table-driven tests; the e2e
   suite keeps one scenario per deployment behaviour.
 - **Bundled object store image is now `docker.io/pgsty/silo`** (Pigsty's

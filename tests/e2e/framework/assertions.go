@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -106,6 +107,7 @@ func duckdbQuery(target QueryTarget, bucket, table, sql string) ([]map[string]an
 	fullSQL := fmt.Sprintf("%s %s", preamble, resolvedSQL)
 
 	cmd := exec.Command("duckdb", "-json", "-c", fullSQL)
+	cmd.Env = append(os.Environ(), "DUCKDB_AGENT_MODE=0") // 2.0 CLI agent mode would swap -json for Markdown; -json already prevents it, this makes it explicit.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("duckdb query failed\n  SQL: %s\n  output: %s\n  error: %w", fullSQL, string(out), err)

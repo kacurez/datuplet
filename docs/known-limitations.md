@@ -232,6 +232,10 @@ manifest walk. A table written by a foreign writer that omits those properties
 reports `null` for both (the UI renders "—"); the `data_files[]` list is no
 longer returned.
 
+**Async read-ahead shares `memory_limit`.** DuckDB 2.0 keeps multiple object-storage reads in flight; the read-ahead budget is bounded by the same `memory_limit` the worker sets, so read-ahead can make a wide scan reach `memory_limit` sooner than on 1.5. Because the locked engine cannot spill to disk, the query then fails (reported as a local-file-access policy error) rather than slowing down; raise the worker's memory limit for such scans. No separate knob is exposed.
+
+**Statically linked `tpch`/`tpcds` are reachable post-lock.** DuckDB 2.0.0 links the benchmark generators into the engine (`dbgen`, `dsdgen`, `tpch_queries()`, `tpcds_queries()`). The generators write into the CURRENT catalog, which is the attached lakekeeper catalog; because it is attached read-only, `CALL dbgen()` / `dsdgen()` against it fail before any catalog write request (binding may still read catalog metadata). Aimed at the in-memory `memory` catalog they still generate data in RAM, bounded by `memory_limit` and the request timeout; a statically linked extension has no runtime off-switch. `TestStaticallyLinkedExtensions` pins the exact set of statically linked extensions that `duckdb_extensions()` lists, and `TestLockdownDenyAttachedReadOnly` proves the refusal. That pin cannot see everything `libduckdb` links: v0.20000.0 links and registers nine components, and the two capability-style ones, `duckdb_httplib` and `duckdb_loadable_extensions`, are never listed by `duckdb_extensions()` and no API exposes them, so a change to them on a bindings bump goes unnoticed by the test.
+
 ---
 
 ## Pipeline config (schema-first, RFC 027)

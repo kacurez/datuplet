@@ -24,15 +24,31 @@ server query service.
 
 ## Read-only enforcement
 
-The engine does not structurally block writes. DuckDB's iceberg extension can
-write. Read-only is enforced by the FGA grant: a viewer receives read-only
-lakekeeper-vended STS credentials, so any catalog-qualified write (INSERT /
-UPDATE / DELETE / MERGE) fails at the catalog side when lakekeeper rejects the
-staging PUT or commit. Do not rely on engine-level write blocking.
+Read-only is enforced in two independent layers.
+
+- **Engine.** The lakekeeper catalog is attached `READ_ONLY` and its bearer
+  secret is dropped before the engine is locked, so user SQL cannot modify the
+  catalog through the engine nor attach it again with the stored token. DuckDB
+  rejects writes before issuing any catalog write request (stage-create,
+  commit, namespace create); binding such a statement may still read catalog
+  metadata and storage. Proven against a fake catalog for the statements in
+  `TestLockdownDenyAttachedReadOnly`: INSERT, CREATE / DROP / ALTER, the
+  iceberg extension's `iceberg_rollback_to_snapshot` and
+  `set/remove_iceberg_*_properties`, the statically linked `dbgen` / `dsdgen`
+  aimed at the catalog, and a re-ATTACH with the stored secret. UPDATE, DELETE
+  and `iceberg_rewrite_data_files` are asserted by the integration test, which
+  awaits a live run.
+- **Catalog.** Lakekeeper's FGA grant decides what the principal may do: a
+  viewer receives read-only vended credentials and lakekeeper rejects its
+  commits.
+
+The engine flag is defence in depth; FGA remains the authorization of record.
 
 ---
 
 ## Server query service
+
+The engine is DuckDB 2.0.0; see the CHANGELOG entry for the dialect changes versus 1.5.
 
 ### Enabling
 

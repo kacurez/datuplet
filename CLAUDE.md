@@ -84,6 +84,8 @@ OrbStack dev loop (namespace `datuplet`; `K8S_NS=datuplet-e2e` retargets):
 3. `scripts/verify-versions.sh` — chart versions and component tag in sync.
 4. `make sync-component-schemas` + `git diff --exit-code` on the chart copies.
 5. `make sync-appshell-schema` + `git diff --exit-code ui/appshell/vegaspec.schema.json`.
+6. `duckdb-modules` — `go test -tags duckdb_arrow` for `components/queryengine`
+   and `components/sql-transform` (warmed lockdown probes skip in CI).
 
 Not in PR CI, so run them yourself before a PR: `deadcode` and the chart
 golden-render diff (both only in `make lint`), and the OpenFGA integration
@@ -306,10 +308,10 @@ These are conventions a new contributor wouldn't infer from the code:
   bypasses Stringer — reviewers catch that one.
 - **`sql-transform` component**: runs user SQL inside an embedded DuckDB
   engine and is **credentials-clean** — it never holds S3, GCS, or
-  lakekeeper credentials. Inputs stream from Data Gateway via Arrow IPC
-  and are materialized into a DuckDB table before user SQL runs (workaround
-  for duckdb-go's GROUP BY / JOIN / UNION ALL bug against registered Arrow
-  streams). Outputs run `COPY <name> TO '<staged>.parquet'` and stream
+  lakekeeper credentials. Inputs arrive from Data Gateway as parquet chunks
+  over its HTTP read endpoint, are streamed to local temp files and exposed to
+  user SQL as `read_parquet` views (bounded RAM; a one-shot stream cannot be
+  scanned twice). Outputs run `COPY <name> TO '<staged>.parquet'` and stream
   the file back via the SDK.
 - **FGA model versioning**: `fgaModel.version` in
   `datuplet-app/values.yaml` and `platform.fgaModelVersion` in

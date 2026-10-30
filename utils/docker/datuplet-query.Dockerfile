@@ -41,12 +41,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 WORKDIR /build/utils/docker/install-duckdb-ext
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 HOME=/root go run -tags=duckdb_arrow . && \
+    CGO_ENABLED=1 go build -tags=duckdb_arrow -o /install-duckdb-ext . && \
+    HOME=/root /install-duckdb-ext && \
     echo "Baked extension directory:" && \
     find /root/.duckdb -type f | sort
 
 # ---- Runtime image --------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -66,3 +67,17 @@ ENV HOME=/home/datuplet
 COPY --from=builder /datuplet-query /usr/local/bin/datuplet-query
 
 ENTRYPOINT ["/usr/local/bin/datuplet-query"]
+
+# ---- Offline extension gate ------------------------------------------------
+# Proves, inside the runtime layout (user, HOME, libc, baked extension dir),
+# that INSTALL/LOAD iceberg + httpfs succeed with NO network. A mis-baked or
+# mis-pathed extension fails the build here instead of the first query.
+FROM runtime AS verify
+COPY --from=builder /install-duckdb-ext /ext-check
+USER datuplet
+ENV HOME=/home/datuplet
+RUN --network=none /ext-check && touch /tmp/ext-verified
+
+# ---- Final image: runtime + proof the gate ran ------------------------------
+FROM runtime
+COPY --from=verify /tmp/ext-verified /tmp/ext-verified

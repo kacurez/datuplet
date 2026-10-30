@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
@@ -198,6 +199,125 @@ func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir
 		return isLast, 0, nil
 	}
 	return isLast, n, nil
+}
+
+// nullTypeRe matches DuckDB's untyped-NULL type name, top-level or nested, but
+// only in a TYPE position: followed by `[]` or `[N]`, a comma, a closing
+// parenthesis or the end of the string. DuckDB 2.0 prints it quoted: `"NULL"`,
+// `"NULL"[]`, `"NULL"[2]`, `STRUCT(a "NULL")`, `MAP(VARCHAR, "NULL")`,
+// `STRUCT(a "NULL", b INTEGER)`. It is applied to `column_type` only, so a
+// column NAME containing "null" is safe, and hasNullType blanks the quoted
+// text that is not a type before matching.
+var nullTypeRe = regexp.MustCompile(`(?i)(?:"NULL"|\bNULL\b)(?:\[\d*\]|\s*[,)]|$)`)
+
+// quotedTokenRe matches one quoted token of a DESCRIBE type string: a
+// single-quoted ENUM label (`ENUM('null[2]', 'ok')`) or a double-quoted
+// identifier, which is either a struct field NAME (`STRUCT("value (null)"
+// INTEGER)`) or the NULL type itself (`"NULL"`). Embedded quotes are doubled.
+var quotedTokenRe = regexp.MustCompile(`'(?:[^']|'')*'|"(?:[^"]|"")*"`)
+
+// hasNullType reports whether a DESCRIBE column_type is or contains the
+// untyped NULL type. Quoted tokens are consumed left to right, whole: every
+// one except the `"NULL"` type token is blanked, so an ENUM label or field
+// name that looks like a type never matches, and a match can never start
+// inside or at the closing quote of a token (`STRUCT(a "NULL", " b" INTEGER)`).
+func hasNullType(typ string) bool {
+	masked := quotedTokenRe.ReplaceAllStringFunc(typ, func(tok string) string {
+		if strings.EqualFold(tok, `"NULL"`) {
+			return tok
+		}
+		return "_"
+	})
+	return nullTypeRe.MatchString(masked)
+}
+
+// nullCol is a column whose DESCRIBE type is or contains the NULL type.
+type nullCol struct{ name, typ string }
+
+// quoteIdent quotes a SQL identifier, doubling embedded double quotes.
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// nullTypedColumns returns, in column order, the columns of `table` (an
+// already-sanitized identifier) whose type is or contains the untyped NULL
+// type. DuckDB 2.0 keeps `SELECT NULL AS x` as type NULL (1.5 made it
+// INTEGER); Iceberg has no NULL type, so such a column cannot be written.
+// It describes a SELECT rather than the bare name: DuckDB rewrites a bare
+// `DESCRIBE tables|databases|schemas|variables` to SHOW, and the SELECT form
+// resolves the name through the same search path COPY uses.
+func nullTypedColumns(ctx context.Context, conn *sql.Conn, table string) ([]nullCol, error) {
+	rows, err := conn.QueryContext(ctx, "DESCRIBE SELECT * FROM "+table)
+	if err != nil {
+		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	dcols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+	}
+	// DESCRIBE yields column_name, column_type, null, key, default, extra;
+	// only the first two matter, so scan the rest into throwaway values.
+	var name, typ string
+	dest := make([]any, len(dcols))
+	dest[0], dest[1] = &name, &typ
+	for i := 2; i < len(dest); i++ {
+		dest[i] = new(any)
+	}
+
+	var hits []nullCol
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+		}
+		if hasNullType(typ) {
+			hits = append(hits, nullCol{name, typ})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
+	}
+	return hits, nil
+}
+
+// checkOutputTypes inspects every declared output, in order, and returns the
+// first problem: Iceberg has no NULL type, so the gateway rejects the Arrow
+// null column COPY would emit (HTTP 500 -> exit 20). Reported here as the
+// user-fixable problem it is (exit 1). Run it for all outputs before writing
+// any, so an earlier output is never committed when a later one fails.
+func checkOutputTypes(ctx context.Context, conn *sql.Conn, outs []sdk.OutputTableRef) error {
+	for _, out := range outs {
+		srcTable, err := sanitizeIdent(out.Name)
+		if err != nil {
+			return fmt.Errorf("output %s.%s: %w", out.Bucket, out.Table, err)
+		}
+		cols, err := nullTypedColumns(ctx, conn, srcTable)
+		if err != nil {
+			return fmt.Errorf("output %s.%s: inspect column types: %w", out.Bucket, out.Table, err)
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		also := ""
+		if len(cols) > 1 {
+			names := make([]string, len(cols)-1)
+			for i, c := range cols[1:] {
+				names[i] = c.name
+			}
+			also = fmt.Sprintf(" (also: %s)", strings.Join(names, ", "))
+		}
+		c := cols[0]
+		if t := strings.Trim(strings.TrimSpace(c.typ), `"`); strings.EqualFold(t, "NULL") {
+			return asUserErr(fmt.Errorf(
+				"output %s.%s: column %s has type NULL — DuckDB 2.0 keeps an untyped NULL as type NULL (1.5 made it INTEGER) and Iceberg has no NULL type; cast it explicitly, e.g. CAST(NULL AS VARCHAR) AS %s%s",
+				out.Bucket, out.Table, quoteIdent(c.name), quoteIdent(c.name), also))
+		}
+		return asUserErr(fmt.Errorf(
+			"output %s.%s: column %s has type %s, which contains the NULL type — DuckDB 2.0 keeps an untyped NULL as type NULL; nested column types (LIST, STRUCT, MAP, ARRAY) are not supported as Datuplet output columns, so project scalar columns instead (e.g. cast each element to a scalar type or unnest)%s",
+			out.Bucket, out.Table, quoteIdent(c.name), c.typ, also))
+	}
+	return nil
 }
 
 // writeOutput materializes one DuckDB table to local parquet then streams

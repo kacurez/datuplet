@@ -50,11 +50,12 @@ const catalogAlias = "lk"
 const catalogSecretName = "lk_tok"
 
 // attachCatalog wires the embedded DuckDB engine to a lakekeeper iceberg-REST
-// catalog using the canonical form proven by RFC 022 Spike 0.1 (lakekeeper
-// v0.12.1 + DuckDB 1.5.3 iceberg ext). It MUST run after openEngine and BEFORE
-// lock(): ATTACH needs mutable config, and the first secret op initializes
-// DuckDB's secret manager via the local stored-secrets dir — which lock()'s
-// disabled_filesystems would block.
+// catalog using the canonical form proven by RFC 022 Spike 0.1 and re-proven on
+// DuckDB 2.0.0 (lakekeeper v0.12.1 + DuckDB 2.0.0 iceberg ext, spike report
+// 2026-10-28). It MUST run after openEngine and BEFORE lock(): ATTACH needs
+// mutable config, and the first secret op initializes DuckDB's secret manager
+// via the local stored-secrets dir — which lock()'s disabled_filesystems would
+// block.
 //
 // SECURITY: the catalog JWT is embedded as a SQL literal in CREATE SECRET.
 // No error or log line below ever includes a statement string that carries the
@@ -119,8 +120,23 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 	// (Spike 0.1 §1 — the extension's /v1/config handshake sends no
 	// x-project-id header, so a bare name resolves against lakekeeper's
 	// nil-UUID default project → 401/403). We pass it verbatim.
+	//
+	// READ_ONLY: the ad-hoc query surface (query-worker, datuplet-query, the
+	// storage preview, app renders) is read-only by product definition, so
+	// DuckDB refuses writes to lk before issuing any catalog write request
+	// (stage-create, commit, namespace create): INSERT, CREATE/DROP/ALTER, the
+	// iceberg extension's catalog-mutating table functions
+	// (iceberg_rollback_to_snapshot, set/remove_iceberg_*_properties) and the
+	// statically linked dbgen/dsdgen, which write into the CURRENT catalog — lk
+	// after the USE below. Binding such a statement may still READ catalog
+	// metadata and storage. Without READ_ONLY those writes reached lakekeeper's
+	// stage-create and /v1/transactions/commit endpoints on the locked engine.
+	// TestLockdownDenyAttachedReadOnly proves exactly its listed statements
+	// against a fake catalog; UPDATE/DELETE/iceberg_rewrite_data_files are only
+	// asserted by the integration test. This is defence in depth: lakekeeper's
+	// FGA grant and the vended credentials remain the authorization of record.
 	attach := fmt.Sprintf(
-		"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials')",
+		"ATTACH '%s' AS %s (TYPE ICEBERG, URI '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials', READ_ONLY)",
 		escapeSQL(r.Warehouse), catalogAlias, escapeSQL(r.LakekeeperURL), catalogSecretName,
 	)
 	if _, err := e.conn.ExecContext(ctx, attach); err != nil {
@@ -138,9 +154,10 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 	// there is nothing to resolve, and fully-qualified lk.<ns>.<table> always
 	// works regardless.
 	//
-	// duckdb_schemas() exposes the owning catalog as `database_name` in this
-	// DuckDB build (1.5.3); `catalog_name` from the spike note is not a column
-	// here. Filter on database_name == the attach alias.
+	// duckdb_schemas() exposes the owning catalog as `database_name` on DuckDB
+	// 2.0.0 (alongside new parent_schema / parent_schema_oid columns, unused
+	// here); `catalog_name` from the spike note is not a column. Filter on
+	// database_name == the attach alias.
 	var schema string
 	// catalogAlias is a package constant ("lk"), not caller input — this concat
 	// is injection-safe by construction.
@@ -160,6 +177,15 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 		// resolve; fully-qualified lk.<ns>.<table> always works regardless.
 	default:
 		return fmt.Errorf("list catalog %s namespaces: %w", catalogAlias, err)
+	}
+
+	// lock_configuration does not block ATTACH: while the bearer secret is
+	// stored, post-lock user SQL could ATTACH the catalog again without
+	// READ_ONLY (SECRET lk_tok) and write through it. The attached catalog keeps
+	// its own credential state, so lk keeps working after the drop. The statement
+	// is a constant and carries no token.
+	if _, err := e.conn.ExecContext(ctx, "DROP SECRET "+catalogSecretName); err != nil {
+		return fmt.Errorf("DROP SECRET %s: %w", catalogSecretName, err)
 	}
 
 	return nil
