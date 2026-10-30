@@ -202,14 +202,25 @@ func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir
 }
 
 // nullTypeRe matches DuckDB's untyped-NULL type name, top-level or nested, but
-// only in a TYPE position: followed by `[]`, a comma, a closing parenthesis or
-// the end of the string. DuckDB 2.0 prints it quoted: `"NULL"`, `"NULL"[]`,
-// `STRUCT(a "NULL")`, `MAP(VARCHAR, "NULL")`, `STRUCT(a "NULL", b INTEGER)`.
+// only in a TYPE position: followed by `[]` or `[N]`, a comma, a closing
+// parenthesis or the end of the string. DuckDB 2.0 prints it quoted: `"NULL"`,
+// `"NULL"[]`, `"NULL"[2]`, `STRUCT(a "NULL")`, `MAP(VARCHAR, "NULL")`,
+// `STRUCT(a "NULL", b INTEGER)`.
 // A struct field NAME is always followed by whitespace and its type
 // (`STRUCT("null" INTEGER)`), so a field literally named null does not match.
 // It is applied to `column_type` only, so a column NAME containing "null" is
-// safe too.
-var nullTypeRe = regexp.MustCompile(`(?i)(?:"NULL"|\bNULL\b)(?:\[\]|\s*[,)]|$)`)
+// safe too. Known false positive, documented and pinned by a test: a struct
+// field name or ENUM label whose quoted text ends in `null)` or `null,`
+// (e.g. `{'value (null)': 1}`) still matches.
+var nullTypeRe = regexp.MustCompile(`(?i)(?:"NULL"|\bNULL\b)(?:\[\d*\]|\s*[,)]|$)`)
+
+// nullCol is a column whose DESCRIBE type is or contains the NULL type.
+type nullCol struct{ name, typ string }
+
+// quoteIdent quotes a SQL identifier, doubling embedded double quotes.
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
 
 // nullTypedColumns returns, in column order, the columns of `table` (an
 // already-sanitized identifier) whose type is or contains the untyped NULL
@@ -218,7 +229,7 @@ var nullTypeRe = regexp.MustCompile(`(?i)(?:"NULL"|\bNULL\b)(?:\[\]|\s*[,)]|$)`)
 // It describes a SELECT rather than the bare name: DuckDB rewrites a bare
 // `DESCRIBE tables|databases|schemas|variables` to SHOW, and the SELECT form
 // resolves the name through the same search path COPY uses.
-func nullTypedColumns(ctx context.Context, conn *sql.Conn, table string) ([]string, error) {
+func nullTypedColumns(ctx context.Context, conn *sql.Conn, table string) ([]nullCol, error) {
 	rows, err := conn.QueryContext(ctx, "DESCRIBE SELECT * FROM "+table)
 	if err != nil {
 		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
@@ -238,19 +249,58 @@ func nullTypedColumns(ctx context.Context, conn *sql.Conn, table string) ([]stri
 		dest[i] = new(any)
 	}
 
-	var hits []string
+	var hits []nullCol
 	for rows.Next() {
 		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
 		}
 		if nullTypeRe.MatchString(typ) {
-			hits = append(hits, name)
+			hits = append(hits, nullCol{name, typ})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
 	}
 	return hits, nil
+}
+
+// checkOutputTypes inspects every declared output, in order, and returns the
+// first problem: Iceberg has no NULL type, so the gateway rejects the Arrow
+// null column COPY would emit (HTTP 500 -> exit 20). Reported here as the
+// user-fixable problem it is (exit 1). Run it for all outputs before writing
+// any, so an earlier output is never committed when a later one fails.
+func checkOutputTypes(ctx context.Context, conn *sql.Conn, outs []sdk.OutputTableRef) error {
+	for _, out := range outs {
+		srcTable, err := sanitizeIdent(out.Name)
+		if err != nil {
+			return fmt.Errorf("output %s.%s: %w", out.Bucket, out.Table, err)
+		}
+		cols, err := nullTypedColumns(ctx, conn, srcTable)
+		if err != nil {
+			return fmt.Errorf("output %s.%s: inspect column types: %w", out.Bucket, out.Table, err)
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		also := ""
+		if len(cols) > 1 {
+			names := make([]string, len(cols)-1)
+			for i, c := range cols[1:] {
+				names[i] = c.name
+			}
+			also = fmt.Sprintf(" (also: %s)", strings.Join(names, ", "))
+		}
+		c := cols[0]
+		if t := strings.Trim(strings.TrimSpace(c.typ), `"`); strings.EqualFold(t, "NULL") {
+			return asUserErr(fmt.Errorf(
+				"output %s.%s: column %s has type NULL — DuckDB 2.0 keeps an untyped NULL as type NULL (1.5 made it INTEGER) and Iceberg has no NULL type; cast it explicitly, e.g. CAST(NULL AS VARCHAR) AS %s%s",
+				out.Bucket, out.Table, quoteIdent(c.name), quoteIdent(c.name), also))
+		}
+		return asUserErr(fmt.Errorf(
+			"output %s.%s: column %s has type %s, which contains the NULL type — DuckDB 2.0 keeps an untyped NULL as type NULL; nested column types (LIST, STRUCT, MAP, ARRAY) are not supported as Datuplet output columns, so project scalar columns instead (e.g. cast each element to a scalar type or unnest)%s",
+			out.Bucket, out.Table, quoteIdent(c.name), c.typ, also))
+	}
+	return nil
 }
 
 // writeOutput materializes one DuckDB table to local parquet then streams
@@ -269,23 +319,6 @@ func writeOutput(ctx context.Context, conn *sql.Conn, client *sdk.Client, workdi
 	srcTable, err := sanitizeIdent(out.Name)
 	if err != nil {
 		return 0, fmt.Errorf("output %s.%s: %w", out.Bucket, out.Table, err)
-	}
-
-	// Pre-flight: Iceberg has no NULL type, so the gateway rejects the Arrow
-	// null column COPY would emit (HTTP 500 -> exit 20). Catch it here, before
-	// anything is staged, as the user-fixable problem it is (exit 1).
-	nullCols, err := nullTypedColumns(ctx, conn, srcTable)
-	if err != nil {
-		return 0, fmt.Errorf("output %s.%s: inspect column types: %w", out.Bucket, out.Table, err)
-	}
-	if len(nullCols) > 0 {
-		also := ""
-		if len(nullCols) > 1 {
-			also = fmt.Sprintf(" (also: %s)", strings.Join(nullCols[1:], ", "))
-		}
-		return 0, asUserErr(fmt.Errorf(
-			"output %s.%s: column %q has type NULL — DuckDB 2.0 keeps an untyped NULL as type NULL (1.5 made it INTEGER) and Iceberg has no NULL type; cast it explicitly, e.g. CAST(NULL AS VARCHAR) AS %q%s",
-			out.Bucket, out.Table, nullCols[0], nullCols[0], also))
 	}
 
 	// Stage parquet locally so we can stream chunks to DG.

@@ -147,6 +147,11 @@ func run(ctx context.Context) error {
 		return asUserErr(fmt.Errorf("SQL execution: %w", err))
 	}
 
+	// Reject unwritable output column types before any output is written.
+	if err := checkOutputTypes(ctx, conn, cfg.OutputTables); err != nil {
+		return err
+	}
+
 	// Stream each declared output back through DG.
 	for _, out := range cfg.OutputTables {
 		rows, err := writeOutput(ctx, conn, client, workdir, out)
