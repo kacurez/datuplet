@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Revision 5 (post-execution)** — Task 7c added (the sql-transform NULL-type pre-flight, a maintainer decision after Task 7's probe); Task 3's sketch now shows the subject-bound `classExtensionUnavailable` predicate that landed (`145f8f6`), as spec D5 required.
+
 **Revision 4** — after the spike (Task 1, commit `324d979`) and Codex round 3 (4 Important, 1 Nit): the four prefix-routed Quack rows deny at the FS layer on 2.0 and get a `fsLayer` class plus a pre-lock `layer-naming` subtest; the listener is a deadline **drain barrier** (no goroutine) run after every statement; `lockedEngineViaAttach` itself enforces `QE_REQUIRE_WARMED=1`; the reject list drops bare `connect`; the inventory pins the exact 2.0.0 static set (`tpch`/`tpcds` accepted as present-by-design) and the canonical `postgres_scanner`/`mysql_scanner` names; Task 2 swaps the integration fixture's dead MinIO images for the chart's `pgsty/silo` pin; `icu` is linked, so the README `LOAD icu` note is dropped; Task 7 uses `datuplet query --sql`; the README `UNION ALL` example is removed; Task 8 asserts zero SKIPs. REVIEW.md's three-round cap: no fourth doc round — the harness is judged as code in Task 3's review and the approach question goes to the maintainer in the PR.
 
 **Revision 3** — rev 1 was reviewed by Codex (7 Important, 3 Nit): the spike commits only its report and the bump lands green in Task 2; the extension inventory runs pre-lock; a Docker `verify` stage executes the offline `INSTALL/LOAD` inside the image build (Task 4); the cluster task keeps a stack alive for the probes; the final gate adds the OpenFGA integration test; `DEFAULT_SCHEMA` is dropped; docs wording comes from `io.go` and documents the existing resource knobs. Rev 2 was reviewed again (5 Important, 1 Nit): the Quack rows now assert a deny-class predicate with a reject list, the listener is drained and a negative control proves it, `QE_REQUIRE_WARMED=1` makes the warmed run mandatory at the gate; the integration fixture replaces the bare `posts` assertion with bare `probe` and seeds one row; the kept-stack run uses the `datuplet` CLI (not the broken `make k8s-retry-duckdb`); the NULL probe writes its own `etl.null_probe` table; `main.go` header items 1 and 2 are both corrected and the README states the empty-input placeholder semantics.
@@ -63,7 +65,7 @@ the task that owns the code.
 1. **Any Quack entry point on a locked engine opens no socket** — the loopback listener's drain barrier in Task 3 must count zero connections after every row, on both the cold and the warmed engine.
 2. **A hyphenated namespace that sorts first** must resolve bare and two-part names after ATTACH (the `USE lk."<schema>"` quoting path). → Task 2 integration fixture.
 3. **`INSTALL/LOAD iceberg, httpfs` inside the final image with no network** must succeed under the runtime user and HOME. → Task 4 `verify` stage; a mis-baked image fails the build.
-4. **An untyped `NULL` output column in sql-transform** (`SELECT NULL AS x`) now has type `NULL`; the Data Gateway must commit it or fail as FailedUser, never FailedApplication. → Task 7 probe; a hard failure is a maintainer decision recorded in the report, not patched.
+4. **An untyped `NULL` output column in sql-transform** (`SELECT NULL AS x`) now has type `NULL`; the Data Gateway must commit it or fail as FailedUser, never FailedApplication. → Task 7 probe; a hard failure is a maintainer decision recorded in the report, not patched. (Decided after Task 7: FailedApplication on the cluster → Task 7c.)
 5. **The e2e CLI step fails closed**: a 404 on the renamed asset must fail the job at install time. → Task 5 keeps `set -euo pipefail` + `curl -f` + `duckdb --version`.
 
 ---
@@ -226,13 +228,18 @@ const (
 // listener is the network proof.
 var rejectRe = regexp.MustCompile(`(?i)(connection refused|could not connect|failed to connect|connection reset|timed out|unauthori[sz]ed|invalid token|parser error|syntax error)`)
 
-// classRe: verbatim phrases from the spike report (## Quack probe). The
-// subject (quack) is checked separately where set.
+// classRe: verbatim phrases from the spike report (## Quack probe).
+// classExtensionUnavailable is deliberately absent: its class phrase is bound
+// to the row's subject (subjectExtensionRe), so another extension's name
+// cannot satisfy it (spec D5).
 var classRe = map[denyClass]*regexp.Regexp{
-	classFSLayer:              regexp.MustCompile(`(?i)LocalFileSystem has been disabled`),
-	classExtensionUnavailable: regexp.MustCompile(`(?i)but it exists in the \w+ extension`),
-	classSecretTypeAbsent:     regexp.MustCompile(`(?i)secret type 'quack' does not exist`),
-	classConfigLocked:         regexp.MustCompile(`(?i)the configuration has been locked`),
+	classFSLayer:          regexp.MustCompile(`(?i)LocalFileSystem has been disabled`),
+	classSecretTypeAbsent: regexp.MustCompile(`(?i)secret type 'quack' does not exist`),
+	classConfigLocked:     regexp.MustCompile(`(?i)the configuration has been locked`),
+}
+
+func subjectExtensionRe(subject string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)but it exists in the ` + regexp.QuoteMeta(subject) + ` extension`)
 }
 
 type quackProbe struct {
@@ -253,7 +260,9 @@ var quackProbes = []quackProbe{
 }
 
 // denied reports whether err proves the row's class: err != nil,
-// !rejectRe.Match, classRe[class].Match, and (subject == "" || contains subject).
+// !rejectRe.Match, the class marker matches (for classExtensionUnavailable,
+// the subject-bound phrase), subjectExtensionRe(subject) matches when subject
+// is set, and the error contains names when set.
 func denied(err error, p quackProbe) (ok bool, why string)
 
 // quackListener owns one loopback *net.TCPListener per subtest. No accept
@@ -584,6 +593,62 @@ make undeploy-local
 git add docs/superpowers/specs/2026-10-28-duckdb-2-spike-report.md
 git commit -m "docs: DuckDB 2.0 cluster verification results"
 ```
+
+---
+
+### Task 7c: sql-transform pre-flight — reject NULL-typed output columns as FailedUser
+
+**Added during execution (maintainer decision, 2026-10-29)** after Task 7's
+NULL probe (Review Focus 4) failed as FailedApplication: DuckDB 2.0 keeps an
+untyped `SELECT NULL AS x` as a column of type `NULL` (1.5.3 silently made it
+`INTEGER`); `COPY … TO parquet` emits an Arrow `null` column, the Data
+Gateway's type mapping rejects it (HTTP 500 `unsupported Arrow type: null`),
+and sql-transform exited 20. The exit-code contract says a user-fixable problem
+is FailedUser (exit 1), so the component checks before the write.
+
+**Model:** sonnet
+
+**Files:**
+- Modify: `components/sql-transform/io.go` — `checkOutputTypes` runs over
+  every declared output before any `COPY`; `nullTypedColumns` describes the
+  output via `SELECT * FROM <ident>` (so reserved bare names and temp tables
+  resolve like `COPY` does) and returns, in column order, every column whose
+  `column_type` is or contains the untyped `NULL` type.
+- Create: `components/sql-transform/io_test.go` (`//go:build duckdb_arrow`).
+- Modify: `components/sql-transform/README.md` ("## DuckDB engine"),
+  `CHANGELOG.md` (the "DuckDB 2.0.0 LTS" bullet).
+
+**Interfaces:**
+- Consumes: `asUserErr(err error) error` (main.go) — the only way `main()`
+  exits 1; the pinned `*sql.Conn`.
+- Produces: `hasNullType(typ string) bool` — DESCRIBE on 2.0 prints the NULL
+  type quoted (`"NULL"`, `"NULL"[]`, `"NULL"[N]`, `STRUCT(a "NULL")`,
+  `MAP(VARCHAR, "NULL")`); quoted tokens (ENUM labels, struct field names) are
+  consumed whole and blanked unless they are the `"NULL"` type token itself,
+  so a label or field name that looks like a type never matches.
+
+- [ ] **Step 1: Failing tests first** (`io_test.go`): `TestNullTypedColumns`
+  table — untyped NULL, cast NULL (no hit), `[NULL]`, `{'a': NULL}`,
+  `MAP {'k': NULL}`, name-contains-null (no hit), two hits keep column order,
+  struct fields named `null`/`NULL` (no hit), reserved bare table names
+  (`tables`, `schemas`, …), `array_value(NULL)`, ENUM labels and quoted field
+  names ending in `null)` / `null[2]` / `null,` (no hit), and a NULL field
+  followed by a quoted field name starting with whitespace (hit).
+  `TestNullTypedColumnsResolvesLikeCopy` (temp table + view);
+  `TestCheckOutputTypesRejectsNullTypedColumnAsUserError` — `*userErr`, the
+  message names the column, `type NULL` and `CAST(NULL AS VARCHAR) AS "<col>"`
+  (nested types get no cast hint); a clean first output is not named.
+
+- [ ] **Step 2: Implement** as specified; run
+  `cd components/sql-transform && CGO_ENABLED=1 go test -tags duckdb_arrow -count=1 ./...`
+  → PASS; `go vet -tags duckdb_arrow ./...` clean.
+
+- [ ] **Step 3: Docs** — README "## DuckDB engine": the NULL-typed output
+  column is rejected before the write as a user error naming the column and
+  the cast; CHANGELOG bullet gains the same sentence.
+
+- [ ] **Step 4: Commit** (landed as `41ed067`, refined by `f301c1f`,
+  `d76c34f`, `c5ee112`, `7d1754d`; each Codex-reviewed).
 
 ---
 

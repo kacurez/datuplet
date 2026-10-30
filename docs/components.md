@@ -387,9 +387,8 @@ exact declared column set (name + type, via the module's `ArrowTypeFor`
 vocabulary) with `WithTypedColumns`. Either sink's `Add`/`Finish` can return
 a `TypeViolationError` for a value that no longer fits its column's type —
 a user-error condition (map it to `sdk.ExitUserError`, not `ExitAppError`).
-Both are the writer-side counterpart of that module's existing Arrow reader
-(used by `sql-transform` to stream Arrow-IPC inputs); base `sdk/go` stays
-Arrow-free.
+Both are the writer-side counterpart of that module's existing Arrow reader;
+base `sdk/go` stays Arrow-free.
 
 **Always check `Commit`'s result, not just its error.** A per-table commit
 failure (an Iceberg schema conflict, a 409, a credential problem) comes back
