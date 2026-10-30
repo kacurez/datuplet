@@ -68,9 +68,24 @@ func TestNullTypedColumns(t *testing.T) {
 		{"reserved name variables", "variables", "SELECT NULL AS v", []string{"v"}},
 		{"fixed-size array of NULL", "t12", "SELECT array_value(NULL, NULL) AS a", []string{"a"}},
 		{"struct with fixed-size array of NULL", "t13", "SELECT {'a': array_value(NULL)} AS s", []string{"s"}},
-		// Known false positive, documented: a struct field name ending in
-		// `null)` looks like a NULL type to the regex.
-		{"struct field name ending in null) (known false positive)", "t14", "SELECT {'value (null)': 1} AS s", []string{"s"}},
+		// Quoted text that is not a type: struct field names and ENUM
+		// labels may end in `null)`, `null,` or `null[N]` without being
+		// the NULL type.
+		{"struct field name ending in null)", "t14", "SELECT {'value (null)': 1} AS s", nil},
+		{"struct field name with doubled quote ending in null)", "t15", `SELECT {'a"b null)': 1} AS s`, nil},
+		{"enum label null[2]", "t16", "SELECT 'null[2]'::ENUM('null[2]', 'ok') AS status", nil},
+		{"enum label with quote ending in null)", "t17", "SELECT 'ok'::ENUM('it''s null)', 'ok') AS e", nil},
+		{"enum label ending in null,", "t18", "SELECT 'ok'::ENUM('a null, b', 'ok') AS e", nil},
+		{"struct field with enum label null[2]", "t19", "SELECT {'f': 'ok'::ENUM('null[2]', 'ok')} AS s", nil},
+		{"struct with NULL field named like a type", "t20", "SELECT {'value (null)': NULL} AS s", []string{"s"}},
+		{"enum column next to a NULL column", "t21", "SELECT 'ok'::ENUM('null)', 'ok') AS e, NULL AS n", []string{"n"}},
+		// A quoted field name starting with whitespace follows the NULL
+		// token: `STRUCT(a "NULL", " b" INTEGER)`. Masking must consume
+		// `"NULL"` whole so no match starts at its closing quote.
+		{"NULL field followed by quoted field name starting with space", "t22", "SELECT {'a': NULL, ' b': 1} AS s", []string{"s"}},
+		{"list of NULL field followed by quoted field name", "t23", "SELECT {'a': [NULL], 'x y': 1} AS s", []string{"s"}},
+		{"struct field named null with NULL type", "t24", "SELECT {'null': NULL} AS s", []string{"s"}},
+		{"enum with space label next to NULL field", "t25", "SELECT {'a': 'x'::ENUM('x', ' y'), 'b': NULL} AS s", []string{"s"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -53,7 +53,7 @@ linked into the engine. An output declared as a VIEW evaluates lazily during
 the write, so a by-zero error there fails the run as an application error
 (exit 20) rather than a SQL error; materialize with `CREATE TABLE … AS` or
 guard with `TRY(…)` / `NULLIF`.
-An output column whose type is `NULL` (an untyped `SELECT NULL AS x`, which 1.5 silently made INTEGER) is rejected as a user error that names the column and the cast to apply (`CAST(NULL AS VARCHAR) AS x`); Iceberg has no NULL type. The check runs for all outputs before any is written. A nested column containing NULL (e.g. `[NULL]`) gets a different message with no cast hint, because nested types are not supported as output columns. Known false positive: a struct field or ENUM label ending in `null)` is also flagged.
+An output column whose type is `NULL` (an untyped `SELECT NULL AS x`, which 1.5 silently made INTEGER) is rejected as a user error that names the column and the cast to apply (`CAST(NULL AS VARCHAR) AS x`); Iceberg has no NULL type. The check runs for all outputs before any is written. A nested column containing NULL (e.g. `[NULL]`) gets a different message with no cast hint, because nested types are not supported as output columns.
 
 ## How inputs and outputs map to SQL
 

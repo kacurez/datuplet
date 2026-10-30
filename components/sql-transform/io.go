@@ -205,14 +205,31 @@ func readNextChunkToFile(ctx context.Context, hc *http.Client, endpoint, workdir
 // only in a TYPE position: followed by `[]` or `[N]`, a comma, a closing
 // parenthesis or the end of the string. DuckDB 2.0 prints it quoted: `"NULL"`,
 // `"NULL"[]`, `"NULL"[2]`, `STRUCT(a "NULL")`, `MAP(VARCHAR, "NULL")`,
-// `STRUCT(a "NULL", b INTEGER)`.
-// A struct field NAME is always followed by whitespace and its type
-// (`STRUCT("null" INTEGER)`), so a field literally named null does not match.
-// It is applied to `column_type` only, so a column NAME containing "null" is
-// safe too. Known false positive, documented and pinned by a test: a struct
-// field name or ENUM label whose quoted text ends in `null)` or `null,`
-// (e.g. `{'value (null)': 1}`) still matches.
+// `STRUCT(a "NULL", b INTEGER)`. It is applied to `column_type` only, so a
+// column NAME containing "null" is safe, and hasNullType blanks the quoted
+// text that is not a type before matching.
 var nullTypeRe = regexp.MustCompile(`(?i)(?:"NULL"|\bNULL\b)(?:\[\d*\]|\s*[,)]|$)`)
+
+// quotedTokenRe matches one quoted token of a DESCRIBE type string: a
+// single-quoted ENUM label (`ENUM('null[2]', 'ok')`) or a double-quoted
+// identifier, which is either a struct field NAME (`STRUCT("value (null)"
+// INTEGER)`) or the NULL type itself (`"NULL"`). Embedded quotes are doubled.
+var quotedTokenRe = regexp.MustCompile(`'(?:[^']|'')*'|"(?:[^"]|"")*"`)
+
+// hasNullType reports whether a DESCRIBE column_type is or contains the
+// untyped NULL type. Quoted tokens are consumed left to right, whole: every
+// one except the `"NULL"` type token is blanked, so an ENUM label or field
+// name that looks like a type never matches, and a match can never start
+// inside or at the closing quote of a token (`STRUCT(a "NULL", " b" INTEGER)`).
+func hasNullType(typ string) bool {
+	masked := quotedTokenRe.ReplaceAllStringFunc(typ, func(tok string) string {
+		if strings.EqualFold(tok, `"NULL"`) {
+			return tok
+		}
+		return "_"
+	})
+	return nullTypeRe.MatchString(masked)
+}
 
 // nullCol is a column whose DESCRIBE type is or contains the NULL type.
 type nullCol struct{ name, typ string }
@@ -254,7 +271,7 @@ func nullTypedColumns(ctx context.Context, conn *sql.Conn, table string) ([]null
 		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("DESCRIBE %s: %w", table, err)
 		}
-		if nullTypeRe.MatchString(typ) {
+		if hasNullType(typ) {
 			hits = append(hits, nullCol{name, typ})
 		}
 	}
