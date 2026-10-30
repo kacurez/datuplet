@@ -46,6 +46,9 @@ const (
 // listener is the network proof.
 var rejectRe = regexp.MustCompile(`(?i)(connection refused|could not connect|failed to connect|connection reset|timed out|unauthori[sz]ed|invalid token|parser error|syntax error)`)
 
+// setNameRe extracts the setting name from a classConfigLocked row's stmt.
+var setNameRe = regexp.MustCompile(`(?i)^SET\s+([a-z_][a-z0-9_]*)\s*=`)
+
 // classRe: verbatim phrases from the spike report (## Quack probe).
 // classExtensionUnavailable is deliberately absent: its class phrase is bound
 // to the row's subject (subjectExtensionRe), so another extension's name
@@ -286,6 +289,45 @@ func TestLockdownDenyQuack(t *testing.T) {
 		}
 	}
 
+	// lock_configuration refuses a SET before resolving the setting name, so a
+	// classConfigLocked row stays green on a typo or a renamed setting. Each
+	// such row must therefore name a setting that exists in the warmed state
+	// (httpfs loaded, which is where the S3 settings come from), checked
+	// pre-lock where duckdb_settings() still answers.
+	t.Run("config-locked-settings-exist", func(t *testing.T) {
+		ctx := context.Background()
+		e, err := openEngine(ctx, Request{TempDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("openEngine: %v", err)
+		}
+		t.Cleanup(func() { _ = e.Close() })
+		requireIcebergExtensions(t, e)
+		checked := 0
+		for _, p := range quackProbes {
+			if p.class != classConfigLocked {
+				continue
+			}
+			m := setNameRe.FindStringSubmatch(p.stmt)
+			if m == nil {
+				t.Errorf("configLocked row %q: stmt %q is not SET <name> = ...; the existence check cannot cover it", p.name, p.stmt)
+				continue
+			}
+			var n int
+			if err := e.conn.QueryRowContext(ctx,
+				`SELECT count(*) FROM duckdb_settings() WHERE name = ?`, m[1]).Scan(&n); err != nil {
+				t.Fatalf("duckdb_settings() lookup for %q: %v", m[1], err)
+			}
+			if n != 1 {
+				t.Errorf("configLocked row %q names setting %q, which duckdb_settings() lists %d time(s) with httpfs loaded; "+
+					"the lock error would not prove the setting is frozen", p.name, m[1], n)
+			}
+			checked++
+		}
+		if checked == 0 {
+			t.Fatal("no classConfigLocked row was checked")
+		}
+	})
+
 	// Cold: lock() with nothing loaded. warmOnly rows do not run here: without
 	// httpfs their setting does not exist, so a lock error would not prove it.
 	t.Run("cold", func(t *testing.T) {
@@ -303,7 +345,8 @@ func TestLockdownDenyQuack(t *testing.T) {
 
 // TestDeniedPredicate pins the predicate itself on synthetic errors: it must
 // accept each row's recorded 2.0.0 deny (first line, verbatim from the spike
-// report's ## Quack probe) and reject a success, a transport failure, and a
+// report's ## Quack probe) and reject a success, a transport failure (also one
+// that carries the row's class marker, which only rejectRe can catch), and a
 // diagnostic that blames the wrong extension or names the wrong object.
 func TestDeniedPredicate(t *testing.T) {
 	const fsLayerText = `Permission Error: File system LocalFileSystem has been disabled by configuration`
@@ -317,6 +360,10 @@ func TestDeniedPredicate(t *testing.T) {
 		"set-s3-deprecated-url-params": `Invalid Input Error: Cannot change configuration option ""s3_enable_deprecated_url_parameters"" - the configuration has been locked`,
 	}
 	const transportText = `IO Error: Could not connect to server error for HTTP HEAD to 'http://127.0.0.1:1/x.parquet'`
+	// transportText carries no class marker, so reject-transport passes on the
+	// class check alone. reject-marker-plus-transport keeps the class marker and
+	// adds a transport phrase, so only the rejectRe check can reject it.
+	const transportPhrase = `Could not connect to server`
 
 	type predicateCase struct {
 		name, row string
@@ -333,6 +380,7 @@ func TestDeniedPredicate(t *testing.T) {
 			predicateCase{"accept-spike-text/" + p.name, p.name, errors.New(line), true},
 			predicateCase{"reject-nil/" + p.name, p.name, nil, false},
 			predicateCase{"reject-transport/" + p.name, p.name, errors.New(transportText), false},
+			predicateCase{"reject-marker-plus-transport/" + p.name, p.name, errors.New(line + " " + transportPhrase), false},
 		)
 	}
 	cases = append(cases,

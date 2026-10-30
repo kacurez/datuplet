@@ -14,6 +14,12 @@ import (
 // off-switch, so the lockdown posture cannot keep it out: this set is part of
 // the post-lock capability surface (spec D5). Runs PRE-lock on purpose:
 // duckdb_extensions() is a documented post-lock deny.
+//
+// The pin covers the STATICALLY_LINKED rows duckdb_extensions() lists, not
+// everything libduckdb links: v0.20000.0 links and registers nine components,
+// and the two capability-style ones, duckdb_httplib and
+// duckdb_loadable_extensions, never appear as rows. No API exposes them, so a
+// bindings bump that changes them passes here unnoticed.
 func TestStaticallyLinkedExtensions(t *testing.T) {
 	ctx := context.Background()
 	e, err := openEngine(ctx, Request{TempDir: t.TempDir()})
@@ -64,7 +70,7 @@ func TestStaticallyLinkedExtensions(t *testing.T) {
 	}
 	rows.Close()
 
-	// Exact set the spike measured on 2.0.0 (1.5.3 lacked tpcds/tpch). dbgen/dsdgen write into
+	// Exact listed set the spike measured on 2.0.0 (1.5.3 lacked tpcds/tpch). dbgen/dsdgen write into
 	// the CURRENT catalog — the attached lk — which is READ_ONLY, so they fail there before any
 	// request (TestLockdownDenyAttachedReadOnly); aimed at `memory` they generate in RAM, bounded
 	// by memory_limit / max_temp_directory_size / the request timeout (spec D5). Any growth or

@@ -480,4 +480,9 @@ own valid catalog JWT can attach it writable, but they already have that
 lakekeeper access and FGA governs it; real lakekeeper rejects
 unauthenticated clients. Wording narrowed to what the tests prove: DuckDB
 rejects the listed statements before any catalog write request — binding
-may still read catalog metadata and storage.
+may still read catalog metadata and storage. The "exact" static set in D5
+and in the rev 4 note is exact only over the rows `duckdb_extensions()`
+lists: `libduckdb` v0.20000.0 links and registers nine components, and the
+two capability-style ones, `duckdb_httplib` and
+`duckdb_loadable_extensions`, never appear there and no API exposes them,
+so `TestStaticallyLinkedExtensions` cannot pin them.

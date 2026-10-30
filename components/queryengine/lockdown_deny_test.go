@@ -36,8 +36,10 @@ package queryengine
 
 import (
 	"context"
+	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -65,8 +67,9 @@ func lockedEngine(t *testing.T) (*engine, string) {
 }
 
 // lockedEngineViaAttach is the high-fidelity warm-up helper: it replays the
-// PRODUCTION pre-lock sequence by calling attachCatalog against a dead loopback
-// endpoint, IGNORING the (expected) ATTACH failure, then lock(). This is the
+// PRODUCTION pre-lock sequence by calling attachCatalog against a loopback
+// listener that accepts and closes every connection, IGNORING the (expected)
+// ATTACH failure, then lock(). This is the
 // single faithful way to reach lock() in the exact state production does:
 //
 //   - iceberg + httpfs LOADED (attachCatalog INSTALL+LOADs both before ATTACH);
@@ -74,7 +77,12 @@ func lockedEngine(t *testing.T) (*engine, string) {
 //     ICEBERG-type bearer secret (lk_tok), which initializes the manager via the
 //     local stored-secrets dir while the FS is still enabled;
 //   - HTTPFileSystem TOUCHED (the /v1/config handshake does a real HTTP GET),
-//     so its cert/config lookup-on-first-use already happened pre-lock;
+//     so its cert/config lookup-on-first-use already happened pre-lock. The
+//     helper's listener counts the connections that GET opened and requires at
+//     least one: attachCatalog wraps option-validation failures (bad
+//     ACCESS_DELEGATION_MODE, unknown option, missing secret) in the same
+//     "ATTACH catalog" text without any request, so the error text alone
+//     cannot prove this state;
 //   - the engine still UNLOCKED (attachCatalog fails at ATTACH, never reaching
 //     lock()), so lock() can then apply the posture.
 //
@@ -113,23 +121,53 @@ func lockedEngineViaAttach(t *testing.T) (*engine, string) {
 		}
 	}
 
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on loopback: %v", err)
+	}
+	var accepted atomic.Int64
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			_ = c.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-acceptDone
+	})
+
 	// Production pre-lock replay. attachCatalog LOADs iceberg+httpfs, creates the
 	// ICEBERG-type lk_tok secret (warming the manager), does the /v1/config HTTP
-	// handshake (warming HTTPFileSystem), then FAILS at ATTACH against the dead
-	// endpoint. We require that the failure is at the ATTACH stage — anything
-	// earlier (extension setup, CREATE SECRET) means the warm-up did not reach
-	// the state we are replaying, so the test would prove the wrong thing.
+	// handshake (warming HTTPFileSystem), then FAILS at ATTACH because the
+	// listener closes the connection without a response. We require that the
+	// failure is at the ATTACH stage — anything earlier (extension setup, CREATE
+	// SECRET) means the warm-up did not reach the state we are replaying, so the
+	// test would prove the wrong thing — and that the handshake reached the
+	// listener. The listener counts a connection before closing it, so a client
+	// that saw the close has already been counted.
 	attachErr := attachCatalog(ctx, e, Request{
-		LakekeeperURL: "http://127.0.0.1:1/catalog",
+		LakekeeperURL: "http://" + ln.Addr().String() + "/catalog",
 		Warehouse:     "x/y",
 		CatalogJWT:    dummyAttachJWT,
 	})
 	if attachErr == nil {
-		t.Fatal("attachCatalog against a dead endpoint must fail at ATTACH")
+		t.Fatal("attachCatalog against an accept-and-close listener must fail at ATTACH")
 	}
 	if !strings.Contains(attachErr.Error(), "ATTACH catalog") {
 		t.Fatalf("attach-warm reached the wrong pre-lock state (want failure at the ATTACH stage): %v", attachErr)
 	}
+	if accepted.Load() < 1 {
+		t.Fatalf("attach-warm: warm-up failed before any HTTP request — option validation? "+
+			"HTTPFileSystem was never touched, so this engine is not the production pre-lock state: %v", attachErr)
+	}
+	t.Logf("attach-warm: ATTACH failed after %d connection(s) to the loopback listener: %v", accepted.Load(), attachErr)
 	if e.locked {
 		t.Fatal("engine must be unlocked after a failed ATTACH")
 	}
@@ -145,7 +183,7 @@ func lockedEngineViaAttach(t *testing.T) (*engine, string) {
 // dummyAttachJWT is a structurally valid (unsigned) JWT shape — three base64url
 // segments. attachCatalog's shape guard rejects malformed tokens before any SQL
 // is built, so the warm-up must use a well-formed shape. It is never validated:
-// ATTACH fails at the dead endpoint long before any token check.
+// ATTACH fails at the warm-up listener long before any token check.
 const dummyAttachJWT = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJxZSJ9.c2ln"
 
 // assertNoFilesCreated proves a denied write/export probe did not leak a file
@@ -451,7 +489,7 @@ func TestLockdownDenyUnredacted(t *testing.T) {
 // this test replays the EXACT production pre-lock sequence via
 // lockedEngineViaAttach: attachCatalog loads iceberg+httpfs, creates the
 // ICEBERG-type bearer secret, and touches the HTTP layer, then fails at ATTACH
-// against the dead endpoint; lock() runs after. So the post-lock http read here
+// against the warm-up listener; lock() runs after. So the post-lock http read here
 // is pure-network, and the connection-class assertion is meaningful.
 func TestLockdownEgressErrorClass(t *testing.T) {
 	ctx := context.Background()
