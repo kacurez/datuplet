@@ -84,6 +84,8 @@ OrbStack dev loop (namespace `datuplet`; `K8S_NS=datuplet-e2e` retargets):
 3. `scripts/verify-versions.sh` — chart versions and component tag in sync.
 4. `make sync-component-schemas` + `git diff --exit-code` on the chart copies.
 5. `make sync-appshell-schema` + `git diff --exit-code ui/appshell/vegaspec.schema.json`.
+6. `duckdb-modules` — `go test -tags duckdb_arrow` for `components/queryengine`
+   and `components/sql-transform` (warmed lockdown probes skip in CI).
 
 Not in PR CI, so run them yourself before a PR: `deadcode` and the chart
 golden-render diff (both only in `make lint`), and the OpenFGA integration

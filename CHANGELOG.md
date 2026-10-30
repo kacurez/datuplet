@@ -44,8 +44,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   changes, per the
   [DuckDB 2.0 migration guide](https://duckdb.org/docs/2.0/operations_manual/migration.html):
   `~`/`!~` now match partially; `!` (factorial) binds tighter; the
-  single-arrow lambda `x -> …` is disabled (use `lambda x : …`); integer
-  `//` and `%` by zero raise instead of returning NULL; an untyped `NULL`
+  single-arrow lambda `x -> …` is disabled (use `lambda x : …`); by-zero
+  integer `//` and `%`, DECIMAL `//` and `%`, and FLOAT/DOUBLE `//` raise
+  instead of returning NULL (DOUBLE `%` by zero returns NaN); an untyped `NULL`
   column keeps type `NULL` instead of `INTEGER` (sql-transform now rejects
   such an output column before the write with a FailedUser message naming the
   cast to apply; on 1.5 it silently became INTEGER); `X'…'`/`B'…'` literals are

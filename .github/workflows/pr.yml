@@ -49,6 +49,33 @@ jobs:
             ./pkg/datagateway/backend/... \
             ./pkg/datupleticeio/...
 
+  duckdb-modules:
+    name: DuckDB module tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            components/queryengine/go.sum
+            components/sql-transform/go.sum
+
+      # QE_REQUIRE_WARMED is deliberately NOT set: the runner may not reach
+      # extensions.duckdb.org reliably, so the warmed lockdown probes skip here.
+      # Run them locally with QE_REQUIRE_WARMED=1 (docs/dependency-upgrades.md).
+      - name: go test (queryengine)
+        run: cd components/queryengine && go test -tags duckdb_arrow -count=1 ./...
+
+      - name: go test (sql-transform)
+        run: cd components/sql-transform && go test -tags duckdb_arrow -count=1 ./...
+
   helm:
     name: helm lint + template
     runs-on: ubuntu-latest

@@ -44,11 +44,15 @@ default `6GB`, a hard cap on spill), `threads` (default `2`), `temp_directory`
 compatibility flags are set, so the 2.0 dialect applies as documented in the
 [migration guide](https://duckdb.org/docs/2.0/operations_manual/migration.html):
 `~`/`!~` match partially; `!` binds tighter; `x -> …` lambdas are disabled
-(`lambda x : …`); integer `//` and `%` by zero raise; an untyped `NULL`
+(`lambda x : …`); by-zero integer `//` and `%`, DECIMAL `//` and `%`, and
+FLOAT/DOUBLE `//` raise (DOUBLE `%` by zero returns NaN); an untyped `NULL`
 column keeps type `NULL`; `X'…'`/`B'…'` literals are BLOB/BITSTRING;
 `MERGE INTO` raises on a doubly matched target row. ICU collations and
 time-zone functions work without `LOAD icu`; the extension is statically
-linked into the engine.
+linked into the engine. An output declared as a VIEW evaluates lazily during
+the write, so a by-zero error there fails the run as an application error
+(exit 20) rather than a SQL error; materialize with `CREATE TABLE … AS` or
+guard with `TRY(…)` / `NULLIF`.
 An output column whose type is `NULL` (an untyped `SELECT NULL AS x`, which 1.5 silently made INTEGER) is rejected as a user error that names the column and the cast to apply (`CAST(NULL AS VARCHAR) AS x`); Iceberg has no NULL type. The check runs for all outputs before any is written. A nested column containing NULL (e.g. `[NULL]`) gets a different message with no cast hint, because nested types are not supported as output columns. Known false positive: a struct field or ENUM label ending in `null)` is also flagged.
 
 ## How inputs and outputs map to SQL
