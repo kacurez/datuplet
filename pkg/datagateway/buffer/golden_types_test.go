@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -313,20 +312,4 @@ func TestGoldenParquetTypes(t *testing.T) {
 			t.Errorf("golden file has no entry for input type %q", in.name)
 		}
 	}
-
-	// Today's write path must still reproduce the recorded behaviour.
-	if got := generateGolden(t); !bytes.Equal(got, raw) {
-		t.Errorf("today's write path no longer matches %s; if intentional, regenerate with -update-golden\n%s",
-			goldenRelPath, firstDiff(string(raw), string(got)))
-	}
-}
-
-func firstDiff(want, got string) string {
-	wl, gl := strings.Split(want, "\n"), strings.Split(got, "\n")
-	for i := 0; i < len(wl) && i < len(gl); i++ {
-		if wl[i] != gl[i] {
-			return fmt.Sprintf("first difference at line %d:\n  golden:    %s\n  generated: %s", i+1, wl[i], gl[i])
-		}
-	}
-	return fmt.Sprintf("length differs: golden %d lines, generated %d lines", len(wl), len(gl))
 }

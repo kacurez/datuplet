@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 
@@ -17,6 +18,11 @@ import (
 // plane (server wiring, gRPC/HTTP handlers). It lives in package datagateway
 // as a _test.go file: a separate test-helper package would import datagateway
 // while datagateway's own tests import it, which is an import cycle.
+//
+// It honours the DataPlane lifecycle contract: after Interrupt or Close every
+// writer/reader operation fails; Abort discards; an injected write failure
+// sticks and fails Close; retained batches are released on writer Close/Abort
+// and plane Close.
 type fakeDataPlane struct {
 	mu sync.Mutex
 
@@ -25,6 +31,7 @@ type fakeDataPlane struct {
 
 	writeErr      error
 	openReaderErr error
+	dead          bool // Interrupt or Close was called
 	interruptedF  bool
 	closed        bool
 	boot          BootInfo
@@ -36,16 +43,29 @@ type fakeTable struct {
 	batches []arrow.RecordBatch
 }
 
+var errFakePlaneDead = errors.New("fake: data plane interrupted or closed")
+
 func newFakeDataPlane() *fakeDataPlane {
 	return &fakeDataPlane{tables: map[string]fakeTable{}}
 }
 
 var _ DataPlane = (*fakeDataPlane)(nil)
 
-func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (TableWriter, error) {
-	// Context ownership: the writer's lifetime never derives from the Open ctx.
+func (p *fakeDataPlane) isDead() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.dead
+}
+
+func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (TableWriter, error) {
+	// Context ownership: the writer's lifetime never derives from the Open
+	// ctx (a cancelled Open ctx must not poison later Writes); it ends with
+	// the plane or an explicit Abort/Close.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dead {
+		return nil, errFakePlaneDead
+	}
 	w := &fakeTableWriter{plane: p, spec: spec}
 	p.writers = append(p.writers, w)
 	return w, nil
@@ -54,6 +74,9 @@ func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (Tab
 func (p *fakeDataPlane) OpenTableReader(_ context.Context, spec ReaderSpec) (RecordStream, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.dead {
+		return nil, errFakePlaneDead
+	}
 	if p.openReaderErr != nil {
 		return nil, p.openReaderErr
 	}
@@ -61,19 +84,27 @@ func (p *fakeDataPlane) OpenTableReader(_ context.Context, spec ReaderSpec) (Rec
 	if !ok {
 		return nil, fmt.Errorf("fake: unknown table %s.%s", spec.Namespace, spec.Table)
 	}
-	return &fakeRecordStream{table: t}, nil
+	return &fakeRecordStream{plane: p, table: t}, nil
 }
 
 func (p *fakeDataPlane) Interrupt() {
 	p.mu.Lock()
 	p.interruptedF = true
+	p.dead = true
 	p.mu.Unlock()
 }
 
+// Close marks the plane dead and releases every writer's retained batches
+// (idempotent).
 func (p *fakeDataPlane) Close() error {
 	p.mu.Lock()
 	p.closed = true
+	p.dead = true
+	writers := append([]*fakeTableWriter(nil), p.writers...)
 	p.mu.Unlock()
+	for _, w := range writers {
+		w.release()
+	}
 	return nil
 }
 
@@ -131,29 +162,62 @@ type fakeTableWriter struct {
 	plane *fakeDataPlane
 	spec  WriterSpec
 
-	mu      sync.Mutex
-	batches []arrow.RecordBatch
-	rows    int64
-	bytes   int64
-	closed  bool
-	aborted bool
-	files   []WrittenFile
+	mu       sync.Mutex
+	batches  []arrow.RecordBatch // retained until release()
+	nWrites  int
+	rows     int64
+	bytes    int64
+	failErr  error // first injected write failure; sticks, fails Close
+	aborted  bool
+	closed   bool
+	files    []WrittenFile
+	closeErr error
+}
+
+// release drops the writer's references to retained batches (idempotent).
+func (w *fakeTableWriter) release() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.releaseLocked()
+}
+
+func (w *fakeTableWriter) releaseLocked() {
+	for _, b := range w.batches {
+		b.Release()
+	}
+	w.batches = nil
 }
 
 func (w *fakeTableWriter) Write(_ context.Context, rec arrow.RecordBatch) error {
-	if err := w.plane.currentWriteErr(); err != nil {
-		return err
+	if w.plane.isDead() {
+		return errFakePlaneDead
 	}
+	injected := w.plane.currentWriteErr()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.closed || w.aborted {
-		return errors.New("fake: write on finished writer")
+	if w.aborted {
+		return errors.New("fake: write on aborted writer")
+	}
+	if w.closed {
+		return errors.New("fake: write on closed writer")
+	}
+	if w.failErr != nil {
+		return w.failErr
+	}
+	if injected != nil {
+		w.failErr = injected
+		return injected
 	}
 	rec.Retain() // the caller keeps ownership of rec; the fake keeps its own ref
 	w.batches = append(w.batches, rec)
+	w.nWrites++
 	w.rows += rec.NumRows()
 	for _, c := range rec.Columns() {
-		w.bytes += int64(c.Data().Len())
+		for _, buf := range c.Data().Buffers() {
+			if buf != nil {
+				w.bytes += int64(buf.Len())
+			}
+		}
 	}
 	return nil
 }
@@ -161,29 +225,43 @@ func (w *fakeTableWriter) Write(_ context.Context, rec arrow.RecordBatch) error 
 func (w *fakeTableWriter) QueuedBytes() int64 { return 0 }
 
 func (w *fakeTableWriter) Close(_ context.Context) ([]WrittenFile, error) {
+	dead := w.plane.isDead()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return w.files, nil
+		return w.files, w.closeErr // idempotent: same result as the first call
+	}
+	if w.aborted {
+		return nil, errors.New("fake: close on aborted writer")
 	}
 	w.closed = true
-	if w.rows > 0 {
+	switch {
+	case dead:
+		w.closeErr = errFakePlaneDead
+	case w.failErr != nil:
+		w.closeErr = fmt.Errorf("fake: writer failed earlier: %w", w.failErr)
+	case w.rows > 0:
 		w.files = []WrittenFile{{
 			Path:  w.spec.DataPrefix + w.spec.FilePrefix + "-00000.parquet",
 			Rows:  w.rows,
 			Bytes: w.bytes,
 		}}
 	}
-	return w.files, nil
+	w.releaseLocked()
+	return w.files, w.closeErr
 }
 
 func (w *fakeTableWriter) Abort() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.aborted = true
+	if !w.closed {
+		w.aborted = true
+	}
+	w.releaseLocked()
 }
 
-// recorded returns the batches written so far (still retained by the writer).
+// recorded returns the batches written so far; it is empty once the writer
+// has been closed, aborted or its plane closed (the batches are released).
 func (w *fakeTableWriter) recorded() []arrow.RecordBatch {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -191,9 +269,10 @@ func (w *fakeTableWriter) recorded() []arrow.RecordBatch {
 }
 
 type fakeRecordStream struct {
-	table fakeTable
-	next  int
-	done  bool
+	plane  *fakeDataPlane
+	table  fakeTable
+	next   int
+	closed bool
 }
 
 func (s *fakeRecordStream) Schema() *arrow.Schema { return s.table.schema }
@@ -202,7 +281,13 @@ func (s *fakeRecordStream) Next(ctx context.Context) (arrow.RecordBatch, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s.done || s.next >= len(s.table.batches) {
+	if s.plane.isDead() {
+		return nil, errFakePlaneDead
+	}
+	if s.closed {
+		return nil, errors.New("fake: Next on closed reader")
+	}
+	if s.next >= len(s.table.batches) {
 		return nil, io.EOF
 	}
 	b := s.table.batches[s.next]
@@ -211,14 +296,14 @@ func (s *fakeRecordStream) Next(ctx context.Context) (arrow.RecordBatch, error) 
 	return b, nil
 }
 
-func (s *fakeRecordStream) Close() error { s.done = true; return nil }
+func (s *fakeRecordStream) Close() error { s.closed = true; return nil }
 
 // ---- self-tests ----------------------------------------------------------
 
-func fakeTestBatch(t *testing.T, ids ...int64) (*arrow.Schema, arrow.RecordBatch) {
+func fakeTestBatchMem(t *testing.T, mem memory.Allocator, ids ...int64) (*arrow.Schema, arrow.RecordBatch) {
 	t.Helper()
 	sch := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
-	b := array.NewInt64Builder(memory.NewGoAllocator())
+	b := array.NewInt64Builder(mem)
 	defer b.Release()
 	b.AppendValues(ids, nil)
 	arr := b.NewArray()
@@ -226,8 +311,25 @@ func fakeTestBatch(t *testing.T, ids ...int64) (*arrow.Schema, arrow.RecordBatch
 	return sch, array.NewRecordBatch(sch, []arrow.Array{arr}, int64(len(ids)))
 }
 
+func fakeTestBatch(t *testing.T, ids ...int64) (*arrow.Schema, arrow.RecordBatch) {
+	return fakeTestBatchMem(t, memory.NewGoAllocator(), ids...)
+}
+
+// fakeInt32Batch is a 3-row int32 batch (narrower than fakeTestBatch's int64).
+func fakeInt32Batch(t *testing.T) arrow.RecordBatch {
+	t.Helper()
+	sch := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true}}, nil)
+	b := array.NewInt32Builder(memory.NewGoAllocator())
+	defer b.Release()
+	b.AppendValues([]int32{1, 2, 3}, nil)
+	arr := b.NewArray()
+	defer arr.Release()
+	return array.NewRecordBatch(sch, []arrow.Array{arr}, 3)
+}
+
 func TestFakeDataPlane_WriteCloseFiles(t *testing.T) {
 	p := newFakeDataPlane()
+	defer p.Close()
 	sch, rec := fakeTestBatch(t, 1, 2, 3)
 	defer rec.Release()
 
@@ -242,6 +344,9 @@ func TestFakeDataPlane_WriteCloseFiles(t *testing.T) {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
+	if n := len(p.writers[0].recorded()); n != 2 {
+		t.Errorf("recorded batches = %d, want 2", n)
+	}
 	files, err := w.Close(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -249,19 +354,64 @@ func TestFakeDataPlane_WriteCloseFiles(t *testing.T) {
 	if len(files) != 1 || files[0].Path != "s3://b/t/data/part-abcd1234-w1-00000.parquet" || files[0].Rows != 6 {
 		t.Fatalf("files = %+v", files)
 	}
-	again, _ := w.Close(context.Background())
-	if len(again) != 1 || again[0] != files[0] {
-		t.Errorf("second Close = %+v, want identical %+v", again, files)
-	}
-	if n := len(p.writers[0].recorded()); n != 2 {
-		t.Errorf("recorded batches = %d, want 2", n)
+	again, err := w.Close(context.Background())
+	if err != nil || len(again) != 1 || again[0] != files[0] {
+		t.Errorf("second Close = %+v, %v; want identical %+v", again, err, files)
 	}
 	w.Abort() // safe after Close
 	w.Abort() // idempotent
+	if again, err := w.Close(context.Background()); err != nil || len(again) != 1 {
+		t.Errorf("Close after Abort-after-Close = %+v, %v; want unchanged result", again, err)
+	}
+}
+
+// Bytes is the sum of the Arrow buffer lengths, so element width matters.
+func TestFakeDataPlane_BytesSumBufferLengths(t *testing.T) {
+	p := newFakeDataPlane()
+	defer p.Close()
+
+	sch64, rec64 := fakeTestBatch(t, 1, 2, 3)
+	defer rec64.Release()
+	rec32 := fakeInt32Batch(t)
+	defer rec32.Release()
+
+	bytesOf := func(sch *arrow.Schema, rec arrow.RecordBatch) int64 {
+		t.Helper()
+		w, _ := p.OpenTableWriter(context.Background(), WriterSpec{Schema: sch})
+		for i := 0; i < 2; i++ {
+			if err := w.Write(context.Background(), rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		files, err := w.Close(context.Background())
+		if err != nil || len(files) != 1 {
+			t.Fatalf("Close = %+v, %v", files, err)
+		}
+		return files[0].Bytes
+	}
+	var want64, want32 int64
+	for _, b := range rec64.Column(0).Data().Buffers() {
+		if b != nil {
+			want64 += int64(b.Len())
+		}
+	}
+	for _, b := range rec32.Column(0).Data().Buffers() {
+		if b != nil {
+			want32 += int64(b.Len())
+		}
+	}
+	got64, got32 := bytesOf(sch64, rec64), bytesOf(rec32.Schema(), rec32)
+	if got64 != 2*want64 || got32 != 2*want32 {
+		t.Errorf("bytes int64=%d int32=%d, want %d / %d", got64, got32, 2*want64, 2*want32)
+	}
+	if got64 < 2*3*8 || got32 < 2*3*4 || got64 <= got32 {
+		t.Errorf("bytes must reflect element width (>= rows*width, int64 > int32): int64=%d int32=%d", got64, got32)
+	}
 }
 
 func TestFakeDataPlane_ReaderReplay(t *testing.T) {
 	p := newFakeDataPlane()
+	defer p.Close()
 	sch, a := fakeTestBatch(t, 1, 2)
 	_, b := fakeTestBatch(t, 3)
 	defer a.Release()
@@ -272,7 +422,6 @@ func TestFakeDataPlane_ReaderReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rs.Close()
 	if !rs.Schema().Equal(sch) {
 		t.Errorf("schema mismatch")
 	}
@@ -291,6 +440,10 @@ func TestFakeDataPlane_ReaderReplay(t *testing.T) {
 	if rows != 3 {
 		t.Errorf("replayed rows = %d, want 3", rows)
 	}
+	rs.Close()
+	if _, err := rs.Next(context.Background()); err == nil || err == io.EOF {
+		t.Errorf("Next after reader Close = %v, want failure", err)
+	}
 	if _, err := p.OpenTableReader(context.Background(), ReaderSpec{Namespace: "raw", Table: "nope"}); err == nil {
 		t.Error("unknown table: want error")
 	}
@@ -298,6 +451,7 @@ func TestFakeDataPlane_ReaderReplay(t *testing.T) {
 
 func TestFakeDataPlane_FailureInjectionAndInterrupt(t *testing.T) {
 	p := newFakeDataPlane()
+	defer p.Close()
 	sch, rec := fakeTestBatch(t, 1)
 	defer rec.Release()
 
@@ -308,9 +462,6 @@ func TestFakeDataPlane_FailureInjectionAndInterrupt(t *testing.T) {
 		t.Errorf("Write err = %v, want boom", err)
 	}
 	p.failWrites(nil)
-	if err := w.Write(context.Background(), rec); err != nil {
-		t.Errorf("Write after clearing failure: %v", err)
-	}
 
 	p.setTable("raw", "t", sch)
 	p.failOpenReader(boom)
@@ -327,8 +478,145 @@ func TestFakeDataPlane_FailureInjectionAndInterrupt(t *testing.T) {
 	}
 }
 
+// An injected write failure sticks: later Writes keep failing and Close fails
+// with no files, even after the injection is cleared.
+func TestFakeDataPlane_InjectedFailureFailsClose(t *testing.T) {
+	p := newFakeDataPlane()
+	defer p.Close()
+	sch, rec := fakeTestBatch(t, 1, 2)
+	defer rec.Release()
+
+	w, _ := p.OpenTableWriter(context.Background(), WriterSpec{DataPrefix: "x/", FilePrefix: "f", Schema: sch})
+	if err := w.Write(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("boom")
+	p.failWrites(boom)
+	if err := w.Write(context.Background(), rec); !errors.Is(err, boom) {
+		t.Fatalf("Write = %v, want boom", err)
+	}
+	p.failWrites(nil)
+	if err := w.Write(context.Background(), rec); !errors.Is(err, boom) {
+		t.Errorf("Write after clearing injection = %v, want the sticky failure", err)
+	}
+	files, err := w.Close(context.Background())
+	if !errors.Is(err, boom) || len(files) != 0 {
+		t.Errorf("Close = %+v, %v; want boom and no files", files, err)
+	}
+	if again, err2 := w.Close(context.Background()); err2 == nil || len(again) != 0 {
+		t.Errorf("second Close = %+v, %v; want the same failure", again, err2)
+	}
+}
+
+func TestFakeDataPlane_WriteAbortClose(t *testing.T) {
+	p := newFakeDataPlane()
+	defer p.Close()
+	sch, rec := fakeTestBatch(t, 1)
+	defer rec.Release()
+
+	w, _ := p.OpenTableWriter(context.Background(), WriterSpec{DataPrefix: "x/", FilePrefix: "f", Schema: sch})
+	if err := w.Write(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	w.Abort()
+	w.Abort() // idempotent
+	if err := w.Write(context.Background(), rec); err == nil {
+		t.Error("Write after Abort: want error")
+	}
+	if files, err := w.Close(context.Background()); err == nil || len(files) != 0 {
+		t.Errorf("Close after Abort = %+v, %v; want error and no files", files, err)
+	}
+}
+
+func TestFakeDataPlane_InterruptAndCloseTerminate(t *testing.T) {
+	p := newFakeDataPlane()
+	defer p.Close()
+	sch, rec := fakeTestBatch(t, 1)
+	defer rec.Release()
+	p.setTable("raw", "t", sch, rec)
+
+	w, _ := p.OpenTableWriter(context.Background(), WriterSpec{DataPrefix: "x/", FilePrefix: "f", Schema: sch})
+	if err := w.Write(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := p.OpenTableReader(context.Background(), ReaderSpec{Namespace: "raw", Table: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.Interrupt()
+	if err := w.Write(context.Background(), rec); err == nil {
+		t.Error("Write after Interrupt: want error")
+	}
+	if files, err := w.Close(context.Background()); err == nil || len(files) != 0 {
+		t.Errorf("Close after Interrupt = %+v, %v; want error and no files", files, err)
+	}
+	if _, err := rs.Next(context.Background()); err == nil || err == io.EOF {
+		t.Errorf("Next after Interrupt = %v, want failure", err)
+	}
+	if _, err := p.OpenTableWriter(context.Background(), WriterSpec{Schema: sch}); err == nil {
+		t.Error("OpenTableWriter after Interrupt: want error")
+	}
+
+	// Plane Close terminates a fresh plane's writers/readers the same way.
+	p2 := newFakeDataPlane()
+	p2.setTable("raw", "t", sch, rec)
+	w2, _ := p2.OpenTableWriter(context.Background(), WriterSpec{Schema: sch})
+	rs2, _ := p2.OpenTableReader(context.Background(), ReaderSpec{Namespace: "raw", Table: "t"})
+	p2.Close()
+	p2.Close() // idempotent
+	if err := w2.Write(context.Background(), rec); err == nil {
+		t.Error("Write after plane Close: want error")
+	}
+	if _, err := rs2.Next(context.Background()); err == nil || err == io.EOF {
+		t.Errorf("Next after plane Close = %v, want failure", err)
+	}
+}
+
+// Retained batches are released by writer Close, writer Abort and plane Close
+// (each idempotent): once the caller has released its own refs, nothing stays
+// allocated.
+func TestFakeDataPlane_ReleasesRetainedBatches(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cleanup func(p *fakeDataPlane, w TableWriter)
+	}{
+		{"writer Close", func(_ *fakeDataPlane, w TableWriter) {
+			w.Close(context.Background())
+			w.Close(context.Background())
+		}},
+		{"writer Abort", func(_ *fakeDataPlane, w TableWriter) { w.Abort(); w.Abort() }},
+		{"plane Close", func(p *fakeDataPlane, _ TableWriter) { p.Close(); p.Close() }},
+		{"plane Interrupt then writer Close", func(p *fakeDataPlane, w TableWriter) {
+			p.Interrupt()
+			w.Close(context.Background())
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+			defer mem.AssertSize(t, 0)
+
+			p := newFakeDataPlane()
+			defer p.Close()
+			sch, rec := fakeTestBatchMem(t, mem, 1, 2, 3)
+			w, _ := p.OpenTableWriter(context.Background(), WriterSpec{Schema: sch})
+			for i := 0; i < 3; i++ {
+				if err := w.Write(context.Background(), rec); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rec.Release() // caller's own reference
+			if mem.CurrentAlloc() == 0 {
+				t.Fatal("writer should still retain the batches before cleanup")
+			}
+			tc.cleanup(p, w)
+		})
+	}
+}
+
 func TestFakeDataPlane_FactoryRecordsBootInfo(t *testing.T) {
 	p := newFakeDataPlane()
+	defer p.Close()
 	want := BootInfo{RunID: "r1", LakekeeperURL: "http://lk", ProjectID: "p", Warehouse: "w", Token: "jwt"}
 	plane, err := fakeFactory(p)(context.Background(), want)
 	if err != nil || plane != DataPlane(p) {
@@ -343,6 +631,7 @@ func TestFakeDataPlane_FactoryRecordsBootInfo(t *testing.T) {
 // accept later Writes, because its lifetime is the plane's, not the Open call's.
 func TestFakeDataPlane_WriterSurvivesCancelledOpenContext(t *testing.T) {
 	p := newFakeDataPlane()
+	defer p.Close()
 	sch, rec := fakeTestBatch(t, 1)
 	defer rec.Release()
 
@@ -357,5 +646,23 @@ func TestFakeDataPlane_WriterSurvivesCancelledOpenContext(t *testing.T) {
 	}
 	if _, err := w.Close(context.Background()); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+// BootInfo carries the raw run JWT; no default fmt verb may print it.
+func TestBootInfo_StringRedactsToken(t *testing.T) {
+	const secret = "eyJhbGciOiJSUzI1NiJ9.super-secret-payload.sig"
+	b := BootInfo{RunID: "run-1", LakekeeperURL: "http://lk", ProjectID: "proj", Warehouse: "wh", Token: secret}
+	for _, verb := range []string{"%v", "%+v", "%s"} {
+		out := fmt.Sprintf(verb, b)
+		if strings.Contains(out, secret) || strings.Contains(out, "super-secret") {
+			t.Errorf("%s leaks the token: %s", verb, out)
+		}
+		if !strings.Contains(out, "run-1") || !strings.Contains(out, "<redacted>") {
+			t.Errorf("%s = %q, want run id and redaction marker", verb, out)
+		}
+	}
+	if out := fmt.Sprintf("%v", &b); strings.Contains(out, secret) {
+		t.Errorf("%%v of *BootInfo leaks the token: %s", out)
 	}
 }

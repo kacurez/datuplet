@@ -2,6 +2,7 @@ package datagateway
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/apache/arrow-go/v18/arrow"
 
@@ -16,6 +17,14 @@ type BootInfo struct {
 	ProjectID     string // validated claim
 	Warehouse     string // validated claim (bare name)
 	Token         string // raw run JWT; never logged
+}
+
+// String redacts Token. Called by every fmt verb that defaults to the Stringer
+// (%v, %+v, %s). %#v still exposes fields; reviewers must catch that one
+// (same convention as catalogwriter.S3Creds / GCSCreds, RFC 019 §4.10).
+func (b BootInfo) String() string {
+	return fmt.Sprintf("BootInfo{run_id=%q lakekeeper_url=%q project_id=%q warehouse=%q token=<redacted>}",
+		b.RunID, b.LakekeeperURL, b.ProjectID, b.Warehouse)
 }
 
 // DataPlaneFactory builds the DataPlane once boot validation has passed.
