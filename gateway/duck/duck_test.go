@@ -365,13 +365,18 @@ func TestStreamBlocksOtherStatements(t *testing.T) {
 
 func threeBatchReader(t *testing.T, n int) array.RecordReader {
 	t.Helper()
+	return threeBatchReaderAlloc(t, n, memory.DefaultAllocator)
+}
+
+func threeBatchReaderAlloc(t *testing.T, n int, mem memory.Allocator) array.RecordReader {
+	t.Helper()
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
 	}, nil)
 	var recs []arrow.RecordBatch
 	for b := 0; b < 3; b++ {
-		bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+		bld := array.NewRecordBuilder(mem, schema)
 		for i := 0; i < n; i++ {
 			bld.Field(0).(*array.Int64Builder).Append(int64(b*n + i))
 			bld.Field(1).(*array.StringBuilder).Append("row-" + strconv.Itoa(b*n+i))
@@ -629,10 +634,16 @@ func TestStreamReleaseWhileFetchEntering(t *testing.T) {
 	}
 }
 
-func pendingViewCount(c *Conn) int {
+func pendingDropCount(c *Conn) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.pendingViews)
+	return len(c.pendingDrops)
+}
+
+func liveViewCount(c *Conn) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.views)
 }
 
 func copyView(t *testing.T, c *Conn, view string) {
@@ -642,6 +653,37 @@ func copyView(t *testing.T, c *Conn, view string) {
 		"COPY (SELECT * FROM %s) TO %s (FORMAT parquet)", Ident(view), Literal(out))); err != nil {
 		t.Fatalf("COPY: %v", err)
 	}
+}
+
+// scanReleased scans a view that survived its release (DROP failed or rolled
+// back). It must fail cleanly, never read freed memory.
+func scanReleased(t *testing.T, c *Conn, view string) {
+	t.Helper()
+	_, err := c.QueryRows(context.Background(), "SELECT count(*) FROM "+Ident(view))
+	if err == nil {
+		t.Fatalf("scan of released view %s: want error", view)
+	}
+}
+
+func TestArrowViewReleaseFreesReader(t *testing.T) {
+	_, c := openConn(t)
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	rr := threeBatchReaderAlloc(t, 100, mem)
+	release, err := c.RegisterArrowView("v", rr)
+	if err != nil {
+		t.Fatalf("RegisterArrowView: %v", err)
+	}
+	rr.Release() // the view holds its own reference
+	copyView(t, c, "v")
+	if mem.CurrentAlloc() == 0 {
+		t.Fatal("reader freed while the view still references it")
+	}
+	release()
+	// The C stream struct stays until Close; the reader and batches do not.
+	if n := liveViewCount(c); n != 1 {
+		t.Fatalf("live views = %d, want 1 (C stream kept until Close)", n)
+	}
+	mem.AssertSize(t, 0)
 }
 
 func TestArrowViewReleaseWhileStreamOpen(t *testing.T) {
@@ -658,8 +700,8 @@ func TestArrowViewReleaseWhileStreamOpen(t *testing.T) {
 		t.Fatalf("QueryStream: %v", err)
 	}
 	release() // DROP cannot run while s is open
-	if n := pendingViewCount(c); n != 1 {
-		t.Fatalf("pending views = %d, want 1 (stream must stay allocated)", n)
+	if n := pendingDropCount(c); n != 1 {
+		t.Fatalf("pending drops = %d, want 1", n)
 	}
 	s.Release()
 	// The next statement drops the view first: it is gone, never dangling.
@@ -667,8 +709,8 @@ func TestArrowViewReleaseWhileStreamOpen(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("query of a released view = %v, want a does-not-exist error", err)
 	}
-	if n := pendingViewCount(c); n != 0 {
-		t.Fatalf("pending views = %d after the next statement, want 0", n)
+	if n := pendingDropCount(c); n != 0 {
+		t.Fatalf("pending drops = %d after the next statement, want 0", n)
 	}
 }
 
@@ -684,21 +726,20 @@ func TestArrowViewDropFailureKeepsStream(t *testing.T) {
 	testHookDropView = func(string) error { return errors.New("injected drop failure") }
 	t.Cleanup(func() { testHookDropView = nil })
 	release()
-	if n := pendingViewCount(c); n != 1 {
-		t.Fatalf("pending views after a failed DROP = %d, want 1", n)
+	if n := pendingDropCount(c); n != 1 {
+		t.Fatalf("pending drops after a failed DROP = %d, want 1", n)
 	}
-	// The view still exists and its (consumed) stream is still allocated:
-	// scanning it is safe, whatever it returns.
-	_, _ = c.QueryRows(context.Background(), "SELECT count(*) FROM v")
-	if n := pendingViewCount(c); n != 1 {
-		t.Fatalf("pending views after a second failed DROP = %d, want 1", n)
+	scanReleased(t, c, "v") // the view survived; its stream is still allocated
+	if n := pendingDropCount(c); n != 1 {
+		t.Fatalf("pending drops after a second failed DROP = %d, want 1", n)
 	}
 	testHookDropView = nil
-	if _, err := c.QueryRows(context.Background(), "SELECT count(*) FROM v"); err == nil {
-		t.Fatal("view still reachable after the retried DROP succeeded")
+	_, err = c.QueryRows(context.Background(), "SELECT count(*) FROM v")
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("query after the retried DROP = %v, want a does-not-exist error", err)
 	}
-	if n := pendingViewCount(c); n != 0 {
-		t.Fatalf("pending views after the retried DROP = %d, want 0", n)
+	if n := pendingDropCount(c); n != 0 {
+		t.Fatalf("pending drops after the retried DROP = %d, want 0", n)
 	}
 }
 
@@ -718,8 +759,8 @@ func TestArrowViewDropFailureInAbortedTransaction(t *testing.T) {
 		t.Fatal("error(): want error")
 	}
 	release() // DROP fails: the transaction is aborted
-	if n := pendingViewCount(c); n != 1 {
-		t.Fatalf("pending views in an aborted transaction = %d, want 1", n)
+	if n := pendingDropCount(c); n != 1 {
+		t.Fatalf("pending drops in an aborted transaction = %d, want 1", n)
 	}
 	if err := c.Exec(context.Background(), "ROLLBACK"); err != nil {
 		t.Fatalf("ROLLBACK: %v", err)
@@ -727,8 +768,54 @@ func TestArrowViewDropFailureInAbortedTransaction(t *testing.T) {
 	if _, err := c.QueryRows(context.Background(), "SELECT count(*) FROM v"); err == nil {
 		t.Fatal("view still reachable after ROLLBACK and the retried DROP")
 	}
-	if n := pendingViewCount(c); n != 0 {
-		t.Fatalf("pending views = %d, want 0", n)
+	if n := pendingDropCount(c); n != 0 {
+		t.Fatalf("pending drops = %d, want 0", n)
+	}
+}
+
+// TestArrowViewReleaseInsideRolledBackTransaction is the review-2 round-1
+// scenario: the DROP runs inside the caller's transaction, ROLLBACK restores
+// the view, and the restored view must not point at freed memory.
+func TestArrowViewReleaseInsideRolledBackTransaction(t *testing.T) {
+	_, c := openConn(t)
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	rr := threeBatchReaderAlloc(t, 100, mem)
+	release, err := c.RegisterArrowView("v", rr)
+	if err != nil {
+		t.Fatalf("RegisterArrowView: %v", err)
+	}
+	rr.Release()
+	if err := c.Exec(context.Background(), "BEGIN TRANSACTION"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	s, err := c.QueryStream(context.Background(), "SELECT * FROM range(10)")
+	if err != nil {
+		t.Fatalf("QueryStream: %v", err)
+	}
+	release() // DROP deferred: the stream is open
+	s.Release()
+	// The pre-statement cleanup DROPs the view inside the transaction.
+	if got := scalarInt(t, c, "SELECT 1"); got != 1 {
+		t.Fatalf("SELECT 1 = %d", got)
+	}
+	if n := pendingDropCount(c); n != 0 {
+		t.Fatalf("pending drops after the in-transaction DROP = %d, want 0", n)
+	}
+	if err := c.Exec(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK: %v", err)
+	}
+	// ROLLBACK restored the view. Its C stream is still allocated (until
+	// Close) and detached from the reader: the scan fails cleanly.
+	if n := liveViewCount(c); n != 1 {
+		t.Fatalf("live views = %d, want 1", n)
+	}
+	_, err = c.QueryRows(context.Background(), "SELECT count(*) FROM v")
+	if err == nil || !strings.Contains(err.Error(), errViewReleased.Error()) {
+		t.Fatalf("scan of the restored view = %v, want %q", err, errViewReleased)
+	}
+	mem.AssertSize(t, 0) // the reader was released at release(), not at Close
+	if got := scalarInt(t, c, "SELECT 2"); got != 2 {
+		t.Fatalf("query after the failed scan = %d, want 2", got)
 	}
 }
 
@@ -742,8 +829,8 @@ func TestArrowViewFreedAtClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	rr := threeBatchReader(t, 10)
-	defer rr.Release()
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	rr := threeBatchReaderAlloc(t, 10, mem)
 	r1, err := c.RegisterArrowView("v1", rr)
 	if err != nil {
 		t.Fatalf("RegisterArrowView v1: %v", err)
@@ -752,20 +839,19 @@ func TestArrowViewFreedAtClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterArrowView v2: %v", err)
 	}
+	rr.Release()
 	testHookDropView = func(string) error { return errors.New("injected drop failure") }
 	t.Cleanup(func() { testHookDropView = nil })
 	r1()
-	if n := pendingViewCount(c); n != 1 {
-		t.Fatalf("pending views = %d, want 1", n)
+	if n := liveViewCount(c); n != 2 {
+		t.Fatalf("live views = %d, want 2", n)
 	}
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if n := pendingViewCount(c); n != 0 {
-		t.Fatalf("pending views after Close = %d, want 0 (freed)", n)
+	if n, d := liveViewCount(c), pendingDropCount(c); n != 0 || d != 0 {
+		t.Fatalf("after Close: live views = %d, pending drops = %d, want 0, 0", n, d)
 	}
-	r2() // after Close: frees immediately, no DROP attempted
-	if n := pendingViewCount(c); n != 0 {
-		t.Fatalf("pending views after release on a closed conn = %d, want 0", n)
-	}
+	mem.AssertSize(t, 0) // v2 was never released by its caller; Close freed it
+	r2()                 // after Close: a no-op
 }

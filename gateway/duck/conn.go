@@ -40,10 +40,11 @@ type Conn struct {
 	mu     sync.Mutex // guards closed, stream and the handle against Interrupt
 	closed bool
 	stream *Stream
-	// pendingViews are released arrow views whose DROP has not succeeded
-	// yet. Their C streams stay allocated until the DROP succeeds (retried
-	// before every statement) or the connection is disconnected.
-	pendingViews []*arrowView
+	// views holds every registered arrow view's C stream until Close (see
+	// arrowview.go for why a DROP never frees it). pendingDrops are released
+	// views whose DROP has not run yet, retried before every statement.
+	views        []*arrowView
+	pendingDrops []string
 
 	interrupts atomic.Uint64 // bumped by every Interrupt call
 }
@@ -313,11 +314,12 @@ func detach(v any) any {
 
 // RegisterArrowView exposes r as a temporary view named name on this
 // connection (duckdb_arrow_scan). The view reads r once: scan it in one
-// statement. release drops the view and then frees the exported stream; call
-// it after the statement reading the view has finished, on this goroutine.
-// If the DROP cannot run now (open Stream, failed statement, unusable DB) the
-// view stays registered and its stream allocated; the DROP is retried before
-// the connection's next statement, and Close frees everything.
+// statement. release releases r and drops the view; call it after the
+// statement reading the view has finished, on this goroutine. If the DROP
+// cannot run now (open Stream, failed statement, unusable DB) it is retried
+// before the connection's next statement. The small exported C stream struct
+// stays allocated until Close (see arrowview.go), so a view restored by a
+// ROLLBACK fails its scan instead of reading freed memory.
 func (c *Conn) RegisterArrowView(name string, r array.RecordReader) (release func(), err error) {
 	if err := c.ready(); err != nil {
 		return nil, err
@@ -326,43 +328,44 @@ func (c *Conn) RegisterArrowView(name string, r array.RecordReader) (release fun
 	return registerArrowView(c, name, r)
 }
 
-// releaseView queues v for dropping and tries to drop it right away.
+// releaseView detaches the caller's reader from the view's stream and drops
+// the view now if the connection is free, else before its next statement.
+// The C stream itself stays allocated until Close.
 func (c *Conn) releaseView(v *arrowView) {
+	v.reader.Release() // the reference registerArrowView took: detaches
+	v.reader.detach()  // detach even if DuckDB still holds the export's reference
 	c.mu.Lock()
 	if c.closed {
-		// Disconnect already destroyed the connection's temporary views.
 		c.mu.Unlock()
-		v.free()
 		return
 	}
-	c.pendingViews = append(c.pendingViews, v)
+	c.pendingDrops = append(c.pendingDrops, v.name)
 	c.mu.Unlock()
 	if c.ready() == nil {
 		c.dropPendingViews()
 	}
 }
 
-// dropPendingViews drops every pending view and frees its stream. A view
-// whose DROP fails stays pending. The caller has checked ready().
+// dropPendingViews drops released views. A failed DROP stays pending and is
+// retried before the next statement; memory safety does not depend on it.
+// The caller has checked ready().
 func (c *Conn) dropPendingViews() {
 	c.mu.Lock()
-	views := c.pendingViews
-	c.pendingViews = nil
+	names := c.pendingDrops
+	c.pendingDrops = nil
 	c.mu.Unlock()
-	if len(views) == 0 {
+	if len(names) == 0 {
 		return
 	}
-	var keep []*arrowView
-	for _, v := range views {
-		if err := c.dropView(v.name); err != nil {
-			keep = append(keep, v)
-			continue
+	var keep []string
+	for _, name := range names {
+		if err := c.dropView(name); err != nil {
+			keep = append(keep, name)
 		}
-		v.free()
 	}
 	if len(keep) > 0 {
 		c.mu.Lock()
-		c.pendingViews = append(keep, c.pendingViews...)
+		c.pendingDrops = append(keep, c.pendingDrops...)
 		c.mu.Unlock()
 	}
 }
@@ -414,9 +417,11 @@ func (c *Conn) Close() error {
 	bindings.Disconnect(&c.conn)
 	// The connection's temporary views died with it; their streams are
 	// unreachable now.
-	for _, v := range c.pendingViews {
+	for _, v := range c.views {
 		v.free()
+		v.reader.detach() // also for views their caller never released
 	}
-	c.pendingViews = nil
+	c.views = nil
+	c.pendingDrops = nil
 	return nil
 }
