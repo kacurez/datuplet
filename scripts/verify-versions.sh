@@ -81,10 +81,10 @@ mct=$(sed -n 's/^COMPONENT_TAG *?*= *//p' Makefile | tail -1)
 
 # 6. duckdb-go pin parity. The image verify stage runs the extension baker
 # (utils/docker/install-duckdb-ext, its own go.mod), and the baked extension dir
-# is per exact DuckDB version — so all three modules must pin the same version
+# is per exact DuckDB version — so every DuckDB module must pin the same version
 # or the verify stage proves a different engine than the one shipped.
 duck_pin() { awk '$1=="github.com/duckdb/duckdb-go/v2" && $2 ~ /^v/ {print $2; exit} $1=="require" && $2=="github.com/duckdb/duckdb-go/v2" {print $3; exit}' "$1/go.mod"; }
-DUCK_MODS="components/sql-transform components/queryengine utils/docker/install-duckdb-ext"
+DUCK_MODS="components/sql-transform components/queryengine gateway utils/docker/install-duckdb-ext"
 duck_first=""; duck_drift=0; duck_report=""
 for m in $DUCK_MODS; do
   v=$(duck_pin "$m")
@@ -93,7 +93,7 @@ for m in $DUCK_MODS; do
   [ -n "$duck_first" ] || duck_first="$v"
   [ "$v" = "$duck_first" ] || duck_drift=1
 done
-[ "$duck_drift" -eq 0 ] || err "duckdb-go/v2 pin drift (must be identical in all three modules):"$'\n'"${duck_report%$'\n'}"
+[ "$duck_drift" -eq 0 ] || err "duckdb-go/v2 pin drift (must be identical in all DuckDB modules):"$'\n'"${duck_report%$'\n'}"
 
 if [ "$fail" -ne 0 ]; then echo "verify-versions: FAILED"; exit 1; fi
 echo "verify-versions: OK"
