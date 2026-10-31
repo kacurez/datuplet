@@ -91,7 +91,19 @@ func (p *fakeDataPlane) Interrupt() {
 	p.mu.Lock()
 	p.interruptedF = true
 	p.dead = true
+	writers := append([]*fakeTableWriter(nil), p.writers...)
 	p.mu.Unlock()
+	terminateAll(writers)
+}
+
+// terminateAll marks each writer terminated and releases its batches, each
+// under that writer's own lock (see the locking protocol on fakeTableWriter).
+// Callers hold no lock; OpenTableWriter registers writers under p.mu only
+// while !dead, so a snapshot taken after dead is set covers every writer.
+func terminateAll(writers []*fakeTableWriter) {
+	for _, w := range writers {
+		w.terminate()
+	}
 }
 
 // Close marks the plane dead and releases every writer's retained batches
@@ -102,9 +114,7 @@ func (p *fakeDataPlane) Close() error {
 	p.dead = true
 	writers := append([]*fakeTableWriter(nil), p.writers...)
 	p.mu.Unlock()
-	for _, w := range writers {
-		w.release()
-	}
+	terminateAll(writers)
 	return nil
 }
 
@@ -158,27 +168,34 @@ func (p *fakeDataPlane) lastBoot() BootInfo {
 	return p.boot
 }
 
+// fakeTableWriter locking protocol: every state change and every check that
+// decides an operation's outcome happens under w.mu. Plane Interrupt/Close do
+// not read a "plane is dead" flag from inside Write/Close; instead they mark
+// each writer terminated, under that writer's w.mu, and release its batches
+// there. So an operation either completes before termination (and its batch is
+// then released by it) or observes terminated: no Write retains a batch and no
+// Close returns files after termination. Lock order: w.mu -> p.mu only; the
+// plane never holds p.mu while taking w.mu.
 type fakeTableWriter struct {
 	plane *fakeDataPlane
 	spec  WriterSpec
 
-	mu       sync.Mutex
-	batches  []arrow.RecordBatch // retained until release()
-	nWrites  int
-	rows     int64
-	bytes    int64
-	failErr  error // first injected write failure; sticks, fails Close
-	aborted  bool
-	closed   bool
-	files    []WrittenFile
-	closeErr error
-}
+	// Test hooks, called at the start of Write/Close before w.mu is taken,
+	// to pause an operation at the point where a race used to be possible.
+	beforeWriteLock func()
+	beforeCloseLock func()
 
-// release drops the writer's references to retained batches (idempotent).
-func (w *fakeTableWriter) release() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.releaseLocked()
+	mu         sync.Mutex
+	batches    []arrow.RecordBatch // retained until released
+	nWrites    int
+	rows       int64
+	bytes      int64
+	failErr    error // first injected write failure; sticks, fails Close
+	aborted    bool
+	terminated bool // plane Interrupt/Close
+	closed     bool
+	files      []WrittenFile
+	closeErr   error
 }
 
 func (w *fakeTableWriter) releaseLocked() {
@@ -188,13 +205,24 @@ func (w *fakeTableWriter) releaseLocked() {
 	w.batches = nil
 }
 
+// terminate is called by plane Interrupt/Close.
+func (w *fakeTableWriter) terminate() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.terminated = true
+	w.releaseLocked()
+}
+
 func (w *fakeTableWriter) Write(_ context.Context, rec arrow.RecordBatch) error {
-	if w.plane.isDead() {
-		return errFakePlaneDead
+	if w.beforeWriteLock != nil {
+		w.beforeWriteLock()
 	}
 	injected := w.plane.currentWriteErr()
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.terminated {
+		return errFakePlaneDead
+	}
 	if w.aborted {
 		return errors.New("fake: write on aborted writer")
 	}
@@ -225,7 +253,9 @@ func (w *fakeTableWriter) Write(_ context.Context, rec arrow.RecordBatch) error 
 func (w *fakeTableWriter) QueuedBytes() int64 { return 0 }
 
 func (w *fakeTableWriter) Close(_ context.Context) ([]WrittenFile, error) {
-	dead := w.plane.isDead()
+	if w.beforeCloseLock != nil {
+		w.beforeCloseLock()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -236,7 +266,7 @@ func (w *fakeTableWriter) Close(_ context.Context) ([]WrittenFile, error) {
 	}
 	w.closed = true
 	switch {
-	case dead:
+	case w.terminated:
 		w.closeErr = errFakePlaneDead
 	case w.failErr != nil:
 		w.closeErr = fmt.Errorf("fake: writer failed earlier: %w", w.failErr)
@@ -594,8 +624,6 @@ func TestFakeDataPlane_ReleasesRetainedBatches(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
-			defer mem.AssertSize(t, 0)
-
 			p := newFakeDataPlane()
 			defer p.Close()
 			sch, rec := fakeTestBatchMem(t, mem, 1, 2, 3)
@@ -610,6 +638,9 @@ func TestFakeDataPlane_ReleasesRetainedBatches(t *testing.T) {
 				t.Fatal("writer should still retain the batches before cleanup")
 			}
 			tc.cleanup(p, w)
+			// Assert right here: the deferred plane Close above is only a
+			// fallback and must not be what releases the batches.
+			mem.AssertSize(t, 0)
 		})
 	}
 }
@@ -665,4 +696,127 @@ func TestBootInfo_StringRedactsToken(t *testing.T) {
 	if out := fmt.Sprintf("%v", &b); strings.Contains(out, secret) {
 		t.Errorf("%%v of *BootInfo leaks the token: %s", out)
 	}
+}
+
+// Plane termination racing a Write that has already passed its pre-lock point:
+// the Write must fail and retain nothing (the old protocol checked plane state
+// before taking the writer lock, so it could succeed after cleanup).
+func TestFakeDataPlane_TerminationRacesWrite(t *testing.T) {
+	for _, term := range []struct {
+		name string
+		fn   func(p *fakeDataPlane)
+	}{
+		{"Close", func(p *fakeDataPlane) { p.Close() }},
+		{"Interrupt", func(p *fakeDataPlane) { p.Interrupt() }},
+	} {
+		t.Run(term.name, func(t *testing.T) {
+			mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+			p := newFakeDataPlane()
+			defer p.Close()
+			sch, rec := fakeTestBatchMem(t, mem, 1, 2, 3)
+			wi, _ := p.OpenTableWriter(context.Background(), WriterSpec{Schema: sch})
+			w := wi.(*fakeTableWriter)
+
+			entered, resume := make(chan struct{}), make(chan struct{})
+			w.beforeWriteLock = func() { close(entered); <-resume }
+			res := make(chan error, 1)
+			go func() { res <- w.Write(context.Background(), rec) }()
+
+			<-entered
+			term.fn(p) // terminate while Write is paused before its critical section
+			close(resume)
+
+			if err := <-res; err == nil {
+				t.Error("Write that raced plane termination succeeded")
+			}
+			if n := len(w.recorded()); n != 0 {
+				t.Errorf("writer retains %d batches after termination", n)
+			}
+			rec.Release()
+			mem.AssertSize(t, 0)
+		})
+	}
+}
+
+// Same for Close: a Close paused before its critical section must not return
+// files once the plane has been terminated.
+func TestFakeDataPlane_TerminationRacesClose(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	p := newFakeDataPlane()
+	defer p.Close()
+	sch, rec := fakeTestBatchMem(t, mem, 1, 2, 3)
+	wi, _ := p.OpenTableWriter(context.Background(), WriterSpec{DataPrefix: "x/", FilePrefix: "f", Schema: sch})
+	w := wi.(*fakeTableWriter)
+	if err := w.Write(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	rec.Release()
+
+	entered, resume := make(chan struct{}), make(chan struct{})
+	w.beforeCloseLock = func() { close(entered); <-resume }
+	type result struct {
+		files []WrittenFile
+		err   error
+	}
+	res := make(chan result, 1)
+	go func() {
+		f, err := w.Close(context.Background())
+		res <- result{f, err}
+	}()
+
+	<-entered
+	p.Close()
+	close(resume)
+
+	r := <-res
+	if r.err == nil || len(r.files) != 0 {
+		t.Errorf("Close that raced plane termination = %+v, %v; want error and no files", r.files, r.err)
+	}
+	mem.AssertSize(t, 0)
+}
+
+// Stress under -race: writers hammer Write while the plane is closed. Every
+// Write that returned nil must have happened before termination, and after
+// plane Close returns, nothing is retained and every further Write fails.
+func TestFakeDataPlane_ConcurrentWritesAndClose(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	p := newFakeDataPlane()
+	sch, rec := fakeTestBatchMem(t, mem, 1, 2, 3)
+
+	const nWriters = 8
+	var wg sync.WaitGroup
+	writers := make([]TableWriter, nWriters)
+	for i := range writers {
+		writers[i], _ = p.OpenTableWriter(context.Background(), WriterSpec{Schema: sch})
+	}
+	start := make(chan struct{})
+	for _, w := range writers {
+		wg.Add(1)
+		go func(w TableWriter) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 2000; i++ {
+				if err := w.Write(context.Background(), rec); err != nil {
+					return
+				}
+			}
+		}(w)
+	}
+	close(start)
+	p.Close()
+	// Close has returned: no writer may retain a batch or accept another.
+	for i, w := range writers {
+		if n := len(w.(*fakeTableWriter).recorded()); n != 0 {
+			t.Errorf("writer %d retains %d batches after plane Close returned", i, n)
+		}
+		if err := w.Write(context.Background(), rec); err == nil {
+			t.Errorf("writer %d accepted a Write after plane Close returned", i)
+		}
+		if files, err := w.Close(context.Background()); err == nil || len(files) != 0 {
+			t.Errorf("writer %d Close after plane Close = %+v, %v", i, files, err)
+		}
+	}
+	wg.Wait()
+	rec.Release()
+	mem.AssertSize(t, 0)
 }
