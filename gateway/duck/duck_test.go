@@ -581,3 +581,191 @@ func TestMain(m *testing.M) {
 	}
 	os.Exit(code)
 }
+
+// TestStreamReleaseWhileFetchEntering pins the interleaving where NextCtx
+// holds the stream lock but has not started the fetch when Release begins:
+// Release must still make that fetch stop instead of waiting for the whole
+// query.
+func TestStreamReleaseWhileFetchEntering(t *testing.T) {
+	_, c := openConn(t)
+	s, err := c.QueryStream(context.Background(),
+		"SELECT sum(hash(range)) FROM range(20_000_000_000)")
+	if err != nil {
+		t.Fatalf("QueryStream: %v", err)
+	}
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	testHookBeforeFetch = func() {
+		close(entered)
+		<-proceed
+	}
+	t.Cleanup(func() { testHookBeforeFetch = nil })
+
+	fetchErr := make(chan error, 1)
+	go func() {
+		_, err := s.NextCtx(context.Background())
+		fetchErr <- err
+	}()
+	<-entered
+	released := make(chan struct{})
+	go func() {
+		s.Release()
+		close(released)
+	}()
+	<-s.closing.Done() // Release has published closing and waits for the lock
+	close(proceed)
+
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Release did not return within 2s of an entering fetch")
+	}
+	if err := <-fetchErr; !errors.Is(err, ErrStreamReleased) {
+		t.Fatalf("entering NextCtx = %v, want ErrStreamReleased", err)
+	}
+	testHookBeforeFetch = nil
+	if got := scalarInt(t, c, "SELECT 13"); got != 13 {
+		t.Fatalf("query after release = %d, want 13", got)
+	}
+}
+
+func pendingViewCount(c *Conn) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pendingViews)
+}
+
+func copyView(t *testing.T, c *Conn, view string) {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "v.parquet")
+	if _, err := c.QueryRows(context.Background(), fmt.Sprintf(
+		"COPY (SELECT * FROM %s) TO %s (FORMAT parquet)", Ident(view), Literal(out))); err != nil {
+		t.Fatalf("COPY: %v", err)
+	}
+}
+
+func TestArrowViewReleaseWhileStreamOpen(t *testing.T) {
+	_, c := openConn(t)
+	rr := threeBatchReader(t, 100)
+	defer rr.Release()
+	release, err := c.RegisterArrowView("v", rr)
+	if err != nil {
+		t.Fatalf("RegisterArrowView: %v", err)
+	}
+	copyView(t, c, "v")
+	s, err := c.QueryStream(context.Background(), "SELECT * FROM range(10)")
+	if err != nil {
+		t.Fatalf("QueryStream: %v", err)
+	}
+	release() // DROP cannot run while s is open
+	if n := pendingViewCount(c); n != 1 {
+		t.Fatalf("pending views = %d, want 1 (stream must stay allocated)", n)
+	}
+	s.Release()
+	// The next statement drops the view first: it is gone, never dangling.
+	_, err = c.QueryRows(context.Background(), "SELECT count(*) FROM v")
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("query of a released view = %v, want a does-not-exist error", err)
+	}
+	if n := pendingViewCount(c); n != 0 {
+		t.Fatalf("pending views = %d after the next statement, want 0", n)
+	}
+}
+
+func TestArrowViewDropFailureKeepsStream(t *testing.T) {
+	_, c := openConn(t)
+	rr := threeBatchReader(t, 100)
+	defer rr.Release()
+	release, err := c.RegisterArrowView("v", rr)
+	if err != nil {
+		t.Fatalf("RegisterArrowView: %v", err)
+	}
+	copyView(t, c, "v")
+	testHookDropView = func(string) error { return errors.New("injected drop failure") }
+	t.Cleanup(func() { testHookDropView = nil })
+	release()
+	if n := pendingViewCount(c); n != 1 {
+		t.Fatalf("pending views after a failed DROP = %d, want 1", n)
+	}
+	// The view still exists and its (consumed) stream is still allocated:
+	// scanning it is safe, whatever it returns.
+	_, _ = c.QueryRows(context.Background(), "SELECT count(*) FROM v")
+	if n := pendingViewCount(c); n != 1 {
+		t.Fatalf("pending views after a second failed DROP = %d, want 1", n)
+	}
+	testHookDropView = nil
+	if _, err := c.QueryRows(context.Background(), "SELECT count(*) FROM v"); err == nil {
+		t.Fatal("view still reachable after the retried DROP succeeded")
+	}
+	if n := pendingViewCount(c); n != 0 {
+		t.Fatalf("pending views after the retried DROP = %d, want 0", n)
+	}
+}
+
+func TestArrowViewDropFailureInAbortedTransaction(t *testing.T) {
+	_, c := openConn(t)
+	rr := threeBatchReader(t, 100)
+	defer rr.Release()
+	release, err := c.RegisterArrowView("v", rr)
+	if err != nil {
+		t.Fatalf("RegisterArrowView: %v", err)
+	}
+	copyView(t, c, "v")
+	if err := c.Exec(context.Background(), "BEGIN TRANSACTION"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if err := c.Exec(context.Background(), "SELECT error('abort the transaction')"); err == nil {
+		t.Fatal("error(): want error")
+	}
+	release() // DROP fails: the transaction is aborted
+	if n := pendingViewCount(c); n != 1 {
+		t.Fatalf("pending views in an aborted transaction = %d, want 1", n)
+	}
+	if err := c.Exec(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK: %v", err)
+	}
+	if _, err := c.QueryRows(context.Background(), "SELECT count(*) FROM v"); err == nil {
+		t.Fatal("view still reachable after ROLLBACK and the retried DROP")
+	}
+	if n := pendingViewCount(c); n != 0 {
+		t.Fatalf("pending views = %d, want 0", n)
+	}
+}
+
+func TestArrowViewFreedAtClose(t *testing.T) {
+	db, err := Open(testSettings(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	c, err := db.Connect()
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	rr := threeBatchReader(t, 10)
+	defer rr.Release()
+	r1, err := c.RegisterArrowView("v1", rr)
+	if err != nil {
+		t.Fatalf("RegisterArrowView v1: %v", err)
+	}
+	r2, err := c.RegisterArrowView("v2", rr)
+	if err != nil {
+		t.Fatalf("RegisterArrowView v2: %v", err)
+	}
+	testHookDropView = func(string) error { return errors.New("injected drop failure") }
+	t.Cleanup(func() { testHookDropView = nil })
+	r1()
+	if n := pendingViewCount(c); n != 1 {
+		t.Fatalf("pending views = %d, want 1", n)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if n := pendingViewCount(c); n != 0 {
+		t.Fatalf("pending views after Close = %d, want 0 (freed)", n)
+	}
+	r2() // after Close: frees immediately, no DROP attempted
+	if n := pendingViewCount(c); n != 0 {
+		t.Fatalf("pending views after release on a closed conn = %d, want 0", n)
+	}
+}

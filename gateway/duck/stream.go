@@ -5,6 +5,7 @@ package duck
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -30,8 +31,14 @@ type Stream struct {
 	opts   bindings.ArrowOptions
 	schema *arrow.Schema
 
-	refs     atomic.Int64
-	fetching atomic.Bool // a FetchChunk is in flight
+	refs atomic.Int64
+
+	// closing is cancelled by Release before it waits for s.mu. Every fetch
+	// runs under a context derived from it, so a fetch that is entering when
+	// Release starts either sees closing and never enters DuckDB, or is
+	// interrupted (and re-interrupted) by the interruptible helper.
+	closing     context.Context
+	closeCancel context.CancelFunc
 
 	mu       sync.Mutex // guards everything below and the result handle
 	cur      arrow.RecordBatch
@@ -52,6 +59,7 @@ func newStream(c *Conn, ps bindings.PreparedStatement, res *bindings.Result) (*S
 		return nil, err
 	}
 	s := &Stream{c: c, ps: ps, res: res, opts: opts, schema: schema}
+	s.closing, s.closeCancel = context.WithCancel(context.Background())
 	s.refs.Store(1)
 	return s, nil
 }
@@ -119,6 +127,9 @@ func (s *Stream) NextCtx(ctx context.Context) (arrow.RecordBatch, error) {
 	if s.done {
 		return nil, io.EOF
 	}
+	if testHookBeforeFetch != nil {
+		testHookBeforeFetch()
+	}
 	rec, err := s.fetch(ctx)
 	switch {
 	case errors.Is(err, io.EOF):
@@ -134,11 +145,20 @@ func (s *Stream) NextCtx(ctx context.Context) (arrow.RecordBatch, error) {
 	return rec, nil
 }
 
-func (s *Stream) fetch(ctx context.Context) (arrow.RecordBatch, error) {
+// testHookBeforeFetch, when set by a test, runs in NextCtx after s.mu is
+// taken and before the fetch starts.
+var testHookBeforeFetch func()
+
+func (s *Stream) fetch(callerCtx context.Context) (arrow.RecordBatch, error) {
+	if s.closing.Err() != nil {
+		return nil, ErrStreamReleased
+	}
+	ctx, cancel := context.WithCancel(callerCtx)
+	defer cancel()
+	stop := context.AfterFunc(s.closing, cancel)
+	defer stop()
 	var rec arrow.RecordBatch
 	before := s.c.interrupts.Load()
-	s.fetching.Store(true)
-	defer s.fetching.Store(false)
 	err := s.c.interruptible(ctx, func() error {
 		ch := bindings.FetchChunk(*s.res)
 		if ch.Ptr != nil && bindings.DataChunkGetSize(ch) > 0 {
@@ -168,6 +188,9 @@ func (s *Stream) fetch(ctx context.Context) (arrow.RecordBatch, error) {
 	if err != nil && rec != nil {
 		rec.Release()
 		rec = nil
+	}
+	if err != nil && callerCtx.Err() == nil && s.closing.Err() != nil {
+		err = fmt.Errorf("%w: %w", ErrStreamReleased, err)
 	}
 	return rec, err
 }
@@ -203,11 +226,9 @@ func (s *Stream) Release() {
 }
 
 func (s *Stream) close() {
-	if s.fetching.Load() {
-		// DuckDB clears an interrupt at the next statement start, so one
-		// landing just after the fetch returned is harmless.
-		s.c.Interrupt()
-	}
+	// Publish closing before waiting for s.mu: an in-flight or entering fetch
+	// is interrupted or refuses to start, so the wait below is short.
+	s.closeCancel()
 	s.mu.Lock()
 	if s.released {
 		s.mu.Unlock()

@@ -51,7 +51,6 @@ struct ArrowArrayStream {
 import "C"
 
 import (
-	"context"
 	"errors"
 	"sync"
 	"unsafe"
@@ -63,30 +62,30 @@ import (
 
 var errArrowScan = errors.New("duck: arrow scan registration failed")
 
+// arrowView is a registered view and the C stream behind it. The stream is
+// freed only once the view is dropped or the connection is disconnected, so
+// no statement can ever scan freed memory.
+type arrowView struct {
+	name   string
+	stream unsafe.Pointer // C-allocated ArrowArrayStream
+}
+
+func (v *arrowView) free() {
+	cdata.ReleaseCArrowArrayStream((*cdata.CArrowArrayStream)(v.stream))
+	C.free(v.stream)
+	v.stream = nil
+}
+
 // registerArrowView mirrors duckdb-go/v2 Arrow.RegisterView (arrow.go): the
 // reader is exported into a C-allocated ArrowArrayStream that DuckDB's
 // arrow_scan reads through a temporary view.
 func registerArrowView(c *Conn, name string, r array.RecordReader) (func(), error) {
-	stream := C.calloc(1, C.sizeof_struct_ArrowArrayStream)
-	freeStream := func() {
-		cdata.ReleaseCArrowArrayStream((*cdata.CArrowArrayStream)(stream))
-		C.free(stream)
-	}
-	cdata.ExportRecordReader(r, (*cdata.CArrowArrayStream)(stream))
-	if bindings.ArrowScan(c.conn, name, bindings.ArrowStream{Ptr: unsafe.Pointer(stream)}) == bindings.StateError {
-		freeStream()
+	v := &arrowView{name: name, stream: C.calloc(1, C.sizeof_struct_ArrowArrayStream)}
+	cdata.ExportRecordReader(r, (*cdata.CArrowArrayStream)(v.stream))
+	if bindings.ArrowScan(c.conn, name, bindings.ArrowStream{Ptr: v.stream}) == bindings.StateError {
+		v.free()
 		return nil, errArrowScan
 	}
 	var once sync.Once
-	return func() {
-		once.Do(func() {
-			// Drop the view first so nothing can scan the freed stream. Best
-			// effort: on a closed or unusable connection the view is gone or
-			// unreachable anyway.
-			if c.ready() == nil {
-				_ = c.Exec(context.Background(), "DROP VIEW IF EXISTS "+Ident(name))
-			}
-			freeStream()
-		})
-	}, nil
+	return func() { once.Do(func() { c.releaseView(v) }) }, nil
 }

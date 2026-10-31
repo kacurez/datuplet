@@ -40,6 +40,10 @@ type Conn struct {
 	mu     sync.Mutex // guards closed, stream and the handle against Interrupt
 	closed bool
 	stream *Stream
+	// pendingViews are released arrow views whose DROP has not succeeded
+	// yet. Their C streams stay allocated until the DROP succeeds (retried
+	// before every statement) or the connection is disconnected.
+	pendingViews []*arrowView
 
 	interrupts atomic.Uint64 // bumped by every Interrupt call
 }
@@ -165,6 +169,7 @@ func (c *Conn) exec(ctx context.Context, sql string) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
+	c.dropPendingViews()
 	ps, res, err := c.execute(ctx, sql, false)
 	if err != nil {
 		return err
@@ -203,6 +208,7 @@ func (c *Conn) QueryStream(ctx context.Context, sql string) (*Stream, error) {
 	if err := c.ready(); err != nil {
 		return nil, err
 	}
+	c.dropPendingViews()
 	ps, res, err := c.execute(ctx, sql, true)
 	if err != nil {
 		return nil, err
@@ -227,6 +233,7 @@ func (c *Conn) QueryRows(ctx context.Context, sql string) ([][]any, error) {
 	if err := c.ready(); err != nil {
 		return nil, err
 	}
+	c.dropPendingViews()
 	ps, res, err := c.execute(ctx, sql, false)
 	if err != nil {
 		return nil, err
@@ -306,14 +313,77 @@ func detach(v any) any {
 
 // RegisterArrowView exposes r as a temporary view named name on this
 // connection (duckdb_arrow_scan). The view reads r once: scan it in one
-// statement. release drops the view and frees the exported stream; call it
-// after the statement reading the view has finished, on this goroutine.
+// statement. release drops the view and then frees the exported stream; call
+// it after the statement reading the view has finished, on this goroutine.
+// If the DROP cannot run now (open Stream, failed statement, unusable DB) the
+// view stays registered and its stream allocated; the DROP is retried before
+// the connection's next statement, and Close frees everything.
 func (c *Conn) RegisterArrowView(name string, r array.RecordReader) (release func(), err error) {
 	if err := c.ready(); err != nil {
 		return nil, err
 	}
+	c.dropPendingViews()
 	return registerArrowView(c, name, r)
 }
+
+// releaseView queues v for dropping and tries to drop it right away.
+func (c *Conn) releaseView(v *arrowView) {
+	c.mu.Lock()
+	if c.closed {
+		// Disconnect already destroyed the connection's temporary views.
+		c.mu.Unlock()
+		v.free()
+		return
+	}
+	c.pendingViews = append(c.pendingViews, v)
+	c.mu.Unlock()
+	if c.ready() == nil {
+		c.dropPendingViews()
+	}
+}
+
+// dropPendingViews drops every pending view and frees its stream. A view
+// whose DROP fails stays pending. The caller has checked ready().
+func (c *Conn) dropPendingViews() {
+	c.mu.Lock()
+	views := c.pendingViews
+	c.pendingViews = nil
+	c.mu.Unlock()
+	if len(views) == 0 {
+		return
+	}
+	var keep []*arrowView
+	for _, v := range views {
+		if err := c.dropView(v.name); err != nil {
+			keep = append(keep, v)
+			continue
+		}
+		v.free()
+	}
+	if len(keep) > 0 {
+		c.mu.Lock()
+		c.pendingViews = append(keep, c.pendingViews...)
+		c.mu.Unlock()
+	}
+}
+
+func (c *Conn) dropView(name string) error {
+	if testHookDropView != nil {
+		if err := testHookDropView(name); err != nil {
+			return err
+		}
+	}
+	ps, res, err := c.execute(context.Background(), "DROP VIEW IF EXISTS "+Ident(name), false)
+	if err != nil {
+		return err
+	}
+	bindings.DestroyResult(res)
+	bindings.DestroyPrepare(&ps)
+	return nil
+}
+
+// testHookDropView, when set by a test, can fail a view DROP.
+var testHookDropView func(name string) error
 
 // Interrupt asks DuckDB to abort the statement running on c. Safe from any
 // goroutine; a no-op on a closed connection.
@@ -342,5 +412,11 @@ func (c *Conn) Close() error {
 	}
 	c.closed = true
 	bindings.Disconnect(&c.conn)
+	// The connection's temporary views died with it; their streams are
+	// unreachable now.
+	for _, v := range c.pendingViews {
+		v.free()
+	}
+	c.pendingViews = nil
 	return nil
 }
