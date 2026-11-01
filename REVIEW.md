@@ -9,12 +9,17 @@ needs. Keep it short; add a line when an incident teaches something.
 
 Each line is a bug class that has shipped or nearly shipped here.
 
-- **Storage paths** (`pkg/datagateway/`, `pkg/lib/datalake/`): a
+- **Storage paths** (`pkg/datagateway/`, `gateway/`, `pkg/lib/datalake/`): a
   `path.Join` / `filepath.Join` on a URL — `s3://b` silently becomes
   `s3:/b`. Only `joinStoragePath()` is allowed.
 - **Credentials** (`pkg/catalogwriter/`, `pkg/datupleticeio/`): a secret
   reaching a log. `%v`/`%s` are redacted by Stringers; `%#v` is not. Any
   new struct holding a token or key needs a redacting `String()`.
+- **DuckDB SQL** (`gateway/`): any identifier or literal that reaches a
+  statement without `duck.Ident` / the literal helper (column and table
+  names are component-controlled), or a `CREATE SECRET` / ATTACH statement or
+  token in a log line or error text. Importing `github.com/duckdb/*` from the
+  root module.
 - **Storage config**: `UseSSL` derived from `UsePathStyle` or vice versa.
   They are independent.
 - **CRDs** (`pkg/k8s/api/v1/`, `charts/*/crds/`): a type change without

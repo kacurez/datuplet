@@ -12,7 +12,6 @@ This directory contains **domain-agnostic infrastructure libraries** that are re
 **What**: Simple MinIO/S3 client with 3 operations: Read, Write, List
 **Used by**:
 - `pkg/pipeline` (pipeline execution)
-- `pkg/tablecommit` (files.json read path)
 - `pkg/pipelineapi/storage` (catalog browse via lakekeeper)
 - `cmd/datuplet` (CLI commands)
 

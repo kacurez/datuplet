@@ -104,10 +104,10 @@ using a real GKE cluster and a GCS bucket as the Iceberg warehouse.
 A user triggers a pipeline via the UI or REST API. `pipeline-api` mints a
 per-run RS256 JWT and creates a PipelineRun CRD. `pipeline-operator` schedules
 component Pods, each with a Data Gateway sidecar. The sidecar fetches
-STS credentials from Lakekeeper, writes parquet to S3/GCS, and commits the
-files to the Iceberg table inline via its commit pool (iceberg-go against
-Lakekeeper), leaving a per-table `files.json` audit breadcrumb. OpenFGA
-enforces authorization at every step.
+STS credentials from Lakekeeper, writes parquet to S3/GCS through an embedded
+DuckDB engine, and commits the files to the Iceberg table inline via its commit
+pool (iceberg-go against Lakekeeper). OpenFGA enforces authorization at every
+step.
 
 Full diagram and component descriptions: [docs/architecture.md](docs/architecture.md)
 

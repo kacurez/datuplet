@@ -1,28 +1,15 @@
-// Package icebergjob — shared CommitTable function.
+// Package icebergjob — shared CommitTableFiles function.
 //
-// CommitTable is the manifest-path variant retained for out-of-band
-// files.json consumers; it has no in-repo production caller since RFC 021
-// (the DG commit pool calls CommitTableFiles directly).
-//
-// CommitTable is a *pure consumer* of the `files.json` wire shape — it
-// does not assume the writer was DG, and does not couple to any
-// caller-side mode plumbing beyond the WriteMode argument.
-//
-// Manifest-reading responsibility lives INSIDE CommitTable: the
-// signature accepts an opaque `manifestPath string`, and CommitTable
-// reads through iceberg-go's per-table `Table.FS()` handle so reads use
-// the same lakekeeper-vended STS creds the writer used. (Production
-// `manifestPath` is an absolute URL — `s3://…` or `file://…` — derived
-// by the caller from `Table.Location()` via FilesManifestPath.)
+// CommitTableFiles applies a caller-supplied list of data-file paths to an
+// Iceberg table (APPEND or FULL_LOAD) with an idempotency key, audit
+// snapshot properties and 409 retry. The Data Gateway commit pool is its
+// only production caller.
 package icebergjob
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"strings"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -35,11 +22,9 @@ import (
 //
 // Both APPEND and FULL_LOAD are implemented end-to-end against
 // lakekeeper: APPEND uses iceberg-go's `txn.AddFiles`, FULL_LOAD uses
-// `txn.ReplaceDataFiles`. CommitTable / CommitTableFiles own the
-// actual dispatch.
+// `txn.ReplaceDataFiles`. CommitTableFiles owns the actual dispatch.
 //
-// UPSERT is a future addition and would extend this type plus the
-// files.json schema (delete_paths) without changing the locked signature.
+// UPSERT is a future addition and would extend this type.
 type WriteMode string
 
 const (
@@ -51,19 +36,7 @@ const (
 	WriteModeFullLoad WriteMode = "FULL_LOAD"
 )
 
-// ErrManifestEmpty signals that the manifest exists but its DataPaths
-// list is empty. CommitTable catches this internally and returns nil
-// (success-zero) — exposed here for callers that want to introspect a
-// returned wrapped error if they ever bypass the success-zero behavior.
-var ErrManifestEmpty = errors.New("icebergjob: manifest empty")
-
-// ErrManifestMissing signals that the manifest file does not exist.
-// CommitTable catches this internally and returns nil (success-zero) —
-// matches the existing post-stage behavior where a stage that produced
-// no parquet for a target table is a no-op rather than an error.
-var ErrManifestMissing = errors.New("icebergjob: manifest missing")
-
-// CommitResult captures observability data for one CommitTable call.
+// CommitResult captures observability data for one CommitTableFiles call.
 // Empty fields (e.g. SnapshotIDBefore on a fresh table) are valid; the
 // caller surfaces this in structured logs.
 type CommitResult struct {
@@ -78,7 +51,7 @@ type CommitResult struct {
 	SnapshotIDAfter string
 
 	// DataFilesAdded is the number of parquet paths added by this
-	// commit (manifest.DataPaths len). Zero on success-zero.
+	// commit (len(dataPaths)). Zero on success-zero.
 	DataFilesAdded int
 
 	// WriteMode echoes the mode the caller selected, preserved for
@@ -98,71 +71,12 @@ type CommitResult struct {
 // without updating the retry predicate.
 var errIdempotencyHit = errors.New("icebergjob: idempotency hit")
 
-// filesManifest is the on-the-wire shape of the per-table `files.json`
-// manifest, supporting both v1 (`paths`) and v2 (`data_paths` +
-// `delete_paths` for future UPSERT).
+// CommitTableFiles commits dataPaths to the table at ident in the given
+// mode. Used by Data Gateway's inline commit path (RFC 021). Empty
+// dataPaths is success-zero.
 //
-// The reader auto-migrates v1 to v2 internally: when SchemaVersion is
-// absent (v1), Paths is copied into DataPaths. Downstream callers see
-// only the v2 shape via DataPaths / DeletePaths.
-type filesManifest struct {
-	SchemaVersion int      `json:"schema_version,omitempty"`
-	RunID         string   `json:"run_id"`
-	Namespace     string   `json:"namespace"`
-	Table         string   `json:"table"`
-	Paths         []string `json:"paths,omitempty"`        // v1
-	DataPaths     []string `json:"data_paths,omitempty"`   // v2
-	DeletePaths   []string `json:"delete_paths,omitempty"` // v2 (UPSERT)
-}
-
-// CommitTable reads files.json from manifestPath, opens an iceberg-go
-// transaction against (cat, ident), applies AddFiles/ReplaceDataFiles
-// according to mode (and AddDeletes for UPSERT once that lands), and
-// commits via the catalog. Pure consumer of the manifest format —
-// indifferent to which writer produced it.
-//
-// snapshotProps is forwarded verbatim as the snapshotProps argument to
-// txn.AddFiles / txn.ReplaceDataFiles. Pass nil to write no extra keys.
-// Pass the result of BuildSnapshotSummary to emit the four datuplet.*
-// audit keys.
-//
-// Errors:
-//   - ErrManifestEmpty (manifestPath exists but data_paths==[]) →
-//     CommitTable returns nil (success-zero, no-op commit).
-//   - ErrManifestMissing (manifestPath not present) → CommitTable
-//     returns nil (success-zero; the run produced no parquet for this
-//     target).
-//   - All other errors propagate.
-//
-// The retry envelope: catalogwriter.RetryOnConflict wraps the txn open
-// + commit so iceberg-go's REST 409 (rest.ErrCommitFailed, surfaced
-// when a concurrent commit lands between attempts) is retried with
-// exponential backoff.
-func CommitTable(
-	ctx context.Context,
-	cat catalog.Catalog,
-	ident icebergtable.Identifier,
-	manifestPath string,
-	mode WriteMode,
-	snapshotProps iceberg.Properties,
-) (*CommitResult, error) {
-	tbl, err := cat.LoadTable(ctx, ident)
-	if err != nil {
-		return nil, fmt.Errorf("CommitTable: load table %v: %w", ident, err)
-	}
-	m, err := readManifestFromTableFS(ctx, tbl, manifestPath)
-	if errors.Is(err, ErrManifestMissing) || errors.Is(err, ErrManifestEmpty) {
-		return &CommitResult{WriteMode: mode}, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("CommitTable: read manifest %s: %w", manifestPath, err)
-	}
-	return CommitTableFiles(ctx, cat, ident, m.DataPaths, mode, snapshotProps, "")
-}
-
-// CommitTableFiles is the in-memory-paths variant of CommitTable: the
-// caller supplies dataPaths directly instead of via a files.json URL.
-// Used by Data Gateway's inline commit path (RFC 021).
+// snapshotProps is forwarded to txn.AddFiles / txn.ReplaceDataFiles; pass
+// the result of BuildSnapshotSummary to emit the datuplet.* audit keys.
 //
 // idempotencyKey, when non-empty, is (a) checked against existing
 // snapshot summaries (key "datuplet.commit-key") on every attempt — a
@@ -261,90 +175,6 @@ func findSnapshotByCommitKey(tbl *icebergtable.Table, key string) string {
 		}
 	}
 	return ""
-}
-
-// isNotFoundErr is a best-effort detector for "object not found" errors
-// surfaced by iceberg-go's FS abstraction. The iceberg-go library
-// doesn't expose a sentinel for s3 NoSuchKey or filesystem
-// os.ErrNotExist — both bubble up as wrapped errors with provider-
-// specific messages. We match on substring rather than type because
-// that's what the surface gives us today; if iceberg-go grows a real
-// sentinel in the future this is the one place to switch over.
-//
-// Backends seen in the wild:
-//   - s3:        `NoSuchKey`, `404`, "key does not exist"
-//   - GCS:       "object doesn't exist" (note the contraction — doesn't,
-//                so `strings.Contains(msg, "not exist")` does NOT match),
-//                and a gocloud `(code=NotFound)` suffix on the wrapped error
-//   - localfs:   "no such file or directory"
-//   - iceberg-go's own paths: "not found"
-func isNotFoundErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "not exist") ||
-		strings.Contains(msg, "doesn't exist") || // GCS via gocloud.dev
-		strings.Contains(msg, "code=notfound") || // gocloud.dev wrapping
-		strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "nosuchkey") ||
-		strings.Contains(msg, "404") ||
-		strings.Contains(msg, "no such file")
-}
-
-// readManifestFromTableFS reads the per-table files.json blob via the
-// table's iceberg-go FS handle (so the read uses lakekeeper-vended
-// STS creds, mirroring the writer side). Returns ErrManifestMissing
-// when the path is not found (best-effort detection via isNotFoundErr,
-// which matches the legacy commitTable behavior). Returns
-// ErrManifestEmpty when the manifest's DataPaths slice is empty after
-// v1→v2 migration.
-func readManifestFromTableFS(ctx context.Context, tbl *icebergtable.Table, manifestPath string) (*filesManifest, error) {
-	if tbl == nil {
-		return nil, errors.New("readManifestFromTableFS: nil table")
-	}
-	if manifestPath == "" {
-		return nil, errors.New("readManifestFromTableFS: empty manifestPath")
-	}
-	fs, err := tbl.FS(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("open table FS: %w", err)
-	}
-	rdr, err := fs.Open(manifestPath)
-	if err != nil {
-		if isNotFoundErr(err) {
-			return nil, ErrManifestMissing
-		}
-		return nil, fmt.Errorf("open manifest %s: %w", manifestPath, err)
-	}
-	defer rdr.Close()
-	body, err := io.ReadAll(io.LimitReader(rdr, maxFilesManifestBytes))
-	if err != nil {
-		return nil, fmt.Errorf("read manifest body: %w", err)
-	}
-	return parseFilesManifest(body)
-}
-
-// parseFilesManifest decodes the bytes into a v2-shaped filesManifest,
-// auto-migrating v1 (`paths`) to v2 (`data_paths`).
-// Returns ErrManifestEmpty when the resulting DataPaths is empty so
-// the caller can short-circuit to success-zero.
-func parseFilesManifest(body []byte) (*filesManifest, error) {
-	m := &filesManifest{}
-	if err := json.Unmarshal(body, m); err != nil {
-		return nil, fmt.Errorf("decode files manifest: %w", err)
-	}
-	// v1 → v2 migration: SchemaVersion absent (==0) and Paths populated
-	// → copy Paths into DataPaths so the rest of the function sees only
-	// the v2 shape. This is a no-op for v2 manifests where Paths is
-	// already absent.
-	if m.SchemaVersion == 0 && len(m.Paths) > 0 && len(m.DataPaths) == 0 {
-		m.DataPaths = m.Paths
-	}
-	if len(m.DataPaths) == 0 {
-		return nil, ErrManifestEmpty
-	}
-	return m, nil
 }
 
 // listCurrentSnapshotFilePaths returns absolute file paths from the

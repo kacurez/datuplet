@@ -11,15 +11,20 @@ between 0.x releases.
 Datuplet is a streaming ETL platform for pipelines with limited local disk.
 Components process data in chunks via Apache Iceberg on object storage
 (MinIO / S3 / GCS). A **Data Gateway sidecar** handles all storage I/O on
-behalf of each component, so component SDKs stay ~300 LOC per language.
+behalf of each component, so component SDKs stay ~300 LOC per language. The
+sidecar's data plane is an embedded **DuckDB 2.0** engine (`gateway/duckplane`):
+it writes Parquet to the table's data prefix and streams reads through the
+Iceberg extension; the Go server (`pkg/datagateway`) keeps the gRPC/HTTP
+contract, table create/load, vended credentials and the commit pool.
 
 **Key architectural principle:** storage paths flow through the system as
 **opaque strings**. Lakekeeper allocates the per-table data prefix; the
-Data Gateway passes whatever URL it gets back verbatim; only the backend
-layer interprets URLs.
+Data Gateway passes whatever URL it gets back verbatim; only the DuckDB
+data plane interprets URLs.
 
-Primary languages: Go (backend, operators, CLI), YAML (K8s manifests),
-Shell (automation). TypeScript only in
+Primary languages: Go (backend, operators, CLI; CGO only in the `gateway/`,
+`components/queryengine` and `components/sql-transform` DuckDB modules),
+YAML (K8s manifests), Shell (automation). TypeScript only in
 the browser UI.
 
 ## Commands
@@ -30,7 +35,7 @@ the browser UI.
 |------|---------|
 | Build binaries | `make build` (→ `bin/datuplet`), `make build-pipeline-api`, `make build-operators` |
 | Unit tests | `make test` (`go test -v ./...`) |
-| One test | `go test ./pkg/datagateway/ -run TestName -v` |
+| One test | `go test ./pkg/datagateway/ -run TestName -v` (DuckDB data plane: `cd gateway && go test -tags duckdb_arrow ./duckplane/ -run TestName -v`) |
 | Lint | `make lint` — `go vet` + `deadcode` + lakekeeper-chart golden-render diff |
 | Tidy all modules | `make tidy` (never a bare `go mod tidy`; see Non-obvious conventions) |
 | Schema sync | `make sync-component-schemas`, `make sync-appshell-schema` (both CI drift-checked) |
@@ -174,15 +179,18 @@ These are conventions a new contributor wouldn't infer from the code:
 - **Never use `filepath.Join` or `path.Join` for storage paths** — they
   corrupt URLs (e.g., `s3://bucket` becomes `s3:/bucket`). Use the
   package-local `joinStoragePath()` helper (defined in
-  `pkg/datagateway/server_v2.go`, `pkg/datagateway/partition/router.go`,
-  `pkg/datagateway/buffer/manager.go`).
+  `pkg/datagateway/server_v2.go`).
 - **`pkg/lib/datalake/` is metadata-only fallback I/O** (Read / Write / List),
-  used by the pipeline-api storage walker fallback. **`pkg/datagateway/backend/`**
-  is the full data-plane abstraction (buffering, format conversion, backends).
-  Don't confuse the two.
-- **Buffer package (`pkg/datagateway/buffer/`) outputs Parquet only.** For
-  other formats on read, use `pkg/datagateway/format/` adapters to convert
-  on the fly.
+  used by the pipeline-api storage walker fallback. The Data Gateway's data
+  plane is **`gateway/duckplane`** (DuckDB; behind the `DataPlane` interface in
+  `pkg/datagateway/dataplane.go`). Don't confuse the two.
+- **The sidecar binary is `datagateway`** (`gateway/cmd/datagateway`, CGO, build
+  tag `duckdb_arrow`), image `utils/docker/Dockerfile.gateway`; `--selfcheck`
+  exercises the engine and baked extensions. The root module stays CGO-free:
+  never import `github.com/duckdb/*` from it. DuckDB writes Parquet only; other
+  wire formats on write/read go through the `pkg/datagateway/format/` adapters
+  (Arrow batches in, Arrow batches out). Every SQL identifier/literal goes
+  through the `gateway/duck` quoting helpers.
 - **Exit code contract**: `0=Succeeded`, `1=FailedUser`, `>=20=FailedApplication`.
   Status messages use the `DUPLET_STATUS_MESSAGE:` prefix in stdout.
 - **CRD manifests are manually maintained** in `charts/datuplet-app/crds/`
@@ -217,20 +225,15 @@ These are conventions a new contributor wouldn't infer from the code:
   (`pkg/pipelineapi/storage/catalog_proxy.go`) when
   `DATUPLET_LAKEKEEPER_URL` is set, falling back to a directory walker
   for tests + local-mode-without-lakekeeper.
-- **Per-table files.json manifests**: Data Gateway writes one `files.json`
-  per `(namespace, table)` at `<table-base>/.run-state/<run-id>/files.json`
-  (inside the table's lakekeeper-managed prefix). Wire shape in
-  `pkg/datagateway/files_manifest.go`:
-  `{"run_id":"...", "namespace":"...", "table":"...", "paths":[...]}`.
-  Since RFC 021 the manifest is an audit breadcrumb (write failure is a
-  logged warning, not fatal): commits happen inline in the Data Gateway.
-  CloseWriter dispatches the writer's parquet paths to the commit pool
-  (`pkg/datagateway/commit_pool.go`), which calls
+- **Commit path**: `CloseWriter` calls `TableWriter.Close` (the DuckDB writer
+  returns its Parquet files with rows/bytes), then dispatches the paths to the
+  commit pool (`pkg/datagateway/commit_pool.go`), which calls
   `icebergjob.CommitTableFiles` — `txn.AddFiles` (APPEND) or
   `txn.ReplaceDataFiles` (FULL_LOAD), 409-conflict retry, idempotency key
   in the snapshot summary. The session Commit RPC is the barrier that
-  drains the pool and reconciles per-writer results. Zero paths =
-  success-zero.
+  drains the pool and reconciles per-writer results. Zero files =
+  success-zero (FULL_LOAD with zero rows does not truncate). There is no
+  `files.json` breadcrumb any more.
 - **Per-run JWT**: pipeline-api mints **one RS256 JWT per run** via
   `tokens.MintRunToken`. Audience is `datuplet-catalog` (lakekeeper). The
   K8s run-token Secret carries a single `token` key.
@@ -343,7 +346,7 @@ These are conventions a new contributor wouldn't infer from the code:
   pipeline-api's `/internal/v1/*` routes) and `cookie-hmac-key` (app-worker
   only, signs viewer session cookies).
 - **Monorepo `go mod tidy`**: the repo has multiple Go modules
-  (`./`, `tests/e2e/`, `components/*/`, `sdk/go/`, `sdk/go/arrow/`,
+  (`./`, `tests/e2e/`, `components/*/`, `gateway/`, `sdk/go/`, `sdk/go/arrow/`,
   `utils/docker/install-duckdb-ext/`).
   Tidying root in isolation drifts the others —
   their Docker builds + e2e enforce parity and fail CI. Always run
@@ -355,11 +358,11 @@ These are conventions a new contributor wouldn't infer from the code:
 |-----------|---------|
 | `pkg/pipeline/config/` | Envelope-free PipelineDoc parser (shared by operator + pipeline-api; RFC 027). |
 | `pkg/pipeline/schemalint/` | Form-Subset linter for `components/*/schema.json` (RFC 027). |
-| `pkg/datagateway/` | Data Gateway service (format conversion, processors, buffering). |
-| `pkg/datagateway/backend/` | Storage backends (MinIO/S3, GCS, local FS). |
+| `pkg/datagateway/` | Data Gateway server (gRPC/HTTP contract, format adapters, processors, commit pool, `DataPlane` interface). Pure Go. |
+| `gateway/` | Own CGO module: `duck/` (DuckDB bindings layer), `duckplane/` (the DuckDB `DataPlane`), `cmd/datagateway/` (sidecar binary). |
 | `pkg/datagateway/lakekeeper/` | Data Gateway's lakekeeper resolver. |
 | `pkg/datupleticeio/` | iceberg-go `gs://` IO factory override (vended OAuth tokens). |
-| `pkg/icebergjob/` | Shared iceberg-commit library (`CommitTableFiles` / `CommitTable`); used by the DG commit pool. |
+| `pkg/icebergjob/` | Shared iceberg-commit library (`CommitTableFiles`); used by the DG commit pool. |
 | `pkg/catalogwriter/` | Shared lakekeeper REST client + VendedCreds. |
 | `pkg/k8s/api/v1/` | CRD types (Pipeline, PipelineRun). |
 | `pkg/k8s/controllers/` | PipelineRun controller; builds per-stage component Jobs. |

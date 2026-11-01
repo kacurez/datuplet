@@ -57,7 +57,7 @@ sequenceDiagram
     LK->>STS: AssumeRole (scoped to table prefix)
     STS-->>LK: temporary credentials (≤15 min)
     LK-->>DG: vended S3 credentials
-    DG->>S3: PutObject with vended credentials
+    DG->>S3: DuckDB COPY ... TO s3://... with vended credentials
 ```
 
 ### GCS leg (Credential Access Boundary — WIF or SA key)
@@ -79,7 +79,7 @@ sequenceDiagram
     IAM-->>LK: downscoped OAuth2 token (≤1 h)
 
     LK-->>DG: vended GCS OAuth2 token (gcs.oauth2.token)
-    DG->>GCS: object writes with vended token
+    DG->>GCS: DuckDB COPY ... TO gs://... with vended token
 ```
 
 In Mode B (static SA key), Lakekeeper holds the key in its Postgres store and
@@ -89,6 +89,13 @@ is skipped. The CAB downscope step is identical in both modes.
 The Data Gateway renews credentials at 50 % of their issued TTL (minimum 60 s
 interval). On cancellation, FGA tuple deletion prevents renewal; the credential
 expires within the STS / CAB TTL (≤15 min for STS, ≤1 h for GCS CAB tokens).
+
+The DuckDB writer installs a fresh DuckDB secret from the current vended
+credentials before every Parquet file, and requires a remaining validity of at
+least `max(2 min, 25 % of the issued TTL)` (it calls `Invalidate()` and
+re-reads once, then fails the write). A single file must finish within that
+window. Reads run under the credentials the DuckDB Iceberg extension vends
+itself after attaching Lakekeeper `READ_ONLY` with the run JWT.
 
 ---
 
@@ -139,21 +146,32 @@ Runs alongside every component container in the same Pod. The component never
 touches S3 directly; it talks to the gateway over gRPC (port 50051, control) and
 HTTP (port 50052, data).
 
+The sidecar binary is `datagateway` (`gateway/cmd/datagateway`, CGO). The Go
+server (`pkg/datagateway`) owns the gRPC/HTTP contract, format adapters, drop
+processors, table create/load, vended credentials and the commit pool; storage
+I/O goes through the `DataPlane` interface, implemented by an embedded
+DuckDB 2.0 engine in `gateway/duckplane`. The engine is locked after boot
+(extensions baked into the image, no autoload/install, configuration locked).
+The sidecar has a `/scratch` emptyDir (2 Gi) for DuckDB spill and a 1 Gi memory
+limit.
+
 Responsibilities at boot:
 - Reads the run-token JWT from `/var/run/secrets/datuplet-runtoken/token`.
 - Validates the JWT against pipeline-api's JWKS (RS256 signature, expiry, claims).
 - Resolves the warehouse from the JWT `warehouse` claim.
+- Opens the DuckDB plane (`httpfs` + `iceberg` loaded from the image, then locked).
 
 Responsibilities per write:
 - Calls Lakekeeper `LoadOrCreate` to get (or create) the table and STS credentials.
-- Buffers incoming data (up to 128 MB per file), converts to Parquet, writes via
-  STS-vended S3 credentials.
-- Writes a `files.json` audit breadcrumb at
-  `<table-base>/.run-state/<run-id>/files.json` listing the written parquet paths.
+  New tables are created with all fields optional.
+- Feeds the component's Arrow batches to DuckDB, which writes Parquet
+  (`COPY ... TO`, zstd) straight to the table's data prefix with the vended
+  credentials, rotating to a new file at 4 x the target file size (128 MiB default).
 
 Responsibilities per commit (RFC 021 — inline, no separate Job):
-- On `CloseWriter`, dispatches the writer's parquet paths to an in-process
-  commit worker pool (`pkg/datagateway/commit_pool.go`).
+- On `CloseWriter`, closes the DuckDB writer and dispatches the written Parquet
+  paths to an in-process commit worker pool (`pkg/datagateway/commit_pool.go`).
+  No files are written other than the Parquet data files (no `files.json`).
 - Each commit opens an Iceberg transaction at Lakekeeper via the
   `pkg/icebergjob` library: `txn.AddFiles` (APPEND) or `txn.ReplaceDataFiles`
   (FULL_LOAD), retried on 409 conflict with exponential backoff, with an
@@ -162,9 +180,12 @@ Responsibilities per commit (RFC 021 — inline, no separate Job):
   per-writer results.
 
 Responsibilities per read:
-- Fetches the current Iceberg snapshot from Lakekeeper.
-- Streams parquet row-groups to the component in the requested format (Parquet,
-  Arrow IPC, CSV, JSON).
+- Attaches Lakekeeper `READ_ONLY` through DuckDB's Iceberg extension (once per
+  sidecar, on the first read) and streams the table; merge-on-read deletes are
+  applied.
+- Serves chunks to the component as Parquet, Arrow IPC, CSV, JSON or JSONL. An
+  empty table returns one last chunk with zero rows. `GetSchema` / `GetSample`
+  return `Unimplemented`.
 
 ### Lakekeeper
 
@@ -213,12 +234,11 @@ A complete pipeline run from trigger to committed Iceberg table:
    gRPC.
 
 4. **Write.** Component calls `OpenWriter` → DG calls Lakekeeper `LoadOrCreate`
-   table, receives STS credentials, writes parquet to S3/GCS. DG accumulates
-   chunks into 128 MB parquet files.
+   table, receives STS credentials, and streams the chunks into DuckDB, which
+   writes parquet files to S3/GCS.
 
-5. **Finalize.** Component closes each writer → DG writes a `files.json` audit
-   breadcrumb per table inside the table's Iceberg-managed prefix and dispatches
-   the writer's parquet paths to its inline commit pool.
+5. **Finalize.** Component closes each writer → DG closes the DuckDB writer and
+   dispatches the written parquet paths to its inline commit pool.
 
 6. **Commit.** The pool opens an iceberg-go transaction against Lakekeeper,
    `AddFiles` / `ReplaceDataFiles`, commits (retrying on 409 conflict). The

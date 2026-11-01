@@ -178,6 +178,40 @@ Iceberg `timestamp` and handling nanoseconds are follow-up work.
 
 ---
 
+## Data Gateway (DuckDB data plane)
+
+**GCS on the DuckDB data plane is unverified.** `gs://` warehouses are written
+through DuckDB's `gcs` secret (`BEARER_TOKEN`) and read through the Iceberg
+extension's vended GCS credentials. No GCS environment exists in CI or locally
+(Lakekeeper hard-codes storage.googleapis.com); prove it on GKE before relying
+on it. S3/MinIO is covered by the integration suite and e2e.
+
+**Writer limits.** `partition_fields` are ignored with one warning per writer
+(no Iceberg partition spec was ever set). `external_files` on `CloseWriter`
+fails with "external data files are not supported". The per-table `files.json`
+audit breadcrumb and the `_schema-*.json` / `_manifest-*.json` sidecar files are
+no longer written. FULL_LOAD with zero rows still does not truncate the table
+(no files, no commit). `large_string` / `large_binary` input is rejected, and
+new tables are created with all fields optional.
+
+**One Parquet file must finish within the vended credentials' validity.** Before
+each file the writer requires `max(2 min, 25 % of the issued TTL)` of remaining
+validity and fails the write otherwise. A single read longer than the vended
+TTL is unverified.
+
+**Read path.** `GetSchema` and `GetSample` return `Unimplemented`. Incremental
+reads and read-time transforms are ignored (full snapshot, `DeltaInfo` nil).
+Zoned timestamps read back as UTC. An empty table returns one last chunk with
+zero rows instead of failing `OpenReader`.
+
+**Image and sizing.** The gateway image is CGO + DuckDB (roughly 300 MB). The
+sidecar gets a 2 Gi `/scratch` emptyDir for DuckDB spill and requests cpu
+100m / memory 256Mi with a 1Gi memory limit; DuckDB defaults to 1 thread and
+50 % of the cgroup memory limit (`DATUPLET_GATEWAY_DUCKDB_THREADS`,
+`DATUPLET_GATEWAY_DUCKDB_MEMORY_LIMIT`).
+
+---
+
 ## JWT handling
 
 **pipeline-api key rotation drops in-flight run tokens.** Run tokens carry a 24 h

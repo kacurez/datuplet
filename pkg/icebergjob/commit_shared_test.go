@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,7 +26,7 @@ import (
 
 // commitSharedFixture spins up a real iceberg-go SQLite catalog over a
 // tmp warehouse directory + creates a (namespace, table) with a small
-// integer schema. Tests use this to drive CommitTable through the local
+// integer schema. Tests use this to drive CommitTableFiles through the local
 // SQLite catalog path.
 type commitSharedFixture struct {
 	t           *testing.T
@@ -124,58 +123,10 @@ func (f *commitSharedFixture) writeParquet(rel string, val int64) string {
 	return "file://" + abs
 }
 
-// writeManifest writes a v1-shaped files.json at <tableLocation>/.run-state/<runID>/files.json
-// and returns the absolute file:// URL of the manifest.
-func (f *commitSharedFixture) writeManifest(runID string, paths []string) string {
-	f.t.Helper()
-	tbl, err := f.cat.LoadTable(context.Background(), f.ident)
-	if err != nil {
-		f.t.Fatalf("LoadTable for manifest base: %v", err)
-	}
-	loc := tbl.Location()
-	manifestURL := FilesManifestPath(loc, runID)
-	// Convert file:// URL to absolute path for os.WriteFile.
-	manifestPath := strings.TrimPrefix(manifestURL, "file://")
-	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
-		f.t.Fatalf("mkdir manifest parent: %v", err)
-	}
-	doc := FilesManifest{
-		RunID:     runID,
-		Namespace: strings.Join(f.ident[:len(f.ident)-1], "."),
-		Table:     f.ident[len(f.ident)-1],
-		Paths:     paths,
-	}
-	body, err := json.Marshal(&doc)
-	if err != nil {
-		f.t.Fatalf("marshal manifest: %v", err)
-	}
-	if err := os.WriteFile(manifestPath, body, 0o644); err != nil {
-		f.t.Fatalf("write manifest: %v", err)
-	}
-	return manifestURL
-}
-
-// writeManifestEmpty writes a manifest with paths=[].
-func (f *commitSharedFixture) writeManifestEmpty(runID string) string {
-	return f.writeManifest(runID, []string{})
-}
-
-// manifestPathFor returns the URL where a manifest WOULD live for runID,
-// without actually creating the file (used to test the missing-manifest
-// success-zero path).
-func (f *commitSharedFixture) manifestPathFor(runID string) string {
-	f.t.Helper()
-	tbl, err := f.cat.LoadTable(context.Background(), f.ident)
-	if err != nil {
-		f.t.Fatalf("LoadTable for manifest path: %v", err)
-	}
-	return FilesManifestPath(tbl.Location(), runID)
-}
-
-// TestCommitTable_AppendHappyPath: 3 paths, APPEND, table has no
+// TestCommitTableFiles_AppendHappyPath: 3 paths, APPEND, table has no
 // pre-existing data → AddFiles + Commit succeed; result reports
 // DataFilesAdded=3 and a non-empty SnapshotIDAfter.
-func TestCommitTable_AppendHappyPath(t *testing.T) {
+func TestCommitTableFiles_AppendHappyPath(t *testing.T) {
 	t.Parallel()
 	fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "events"})
 
@@ -184,11 +135,10 @@ func TestCommitTable_AppendHappyPath(t *testing.T) {
 		fx.writeParquet("data/b.parquet", 2),
 		fx.writeParquet("data/c.parquet", 3),
 	}
-	manifestPath := fx.writeManifest("run-append-1", paths)
 
-	res, err := CommitTable(context.Background(), fx.cat, fx.ident, manifestPath, WriteModeAppend, nil)
+	res, err := CommitTableFiles(context.Background(), fx.cat, fx.ident, paths, WriteModeAppend, nil, "")
 	if err != nil {
-		t.Fatalf("CommitTable: %v", err)
+		t.Fatalf("CommitTableFiles: %v", err)
 	}
 	if res == nil {
 		t.Fatalf("nil result")
@@ -238,10 +188,10 @@ func TestCommitTable_AppendHappyPath(t *testing.T) {
 	}
 }
 
-// TestCommitTable_FullLoadHappyPath: table has 2 existing files (via
+// TestCommitTableFiles_FullLoadHappyPath: table has 2 existing files (via
 // initial APPEND); FULL_LOAD with 1 new path should ReplaceDataFiles
 // the existing 2 with the new 1.
-func TestCommitTable_FullLoadHappyPath(t *testing.T) {
+func TestCommitTableFiles_FullLoadHappyPath(t *testing.T) {
 	t.Parallel()
 	fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "fullload_target"})
 
@@ -250,8 +200,7 @@ func TestCommitTable_FullLoadHappyPath(t *testing.T) {
 		fx.writeParquet("data/seed-a.parquet", 10),
 		fx.writeParquet("data/seed-b.parquet", 20),
 	}
-	seedManifest := fx.writeManifest("seed-run", seedPaths)
-	if _, err := CommitTable(context.Background(), fx.cat, fx.ident, seedManifest, WriteModeAppend, nil); err != nil {
+	if _, err := CommitTableFiles(context.Background(), fx.cat, fx.ident, seedPaths, WriteModeAppend, nil, ""); err != nil {
 		t.Fatalf("seed APPEND: %v", err)
 	}
 
@@ -259,11 +208,10 @@ func TestCommitTable_FullLoadHappyPath(t *testing.T) {
 	newPaths := []string{
 		fx.writeParquet("data/new-x.parquet", 99),
 	}
-	manifestPath := fx.writeManifest("run-fullload-1", newPaths)
 
-	res, err := CommitTable(context.Background(), fx.cat, fx.ident, manifestPath, WriteModeFullLoad, nil)
+	res, err := CommitTableFiles(context.Background(), fx.cat, fx.ident, newPaths, WriteModeFullLoad, nil, "")
 	if err != nil {
-		t.Fatalf("CommitTable FULL_LOAD: %v", err)
+		t.Fatalf("CommitTableFiles FULL_LOAD: %v", err)
 	}
 	if res.WriteMode != WriteModeFullLoad {
 		t.Errorf("WriteMode=%q want FULL_LOAD", res.WriteMode)
@@ -309,21 +257,20 @@ func TestCommitTable_FullLoadHappyPath(t *testing.T) {
 	}
 }
 
-// TestCommitTable_FullLoad_FreshTable: FULL_LOAD against a table with
+// TestCommitTableFiles_FullLoad_FreshTable: FULL_LOAD against a table with
 // no current snapshot — iceberg-go's ReplaceDataFiles delegates to
 // AddFiles when filesToDelete is empty, so the call should succeed.
-func TestCommitTable_FullLoad_FreshTable(t *testing.T) {
+func TestCommitTableFiles_FullLoad_FreshTable(t *testing.T) {
 	t.Parallel()
 	fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "fresh_fullload"})
 
 	newPaths := []string{
 		fx.writeParquet("data/initial.parquet", 7),
 	}
-	manifestPath := fx.writeManifest("run-fresh-fullload", newPaths)
 
-	res, err := CommitTable(context.Background(), fx.cat, fx.ident, manifestPath, WriteModeFullLoad, nil)
+	res, err := CommitTableFiles(context.Background(), fx.cat, fx.ident, newPaths, WriteModeFullLoad, nil, "")
 	if err != nil {
-		t.Fatalf("CommitTable FULL_LOAD on fresh table: %v", err)
+		t.Fatalf("CommitTableFiles FULL_LOAD on fresh table: %v", err)
 	}
 	if res.DataFilesAdded != 1 {
 		t.Errorf("DataFilesAdded=%d want 1", res.DataFilesAdded)
@@ -348,118 +295,41 @@ func TestCommitTable_FullLoad_FreshTable(t *testing.T) {
 	}
 }
 
-// TestCommitTable_NoManifestFiles_NoOp: a manifest that exists but has paths
-// [], and a manifestPath that does not exist, both return a success-zero
-// result and no commit happens (matches today's table-commit behavior where a
-// run that produced no parquet for a target is a no-op).
-func TestCommitTable_NoManifestFiles_NoOp(t *testing.T) {
+// TestCommitTableFiles_NoPaths_NoOp: empty dataPaths is success-zero and no
+// commit happens.
+func TestCommitTableFiles_NoPaths_NoOp(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name         string
-		manifestPath func(fx *commitSharedFixture) string
-	}{
-		{"empty manifest", func(fx *commitSharedFixture) string { return fx.writeManifestEmpty("run-empty") }},
-		{"missing manifest", func(fx *commitSharedFixture) string { return fx.manifestPathFor("run-missing") /* never written */ }},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "no_manifest_files"})
+	fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "no_paths"})
 
-			res, err := CommitTable(context.Background(), fx.cat, fx.ident, tc.manifestPath(fx), WriteModeAppend, nil)
-			if err != nil {
-				t.Fatalf("CommitTable: %v", err)
-			}
-			if res == nil {
-				t.Fatalf("nil result")
-			}
-			if res.DataFilesAdded != 0 {
-				t.Errorf("DataFilesAdded=%d want 0", res.DataFilesAdded)
-			}
-			if res.SnapshotIDAfter != "" {
-				t.Errorf("SnapshotIDAfter=%q want empty (no commit)", res.SnapshotIDAfter)
-			}
-			if res.WriteMode != WriteModeAppend {
-				t.Errorf("WriteMode=%q want APPEND", res.WriteMode)
-			}
-		})
+	res, err := CommitTableFiles(context.Background(), fx.cat, fx.ident, nil, WriteModeAppend, nil, "")
+	if err != nil {
+		t.Fatalf("CommitTableFiles: %v", err)
+	}
+	if res.DataFilesAdded != 0 {
+		t.Errorf("DataFilesAdded=%d want 0", res.DataFilesAdded)
+	}
+	if res.SnapshotIDAfter != "" {
+		t.Errorf("SnapshotIDAfter=%q want empty (no commit)", res.SnapshotIDAfter)
+	}
+	if res.WriteMode != WriteModeAppend {
+		t.Errorf("WriteMode=%q want APPEND", res.WriteMode)
 	}
 }
 
-// TestCommitTable_UnsupportedMode_Error: mode "UPSERT" (or any unknown
+// TestCommitTableFiles_UnsupportedMode_Error: mode "UPSERT" (or any unknown
 // literal) returns an error before any commit work runs.
-func TestCommitTable_UnsupportedMode_Error(t *testing.T) {
+func TestCommitTableFiles_UnsupportedMode_Error(t *testing.T) {
 	t.Parallel()
 	fx := newCommitSharedFixture(t, icebergtable.Identifier{"raw", "unsupported_mode"})
 
 	paths := []string{fx.writeParquet("data/a.parquet", 1)}
-	manifestPath := fx.writeManifest("run-unsupported", paths)
 
-	_, err := CommitTable(context.Background(), fx.cat, fx.ident, manifestPath, WriteMode("UPSERT"), nil)
+	_, err := CommitTableFiles(context.Background(), fx.cat, fx.ident, paths, WriteMode("UPSERT"), nil, "")
 	if err == nil {
 		t.Fatalf("expected error for unsupported mode UPSERT, got nil")
 	}
 	if !strings.Contains(err.Error(), "unsupported write mode") {
 		t.Errorf("error=%q want 'unsupported write mode' substring", err)
-	}
-}
-
-// TestParseFilesManifest: a v1 manifest (Paths populated, SchemaVersion absent)
-// is migrated to v2 (DataPaths populated); a v2 manifest with SchemaVersion=2
-// and DataPaths is read directly without migration; an empty paths/data_paths
-// produces ErrManifestEmpty.
-func TestParseFilesManifest(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name          string
-		body          string
-		wantErr       error
-		wantVersion   int
-		wantDataPaths []string
-	}{
-		{
-			name:          "v1 migrates paths to data paths",
-			body:          `{"run_id":"r","namespace":"raw","table":"t","paths":["s3://b/a.parquet","s3://b/b.parquet"]}`,
-			wantVersion:   0,
-			wantDataPaths: []string{"s3://b/a.parquet", "s3://b/b.parquet"},
-		},
-		{
-			name:          "v2 is read directly",
-			body:          `{"schema_version":2,"run_id":"r","namespace":"raw","table":"t","data_paths":["s3://b/a.parquet"],"delete_paths":[]}`,
-			wantVersion:   2,
-			wantDataPaths: []string{"s3://b/a.parquet"},
-		},
-		{
-			name:    "empty paths is ErrManifestEmpty",
-			body:    `{"run_id":"r","namespace":"raw","table":"t","paths":[]}`,
-			wantErr: ErrManifestEmpty,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			m, err := parseFilesManifest([]byte(tc.body))
-			if tc.wantErr != nil {
-				if err != tc.wantErr {
-					t.Fatalf("err=%v want %v", err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parseFilesManifest: %v", err)
-			}
-			if m.SchemaVersion != tc.wantVersion {
-				t.Errorf("SchemaVersion=%d want %d", m.SchemaVersion, tc.wantVersion)
-			}
-			if len(m.DataPaths) != len(tc.wantDataPaths) {
-				t.Fatalf("DataPaths=%v want %v", m.DataPaths, tc.wantDataPaths)
-			}
-			for i, p := range tc.wantDataPaths {
-				if m.DataPaths[i] != p {
-					t.Errorf("DataPaths[%d]=%q want %q", i, m.DataPaths[i], p)
-				}
-			}
-		})
 	}
 }
 

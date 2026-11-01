@@ -89,7 +89,7 @@ JWT, or the Data Gateway sidecar logs `failed to validate run token`.
 **Diagnosis.**
 
 ```bash
-kubectl logs -n datuplet <pod-name> -c datagateway
+kubectl logs -n datuplet <pod-name> -c gateway
 ```
 
 **Causes and fixes.**
@@ -237,11 +237,14 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
   (`catalogwriter.RetryOnConflict`) was exhausted. This happens when multiple
   runs write to the same table concurrently; retries are automatic, but a
   persistent conflict surfaces as a failed commit in the gateway log.
-- `files.json` at `<table-base>/.run-state/<run-id>/files.json` is written as
-  an audit breadcrumb only — its absence or a write failure is a logged
-  warning, not the cause of a commit failure. Don't treat a missing
-  `files.json` as the root cause; look at the commit-pool error in the gateway
-  log instead.
+- A DuckDB write error (the COPY to object storage failed — credentials too
+  close to expiry, endpoint unreachable, out of `/scratch` or `memory_limit`)
+  fails the writer before anything is dispatched to the commit pool; the
+  gateway log has the error. Statements containing secrets are never logged,
+  so the message is generic by design.
+- iceberg-go rejected the Parquet at `AddFiles` (for example a naive or
+  nanosecond timestamp column; see [known limitations](known-limitations.md)).
+  The commit-pool error in the gateway log names the column.
 
 ---
 
@@ -266,11 +269,12 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
 - Lakekeeper returned a 409 conflict and the retry budget was exhausted. This
   happens when multiple runs write to the same table concurrently. The next run
   will succeed; the failed run's data is orphaned in S3 but not committed.
-- The `files.json` path is wrong. Confirm by listing the prefix directly in S3:
+- The Parquet files were never written. Confirm by listing the table's data
+  prefix directly in S3:
   ```bash
   # For MinIO:
   kubectl exec -n datuplet deploy/minio -- \
-    mc ls local/datuplet/<table-uuid>/.run-state/<run-id>/
+    mc ls local/datuplet/<table-uuid>/data/
   ```
 - The Pipeline's output bucket does not match a registered Lakekeeper namespace.
   Check that the namespace exists in Lakekeeper: open the Storage tab in the UI
