@@ -13,6 +13,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -212,11 +213,27 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 									Protocol:      corev1.ProtocolTCP,
 								},
 							},
+							// requests/limits: the DuckDB data plane sizes memory_limit
+							// at 50% of the cgroup memory limit and spills to /scratch.
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("256Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("1Gi"),
+								},
+							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "gateway-config",
 									MountPath: "/config",
 									ReadOnly:  true,
+								},
+								// DuckDB temp_directory (default /scratch).
+								{
+									Name:      "gateway-scratch",
+									MountPath: "/scratch",
 								},
 							},
 						},
@@ -254,6 +271,14 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 									LocalObjectReference: corev1.LocalObjectReference{
 										Name: configMapName,
 									},
+								},
+							},
+						},
+						{
+							Name: "gateway-scratch",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{
+									SizeLimit: resource.NewQuantity(2<<30, resource.BinarySI),
 								},
 							},
 						},

@@ -9,6 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // minimalPipeline returns a Pipeline with one stage and one component,
@@ -617,4 +618,83 @@ func envVarValue(envs []corev1.EnvVar, name string) string {
 		}
 	}
 	return ""
+}
+
+// The gateway sidecar gets a bounded emptyDir at /scratch (DuckDB temp
+// directory) and explicit resources: the DuckDB data plane spills to disk and
+// sizes memory_limit from the cgroup limit.
+func TestGatewaySidecarHasScratchAndResources(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+	job, _, err := r.buildComponentJob(context.Background(), minimalPipelineRun(), &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	podSpec := job.Spec.Template.Spec
+
+	var vol *corev1.Volume
+	for i := range podSpec.Volumes {
+		if podSpec.Volumes[i].Name == "gateway-scratch" {
+			vol = &podSpec.Volumes[i]
+		}
+	}
+	if vol == nil || vol.EmptyDir == nil {
+		t.Fatalf("gateway-scratch emptyDir volume not found: %+v", podSpec.Volumes)
+	}
+	if vol.EmptyDir.SizeLimit == nil || vol.EmptyDir.SizeLimit.Cmp(resource.MustParse("2Gi")) != 0 {
+		t.Errorf("gateway-scratch sizeLimit = %v, want 2Gi", vol.EmptyDir.SizeLimit)
+	}
+
+	gw := podSpec.InitContainers[0]
+	if gw.Name != "gateway" {
+		t.Fatalf("first init container is %q, want gateway", gw.Name)
+	}
+	var mount *corev1.VolumeMount
+	for i := range gw.VolumeMounts {
+		if gw.VolumeMounts[i].Name == "gateway-scratch" {
+			mount = &gw.VolumeMounts[i]
+		}
+	}
+	if mount == nil || mount.MountPath != "/scratch" || mount.ReadOnly {
+		t.Errorf("gateway-scratch mount = %+v, want read-write at /scratch", mount)
+	}
+	for _, c := range podSpec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "gateway-scratch" {
+				t.Errorf("component container %q must not mount gateway-scratch", c.Name)
+			}
+		}
+	}
+
+	res := gw.Resources
+	if got := res.Requests[corev1.ResourceCPU]; got.Cmp(resource.MustParse("100m")) != 0 {
+		t.Errorf("requests.cpu = %v, want 100m", got.String())
+	}
+	if got := res.Requests[corev1.ResourceMemory]; got.Cmp(resource.MustParse("256Mi")) != 0 {
+		t.Errorf("requests.memory = %v, want 256Mi", got.String())
+	}
+	if got := res.Limits[corev1.ResourceMemory]; got.Cmp(resource.MustParse("1Gi")) != 0 {
+		t.Errorf("limits.memory = %v, want 1Gi", got.String())
+	}
+	if _, ok := res.Limits[corev1.ResourceCPU]; ok {
+		t.Errorf("limits.cpu is set (%v); the spec sets only a memory limit", res.Limits[corev1.ResourceCPU])
+	}
+}
+
+// The gateway image's ENTRYPOINT is the datagateway binary: the operator must
+// not override it with a command or pass a subcommand as the first arg.
+func TestGatewaySidecarArgsFitEntrypoint(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+	job, _, err := r.buildComponentJob(context.Background(), minimalPipelineRun(), &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	gw := job.Spec.Template.Spec.InitContainers[0]
+	if len(gw.Command) != 0 {
+		t.Errorf("gateway Command = %v, want none (image ENTRYPOINT)", gw.Command)
+	}
+	if len(gw.Args) == 0 || !strings.HasPrefix(gw.Args[0], "-") {
+		t.Errorf("gateway Args = %v, want flags only (no subcommand)", gw.Args)
+	}
 }

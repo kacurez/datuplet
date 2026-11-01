@@ -35,6 +35,9 @@ jobs:
       dockerfile: utils/docker/Dockerfile.pipeline-operator
     secrets: inherit
 
+  # gateway: the sidecar image. CGO (DuckDB data plane in gateway/, extensions
+  # baked + verified offline in the Dockerfile's verify stage), so — like
+  # query-worker — a multi-arch native build per arch, no cross-compile.
   gateway:
     uses: ./.github/workflows/_release-image.yml
     with:

@@ -63,3 +63,31 @@ func TestUnknownFlagExitsNonZero(t *testing.T) {
 		t.Error("unknown flag: exit code 0, want non-zero")
 	}
 }
+
+// --selfcheck needs no --config: the image build runs it offline.
+func TestParseFlagsSelfcheck(t *testing.T) {
+	opts, err := parseFlags([]string{"--selfcheck"}, noEnv, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if !opts.selfcheck {
+		t.Errorf("opts.selfcheck = false, want true")
+	}
+	opts, err = parseFlags([]string{"--config", "c.yaml"}, noEnv, &bytes.Buffer{})
+	if err != nil || opts.selfcheck {
+		t.Errorf("without the flag: opts = %+v, err = %v", opts, err)
+	}
+}
+
+// --selfcheck fails (exit 20) when httpfs/iceberg cannot be loaded. The
+// success path needs the baked extensions; the image's verify stage covers it.
+func TestSelfcheckFailsWithoutExtensions(t *testing.T) {
+	var stderr bytes.Buffer
+	// Settings come from the process env; an empty extension dir has nothing
+	// to LOAD (and no network is attempted: autoinstall is off).
+	t.Setenv("DATUPLET_GATEWAY_DUCKDB_EXTENSION_DIR", t.TempDir())
+	t.Setenv("DATUPLET_GATEWAY_DUCKDB_TEMP_DIR", t.TempDir())
+	if code := realMain([]string{"--selfcheck"}, noEnv, &stderr); code != exitApplication {
+		t.Errorf("selfcheck with no extensions: exit %d, want %d (stderr %q)", code, exitApplication, stderr.String())
+	}
+}

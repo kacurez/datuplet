@@ -31,6 +31,7 @@ type options struct {
 	runTokenPath       string
 	podAnnotationsPath string
 	mode               string // "minio" / "local" when given (names the component), else "gateway"
+	selfcheck          bool   // --selfcheck: open the plane offline, then exit
 }
 
 func main() {
@@ -47,7 +48,36 @@ func realMain(args []string, getenv func(string) string, stderr io.Writer) int {
 	if err != nil {
 		return exitApplication
 	}
+	if opts.selfcheck {
+		return selfcheck(stderr)
+	}
 	return run(opts, getenv)
+}
+
+// selfcheck opens the data plane with the default (env) settings, which loads
+// httpfs and iceberg from the baked extension directory and locks the
+// configuration, then closes it. It needs no config file and no network; the
+// image's verify stage runs it with --network=none as the runtime user.
+func selfcheck(stderr io.Writer) int {
+	settings, err := duckplane.SettingsFromEnv()
+	if err != nil {
+		fmt.Fprintf(stderr, "datagateway: selfcheck: %v\n", err)
+		return exitApplication
+	}
+	plane, err := duckplane.New(duckplane.Config{
+		Settings:   settings,
+		Extensions: []string{"httpfs", "iceberg"},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "datagateway: selfcheck: %v\n", err)
+		return exitApplication
+	}
+	if err := plane.Close(); err != nil {
+		fmt.Fprintf(stderr, "datagateway: selfcheck: close: %v\n", err)
+		return exitApplication
+	}
+	fmt.Fprintln(stderr, "datagateway: selfcheck ok")
+	return 0
 }
 
 // parseFlags parses the sidecar flags. --minio and --local are accepted and
@@ -62,8 +92,12 @@ func parseFlags(args []string, getenv func(string) string, stderr io.Writer) (op
 	podAnnotationsPath := fs.String("pod-annotations-path", "", "Path to the downward-API pod annotations file; the gateway exits cleanly on datuplet.io/cancel=true (also POD_ANNOTATIONS_PATH)")
 	minio := fs.Bool("minio", false, "Accepted and ignored (operator compatibility)")
 	local := fs.Bool("local", false, "Accepted and ignored (operator compatibility)")
+	selfcheck := fs.Bool("selfcheck", false, "Open the DuckDB plane (load httpfs + iceberg, lock) and exit 0; needs no config or network")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
+	}
+	if *selfcheck {
+		return options{selfcheck: true}, nil
 	}
 	if *configPath == "" {
 		fmt.Fprintln(stderr, "datagateway: --config is required")

@@ -45,7 +45,11 @@ build-operators: ## Build pipeline-operator binary
 engine-wasm: ## Build pkg/appengine/embed/engine.wasm (Docker, wasi-sdk)
 	docker build -f utils/docker/engine-wasm.Dockerfile -o pkg/appengine/embed .
 
-# Build the data gateway sidecar image
+# Build the data gateway sidecar image: the CGO DuckDB-plane binary
+# (gateway/cmd/datagateway) with httpfs + iceberg baked in. The build's
+# `verify` stage loads them and runs `datagateway --selfcheck` offline as uid
+# 65532, so a mis-baked extension fails here. Not part of `make build`
+# (that is the CGO-free CLI only).
 build-gateway: ## Build gateway Docker image
 	docker build -t datuplet/gateway:latest -f utils/docker/Dockerfile.gateway .
 

@@ -1,32 +1,86 @@
-# Data Gateway sidecar image
-FROM golang:1.25-alpine AS builder
+# syntax=docker/dockerfile:1.4
+#
+# Data Gateway sidecar image: the datagateway binary (module gateway/, CGO,
+# DuckDB data plane) with the DuckDB httpfs + iceberg extensions baked in.
+#
+# Same pattern as utils/docker/query-worker.Dockerfile: Debian bookworm (not
+# Alpine: DuckDB's prebuilt library needs glibc), BuildKit cache mounts, a
+# throwaway baker (utils/docker/install-duckdb-ext) that INSTALLs the
+# extensions in the builder where the network is available.
+#
+# Why baked: run pods have no outbound route to extensions.duckdb.org, and the
+# engine's lockdown (autoinstall/autoload off, configuration locked) forbids a
+# post-boot INSTALL. The binary LOADs httpfs + iceberg from
+# DATUPLET_GATEWAY_DUCKDB_EXTENSION_DIR before locking.
+#
+# The runtime user is uid/gid 65532, the identity the operator runs the
+# sidecar as (pkg/k8s/controllers: RunAsUser 65532, fsGroup 65532). /scratch is
+# the DuckDB temp_directory; the operator mounts an emptyDir over it.
 
-WORKDIR /app
+FROM golang:1.25-bookworm AS builder
 
-# Copy go mod files
-COPY go.mod go.sum ./
+WORKDIR /build
 
-# Download modules with cache mount
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+# Build dependencies (CGO required for DuckDB).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy source
-COPY cmd/ ./cmd/
-COPY pkg/ ./pkg/
-COPY api/ ./api/
+# Copy the full repo so the gateway module's `replace => ..` resolves.
+COPY . .
 
-# Build datuplet binary with cache mounts
+WORKDIR /build/gateway
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -o /datuplet ./cmd/datuplet
+    CGO_ENABLED=1 go build -tags=duckdb_arrow -o /datagateway ./cmd/datagateway
 
-# Runtime image
-FROM alpine:3.19
+# Bake httpfs + iceberg into /root/.duckdb/extensions. The baker binary is not
+# shipped; it is reused as /ext-check in the verify stage.
+WORKDIR /build/utils/docker/install-duckdb-ext
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 go build -tags=duckdb_arrow -o /install-duckdb-ext . && \
+    HOME=/root /install-duckdb-ext && \
+    echo "Baked extension directory:" && \
+    find /root/.duckdb -type f | sort
 
-RUN apk add --no-cache ca-certificates
+# ---- Runtime image --------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
 
-COPY --from=builder /datuplet /usr/local/bin/datuplet
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libstdc++6 && \
+    rm -rf /var/lib/apt/lists/*
 
-# The entrypoint just sets up the gateway command; mode is passed via CMD
-ENTRYPOINT ["datuplet", "gateway"]
-CMD ["--local"]
+RUN groupadd -g 65532 datuplet && \
+    useradd -r -u 65532 -g datuplet -d /home/datuplet -m datuplet
+
+COPY --from=builder --chown=65532:65532 /root/.duckdb /home/datuplet/.duckdb
+
+# DuckDB temp_directory (SettingsFromEnv default).
+RUN mkdir -p /scratch && chown 65532:65532 /scratch
+
+COPY --from=builder /datagateway /usr/local/bin/datagateway
+
+USER 65532:65532
+ENV HOME=/home/datuplet \
+    DATUPLET_GATEWAY_DUCKDB_EXTENSION_DIR=/home/datuplet/.duckdb/extensions
+
+ENTRYPOINT ["datagateway"]
+
+# ---- Offline gate -----------------------------------------------------------
+# Proves, in the runtime layout (uid 65532, HOME, libc, baked extension dir)
+# with NO network, that (1) INSTALL/LOAD httpfs + iceberg succeed and (2) the
+# gateway's own boot path (--selfcheck: open plane, LOAD both, lock) works.
+# A mis-baked or mis-pathed extension fails the build here, not the first run.
+FROM runtime AS verify
+COPY --from=builder /install-duckdb-ext /ext-check
+RUN --network=none /ext-check && datagateway --selfcheck && touch /tmp/ext-verified
+
+# ---- Final image: runtime + proof the gate ran ------------------------------
+FROM runtime
+COPY --from=verify /tmp/ext-verified /tmp/ext-verified
