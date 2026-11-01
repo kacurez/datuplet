@@ -41,9 +41,19 @@ type fakeDataPlane struct {
 	// rejectLargeTypes makes OpenTableWriter refuse large_string /
 	// large_binary columns, as the DuckDB plane does (duckplane selectList).
 	rejectLargeTypes bool
-	// openAfterInterrupt lets OpenTableWriter succeed after Interrupt (not
-	// after Close), as the DuckDB plane does; writers opened then are live.
+	// openAfterInterrupt lets OpenTableWriter and OpenTableReader succeed
+	// after Interrupt (not after Close), as the DuckDB plane does; writers and
+	// readers opened then are live.
 	openAfterInterrupt bool
+
+	streams []*fakeRecordStream // every reader opened, in order
+	// nextErr, when set, fails every reader's Next once it has returned
+	// nextErrAfter batches.
+	nextErr      error
+	nextErrAfter int
+	// beforeOpenReader, when set, runs at the start of OpenTableReader
+	// (before p.mu), so a test can pause an open across a cancel.
+	beforeOpenReader func()
 }
 
 type fakeTable struct {
@@ -58,12 +68,6 @@ func newFakeDataPlane() *fakeDataPlane {
 }
 
 var _ DataPlane = (*fakeDataPlane)(nil)
-
-func (p *fakeDataPlane) isDead() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.dead
-}
 
 func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (TableWriter, error) {
 	// Context ownership: the writer's lifetime never derives from the Open
@@ -88,9 +92,12 @@ func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (Tab
 }
 
 func (p *fakeDataPlane) OpenTableReader(_ context.Context, spec ReaderSpec) (RecordStream, error) {
+	if p.beforeOpenReader != nil {
+		p.beforeOpenReader()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.dead {
+	if p.closed || (p.dead && !p.openAfterInterrupt) {
 		return nil, errFakePlaneDead
 	}
 	if p.openReaderErr != nil {
@@ -100,7 +107,9 @@ func (p *fakeDataPlane) OpenTableReader(_ context.Context, spec ReaderSpec) (Rec
 	if !ok {
 		return nil, fmt.Errorf("fake: unknown table %s.%s", spec.Namespace, spec.Table)
 	}
-	return &fakeRecordStream{plane: p, table: t}, nil
+	rs := &fakeRecordStream{plane: p, table: t}
+	p.streams = append(p.streams, rs)
+	return rs, nil
 }
 
 func (p *fakeDataPlane) Interrupt() {
@@ -108,8 +117,34 @@ func (p *fakeDataPlane) Interrupt() {
 	p.interruptedF = true
 	p.dead = true
 	writers := append([]*fakeTableWriter(nil), p.writers...)
+	streams := append([]*fakeRecordStream(nil), p.streams...)
 	p.mu.Unlock()
 	terminateAll(writers)
+	interruptAll(streams)
+}
+
+// interruptAll fails every stream's later Next (each under its own lock).
+func interruptAll(streams []*fakeRecordStream) {
+	for _, rs := range streams {
+		rs.mu.Lock()
+		rs.interrupted = true
+		rs.mu.Unlock()
+	}
+}
+
+// readers returns every reader opened so far.
+func (p *fakeDataPlane) readers() []*fakeRecordStream {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*fakeRecordStream(nil), p.streams...)
+}
+
+// failNext makes every reader's Next fail with err once it has returned
+// after batches.
+func (p *fakeDataPlane) failNext(err error, after int) {
+	p.mu.Lock()
+	p.nextErr, p.nextErrAfter = err, after
+	p.mu.Unlock()
 }
 
 // terminateAll marks each writer terminated and releases its batches, each
@@ -129,8 +164,10 @@ func (p *fakeDataPlane) Close() error {
 	p.closed = true
 	p.dead = true
 	writers := append([]*fakeTableWriter(nil), p.writers...)
+	streams := append([]*fakeRecordStream(nil), p.streams...)
 	p.mu.Unlock()
 	terminateAll(writers)
+	interruptAll(streams)
 	return nil
 }
 
@@ -320,11 +357,16 @@ func (w *fakeTableWriter) recorded() []arrow.RecordBatch {
 	return append([]arrow.RecordBatch(nil), w.batches...)
 }
 
+// fakeRecordStream replays a table's batches. Its state is guarded by mu;
+// plane Interrupt/Close mark it interrupted under that lock.
 type fakeRecordStream struct {
-	plane  *fakeDataPlane
-	table  fakeTable
-	next   int
-	closed bool
+	plane *fakeDataPlane
+	table fakeTable
+
+	mu          sync.Mutex
+	next        int
+	closes      int // Close calls
+	interrupted bool
 }
 
 func (s *fakeRecordStream) Schema() *arrow.Schema { return s.table.schema }
@@ -333,11 +375,20 @@ func (s *fakeRecordStream) Next(ctx context.Context) (arrow.RecordBatch, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s.plane.isDead() {
+	p := s.plane
+	p.mu.Lock()
+	nextErr, after := p.nextErr, p.nextErrAfter
+	p.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.interrupted {
 		return nil, errFakePlaneDead
 	}
-	if s.closed {
+	if s.closes > 0 {
 		return nil, errors.New("fake: Next on closed reader")
+	}
+	if nextErr != nil && s.next >= after {
+		return nil, nextErr
 	}
 	if s.next >= len(s.table.batches) {
 		return nil, io.EOF
@@ -348,7 +399,19 @@ func (s *fakeRecordStream) Next(ctx context.Context) (arrow.RecordBatch, error) 
 	return b, nil
 }
 
-func (s *fakeRecordStream) Close() error { s.closed = true; return nil }
+func (s *fakeRecordStream) Close() error {
+	s.mu.Lock()
+	s.closes++
+	s.mu.Unlock()
+	return nil
+}
+
+// closeCount is the number of Close calls.
+func (s *fakeRecordStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closes
+}
 
 // ---- self-tests ----------------------------------------------------------
 

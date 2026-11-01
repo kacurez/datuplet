@@ -43,7 +43,7 @@ Test gates — `go test ./...` must stay green on a bare machine:
   unless `TEST_DATABASE_URL` points at a Postgres, e.g.
   `postgres://postgres:test@localhost:55432/test?sslmode=disable`.
 - `//go:build integration` tests need Docker (testcontainers). CI runs
-  `go test -tags=integration ./pkg/datagateway/backend/... ./pkg/datupleticeio/...`
+  `go test -tags=integration ./pkg/datupleticeio/...`
   (fake-gcs-server). `pkg/pipelineapi/authz` has an OpenFGA test under the
   same tag that CI does not run.
 - The e2e suite (`tests/e2e/`, its own module) gates on `E2E_K8S=1`; without

@@ -165,7 +165,6 @@ func TestCancelAnnotation_CancelsCommitPool(t *testing.T) {
 		RunID:              "cancel-pool-test-run",
 		ComponentName:      "test",
 		DefaultBucket:      "raw",
-		Backend:            newMockBackend(),
 		PodAnnotationsPath: annotationsPath,
 		CancelPollInterval: 50 * time.Millisecond,
 	}

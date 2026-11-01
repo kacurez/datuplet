@@ -81,10 +81,6 @@ func (r *fakeResolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string,
 	return &dglakekeeper.WriterTarget{BasePath: "s3://warehouse/" + ns + "/" + tbl + "/data/"}, nil
 }
 
-func (r *fakeResolver) LoadTableForRead(context.Context, string, string) (*dglakekeeper.ReaderTarget, error) {
-	return nil, errors.New("fake resolver: no reads")
-}
-
 func (r *fakeResolver) Catalog(context.Context) (catalog.Catalog, error) { return nil, nil }
 func (r *fakeResolver) Close() error                                     { return nil }
 

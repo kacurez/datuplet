@@ -6,7 +6,6 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -18,10 +17,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
-	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
 
 func TestResolveSecretRefsInConfig(t *testing.T) {
@@ -100,148 +97,6 @@ func TestResolveSecretRefsInConfig(t *testing.T) {
 	}
 }
 
-// mockBackend implements a minimal backend.StorageBackend for testing.
-type mockBackend struct {
-	data map[string][]byte
-}
-
-func newMockBackend() *mockBackend {
-	return &mockBackend{
-		data: make(map[string][]byte),
-	}
-}
-
-func (b *mockBackend) OpenReader(ctx context.Context, tablePath string) (backend.Reader, error) {
-	return &mockReader{data: b.data[tablePath]}, nil
-}
-
-func (b *mockBackend) OpenWriter(ctx context.Context, tablePath string, opts backend.WriteOptions) (backend.Writer, error) {
-	return &mockWriter{path: tablePath, backend: b}, nil
-}
-
-func (b *mockBackend) Commit(ctx context.Context, writers []backend.Writer) (*backend.CommitResult, error) {
-	return &backend.CommitResult{}, nil
-}
-
-func (b *mockBackend) Rollback(ctx context.Context, writers []backend.Writer) error {
-	return nil
-}
-
-func (b *mockBackend) GetSchema(ctx context.Context, tablePath string) (*backend.SchemaInfo, error) {
-	return &backend.SchemaInfo{
-		Columns: []backend.ColumnInfo{
-			{Name: "id", Type: "int64", Nullable: false},
-			{Name: "name", Type: "string", Nullable: true},
-		},
-	}, nil
-}
-
-func (b *mockBackend) GetSample(ctx context.Context, tablePath string, limit int) (*backend.SampleResult, error) {
-	return &backend.SampleResult{
-		Schema: &backend.SchemaInfo{
-			Columns: []backend.ColumnInfo{
-				{Name: "id", Type: "int64", Nullable: false},
-				{Name: "name", Type: "string", Nullable: true},
-			},
-		},
-		Rows:          [][]byte{[]byte(`{"id":1,"name":"test"}`)},
-		TotalEstimate: 100,
-	}, nil
-}
-
-func (b *mockBackend) GetObject(ctx context.Context, path string) ([]byte, error) {
-	if data, ok := b.data[path]; ok {
-		return data, nil
-	}
-	return nil, fmt.Errorf("object not found: %s", path)
-}
-
-func (b *mockBackend) PutObject(ctx context.Context, path string, data []byte) error {
-	b.data[path] = data
-	return nil
-}
-
-func (b *mockBackend) RemoveAll(ctx context.Context, prefix string) error {
-	for k := range b.data {
-		if strings.HasPrefix(k, prefix) {
-			delete(b.data, k)
-		}
-	}
-	return nil
-}
-
-func (b *mockBackend) Close() error {
-	return nil
-}
-
-type mockReader struct {
-	data    []byte
-	readPos int
-}
-
-func (r *mockReader) ReadChunk() (*backend.DataChunk, error) {
-	if r.readPos > 0 {
-		return &backend.DataChunk{
-			IsLast: true,
-		}, nil
-	}
-	r.readPos++
-	return &backend.DataChunk{
-		Data:        r.data,
-		Format:      "csv",
-		IsLast:      true,
-		RowsInChunk: 1,
-	}, nil
-}
-
-func (r *mockReader) Schema() *backend.SchemaInfo {
-	return &backend.SchemaInfo{
-		Columns: []backend.ColumnInfo{
-			{Name: "id", Type: "int64", Nullable: false},
-			{Name: "name", Type: "string", Nullable: true},
-		},
-	}
-}
-
-func (r *mockReader) TotalSizeEstimate() int64 {
-	return int64(len(r.data))
-}
-
-func (r *mockReader) Close() error {
-	return nil
-}
-
-type mockWriter struct {
-	path    string
-	data    []byte
-	backend *mockBackend
-}
-
-func (w *mockWriter) WriteChunk(data []byte, rows int64) error {
-	w.data = append(w.data, data...)
-	return nil
-}
-
-func (w *mockWriter) OutputName() string {
-	return filepath.Base(w.path)
-}
-
-func (w *mockWriter) TablePath() string {
-	return w.path
-}
-
-func (w *mockWriter) Stats() backend.WriterStats {
-	return backend.WriterStats{
-		BytesWritten: int64(len(w.data)),
-		RowsWritten:  1,
-	}
-}
-
-func (w *mockWriter) Close() error {
-	w.backend.data[w.path] = w.data
-	return nil
-}
-
 func createTestServerV2(t *testing.T) (*ServerV2, string) {
 	tmpDir, err := os.MkdirTemp("", "gateway-v2-test-*")
 	if err != nil {
@@ -256,8 +111,7 @@ func createTestServerV2(t *testing.T) (*ServerV2, string) {
 		Outputs: map[string]OutputConfig{
 			"output": {Path: filepath.Join(tmpDir, "output")},
 		},
-		Backend:      newMockBackend(), // read side (static backend)
-		LocalDataDir: tmpDir,           // write side: local data prefixes on the fake plane
+		LocalDataDir: tmpDir, // local data prefixes on the fake plane
 	}
 
 	return mustNewServerV2(t, cfg), tmpDir
@@ -323,7 +177,6 @@ func TestServerV2_GetConfig_OutputTableColumns(t *testing.T) {
 				WriteMode: "APPEND",
 			},
 		},
-		Backend: newMockBackend(),
 	}
 	server := mustNewServerV2(t, cfg)
 
@@ -559,74 +412,6 @@ func TestServerV2_CloseWriter(t *testing.T) {
 	}
 }
 
-func TestServerV2_OpenReader(t *testing.T) {
-	// OpenReader test uses direct backend read (no lakekeeper)
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	// Open reader with JSON output format - requires bucket and table
-	resp, err := server.OpenReader(ctx, &pb.OpenReaderRequest{
-		Bucket:       "raw",
-		Table:        "input",
-		OutputFormat: pb.DataFormat_FORMAT_JSON,
-	})
-	if err != nil {
-		t.Fatalf("OpenReader error: %v", err)
-	}
-
-	if resp.ReaderId == "" {
-		t.Error("ReaderId should not be empty")
-	}
-	if resp.Schema == nil {
-		t.Error("Schema should be populated")
-	}
-}
-
-func TestServerV2_GetSchema(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	resp, err := server.GetSchema(ctx, &pb.GetSchemaRequest{
-		InputName: "input",
-	})
-	if err != nil {
-		t.Fatalf("GetSchema error: %v", err)
-	}
-
-	if resp.Schema == nil {
-		t.Error("Schema should not be nil")
-	}
-	if len(resp.Schema.Columns) != 2 {
-		t.Errorf("columns count = %d, want 2", len(resp.Schema.Columns))
-	}
-}
-
-func TestServerV2_GetSample(t *testing.T) {
-	server, tmpDir := createTestServerV2(t)
-	defer os.RemoveAll(tmpDir)
-
-	ctx := context.Background()
-
-	resp, err := server.GetSample(ctx, &pb.GetSampleRequest{
-		InputName: "input",
-		Limit:     10,
-	})
-	if err != nil {
-		t.Fatalf("GetSample error: %v", err)
-	}
-
-	if resp.Schema == nil {
-		t.Error("Schema should not be nil")
-	}
-	if len(resp.Rows) == 0 {
-		t.Error("should have sample rows")
-	}
-}
-
 func TestServerV2_Commit(t *testing.T) {
 	server, tmpDir := createTestServerV2(t)
 	defer os.RemoveAll(tmpDir)
@@ -732,50 +517,6 @@ func TestSchemaConversion(t *testing.T) {
 		if resultProto.Columns[i].Name != col.Name {
 			t.Errorf("column %d name = %q, want %q", i, resultProto.Columns[i].Name, col.Name)
 		}
-	}
-}
-
-func TestBackendSchemaToGatewaySchema(t *testing.T) {
-	tests := []struct {
-		name    string
-		in      *backend.SchemaInfo
-		wantNil bool
-		want    []schema.ColumnDef
-	}{
-		{
-			name: "converts columns",
-			in: &backend.SchemaInfo{Columns: []backend.ColumnInfo{
-				{Name: "id", Type: "int64", Nullable: false},
-				{Name: "name", Type: "string", Nullable: true},
-			}},
-			want: []schema.ColumnDef{
-				{Name: "id", Type: schema.TypeInt64},
-				{Name: "name", Type: schema.TypeString},
-			},
-		},
-		{name: "nil backend schema returns nil gateway schema", in: nil, wantNil: true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := backendSchemaToGatewaySchema(tc.in)
-			if tc.wantNil {
-				if got != nil {
-					t.Fatal("nil backend schema should return nil gateway schema")
-				}
-				return
-			}
-			if got == nil {
-				t.Fatal("schema should not be nil")
-			}
-			if got.NumColumns() != len(tc.want) {
-				t.Fatalf("NumColumns() = %d, want %d", got.NumColumns(), len(tc.want))
-			}
-			for i, w := range tc.want {
-				if col := got.Column(i); col.Name != w.Name || col.Type != w.Type {
-					t.Errorf("column %d = %+v, want %s:%v", i, col, w.Name, w.Type)
-				}
-			}
-		})
 	}
 }
 

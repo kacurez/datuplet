@@ -2,19 +2,65 @@ package datagateway
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"sync"
 
-	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
+	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
 
+// defaultReadChunkBytes is the chunk boundary (uncompressed Arrow bytes) when
+// the config sets no chunk_size.
+const defaultReadChunkBytes = 32 << 20
+
+var errReaderClosed = errors.New("reader is closed")
+
+// readerState is one open table reader: a plane RecordStream served chunk by
+// chunk over HTTP GET /data/read/{id} and gRPC ReadChunk.
+type readerState struct {
+	inputName string
+	stream    RecordStream
+	schema    *arrow.Schema
+	format    format.DataFormat
+	adapter   format.FormatAdapter // CSV/JSON/JSONL only
+
+	// ctx is the reader's lifetime, owned by the server and cancelled only
+	// by close: Next always runs on it, never on an RPC or HTTP request ctx
+	// (a ctx that ends mid-fetch ends a DuckDB reader for good).
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// mu serializes chunk reads and guards the fields below.
+	mu sync.Mutex
+	// pending is the batch read past the previous chunk's boundary to learn
+	// whether that chunk was the last; it opens the next chunk.
+	pending arrow.RecordBatch
+	// pendingErr is a Next failure met while peeking; the next chunk
+	// returns it.
+	pendingErr error
+	done       bool // the last chunk was served
+	closed     bool
+
+	closeOnce sync.Once
+}
+
+// readChunk is one encoded chunk.
+type readChunk struct {
+	data []byte
+	rows int64
+	last bool
+}
+
 func (s *ServerV2) OpenReader(ctx context.Context, req *pb.OpenReaderRequest) (*pb.OpenReaderResponse, error) {
-	// Bucket and table are required for reads
 	bucket := req.Bucket
 	table := req.Table
 	if bucket == "" {
@@ -24,158 +70,82 @@ func (s *ServerV2) OpenReader(ctx context.Context, req *pb.OpenReaderRequest) (*
 		return nil, fmt.Errorf("table is required for reads")
 	}
 
-	var backendReader backend.Reader
-	var readerBackend backend.StorageBackend
-	var sch *schema.Schema
-	var totalRows int64
-	// lakekeeperDataFiles is the resolved parquet path list when the
-	// lakekeeper path was taken; nil for the static-backend path. We
-	// stash it here so the FORMAT_ARROW_IPC streaming branch below can
-	// reuse it without calling LoadTableForRead a second time (cuts
-	// catalog/lock pressure in half on multi-input concurrent OpenReader calls).
-	var lakekeeperDataFiles []string
-	var deltaInfo *pb.DeltaInfo
-	var err error
-
-	// Auto-apply incremental config from gateway config if SDK didn't set it
+	// Incremental reads are not supported: a CRD `sinceDays` setting
+	// degrades to a full-snapshot read with a warning instead of failing.
 	if req.Incremental == nil {
 		req.Incremental = s.getIncrementalSpecForTable(bucket, table)
 	}
-
-	switch {
-	case s.lakekeeperResolver != nil:
-		// Incremental reads are not yet supported via the lakekeeper-only
-		// path. Soft-skip rather than failing so a CRD `sinceDays` setting
-		// degrades to a full-snapshot read with a warning instead of
-		// bricking the run.
-		if req.Incremental != nil {
-			log.Printf("warning: incremental reads not yet supported in lakekeeper mode (table %s.%s); falling back to full snapshot", bucket, table)
-			req.Incremental = nil
-		}
-		readerBackend, backendReader, sch, totalRows, lakekeeperDataFiles, err = s.openReaderViaLakekeeper(ctx, bucket, table)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read via lakekeeper: %w", err)
-		}
-	default:
-		// Static-backend / direct mode (tests).
-		if s.backend == nil {
-			return nil, fmt.Errorf("no backend available for reading")
-		}
-		tablePath := fmt.Sprintf("%s/%s", bucket, table)
-		backendReader, err = s.backend.OpenReader(ctx, tablePath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open reader for %s.%s: %w", bucket, table, err)
-		}
-		if backendSchema := backendReader.Schema(); backendSchema != nil {
-			sch = backendSchemaToGatewaySchema(backendSchema)
-		}
+	if req.Incremental != nil {
+		log.Printf("warning: incremental reads not supported (table %s.%s); falling back to full snapshot", bucket, table)
 	}
 
-	// Get output format adapter
 	outputFormat := protoToDataFormat(req.OutputFormat)
 	if outputFormat == format.FormatUnknown {
-		outputFormat = format.FormatCSV // Default to CSV
+		outputFormat = format.FormatCSV
 	}
-
-	// FORMAT_ARROW_IPC special path: row-group streaming reader, not a generic
-	// adapter conversion. Replaces the "io.Copy whole parquet file" reader for
-	// arrow consumers (sql-transform). CSV/JSON/parquet pass-through unaffected.
-	if outputFormat == format.FormatArrowIPC {
-		type streamingBackend interface {
-			OpenStreamingArrowReader(ctx context.Context, filePaths []string, currentSchema *backend.SchemaInfo) (backend.Reader, error)
-		}
-		if readerBackend != nil {
-			// Lakekeeper path: reuse the file list resolved earlier
-			// (lakekeeperDataFiles) instead of calling LoadTableForRead
-			// a second time. Halves catalog round-trips and lock
-			// pressure on multi-input concurrent OpenReader calls.
-			if sb, ok := readerBackend.(streamingBackend); ok {
-				sInfo := gatewaySchemaToBackendSchema(sch)
-				if sInfo != nil {
-					backendReader.Close()
-					// Detach from the OpenReader request ctx: the streaming reader
-					// stores this ctx and reuses it later for ranged GETs and
-					// arrow record-reader iteration. Once OpenReader returns,
-					// the gRPC request ctx is Done — by the time DuckDB's
-					// arrow_scan triggers reads the ctx is dead. Reader lifetime
-					// is governed by CloseReader / Close(); ctx cancellation
-					// is not the right shutdown signal here.
-					readerCtx := context.WithoutCancel(ctx)
-					var streamErr error
-					backendReader, streamErr = sb.OpenStreamingArrowReader(readerCtx, lakekeeperDataFiles, sInfo)
-					if streamErr != nil {
-						return nil, fmt.Errorf("open streaming reader: %w", streamErr)
-					}
-				}
-			}
-		} else if s.backend != nil {
-			// Static-backend path (local mode / tests).
-			if sb, ok := s.backend.(streamingBackend); ok {
-				sInfo := gatewaySchemaToBackendSchema(sch)
-				if sInfo == nil {
-					// Schema not available from OpenReader; try GetSchema.
-					tablePath := fmt.Sprintf("%s/%s", bucket, table)
-					if bSch, bErr := s.backend.GetSchema(ctx, tablePath); bErr == nil {
-						sInfo = bSch
-						// Keep sch in sync so OpenReaderResponse.Schema is non-nil
-						// and the SDK's protoSchemaToArrow doesn't error.
-						sch = backendSchemaToGatewaySchema(sInfo)
-					}
-				}
-				if sInfo != nil {
-					backendReader.Close()
-					tablePath := fmt.Sprintf("%s/%s", bucket, table)
-					// See note above: detach from the OpenReader request ctx
-					// so subsequent reads (DuckDB arrow_scan) don't fail with
-					// context canceled.
-					readerCtx := context.WithoutCancel(ctx)
-					var streamErr error
-					backendReader, streamErr = sb.OpenStreamingArrowReader(readerCtx, []string{tablePath}, sInfo)
-					if streamErr != nil {
-						return nil, fmt.Errorf("open streaming reader (static): %w", streamErr)
-					}
-				}
-			}
+	var adapter format.FormatAdapter
+	switch outputFormat {
+	case format.FormatArrowIPC, format.FormatParquet:
+	default:
+		var err error
+		if adapter, err = s.registry.Get(outputFormat); err != nil {
+			return nil, fmt.Errorf("unsupported output format: %s", outputFormat)
 		}
 	}
 
-	adapter, err := s.registry.Get(outputFormat)
+	if s.isCancelled() {
+		return nil, errRunCancelled
+	}
+	stream, err := s.plane.OpenTableReader(ctx, ReaderSpec{Namespace: bucket, Table: table})
 	if err != nil {
-		backendReader.Close()
-		return nil, fmt.Errorf("unsupported output format: %s", outputFormat)
+		return nil, fmt.Errorf("failed to open reader for %s.%s: %w", bucket, table, err)
+	}
+	rctx, cancel := context.WithCancel(context.Background())
+	rs := &readerState{
+		inputName: bucket + "." + table,
+		stream:    stream,
+		schema:    stream.Schema(),
+		format:    outputFormat,
+		adapter:   adapter,
+		ctx:       rctx,
+		cancel:    cancel,
 	}
 
-	// Note: Read-time transforms not yet implemented
-	outputSchema := sch
-
-	// Generate reader ID and store state
+	// Publish under s.mu, the lock the cancel watcher sets s.cancelled and
+	// snapshots open readers under: either the watcher sees this reader and
+	// closes it, or this sees the cancel and closes it here.
 	s.mu.Lock()
+	if s.cancelled {
+		s.mu.Unlock()
+		rs.close()
+		return nil, errRunCancelled
+	}
 	s.readerCounter++
 	readerID := fmt.Sprintf("r-%d", s.readerCounter)
-	s.readers[readerID] = &readerState{
-		inputName:     fmt.Sprintf("%s.%s", bucket, table),
-		tablePath:     fmt.Sprintf("%s/%s", bucket, table),
-		backendReader: backendReader,
-		adapter:       adapter,
-		pipeline:      nil, // Read-time transforms not yet implemented
-		schema:        outputSchema,
-		readerBackend: readerBackend, // Per-reader backend (nil in static-backend mode)
-	}
+	s.readers[readerID] = rs
 	s.mu.Unlock()
 
-	// Build HTTP endpoint URL
-	httpEndpoint := s.getHTTPEndpoint(fmt.Sprintf("/data/read/%s", readerID))
-
 	return &pb.OpenReaderResponse{
-		ReaderId:          readerID,
-		Schema:            schemaToProto(outputSchema),
-		TotalRowsEstimate: totalRows,
-		TotalSizeEstimate: backendReader.TotalSizeEstimate(),
-		HttpEndpoint:      httpEndpoint,
-		Bucket:            bucket,
-		Table:             table,
-		DeltaInfo:         deltaInfo,
+		ReaderId:     readerID,
+		Schema:       arrowSchemaToProto(rs.schema),
+		HttpEndpoint: s.getHTTPEndpoint(fmt.Sprintf("/data/read/%s", readerID)),
+		Bucket:       bucket,
+		Table:        table,
 	}, nil
+}
+
+// arrowSchemaToProto describes a plane stream's schema; a column whose Arrow
+// type has no gateway type is reported as string.
+func arrowSchemaToProto(sch *arrow.Schema) *pb.Schema {
+	out := &pb.Schema{Columns: make([]*pb.ColumnDef, sch.NumFields())}
+	for i, f := range sch.Fields() {
+		dt, err := schema.FromArrowType(f.Type)
+		if err != nil {
+			dt = schema.TypeString
+		}
+		out.Columns[i] = &pb.ColumnDef{Name: f.Name, Type: dt.String(), Nullable: f.Nullable, FieldId: int32(i + 1)}
+	}
+	return out
 }
 
 // getIncrementalSpecForTable checks the gateway config for incremental read settings
@@ -202,199 +172,127 @@ func (s *ServerV2) getIncrementalSpecForTable(bucket, table string) *pb.Incremen
 	return nil
 }
 
-// openReaderViaLakekeeper uses the lakekeeper resolver to get the
-// current snapshot's parquet path list + a vended-creds-backed
-// MinIO/Local backend, then opens a reader across all files. The
-// resolved DataFiles slice is also returned so the FORMAT_ARROW_IPC
-// streaming branch in OpenReader can reuse it without a second
-// LoadTableForRead round-trip.
-func (s *ServerV2) openReaderViaLakekeeper(ctx context.Context, bucket, table string) (backend.StorageBackend, backend.Reader, *schema.Schema, int64, []string, error) {
-	rt, err := s.lakekeeperResolver.LoadTableForRead(ctx, bucket, table)
-	if err != nil {
-		return nil, nil, nil, 0, nil, fmt.Errorf("lakekeeper load %s.%s: %w", bucket, table, err)
+// readChunkSize is the chunk boundary in uncompressed Arrow bytes.
+func (s *ServerV2) readChunkSize() int64 {
+	if s.config.ChunkSize > 0 {
+		return s.config.ChunkSize
 	}
-	if len(rt.DataFiles) == 0 {
-		return nil, nil, nil, 0, nil, fmt.Errorf("no data files in snapshot for table %s.%s", bucket, table)
-	}
-
-	log.Printf("lakekeeper returned %d files for table %s.%s", len(rt.DataFiles), bucket, table)
-
-	// OpenReaderForFiles is on both MinIOBackend and LocalBackend but
-	// not on the StorageBackend interface. The resolver returns one or
-	// the other depending on dataPrefix scheme.
-	type fileReader interface {
-		OpenReaderForFiles(ctx context.Context, filePaths []string) (backend.Reader, error)
-	}
-	fr, ok := rt.Backend.(fileReader)
-	if !ok {
-		return nil, nil, nil, 0, nil, fmt.Errorf("reader backend does not support OpenReaderForFiles")
-	}
-	reader, err := fr.OpenReaderForFiles(ctx, rt.DataFiles)
-	if err != nil {
-		return nil, nil, nil, 0, nil, fmt.Errorf("failed to open reader for resolved files: %w", err)
-	}
-
-	var sch *schema.Schema
-	if len(rt.SchemaJSON) > 0 {
-		sch, err = parseIcebergSchemaJSON(rt.SchemaJSON)
-		if err != nil {
-			log.Printf("Warning: failed to parse schema from lakekeeper: %v", err)
-		}
-	}
-	return rt.Backend, reader, sch, rt.TotalRows, rt.DataFiles, nil
+	return defaultReadChunkBytes
 }
 
-// parseIcebergSchemaJSON parses an Iceberg schema JSON to our schema type.
-func parseIcebergSchemaJSON(schemaJSON []byte) (*schema.Schema, error) {
-	// Iceberg schema JSON format:
-	// {"type": "struct", "fields": [{"id": 1, "name": "col", "required": true, "type": "long"}, ...]}
-	var icebergSchema struct {
-		Fields []struct {
-			Name     string `json:"name"`
-			Type     string `json:"type"`
-			Required bool   `json:"required"`
-		} `json:"fields"`
+// nextChunk pulls batches until the chunk holds at least limit uncompressed
+// bytes or the stream ends, then encodes them. It peeks one batch past the
+// boundary so the last chunk is marked last; an empty table is one last
+// chunk with zero rows. nil (no error) means the last chunk was already
+// served.
+func (rs *readerState) nextChunk(limit int64, mem memory.Allocator) (*readChunk, error) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.closed {
+		return nil, errReaderClosed
+	}
+	if rs.done {
+		return nil, nil
 	}
 
-	if err := json.Unmarshal(schemaJSON, &icebergSchema); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal Iceberg schema: %w", err)
+	var batches []arrow.RecordBatch
+	defer func() {
+		for _, b := range batches {
+			b.Release()
+		}
+	}()
+	var size, rows int64
+	add := func(b arrow.RecordBatch) {
+		batches = append(batches, b)
+		size += batchBytes(b)
+		rows += b.NumRows()
+	}
+	if rs.pending != nil {
+		add(rs.pending)
+		rs.pending = nil
+	} else if rs.pendingErr != nil {
+		return nil, rs.pendingErr
 	}
 
-	columns := make([]schema.ColumnDef, len(icebergSchema.Fields))
-	for i, field := range icebergSchema.Fields {
-		columns[i] = schema.ColumnDef{
-			Name:     field.Name,
-			Type:     icebergTypeToSchemaType(field.Type),
-			Nullable: !field.Required,
+	eof := false
+	for !eof && size < limit {
+		b, err := rs.stream.Next(rs.ctx)
+		switch {
+		case errors.Is(err, io.EOF):
+			eof = true
+		case err != nil:
+			return nil, err
+		default:
+			add(b)
+		}
+	}
+	if !eof {
+		b, err := rs.stream.Next(rs.ctx)
+		switch {
+		case errors.Is(err, io.EOF):
+			eof = true
+		case err != nil:
+			rs.pendingErr = err // this chunk is still good; the next fails
+		default:
+			rs.pending = b
 		}
 	}
 
-	return schema.NewSchema(columns)
+	data, err := encodeChunk(rs.format, rs.adapter, rs.schema, batches, mem)
+	if err != nil {
+		return nil, fmt.Errorf("serialize %s chunk: %w", rs.format, err)
+	}
+	rs.done = eof
+	return &readChunk{data: data, rows: rows, last: eof}, nil
 }
 
-// icebergTypeToSchemaType converts Iceberg type strings to schema.DataType.
-func icebergTypeToSchemaType(icebergType string) schema.DataType {
-	switch icebergType {
-	case "boolean":
-		return schema.TypeBool
-	case "int":
-		return schema.TypeInt32
-	case "long":
-		return schema.TypeInt64
-	case "float":
-		return schema.TypeFloat32
-	case "double":
-		return schema.TypeFloat64
-	case "string":
-		return schema.TypeString
-	case "date":
-		return schema.TypeDate
-	case "timestamp", "timestamptz":
-		return schema.TypeTimestamp
-	case "binary":
-		return schema.TypeBinary
-	default:
-		return schema.TypeString // Default to string for unknown types
-	}
+// close ends the reader: it cancels the lifetime ctx (interrupting a running
+// Next), drops the peeked batch and closes the plane stream. Idempotent.
+func (rs *readerState) close() {
+	rs.closeOnce.Do(func() {
+		rs.cancel()
+		rs.mu.Lock()
+		rs.closed = true
+		if rs.pending != nil {
+			rs.pending.Release()
+			rs.pending = nil
+		}
+		rs.mu.Unlock()
+		if err := rs.stream.Close(); err != nil {
+			log.Printf("Warning: close reader %s: %v", rs.inputName, err)
+		}
+	})
+}
+
+func (s *ServerV2) lookupReader(id string) (*readerState, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rs, ok := s.readers[id]
+	return rs, ok
 }
 
 func (s *ServerV2) ReadChunk(req *pb.ReadChunkRequest, stream pb.DataGateway_ReadChunkServer) error {
-	s.mu.RLock()
-	rs, ok := s.readers[req.ReaderId]
-	s.mu.RUnlock()
-
+	rs, ok := s.lookupReader(req.ReaderId)
 	if !ok {
 		return fmt.Errorf("unknown reader: %s", req.ReaderId)
 	}
-
 	for {
-		// Read chunk from backend
-		chunk, err := rs.backendReader.ReadChunk()
-		if err == io.EOF {
-			return nil
-		}
+		chunk, err := rs.nextChunk(s.readChunkSize(), s.allocator)
 		if err != nil {
 			return fmt.Errorf("read error: %w", err)
 		}
-
-		// Parse backend chunk to Arrow (if needed for transforms)
-		// For now, pass through if no transforms
-		var outputData []byte
-		var rowsInChunk int64
-
-		if rs.pipeline != nil {
-			// Parse input, apply transforms, serialize output
-			inputFormat := format.ParseDataFormat(chunk.Format)
-			inputAdapter, err := s.registry.Get(inputFormat)
-			if err != nil {
-				return fmt.Errorf("unsupported backend format: %s", chunk.Format)
-			}
-
-			record, _, err := inputAdapter.Parse(chunk.Data, rs.schema)
-			if err != nil {
-				return fmt.Errorf("failed to parse backend data: %w", err)
-			}
-
-			// Apply transforms
-			transformedRecord, err := rs.pipeline.Apply(record, s.allocator)
-			if err != nil {
-				record.Release()
-				return fmt.Errorf("transform failed: %w", err)
-			}
-			if transformedRecord != record {
-				record.Release()
-			}
-
-			// Serialize to output format
-			outputData, err = rs.adapter.Serialize(transformedRecord)
-			if err != nil {
-				transformedRecord.Release()
-				return fmt.Errorf("failed to serialize output: %w", err)
-			}
-			rowsInChunk = transformedRecord.NumRows()
-			transformedRecord.Release()
-		} else {
-			// No transforms - convert format if needed
-			inputFormat := format.ParseDataFormat(chunk.Format)
-			if inputFormat == rs.adapter.Format() {
-				// Same format, pass through
-				outputData = chunk.Data
-				rowsInChunk = chunk.RowsInChunk
-			} else {
-				// Convert format
-				inputAdapter, err := s.registry.Get(inputFormat)
-				if err != nil {
-					return fmt.Errorf("unsupported backend format: %s", chunk.Format)
-				}
-
-				record, _, err := inputAdapter.Parse(chunk.Data, nil)
-				if err != nil {
-					return fmt.Errorf("failed to parse backend data: %w", err)
-				}
-
-				outputData, err = rs.adapter.Serialize(record)
-				if err != nil {
-					record.Release()
-					return fmt.Errorf("failed to serialize output: %w", err)
-				}
-				rowsInChunk = record.NumRows()
-				record.Release()
-			}
+		if chunk == nil {
+			return nil
 		}
-
-		pbChunk := &pb.DataChunk{
-			Data:        outputData,
-			Format:      dataFormatToProto(rs.adapter.Format()),
-			RowsInChunk: rowsInChunk,
-			IsLast:      chunk.IsLast,
-			Metadata:    chunk.Metadata,
-		}
-
-		if err := stream.Send(pbChunk); err != nil {
+		if err := stream.Send(&pb.DataChunk{
+			Data:        chunk.data,
+			Format:      dataFormatToProto(rs.format),
+			RowsInChunk: chunk.rows,
+			IsLast:      chunk.last,
+		}); err != nil {
 			return err
 		}
-
-		if chunk.IsLast {
+		if chunk.last {
 			return nil
 		}
 	}
@@ -408,9 +306,18 @@ func (s *ServerV2) CloseReader(ctx context.Context, req *pb.CloseReaderRequest) 
 	}
 	s.mu.Unlock()
 
-	if ok && rs.backendReader != nil {
-		rs.backendReader.Close()
+	if ok {
+		rs.close()
 	}
-
 	return &pb.CloseReaderResponse{}, nil
+}
+
+// GetSchema is not supported: OpenReader returns the table schema.
+func (s *ServerV2) GetSchema(ctx context.Context, req *pb.GetSchemaRequest) (*pb.SchemaResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "GetSchema is not supported; OpenReader returns the table schema")
+}
+
+// GetSample is not supported: read the table with OpenReader.
+func (s *ServerV2) GetSample(ctx context.Context, req *pb.GetSampleRequest) (*pb.SampleResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "GetSample is not supported; read the table with OpenReader")
 }
