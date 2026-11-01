@@ -283,3 +283,64 @@ func readParquet(t *testing.T, path string) ([]goldenColumn, []string, int64) {
 	}
 	return cols, vals, tbl.NumRows()
 }
+
+// TestTimestampZonesMatchToday: timestamps in a zone other than UTC were
+// accepted by today's writer and written exactly like UTC ones (probe of
+// pkg/datagateway/buffer at main ecff5c5; see task-3-report.md, fix round 2).
+// Each unit × zone must produce the Parquet column of the UTC golden entry for
+// that unit (including the accepted s/ms micros deviation) and read back the
+// same instants. Only the Arrow read type's zone name differs: today's file
+// embedded the Arrow schema (zone name kept), DuckDB's reads back as UTC.
+func TestTimestampZonesMatchToday(t *testing.T) {
+	golden := loadGolden(t)
+	p := testPlane(t)
+	mem := memory.NewGoAllocator()
+	for _, in := range goldenInputs() {
+		ts, ok := in.dt.(*arrow.TimestampType)
+		if !ok || ts.TimeZone != "UTC" {
+			continue
+		}
+		utc := golden[in.name]
+		wantCol := utc.Columns[0]
+		if dev, ok := knownDeviations[in.name]; ok {
+			wantCol = dev
+		}
+		for _, zone := range []string{"Europe/Prague", "+01:00", "America/New_York"} {
+			t.Run(in.name+"/"+zone, func(t *testing.T) {
+				dt := &arrow.TimestampType{Unit: ts.Unit, TimeZone: zone}
+				sch := arrow.NewSchema([]arrow.Field{{Name: "v", Type: dt, Nullable: true}}, nil)
+				w, err := p.OpenTableWriter(context.Background(), datagateway.WriterSpec{
+					DataPrefix: t.TempDir() + "/", FilePrefix: "part-zone-w", Schema: sch,
+				})
+				if err != nil {
+					t.Fatalf("OpenTableWriter: %v", err)
+				}
+				for _, js := range []string{in.chunk1, in.chunk2} {
+					arr, _, err := array.FromJSON(mem, dt, strings.NewReader(js))
+					if err != nil {
+						t.Fatal(err)
+					}
+					rec := array.NewRecordBatch(sch, []arrow.Array{arr}, int64(arr.Len()))
+					arr.Release()
+					err = w.Write(context.Background(), rec)
+					rec.Release()
+					if err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+				}
+				files, err := w.Close(context.Background())
+				if err != nil || len(files) != 1 {
+					t.Fatalf("Close = %+v, %v", files, err)
+				}
+				cols, vals, n := readParquet(t, files[0].Path)
+				if len(cols) != 1 || cols[0] != wantCol {
+					t.Errorf("column:\n got  %+v\n want %+v", cols, wantCol)
+				}
+				// Values render in UTC, so equal strings mean equal instants.
+				if n != utc.Rows || strings.Join(vals, "\x00") != strings.Join(utc.Values, "\x00") {
+					t.Errorf("values = %q (%d rows), want instants %q", vals, n, utc.Values)
+				}
+			})
+		}
+	}
+}

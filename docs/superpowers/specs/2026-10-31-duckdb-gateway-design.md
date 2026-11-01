@@ -150,7 +150,7 @@ for backpressure; `Close()` returns the written files with path, row count and b
    accepted ones (`SELECT` list of `CAST(<Ident(col)> AS <type>)`) so the Parquet column types match the golden.
    Repetition is the one deliberate difference: every column is OPTIONAL (item 3).
    **Maintainer ruling 2026-11-01** — two accepted timestamp deviations:
-   - `timestamp[s|ms, tz=UTC]` is written as UTC **microseconds** (`Timestamp(isAdjustedToUTC=true, MICROS)`,
+   - `timestamp[s|ms, tz=<any zone>]` is written as UTC **microseconds** (`Timestamp(isAdjustedToUTC=true, MICROS)`,
      `TIMESTAMP_MICROS`) instead of the golden's milliseconds: DuckDB 2.0 has no `TIMESTAMPTZ_MS`/`TIMESTAMPTZ_S`.
      The instants are identical and iceberg-go `AddFiles` accepts the files. Pinned by `knownDeviations` in
      `gateway/duckplane/golden_test.go`.

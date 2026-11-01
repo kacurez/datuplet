@@ -38,6 +38,10 @@ func TestDuckTypeFor(t *testing.T) {
 		{ts(arrow.Millisecond, "UTC"), "TIMESTAMPTZ"},
 		{ts(arrow.Microsecond, "UTC"), "TIMESTAMPTZ"},
 		{ts(arrow.Nanosecond, "UTC"), "TIMESTAMPTZ_NS"},
+		{ts(arrow.Second, "Europe/Prague"), "TIMESTAMPTZ"},
+		{ts(arrow.Millisecond, "+01:00"), "TIMESTAMPTZ"},
+		{ts(arrow.Microsecond, "America/New_York"), "TIMESTAMPTZ"},
+		{ts(arrow.Nanosecond, "Europe/Prague"), "TIMESTAMPTZ_NS"},
 	} {
 		got, err := duckTypeFor(tc.dt)
 		if err != nil || got != tc.want {
@@ -57,7 +61,6 @@ func TestDuckTypeForRejects(t *testing.T) {
 		&arrow.Decimal128Type{Precision: 10, Scale: 2},
 		arrow.ListOf(arrow.PrimitiveTypes.Int64),
 		arrow.StructOf(arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int64}),
-		&arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "Europe/Prague"},
 		arrow.FixedWidthTypes.Time64us,
 		&arrow.DictionaryType{IndexType: arrow.PrimitiveTypes.Int32, ValueType: arrow.BinaryTypes.String},
 	} {

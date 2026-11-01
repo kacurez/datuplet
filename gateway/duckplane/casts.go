@@ -16,8 +16,9 @@ import (
 // Types the golden file records as rejected (large_string, large_binary) and
 // types it has no entry for are refused.
 //
-// Two golden columns cannot be reproduced: timestamp[s|ms, tz=UTC] are written
-// as UTC microseconds (DuckDB has no TIMESTAMPTZ in s/ms); see golden_test.go.
+// Timestamps with any time zone are written like UTC ones. Two golden columns
+// cannot be reproduced: timestamp[s|ms, <zone>] are written as UTC
+// microseconds (DuckDB has no TIMESTAMPTZ in s/ms); see golden_test.go.
 func duckTypeFor(dt arrow.DataType) (string, error) {
 	switch dt.ID() {
 	case arrow.INT8:
@@ -62,7 +63,9 @@ func duckTypeFor(dt arrow.DataType) (string, error) {
 			case arrow.Nanosecond:
 				return "TIMESTAMP_NS", nil
 			}
-		case "UTC":
+		default:
+			// Any zone: Arrow stores the instants in UTC, and today's writer
+			// wrote every zone like UTC (UTC-adjusted Parquet timestamps).
 			if ts.Unit == arrow.Nanosecond {
 				return "TIMESTAMPTZ_NS", nil
 			}

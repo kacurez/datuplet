@@ -165,14 +165,10 @@ creates every timestamp column as Iceberg `timestamptz`. Arrow timestamps
 without a time zone (any unit) are written as non-UTC-adjusted Parquet
 timestamps, and nanosecond timestamps (with or without a zone) are rejected
 by iceberg-go, so the inline commit (`AddFiles`) fails for these columns —
-as it already did before the DuckDB data plane. UTC timestamps in seconds or
-milliseconds are stored as microseconds (the DuckDB data plane has no
-millisecond UTC type); the instants are unchanged. The DuckDB data plane also
-accepts only `UTC` as a time zone: Arrow timestamps with any other zone (for
-example `Europe/Prague` or `+01:00`) are now rejected with "unsupported Arrow
-type", where the previous writer accepted and stored them as UTC-adjusted
-timestamps. Mapping naive timestamps to Iceberg `timestamp`, handling
-nanoseconds, and accepting other zones are follow-up work.
+as it already did before the DuckDB data plane. Timestamps with a time zone
+in seconds or milliseconds are stored as UTC microseconds (the DuckDB data
+plane has no millisecond UTC type); the instants are unchanged. Mapping naive timestamps to
+Iceberg `timestamp` and handling nanoseconds are follow-up work.
 
 ---
 
