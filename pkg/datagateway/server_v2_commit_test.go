@@ -8,9 +8,7 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	icebergtable "github.com/apache/iceberg-go/table"
 
-	"github.com/datuplet/datuplet/pkg/datagateway/buffer"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
-	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 	"github.com/datuplet/datuplet/pkg/icebergjob"
 )
 
@@ -248,24 +246,15 @@ func TestWriteModeForTable(t *testing.T) {
 // a writer that produced files reports STATUS_COMMITTED.
 func TestCommit_NoPool_WriterWithFiles(t *testing.T) {
 	ctx := context.Background()
-	mb := newMockBackend()
 	cfg := &Config{RunID: "r", DefaultBucket: "raw"}
 	server := &ServerV2{
-		backend:       mb,
-		config:        cfg,
-		writers:       make(map[string]*writerState),
-		filesManifest: NewFilesManifest("r"),
+		config:  cfg,
+		writers: make(map[string]*writerState),
 	}
 
-	sch, _ := schema.NewSchema([]schema.ColumnDef{
-		{Name: "id", Type: schema.TypeInt64},
-	})
 	ws := &writerState{
 		writerID: "w1", bucket: "raw", table: "t1",
-		externalFiles: []buffer.FileInfo{
-			{Path: "s3://b/f.parquet", RowCount: 1, SizeBytes: 100},
-		},
-		schema:    sch,
+		files:     []WrittenFile{{Path: "s3://b/f.parquet", Rows: 1, Bytes: 100}},
 		committed: true, // already claimed (simulates CloseWriter path)
 	}
 	server.writers["w1"] = ws
@@ -297,13 +286,10 @@ func TestCommit_NoPool_WriterWithFiles(t *testing.T) {
 // a writer that produced no files reports STATUS_SKIPPED.
 func TestCommit_NoPool_WriterWithNoFiles(t *testing.T) {
 	ctx := context.Background()
-	mb := newMockBackend()
 	cfg := &Config{RunID: "r", DefaultBucket: "raw"}
 	server := &ServerV2{
-		backend:       mb,
-		config:        cfg,
-		writers:       make(map[string]*writerState),
-		filesManifest: NewFilesManifest("r"),
+		config:  cfg,
+		writers: make(map[string]*writerState),
 	}
 
 	ws := &writerState{
@@ -311,7 +297,7 @@ func TestCommit_NoPool_WriterWithNoFiles(t *testing.T) {
 		bucket:    "raw",
 		table:     "empty_table",
 		committed: true,
-		// no bufferMgr, no partitionRouter, no externalFiles → no files
+		// no table writer, no files
 	}
 	server.writers["w1"] = ws
 
@@ -341,10 +327,10 @@ func createTestServerV2WithOutputTable(t *testing.T) (*ServerV2, string) {
 		RunID:         "test-pool-exec",
 		ComponentName: "test-component",
 		DefaultBucket: "raw",
-		Backend:       newMockBackend(),
+		LocalDataDir:  t.TempDir(),
 		OutputTables: []OutputTableConfig{
 			{Name: "orders", Bucket: "raw", WriteMode: "APPEND"},
 		},
 	}
-	return NewServerV2(cfg), t.TempDir()
+	return mustNewServerV2(t, cfg), t.TempDir()
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/backend"
-	"github.com/datuplet/datuplet/pkg/datagateway/buffer"
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
@@ -257,10 +256,21 @@ func createTestServerV2(t *testing.T) (*ServerV2, string) {
 		Outputs: map[string]OutputConfig{
 			"output": {Path: filepath.Join(tmpDir, "output")},
 		},
-		Backend: newMockBackend(),
+		Backend:      newMockBackend(), // read side (static backend)
+		LocalDataDir: tmpDir,           // write side: local data prefixes on the fake plane
 	}
 
-	return NewServerV2(cfg), tmpDir
+	return mustNewServerV2(t, cfg), tmpDir
+}
+
+// mustNewServerV2 builds a server on a fresh fake data plane.
+func mustNewServerV2(t *testing.T, cfg *Config) *ServerV2 {
+	t.Helper()
+	s, err := NewServerV2(cfg, fakeFactory(newFakeDataPlane()))
+	if err != nil {
+		t.Fatalf("NewServerV2: %v", err)
+	}
+	return s
 }
 
 func TestServerV2_GetConfig(t *testing.T) {
@@ -315,7 +325,7 @@ func TestServerV2_GetConfig_OutputTableColumns(t *testing.T) {
 		},
 		Backend: newMockBackend(),
 	}
-	server := NewServerV2(cfg)
+	server := mustNewServerV2(t, cfg)
 
 	ctx := context.Background()
 	resp, err := server.GetConfig(ctx, &pb.GetConfigRequest{})
@@ -440,23 +450,16 @@ func TestServerV2_MissingRequiredFields(t *testing.T) {
 }
 
 func TestServerV2_OpenWriter_RequiresBackend(t *testing.T) {
-	// Server without lakekeeper resolver and without static backend
+	// Server without lakekeeper resolver and without a local data dir
 	// rejects OpenWriter — there's no place for parquet to land.
-	tmpDir, err := os.MkdirTemp("", "gateway-v2-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	server := NewServerV2(&Config{
+	server := mustNewServerV2(t, &Config{
 		RunID:         "test-exec",
 		ComponentName: "test-component",
 		DefaultBucket: "raw",
-		// No Backend, no LakekeeperURL.
+		// No LakekeeperURL, no LocalDataDir.
 	})
 
-	ctx := context.Background()
-	_, err = server.OpenWriter(ctx, &pb.OpenWriterRequest{
+	_, err := server.OpenWriter(context.Background(), &pb.OpenWriterRequest{
 		Table:       "output",
 		InputFormat: pb.DataFormat_FORMAT_CSV,
 	})
@@ -771,129 +774,6 @@ func TestBackendSchemaToGatewaySchema(t *testing.T) {
 				if col := got.Column(i); col.Name != w.Name || col.Type != w.Type {
 					t.Errorf("column %d = %+v, want %s:%v", i, col, w.Name, w.Type)
 				}
-			}
-		})
-	}
-}
-
-// Helper function to create schema for tests
-func mustNewSchema(t *testing.T, columns []schema.ColumnDef) *schema.Schema {
-	t.Helper()
-	sch, err := schema.NewSchema(columns)
-	if err != nil {
-		t.Fatalf("Failed to create schema: %v", err)
-	}
-	return sch
-}
-
-// TestBuildFieldIDMap tests that field IDs are correctly assigned from schema
-func TestBuildFieldIDMap(t *testing.T) {
-	tests := []struct {
-		name     string
-		schema   *schema.Schema
-		expected map[string]int32
-	}{
-		{
-			name: "auto-assign field IDs",
-			schema: mustNewSchema(t, []schema.ColumnDef{
-				{Name: "id", Type: schema.TypeInt64, Nullable: false},
-				{Name: "name", Type: schema.TypeString, Nullable: true},
-				{Name: "price", Type: schema.TypeFloat64, Nullable: true},
-			}),
-			expected: map[string]int32{
-				"id":    1,
-				"name":  2,
-				"price": 3,
-			},
-		},
-		{
-			name: "explicit field IDs",
-			schema: mustNewSchema(t, []schema.ColumnDef{
-				{Name: "id", Type: schema.TypeInt64, Nullable: false, FieldID: 10},
-				{Name: "name", Type: schema.TypeString, Nullable: true, FieldID: 20},
-			}),
-			expected: map[string]int32{
-				"id":   10,
-				"name": 20,
-			},
-		},
-		{
-			name: "mixed field IDs",
-			schema: mustNewSchema(t, []schema.ColumnDef{
-				{Name: "id", Type: schema.TypeInt64, Nullable: false, FieldID: 5},
-				{Name: "name", Type: schema.TypeString, Nullable: true}, // Should auto-assign
-			}),
-			expected: map[string]int32{
-				"id":   5,
-				"name": 2, // Auto-assigned based on index (0-based index + 1)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := buildFieldIDMap(tt.schema)
-
-			if len(result) != len(tt.expected) {
-				t.Errorf("field ID map length = %d, want %d", len(result), len(tt.expected))
-			}
-
-			for name, expectedID := range tt.expected {
-				if gotID, ok := result[name]; !ok {
-					t.Errorf("field %q not found in result map", name)
-				} else if gotID != expectedID {
-					t.Errorf("field %q ID = %d, want %d", name, gotID, expectedID)
-				}
-			}
-		})
-	}
-}
-
-func TestPatchParquetFieldIDs(t *testing.T) {
-	tests := []struct {
-		name    string
-		ws      *writerState
-		wantErr string // empty: must succeed
-	}{
-		{
-			name: "no external files is a no-op",
-			ws: &writerState{
-				bucket:        "test-bucket",
-				table:         "test-table",
-				externalFiles: []buffer.FileInfo{},
-				schema: mustNewSchema(t, []schema.ColumnDef{
-					{Name: "id", Type: schema.TypeInt64},
-				}),
-			},
-		},
-		{
-			name: "external files but nil schema fails",
-			ws: &writerState{
-				bucket: "test-bucket",
-				table:  "test-table",
-				externalFiles: []buffer.FileInfo{
-					{Path: "s3://bucket/file.parquet", RowCount: 10, SizeBytes: 1000},
-				},
-			},
-			wantErr: "schema is nil",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			server := &ServerV2{
-				backend: newMockBackend(),
-				config:  &Config{RunID: "ws-test"},
-				writers: make(map[string]*writerState),
-			}
-			err := server.patchParquetFieldIDs(context.Background(), tc.ws)
-			if tc.wantErr == "" {
-				if err != nil {
-					t.Errorf("patchParquetFieldIDs() should not error, got: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("patchParquetFieldIDs() err = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
 	}

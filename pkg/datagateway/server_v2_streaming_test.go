@@ -48,7 +48,7 @@ func newTestServerV2WithLocalBackend(t *testing.T, dir string) *ServerV2 {
 		DefaultBucket: "raw",
 		Backend:       lb,
 	}
-	return NewServerV2(cfg)
+	return mustNewServerV2(t, cfg)
 }
 
 // writeStreamingFixtureParquet writes a single-column int64 parquet at path.

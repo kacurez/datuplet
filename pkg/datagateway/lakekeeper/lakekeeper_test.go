@@ -228,3 +228,35 @@ func TestNewClient_TokenForwarded(t *testing.T) {
 		t.Errorf("Authorization header = %q, want it to contain \"jwt-from-run-token\"", seenAuth)
 	}
 }
+
+// TestWriteCreds_PerScheme: writers get a per-table VendedCreds of the
+// scheme's credential type (no storage backend is built for writes), nil for
+// file://, and an error for an unknown scheme.
+func TestWriteCreds_PerScheme(t *testing.T) {
+	r := &Resolver{URL: "http://lk.invalid/catalog", Warehouse: "wh", Token: "jwt", ProjectID: "proj"}
+	for _, tc := range []struct {
+		prefix string
+		want   catalogwriter.CredsType
+	}{
+		{"s3://bucket/wh/t/data/", catalogwriter.CredsTypeS3},
+		{"gs://bucket/wh/t/data/", catalogwriter.CredsTypeGCS},
+	} {
+		vc, err := r.writeCreds(tc.prefix, "raw", "orders")
+		if err != nil || vc == nil {
+			t.Fatalf("%s: writeCreds = %v, %v", tc.prefix, vc, err)
+		}
+		if vc.ExpectedCredsType != tc.want || vc.Namespace != "raw" || vc.Table != "orders" ||
+			vc.WarehouseName != "wh" || vc.ProjectID != "proj" || vc.LakekeeperURL != r.URL {
+			t.Errorf("%s: VendedCreds = %+v", tc.prefix, vc)
+		}
+		if tok, _ := vc.TokenProvider(context.Background()); tok != "jwt" {
+			t.Errorf("%s: token provider returned %q", tc.prefix, tok)
+		}
+	}
+	if vc, err := r.writeCreds("file:///tmp/wh/t/data/", "raw", "orders"); err != nil || vc != nil {
+		t.Errorf("file://: writeCreds = %v, %v; want nil, nil", vc, err)
+	}
+	if _, err := r.writeCreds("http://x/data/", "raw", "orders"); err == nil || !strings.Contains(err.Error(), "unsupported scheme") {
+		t.Errorf("http://: err = %v, want unsupported scheme", err)
+	}
+}

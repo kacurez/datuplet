@@ -45,38 +45,12 @@ func main() {
 	queryFormat := queryCmd.String("format", "table", "Output format: table | csv | json")
 	queryLocal := queryCmd.Bool("local", false, "Force local execution (requires the separate duckdb-enabled datuplet-query binary)")
 
-	gatewayCmd := flag.NewFlagSet("gateway", flag.ExitOnError)
-	gatewayLocal := gatewayCmd.Bool("local", false, "Run in local mode (filesystem backend)")
-	gatewayMinio := gatewayCmd.Bool("minio", false, "Run in MinIO mode (S3-compatible backend)")
-	gatewayConfig := gatewayCmd.String("config", "", "Path to config file (YAML)")
-	gatewayDataDir := gatewayCmd.String("data-dir", "./data", "Data directory for local mode")
-	gatewayAddr := gatewayCmd.String("addr", ":50051", "gRPC server address")
-	gatewayRunTokenPath := gatewayCmd.String("run-token-path", "", "Path to the mounted run-token file (K8s typically sets /var/run/secrets/datuplet-runtoken/tokens). When set, the gateway holds the per-table JSON map of JWTs the gateway forwards to lakekeeper for catalog + STS calls. Also RUN_TOKEN_PATH env var.")
-	gatewayPodAnnotationsPath := gatewayCmd.String("pod-annotations-path", "", "Path to the kubelet downward-API pod-annotations file (K8s typically sets /etc/podinfo/annotations). When set, the gateway polls the file every 5s and exits cleanly on `datuplet.io/cancel=true`. Also POD_ANNOTATIONS_PATH env var.")
-
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
 	}
 
 	switch os.Args[1] {
-	case "gateway":
-		gatewayCmd.Parse(os.Args[2:])
-		if !*gatewayLocal && !*gatewayMinio {
-			fmt.Println("Error: must specify --local or --minio mode")
-			os.Exit(1)
-		}
-		mode := "local"
-		if *gatewayMinio {
-			mode = "minio"
-		}
-		runTokenPath := resolveRunTokenPath(*gatewayRunTokenPath, os.Getenv("RUN_TOKEN_PATH"))
-		podAnnotationsPath := resolveRunTokenPath(*gatewayPodAnnotationsPath, os.Getenv("POD_ANNOTATIONS_PATH"))
-		if err := runGateway(mode, *gatewayConfig, *gatewayDataDir, *gatewayAddr, runTokenPath, podAnnotationsPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
 	case "login":
 		loginCmd.Parse(os.Args[2:])
 		if *loginRemote == "" {
@@ -227,15 +201,6 @@ func main() {
 	}
 }
 
-// resolveRunTokenPath returns flagVal if non-empty, otherwise envVal. This
-// precedence rule (flag > env) must not be inverted in future refactors.
-func resolveRunTokenPath(flagVal, envVal string) string {
-	if flagVal != "" {
-		return flagVal
-	}
-	return envVal
-}
-
 func printUsage() {
 	fmt.Println(`datuplet - Data pipeline orchestrator
 
@@ -251,7 +216,6 @@ Commands:
   apps                   Manage user apps (init, put, get, list, delete, render, promote, token)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
-  gateway                Start the data gateway server (container entrypoint)
   version                Show version
   help                   Show this help
 
@@ -329,15 +293,5 @@ Headless / agent auth (RFC 027 §7):
   DATUPLET_REMOTE        pipeline-api URL; precedence: -remote > $DATUPLET_REMOTE > ~/.datuplet/cluster.json
   DATUPLET_PROJECT       Project name (resolved like -project) or UUID (fully-headless fast path only); precedence: -project > $DATUPLET_PROJECT > on-disk project resolution
   With all set, no ~/.datuplet state is needed. Use 'datuplet login -email <e> -password-stdin'
-  for explicit non-interactive login instead.
-
-Options for 'gateway':
-  -local                 Run in local mode (filesystem backend)
-  -minio                 Run in MinIO mode (S3-compatible backend)
-  -config string         Path to config file (YAML)
-  -data-dir string       Data directory for local mode (default: ./data)
-  -addr string           gRPC server address (default: :50051)
-
-Examples:
-  datuplet gateway --minio --config minio.yaml`)
+  for explicit non-interactive login instead.`)
 }

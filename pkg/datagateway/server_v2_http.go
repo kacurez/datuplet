@@ -10,27 +10,11 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 
-	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/backend"
-	"github.com/datuplet/datuplet/pkg/datagateway/buffer"
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
-	"github.com/datuplet/datuplet/pkg/datagateway/partition"
+	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
-
-// countingReader wraps an io.Reader and tallies bytes read. Used by the
-// streaming-ingest path to keep the per-chunk byte count (ws.totalBytes)
-// accurate without buffering the payload.
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
-}
 
 // httpWriteResponse is the JSON body returned by the HTTP write endpoint.
 type httpWriteResponse struct {
@@ -109,10 +93,9 @@ func (s *ServerV2) handleWrite(w http.ResponseWriter, r *http.Request) {
 
 // processWriteChunk processes a data chunk (shared between gRPC and HTTP).
 //
-// `ctx` carries the originating request's deadline / cancellation. It is
-// used both for the deferred lakekeeper.LoadOrCreateForWrite call and as
-// the parent of the buffer-manager backend writer, so a cancelled
-// request short-circuits the in-flight S3 PutObject path.
+// `ctx` carries the originating request's deadline / cancellation. It bounds
+// the deferred lakekeeper.LoadOrCreateForWrite call and the blocking of the
+// plane writer's Write, never the writer itself.
 func (s *ServerV2) processWriteChunk(ctx context.Context, ws *writerState, data []byte) (*pb.WriteChunkResponse, error) {
 	// Per-chunk debug log: the SINGLE most useful signal for diagnosing
 	// whether SDK batching is in effect. Batched calls deliver ~1 MiB;
@@ -126,138 +109,35 @@ func (s *ServerV2) processWriteChunk(ctx context.Context, ws *writerState, data 
 	}
 	defer record.Release()
 
-	return s.processParsedRecord(ctx, ws, record, inferredSchema, int64(len(data)))
+	return s.processParsedRecord(ctx, ws, record, inferredSchema)
 }
 
 // processWriteChunkReader is the streaming-ingest sibling of
 // processWriteChunk. It parses directly off r (the HTTP request body) via a
 // StreamingAdapter, avoiding the io.ReadAll copy of the whole chunk — the
-// gateway's #1 ingest allocation site (run 40556560 profile). A
-// byte-counting reader keeps ws.totalBytes accurate without materialising
-// the payload.
+// gateway's #1 ingest allocation site (run 40556560 profile).
 func (s *ServerV2) processWriteChunkReader(ctx context.Context, ws *writerState, r io.Reader, sa format.StreamingAdapter) (*pb.WriteChunkResponse, error) {
 	Debugf("processWriteChunkReader: writer=%s format=%s mode=streaming", ws.writerID, ws.inputFormat)
 
-	cr := &countingReader{r: r}
-	record, inferredSchema, err := sa.ParseReader(cr, ws.schema)
+	record, inferredSchema, err := sa.ParseReader(r, ws.schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse input: %w", err)
 	}
 	defer record.Release()
 
-	return s.processParsedRecord(ctx, ws, record, inferredSchema, cr.n)
+	return s.processParsedRecord(ctx, ws, record, inferredSchema)
 }
 
 // processParsedRecord holds the post-parse write path shared by the
 // buffered (processWriteChunk) and streaming (processWriteChunkReader)
-// entry points: deferred lakekeeper create, buffer-manager init, transform,
-// and the Add into the buffer/partition router. inputBytes is the raw
-// chunk size used only for the ws.totalBytes counter.
-func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, record arrow.Record, inferredSchema *schema.Schema, inputBytes int64) (*pb.WriteChunkResponse, error) {
-	var err error
-
-	// Deferred-create + buffer-manager init: serialize under ws.initMu so
-	// two parallel chunk requests for the same writer don't race on
-	// building duplicate BufferManager / partitionRouter / per-writer
-	// backend instances. The lock guards the whole "first-chunk wins"
-	// path: lakekeeper LoadOrCreate, schema fan-out, buffer construction.
-	var responseSchema *pb.Schema
-	ws.initMu.Lock()
-	if ws.basePath == "" && s.lakekeeperResolver != nil {
-		schemaToUse := ws.schema
-		if schemaToUse == nil {
-			schemaToUse = inferredSchema
-		}
-		if schemaToUse == nil {
-			ws.initMu.Unlock()
-			return nil, fmt.Errorf("cannot create table %s.%s: no schema (request didn't supply one and inference failed)", ws.bucket, ws.table)
-		}
-		// Capture the schema in a closure so the resolver hits the
-		// schema we already have (no second inference round-trip).
-		sch := schemaToUse
-		sp := func(context.Context) (*schema.Schema, error) { return sch, nil }
-		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, ws.bucket, ws.table, sp)
-		if lkErr != nil {
-			ws.initMu.Unlock()
-			return nil, fmt.Errorf("lakekeeper deferred create %s.%s: %w", ws.bucket, ws.table, lkErr)
-		}
-		ws.basePath = target.BasePath
-		ws.writerBackend = target.Backend
-		ws.tableExists = true
+// entry points: first-chunk setup (deferred create, plane writer open), the
+// drop pipeline, today's record-type acceptance check on the post-drop
+// record, and the plane Write.
+func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, record arrow.Record, inferredSchema *schema.Schema) (*pb.WriteChunkResponse, error) {
+	tw, outputSchema, responseSchema, err := s.ensureTableWriter(ctx, ws, inferredSchema)
+	if err != nil {
+		return nil, err
 	}
-
-	// If schema was inferred, store it and create buffer manager
-	if ws.schema == nil && inferredSchema != nil {
-		ws.schema = inferredSchema
-		responseSchema = schemaToProto(inferredSchema)
-		logWriterSchema(ws, "gateway-inferred")
-
-		// Build common buffer config
-		bufferConfig := buffer.DefaultBufferConfig()
-		bufferConfig.OutputDir = ws.basePath
-		// Run-scoped file prefix: part-{runID8}-{writerID} to avoid collisions in shared data/ dir
-		runID := s.config.GetRunID()
-		runID8 := runID
-		if len(runID8) > 8 {
-			runID8 = runID8[:8]
-		}
-		bufferConfig.FilePrefix = fmt.Sprintf("part-%s-%s", runID8, ws.writerID)
-		if s.config.BufferSize > 0 {
-			bufferConfig.BufferSize = s.config.BufferSize
-		}
-		if s.config.RowGroupSize > 0 {
-			bufferConfig.RowGroupSize = s.config.RowGroupSize
-		}
-		if s.config.TargetFileSize > 0 {
-			bufferConfig.TargetFileSize = s.config.TargetFileSize
-		}
-
-		// Apply transform to get output schema
-		outputSchema := ws.schema
-		if ws.pipeline != nil {
-			outputSchema, err = ws.pipeline.TransformSchema(ws.schema)
-			if err != nil {
-				ws.initMu.Unlock()
-				return nil, fmt.Errorf("failed to compute output schema: %w", err)
-			}
-		}
-		ws.outputSchema = outputSchema
-
-		// Use per-writer backend if available (lakekeeper / static backend)
-		backendToUse := s.backend
-		if ws.writerBackend != nil {
-			backendToUse = ws.writerBackend
-		}
-		factory := buffer.NewBackendWriterFactory(s.ctx, backendToUse)
-
-		if len(ws.partitionFields) > 0 {
-			// Partitioned table: create Router that manages per-partition BufferManagers
-			fields := make([]partition.FieldSpec, len(ws.partitionFieldDefs))
-			for i, pf := range ws.partitionFieldDefs {
-				fields[i] = partition.FieldSpec{
-					SourceColumn: pf.SourceColumn,
-					Transform:    pf.Transform,
-					FieldName:    pf.FieldName,
-				}
-			}
-			ws.partitionRouter = partition.NewRouter(
-				fields, ws.basePath, bufferConfig, s.allocator, factory,
-			)
-		} else {
-			// Unpartitioned table: single BufferManager
-			ws.bufferMgr, err = buffer.NewBufferManager(
-				outputSchema,
-				bufferConfig,
-				s.allocator,
-				factory,
-			)
-			if err != nil {
-				ws.initMu.Unlock()
-				return nil, fmt.Errorf("failed to create buffer manager: %w", err)
-			}
-		}
-	}
-	ws.initMu.Unlock()
 
 	// Apply transforms if configured
 	outputRecord := record
@@ -271,32 +151,82 @@ func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, rec
 		}
 	}
 
-	// Add to buffer (partitioned or unpartitioned)
-	if ws.partitionRouter != nil {
-		if err := ws.partitionRouter.Add(outputRecord, ws.outputSchema); err != nil {
-			return nil, fmt.Errorf("partition routing error: %w", err)
-		}
-	} else if ws.bufferMgr != nil {
-		if err := ws.bufferMgr.Add(outputRecord); err != nil {
-			return nil, fmt.Errorf("buffer error: %w", err)
-		}
+	// The plane only ever receives the types today's write path accepted;
+	// a non-canonical type in a dropped column never gets here.
+	if err := acceptRecordTypes(outputRecord.Schema(), outputSchema.ArrowSchema()); err != nil {
+		return nil, fmt.Errorf("buffer error: %w", err)
 	}
-
-	// Update statistics
-	ws.totalRows += outputRecord.NumRows()
-	ws.totalBytes += inputBytes
-
-	// Get buffer size for monitoring
-	var bufferSize int64
-	if ws.bufferMgr != nil {
-		bufferSize = ws.bufferMgr.Stats().BufferedBytes
+	if err := tw.Write(ctx, outputRecord); err != nil {
+		return nil, fmt.Errorf("write error: %w", err)
 	}
 
 	return &pb.WriteChunkResponse{
 		RowsAccepted:    outputRecord.NumRows(),
-		BufferSizeBytes: bufferSize,
+		BufferSizeBytes: tw.QueuedBytes(),
 		InferredSchema:  responseSchema,
 	}, nil
+}
+
+// ensureTableWriter returns ws's plane writer, opening it on the first chunk:
+// the input schema is the component's or the first chunk's inferred one, the
+// table (when not created at OpenWriter) is created with its post-drop form,
+// and the writer is opened with that post-drop schema. Serialized under
+// ws.initMu so parallel first chunks open one writer. The inferred schema is
+// returned (for the response) only by the call that adopted it.
+func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, inferred *schema.Schema) (TableWriter, *schema.Schema, *pb.Schema, error) {
+	ws.initMu.Lock()
+	defer ws.initMu.Unlock()
+	if ws.tw != nil {
+		return ws.tw, ws.outputSchema, nil, nil
+	}
+
+	inSchema, fromInference := ws.schema, false
+	if inSchema == nil {
+		inSchema, fromInference = inferred, true
+	}
+	if inSchema == nil {
+		return nil, nil, nil, fmt.Errorf("cannot create table %s.%s: no schema (request didn't supply one and inference failed)", ws.bucket, ws.table)
+	}
+	outSchema, err := outputSchemaFor(inSchema, ws.pipeline)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to compute output schema: %w", err)
+	}
+
+	if ws.basePath == "" {
+		if s.lakekeeperResolver == nil {
+			return nil, nil, nil, fmt.Errorf("no write target for %s.%s", ws.bucket, ws.table)
+		}
+		sp := func(context.Context) (*schema.Schema, error) { return outSchema, nil }
+		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, ws.bucket, ws.table, sp)
+		if lkErr != nil {
+			return nil, nil, nil, fmt.Errorf("lakekeeper deferred create %s.%s: %w", ws.bucket, ws.table, lkErr)
+		}
+		ws.basePath = target.BasePath
+		ws.creds = credsSource(target.VendedCreds)
+	}
+
+	tw, err := s.plane.OpenTableWriter(ctx, WriterSpec{
+		DataPrefix:      ws.basePath,
+		FilePrefix:      filePrefix(s.config.GetRunID(), ws.writerID),
+		Schema:          outSchema.ArrowSchema(),
+		Creds:           ws.creds,
+		TargetFileBytes: s.config.TargetFileSize,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open table writer %s.%s: %w", ws.bucket, ws.table, err)
+	}
+
+	var responseSchema *pb.Schema
+	s.mu.Lock()
+	ws.schema = inSchema
+	ws.outputSchema = outSchema
+	ws.tw = tw
+	s.mu.Unlock()
+	if fromInference {
+		responseSchema = schemaToProto(inSchema)
+		logWriterSchema(ws, "gateway-inferred")
+	}
+	return tw, outSchema, responseSchema, nil
 }
 
 // handleRead handles HTTP GET requests for reading data.

@@ -4,12 +4,13 @@
 // All storage paths flowing through DataGateway are treated as opaque URLs.
 // Any parsing or normalization must happen in the backend layer.
 // Paths come from lakekeeper (per-table data prefix returned by
-// LoadTable / CreateTable) and are passed verbatim to BufferManager and Backend.
+// LoadTable / CreateTable) and are passed verbatim to the DataPlane.
 package datagateway
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -29,17 +30,14 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/backend"
-	"github.com/datuplet/datuplet/pkg/datagateway/buffer"
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
 	"github.com/datuplet/datuplet/pkg/datagateway/jwks"
 	dglakekeeper "github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
-	"github.com/datuplet/datuplet/pkg/datagateway/manifest"
-	"github.com/datuplet/datuplet/pkg/datupleticeio"
-	"github.com/datuplet/datuplet/pkg/datagateway/partition"
-	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/processor"
+	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	runtokenpkg "github.com/datuplet/datuplet/pkg/datagateway/runtoken"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
+	"github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 // ServerV2 implements the DataGateway v2 gRPC service.
@@ -48,10 +46,13 @@ type ServerV2 struct {
 	pb.UnimplementedDataGatewayServer
 
 	config    *Config
-	backend   backend.StorageBackend
+	backend   backend.StorageBackend // read side only (static test backend)
 	allocator memory.Allocator
 	registry  *format.Registry
-	ctx       context.Context // Background context for long-lived operations
+
+	// plane writes (and, from Task 6, reads) table data. Built once by the
+	// DataPlaneFactory in NewServerV2; nil only in hand-built test servers.
+	plane DataPlane
 
 	writers map[string]*writerState
 	readers map[string]*readerState
@@ -83,18 +84,11 @@ type ServerV2 struct {
 	cancelCtx  context.Context
 	cancelStop context.CancelFunc
 
-	// filesManifest accumulates the parquet paths written during the
-	// run, grouped by (namespace, table). Persisted at end-of-stream
-	// to `<table-base>/.run-state/<run-id>/files.json` as a
-	// recovery/observability breadcrumb (RFC 021 — DG commits inline;
-	// no external TableCommit Job consumes this anymore).
-	filesManifest *FilesManifest
-
 	// lakekeeperResolver is constructed at boot when Config.LakekeeperURL
-	// is set. It owns the catalog-side LoadOrCreate plus vended-creds
-	// backend construction for both writes and reads.
-	// nil when DG runs without lakekeeper (tests, legacy Docker).
-	lakekeeperResolver *dglakekeeper.Resolver
+	// is set. It owns the catalog-side LoadOrCreate plus the per-table
+	// vended credentials.
+	// nil when DG runs without lakekeeper (tests).
+	lakekeeperResolver tableResolver
 
 	// commitPool dispatches per-table iceberg commits inline after
 	// CloseWriter. nil when lakekeeperResolver is nil (test/static-backend
@@ -110,13 +104,24 @@ type ServerV2 struct {
 	validatedClaims *runtokenpkg.ValidatedClaims
 }
 
+// tableResolver is the catalog surface the server uses;
+// *lakekeeper.Resolver implements it (an interface so tests can observe
+// table creates).
+type tableResolver interface {
+	LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sp dglakekeeper.SchemaProvider) (*dglakekeeper.WriterTarget, error)
+	LoadTableForRead(ctx context.Context, ns, tbl string) (*dglakekeeper.ReaderTarget, error)
+	Catalog(ctx context.Context) (catalog.Catalog, error)
+	Close() error
+}
+
 // writerState holds the state for an active writer.
 type writerState struct {
 	writerID   string // Writer ID (e.g., "w1") - used in run-scoped file prefixes
 	outputName string
 	bucket     string // Logical bucket (e.g., "raw") - used for logging/metadata only
 	table      string // Logical table (e.g., "orders") - used for logging/metadata only
-	basePath   string // Resolved base path from lakekeeper (opaque, passed as-is to backend)
+	basePath   string // Data prefix from lakekeeper (opaque, passed as-is to the plane); "" until the table exists
+	creds      CredsSource
 
 	// Input format for Content-Type validation
 	inputFormat format.DataFormat
@@ -127,55 +132,31 @@ type writerState struct {
 	// Transform pipeline (optional)
 	pipeline *processor.Pipeline
 
-	// Buffer manager for Parquet output
-	bufferMgr *buffer.BufferManager
-
-	// Per-writer backend (vended-creds-backed minio backend, or static
-	// backend in test mode).
-	writerBackend backend.StorageBackend
-
-	// Schema (may be inferred from first chunk)
-	schema         *schema.Schema
-	outputSchema   *schema.Schema // After transforms (same as schema when no transforms)
+	// schema is the input (pre-drop) schema records are parsed with:
+	// component-supplied, or inferred from the first chunk.
+	schema *schema.Schema
+	// outputSchema is schema after the drop processors: the table schema,
+	// the plane writer's schema, and what every record must match.
+	outputSchema   *schema.Schema
 	schemaInferred bool
 
-	// Statistics
-	totalRows  int64
-	totalBytes int64
-
-	// External files (for components that write directly to storage)
-	// If set, these are used instead of bufferMgr.FilesWritten()
-	externalFiles []buffer.FileInfo
-
-	// Partition fields (resolved from config or control file)
-	partitionFields   []PartitionFieldConfig
-	partitionFieldDefs []manifest.PartitionFieldDef
-
-	// Partition router (non-nil only for partitioned tables)
-	partitionRouter *partition.Router
-
-	// Whether table already exists in the catalog at OpenWriter time
-	// (set by the lakekeeper resolver: true on LoadTable success, false
-	// when CreateTable was deferred to first-chunk schema inference).
-	tableExists bool
-
-	// initMu serializes the deferred-create + buffer-manager construction
-	// path in processWriteChunk. Two parallel WriteChunk / handleHTTPWrite
-	// requests for the same writerID could otherwise both observe
-	// basePath == "" (or schema == nil) and race on building duplicate
-	// BufferManager / partitionRouter / per-writer backend instances.
+	// initMu serializes the first-chunk path (deferred create + plane
+	// writer open) and the writer Close, so two parallel chunk requests for
+	// the same writerID cannot open two plane writers.
 	initMu sync.Mutex
+
+	// tw is the plane writer, opened on the first chunk. Set under initMu
+	// and s.mu.
+	tw TableWriter
+
+	// files are the Parquet files tw produced, set once it closed
+	// successfully. Set under s.mu.
+	files []WrittenFile
 
 	// committed is set once finalizeAndDispatch has CLAIMED this writer,
 	// so a later defensive sweep in Commit() does not double-process it.
 	// Set under s.mu.
 	committed bool
-
-	// closed is set the first time this writer's buffer/router is closed
-	// (by CloseWriter). The Commit sweep checks it to avoid a second
-	// Close() call (buffer/router Close is not guaranteed idempotent).
-	// Set under s.mu.
-	closed bool
 }
 
 // readerState holds the state for an active reader.
@@ -209,15 +190,27 @@ func joinStoragePath(basePath, filename string) string {
 	return basePath + filename
 }
 
-// NewServerV2 creates a new v2 gateway server.
-func NewServerV2(cfg *Config) *ServerV2 {
+// NewServerV2 creates a new v2 gateway server: it resolves secret refs,
+// validates the run token, builds the lakekeeper resolver and commit pool,
+// then calls newPlane exactly once and only then starts the cancel watcher.
+// Boot failures are returned (the binary exits with an application code).
+func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
+	if newPlane == nil {
+		return nil, errors.New("data gateway: no data plane factory")
+	}
 	// Resolve $[name] references in the component config. Fail fast — if any
 	// reference can't be resolved, the gateway refuses to start and the Pod
 	// surfaces the error via its status.
 	if len(cfg.ComponentCfg) > 0 {
 		if err := resolveSecretRefsInConfig(cfg); err != nil {
-			log.Fatalf("secret resolution failed: %v", err)
+			return nil, fmt.Errorf("secret resolution failed: %w", err)
 		}
+	}
+
+	// A static backend or local data dir would bypass the per-table
+	// vended-creds contract that lakekeeper routing requires.
+	if cfg.LakekeeperURL != "" && (cfg.Backend != nil || cfg.LocalDataDir != "") {
+		return nil, errors.New("data gateway: a static backend or local data dir must not be set when LakekeeperURL is configured")
 	}
 
 	httpAddr := cfg.HTTPAddr
@@ -225,8 +218,8 @@ func NewServerV2(cfg *Config) *ServerV2 {
 		httpAddr = ":50052" // Default HTTP port
 	}
 	// Validate the mounted run-token JWT against pipeline-api's JWKS.
-	// Soft-degrade preserved for tests/Docker without a mounted token —
-	// caller checks path emptiness before invoking the validator.
+	// Soft-degrade preserved for tests without a mounted token — caller
+	// checks path emptiness before invoking the validator.
 	//
 	// In production both RunTokenPath and PipelineAPIJWKSURL are set by the
 	// operator. If RunTokenPath is set but JWKS URL is not (misconfiguration),
@@ -235,44 +228,39 @@ func NewServerV2(cfg *Config) *ServerV2 {
 	var validatedClaims *runtokenpkg.ValidatedClaims
 	if cfg.RunTokenPath != "" {
 		if cfg.PipelineAPIJWKSURL == "" {
-			log.Fatalf("data gateway: RunTokenPath is set but PipelineAPIJWKSURL is empty — refusing to boot without JWT validation")
+			return nil, errors.New("data gateway: RunTokenPath is set but PipelineAPIJWKSURL is empty — refusing to boot without JWT validation")
 		}
 		var err error
 		validatedClaims, runToken, err = validateRunTokenForBoot(cfg)
 		if err != nil {
-			log.Fatalf("data gateway: run-token validation failed: %v", err)
+			return nil, fmt.Errorf("data gateway: run-token validation failed: %w", err)
 		}
 		log.Printf("data gateway: run-token validated; routing to warehouse=%q project_id=%q", validatedClaims.Warehouse, validatedClaims.ProjectID)
 	}
-	cancelCtx, cancelStop := context.WithCancel(context.Background())
 	s := &ServerV2{
 		config:          cfg,
 		backend:         cfg.Backend,
 		allocator:       memory.NewGoAllocator(),
 		registry:        format.DefaultRegistry(),
-		ctx:             context.Background(), // Long-lived context for background operations
 		writers:         make(map[string]*writerState),
 		readers:         make(map[string]*readerState),
 		httpAddr:        httpAddr,
 		runToken:        runToken,
-		cancelCtx:       cancelCtx,
-		cancelStop:      cancelStop,
-		filesManifest:   NewFilesManifest(cfg.GetRunID()),
 		validatedClaims: validatedClaims,
 	}
 
 	// When LakekeeperURL is configured, construct the catalog resolver.
 	// DG's per-write path then asks lakekeeper for vended STS creds + a
-	// per-table data prefix. When unset (tests, pure-static-backend dev),
-	// the field stays nil and writes fall back to the static backend.
-	// Warehouse + project_id come from the validated JWT claims.
+	// per-table data prefix. When unset (tests), the field stays nil and
+	// writes go to LocalDataDir. Warehouse + project_id come from the
+	// validated JWT claims.
 	if cfg.LakekeeperURL != "" {
 		if s.validatedClaims == nil {
-			log.Fatalf("data gateway: LakekeeperURL is set but no validated run-token claims — refusing to boot")
+			return nil, errors.New("data gateway: LakekeeperURL is set but no validated run-token claims — refusing to boot")
 		}
 		res, lkErr := dglakekeeper.NewResolver(cfg.LakekeeperURL, s.validatedClaims.Warehouse, runToken, s.validatedClaims.ProjectID)
 		if lkErr != nil {
-			log.Fatalf("lakekeeper resolver: %v", lkErr)
+			return nil, fmt.Errorf("lakekeeper resolver: %w", lkErr)
 		}
 		s.lakekeeperResolver = res
 
@@ -291,7 +279,7 @@ func NewServerV2(cfg *Config) *ServerV2 {
 		s.commitPool = NewCommitPool(CommitPoolConfig{
 			Workers:      4,
 			MaxQueueSize: 256,
-			CatalogFn:    s.lakekeeperResolver.Catalog,
+			CatalogFn:    res.Catalog,
 			CommitFn: func(ctx context.Context, cat catalog.Catalog, ident icebergtable.Identifier, paths []string, mode icebergjob.WriteMode, key string) (*icebergjob.CommitResult, error) {
 				return icebergjob.CommitTableFiles(ctx, cat, ident, paths, mode, auditProps, key)
 			},
@@ -310,33 +298,61 @@ func NewServerV2(cfg *Config) *ServerV2 {
 		})
 	}
 
-	// Kick off the in-band cancel watcher. WatchCancelAnnotation is a
-	// no-op when PodAnnotationsPath is empty (Docker / non-K8s).
-	go func() {
-		if err := WatchCancelAnnotation(cancelCtx, cfg.PodAnnotationsPath, cfg.CancelPollInterval); err == nil {
-			// Returning nil means cancellation was requested. Signal
-			// the rest of the server by cancelling cancelCtx; the
-			// gateway's main loop watches it and exits gracefully.
-			//
-			// TODO: also abort in-flight S3 uploads here so we exit faster
-			// than the gRPC graceful-stop timeout (future improvement).
-			log.Printf("datuplet.io/cancel=true observed on pod annotations; initiating graceful shutdown")
-			if s.commitPool != nil {
-				log.Printf("cancel: cancelling commit pool")
-				s.commitPool.Cancel()
-			}
-			cancelStop()
-		}
-	}()
-
-	// Enforce: static backend must not coexist with the lakekeeper
-	// resolver. A static backend would bypass the per-table vended-creds
-	// contract that lakekeeper routing requires.
-	if s.lakekeeperResolver != nil && s.backend != nil {
-		log.Fatalf("FATAL: static backend must be nil when LakekeeperURL is configured (got %T)", s.backend)
+	// The plane is built after token validation (a reader's catalog ATTACH
+	// needs the validated claims) and published BEFORE the cancel watcher
+	// starts, so a cancel annotation already present at boot interrupts it.
+	boot := BootInfo{RunID: cfg.GetRunID(), LakekeeperURL: cfg.LakekeeperURL, Token: runToken}
+	if validatedClaims != nil {
+		boot.ProjectID = validatedClaims.ProjectID
+		boot.Warehouse = validatedClaims.Warehouse
 	}
+	plane, err := newPlane(context.Background(), boot)
+	if err == nil && plane == nil {
+		err = errors.New("factory returned no data plane")
+	}
+	if err != nil {
+		if s.commitPool != nil {
+			s.commitPool.Cancel()
+		}
+		return nil, fmt.Errorf("data gateway: data plane: %w", err)
+	}
+	s.plane = plane
 
-	return s
+	// Kick off the in-band cancel watcher. WatchCancelAnnotation only
+	// waits for ctx when PodAnnotationsPath is empty (non-K8s).
+	cancelCtx, cancelStop := context.WithCancel(context.Background())
+	s.cancelCtx = cancelCtx
+	s.cancelStop = cancelStop
+	go s.watchCancel(cancelCtx, cancelStop)
+
+	return s, nil
+}
+
+// watchCancel waits for the cancel annotation; on it, it cancels the commit
+// pool, interrupts the data plane, aborts every open writer and cancels ctx
+// (Serve watches it and stops the servers).
+func (s *ServerV2) watchCancel(ctx context.Context, stop context.CancelFunc) {
+	if err := WatchCancelAnnotation(ctx, s.config.PodAnnotationsPath, s.config.CancelPollInterval); err != nil {
+		return // ctx done: server closing
+	}
+	log.Printf("datuplet.io/cancel=true observed on pod annotations; initiating graceful shutdown")
+	if s.commitPool != nil {
+		log.Printf("cancel: cancelling commit pool")
+		s.commitPool.Cancel()
+	}
+	s.plane.Interrupt()
+	s.mu.RLock()
+	open := make([]TableWriter, 0, len(s.writers))
+	for _, ws := range s.writers {
+		if ws.tw != nil {
+			open = append(open, ws.tw)
+		}
+	}
+	s.mu.RUnlock()
+	for _, tw := range open {
+		tw.Abort()
+	}
+	stop()
 }
 
 // validateRunTokenForBoot performs the JWT validation + raw-token read for DG
@@ -492,7 +508,6 @@ func (s *ServerV2) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-
 // ============================================================================
 // Lifecycle RPCs
 // ============================================================================
@@ -546,156 +561,21 @@ func (s *ServerV2) GetConfig(ctx context.Context, req *pb.GetConfigRequest) (*pb
 		})
 	}
 
-	// Build storage bootstrap for native S3 components (if configured)
-	var storageBootstrap *pb.StorageBootstrap
-	if len(s.config.InputTables) > 0 || len(s.config.OutputTables) > 0 {
-		var err error
-		storageBootstrap, err = s.buildStorageBootstrap(ctx)
-		if err != nil {
-			// A not-yet-created output table is the normal case, not a
-			// problem: the table is created on first write once the schema is
-			// known. Logging that as a Warning reads like the cause of a later
-			// failure and sends people chasing it.
-			if isSchemaDeferred(err) {
-				log.Printf("storage bootstrap skipped (expected): output table not created yet — it is created on first write once the schema is known: %v", err)
-			} else {
-				log.Printf("Warning: failed to build storage bootstrap: %v", err)
-			}
-			// Don't fail the whole request - component may not need it
-		}
-	}
-
+	// StorageBootstrap (direct storage access for native components) is no
+	// longer built: all component data flows through the gateway.
 	return &pb.ComponentConfig{
-		ExecutionId:      s.config.RunID,
-		ComponentName:    s.config.ComponentName,
-		InputBuckets:     s.config.InputBuckets,
-		OutputBuckets:    s.config.OutputBuckets,
-		InputTables:      inputTables,
-		OutputConfig:     outputConfig,
-		Config:           s.config.ComponentCfg,
-		ChunkSize:        s.config.ChunkSize,
-		StorageBootstrap: storageBootstrap,
+		ExecutionId:   s.config.RunID,
+		ComponentName: s.config.ComponentName,
+		InputBuckets:  s.config.InputBuckets,
+		OutputBuckets: s.config.OutputBuckets,
+		InputTables:   inputTables,
+		OutputConfig:  outputConfig,
+		Config:        s.config.ComponentCfg,
+		ChunkSize:     s.config.ChunkSize,
 		// Legacy fields
 		Inputs:  s.config.Inputs,
 		Outputs: outputPaths,
 	}, nil
-}
-
-// buildStorageBootstrap builds the StorageBootstrap data for native S3
-// components. Inputs/outputs are resolved via the lakekeeper resolver
-// when configured; bucket credentials come from the static
-// `s.config.S3*` fields. Native S3 components are a legacy escape hatch
-// — the canonical write path goes through DataGateway's gRPC/HTTP
-// surface where vended-creds rotation is handled per-call.
-func (s *ServerV2) buildStorageBootstrap(ctx context.Context) (*pb.StorageBootstrap, error) {
-	bootstrap := &pb.StorageBootstrap{
-		BucketCredentials: make(map[string]*pb.S3Credentials),
-	}
-
-	// Build input table data (file paths from lakekeeper).
-	for _, input := range s.config.InputTables {
-		var filePaths []string
-		if s.lakekeeperResolver != nil {
-			rt, err := s.lakekeeperResolver.LoadTableForRead(ctx, input.Bucket, input.Table)
-			if err != nil {
-				log.Printf("Warning: failed to resolve table %s.%s via lakekeeper: %v", input.Bucket, input.Table, err)
-			} else {
-				filePaths = rt.DataFiles
-			}
-		}
-
-		// Resolve logical name (default to table name if not specified)
-		logicalName := input.As
-		if logicalName == "" {
-			logicalName = input.Table
-		}
-
-		bootstrap.Inputs = append(bootstrap.Inputs, &pb.ResolvedInput{
-			Bucket:      input.Bucket,
-			Table:       input.Table,
-			FilePaths:   filePaths,
-			Format:      "parquet",
-			LogicalName: logicalName,
-		})
-	}
-
-	// Build output table data (S3 write locations from lakekeeper).
-	for _, output := range s.config.OutputTables {
-		var location string
-		if s.lakekeeperResolver != nil {
-			wt, err := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, output.Bucket, output.Name, nil)
-			if err != nil {
-				if s.config.S3BucketName != "" {
-					// Schema-deferred path: just synthesize a hint so
-					// native components have something to log; real
-					// writes go through DG's per-table create.
-					location = fmt.Sprintf("s3://%s/%s/%s/data/",
-						s.config.S3BucketName, output.Bucket, output.Name)
-				} else {
-					return nil, fmt.Errorf("failed to resolve write path for %s.%s: %w", output.Bucket, output.Name, err)
-				}
-			} else {
-				location = wt.BasePath
-			}
-		} else if s.config.S3BucketName != "" {
-			location = fmt.Sprintf("s3://%s/%s/%s/data/",
-				s.config.S3BucketName, output.Bucket, output.Name)
-		} else {
-			return nil, fmt.Errorf("no lakekeeper resolver and no S3BucketName for output %s.%s", output.Bucket, output.Name)
-		}
-
-		bootstrap.Outputs = append(bootstrap.Outputs, &pb.ResolvedOutput{
-			Bucket:   output.Bucket,
-			Table:    output.Name,
-			Location: location,
-		})
-	}
-
-	// Bucket credentials. Native S3 components fall back to static
-	// config-supplied MinIO credentials (same as the Docker path).
-	// Vended-creds for native components is future work.
-	if (s.config.S3Endpoint != "" && s.config.S3AccessKey != "") &&
-		(len(bootstrap.Inputs) > 0 || len(bootstrap.Outputs) > 0) {
-		bucketSet := make(map[string]bool)
-		for _, input := range bootstrap.Inputs {
-			bucketSet[input.Bucket] = true
-		}
-		for _, output := range bootstrap.Outputs {
-			bucketSet[output.Bucket] = true
-		}
-		for bucket := range bucketSet {
-			bootstrap.BucketCredentials[bucket] = &pb.S3Credentials{
-				AccessKeyId:     s.config.S3AccessKey,
-				SecretAccessKey: s.config.S3SecretKey,
-				Endpoint:        s.config.S3Endpoint,
-				Region:          s.config.S3Region,
-				BucketName:      s.config.S3BucketName,
-				UseSsl:          false, // local MinIO default
-				UsePathStyle:    true,  // required for MinIO
-			}
-		}
-	} else if hasFilesystemPaths(bootstrap) {
-		log.Printf("Filesystem mode detected — bootstrap has file:// paths, no S3 credentials needed")
-	}
-
-	return bootstrap, nil
-}
-
-// hasFilesystemPaths checks if any bootstrap input file paths or output locations use file:// scheme.
-func hasFilesystemPaths(bootstrap *pb.StorageBootstrap) bool {
-	for _, input := range bootstrap.Inputs {
-		for _, fp := range input.FilePaths {
-			if strings.HasPrefix(fp, "file://") {
-				return true
-			}
-		}
-	}
-	for _, output := range bootstrap.Outputs {
-		if strings.HasPrefix(output.Location, "file://") {
-			return true
-		}
-	}
-	return false
 }
 
 // Shutdown is a no-op RPC retained for protocol compatibility.
@@ -752,6 +632,14 @@ func (s *ServerV2) Close() error {
 		drainCancel()
 	}
 
+	// Close the data plane once no commit can still be running; open
+	// writers and readers end with it.
+	if s.plane != nil {
+		if err := s.plane.Close(); err != nil {
+			log.Printf("Warning: data plane close error: %v", err)
+		}
+	}
+
 	// Release the lakekeeper resolver's resources. For SQLite-filesystem
 	// mode this closes the underlying *sql.DB pool that the lazy-init
 	// shim opened; for REST mode it's a no-op.
@@ -763,7 +651,6 @@ func (s *ServerV2) Close() error {
 
 	return nil
 }
-
 
 // ============================================================================
 // Schema/Sampling RPCs
@@ -958,7 +845,7 @@ func buildPipelineFromProcessors(processors []ProcessorConfig) *processor.Pipeli
 		switch proc.Type {
 		case "drop":
 			p.Add(processor.NewDropOp(proc.Columns))
-		// Add more processor types here as needed
+			// Add more processor types here as needed
 		}
 	}
 

@@ -8,8 +8,8 @@ import (
 
 // Config contains the gateway server configuration.
 type Config struct {
-	RunID string `yaml:"run_id,omitempty"` // Unique run identifier for this pipeline execution
-	ComponentName  string `yaml:"component_name,omitempty"`
+	RunID         string `yaml:"run_id,omitempty"` // Unique run identifier for this pipeline execution
+	ComponentName string `yaml:"component_name,omitempty"`
 
 	// Bucket-based access control
 	InputBuckets  []string `yaml:"input_buckets,omitempty"`  // Buckets component can read from
@@ -30,13 +30,20 @@ type Config struct {
 	Inputs  map[string]string       `yaml:"inputs,omitempty"`  // logical name -> table path
 	Outputs map[string]OutputConfig `yaml:"outputs,omitempty"` // logical name -> output config
 
-	ComponentCfg     []byte                 `yaml:"config,omitempty"` // Component-specific JSON config
-	ChunkSize        int64                  `yaml:"chunk_size,omitempty"`
-	BufferSize       int64                  `yaml:"buffer_size,omitempty"`
-	RowGroupSize     int64                  `yaml:"row_group_size,omitempty"`
-	TargetFileSize   int64                  `yaml:"target_file_size,omitempty"`
-	Backend  backend.StorageBackend `yaml:"-"` // Not serialized
+	ComponentCfg   []byte `yaml:"config,omitempty"` // Component-specific JSON config
+	ChunkSize      int64  `yaml:"chunk_size,omitempty"`
+	BufferSize     int64  `yaml:"buffer_size,omitempty"`
+	RowGroupSize   int64  `yaml:"row_group_size,omitempty"`
+	TargetFileSize int64  `yaml:"target_file_size,omitempty"`
+	// Backend is a static storage backend for the read side in tests (Not
+	// serialized). Writes never use it.
+	Backend  backend.StorageBackend `yaml:"-"`
 	HTTPAddr string                 `yaml:"http_addr,omitempty"`
+
+	// LocalDataDir (tests only; not serialized): with no LakekeeperURL,
+	// writer data prefixes are <LocalDataDir>/<bucket>/<table>/data/ and no
+	// commit is dispatched. Empty with no LakekeeperURL = OpenWriter fails.
+	LocalDataDir string `yaml:"-"`
 
 	// RunTokenPath is the filesystem path to the mounted run-token Secret.
 	// When non-empty and the file exists, the gateway reads it at boot.
@@ -60,8 +67,8 @@ type Config struct {
 	// LakekeeperURL is the base URL of the Iceberg REST catalog (lakekeeper).
 	// When set, the gateway constructs a `pkg/datagateway/lakekeeper.Resolver`
 	// at boot and routes per-write/per-read requests through it for
-	// LoadOrCreate + vended-creds rotation. Empty = static-backend mode
-	// (tests + dev only).
+	// LoadOrCreate + vended-creds rotation. Empty = tests only (LocalDataDir
+	// for writes, Backend for reads).
 	LakekeeperURL string `yaml:"lakekeeper_url,omitempty"`
 
 	// PipelineAPIJWKSURL is the JWKS endpoint URL pipeline-api serves
@@ -77,13 +84,6 @@ type Config struct {
 	// empty, no resolution is attempted and any $[name] reference in ComponentCfg
 	// causes NewServerV2 to fail.
 	SecretsDir string `yaml:"secrets_dir,omitempty"`
-
-	// Storage credentials for native S3 components (StorageBootstrap)
-	S3Endpoint   string `yaml:"s3_endpoint,omitempty"`
-	S3AccessKey  string `yaml:"s3_access_key,omitempty"`
-	S3SecretKey  string `yaml:"s3_secret_key,omitempty"`
-	S3Region     string `yaml:"s3_region,omitempty"`
-	S3BucketName string `yaml:"s3_bucket_name,omitempty"`
 }
 
 // InputTableConfig defines a specific table input.
@@ -105,7 +105,7 @@ type OutputTableConfig struct {
 	Bucket          string                 `yaml:"bucket"`                     // Bucket name
 	WriteMode       string                 `yaml:"write_mode"`                 // APPEND or FULL_LOAD
 	LogicalName     string                 `yaml:"logical_name,omitempty"`     // SDK-facing identifier (defaults to Name when empty)
-	PartitionFields []PartitionFieldConfig `yaml:"partition_fields,omitempty"` // Optional partition spec
+	PartitionFields []PartitionFieldConfig `yaml:"partition_fields,omitempty"` // Ignored with a warning (writes are unpartitioned)
 
 	// Columns is an optional explicit column mapping (name+type). When set,
 	// the producer writes exactly these columns and infers nothing; empty =

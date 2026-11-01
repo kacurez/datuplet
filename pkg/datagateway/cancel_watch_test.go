@@ -169,7 +169,7 @@ func TestCancelAnnotation_CancelsCommitPool(t *testing.T) {
 		PodAnnotationsPath: annotationsPath,
 		CancelPollInterval: 50 * time.Millisecond,
 	}
-	server := NewServerV2(cfg)
+	server := mustNewServerV2(t, cfg)
 
 	// blockCh lets the test control when the CommitFn unblocks.
 	// The CommitFn blocks until its context is cancelled.
