@@ -4,7 +4,7 @@
 # pipeline-api `runs` table. Single-replica (no leader election); 2-replica
 # pipeline-api owns HTTP-only paths. Shares pkg/pipelineapi/k8s/* with
 # pipeline-api — no code duplication.
-FROM golang:1.25-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 

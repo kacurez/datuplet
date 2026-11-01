@@ -108,7 +108,7 @@ image runs **non-root**. Copy `components/http-json-extractor/Dockerfile`
 verbatim and change the two component-name occurrences:
 
 ```dockerfile
-FROM golang:1.25-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /app
 COPY . .
 WORKDIR /app/components/<name>
