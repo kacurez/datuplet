@@ -615,7 +615,9 @@ func TestIntegrationReadBack(t *testing.T) {
 	for tr.Next() {
 		b := tr.RecordBatch()
 		for i := 0; i < int(b.NumRows()); i++ {
-			js, err := b.NewSlice(int64(i), int64(i+1)).MarshalJSON()
+			slice := b.NewSlice(int64(i), int64(i+1))
+			js, err := slice.MarshalJSON()
+			slice.Release()
 			if err != nil {
 				t.Fatal(err)
 			}

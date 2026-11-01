@@ -174,6 +174,8 @@ for backpressure; `Close()` returns the written files with path, row count and b
    `CREATE SECRET (TYPE ICEBERG, TOKEN '<run jwt>')`, `ATTACH '<project-id>/<warehouse>' AS lk (TYPE ICEBERG,
    URI '<lakekeeper_url>', SECRET …, ACCESS_DELEGATION_MODE 'vended_credentials', READ_ONLY)`, then `DROP SECRET`
    (the queryengine pattern, `components/queryengine/attach.go`). Extractor sidecars never attach.
+   **Maintainer ruling 2026-11-01** — an ATTACH cut short by cancellation, interrupt or plane close is not cached —
+   the next reader retries; a genuine attach failure is cached for the plane's lifetime.
 2. The reader runs `SELECT * FROM lk."<ns>"."<table>"` on its own connection through the streaming API with
    `enable_external_file_cache=false` and `read_ahead_depth=1` (spike: 143 MiB for a 2 M-row full scan vs 1 085 MiB
    materialized).
