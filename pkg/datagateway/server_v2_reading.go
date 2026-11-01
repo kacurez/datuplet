@@ -47,8 +47,12 @@ type readerState struct {
 	// pendingErr is a Next failure met while peeking; the next chunk
 	// returns it.
 	pendingErr error
-	done       bool // the last chunk was served
-	closed     bool
+	// err is the reader's first failure (a Next while filling a chunk, an
+	// encode, or pendingErr once returned); every later chunk returns it, so
+	// a retried read never skips the failed chunk's rows.
+	err    error
+	done   bool // the last chunk was served
+	closed bool
 
 	closeOnce sync.Once
 }
@@ -135,7 +139,10 @@ func (s *ServerV2) OpenReader(ctx context.Context, req *pb.OpenReaderRequest) (*
 }
 
 // arrowSchemaToProto describes a plane stream's schema; a column whose Arrow
-// type has no gateway type is reported as string.
+// type has no gateway type is reported as string. FieldId and Nullable are
+// not catalog-sourced on this path: FieldId is 0 (unknown; the Iceberg field
+// ids are not read) and Nullable is the plane's Arrow flag, not the Iceberg
+// required flag.
 func arrowSchemaToProto(sch *arrow.Schema) *pb.Schema {
 	out := &pb.Schema{Columns: make([]*pb.ColumnDef, sch.NumFields())}
 	for i, f := range sch.Fields() {
@@ -143,7 +150,7 @@ func arrowSchemaToProto(sch *arrow.Schema) *pb.Schema {
 		if err != nil {
 			dt = schema.TypeString
 		}
-		out.Columns[i] = &pb.ColumnDef{Name: f.Name, Type: dt.String(), Nullable: f.Nullable, FieldId: int32(i + 1)}
+		out.Columns[i] = &pb.ColumnDef{Name: f.Name, Type: dt.String(), Nullable: f.Nullable}
 	}
 	return out
 }
@@ -191,6 +198,9 @@ func (rs *readerState) nextChunk(limit int64, mem memory.Allocator) (*readChunk,
 	if rs.closed {
 		return nil, errReaderClosed
 	}
+	if rs.err != nil {
+		return nil, rs.err
+	}
 	if rs.done {
 		return nil, nil
 	}
@@ -211,7 +221,7 @@ func (rs *readerState) nextChunk(limit int64, mem memory.Allocator) (*readChunk,
 		add(rs.pending)
 		rs.pending = nil
 	} else if rs.pendingErr != nil {
-		return nil, rs.pendingErr
+		return nil, rs.fail(rs.pendingErr)
 	}
 
 	eof := false
@@ -221,7 +231,7 @@ func (rs *readerState) nextChunk(limit int64, mem memory.Allocator) (*readChunk,
 		case errors.Is(err, io.EOF):
 			eof = true
 		case err != nil:
-			return nil, err
+			return nil, rs.fail(err)
 		default:
 			add(b)
 		}
@@ -240,10 +250,21 @@ func (rs *readerState) nextChunk(limit int64, mem memory.Allocator) (*readChunk,
 
 	data, err := encodeChunk(rs.format, rs.adapter, rs.schema, batches, mem)
 	if err != nil {
-		return nil, fmt.Errorf("serialize %s chunk: %w", rs.format, err)
+		return nil, rs.fail(fmt.Errorf("serialize %s chunk: %w", rs.format, err))
 	}
 	rs.done = eof
 	return &readChunk{data: data, rows: rows, last: eof}, nil
+}
+
+// fail records err as the reader's sticky failure and drops the peeked
+// batch; the caller holds rs.mu.
+func (rs *readerState) fail(err error) error {
+	rs.err = err
+	if rs.pending != nil {
+		rs.pending.Release()
+		rs.pending = nil
+	}
+	return err
 }
 
 // close ends the reader: it cancels the lifetime ctx (interrupting a running

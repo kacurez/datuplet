@@ -39,19 +39,10 @@ jobs:
       - name: go test
         run: go test -count=1 ./...
 
-      - name: go test (integration — datupleticeio)
-        # Validates pkg/datupleticeio
-        # against fsouza/fake-gcs-server via testcontainers. Docker is
-        # available on ubuntu-latest runners by default; no extra setup.
-        # See RFC 019 §B.3-B.4 for what this covers.
-        run: |
-          go test -tags=integration -count=1 -timeout 10m \
-            ./pkg/datupleticeio/...
-
   duckdb-modules:
     name: DuckDB module tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       CGO_ENABLED: "1"
     steps:
@@ -78,6 +69,14 @@ jobs:
 
       - name: go test (gateway)
         run: cd gateway && go test -tags duckdb_arrow -count=1 ./...
+
+      # Postgres + Lakekeeper + silo started with the docker CLI on the host
+      # network (gateway/duckplane/fixture_test.go). The suite INSTALLs httpfs
+      # and iceberg from extensions.duckdb.org into a temp dir, as the image
+      # builds in e2e.yml do; it fails (never skips) without Docker or the
+      # extensions.
+      - name: go test (gateway integration — Docker + Lakekeeper)
+        run: cd gateway && go test -tags 'duckdb_arrow integration' -count=1 -run Integration ./... -timeout 20m
 
   helm:
     name: helm lint + template

@@ -51,6 +51,7 @@ type fakeDataPlane struct {
 	// nextErrAfter batches.
 	nextErr      error
 	nextErrAfter int
+	nextErrOnce  bool // the injected Next failure fires once, then clears
 	// beforeOpenReader, when set, runs at the start of OpenTableReader
 	// (before p.mu), so a test can pause an open across a cancel.
 	beforeOpenReader func()
@@ -143,7 +144,15 @@ func (p *fakeDataPlane) readers() []*fakeRecordStream {
 // after batches.
 func (p *fakeDataPlane) failNext(err error, after int) {
 	p.mu.Lock()
-	p.nextErr, p.nextErrAfter = err, after
+	p.nextErr, p.nextErrAfter, p.nextErrOnce = err, after, false
+	p.mu.Unlock()
+}
+
+// failNextOnce is failNext for a single (transient) failure: the next Next
+// after that one carries on with the following batch.
+func (p *fakeDataPlane) failNextOnce(err error, after int) {
+	p.mu.Lock()
+	p.nextErr, p.nextErrAfter, p.nextErrOnce = err, after, true
 	p.mu.Unlock()
 }
 
@@ -376,11 +385,14 @@ func (s *fakeRecordStream) Next(ctx context.Context) (arrow.RecordBatch, error) 
 		return nil, err
 	}
 	p := s.plane
-	p.mu.Lock()
-	nextErr, after := p.nextErr, p.nextErrAfter
-	p.mu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	p.mu.Lock()
+	nextErr, after := p.nextErr, p.nextErrAfter
+	if nextErr != nil && s.next >= after && p.nextErrOnce {
+		p.nextErr = nil
+	}
+	p.mu.Unlock()
 	if s.interrupted {
 		return nil, errFakePlaneDead
 	}

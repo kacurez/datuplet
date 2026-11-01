@@ -68,6 +68,76 @@ func TestArrowReader_FromGRPCStream(t *testing.T) {
 	}
 }
 
+// A chunk may hold several record batches (the gateway packs every batch of
+// a chunk into one IPC stream); the reader yields all of them.
+func TestArrowReader_MultiBatchChunk(t *testing.T) {
+	pool := memory.NewGoAllocator()
+	arrowSch := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+	}, nil)
+	multi := buildMultiBatchIPCChunk(t, pool, arrowSch, [][]int64{{1, 2, 3}, {4, 5, 6, 7}, {8, 9}})
+	single := buildFakeIPCChunks(t, pool, arrowSch, [][]int64{{10}})[0]
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := grpc.NewServer()
+	pb.RegisterDataGatewayServer(grpcSrv, &fakeGW{schema: arrowSch, chunks: [][]byte{multi, single}})
+	go func() { _ = grpcSrv.Serve(lis) }()
+	defer grpcSrv.Stop()
+
+	sdkClient := sdk.NewWithDialer(t, func(ctx context.Context, _ string) (net.Conn, error) {
+		return lis.DialContext(ctx)
+	})
+	defer sdkClient.Close()
+	sdkReader, err := sdkClient.OpenReader(context.Background(), "b", "t",
+		sdk.WithOutputFormat(pb.DataFormat_FORMAT_ARROW_IPC))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	rr, err := NewReader(context.Background(), sdkReader)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer rr.Release()
+
+	var ids []int64
+	batches := 0
+	for rr.Next() {
+		batches++
+		col := rr.RecordBatch().Column(0).(*array.Int64)
+		ids = append(ids, col.Int64Values()...)
+	}
+	if rr.Err() != nil {
+		t.Fatalf("rr.Err: %v", rr.Err())
+	}
+	if batches != 4 || len(ids) != 10 || ids[0] != 1 || ids[9] != 10 {
+		t.Errorf("batches = %d, ids = %v; want 4 batches with ids 1..10", batches, ids)
+	}
+}
+
+// buildMultiBatchIPCChunk encodes one IPC stream holding one batch per rows
+// entry.
+func buildMultiBatchIPCChunk(t *testing.T, pool memory.Allocator, sch *arrow.Schema, rows [][]int64) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := ipc.NewWriter(&buf, ipc.WithSchema(sch))
+	for _, r := range rows {
+		b := array.NewInt64Builder(pool)
+		b.AppendValues(r, nil)
+		arr := b.NewArray()
+		rec := array.NewRecordBatch(sch, []arrow.Array{arr}, int64(len(r)))
+		if err := w.Write(rec); err != nil {
+			t.Fatalf("ipc write: %v", err)
+		}
+		rec.Release()
+		arr.Release()
+		b.Release()
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("ipc close: %v", err)
+	}
+	return buf.Bytes()
+}
+
 type fakeGW struct {
 	pb.UnimplementedDataGatewayServer
 	schema *arrow.Schema

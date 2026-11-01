@@ -23,8 +23,7 @@ func TestNewResolver_RequiresURL(t *testing.T) {
 }
 
 // TestNewResolver_OK: a non-empty URL succeeds. Constructor doesn't
-// dial lakekeeper — opening a connection is deferred to LoadOrCreate
-// / LoadTableForRead.
+// dial lakekeeper — opening a connection is deferred to LoadOrCreate.
 func TestNewResolver_OK(t *testing.T) {
 	r, err := NewResolver("http://example.invalid:8181/catalog", "datuplet", "jwt-1", "11111111-2222-3333-4444-555555555555")
 	if err != nil {

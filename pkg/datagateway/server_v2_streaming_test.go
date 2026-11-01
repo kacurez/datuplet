@@ -119,6 +119,11 @@ func TestReadParquetChunksAreSelfContained(t *testing.T) {
 		resp.Schema.Columns[0].Type != "int64" || resp.Schema.Columns[1].Type != "string" {
 		t.Errorf("OpenReader schema = %v, want id int64, name string", resp.Schema)
 	}
+	for _, c := range resp.Schema.GetColumns() {
+		if c.FieldId != 0 {
+			t.Errorf("column %q FieldId = %d, want 0 (unknown: not catalog-sourced)", c.Name, c.FieldId)
+		}
+	}
 
 	chunks := drainHTTP(t, s, resp.ReaderId)
 	if len(chunks) != 3 {
@@ -294,6 +299,24 @@ func TestReadPlaneErrorSurfaces(t *testing.T) {
 	c := httpReadChunk(t, s, resp.ReaderId)
 	if c.status != http.StatusInternalServerError || !strings.Contains(string(c.data), "boom") || !strings.Contains(string(c.data), "READ_ERROR") {
 		t.Errorf("failed chunk: HTTP %d %s; want 500 READ_ERROR naming the plane error", c.status, c.data)
+	}
+
+	// A failure is sticky: a transient plane error in the middle of a chunk
+	// fails that GET and every later one, never a 200 that skips the rows of
+	// the failed chunk.
+	s2, p2, _ := newReadTestServer(t, 0, memory.NewGoAllocator()) // default chunk size: the failure lands mid-fill
+	p2.failNextOnce(boom, 1)
+	resp = openTestReader(t, s2, "orders", pb.DataFormat_FORMAT_JSONL)
+	for i := 0; i < 2; i++ {
+		c := httpReadChunk(t, s2, resp.ReaderId)
+		if c.status != http.StatusInternalServerError || !strings.Contains(string(c.data), "boom") {
+			t.Errorf("GET %d after a mid-chunk failure: HTTP %d last=%v rows=%d %s; want 500 naming the plane error",
+				i, c.status, c.last, c.rows, c.data)
+		}
+	}
+	stream2 := &mockReadChunkStream{ctx: context.Background()}
+	if err := s2.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream2); err == nil || !strings.Contains(err.Error(), "boom") || len(stream2.chunks) != 0 {
+		t.Errorf("ReadChunk after a mid-chunk failure = %v (%d chunks), want the plane error and no chunk", err, len(stream2.chunks))
 	}
 
 	p.failNext(boom, 0)

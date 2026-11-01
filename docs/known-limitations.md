@@ -104,6 +104,12 @@ Phase 2 (`datuplet-infra`) or Phase 4 (`datuplet-lakekeeper`) upgrades —
 CNPG backups are not configured by the charts (see above), so this is a
 manual step.
 
+**Rebuild Arrow-reading components on the current Go SDK.** The DuckDB data
+gateway packs several record batches into one Arrow IPC chunk. Components
+built against a `sdk/go/arrow` version before this fix read only the first
+batch of each chunk (`arrow.NewReader`) and silently drop the rest; rebuild
+them on the fixed SDK before upgrading the gateway.
+
 ---
 
 ## Chart structure

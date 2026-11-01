@@ -42,10 +42,11 @@ Test gates — `go test ./...` must stay green on a bare machine:
 - DB-backed tests under `pkg/pipelineapi/{apps,auth,db,http,k8s,store}` skip
   unless `TEST_DATABASE_URL` points at a Postgres, e.g.
   `postgres://postgres:test@localhost:55432/test?sslmode=disable`.
-- `//go:build integration` tests need Docker (testcontainers). CI runs
-  `go test -tags=integration ./pkg/datupleticeio/...`
-  (fake-gcs-server). `pkg/pipelineapi/authz` has an OpenFGA test under the
-  same tag that CI does not run.
+- `//go:build integration` tests need Docker. CI runs only the `gateway/`
+  one: `cd gateway && go test -tags 'duckdb_arrow integration' -run Integration ./...`
+  (Postgres + Lakekeeper + silo via the docker CLI, host network; needs
+  extensions.duckdb.org). `pkg/pipelineapi/authz` has an OpenFGA test under
+  the `integration` tag that CI does not run.
 - The e2e suite (`tests/e2e/`, its own module) gates on `E2E_K8S=1`; without
   it every scenario SKIPs. `E2E_REQUIRE=1` turns a bootstrap failure into a
   hard fail. Assertions shell out to the `duckdb` CLI — a missing binary once
@@ -78,14 +79,15 @@ OrbStack dev loop (namespace `datuplet`; `K8S_NS=datuplet-e2e` retargets):
 
 `.github/workflows/pr.yml` runs on every PR and push to `main`:
 
-1. `go vet ./...`, `go test -count=1 ./...`, then the `integration`-tagged
-   GCS/datupleticeio tests.
+1. `go vet ./...`, `go test -count=1 ./...`.
 2. `helm dependency build` + `helm lint` + `helm template`, once per chart.
 3. `scripts/verify-versions.sh` — chart versions and component tag in sync.
 4. `make sync-component-schemas` + `git diff --exit-code` on the chart copies.
 5. `make sync-appshell-schema` + `git diff --exit-code ui/appshell/vegaspec.schema.json`.
-6. `duckdb-modules` — `go test -tags duckdb_arrow` for `components/queryengine`
-   and `components/sql-transform` (warmed lockdown probes skip in CI).
+6. `duckdb-modules` — `go test -tags duckdb_arrow` for `components/queryengine`,
+   `components/sql-transform` and `gateway` (warmed lockdown probes skip in
+   CI), then the `gateway` integration suite
+   (`-tags 'duckdb_arrow integration' -run Integration`).
 
 Not in PR CI, so run them yourself before a PR: `deadcode` and the chart
 golden-render diff (both only in `make lint`), and the OpenFGA integration

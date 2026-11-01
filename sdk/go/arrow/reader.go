@@ -48,6 +48,7 @@ type grpcRecordReader struct {
 	stream       pb.DataGateway_ReadChunkClient
 	targetSchema *arrow.Schema
 	sdkReader    *sdk.Reader
+	chunk        *ipc.Reader // the IPC stream of the chunk being read; nil between chunks
 	current      arrow.RecordBatch
 	err          error
 	closed       bool
@@ -56,6 +57,8 @@ type grpcRecordReader struct {
 
 func (g *grpcRecordReader) Schema() *arrow.Schema { return g.targetSchema }
 
+// Next yields every record batch of every chunk: a chunk is one IPC stream
+// that may hold several batches.
 func (g *grpcRecordReader) Next() bool {
 	if g.current != nil {
 		g.current.Release()
@@ -65,34 +68,43 @@ func (g *grpcRecordReader) Next() bool {
 		return false
 	}
 	for {
-		chunk, err := g.stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return false
+		if g.chunk == nil {
+			chunk, err := g.stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return false
+			}
+			if err != nil {
+				g.err = err
+				return false
+			}
+			rdr, err := ipc.NewReader(bytes.NewReader(chunk.Data))
+			if err != nil {
+				g.err = fmt.Errorf("ipc read: %w", err)
+				return false
+			}
+			g.chunk = rdr
 		}
-		if err != nil {
-			g.err = err
-			return false
+		if g.chunk.Next() {
+			// Checked only once a batch exists: an empty chunk is skipped.
+			if !g.chunk.Schema().Equal(g.targetSchema) {
+				g.err = fmt.Errorf("ipc schema mismatch: stream %s, expected %s", g.chunk.Schema(), g.targetSchema)
+				g.chunk.Release()
+				g.chunk = nil
+				return false
+			}
+			rec := g.chunk.RecordBatch()
+			rec.Retain()
+			g.current = rec
+			return true
 		}
-		rdr, err := ipc.NewReader(bytes.NewReader(chunk.Data))
-		if err != nil {
+		err := g.chunk.Err()
+		g.chunk.Release()
+		g.chunk = nil
+		if err != nil && !errors.Is(err, io.EOF) {
 			g.err = fmt.Errorf("ipc read: %w", err)
 			return false
 		}
-		if !rdr.Next() {
-			// Empty chunk (no record batches in IPC stream) — try next.
-			rdr.Release()
-			continue
-		}
-		if !rdr.Schema().Equal(g.targetSchema) {
-			rdr.Release()
-			g.err = fmt.Errorf("ipc schema mismatch: stream %s, expected %s", rdr.Schema(), g.targetSchema)
-			return false
-		}
-		rec := rdr.RecordBatch()
-		rec.Retain()
-		rdr.Release()
-		g.current = rec
-		return true
+		// Chunk exhausted (or empty): move on to the next one.
 	}
 }
 
@@ -114,6 +126,10 @@ func (g *grpcRecordReader) Release() {
 	if g.current != nil {
 		g.current.Release()
 		g.current = nil
+	}
+	if g.chunk != nil {
+		g.chunk.Release()
+		g.chunk = nil
 	}
 	// Use Background here — g.ctx may already be cancelled by the caller
 	// (e.g. defer rr.Release() after the ctx deadline fired) and we still
