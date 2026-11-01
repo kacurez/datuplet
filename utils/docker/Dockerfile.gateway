@@ -13,8 +13,9 @@
 # post-boot INSTALL. The binary LOADs httpfs + iceberg from
 # DATUPLET_GATEWAY_DUCKDB_EXTENSION_DIR before locking.
 #
-# The runtime user is uid/gid 65532, the identity the operator runs the
-# sidecar as (pkg/k8s/controllers: RunAsUser 65532, fsGroup 65532). /scratch is
+# The runtime user is uid/gid 65532: the uid the operator forces when it sets
+# one (pkg/k8s/controllers, secrets/run-token mounts); the image's USER covers
+# the rest. /scratch is
 # the DuckDB temp_directory; the operator mounts an emptyDir over it.
 
 FROM golang:1.25-bookworm AS builder

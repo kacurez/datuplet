@@ -84,7 +84,7 @@ func TestParseFlagsSelfcheck(t *testing.T) {
 func TestSelfcheckFailsWithoutExtensions(t *testing.T) {
 	var stderr bytes.Buffer
 	// Settings come from the process env; an empty extension dir has nothing
-	// to LOAD (and no network is attempted: autoinstall is off).
+	// to LOAD (and nothing is fetched: an explicit LOAD never installs).
 	t.Setenv("DATUPLET_GATEWAY_DUCKDB_EXTENSION_DIR", t.TempDir())
 	t.Setenv("DATUPLET_GATEWAY_DUCKDB_TEMP_DIR", t.TempDir())
 	if code := realMain([]string{"--selfcheck"}, noEnv, &stderr); code != exitApplication {
