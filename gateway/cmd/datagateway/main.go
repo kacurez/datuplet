@@ -157,6 +157,14 @@ func run(opts options, getenv func(string) string) int {
 		}()
 	}
 
+	// Registered before the data plane comes up: the kubelet may stop the
+	// sidecar while NewServerV2 is still initialising, and an unhandled
+	// SIGTERM there kills the process mid-init (exit 2). A signal caught here
+	// is handled by the select below once the server exists.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
 	server, err := datagateway.NewServerV2(cfg, duckplane.Factory(duckplane.Config{
 		Settings:   settings,
 		Extensions: []string{"httpfs", "iceberg"},
@@ -165,10 +173,6 @@ func run(opts options, getenv func(string) string) int {
 		log.Printf("datagateway: %v", err)
 		return exitApplication
 	}
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
 
 	// ServeWithHTTP starts both gRPC (control) and HTTP (data transfer); it
 	// returns after a graceful stop (Close, or the cancel annotation).

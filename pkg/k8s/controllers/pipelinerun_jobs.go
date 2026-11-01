@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // componentJobName returns the K8s Job name for (pr, stage, component).
@@ -207,6 +208,20 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 							Args:            gatewayArgs,
 							Env:             gatewayEnv,
 							RestartPolicy:   &restartPolicyAlways,
+							// A native sidecar counts as started as soon as its
+							// process runs, so without a startupProbe the component
+							// starts while the gateway is still bringing up its
+							// DuckDB data plane, and the SDK's single GetConfig call
+							// fails with connection refused.
+							StartupProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									TCPSocket: &corev1.TCPSocketAction{
+										Port: intstr.FromInt32(int32(PipelineRunGatewayPort)),
+									},
+								},
+								PeriodSeconds:    1,
+								FailureThreshold: 120,
+							},
 							Ports: []corev1.ContainerPort{
 								{
 									ContainerPort: int32(PipelineRunGatewayPort),
