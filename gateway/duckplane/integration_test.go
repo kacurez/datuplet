@@ -176,7 +176,7 @@ func allTypesBatches(t *testing.T, sch *arrow.Schema, inputs []goldenInput) []ar
 			if chunk == 1 {
 				js = in.chunk2
 			}
-			arr, _, err := array.FromJSON(mem, in.dt, strings.NewReader(js))
+			arr, _, err := array.FromJSON(mem, in.dt, strings.NewReader(js), array.WithUseNumber())
 			if err != nil {
 				t.Fatalf("%s: %v", in.name, err)
 			}

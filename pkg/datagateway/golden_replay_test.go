@@ -153,7 +153,7 @@ func TestGoldenAcceptanceReplayedThroughServer(t *testing.T) {
 			sch := arrow.NewSchema([]arrow.Field{{Name: "v", Type: in.dt, Nullable: true}}, nil)
 
 			for i, js := range []string{in.chunk1, in.chunk2} {
-				arr, _, err := array.FromJSON(mem, in.dt, strings.NewReader(js))
+				arr, _, err := array.FromJSON(mem, in.dt, strings.NewReader(js), array.WithUseNumber())
 				if err != nil {
 					t.Fatal(err)
 				}

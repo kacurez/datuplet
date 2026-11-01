@@ -177,7 +177,7 @@ func TestParquetTypesMatchGolden(t *testing.T) {
 				t.Fatalf("OpenTableWriter: %v", err)
 			}
 			for _, js := range []string{in.chunk1, in.chunk2} {
-				arr, _, err := array.FromJSON(mem, in.dt, strings.NewReader(js))
+				arr, _, err := array.FromJSON(mem, in.dt, strings.NewReader(js), array.WithUseNumber())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -316,7 +316,7 @@ func TestTimestampZonesMatchToday(t *testing.T) {
 					t.Fatalf("OpenTableWriter: %v", err)
 				}
 				for _, js := range []string{in.chunk1, in.chunk2} {
-					arr, _, err := array.FromJSON(mem, dt, strings.NewReader(js))
+					arr, _, err := array.FromJSON(mem, dt, strings.NewReader(js), array.WithUseNumber())
 					if err != nil {
 						t.Fatal(err)
 					}
