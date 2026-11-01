@@ -48,19 +48,16 @@ operator doesn't re-template in-place. See RFC 019 §12.6 R1.
 
 ## GCS
 
-## GCS inline-commit transaction TTL ceiling
+## GCS inline-commit token refresh is untested end-to-end
 
-`pkg/datupleticeio/`'s `loadTableRefresh` (the default refresh strategy)
-is currently an unimplemented stub — the factory's vended OAuth bearer
-expires after the lakekeeper-issued TTL (~15 min default; ~1 hour on
-some warehouses) and any in-flight inline commit transaction (in the DG
-sidecar) that exceeds that window fails with `loadTableRefresh: caller
-did not inject a refresh closure`. RFC 019 §4.5.3 describes the planned
-wiring; v0.2 ships the latent code path with a hard-error stub. Typical
-inline commit transactions complete in seconds to a few minutes, so the
-ceiling is rarely hit in practice. Sufficiently large commits
-(e.g., ReplaceDataFiles on a 100GB+ partition) may exceed the window —
-in which case the run must be retried with a smaller batch.
+The inline commit's GCS IO (`pkg/datupleticeio/`) refreshes its vended OAuth
+token through `loadTableRefresh`: when the bearer nears expiry it calls the
+table's `gcs.oauth2.refresh-credentials-endpoint` with the run JWT (the Data
+Gateway installs the provider at boot via `datupleticeio.SetTokenProvider`).
+A failed refresh fails the request rather than reusing the expired token.
+Unit tests cover this path, but no CI or e2e lane runs against GCS, so a
+commit that outlives the token TTL (~15 min default) is not exercised against
+real Lakekeeper + GCS.
 
 **GCS audit attribution.** Lakekeeper vends GCS tokens scoped to the per-table
 prefix (via Credential Access Boundaries). However, GCP Cloud Audit Logs record
