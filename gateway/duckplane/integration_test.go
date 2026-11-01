@@ -12,7 +12,9 @@ package duckplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -467,5 +469,289 @@ func TestIntegrationAddFilesPerType(t *testing.T) {
 				t.Errorf("%s: %d rows committed, want 6", in.name, got)
 			}
 		}
+	}
+}
+
+// --- reads (Task 4) ----------------------------------------------------------
+
+// readPlane is a locked plane (New applies the lockdown) with the fixture's
+// catalog configured for reads.
+func (e *integrationEnv) readPlane(t *testing.T) *Plane {
+	t.Helper()
+	p, err := New(Config{
+		Settings: duck.Settings{
+			Threads:        1,
+			MemoryLimit:    "1GiB",
+			TempDir:        t.TempDir(),
+			MaxTempDirSize: "1GiB",
+			ExtensionDir:   e.extDir,
+		},
+		Extensions: []string{"httpfs", "iceberg"},
+		Catalog: CatalogAttach{
+			URL:       e.fx.catalogURL(),
+			ProjectID: e.fx.projectID,
+			Warehouse: e.fx.warehouseName,
+			Token:     dummyCatalogJWT,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { p.Close() })
+	return p
+}
+
+// writeCommitted creates ns.tbl with sch, writes the batches through a writer
+// of the write plane and commits them (APPEND).
+func (e *integrationEnv) writeCommitted(t *testing.T, ns, tbl string, sch *arrow.Schema, batches ...arrow.RecordBatch) {
+	t.Helper()
+	r := e.resolver(t)
+	target := createTable(t, r, ns, tbl, sch)
+	w, err := e.plane(t).OpenTableWriter(context.Background(), datagateway.WriterSpec{
+		DataPrefix: target.BasePath, FilePrefix: "part-read0001-w1", Schema: sch, Creds: target.VendedCreds,
+	})
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+	writeBatches(t, w, batches...)
+	files, err := w.Close(context.Background())
+	if err != nil || len(files) == 0 {
+		t.Fatalf("Close = %+v, %v", files, err)
+	}
+	commit(t, r, ns, tbl, files, icebergjob.WriteModeAppend, "key-"+tbl)
+}
+
+func openReader(t *testing.T, p *Plane, ns, tbl string) *reader {
+	t.Helper()
+	rs, err := p.OpenTableReader(context.Background(), datagateway.ReaderSpec{Namespace: ns, Table: tbl})
+	if err != nil {
+		t.Fatalf("OpenTableReader(%s.%s): %v", ns, tbl, err)
+	}
+	t.Cleanup(func() { rs.Close() })
+	return rs.(*reader)
+}
+
+func TestIntegrationAttachAfterLock(t *testing.T) {
+	env := sharedEnv(t)
+	const ns, tbl = "dg_read", "after_lock"
+	env.writeCommitted(t, ns, tbl, idNameSchema, idNameBatch(t, 0, 1000))
+
+	p := env.readPlane(t)
+	c := queryConn(t, p)
+	if err := c.Exec(context.Background(), "SET threads = 2"); err == nil {
+		t.Fatal("the plane is not locked: SET succeeded")
+	}
+	r := openReader(t, p, ns, tbl)
+	if got := drain(t, r); got != 1000 {
+		t.Fatalf("rows = %d, want 1000", got)
+	}
+	if n := scalar(t, c, "SELECT count(*) FROM duckdb_secrets() WHERE name = "+duck.Literal(catalogSecretName)); n != 0 {
+		t.Fatalf("catalog secret left after ATTACH: %d", n)
+	}
+	if n := scalar(t, c, "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'lk' AND readonly"); n != 1 {
+		t.Fatalf("lk attached read-only: %d", n)
+	}
+}
+
+func TestIntegrationReadBack(t *testing.T) {
+	env := sharedEnv(t)
+	const ns, tbl = "dg_read", "read_back"
+	sch := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "i32", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "f", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+		{Name: "b", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "d", Type: arrow.FixedWidthTypes.Date32, Nullable: true},
+		{Name: "ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "bin", Type: arrow.BinaryTypes.Binary, Nullable: true},
+	}, nil)
+	rec, _, err := array.RecordFromJSON(memory.NewGoAllocator(), sch, strings.NewReader(`[
+		{"id": 1, "i32": -7, "name": "alpha", "f": 1.5, "b": true, "d": "2026-10-31", "ts": "2026-10-31T12:34:56.123456Z", "bin": "AAEC"},
+		{"id": 2, "i32": null, "name": null, "f": null, "b": false, "d": null, "ts": null, "bin": null}
+	]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.writeCommitted(t, ns, tbl, sch, rec)
+
+	p := env.readPlane(t)
+	r := openReader(t, p, ns, tbl)
+	got := r.Schema()
+	t.Logf("read schema: %s", got)
+	if got.NumFields() != sch.NumFields() {
+		t.Fatalf("schema = %s", got)
+	}
+	for i, f := range sch.Fields() {
+		if got.Field(i).Name != f.Name || !arrow.TypeEqual(got.Field(i).Type, f.Type) {
+			t.Errorf("field %d = %s %s, want %s %s", i, got.Field(i).Name, got.Field(i).Type, f.Name, f.Type)
+		}
+	}
+	var rows []arrow.RecordBatch
+	for {
+		b, err := r.Next(context.Background())
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		rows = append(rows, b)
+	}
+	tbl2 := array.NewTableFromRecords(got, rows)
+	defer tbl2.Release()
+	for _, b := range rows {
+		b.Release()
+	}
+	if tbl2.NumRows() != 2 {
+		t.Fatalf("rows = %d, want 2", tbl2.NumRows())
+	}
+	want := map[int64]string{
+		1: `{"b":true,"bin":"AAEC","d":"2026-10-31","f":1.5,"i32":-7,"id":1,"name":"alpha","ts":"2026-10-31T12:34:56.123456Z"}`,
+		2: `{"b":false,"bin":null,"d":null,"f":null,"i32":null,"id":2,"name":null,"ts":null}`,
+	}
+	tr := array.NewTableReader(tbl2, -1)
+	defer tr.Release()
+	for tr.Next() {
+		b := tr.RecordBatch()
+		for i := 0; i < int(b.NumRows()); i++ {
+			js, err := b.NewSlice(int64(i), int64(i+1)).MarshalJSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			line := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(string(js)), "["), "]"))
+			id := b.Column(0).(*array.Int64).Value(i)
+			if line != want[id] {
+				t.Errorf("row %d = %s\n want %s", id, line, want[id])
+			}
+		}
+	}
+}
+
+// Review Focus 5: a table without a snapshot reads as its schema and no rows.
+func TestIntegrationReadEmptyTable(t *testing.T) {
+	env := sharedEnv(t)
+	const ns, tbl = "dg_read", "empty"
+	createTable(t, env.resolver(t), ns, tbl, idNameSchema)
+
+	r := openReader(t, env.readPlane(t), ns, tbl)
+	sch := r.Schema()
+	if sch.NumFields() != 2 || sch.Field(0).Name != "id" || sch.Field(1).Name != "name" {
+		t.Fatalf("schema = %s", sch)
+	}
+	if _, err := r.Next(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("Next = %v, want io.EOF", err)
+	}
+}
+
+// Review Focus 1: hostile table and column names are read back verbatim.
+func TestIntegrationReadHostileNames(t *testing.T) {
+	env := sharedEnv(t)
+	const ns, tbl = "dg_read", "t\"x'y"
+	names := []string{`a"b`, `x'y`, `;DROP`, "nl\nx", `ünï`}
+	var fields []arrow.Field
+	for _, n := range names {
+		fields = append(fields, arrow.Field{Name: n, Type: arrow.BinaryTypes.String, Nullable: true})
+	}
+	sch := arrow.NewSchema(fields, nil)
+	b := array.NewRecordBuilder(memory.NewGoAllocator(), sch)
+	for i, n := range names {
+		b.Field(i).(*array.StringBuilder).Append("v:" + n)
+	}
+	rec := b.NewRecordBatch()
+	b.Release()
+	env.writeCommitted(t, ns, tbl, sch, rec)
+
+	r := openReader(t, env.readPlane(t), ns, tbl)
+	got, err := r.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	defer got.Release()
+	if got.NumRows() != 1 || int(got.NumCols()) != len(names) {
+		t.Fatalf("read %d rows x %d cols", got.NumRows(), got.NumCols())
+	}
+	for i, n := range names {
+		if got.ColumnName(i) != n || got.Column(i).(*array.String).Value(0) != "v:"+n {
+			t.Errorf("column %d = %q %q, want %q", i, got.ColumnName(i), got.Column(i).(*array.String).Value(0), n)
+		}
+	}
+	if _, err := r.Next(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("Next = %v, want io.EOF", err)
+	}
+}
+
+const bigRows = 300_000
+
+func (e *integrationEnv) writeBig(t *testing.T, ns, tbl string) {
+	t.Helper()
+	var batches []arrow.RecordBatch
+	for i := 0; i < bigRows; i += 50_000 {
+		batches = append(batches, idNameBatch(t, i, 50_000))
+	}
+	e.writeCommitted(t, ns, tbl, idNameSchema, batches...)
+}
+
+func TestIntegrationReaderIsStreaming(t *testing.T) {
+	env := sharedEnv(t)
+	const ns, tbl = "dg_read", "streaming"
+	env.writeBig(t, ns, tbl)
+
+	r := openReader(t, env.readPlane(t), ns, tbl)
+	if !r.stream.IsStreaming() {
+		t.Fatal("the Iceberg scan is not a streaming result")
+	}
+	rows, hw := drainHoldingPrevious(t, r)
+	if rows != bigRows {
+		t.Fatalf("rows = %d, want %d", rows, bigRows)
+	}
+	if hw > 2 {
+		t.Fatalf("batches alive at once = %d, want <= 2", hw)
+	}
+}
+
+func TestIntegrationReaderCtxOwnership(t *testing.T) {
+	env := sharedEnv(t)
+	const ns, tbl = "dg_read", "ctx_owned"
+	env.writeBig(t, ns, tbl)
+	p := env.readPlane(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rs, err := p.OpenTableReader(ctx, datagateway.ReaderSpec{Namespace: ns, Table: tbl})
+	cancel()
+	if err != nil {
+		t.Fatalf("OpenTableReader: %v", err)
+	}
+	defer rs.Close()
+	var rows int64
+	for {
+		live, liveCancel := context.WithTimeout(context.Background(), time.Minute)
+		b, err := rs.Next(live)
+		liveCancel()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next after %d rows: %v", rows, err)
+		}
+		rows += b.NumRows()
+		b.Release()
+	}
+	if rows != bigRows {
+		t.Fatalf("rows = %d, want %d", rows, bigRows)
+	}
+
+	// Close mid-stream, then a new reader drains everything.
+	mid := openReader(t, p, ns, tbl)
+	b, err := mid.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	b.Release()
+	if err := mid.Close(); err != nil {
+		t.Fatalf("Close mid-stream: %v", err)
+	}
+	if got := drain(t, openReader(t, p, ns, tbl)); got != bigRows {
+		t.Fatalf("rows after a mid-stream Close = %d", got)
 	}
 }

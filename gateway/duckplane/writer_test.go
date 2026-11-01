@@ -679,13 +679,6 @@ func TestPlaneInterruptAbortsWriters(t *testing.T) {
 	}
 }
 
-func TestReadsNotImplemented(t *testing.T) {
-	p := testPlane(t)
-	if _, err := p.OpenTableReader(context.Background(), datagateway.ReaderSpec{Namespace: "n", Table: "t"}); err == nil {
-		t.Fatal("OpenTableReader succeeded")
-	}
-}
-
 func TestSettingsFromEnv(t *testing.T) {
 	dir := t.TempDir()
 	memMax := filepath.Join(dir, "memory.max")
