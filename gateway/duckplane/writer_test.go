@@ -4,6 +4,7 @@ package duckplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -736,5 +737,121 @@ func TestCatalogAttachRedactsToken(t *testing.T) {
 		if strings.Contains(s, "secret-jwt") {
 			t.Fatalf("token leaked: %s", s)
 		}
+	}
+}
+
+func emptyBatch(t *testing.T) arrow.RecordBatch {
+	t.Helper()
+	b := array.NewRecordBuilder(memory.NewGoAllocator(), idNameSchema)
+	defer b.Release()
+	return b.NewRecordBatch()
+}
+
+func TestWriterEmptyBatchesOnly(t *testing.T) {
+	p := testPlane(t)
+	dir := t.TempDir()
+	w, err := p.OpenTableWriter(context.Background(), localSpec(dir+"/"))
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+	writeBatches(t, w, emptyBatch(t), emptyBatch(t), emptyBatch(t))
+	files, err := w.Close(context.Background())
+	if err != nil || len(files) != 0 {
+		t.Fatalf("Close = %+v, %v; want no files", files, err)
+	}
+	if names := listDir(t, dir); len(names) != 0 {
+		t.Fatalf("files on disk: %v", names)
+	}
+}
+
+func TestWriterEmptyBatchAfterRotation(t *testing.T) {
+	p := testPlane(t)
+	dir := t.TempDir()
+	spec := localSpec(dir + "/")
+	spec.TargetFileBytes = 1 // every non-empty batch ends a file
+	w, err := p.OpenTableWriter(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+	writeBatches(t, w, idNameBatch(t, 0, 10), emptyBatch(t))
+	files, err := w.Close(context.Background())
+	if err != nil || len(files) != 1 || files[0].Rows != 10 {
+		t.Fatalf("Close = %+v, %v; want one 10-row file", files, err)
+	}
+	if names := listDir(t, dir); len(names) != 1 {
+		t.Fatalf("files on disk: %v", names)
+	}
+}
+
+// TestWriterAdmissionHonorsCtx: while one Write is blocked on COPY
+// backpressure, a second Write and a Close with short deadlines return
+// ctx.Err() in time, and the writer is unharmed by them.
+func TestWriterAdmissionHonorsCtx(t *testing.T) {
+	p := testPlane(t)
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	openGate := func() { gateOnce.Do(func() { close(gate) }) }
+	p.readerHook = func() { <-gate } // the COPY consumes nothing until the gate opens
+	w, err := p.OpenTableWriter(context.Background(), localSpec(t.TempDir()+"/"))
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+	defer func() { openGate(); w.Abort() }() // the gate first, or Abort waits on it
+
+	// channelBatches fill the channel; the next Write blocks on backpressure.
+	blocked := make(chan error, 1)
+	go func() {
+		for i := 0; i <= channelBatches+1; i++ {
+			rec := idNameBatch(t, i*10, 10)
+			err := w.Write(context.Background(), rec)
+			rec.Release()
+			if err != nil {
+				blocked <- err
+				return
+			}
+		}
+		blocked <- nil
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for w.QueuedBytes() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("first writer never queued")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond) // let it reach the blocked send
+
+	const limit = 150 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	start := time.Now()
+	rec := idNameBatch(t, 1000, 1)
+	err = w.Write(ctx, rec)
+	rec.Release()
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > limit+time.Second {
+		t.Fatalf("second Write = %v after %v", err, time.Since(start))
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), limit)
+	start = time.Now()
+	files, err := w.Close(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) || files != nil || time.Since(start) > limit+time.Second {
+		t.Fatalf("Close = %v, %v after %v", files, err, time.Since(start))
+	}
+
+	openGate()
+	if err := <-blocked; err != nil {
+		t.Fatalf("blocked Write: %v", err)
+	}
+	files, err = w.Close(context.Background())
+	if err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	var rows int64
+	for _, f := range files {
+		rows += f.Rows
+	}
+	if want := int64(10 * (channelBatches + 2)); rows != want {
+		t.Fatalf("rows = %d, want %d", rows, want)
 	}
 }

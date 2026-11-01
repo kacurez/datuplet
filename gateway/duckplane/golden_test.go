@@ -105,7 +105,9 @@ type goldenEntry struct {
 	Values    []string       `json:"values,omitempty"`
 }
 
-// knownDeviations are golden columns DuckDB cannot reproduce. DuckDB has no
+// knownDeviations are golden columns DuckDB cannot reproduce, accepted by
+// maintainer ruling 2026-11-01 (spec docs/superpowers/specs/
+// 2026-10-31-duckdb-gateway-design.md, Write path item 6). DuckDB has no
 // millisecond (or second) UTC-adjusted timestamp type: TIMESTAMPTZ is
 // microseconds, so a UTC timestamp in s/ms is written as UTC microseconds
 // (same instants, finer unit; Iceberg's timestamptz is microseconds anyway).

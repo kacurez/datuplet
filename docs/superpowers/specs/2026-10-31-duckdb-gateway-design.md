@@ -149,6 +149,15 @@ for backpressure; `Close()` returns the written files with path, row count and b
    example int8) may be rejected today; the new path rejects exactly those with the same error class and casts the
    accepted ones (`SELECT` list of `CAST(<Ident(col)> AS <type>)`) so the Parquet column types match the golden.
    Repetition is the one deliberate difference: every column is OPTIONAL (item 3).
+   **Maintainer ruling 2026-11-01** — two accepted timestamp deviations:
+   - `timestamp[s|ms, tz=UTC]` is written as UTC **microseconds** (`Timestamp(isAdjustedToUTC=true, MICROS)`,
+     `TIMESTAMP_MICROS`) instead of the golden's milliseconds: DuckDB 2.0 has no `TIMESTAMPTZ_MS`/`TIMESTAMPTZ_S`.
+     The instants are identical and iceberg-go `AddFiles` accepts the files. Pinned by `knownDeviations` in
+     `gateway/duckplane/golden_test.go`.
+   - Naive timestamps (`s`/`ms`/`us`, no time zone) and every nanosecond timestamp fail iceberg-go `AddFiles` at
+     commit: the table column is `timestamptz` (all timestamps map to it) while the Parquet column is not UTC-adjusted,
+     and this iceberg-go rejects nanosecond precision. The Parquet types equal the golden, so today's writer fails the
+     same way; not fixed here. Pinned by `TestIntegrationAddFilesPerType` (`addFilesRejects`).
 7. `CloseWriter` closes the writer, returns `total_rows`/`total_bytes`/`files_written` from the stats rows, and
    dispatches the paths to the unchanged commit pool. Zero files: no dispatch (today's SKIPPED semantics; FULL_LOAD
    with zero rows still does not truncate).

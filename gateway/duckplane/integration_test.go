@@ -142,7 +142,11 @@ var addFilesRejects = map[string]string{
 }
 
 // allTypesSchema has one optional column per accepted golden type that
-// AddFiles can commit (see addFilesRejects).
+// AddFiles can commit. The five addFilesRejects timestamp types are excluded
+// because iceberg-go refuses them at commit for today's writer too (naive
+// s/ms/us against the timestamptz column, any ns); maintainer ruling
+// 2026-11-01, spec Write path item 6. TestIntegrationAddFilesPerType pins
+// that refusal so a fix or a regression is noticed.
 func allTypesSchema(t *testing.T) (*arrow.Schema, []goldenInput) {
 	t.Helper()
 	golden := loadGolden(t)

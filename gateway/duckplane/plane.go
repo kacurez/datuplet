@@ -62,6 +62,9 @@ type Plane struct {
 	// secretExec, when set by a test, replaces the secret statement and
 	// runs it for local prefixes too (no S3/GCS secret type without httpfs).
 	secretExec func(ctx context.Context, sql string) error
+	// readerHook, when set by a test, runs in every writer view's Next before
+	// it receives a batch (a test can stall the COPY to build backpressure).
+	readerHook func()
 }
 
 var _ datagateway.DataPlane = (*Plane)(nil)
@@ -165,6 +168,7 @@ func (p *Plane) OpenTableWriter(_ context.Context, spec datagateway.WriterSpec) 
 		conn:       conn,
 		ctx:        wctx,
 		cancel:     cancel,
+		op:         make(chan struct{}, 1),
 	}
 	p.writers[w] = struct{}{}
 	return w, nil

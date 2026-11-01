@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"sync/atomic"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -47,9 +46,11 @@ type writer struct {
 	cancel     context.CancelCauseFunc
 
 	queued   atomic.Int64
-	finished atomic.Bool // done, readable without mu
+	finished atomic.Bool // done, readable without holding op
 
-	mu         sync.Mutex // serializes Write, Close and Abort
+	// op is a 1-slot semaphore serializing Write, Close and Abort. Unlike a
+	// mutex, waiting for it is bounded by the caller's ctx (acquire).
+	op         chan struct{}
 	run        *copyRun
 	fed        int64 // bytes fed into the current run
 	seq        int   // next file number
@@ -91,10 +92,15 @@ func (w *writer) Write(ctx context.Context, rec arrow.RecordBatch) error {
 	if !sameColumns(w.spec.Schema, rec.Schema()) {
 		return errors.New("duckplane: record schema does not match the writer schema")
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.acquire(ctx); err != nil {
+		return err
+	}
+	defer w.release()
 	if err := w.usable(); err != nil {
 		return err
+	}
+	if rec.NumRows() == 0 {
+		return nil // never starts a file: no rows written means no files
 	}
 	if w.run == nil {
 		if err := w.startCopy(ctx); err != nil {
@@ -138,6 +144,24 @@ func (w *writer) Write(ctx context.Context, rec arrow.RecordBatch) error {
 	}
 	return nil
 }
+
+// acquire admits one operation at a time; ctx bounds the wait. A cancelled
+// wait leaves the writer untouched (the call ctx never owns the writer).
+func (w *writer) acquire(ctx context.Context) error {
+	select {
+	case w.op <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case w.op <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("duckplane: waiting for the writer: %w", ctx.Err())
+	}
+}
+
+func (w *writer) release() { <-w.op }
 
 func (w *writer) usable() error {
 	switch {
@@ -183,7 +207,7 @@ func (w *writer) startCopy(ctx context.Context) error {
 	}
 
 	run := &copyRun{path: path, ch: make(chan item, channelBatches), done: make(chan struct{})}
-	r := &chanReader{schema: w.spec.Schema, ch: run.ch, stop: w.ctx, queued: &w.queued}
+	r := &chanReader{schema: w.spec.Schema, ch: run.ch, stop: w.ctx, queued: &w.queued, hook: w.p.readerHook}
 	r.refs.Store(1)
 	view := fmt.Sprintf("dgv_%d_%d", w.id, w.seq)
 	release, err := w.conn.RegisterArrowView(view, r)
@@ -292,8 +316,10 @@ func (w *writer) Close(ctx context.Context) ([]datagateway.WrittenFile, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer w.release()
 	if w.done {
 		return w.result, w.resultErr
 	}
@@ -322,9 +348,9 @@ func (w *writer) Abort() {
 	if w.finished.Load() {
 		return
 	}
-	w.interrupt(errAborted) // unblocks a Write waiting on the channel
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.interrupt(errAborted) // unblocks the operation holding op, if any
+	_ = w.acquire(context.Background())
+	defer w.release()
 	if w.done {
 		return
 	}
@@ -359,6 +385,7 @@ type chanReader struct {
 	ch     <-chan item
 	stop   context.Context
 	queued *atomic.Int64
+	hook   func() // tests: runs before each receive
 	cur    arrow.RecordBatch
 	err    error
 }
@@ -383,6 +410,9 @@ func (r *chanReader) Next() bool {
 	}
 	if r.err != nil {
 		return false
+	}
+	if r.hook != nil {
+		r.hook()
 	}
 	if r.stop.Err() != nil {
 		r.err = context.Cause(r.stop)
