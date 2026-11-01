@@ -8,6 +8,7 @@ require (
 	github.com/datuplet/datuplet v0.0.0-00010101000000-000000000000
 	github.com/duckdb/duckdb-go-bindings v0.20000.0
 	github.com/duckdb/duckdb-go/v2 v2.20000.0
+	google.golang.org/grpc v1.80.0
 )
 
 require (
@@ -135,7 +136,6 @@ require (
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260427160629-7cedc36a6bc4 // indirect
-	google.golang.org/grpc v1.80.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

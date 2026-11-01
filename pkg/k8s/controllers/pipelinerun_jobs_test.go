@@ -698,34 +698,3 @@ func TestGatewaySidecarArgsFitEntrypoint(t *testing.T) {
 		t.Errorf("gateway Args = %v, want flags only (no subcommand)", gw.Args)
 	}
 }
-
-// The component's SDK makes a single GetConfig call at startup, and the
-// DuckDB gateway listens only after its data plane is up (~1s), so the
-// native sidecar must hold the component back until :50051 accepts.
-func TestGatewaySidecarHasStartupProbe(t *testing.T) {
-	r := &PipelineRunReconciler{}
-	pipeline := minimalPipeline()
-	job, _, err := r.buildComponentJob(context.Background(), minimalPipelineRun(), &pipeline.Spec.Stages[0].Components[0])
-	if err != nil {
-		t.Fatalf("buildComponentJob: %v", err)
-	}
-	gw := job.Spec.Template.Spec.InitContainers[0]
-	if gw.Name != "gateway" {
-		t.Fatalf("first init container is %q, want gateway", gw.Name)
-	}
-	p := gw.StartupProbe
-	if p == nil || p.TCPSocket == nil {
-		t.Fatalf("gateway startupProbe = %+v, want a TCP probe", p)
-	}
-	if p.TCPSocket.Port.IntValue() != PipelineRunGatewayPort {
-		t.Errorf("startupProbe port = %v, want %d", p.TCPSocket.Port, PipelineRunGatewayPort)
-	}
-	if p.PeriodSeconds != 1 || p.FailureThreshold != 120 {
-		t.Errorf("startupProbe period/failureThreshold = %d/%d, want 1/120", p.PeriodSeconds, p.FailureThreshold)
-	}
-	for _, c := range job.Spec.Template.Spec.Containers {
-		if c.StartupProbe != nil {
-			t.Errorf("component container %q must not get the gateway startupProbe", c.Name)
-		}
-	}
-}

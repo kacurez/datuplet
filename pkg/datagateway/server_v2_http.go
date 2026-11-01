@@ -292,6 +292,11 @@ func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 
 // httpError sends an HTTP error response.
 func (s *ServerV2) httpError(w http.ResponseWriter, status int, message, code string) {
+	writeHTTPError(w, status, message, code)
+}
+
+// writeHTTPError writes the httpErrorResponse envelope with status.
+func writeHTTPError(w http.ResponseWriter, status int, message, code string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(httpErrorResponse{

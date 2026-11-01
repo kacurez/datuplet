@@ -26,8 +26,6 @@ import (
 	"github.com/datuplet/datuplet/pkg/icebergjob"
 	"github.com/datuplet/datuplet/pkg/lib/secrets"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/health"
-	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
 	"github.com/datuplet/datuplet/pkg/datagateway/jwks"
@@ -60,10 +58,9 @@ type ServerV2 struct {
 
 	mu sync.RWMutex
 
-	// gRPC server (set by Serve; used by Close for graceful stop).
+	// gRPC and HTTP servers (published under mu by BootGate.Ready; used by
+	// Close for graceful stop).
 	grpcServer *grpc.Server
-
-	// HTTP data plane
 	httpServer *http.Server
 	httpAddr   string // HTTP server address (e.g., "localhost:50052")
 
@@ -192,10 +189,7 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 		return nil, errors.New("data gateway: a local data dir must not be set when LakekeeperURL is configured")
 	}
 
-	httpAddr := cfg.HTTPAddr
-	if httpAddr == "" {
-		httpAddr = ":50052" // Default HTTP port
-	}
+	httpAddr := cfg.HTTPListenAddr()
 	// Validate the mounted run-token JWT against pipeline-api's JWKS.
 	// Soft-degrade preserved for tests without a mounted token — caller
 	// checks path emptiness before invoking the validator.
@@ -417,90 +411,68 @@ func resolveSecretRefsInConfig(cfg *Config) error {
 	return nil
 }
 
-// Serve starts the gRPC server on the given address.
-func (s *ServerV2) Serve(addr string) error {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", addr, err)
+// stopServersOnCancel reacts to in-band cancellation: when the cancel
+// watcher fires, the cancelCtx becomes Done and we initiate GracefulStop on
+// the gRPC server AND shut down the HTTP data plane, so a cancel that arrives
+// while serving still causes a clean exit without requiring the orchestrator
+// to call Close explicitly.
+//
+// Shutting down the HTTP listener after the gRPC stop is load-bearing for the
+// cancel-via-annotation contract: otherwise an in-flight `/data/write/...`
+// upload could keep streaming bytes for the ≤15-min STS leak window even
+// though the run has been cancelled.
+func (s *ServerV2) stopServersOnCancel(grpcServer *grpc.Server) {
+	if s.cancelCtx == nil {
+		return
 	}
-
-	grpcServer := grpc.NewServer()
-	pb.RegisterDataGatewayServer(grpcServer, s)
-
-	// Enable gRPC health checking for K8s probes
-	healthServer := health.NewServer()
-	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
-	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
-
-	// Publish grpcServer so Close() can stop it gracefully.
-	s.mu.Lock()
-	s.grpcServer = grpcServer
-	s.mu.Unlock()
-
-	// React to in-band cancellation: when the cancel
-	// watcher fires, the cancelCtx becomes Done and we initiate
-	// GracefulStop on the gRPC server AND shut down the HTTP data
-	// plane. Tied here (rather than in Close) so a cancel that
-	// arrives while Serve is blocked still causes a clean exit
-	// without requiring the orchestrator to call Close explicitly.
-	//
-	// Shutting down the HTTP listener after the gRPC stop is load-bearing
-	// for the cancel-via-annotation contract: otherwise an in-flight
-	// `/data/write/...` upload could keep streaming bytes for the ≤15-min
-	// STS leak window even though the run has been cancelled.
-	if s.cancelCtx != nil {
-		go func() {
-			<-s.cancelCtx.Done()
-			log.Printf("data gateway: cancel context fired; stopping gRPC server")
-			grpcServer.GracefulStop()
-			s.mu.Lock()
-			httpSrv := s.httpServer
-			s.mu.Unlock()
-			if httpSrv != nil {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-					log.Printf("data gateway: HTTP server shutdown after cancel: %v", err)
-				}
+	go func() {
+		<-s.cancelCtx.Done()
+		log.Printf("data gateway: cancel context fired; stopping gRPC server")
+		grpcServer.GracefulStop()
+		s.mu.Lock()
+		httpSrv := s.httpServer
+		s.mu.Unlock()
+		if httpSrv != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+				log.Printf("data gateway: HTTP server shutdown after cancel: %v", err)
 			}
-		}()
-	}
-
-	log.Printf("Data Gateway v2 listening on %s (%s)", addr, GatewayBuildInfo())
-	if DebugEnabled() {
-		log.Printf("DBG gateway debug logging enabled via DATUPLET_GATEWAY_DEBUG")
-	}
-
-	return grpcServer.Serve(lis)
+		}
+	}()
 }
 
-// ServeWithHTTP starts both gRPC and HTTP servers.
+// ServeWithHTTP binds the HTTP data plane (Config.HTTPAddr) and gRPC
+// (grpcAddr) listeners, then serves both; it returns after a graceful stop
+// (Close, or the cancel annotation). A bind failure is returned. The
+// gateway binary instead binds before boot and serves through a BootGate.
 func (s *ServerV2) ServeWithHTTP(grpcAddr string) error {
-	// Start HTTP server in background
+	httpLis, err := net.Listen("tcp", s.httpAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s (HTTP): %w", s.httpAddr, err)
+	}
+	grpcLis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		httpLis.Close()
+		return fmt.Errorf("failed to listen on %s: %w", grpcAddr, err)
+	}
+	gate := NewBootGate()
+	gate.Ready(s)
 	go func() {
-		if err := s.serveHTTP(); err != nil && err != http.ErrServerClosed {
+		if err := gate.ServeDataHTTP(httpLis); err != nil {
 			log.Printf("HTTP server error: %v", err)
 		}
 	}()
-
-	// Start gRPC server (blocking)
-	return s.Serve(grpcAddr)
+	return gate.ServeGRPC(grpcLis)
 }
 
-// serveHTTP starts the HTTP data plane server.
-func (s *ServerV2) serveHTTP() error {
+// httpHandler is the HTTP data plane's request router.
+func (s *ServerV2) httpHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/data/write/", s.handleWrite)
 	mux.HandleFunc("/data/read/", s.handleRead)
 	mux.HandleFunc("/health", s.handleHealth)
-
-	s.httpServer = &http.Server{
-		Addr:    s.httpAddr,
-		Handler: mux,
-	}
-
-	log.Printf("Data Gateway HTTP server listening on %s", s.httpAddr)
-	return s.httpServer.ListenAndServe()
+	return mux
 }
 
 // handleHealth handles HTTP health check requests.
@@ -598,27 +570,17 @@ func (s *ServerV2) Close() error {
 
 	// Gracefully stop gRPC server if running; force-stop if drain exceeds the timeout.
 	s.mu.RLock()
-	grpcServer := s.grpcServer
+	grpcServer, httpServer := s.grpcServer, s.httpServer
 	s.mu.RUnlock()
 	if grpcServer != nil {
-		done := make(chan struct{})
-		go func() {
-			grpcServer.GracefulStop()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			log.Printf("Warning: gRPC graceful stop timed out, forcing stop")
-			grpcServer.Stop()
-		}
+		stopGRPC(grpcServer, 10*time.Second)
 	}
 
 	// Shut down HTTP data plane with a short deadline.
-	if s.httpServer != nil {
+	if httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := s.httpServer.Shutdown(ctx); err != nil {
+		if err := httpServer.Shutdown(ctx); err != nil {
 			log.Printf("Warning: HTTP server shutdown error: %v", err)
 		}
 	}

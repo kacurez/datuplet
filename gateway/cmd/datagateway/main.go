@@ -14,11 +14,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/datuplet/datuplet/gateway/duck"
 	"github.com/datuplet/datuplet/gateway/duckplane"
 	"github.com/datuplet/datuplet/pkg/datagateway"
 )
@@ -51,7 +53,7 @@ func realMain(args []string, getenv func(string) string, stderr io.Writer) int {
 	if opts.selfcheck {
 		return selfcheck(stderr)
 	}
-	return run(opts, getenv)
+	return run(opts, getenv, runHooks{})
 }
 
 // selfcheck opens the data plane with the default (env) settings, which loads
@@ -128,24 +130,56 @@ func firstNonEmpty(flagVal, envVal string) string {
 	return envVal
 }
 
-func run(opts options, getenv func(string) string) int {
+// bootFailureHold bounds how long a gateway whose boot failed keeps serving
+// the boot error before it exits.
+const bootFailureHold = 10 * time.Minute
+
+// runHooks lets tests drive run without DuckDB or process signals. The zero
+// value is production.
+type runHooks struct {
+	// newPlane replaces the DuckDB plane factory.
+	newPlane func(duck.Settings) datagateway.DataPlaneFactory
+	// signals replaces SIGINT/SIGTERM delivery.
+	signals chan os.Signal
+	// bootFailureHold replaces bootFailureHold when non-zero.
+	bootFailureHold time.Duration
+	// httpAddr replaces the config's HTTP listen address when non-empty.
+	httpAddr string
+	// listening is called with the gRPC address once it is bound.
+	listening func(net.Addr)
+}
+
+// run listens before it boots: the component container starts with this
+// process and its SDK makes a single GetConfig call, so the gRPC listener is
+// bound first and the HTTP one as soon as the config is loaded; both hold
+// every request until boot ends. A failed boot is served as the error (gRPC
+// Unavailable / HTTP 503) until SIGTERM/SIGINT or bootFailureHold, then the
+// gateway exits 20: exiting at once would make the kubelet restart the
+// sidecar and race the component's call again.
+func run(opts options, getenv func(string) string, hooks runHooks) int {
 	log.Printf("datagateway: starting %s iteration_id=%s run_id=%s",
 		datagateway.GatewayBuildInfo(), orNone(getenv("DATUPLET_ITERATION_ID")), orNone(getenv("RUN_ID")))
 
-	cfg, err := datagateway.LoadConfigFile(opts.configPath, opts.runTokenPath, opts.podAnnotationsPath)
-	if err != nil {
-		log.Printf("datagateway: %v", err)
-		return exitApplication
+	// Registered before boot: the kubelet may stop the sidecar while it is
+	// still booting. A signal caught during boot is handled once boot returns.
+	sigCh := hooks.signals
+	if sigCh == nil {
+		sigCh = make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigCh)
 	}
-	if cfg.RunID == "" {
-		cfg.RunID = fmt.Sprintf("%s-%d", opts.mode, time.Now().Unix())
-	}
-	cfg.ComponentName = opts.mode + "-component"
 
-	settings, err := duckplane.SettingsFromEnv()
+	grpcLis, err := net.Listen("tcp", opts.addr)
 	if err != nil {
-		log.Printf("datagateway: %v", err)
+		log.Printf("datagateway: listen %s: %v", opts.addr, err)
 		return exitApplication
+	}
+	gate := datagateway.NewBootGate()
+	// Each serve goroutine sends once; buffered so neither blocks.
+	serveErr := make(chan error, 2)
+	go func() { serveErr <- gate.ServeGRPC(grpcLis) }()
+	if hooks.listening != nil {
+		hooks.listening(grpcLis.Addr())
 	}
 
 	// Pyroscope continuous profiling when DATUPLET_GATEWAY_PROFILING is set.
@@ -157,30 +191,35 @@ func run(opts options, getenv func(string) string) int {
 		}()
 	}
 
-	// Registered before the data plane comes up: the kubelet may stop the
-	// sidecar while NewServerV2 is still initialising, and an unhandled
-	// SIGTERM there kills the process mid-init (exit 2). A signal caught here
-	// is handled by the select below once the server exists.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	server, err := datagateway.NewServerV2(cfg, duckplane.Factory(duckplane.Config{
-		Settings:   settings,
-		Extensions: []string{"httpfs", "iceberg"},
-	}))
+	server, err := boot(opts, hooks, gate, serveErr)
 	if err != nil {
-		log.Printf("datagateway: %v", err)
+		err = datagateway.SanitizeBootError(err, opts.runTokenPath)
+		gate.Fail(err)
+		hold := bootFailureHold
+		if hooks.bootFailureHold > 0 {
+			hold = hooks.bootFailureHold
+		}
+		log.Printf("datagateway: boot failed: %v; serving the error for at most %s", err, hold)
+		timer := time.NewTimer(hold)
+		defer timer.Stop()
+		select {
+		case sig := <-sigCh:
+			log.Printf("datagateway: received %s after a failed boot; shutting down", sig)
+		case <-timer.C:
+			log.Printf("datagateway: boot error served for %s; exiting", hold)
+		case err := <-serveErr:
+			if err != nil {
+				log.Printf("datagateway: serve: %v", err)
+			}
+		}
+		gate.Stop()
 		return exitApplication
 	}
-
-	// ServeWithHTTP starts both gRPC (control) and HTTP (data transfer); it
-	// returns after a graceful stop (Close, or the cancel annotation).
-	errCh := make(chan error, 1)
-	go func() { errCh <- server.ServeWithHTTP(opts.addr) }()
+	gate.Ready(server)
 
 	select {
-	case err := <-errCh:
+	case err := <-serveErr:
+		// A graceful stop (the cancel annotation) or a serve failure.
 		closeServer(server)
 		if err != nil {
 			log.Printf("datagateway: serve: %v", err)
@@ -191,9 +230,48 @@ func run(opts options, getenv func(string) string) int {
 		log.Printf("datagateway: received %s; shutting down", sig)
 		closeServer(server)
 		// Wait for Serve to return after the graceful stop so in-flight RPCs finish.
-		<-errCh
+		<-serveErr
 		return 0
 	}
+}
+
+// boot loads the config, binds and serves the HTTP listener, then builds the
+// server (run-token validation, secrets, commit pool, data plane).
+func boot(opts options, hooks runHooks, gate *datagateway.BootGate, serveErr chan<- error) (*datagateway.ServerV2, error) {
+	cfg, err := datagateway.LoadConfigFile(opts.configPath, opts.runTokenPath, opts.podAnnotationsPath)
+	if err != nil {
+		return nil, err
+	}
+	if hooks.httpAddr != "" {
+		cfg.HTTPAddr = hooks.httpAddr
+	}
+	// Bound before boot completes, so a GetConfig that advertises the HTTP
+	// endpoint never points at an unbound port.
+	httpLis, err := net.Listen("tcp", cfg.HTTPListenAddr())
+	if err != nil {
+		return nil, fmt.Errorf("listen %s (HTTP): %w", cfg.HTTPListenAddr(), err)
+	}
+	go func() { serveErr <- gate.ServeDataHTTP(httpLis) }()
+
+	if cfg.RunID == "" {
+		cfg.RunID = fmt.Sprintf("%s-%d", opts.mode, time.Now().Unix())
+	}
+	cfg.ComponentName = opts.mode + "-component"
+
+	settings, err := duckplane.SettingsFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	newPlane := hooks.newPlane
+	if newPlane == nil {
+		newPlane = func(settings duck.Settings) datagateway.DataPlaneFactory {
+			return duckplane.Factory(duckplane.Config{
+				Settings:   settings,
+				Extensions: []string{"httpfs", "iceberg"},
+			})
+		}
+	}
+	return datagateway.NewServerV2(cfg, newPlane(settings))
 }
 
 func closeServer(server *datagateway.ServerV2) {

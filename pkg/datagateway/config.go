@@ -126,6 +126,15 @@ func (c *Config) GetRunID() string {
 	return c.RunID
 }
 
+// HTTPListenAddr is the HTTP data plane's listen address: HTTPAddr, else
+// ":50052".
+func (c *Config) HTTPListenAddr() string {
+	if c.HTTPAddr == "" {
+		return ":50052"
+	}
+	return c.HTTPAddr
+}
+
 // OutputConfig contains output path and optional processors.
 // Deprecated: Use bucket-based outputs instead.
 type OutputConfig struct {
