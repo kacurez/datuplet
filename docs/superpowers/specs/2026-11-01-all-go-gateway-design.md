@@ -22,7 +22,10 @@ Components, the SDK, the proto, the operator contract, the gateway image and the
 ## Goals
 
 1. iceberg-go `v0.7.0` in every module that uses it (root, `components/queryengine`, `tests/e2e`, and anything
-   `make tidy` pulls along); `go` directive raised to `1.25.9` where required; arrow-go/gocloud follow MVS.
+   `make tidy` pulls along); arrow-go/gocloud follow MVS. **Go 1.27.3** (latest stable, maintainer 2026-11-01:
+   "update go to the latest version … or the latest that other libraries support"): the `go` directive of every
+   module and the `golang:1.25-*` builder images in `utils/docker/` move to 1.27.3 / `golang:1.27-*`; CI reads
+   `go.mod`. If any module or tool fails to build or test on 1.27, fall back to 1.26.10 for all and record why.
 2. Writes: Arrow records → arrow-go `pqarrow` Parquet (ZSTD) → streamed multipart upload through iceberg-go IO to
    the table's data prefix with Lakekeeper-vended credentials; commit unchanged (commit pool → `icebergjob`).
 3. Reads: `OpenReader` plans the table's current snapshot with iceberg-go (`Scan.PlanFiles`); each data file is
@@ -38,7 +41,8 @@ Components, the SDK, the proto, the operator contract, the gateway image and the
 
 ## Non-goals
 
-- Changing components, the SDK, the proto, the gateway image or its entrypoint (`datuplet gateway` stays).
+- Changing components, the SDK, the proto, the gateway image or its entrypoint (`datuplet gateway` stays); the only
+  image change is the Go builder base version (Goals 1).
 - Iceberg partition specs, read-time projection/filters/transforms, working incremental reads, GetSchema/GetSample,
   run-pod NetworkPolicy, loopback auth, sidecar resource requests/limits in the operator.
 - Any migration (greenfield; nothing deployed).
@@ -113,7 +117,12 @@ New (the Go writer, `goplane`):
    vended endpoint verbatim, when set); path-style addressing unless the endpoint host is `amazonaws.com` or ends in
    `.amazonaws.com` (then `s3.force-virtual-addressing=true`). GCS → `gcs.oauth2.token` (+ project) consumed by the
    `pkg/datupleticeio` `gs://` factory (blank-imported by `goplane`). Closing the pqarrow writer closes the sink and
-   completes the upload; an aborted or failed file cancels the upload's context so no object is completed.
+   completes the upload. **Failure / abort cleanup is explicit:** on any encode, upload or close error, on `Abort`
+   and on lifetime-context cancellation, the writer (a) cancels the context the file's IO was loaded with **before**
+   closing the sink — for gocloud blob writers this is what makes `Close` abort the multipart upload instead of
+   completing it — then (b) closes the sink itself (never relying on `pqarrow.FileWriter.Close` reaching the sink,
+   which it skips on an earlier row-group error), and (c) for local `file://` prefixes removes the partial file.
+   No partial object may exist afterwards and no multipart upload may stay open.
 7. Credential lifetime (inherited rule): before each file the writer requires a remaining validity of at least
    `max(2 min, 25 % of Expires − Issued)`; otherwise `Invalidate()` + `Get()` once; if still too short the write fails
    with `goplane: vended credentials expire too soon`. One file must finish within that validity.
@@ -131,33 +140,56 @@ New (the Go writer, `goplane`):
 1. `OpenReader` resolves bucket/table as today and calls `plane.OpenTableReader`. The plane loads the table through
    the Lakekeeper catalog (`lakekeeper.Resolver`, built by `goplane.Factory` from `BootInfo`), pins the current
    snapshot and runs `Scan.PlanFiles` once (no filter, all columns).
-2. **Raw eligibility, per `FileScanTask`** — all must hold, else the file is decoded:
+2. **Split coalescing, then raw eligibility, per task.** iceberg-go v0.7.0 splits a Parquet data file larger than
+   the table's `read.split.target-size` (default 128 MiB) into consecutive byte-range tasks of the same file
+   (`table/scan_splits.go`). The plane first coalesces each run of consecutive tasks with the same data file whose
+   ranges are contiguous and cover exactly `[0, FileSizeBytes)` back into one whole-file task. Then, per task — all
+   must hold, else the task is decoded with its own range:
    - `ReaderSpec.RawParquet` is true (the request format is `FORMAT_PARQUET`; other formats decode everything);
+   - the task covers the whole file: `Start == 0 && Length == File.FileSizeBytes()` (a partial task is never raw —
+     serving the whole object for each split would duplicate rows);
    - the task has no `DeleteFiles`, `EqualityDeleteFiles` or `DeletionVectorFiles`;
    - the data file format is Parquet;
    - the file's Parquet footer (read through the table IO, ranged) converted with `pqarrow` yields an Arrow schema
      whose fields equal, in order, the table's current schema converted with iceberg-go `SchemaToArrowSchema`
      (no large types): same names and identical Arrow data types; nullability and field metadata ignored;
-   - if the file's columns carry Parquet field ids, each equals the current schema's field id for that name (a
-     file without field ids relies on the table's name mapping, matched by name above).
+   - **field identity:** every file column resolves to the same Iceberg field id as the current-schema column it is
+     compared with. A file carrying Parquet field ids uses them; a file without field ids is resolved through the
+     table's name mapping (`Table.NameMapping()`, the way iceberg-go's reader applies it). A missing, incomplete or
+     ambiguous mapping, or any id mismatch, makes the task non-raw.
 3. A **raw part** is one read chunk: `X-Datuplet-Rows` = the manifest entry's record count, body = the file's bytes.
    HTTP streams the body straight from storage (no buffering; `Content-Length` = file size). gRPC `ReadChunk`
    buffers the file into the message (today's behaviour and today's gRPC size cap).
-4. **Decoded parts**: consecutive non-raw tasks are read together with `Scan.ReadTasks` (deletes applied, columns
-   projected to the current schema by field id / name mapping, types promoted). Batches are chunked by `chunk_size`
+4. **Decoded parts**: consecutive non-raw tasks form one decoded part, read **one task per `Scan.ReadTasks` call**
+   in planning order (deletes applied, columns projected to the current schema by field id / name mapping, types
+   promoted, the task's byte range respected) — `ReadTasks` obtains one IO per call, so per-task calls are what let
+   credentials renew between files (Read path 6). Batches are chunked by `chunk_size`
    (default 32 MiB uncompressed) and serialized as today's DuckDB-branch server does (inherited
    `read_serialize.go`): `FORMAT_PARQUET` → one self-contained `pqarrow` ZSTD file per chunk; `FORMAT_ARROW_IPC` →
    one IPC stream; CSV/JSON/JSONL → the `format` adapters.
-5. Every raw and decoded chunk carries the table's current schema (names and Arrow types) — guaranteed by rule 2.
-6. Credentials: every raw file open and every `ReadTasks` call uses IO built from the table's current vended
-   credentials (`catalogwriter.VendedCreds.Get`, the renewal the writer uses), so a long read renews between files.
+5. Every raw and decoded `FORMAT_PARQUET` (and CSV/JSON/JSONL) chunk carries the table's current schema (names and
+   Arrow types) — guaranteed by rule 2. `FORMAT_ARROW_IPC` chunks carry the SDK wire schema (Read path 8).
+6. Credentials: every raw file open, every footer read and every (single-task) `ReadTasks` call uses IO built from
+   the table's current vended credentials (`catalogwriter.VendedCreds.Get`, the renewal the writer uses), so a long
+   read — raw or decoded — renews between files. One file must be read within its credentials' validity.
 7. Inherited read behaviour: empty table (no snapshot or no files) → one last chunk with zero rows (`FORMAT_PARQUET`:
    a valid zero-row Parquet file with the table schema); headers `X-Datuplet-Is-Last`/`X-Datuplet-Rows` keep their
    meaning; incremental specs log today's warning and read the full snapshot; GetSchema/GetSample →
    `codes.Unimplemented`; the reader's lifetime is independent of the OpenReader RPC context.
-8. **Deviation from the ported serializer:** a `FORMAT_ARROW_IPC` chunk is one IPC stream holding exactly **one**
-   record batch (the chunk's batches concatenated), because the frozen `sdk/go` reads only the first batch of each
-   chunk. The DuckDB branch's SDK change (`sdk/go/arrow/reader.go`, commit `270014ad`) is **not** ported.
+8. **`FORMAT_ARROW_IPC` wire contract for the frozen SDK** (deviation from the ported serializer). The frozen
+   `sdk/go/arrow` reader reads only the first batch of each chunk and rejects a chunk whose IPC schema differs from
+   the schema it derives from `OpenReaderResponse.schema` (`protoSchemaToArrow`, `sdk/go/arrow/reader.go:132`:
+   e.g. every `timestamp` → `timestamp[us, tz=UTC]`). So for this format:
+   - each chunk is one IPC stream holding exactly **one** record batch (the chunk's batches concatenated);
+   - the chunk's Arrow schema is the **SDK wire schema**: `OpenReaderResponse.schema` (the server's
+     `arrowSchemaToProto(Schema())`, unknown types reported as `string`) mapped exactly as `protoSchemaToArrow`
+     does. The server reproduces that mapping in one helper, pinned by a table test over every proto type string
+     that cites the SDK source line, and casts every decoded column to its wire type (arrow-go `compute` cast; a
+     naive timestamp is reinterpreted as UTC, `timestamp[ns]` truncates to µs, unknown types become strings);
+   - a column the SDK cannot represent and that cannot be cast to its wire type fails `OpenReader` with
+     `InvalidArgument` naming the column and type, before any chunk is served;
+   - Parquet and CSV/JSON/JSONL chunks keep the table's own Arrow types (Read path 5).
+   The DuckDB branch's SDK change (`sdk/go/arrow/reader.go`, commit `270014ad`) is **not** ported.
 
 ## Boot (fixes carried over from the DuckDB branch — maintainer, 2026-11-01: "bring fixes … if it makes sense")
 
@@ -184,8 +216,14 @@ rounds) and in Read path 8 (the SDK change that is *not* carried over).
   `goplane` writer and reader against local `file://` tables built with iceberg-go in tests.
 - Integration (`//go:build integration`, Docker: Postgres + Lakekeeper v0.12.1 + silo, container prefix `gw-it-`):
   write → `icebergjob.CommitTableFiles` APPEND/FULL_LOAD → read back; raw eligibility on a clean table; decoded
-  reads after an iceberg-go position delete (`Transaction.Delete`), an added column, a renamed column, and a
-  non-canonical (int8) write; credential `Invalidate()` between files. Runs in PR CI's integration line.
+  reads after an iceberg-go position delete, an added column, a renamed column, and a non-canonical (int8) write;
+  credential `Invalidate()` between files (raw and within one decoded run); an aborted S3 write leaves no object and
+  no open multipart upload. **Delete fixtures:** iceberg-go v0.7.0 defaults `write.delete.mode` to copy-on-write
+  (`table/properties.go:102`), which rewrites files instead of writing delete files — every delete fixture sets
+  `write.delete.mode=merge-on-read` on a format-v2 table, deletes a strict subset of one file's rows, reloads the
+  table and asserts the planned task carries delete files before asserting read output. Equality deletes and v3
+  deletion vectors get their own fixtures where iceberg-go can write them, otherwise synthetic `FileScanTask`s in
+  unit tests. Runs in PR CI's integration line.
 - Live: `make e2e-k8s` on OrbStack, full suite green.
 - Performance: Goals 5, on the spike harness, report committed.
 
