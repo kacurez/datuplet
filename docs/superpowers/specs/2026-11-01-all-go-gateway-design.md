@@ -119,8 +119,10 @@ New (the Go writer, `goplane`):
    `pkg/datupleticeio` `gs://` factory (blank-imported by `goplane`). Closing the pqarrow writer closes the sink and
    completes the upload. **Failure / abort cleanup is explicit:** on any encode, upload or close error, on `Abort`
    and on lifetime-context cancellation, the writer (a) cancels the context the file's IO was loaded with **before**
-   closing the sink — for gocloud blob writers this is what makes `Close` abort the multipart upload instead of
-   completing it — then (b) closes the sink itself (never relying on `pqarrow.FileWriter.Close` reaching the sink,
+   closing the sink — for gocloud blob writers this is what makes `Close` not complete the upload; because the AWS
+   transfer manager then sends `AbortMultipartUpload` on that already-cancelled context (and vended credentials may
+   not list uploads), an S3 client middleware re-issues the abort on an uncancelled context bounded to 30 s
+   (Task 3 ruling R3a) — then (b) closes the sink itself (never relying on `pqarrow.FileWriter.Close` reaching the sink,
    which it skips on an earlier row-group error), and (c) for local `file://` prefixes removes the partial file.
    No partial object may exist afterwards and no multipart upload may stay open.
 7. Credential lifetime (inherited rule): before each file the writer requires a remaining validity of at least
