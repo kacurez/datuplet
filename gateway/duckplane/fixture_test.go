@@ -4,7 +4,8 @@ package duckplane
 
 // Integration fixture (copied from components/queryengine/integration_test.go):
 // Postgres + Lakekeeper (authn off, allowall) + silo on the host network via
-// the docker CLI, container names prefixed dg-it-. Local only, not in PR CI.
+// the docker CLI, container names prefixed dg-it-. Runs in PR CI (pr.yml
+// duckdb-modules job).
 
 import (
 	"bytes"
