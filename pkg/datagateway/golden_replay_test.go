@@ -148,6 +148,7 @@ func TestGoldenAcceptanceReplayedThroughServer(t *testing.T) {
 				t.Fatalf("golden rejects at %q; the replay only covers chunk-time rejections", want.RejectedAt)
 			}
 			s, p := newWriteTestServer(t, &Config{DefaultBucket: "raw"})
+			p.rejectLargeTypes = true // like the DuckDB plane: the type check must run first
 			id := openIPCWriter(t, s, "t")
 			sch := arrow.NewSchema([]arrow.Field{{Name: "v", Type: in.dt, Nullable: true}}, nil)
 

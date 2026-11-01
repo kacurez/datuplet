@@ -36,6 +36,14 @@ type fakeDataPlane struct {
 	closed        bool
 	boot          BootInfo
 	factoryCalls  int
+	opens         int // OpenTableWriter calls, successful or not
+
+	// rejectLargeTypes makes OpenTableWriter refuse large_string /
+	// large_binary columns, as the DuckDB plane does (duckplane selectList).
+	rejectLargeTypes bool
+	// openAfterInterrupt lets OpenTableWriter succeed after Interrupt (not
+	// after Close), as the DuckDB plane does; writers opened then are live.
+	openAfterInterrupt bool
 }
 
 type fakeTable struct {
@@ -63,8 +71,16 @@ func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (Tab
 	// the plane or an explicit Abort/Close.
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.dead {
+	p.opens++
+	if p.closed || (p.dead && !p.openAfterInterrupt) {
 		return nil, errFakePlaneDead
+	}
+	if p.rejectLargeTypes && spec.Schema != nil {
+		for _, f := range spec.Schema.Fields() {
+			if id := f.Type.ID(); id == arrow.LARGE_STRING || id == arrow.LARGE_BINARY {
+				return nil, fmt.Errorf("fake: column %q: unsupported Arrow type %s", f.Name, f.Type)
+			}
+		}
 	}
 	w := &fakeTableWriter{plane: p, spec: spec}
 	p.writers = append(p.writers, w)
@@ -135,6 +151,12 @@ func (p *fakeDataPlane) failOpenReader(err error) {
 	p.mu.Lock()
 	p.openReaderErr = err
 	p.mu.Unlock()
+}
+
+func (p *fakeDataPlane) openCalls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.opens
 }
 
 func (p *fakeDataPlane) interrupted() bool {

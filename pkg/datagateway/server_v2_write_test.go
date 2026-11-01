@@ -54,6 +54,10 @@ type fakeResolver struct {
 	mu      sync.Mutex
 	creates []*schema.Schema // one per LoadOrCreateForWrite that created
 	calls   int
+
+	// When set, a create (schema provider given) closes entered and then
+	// blocks until release is closed.
+	entered, release chan struct{}
 }
 
 func (r *fakeResolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sp dglakekeeper.SchemaProvider) (*dglakekeeper.WriterTarget, error) {
@@ -62,6 +66,10 @@ func (r *fakeResolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string,
 	r.mu.Unlock()
 	if sp == nil {
 		return nil, fmt.Errorf("lakekeeper: table %s.%s missing and no schema available to create it", ns, tbl)
+	}
+	if r.release != nil {
+		close(r.entered)
+		<-r.release
 	}
 	sch, err := sp(ctx)
 	if err != nil {
@@ -623,5 +631,103 @@ func TestWriteErrorFromPlaneIs500(t *testing.T) {
 	}
 	if _, err := s.CloseWriter(context.Background(), &pb.CloseWriterRequest{WriterId: open.WriterId}); err == nil {
 		t.Error("CloseWriter after a failed write: want error")
+	}
+}
+
+// A first chunk of a type the plane cannot write fails with today's "buffer
+// error" class BEFORE any table create or plane writer open (the DuckDB plane
+// would otherwise fail OpenTableWriter with its own error).
+func TestFirstChunkTypeRejectedBeforeWriterOpen(t *testing.T) {
+	for _, dt := range []arrow.DataType{arrow.BinaryTypes.LargeString, arrow.BinaryTypes.LargeBinary} {
+		t.Run(dt.String(), func(t *testing.T) {
+			s, p := newWriteTestServer(t, &Config{DefaultBucket: "raw"})
+			p.rejectLargeTypes = true
+			fr := &fakeResolver{}
+			s.lakekeeperResolver = fr
+
+			js := `["a", null]`
+			if dt.ID() == arrow.LARGE_BINARY {
+				js = `["YQ==", null]`
+			}
+			arr, _, err := array.FromJSON(memory.NewGoAllocator(), dt, strings.NewReader(js))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sch := arrow.NewSchema([]arrow.Field{{Name: "v", Type: dt, Nullable: true}}, nil)
+			rec := array.NewRecordBatch(sch, []arrow.Array{arr}, 2)
+			arr.Release()
+			defer rec.Release()
+
+			id := openIPCWriter(t, s, "t")
+			resp := httpWrite(s, id, ipcPayload(t, rec))
+			if resp.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", resp.Code)
+			}
+			if e := decodeHTTPError(t, resp); errorClass(e.Error) != "buffer error" || !strings.Contains(e.Error, "unsupported Arrow type") {
+				t.Errorf("error = %q, want the buffer error class naming the unsupported type", e.Error)
+			}
+			if n := p.openCalls(); n != 0 {
+				t.Errorf("OpenTableWriter called %d times for a rejected first chunk", n)
+			}
+			if got := fr.createdColumns(); len(got) != 0 {
+				t.Errorf("table created for a rejected first chunk: %v", got)
+			}
+		})
+	}
+}
+
+// A cancel that lands while the first chunk is blocked in the deferred table
+// create must not let that chunk open a live writer afterwards: the write
+// fails and no plane writer survives un-aborted (the DuckDB plane accepts new
+// writers after Interrupt, which the fake mimics here).
+func TestCancelDuringDeferredCreateOpensNoLiveWriter(t *testing.T) {
+	annotations := filepath.Join(t.TempDir(), "annotations")
+	if err := os.WriteFile(annotations, []byte("other=\"x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, p := newWriteTestServer(t, &Config{
+		DefaultBucket: "raw", PodAnnotationsPath: annotations, CancelPollInterval: 5 * time.Millisecond,
+	})
+	p.openAfterInterrupt = true
+	fr := &fakeResolver{entered: make(chan struct{}), release: make(chan struct{})}
+	s.lakekeeperResolver = fr
+	ctx := context.Background()
+
+	open, err := s.OpenWriter(ctx, &pb.OpenWriterRequest{Table: "orders", InputFormat: pb.DataFormat_FORMAT_CSV})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: open.WriterId, Data: []byte("id\n1\n")})
+		writeErr <- err
+	}()
+	<-fr.entered
+	if err := os.WriteFile(annotations, []byte(CancelAnnotationKey+"=\"true\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-s.cancelCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel not observed")
+	}
+	if !p.interrupted() {
+		t.Fatal("plane not interrupted by the cancel")
+	}
+	close(fr.release)
+
+	if err := <-writeErr; err == nil {
+		t.Fatal("write that raced the cancel succeeded")
+	}
+	p.mu.Lock()
+	writers := append([]*fakeTableWriter(nil), p.writers...)
+	p.mu.Unlock()
+	for i, w := range writers {
+		w.mu.Lock()
+		live := !w.aborted && !w.terminated && !w.closed
+		w.mu.Unlock()
+		if live {
+			t.Errorf("plane writer %d opened across the cancel is still live", i)
+		}
 	}
 }

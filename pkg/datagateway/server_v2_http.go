@@ -130,18 +130,15 @@ func (s *ServerV2) processWriteChunkReader(ctx context.Context, ws *writerState,
 
 // processParsedRecord holds the post-parse write path shared by the
 // buffered (processWriteChunk) and streaming (processWriteChunkReader)
-// entry points: first-chunk setup (deferred create, plane writer open), the
-// drop pipeline, today's record-type acceptance check on the post-drop
-// record, and the plane Write.
+// entry points: the drop pipeline, today's record-type acceptance check on
+// the post-drop record, first-chunk setup (deferred create, plane writer
+// open) and the plane Write. The type check runs before any create or open,
+// so a rejected first chunk fails with the "buffer error" class.
 func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, record arrow.Record, inferredSchema *schema.Schema) (*pb.WriteChunkResponse, error) {
-	tw, outputSchema, responseSchema, err := s.ensureTableWriter(ctx, ws, inferredSchema)
-	if err != nil {
-		return nil, err
-	}
-
 	// Apply transforms if configured
 	outputRecord := record
 	if ws.pipeline != nil {
+		var err error
 		outputRecord, err = ws.pipeline.Apply(record, s.allocator)
 		if err != nil {
 			return nil, fmt.Errorf("transform failed: %w", err)
@@ -151,10 +148,9 @@ func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, rec
 		}
 	}
 
-	// The plane only ever receives the types today's write path accepted;
-	// a non-canonical type in a dropped column never gets here.
-	if err := acceptRecordTypes(outputRecord.Schema(), outputSchema.ArrowSchema()); err != nil {
-		return nil, fmt.Errorf("buffer error: %w", err)
+	tw, responseSchema, err := s.ensureTableWriter(ctx, ws, inferredSchema, outputRecord.Schema())
+	if err != nil {
+		return nil, err
 	}
 	if err := tw.Write(ctx, outputRecord); err != nil {
 		return nil, fmt.Errorf("write error: %w", err)
@@ -167,17 +163,24 @@ func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, rec
 	}, nil
 }
 
-// ensureTableWriter returns ws's plane writer, opening it on the first chunk:
-// the input schema is the component's or the first chunk's inferred one, the
+// ensureTableWriter checks the post-drop record schema recSchema against the
+// writer's output schema (the plane only ever receives the types today's
+// write path accepted; a non-canonical type in a dropped column never gets
+// here) and returns ws's plane writer, opening it on the first chunk: the
+// input schema is the component's or the first chunk's inferred one, the
 // table (when not created at OpenWriter) is created with its post-drop form,
 // and the writer is opened with that post-drop schema. Serialized under
-// ws.initMu so parallel first chunks open one writer. The inferred schema is
-// returned (for the response) only by the call that adopted it.
-func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, inferred *schema.Schema) (TableWriter, *schema.Schema, *pb.Schema, error) {
+// ws.initMu so parallel first chunks open one writer. Fails once the run is
+// cancelled; a writer opened across the cancel is aborted. The inferred
+// schema is returned (for the response) only by the call that adopted it.
+func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, inferred *schema.Schema, recSchema *arrow.Schema) (TableWriter, *pb.Schema, error) {
 	ws.initMu.Lock()
 	defer ws.initMu.Unlock()
 	if ws.tw != nil {
-		return ws.tw, ws.outputSchema, nil, nil
+		if err := acceptRecordTypes(recSchema, ws.outputSchema.ArrowSchema()); err != nil {
+			return nil, nil, fmt.Errorf("buffer error: %w", err)
+		}
+		return ws.tw, nil, nil
 	}
 
 	inSchema, fromInference := ws.schema, false
@@ -185,21 +188,27 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 		inSchema, fromInference = inferred, true
 	}
 	if inSchema == nil {
-		return nil, nil, nil, fmt.Errorf("cannot create table %s.%s: no schema (request didn't supply one and inference failed)", ws.bucket, ws.table)
+		return nil, nil, fmt.Errorf("cannot create table %s.%s: no schema (request didn't supply one and inference failed)", ws.bucket, ws.table)
 	}
 	outSchema, err := outputSchemaFor(inSchema, ws.pipeline)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to compute output schema: %w", err)
+		return nil, nil, fmt.Errorf("failed to compute output schema: %w", err)
+	}
+	if err := acceptRecordTypes(recSchema, outSchema.ArrowSchema()); err != nil {
+		return nil, nil, fmt.Errorf("buffer error: %w", err)
+	}
+	if s.isCancelled() {
+		return nil, nil, errRunCancelled
 	}
 
 	if ws.basePath == "" {
 		if s.lakekeeperResolver == nil {
-			return nil, nil, nil, fmt.Errorf("no write target for %s.%s", ws.bucket, ws.table)
+			return nil, nil, fmt.Errorf("no write target for %s.%s", ws.bucket, ws.table)
 		}
 		sp := func(context.Context) (*schema.Schema, error) { return outSchema, nil }
 		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, ws.bucket, ws.table, sp)
 		if lkErr != nil {
-			return nil, nil, nil, fmt.Errorf("lakekeeper deferred create %s.%s: %w", ws.bucket, ws.table, lkErr)
+			return nil, nil, fmt.Errorf("lakekeeper deferred create %s.%s: %w", ws.bucket, ws.table, lkErr)
 		}
 		ws.basePath = target.BasePath
 		ws.creds = credsSource(target.VendedCreds)
@@ -213,20 +222,29 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 		TargetFileBytes: s.config.TargetFileSize,
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("open table writer %s.%s: %w", ws.bucket, ws.table, err)
+		return nil, nil, fmt.Errorf("open table writer %s.%s: %w", ws.bucket, ws.table, err)
 	}
 
-	var responseSchema *pb.Schema
+	// Publish under s.mu, the lock the cancel watcher sets s.cancelled and
+	// snapshots open writers under: either the watcher sees this writer and
+	// aborts it, or this sees the cancel and aborts it here.
 	s.mu.Lock()
+	if s.cancelled {
+		s.mu.Unlock()
+		tw.Abort()
+		return nil, nil, errRunCancelled
+	}
 	ws.schema = inSchema
 	ws.outputSchema = outSchema
 	ws.tw = tw
 	s.mu.Unlock()
+
+	var responseSchema *pb.Schema
 	if fromInference {
 		responseSchema = schemaToProto(inSchema)
 		logWriterSchema(ws, "gateway-inferred")
 	}
-	return tw, outSchema, responseSchema, nil
+	return tw, responseSchema, nil
 }
 
 // handleRead handles HTTP GET requests for reading data.

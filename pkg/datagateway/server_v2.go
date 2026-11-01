@@ -84,6 +84,10 @@ type ServerV2 struct {
 	cancelCtx  context.Context
 	cancelStop context.CancelFunc
 
+	// cancelled is set (under mu) by the cancel watcher before it snapshots
+	// the open writers; a writer published afterwards is aborted instead.
+	cancelled bool
+
 	// lakekeeperResolver is constructed at boot when Config.LakekeeperURL
 	// is set. It owns the catalog-side LoadOrCreate plus the per-table
 	// vended credentials.
@@ -328,6 +332,16 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 	return s, nil
 }
 
+// errRunCancelled fails writes that would open a plane writer after the cancel
+// annotation was observed.
+var errRunCancelled = errors.New("data gateway: run cancelled")
+
+func (s *ServerV2) isCancelled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cancelled
+}
+
 // watchCancel waits for the cancel annotation; on it, it cancels the commit
 // pool, interrupts the data plane, aborts every open writer and cancels ctx
 // (Serve watches it and stops the servers).
@@ -340,15 +354,16 @@ func (s *ServerV2) watchCancel(ctx context.Context, stop context.CancelFunc) {
 		log.Printf("cancel: cancelling commit pool")
 		s.commitPool.Cancel()
 	}
-	s.plane.Interrupt()
-	s.mu.RLock()
+	s.mu.Lock()
+	s.cancelled = true
 	open := make([]TableWriter, 0, len(s.writers))
 	for _, ws := range s.writers {
 		if ws.tw != nil {
 			open = append(open, ws.tw)
 		}
 	}
-	s.mu.RUnlock()
+	s.mu.Unlock()
+	s.plane.Interrupt()
 	for _, tw := range open {
 		tw.Abort()
 	}

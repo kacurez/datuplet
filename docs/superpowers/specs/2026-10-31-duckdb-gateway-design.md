@@ -158,6 +158,15 @@ for backpressure; `Close()` returns the written files with path, row count and b
      commit: the table column is `timestamptz` (all timestamps map to it) while the Parquet column is not UTC-adjusted,
      and this iceberg-go rejects nanosecond precision. The Parquet types equal the golden, so today's writer fails the
      same way; not fixed here. Pinned by `TestIntegrationAddFilesPerType` (`addFilesRejects`).
+
+   **Maintainer ruling 2026-11-01 (R7)** — where the type check runs and what it compares against: the server checks
+   the post-drop record, before the plane writer is opened, against the writer's output schema, exactly as
+   `BufferManager` did. That schema holds the canonical `schema.ToArrowType` types only when a drop processor is
+   configured (the drop rebuilds it); otherwise it is the inferred input schema, with the input's own Arrow types. This
+   preserves the golden's acceptance (int8, uint*, date64, timestamp[s|ms|ns] stay accepted), so the plane may receive
+   non-canonical input types and casts them per the golden. `large_string`/`large_binary` are now rejected for every
+   record (`buffer error` class); today only records small enough for the coalesce copy (< 128 rows) were rejected.
+   Pinned by `TestGoldenAcceptanceReplayedThroughServer` and `TestNonCanonicalTypeInDroppedColumnAccepted`.
 7. `CloseWriter` closes the writer, returns `total_rows`/`total_bytes`/`files_written` from the stats rows, and
    dispatches the paths to the unchanged commit pool. Zero files: no dispatch (today's SKIPPED semantics; FULL_LOAD
    with zero rows still does not truncate).
