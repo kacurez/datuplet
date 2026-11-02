@@ -25,6 +25,7 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/hadoop"
 	"github.com/apache/iceberg-go/table"
+	"gocloud.dev/blob"
 
 	"github.com/datuplet/datuplet/pkg/datagateway"
 	"github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
@@ -787,7 +788,7 @@ func TestPartitionedAbortCleansAllOpenFiles(t *testing.T) {
 			var inFlight atomic.Int32
 			var mu sync.Mutex
 			var sinks []*abortSink
-			p.openSink = func(ctx context.Context, _ map[string]string, _ string) (io.WriteCloser, error) {
+			p.openSink = func(ctx context.Context, _ map[string]string, _ string, _ *blob.WriterOptions) (io.WriteCloser, error) {
 				s := &abortSink{ctx: ctx, inFlight: &inFlight, want: 3}
 				mu.Lock()
 				sinks = append(sinks, s)
@@ -884,7 +885,7 @@ func TestPartitionedOneUploadErrorAbortsAll(t *testing.T) {
 	p := New(Config{})
 	var mu sync.Mutex
 	sinks := map[string]*partSink{}
-	p.openSink = func(ctx context.Context, _ map[string]string, path string) (io.WriteCloser, error) {
+	p.openSink = func(ctx context.Context, _ map[string]string, path string, _ *blob.WriterOptions) (io.WriteCloser, error) {
 		s := &partSink{ctx: ctx, fail: strings.Contains(path, "/name=b/")}
 		mu.Lock()
 		sinks[path] = s

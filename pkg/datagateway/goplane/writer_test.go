@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"gocloud.dev/blob"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/pkg/datagateway"
@@ -439,7 +440,7 @@ func TestEncodeErrorClosesSink(t *testing.T) {
 	defer p.Close()
 	sink := &failingSink{okWrites: 1} // the magic header, then fail mid-row-group flush
 	var opens atomic.Int32
-	p.openSink = func(ctx context.Context, props map[string]string, path string) (io.WriteCloser, error) {
+	p.openSink = func(ctx context.Context, props map[string]string, path string, opts *blob.WriterOptions) (io.WriteCloser, error) {
 		opens.Add(1)
 		sink.ctx = ctx
 		return sink, nil
@@ -530,11 +531,11 @@ func s3creds(key string, issued, expires time.Time) catalogwriter.S3Creds {
 func recordProps(p *Plane) *[]map[string]string {
 	var mu sync.Mutex
 	var got []map[string]string
-	p.openSink = func(ctx context.Context, props map[string]string, path string) (io.WriteCloser, error) {
+	p.openSink = func(ctx context.Context, props map[string]string, path string, opts *blob.WriterOptions) (io.WriteCloser, error) {
 		mu.Lock()
 		got = append(got, props)
 		mu.Unlock()
-		return openIOSink(ctx, props, path)
+		return openIOSink(ctx, props, path, opts)
 	}
 	return &got
 }
@@ -612,9 +613,9 @@ func TestCredsStillNearExpiryFails(t *testing.T) {
 		s3creds("stale", now.Add(-59*time.Minute), now.Add(time.Minute)),
 	}}
 	var opens atomic.Int32
-	p.openSink = func(ctx context.Context, props map[string]string, path string) (io.WriteCloser, error) {
+	p.openSink = func(ctx context.Context, props map[string]string, path string, opts *blob.WriterOptions) (io.WriteCloser, error) {
 		opens.Add(1)
-		return openIOSink(ctx, props, path)
+		return openIOSink(ctx, props, path, opts)
 	}
 	prefix := localPrefix(t)
 	w := openWriter(t, p, datagateway.WriterSpec{DataPrefix: prefix, Creds: creds})
@@ -684,7 +685,9 @@ func TestWriterBackpressureAndQueuedBytes(t *testing.T) {
 	p := New(Config{})
 	defer p.Close()
 	sink := &blockingSink{release: make(chan struct{})}
-	p.openSink = func(context.Context, map[string]string, string) (io.WriteCloser, error) { return sink, nil }
+	p.openSink = func(context.Context, map[string]string, string, *blob.WriterOptions) (io.WriteCloser, error) {
+		return sink, nil
+	}
 	w := openWriter(t, p, datagateway.WriterSpec{DataPrefix: "file:///unused/"})
 	one := batch(testSchema, 0, 10)
 	size := recordBytes(one)
@@ -767,7 +770,7 @@ func TestWriterExitsOnPlaneCancel(t *testing.T) {
 			p := New(Config{})
 			sink := &stallSink{release: make(chan struct{})}
 			opened := make(chan struct{})
-			p.openSink = func(ctx context.Context, _ map[string]string, _ string) (io.WriteCloser, error) {
+			p.openSink = func(ctx context.Context, _ map[string]string, _ string, _ *blob.WriterOptions) (io.WriteCloser, error) {
 				sink.ctx = ctx
 				close(opened)
 				return sink, nil
@@ -814,7 +817,9 @@ func TestWriteCloseHonourDeadlinesUnderBackpressure(t *testing.T) {
 	p := New(Config{})
 	defer p.Close()
 	sink := &blockingSink{release: make(chan struct{})}
-	p.openSink = func(context.Context, map[string]string, string) (io.WriteCloser, error) { return sink, nil }
+	p.openSink = func(context.Context, map[string]string, string, *blob.WriterOptions) (io.WriteCloser, error) {
+		return sink, nil
+	}
 	w := openWriter(t, p, datagateway.WriterSpec{DataPrefix: "file:///unused/"}).(*writer)
 	one := batch(testSchema, 0, 10)
 	size := recordBytes(one)

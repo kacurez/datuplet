@@ -18,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"gocloud.dev/blob"
 
 	"github.com/datuplet/datuplet/pkg/datagateway"
 )
@@ -47,7 +48,8 @@ type writer struct {
 	maxOpen     int
 	local       bool
 	openSink    sinkOpener
-	writeSchema *arrow.Schema // spec.Schema without PARQUET:field_id metadata
+	upload      *blob.WriterOptions // nil: the IO's default upload buffers
+	writeSchema *arrow.Schema       // spec.Schema without PARQUET:field_id metadata
 	props       *parquet.WriterProperties
 	arrowProps  pqarrow.ArrowWriterProperties
 
@@ -125,6 +127,7 @@ func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, 
 		w.specID = spec.PartitionSpec.ID()
 	}
 	if part != nil {
+		w.upload = partitionUploadOptions()
 		w.open = map[string]*dataFile{}
 		w.seed = maphash.MakeSeed()
 		w.tuples = map[uint64]struct{}{}
@@ -619,7 +622,7 @@ func (w *writer) openPath(path string) (*dataFile, error) {
 		}
 	}
 	ctx, cancel := context.WithCancel(w.ctx)
-	sink, err := w.openSink(ctx, props, path)
+	sink, err := w.openSink(ctx, props, path, w.upload)
 	if err != nil {
 		cancel()
 		if w.local {

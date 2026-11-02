@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"gocloud.dev/blob"
 
 	"github.com/datuplet/datuplet/pkg/datagateway"
 	"github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
@@ -331,8 +332,8 @@ func TestPartitionBudgetFlushErrorCleansAll(t *testing.T) {
 				want.Store(1 << 30)
 				var mu sync.Mutex
 				sinks := map[string]*flushSink{}
-				p.openSink = func(ctx context.Context, props map[string]string, path string) (io.WriteCloser, error) {
-					inner, err := openIOSink(ctx, props, path)
+				p.openSink = func(ctx context.Context, props map[string]string, path string, opts *blob.WriterOptions) (io.WriteCloser, error) {
+					inner, err := openIOSink(ctx, props, path, opts)
 					if err != nil {
 						return nil, err
 					}

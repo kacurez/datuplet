@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"gocloud.dev/blob"
 
 	"github.com/datuplet/datuplet/pkg/datagateway"
 )
@@ -39,7 +40,7 @@ func openWriterWithSlowAbort(t *testing.T, p *Plane) *slowAbortSink {
 	t.Helper()
 	sink := &slowAbortSink{release: make(chan struct{})}
 	opened := make(chan struct{})
-	p.openSink = func(ctx context.Context, _ map[string]string, _ string) (io.WriteCloser, error) {
+	p.openSink = func(ctx context.Context, _ map[string]string, _ string, _ *blob.WriterOptions) (io.WriteCloser, error) {
 		sink.ctx = ctx
 		close(opened)
 		return sink, nil

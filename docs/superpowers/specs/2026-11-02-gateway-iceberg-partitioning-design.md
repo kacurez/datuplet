@@ -114,6 +114,12 @@ partitioning** over restoring that layout.
      through the existing `consume` → `fail` path, which keeps every affected file in the open set, cancels upload
      contexts before closing sinks, aborts all open files concurrently, and leaves no partial objects, local files or
      open multipart uploads.
+   - **Upload buffers (rev 5, Task 9 re-measure; maintainer: "Yes, shrink buffers").** The byte budget did not lower
+     memory (bucket[8] 1 221 MiB, bucket[16] 1 520 MiB): the live memory per open file (~45 MiB, gctrace) is the S3
+     multipart upload — transfermanager default 8 MiB parts × 5 in flight. Partitioned writers therefore open each
+     file's upload through `blobfs.FileIO.NewWriter(ctx, path, true, &blob.WriterOptions{BufferSize: 5 MiB,
+     MaxConcurrency: 1})` (5 MiB = the S3 minimum part size), about 10 MiB per open file; other IO implementations
+     (local `file://`, GCS) keep their defaults. Unpartitioned writers keep the defaults (throughput).
    - `MaxOpenPartitions` default lowers from 32 to **16**, same env `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (1–1024).
      Each open file also holds upload buffers (an S3 multipart part is ≥ 5 MiB), which the byte budget cannot
      shrink, so the cap bounds that part. A sub-batch for a tuple not open while at the cap finishes the

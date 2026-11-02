@@ -12,10 +12,12 @@ import (
 	"time"
 
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/io/gocloud/blobfs"
 	icebergs3 "github.com/apache/iceberg-go/io/gocloud/s3"
 	icebergutils "github.com/apache/iceberg-go/utils"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/middleware"
+	"gocloud.dev/blob"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/pkg/datagateway"
@@ -28,8 +30,17 @@ const minCredsValidity = 2 * time.Minute
 var errCredsExpireTooSoon = errors.New("goplane: vended credentials expire too soon")
 
 // sinkOpener opens the upload sink of one data file. ctx is the file's own
-// upload context: cancelling it before Close aborts the upload.
-type sinkOpener func(ctx context.Context, props map[string]string, path string) (io.WriteCloser, error)
+// upload context: cancelling it before Close aborts the upload. opts, when
+// not nil, sets an S3 upload's part size and parts in flight; nil keeps the
+// IO's defaults.
+type sinkOpener func(ctx context.Context, props map[string]string, path string, opts *blob.WriterOptions) (io.WriteCloser, error)
+
+// partitionUploadOptions is the S3 upload of each open partition file: one
+// 5 MiB part (the S3 minimum) in flight instead of the transfer manager's
+// 8 MiB x 5 (spec decision 9, rev 5).
+func partitionUploadOptions() *blob.WriterOptions {
+	return &blob.WriterOptions{BufferSize: 5 << 20, MaxConcurrency: 1}
+}
 
 // openIOSink loads the iceberg-go IO for path with ctx (gocloud blob writers
 // keep ctx and abort the upload when it is cancelled before Close) and
@@ -42,7 +53,7 @@ type sinkOpener func(ctx context.Context, props map[string]string, path string) 
 // AbortMultipartUpload would fail and leave the upload open. The middleware
 // runs AbortMultipartUpload on an uncancelled context bounded by
 // uploadAbortTimeout.
-func openIOSink(ctx context.Context, props map[string]string, path string) (io.WriteCloser, error) {
+func openIOSink(ctx context.Context, props map[string]string, path string, opts *blob.WriterOptions) (io.WriteCloser, error) {
 	if strings.HasPrefix(path, "s3://") {
 		cfg, err := icebergs3.ParseAWSConfig(ctx, props)
 		if err != nil {
@@ -55,6 +66,20 @@ func openIOSink(ctx context.Context, props map[string]string, path string) (io.W
 	fsys, err := iceio.LoadFS(ctx, props, path)
 	if err != nil {
 		return nil, fmt.Errorf("goplane: load IO for %s: %w", path, err)
+	}
+	return createUpload(ctx, fsys, path, opts)
+}
+
+// createUpload creates the file at path on fsys. An S3 path on a gocloud
+// blob IO is opened with opts when given (with ctx, the context the IO was
+// loaded with, as Create does); anything else uses Create.
+func createUpload(ctx context.Context, fsys iceio.IO, path string, opts *blob.WriterOptions) (io.WriteCloser, error) {
+	if bfs, ok := fsys.(*blobfs.FileIO); ok && opts != nil && strings.HasPrefix(path, "s3://") {
+		fw, err := bfs.NewWriter(ctx, path, true, opts)
+		if err != nil {
+			return nil, fmt.Errorf("goplane: create %s: %w", path, err)
+		}
+		return fw, nil
 	}
 	wfs, ok := fsys.(iceio.WriteFileIO)
 	if !ok {
