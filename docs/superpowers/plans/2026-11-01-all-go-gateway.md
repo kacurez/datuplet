@@ -179,6 +179,17 @@ Writer behaviour — spec Write path 4–7 exactly (the spike `spikes/go-write-p
 - [ ] **Step 2:** `make lint` → list findings; delete orphaned code; update docs; `make lint` → clean except the pre-existing lakekeeper-chart golden drift if `main` has it (record evidence: same diff on `ecff5c5`).
 - [ ] **Step 3:** Root build/vet/test → PASS. Commit `docs,chore: Go data plane docs, cgroup-derived GOMEMLIMIT, drop orphaned code`.
 
+### Task 8b: Iceberg partitioned writes (added 2026-11-02, maintainer)
+
+**Model:** opus. **Spec:** `docs/superpowers/specs/2026-11-02-gateway-iceberg-partitioning-design.md` (binding; supersedes the main spec's "partition specs" non-goal and the `partition_fields` warning).
+
+**Files:** Create `pkg/datagateway/goplane/partition.go` (spec resolution, tuple computation, routing, open-writer cap) + `partition_test.go`. Modify `goplane/writer.go`/`plane.go` only to host per-tuple writers behind the existing `TableWriter`; `pkg/datagateway/dataplane.go` (`WrittenFile` gains `SpecID int` and `Partition map[int]any`; `WriterSpec` gains the configured partition fields); `pkg/datagateway/server_v2_writing.go` (pass `partition_fields` instead of warning; validation errors → `InvalidArgument`); `pkg/datagateway/lakekeeper/lakekeeper.go` (create with `catalog.WithPartitionSpec`; expose the loaded table's current spec); `pkg/datagateway/commit_pool.go` + `pkg/icebergjob/commit_shared.go` (partitioned commit via `AddDataFiles` / `ReplaceDataFilesWithDataFiles` with explicit tuples; unpartitioned path byte-for-byte unchanged); docs `docs/known-limitations.md`, `docs/troubleshooting.md`, `docs/architecture.md` (replace "partition fields ignored"). `MaxOpenPartitions` default 32, env `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (1–1024).
+
+- [ ] **Step 1: Failing unit tests** (local catalog as Task 5's tests): `TestPartitionedWriteIdentityAndDay`, `TestPartitionedCommitTuplesMatchRows`, `TestPartitionedScanPrunesByFilter`, `TestPartitionBucketAndTruncateLongStrings`, `TestPartitionNullValues`, `TestOpenPartitionCapEvicts` (cap 2, 3 tuples interleaved; all rows committed exactly once), `TestExistingTableSpecWins` (warning + table spec used), `TestPartitionValidationErrors` (unknown column, bad transform, transform invalid for type → `InvalidArgument`), `TestPartitionedFullLoadReplaces`, `TestUnpartitionedStillUsesAddFiles`, `TestMaxOpenPartitionsEnv`.
+- [ ] **Step 2: Run** → FAIL. **Step 3: Implement.**
+- [ ] **Step 4: Integration:** `TestIntegrationServerPartitionedWrite` (real server + Lakekeeper fixture: new partitioned table, write, `Commit`, iceberg-go row-filter scan returns only matching rows and plans fewer files than the unfiltered scan; second APPEND; gateway read returns all rows). `-tags=integration` → PASS.
+- [ ] **Step 5:** Root build/vet/test, `go test -race ./pkg/datagateway/... ./pkg/icebergjob/...` → PASS. Commit `feat(goplane): Iceberg partitioned writes (partition spec on create, per-tuple files, explicit-tuple commit)`.
+
 ### Task 9: Live verification — e2e on OrbStack and performance
 
 **Model:** controller runs it directly. No code changes except fixes that go back through a review loop.

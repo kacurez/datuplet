@@ -43,7 +43,7 @@ Components, the SDK, the proto, the operator contract, the gateway image and the
 
 - Changing components, the SDK, the proto, the gateway image or its entrypoint (`datuplet gateway` stays); the only
   image change is the Go builder base version (Goals 1).
-- Iceberg partition specs, read-time projection/filters/transforms, working incremental reads, GetSchema/GetSample,
+- Iceberg partition specs (superseded 2026-11-02: see `2026-11-02-gateway-iceberg-partitioning-design.md`), read-time projection/filters/transforms, working incremental reads, GetSchema/GetSample,
   run-pod NetworkPolicy, loopback auth, sidecar resource requests/limits in the operator.
 - Any migration (greenfield; nothing deployed).
 
@@ -99,7 +99,7 @@ Inherited from the DuckDB branch (ported, unchanged in behaviour):
    first chunk before the plane writer opens; `large_string`/`large_binary` rejected for every record.
 3. `CloseWriter` → `TableWriter.Close` → totals from `WrittenFile`s → commit pool (zero files → no dispatch;
    FULL_LOAD with zero rows still does not truncate). `external_files` → error `external data files are not
-   supported`; `partition_fields` → one warning per writer, ignored; no files.json, `_schema-*.json`,
+   supported`; `partition_fields` → Iceberg partition spec (addendum `2026-11-02-gateway-iceberg-partitioning-design.md`); no files.json, `_schema-*.json`,
    `_manifest-*.json`.
 
 New (the Go writer, `goplane`):
