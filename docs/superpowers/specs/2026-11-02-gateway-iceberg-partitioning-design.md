@@ -97,14 +97,23 @@ partitioning** over restoring that layout.
    - `PartitionBufferBytes` — default 256 MiB, env `DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES` (16 MiB–8 GiB, invalid →
      default + warning), read once in `goplane.Factory`. It applies to **partitioned** writers only; unpartitioned
      writers keep today's row-group rule unchanged.
-   - Buffered bytes of an open file = `pqarrow.FileWriter.RowGroupTotalCompressedBytes()` plus
-     `RowGroupTotalBytesWritten()` of its current buffered row group (what the encoder holds in memory).
-   - Before writing a sub-batch to file *f*: if *f*'s buffered bytes ≥ `PartitionBufferBytes / openFiles`
-     (its fair share at that moment), *f* first ends its row group (`NewBufferedRowGroupChecked`, which flushes it
-     to the upload stream). After the write, while the sum over all open files exceeds `PartitionBufferBytes`, the
-     file with the most buffered bytes ends its row group. So memory held in encoders stays ≤ budget + one
-     sub-batch, row groups shrink as more files are open (1 file: up to the full budget or 229 376 rows; 8 files:
-     ~32 MiB each; 16: ~16 MiB), and every partition still gets one file (until rotation).
+   - **Trigger, not a hard bound** (Codex plan review 8c). An open file's *buffered page bytes* =
+     `pqarrow.FileWriter.RowGroupTotalCompressedBytes()` of its current buffered row group (the encoded pages it
+     holds). This is an approximate flush trigger: it excludes each column encoder's not-yet-paged values,
+     dictionary state, level and scratch buffers, and encode-time temporaries. `RowGroupTotalBytesWritten()` is not
+     added (it re-counts page payload). The accepted memory result is the **measured gateway RSS in Task 9**, not a
+     formula.
+   - Before writing a sub-batch to file *f*: if *f*'s buffered page bytes ≥ `PartitionBufferBytes / openFiles`
+     (its fair share at that moment), *f* first ends its row group (`NewBufferedRowGroupChecked`, which flushes it to
+     the upload stream). After the write, while the sum over all open files exceeds `PartitionBufferBytes`, the file
+     with the most buffered page bytes ends its row group. Both checks run inside the writer's `run` goroutine, which
+     owns all file state. Row groups therefore shrink as more files are open, and every partition still gets one
+     file (until rotation). Rotation accounting is unchanged: cumulative Arrow bytes fed per file vs
+     4 × `TargetFileBytes`; `WriteBuffered`'s 229 376-row limit still applies independently.
+   - **Errors at both flush sites** (before a write, and flushing a *different* file's largest row group) return
+     through the existing `consume` → `fail` path, which keeps every affected file in the open set, cancels upload
+     contexts before closing sinks, aborts all open files concurrently, and leaves no partial objects, local files or
+     open multipart uploads.
    - `MaxOpenPartitions` default lowers from 32 to **16**, same env `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (1–1024).
      Each open file also holds upload buffers (an S3 multipart part is ≥ 5 MiB), which the byte budget cannot
      shrink, so the cap bounds that part. A sub-batch for a tuple not open while at the cap finishes the
@@ -112,7 +121,9 @@ partitioning** over restoring that layout.
    - **More distinct tuples per batch than the cap** (Task 9: bucket[200] → 48 324 files of ~41 rows, 532 s, 43 s
      commit) cannot be streamed cheaply. The first eviction's warning now says so and names the remedy: cluster the
      input by the partition column(s) or use a coarser transform. In addition, when a writer closes having produced
-     more than 4 × distinct-tuples files, it logs one summary warning (table, files, tuples). Documented in
+     more than 4 × distinct-tuples files, it logs one summary warning (table, files, tuples). Distinct tuples are
+     counted for the writer's whole lifetime (a set of the canonical tuple keys' 64-bit hashes — 8 bytes per tuple;
+     a hash collision can only under-count, which only suppresses the warning). Documented in
      `known-limitations.md` and `troubleshooting.md` with the Task 9 numbers.
 10. **File paths.** `<DataPrefix><PartitionToPath(tuple, schema)>/<FilePrefix>-<seq>.parquet` via
     `PartitionSpec.PartitionToPath`, joined by concatenation. A resulting object key over 1 024 bytes → write error
