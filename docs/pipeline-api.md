@@ -131,7 +131,7 @@ the data the run actually sees.
 An explicit output table can declare an Iceberg partition spec: a list of
 `{source_column, transform}` entries. `transform` is one of `identity`,
 `year`, `month`, `day`, `hour`, `void`, `bucket[N]` or `truncate[W]` (N and W
-positive integers, written exactly so). One column may appear in several
+integers 1-2147483647, written exactly so). One column may appear in several
 entries (e.g. `bucket[16]` and `truncate[4]`), but not twice with the same
 transform, and with at most one of `year`/`month`/`day`/`hour`. These rules are
 checked at `PUT`/`validate` time; the CRD carries the same transform pattern.

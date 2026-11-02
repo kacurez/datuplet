@@ -631,7 +631,7 @@ func validatePartitionSpec(compName, tableName string, spec []datupletv1.Partiti
 		if field.Transform != "" && !ok {
 			findings = append(findings, Finding{
 				Path:     fieldPath + ".transform",
-				Message:  fmt.Sprintf("component %s, output table %s, partitionSpec[%d]: invalid transform %q (supported: %s; N and W positive integers)", compName, tableName, i, field.Transform, supportedPartitionTransforms),
+				Message:  fmt.Sprintf("component %s, output table %s, partitionSpec[%d]: invalid transform %q (supported: %s; N and W integers 1-2147483647)", compName, tableName, i, field.Transform, supportedPartitionTransforms),
 				Severity: severityError,
 			})
 		}
