@@ -8,7 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/apache/iceberg-go/table"
 
@@ -37,14 +40,25 @@ type Plane struct {
 
 	// openSink opens the upload sink of one data file; tests replace it.
 	openSink sinkOpener
+	// closeWait bounds how long Close waits for open writers' cleanup;
+	// tests shorten it.
+	closeWait time.Duration
+
+	mu      sync.Mutex
+	closed  bool           // set by Close: no new writers
+	writers sync.WaitGroup // one per writer goroutine not yet exited
 }
+
+// defaultCloseWait bounds Close's wait for writer upload cleanup (sink
+// close, AbortMultipartUpload) so shutdown cannot hang on a stuck upload.
+const defaultCloseWait = 30 * time.Second
 
 var _ datagateway.DataPlane = (*Plane)(nil)
 
 // New returns a Plane.
 func New(cfg Config) *Plane {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Plane{cfg: cfg, ctx: ctx, cancel: cancel, openSink: openIOSink}
+	return &Plane{cfg: cfg, ctx: ctx, cancel: cancel, openSink: openIOSink, closeWait: defaultCloseWait}
 }
 
 // Factory builds the plane once boot validation has passed.
@@ -65,16 +79,27 @@ func (p *Plane) OpenTableWriter(_ context.Context, spec datagateway.WriterSpec) 
 	if spec.Creds == nil && !local {
 		return nil, fmt.Errorf("goplane: no credentials for remote data prefix %q", spec.DataPrefix)
 	}
-	if err := p.ctx.Err(); err != nil {
-		return nil, fmt.Errorf("goplane: plane closed: %w", err)
-	}
 	if spec.TargetFileBytes <= 0 {
 		spec.TargetFileBytes = defaultTargetFileBytes
 	}
 	if spec.RowGroupRows <= 0 {
 		spec.RowGroupRows = defaultRowGroupRows
 	}
-	return newWriter(p.ctx, spec, local, p.openSink), nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, errors.New("goplane: plane closed")
+	}
+	if err := p.ctx.Err(); err != nil {
+		return nil, fmt.Errorf("goplane: plane closed: %w", err)
+	}
+	w := newWriter(p.ctx, spec, local, p.openSink)
+	p.writers.Add(1)
+	go func() {
+		<-w.done
+		p.writers.Done()
+	}()
+	return w, nil
 }
 
 // OpenTableReader is not implemented yet.
@@ -82,12 +107,32 @@ func (p *Plane) OpenTableReader(context.Context, datagateway.ReaderSpec) (dataga
 	return nil, errors.New("goplane: reads not implemented")
 }
 
-// Interrupt aborts every in-flight writer.
+// Interrupt aborts every in-flight writer and returns at once; their upload
+// cleanup runs in the background (Close, or each writer's Abort, waits for it).
 func (p *Plane) Interrupt() { p.cancel() }
 
-// Close aborts every in-flight writer.
+// Close stops admission, aborts every in-flight writer and waits until every
+// writer goroutine has finished its upload cleanup (sink close, multipart
+// abort), bounded by closeWait; on timeout it logs a warning and returns.
+// Safe to call more than once.
 func (p *Plane) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
 	p.cancel()
+
+	done := make(chan struct{})
+	go func() {
+		p.writers.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(p.closeWait)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+		log.Printf("goplane: warning: writer upload cleanup still running after %s; closing anyway", p.closeWait)
+	}
 	return nil
 }
 

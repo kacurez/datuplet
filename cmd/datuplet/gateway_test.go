@@ -38,23 +38,23 @@ func TestGatewaySubcommandFlags(t *testing.T) {
 		}
 	})
 
-	t.Run("missing config exits non-zero with usage", func(t *testing.T) {
+	t.Run("missing config exits 2 with usage", func(t *testing.T) {
 		var stderr bytes.Buffer
-		if code := gatewayMain([]string{"--minio"}, noEnv, &stderr); code == 0 {
-			t.Fatal("missing --config: exit code 0, want non-zero")
+		if code := gatewayMain([]string{"--minio"}, noEnv, &stderr); code != 2 {
+			t.Fatalf("missing --config: exit code %d, want 2", code)
 		}
 		if !strings.Contains(stderr.String(), "--config is required") || !strings.Contains(stderr.String(), "Usage") {
 			t.Errorf("stderr = %q, want the error and the usage text", stderr.String())
 		}
 	})
 
-	t.Run("unknown flag exits non-zero", func(t *testing.T) {
-		if code := gatewayMain([]string{"--nope"}, noEnv, &bytes.Buffer{}); code == 0 {
-			t.Error("unknown flag: exit code 0, want non-zero")
+	t.Run("unknown flag exits 2", func(t *testing.T) {
+		if code := gatewayMain([]string{"--nope"}, noEnv, &bytes.Buffer{}); code != 2 {
+			t.Errorf("unknown flag: exit code %d, want 2", code)
 		}
 	})
 
-	t.Run("boot failure exits 20", func(t *testing.T) {
+	t.Run("config-load failure exits 20", func(t *testing.T) {
 		// A config path that cannot be read fails before any listener binds.
 		if code := gatewayMain([]string{"--minio", "--config", t.TempDir() + "/missing.yaml"}, noEnv, &bytes.Buffer{}); code != gatewayExitApplication {
 			t.Errorf("exit code = %d, want %d", code, gatewayExitApplication)
