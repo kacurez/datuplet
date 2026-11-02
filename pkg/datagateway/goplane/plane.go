@@ -37,14 +37,27 @@ type Config struct {
 	// MaxOpenPartitions caps the open files of one partitioned table writer
 	// (spec decision 9); <=0 means defaultMaxOpenPartitions.
 	MaxOpenPartitions int
+	// PartitionBufferBytes is the row-group byte budget shared by the open
+	// files of one partitioned table writer (spec decision 9); <=0 means
+	// defaultPartitionBufferBytes.
+	PartitionBufferBytes int64
 }
 
 // Open partition files per table writer: default and the bounds of
 // DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS.
 const (
-	defaultMaxOpenPartitions = 32
+	defaultMaxOpenPartitions = 16
 	maxMaxOpenPartitions     = 1024
 	maxOpenPartitionsEnv     = "DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS"
+)
+
+// Partitioned-writer row-group budget: default and the bounds of
+// DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES.
+const (
+	defaultPartitionBufferBytes int64 = 256 << 20
+	minPartitionBufferBytes     int64 = 16 << 20
+	maxPartitionBufferBytes     int64 = 8 << 30
+	partitionBufferBytesEnv           = "DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES"
 )
 
 // maxOpenPartitionsFromEnv reads DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS:
@@ -62,6 +75,23 @@ func maxOpenPartitionsFromEnv() int {
 	return n
 }
 
+// partitionBufferBytesFromEnv reads DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES:
+// a byte count in 16 MiB-8 GiB; unset means the default, anything else the
+// default and a warning.
+func partitionBufferBytesFromEnv() int64 {
+	v, ok := os.LookupEnv(partitionBufferBytesEnv)
+	if !ok || v == "" {
+		return defaultPartitionBufferBytes
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || n < minPartitionBufferBytes || n > maxPartitionBufferBytes {
+		log.Printf("goplane: warning: %s=%q is not a byte count in %d-%d; using %d",
+			partitionBufferBytesEnv, v, minPartitionBufferBytes, maxPartitionBufferBytes, defaultPartitionBufferBytes)
+		return defaultPartitionBufferBytes
+	}
+	return n
+}
+
 // Plane implements datagateway.DataPlane.
 type Plane struct {
 	cfg    Config
@@ -75,6 +105,9 @@ type Plane struct {
 	// closeWait bounds how long Close waits for open writers' cleanup;
 	// tests shorten it.
 	closeWait time.Duration
+	// budgetHook, nil in production, sees each partitioned writer's
+	// row-group budget decisions from inside its run goroutine; tests set it.
+	budgetHook func(budgetEvent)
 
 	mu      sync.Mutex
 	closed  bool           // set by Close: no new writers
@@ -93,6 +126,9 @@ func New(cfg Config) *Plane {
 	if cfg.MaxOpenPartitions <= 0 {
 		cfg.MaxOpenPartitions = defaultMaxOpenPartitions
 	}
+	if cfg.PartitionBufferBytes <= 0 {
+		cfg.PartitionBufferBytes = defaultPartitionBufferBytes
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Plane{cfg: cfg, ctx: ctx, cancel: cancel, openSink: openIOSink, loadIO: iceio.LoadFS, readers: map[*reader]struct{}{}, closeWait: defaultCloseWait}
 }
@@ -100,7 +136,7 @@ func New(cfg Config) *Plane {
 // Factory builds the plane once boot validation has passed. With a
 // Lakekeeper URL, reads load tables through a lakekeeper.Resolver.
 func Factory(_ context.Context, boot datagateway.BootInfo) (datagateway.DataPlane, error) {
-	cfg := Config{MaxOpenPartitions: maxOpenPartitionsFromEnv()}
+	cfg := Config{MaxOpenPartitions: maxOpenPartitionsFromEnv(), PartitionBufferBytes: partitionBufferBytesFromEnv()}
 	if boot.LakekeeperURL != "" {
 		r, err := lakekeeper.NewResolver(boot.LakekeeperURL, boot.Warehouse, boot.Token, boot.ProjectID)
 		if err != nil {
@@ -160,7 +196,7 @@ func (p *Plane) OpenTableWriter(_ context.Context, spec datagateway.WriterSpec) 
 	if err := p.ctx.Err(); err != nil {
 		return nil, fmt.Errorf("goplane: plane closed: %w", err)
 	}
-	w := newWriter(p.ctx, spec, local, p.openSink, part, p.cfg.MaxOpenPartitions)
+	w := newWriter(p.ctx, spec, local, p.openSink, part, p.cfg.MaxOpenPartitions, p.cfg.PartitionBufferBytes, p.budgetHook)
 	p.writers.Add(1)
 	go func() {
 		<-w.done

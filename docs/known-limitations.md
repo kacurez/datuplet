@@ -180,15 +180,25 @@ cannot assign, so such a table fails the writer with InvalidArgument.
 Unpartitioned v3 tables are written as before.
 
 **Open partition files cost memory.** A partitioned table writer keeps up to
-`DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` files open (default 32, 1-1024). Each
-open file holds a row group under encode plus its upload buffers, so memory
-grows with the number of open files. There is no byte budget; the bound is a
-file count.
+`DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` files open (default 16, 1-1024). Without
+a limit each open file buffers a full row group (measured ~82 MiB per file:
+`bucket[8]` peaked at 1 174 MiB against 517 MiB unpartitioned). The open files
+of one writer therefore share a row-group budget,
+`DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES` (default 256 MiB, 16 MiB-8 GiB):
+a file ends its row group early once it holds its share of the budget, and the
+largest one does while the sum is over it, so row groups get smaller as more
+files are open. The budget counts encoded pages only (not encoder state,
+dictionaries or upload buffers, at least 5 MiB per open S3 upload), so it is a
+flush trigger, not a hard memory bound. Unpartitioned writers are unaffected.
 
-**High partition cardinality makes many small files.** When a writer needs more
-open files than the cap, it finishes the least recently written file early
-(one warning per writer). Every tuple then becomes its own small file, and the
-commit reads one footer per file, so commits slow down too.
+**High partition cardinality makes many small files.** When a batch spreads
+over more distinct tuples than the open-file cap, the writer finishes the least
+recently written file early (one warning per writer). Every tuple then becomes
+its own small file and the commit reads one footer per file: `bucket[200]` over
+the same data wrote 48 324 files of ~41 rows in 532 s, 43 s of it commit. A
+writer that ends with more than 4 files per distinct tuple logs a summary
+warning. Cluster (sort) the input by the partition column(s) or use a coarser
+transform; raising the cap only helps while the pod has memory for it.
 
 **Partition paths are limited to 1 024-byte object keys.** An identity value
 is URL-escaped into the file path. A key over S3's 1 024-byte limit fails the

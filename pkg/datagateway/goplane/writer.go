@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log"
 	"slices"
@@ -75,16 +76,34 @@ type writer struct {
 	open    map[string]*dataFile // by tuple key
 	tick    uint64               // LRU clock
 	nextSeq int                  // writer-wide file sequence
-	seen    map[string]struct{}  // distinct tuples, until the first eviction
+	budget  int64                // row-group bytes shared by the open files
+	hook    func(budgetEvent)    // nil in production
+	seed    maphash.Seed
+	tuples  map[uint64]struct{} // hashes of every tuple key seen (lifetime)
 	evicted bool
 }
 
-func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, open sinkOpener, part *partitioner, maxOpen int) *writer {
+// budgetEvent is what the test hook sees of the row-group budget, from
+// inside run: a flush about to happen ("share": the file about to be written
+// holds at least its fair share; "largest": the open files hold more than
+// the budget after a write) or the state after a sub-batch ("enforced").
+type budgetEvent struct {
+	site    string
+	path    string // the file whose row group ends ("share", "largest")
+	writing string // the file the sub-batch went to
+	sum     int64  // buffered page bytes of all open files ("enforced")
+	budget  int64
+	open    int
+}
+
+func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, open sinkOpener, part *partitioner, maxOpen int, budget int64, hook func(budgetEvent)) *writer {
 	ctx, cancel := context.WithCancelCause(parent)
 	w := &writer{
 		spec:        spec,
 		part:        part,
 		maxOpen:     maxOpen,
+		budget:      budget,
+		hook:        hook,
 		local:       local,
 		openSink:    open,
 		writeSchema: stripFieldIDMetadata(spec.Schema),
@@ -107,7 +126,8 @@ func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, 
 	}
 	if part != nil {
 		w.open = map[string]*dataFile{}
-		w.seen = map[string]struct{}{}
+		w.seed = maphash.MakeSeed()
+		w.tuples = map[uint64]struct{}{}
 	}
 	go w.run()
 	return w
@@ -386,6 +406,11 @@ func (w *writer) finishOpen() {
 			return
 		}
 	}
+	if len(w.files) > 4*len(w.tuples) { // spec decision 9: more than 4 files per distinct tuple
+		log.Printf("goplane: warning: table %s: wrote %d files for %d distinct partition tuples; "+
+			"cluster the input by the partition column(s) or use a coarser transform",
+			w.spec.Table, len(w.files), len(w.tuples))
+	}
 	w.cancel(errClosed) // release the lifetime context; the writer is done
 }
 
@@ -422,6 +447,9 @@ func (w *writer) writeGroup(rec arrow.RecordBatch, g *rowGroup, parentBytes int6
 			return err
 		}
 	}
+	if err := w.flushShare(f); err != nil {
+		return err
+	}
 	if err := f.fw.WriteBuffered(sub); err != nil {
 		return fmt.Errorf("goplane: encode %s: %w", f.path, err)
 	}
@@ -431,7 +459,60 @@ func (w *writer) writeGroup(rec arrow.RecordBatch, g *rowGroup, parentBytes int6
 	f.lastUsed = w.tick
 	if f.fed >= rotationFactor*w.spec.TargetFileBytes {
 		delete(w.open, g.key)
-		return w.finish(f)
+		if err := w.finish(f); err != nil {
+			return err
+		}
+	}
+	return w.enforceBudget(f.path)
+}
+
+// flushShare ends f's row group before a write when f already holds its
+// fair share of the budget (spec decision 9).
+func (w *writer) flushShare(f *dataFile) error {
+	n := f.fw.RowGroupTotalCompressedBytes()
+	if n == 0 || n < w.budget/int64(len(w.open)) {
+		return nil
+	}
+	if w.hook != nil {
+		w.hook(budgetEvent{site: "share", path: f.path, writing: f.path, budget: w.budget, open: len(w.open)})
+	}
+	return flushRowGroup(f)
+}
+
+// enforceBudget ends the largest buffered row group while the open files
+// hold more than the budget. Buffered page bytes are an approximate trigger:
+// encoder state and not-yet-paged values are not counted.
+func (w *writer) enforceBudget(writing string) error {
+	for {
+		var sum, most int64
+		var largest *dataFile
+		for _, f := range w.open {
+			n := f.fw.RowGroupTotalCompressedBytes()
+			sum += n
+			if largest == nil || n > most {
+				largest, most = f, n
+			}
+		}
+		if sum <= w.budget || most == 0 {
+			if w.hook != nil {
+				w.hook(budgetEvent{site: "enforced", writing: writing, sum: sum, budget: w.budget, open: len(w.open)})
+			}
+			return nil
+		}
+		if w.hook != nil {
+			w.hook(budgetEvent{site: "largest", path: largest.path, writing: writing, budget: w.budget, open: len(w.open)})
+		}
+		if err := flushRowGroup(largest); err != nil {
+			return err
+		}
+	}
+}
+
+// flushRowGroup ends f's buffered row group, writing it to the upload
+// stream. f stays open, so a failure reaches fail, which aborts it.
+func flushRowGroup(f *dataFile) error {
+	if err := f.fw.NewBufferedRowGroupChecked(); err != nil {
+		return fmt.Errorf("goplane: flush row group of %s: %w", f.path, err)
 	}
 	return nil
 }
@@ -479,9 +560,7 @@ func subBatch(ctx context.Context, rec arrow.RecordBatch, g *rowGroup, parentByt
 // openPartition opens the file of g's tuple, first finishing the least
 // recently written open file when maxOpen files are open.
 func (w *writer) openPartition(g *rowGroup) (*dataFile, error) {
-	if w.seen != nil {
-		w.seen[g.key] = struct{}{}
-	}
+	w.tuples[maphash.String(w.seed, g.key)] = struct{}{}
 	if len(w.open) >= w.maxOpen {
 		if err := w.evictLRU(); err != nil {
 			return nil, err
@@ -503,7 +582,7 @@ func (w *writer) openPartition(g *rowGroup) (*dataFile, error) {
 }
 
 // evictLRU finishes (and keeps for commit) the least recently written open
-// file; the first eviction of a writer logs one warning.
+// file; the first eviction of a writer logs one warning naming the remedy.
 func (w *writer) evictLRU() error {
 	var lru *dataFile
 	for _, f := range w.open {
@@ -514,9 +593,9 @@ func (w *writer) evictLRU() error {
 	if !w.evicted {
 		w.evicted = true
 		log.Printf("goplane: warning: table %s: %d partition files open (DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS); "+
-			"finishing the least recently written one after %d distinct partition tuples, so this writer produces more, smaller files",
-			w.spec.Table, w.maxOpen, len(w.seen))
-		w.seen = nil
+			"finishing the least recently written one after %d distinct partition tuples, so this writer produces more, smaller files; "+
+			"more distinct tuples per batch than the cap cannot be streamed cheaply: cluster the input by the partition column(s) or use a coarser transform",
+			w.spec.Table, w.maxOpen, len(w.tuples))
 	}
 	delete(w.open, lru.key)
 	return w.finish(lru)

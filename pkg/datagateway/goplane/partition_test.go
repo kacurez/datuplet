@@ -963,12 +963,12 @@ func TestMaxOpenPartitionsEnv(t *testing.T) {
 		want int
 		warn bool
 	}{
-		{"", false, 32, false},
+		{"", false, 16, false},
 		{"2", true, 2, false},
 		{"1024", true, 1024, false},
-		{"0", true, 32, true},
-		{"1025", true, 32, true},
-		{"abc", true, 32, true},
+		{"0", true, 16, true},
+		{"1025", true, 16, true},
+		{"abc", true, 16, true},
 	} {
 		t.Run(tc.val, func(t *testing.T) {
 			logs := captureLog(t)

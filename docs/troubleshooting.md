@@ -273,14 +273,24 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
   the partition value cannot be computed from (e.g. a string into a `long`
   column). Write the column with the table's type, or drop and recreate the
   table.
-- The gateway log shows `goplane: warning: table <ns>.<table>: 32 partition
+- The gateway log shows `goplane: warning: table <ns>.<table>: 16 partition
   files open (DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS); finishing the least
-  recently written one after N distinct partition tuples`. The writer sees more
-  distinct partition tuples than its open-file cap, so it writes more, smaller
-  files and commits get slower. Choose a coarser transform (e.g. `month`
-  instead of `day`, fewer buckets) or raise
-  `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (up to 1024) if the pod has memory
-  for it.
+  recently written one after N distinct partition tuples`, and at close
+  `wrote F files for N distinct partition tuples`. The batches spread over more
+  distinct partition tuples than the open-file cap, so the writer writes many
+  small files and commits get slower (measured: `bucket[200]` wrote 48 324
+  files of ~41 rows, 532 s, 43 s of it commit). Cluster (sort) the input by the
+  partition column(s), or choose a coarser transform (e.g. `month` instead of
+  `day`, fewer buckets). Raise `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (up to
+  1024) only if the pod has memory for it: each open file keeps upload buffers
+  (at least 5 MiB per S3 multipart part).
+- A partitioned write uses more gateway memory than expected. The open files of
+  one writer share `DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES` (default 256 MiB,
+  16 MiB-8 GiB) of buffered row groups; lower it, or lower
+  `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS`, to shrink row groups and the peak.
+  The budget is a flush trigger on encoded pages, not a hard bound (without it
+  each open file held ~82 MiB: `bucket[8]` peaked at 1 174 MiB against 517 MiB
+  unpartitioned).
 - The gateway log shows `partition_fields [...] differ from the existing
   table's partition spec [...]`. The table already existed with another spec,
   which is used; drop the table to repartition it.

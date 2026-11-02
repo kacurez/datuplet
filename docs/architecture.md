@@ -158,8 +158,9 @@ Responsibilities per write:
   target file size). Nothing is staged on local disk.
 - For a partitioned table the writer splits each batch by partition tuple and
   keeps one open file per tuple under `<data>/<field>=<value>/...`, at most
-  `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (default 32) at once; every file holds
-  exactly one tuple.
+  `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (default 16) at once, sharing a
+  `DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES` (default 256 MiB) row-group budget;
+  every file holds exactly one tuple.
 - Writes no `files.json` or other marker object; the commit carries the audit
   properties.
 
