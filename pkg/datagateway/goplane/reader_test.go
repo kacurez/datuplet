@@ -1049,6 +1049,128 @@ func TestRawBodyReadsRaceShutdown(t *testing.T) {
 	}
 }
 
+// gatedIO wraps the plane's IO loader. Once armed, a file's Read signals
+// readStarted and blocks until the context its IO was loaded with is
+// cancelled, as a Read blocked on remote storage does. Close records whether
+// it started while such a Read was still running.
+type gatedIO struct {
+	armed           atomic.Bool
+	readStarted     chan struct{}
+	startOnce       sync.Once
+	inRead          atomic.Int32
+	gatedClosed     atomic.Bool // the file of a gated Read was closed
+	closeDuringRead atomic.Bool
+}
+
+type gatedFS struct {
+	iceio.IO
+	g   *gatedIO
+	ctx context.Context
+}
+
+type gatedFile struct {
+	iceio.File
+	g     *gatedIO
+	ctx   context.Context
+	gated atomic.Bool // a gated Read ran on this file
+}
+
+func gateIO(p *Plane) *gatedIO {
+	g := &gatedIO{readStarted: make(chan struct{})}
+	p.loadIO = func(ctx context.Context, props map[string]string, location string) (iceio.IO, error) {
+		fsys, err := iceio.LoadFS(ctx, props, location)
+		if err != nil {
+			return nil, err
+		}
+		return gatedFS{IO: fsys, g: g, ctx: ctx}, nil
+	}
+	return g
+}
+
+func (fs gatedFS) Open(name string) (iceio.File, error) {
+	f, err := fs.IO.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &gatedFile{File: f, g: fs.g, ctx: fs.ctx}, nil
+}
+
+func (f *gatedFile) Read(p []byte) (int, error) {
+	if !f.g.armed.Load() {
+		return f.File.Read(p)
+	}
+	f.gated.Store(true)
+	f.g.inRead.Add(1)
+	defer f.g.inRead.Add(-1)
+	f.g.startOnce.Do(func() { close(f.g.readStarted) })
+	<-f.ctx.Done()
+	return 0, f.ctx.Err()
+}
+
+func (f *gatedFile) Close() error {
+	if f.gated.Load() {
+		if f.g.inRead.Load() != 0 {
+			f.g.closeDuringRead.Store(true)
+		}
+		f.g.gatedClosed.Store(true)
+	}
+	return f.File.Close()
+}
+
+// Each way a raw body ends, with a Read actually in flight inside the
+// underlying file: the shutdown completes, the Read returns an error, and the
+// file's Close starts only after that Read has returned.
+func TestRawBodyShutdownWaitsForInFlightRead(t *testing.T) {
+	ends := map[string]func(*tfx, *reader, io.ReadCloser){
+		"reader Close": func(_ *tfx, r *reader, _ io.ReadCloser) { _ = r.Close() },
+		"Interrupt":    func(f *tfx, _ *reader, _ io.ReadCloser) { f.p.Interrupt() },
+		"plane Close":  func(f *tfx, _ *reader, _ io.ReadCloser) { _ = f.p.Close() },
+		"body Close":   func(_ *tfx, _ *reader, b io.ReadCloser) { _ = b.Close() },
+	}
+	for name, end := range ends {
+		t.Run(name, func(t *testing.T) {
+			f := newTable(t, readSchema, morProps("2"))
+			f.addFiles(f.writeFile(0, 2000, 0))
+			g := gateIO(f.p)
+			r, raw := rawPart(t, f)
+			body := openBody(t, raw)
+
+			g.armed.Store(true)
+			readErr := make(chan error, 1)
+			go func() {
+				_, err := body.Read(make([]byte, 16))
+				readErr <- err
+			}()
+			waitClosed(t, g.readStarted, "the in-flight Read")
+
+			ended := make(chan struct{})
+			go func() {
+				defer close(ended)
+				end(f, r, body)
+				r.closeBodies(false) // Interrupt is asynchronous; this waits for it
+			}()
+			waitClosed(t, ended, "shutdown")
+			select {
+			case err := <-readErr:
+				if err == nil {
+					t.Fatal("the in-flight Read succeeded, want an error")
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the in-flight Read never returned")
+			}
+			if !g.gatedClosed.Load() {
+				t.Fatal("shutdown returned without closing the file")
+			}
+			if g.closeDuringRead.Load() {
+				t.Fatal("the file's Close started while its Read was running")
+			}
+			if _, err := body.Read(make([]byte, 8)); err == nil {
+				t.Fatal("Read after shutdown succeeded")
+			}
+		})
+	}
+}
+
 // ReadPart.Started counts tasks as the stream starts them, not as planned.
 func TestDecodedPartStartedCountsTasksLazily(t *testing.T) {
 	f := newTable(t, readSchema, morProps("2"))

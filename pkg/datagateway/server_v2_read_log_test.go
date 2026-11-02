@@ -166,13 +166,24 @@ func TestReadSummaryGRPCSendFailure(t *testing.T) {
 	if err := s.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream); err == nil {
 		t.Fatal("ReadChunk succeeded, want the send error")
 	}
+	// The failed send is sticky: a retry on a working stream gets the send
+	// error again, never end-of-data that would skip the undelivered chunk.
+	retry := &mockReadChunkStream{ctx: context.Background()}
+	err := s.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, retry)
+	if err == nil || !strings.Contains(err.Error(), "transport closed") {
+		t.Fatalf("retry ReadChunk = %v, want the sticky send error", err)
+	}
+	if len(retry.chunks) != 0 {
+		t.Errorf("retry sent %d chunks, want 0", len(retry.chunks))
+	}
 	s.CloseReader(context.Background(), &pb.CloseReaderRequest{ReaderId: resp.ReaderId})
 	wantSummary(t, lines(), "table=raw.g", "outcome=error")
 }
 
 // close() racing chunk production: the raw open is held inside nextChunk, the
-// close starts meanwhile and must wait for the production to finish, so the
-// summary's counters agree with each other.
+// close starts meanwhile, cancels the reader and must then wait for the
+// production to finish before it takes the lock, so the summary's counters
+// agree with each other.
 func TestReadSummaryCloseDuringProduction(t *testing.T) {
 	lines := captureLog(t)
 	s, p := newWriteTestServer(t, &Config{})
@@ -198,6 +209,7 @@ func TestReadSummaryCloseDuringProduction(t *testing.T) {
 	<-entered
 	closed := make(chan struct{})
 	go func() { defer close(closed); rs.close() }()
+	<-rs.ctx.Done() // close has cancelled and now waits for the lock
 	close(release)
 	<-produced
 	<-closed
