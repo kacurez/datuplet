@@ -483,7 +483,13 @@ func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string
 // and iceberg-go would then drop every column's bounds and null counts for
 // the whole file. The footer is read once; FileToDataFile runs on a copy of
 // it, without the empty row groups, served from memory.
-func footerMetrics(ctx context.Context, fs iceio.IO, path string, sc *iceberg.Schema, props iceberg.Properties) (iceberg.DataFile, int64, error) {
+func footerMetrics(ctx context.Context, fs iceio.IO, path string, sc *iceberg.Schema, props iceberg.Properties) (df iceberg.DataFile, size int64, err error) {
+	// A malformed footer must fail this file, never the commit worker.
+	defer func() {
+		if r := recover(); r != nil {
+			df, size, err = nil, 0, fmt.Errorf("parquet footer: %v", r)
+		}
+	}()
 	f, err := fs.Open(path)
 	if err != nil {
 		return nil, 0, err
@@ -493,8 +499,14 @@ func footerMetrics(ctx context.Context, fs iceio.IO, path string, sc *iceberg.Sc
 		_ = f.Close()
 		return nil, 0, err
 	}
+	defer rdr.Close()
 	md := rdr.MetaData()
-	size := md.GetSourceFileSize()
+	// An encrypted file with a plaintext footer opens without keys; its
+	// footer cannot be re-serialized without an encryptor.
+	if md.IsSetEncryptionAlgorithm() || md.FileDecryptor != nil {
+		return nil, 0, errors.New("unsupported encrypted parquet file")
+	}
+	size = md.GetSourceFileSize()
 	keep := make([]int, 0, md.NumRowGroups())
 	for i := 0; i < md.NumRowGroups(); i++ {
 		if md.RowGroup(i).NumRows() > 0 {
@@ -503,14 +515,12 @@ func footerMetrics(ctx context.Context, fs iceio.IO, path string, sc *iceberg.Sc
 	}
 	if len(keep) < md.NumRowGroups() {
 		if md, err = md.Subset(keep); err != nil {
-			_ = rdr.Close()
 			return nil, 0, err
 		}
 	}
 	var footer bytes.Buffer
 	footer.WriteString("PAR1")
 	n, err := md.WriteTo(&footer, nil)
-	_ = rdr.Close()
 	if err != nil {
 		return nil, 0, fmt.Errorf("serialize footer: %w", err)
 	}

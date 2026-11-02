@@ -714,6 +714,9 @@ func TestPartitionBudgetEmptyRowGroupKeepsMetrics(t *testing.T) {
 			if df == nil {
 				t.Fatalf("%s not committed", zero)
 			}
+			if got, want := df.FileSizeBytes(), fileSize(t, zero); got != want {
+				t.Errorf("committed file size %d, want the object's %d", got, want)
+			}
 			sc := tb.Schema()
 			want := map[string][2]string{
 				"id":  {"0", "47999"},

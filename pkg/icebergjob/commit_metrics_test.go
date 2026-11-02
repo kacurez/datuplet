@@ -7,6 +7,7 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -38,12 +39,17 @@ var metricsIceberg = iceberg.NewSchema(0,
 // id%5 == 0, score NaN when id%7 == 0.
 func writeGroups(t *testing.T, name string, groups ...[]int64) string {
 	t.Helper()
+	return writeGroupsWith(t, name, nil, groups...)
+}
+
+func writeGroupsWith(t *testing.T, name string, extra []parquet.WriterProperty, groups ...[]int64) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
 	sink, err := (iceio.LocalFS{}).Create(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Zstd), parquet.WithStats(true))
+	props := parquet.NewWriterProperties(append([]parquet.WriterProperty{parquet.WithCompression(compress.Codecs.Zstd), parquet.WithStats(true)}, extra...)...)
 	fw, err := pqarrow.NewFileWriter(metricsArrow, sink, props, pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()))
 	if err != nil {
 		t.Fatal(err)
@@ -94,6 +100,34 @@ func rowGroupRows(t *testing.T, path string) []int64 {
 	var out []int64
 	for i := 0; i < rdr.NumRowGroups(); i++ {
 		out = append(out, rdr.MetaData().RowGroup(i).NumRows())
+	}
+	return out
+}
+
+// retainedSplitOffsets is the split offset (as iceberg-go computes it) of
+// each non-empty row group of the file at path.
+func retainedSplitOffsets(t *testing.T, path string) []int64 {
+	t.Helper()
+	rdr, err := file.OpenParquetFile(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdr.Close()
+	var out []int64
+	for i := 0; i < rdr.NumRowGroups(); i++ {
+		rg := rdr.MetaData().RowGroup(i)
+		if rg.NumRows() == 0 {
+			continue
+		}
+		cc, err := rg.ColumnChunk(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cc.HasDictionaryPage() && cc.DictionaryPageOffset() < cc.DataPageOffset() {
+			out = append(out, cc.DictionaryPageOffset())
+		} else {
+			out = append(out, cc.DataPageOffset())
+		}
 	}
 	return out
 }
@@ -174,8 +208,8 @@ func TestFooterMetricsSkipEmptyRowGroups(t *testing.T) {
 			if want := fileToDataFile(t, path).FileSizeBytes(); size != want {
 				t.Errorf("size = %d, want the file's %d", size, want)
 			}
-			if n := len(got.SplitOffsets()); n != 1 {
-				t.Errorf("split offsets %v, want one (the non-empty row group)", got.SplitOffsets())
+			if want := retainedSplitOffsets(t, path); len(want) != 1 || !reflect.DeepEqual(got.SplitOffsets(), want) {
+				t.Errorf("split offsets %v, want the non-empty row group's %v", got.SplitOffsets(), want)
 			}
 		})
 	}
@@ -196,3 +230,27 @@ func TestFooterMetricsSkipEmptyRowGroups(t *testing.T) {
 		}
 	})
 }
+
+// An encrypted file whose footer is plaintext opens without keys; its
+// metrics are refused with an error, not a panic.
+func TestFooterMetricsRejectsEncryptedPlaintextFooter(t *testing.T) {
+	enc := parquet.NewFileEncryptionProperties("0123456789012345", parquet.WithPlaintextFooter())
+	path := writeGroupsWith(t, "enc.parquet", []parquet.WriterProperty{parquet.WithEncryptionProperties(enc)}, idRange(0, 100), nil)
+	_, _, err := footerMetrics(context.Background(), iceio.LocalFS{}, path, metricsIceberg, metricsProps(t))
+	if err == nil || !strings.Contains(err.Error(), "unsupported encrypted parquet file") {
+		t.Fatalf("err = %v, want unsupported encrypted parquet file", err)
+	}
+}
+
+// footerMetrics turns a panic while reading a footer into an error.
+func TestFooterMetricsRecoversPanic(t *testing.T) {
+	_, _, err := footerMetrics(context.Background(), panicIO{}, "x.parquet", metricsIceberg, metricsProps(t))
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want the recovered panic", err)
+	}
+}
+
+type panicIO struct{}
+
+func (panicIO) Open(string) (iceio.File, error) { panic("boom") }
+func (panicIO) Remove(string) error             { return nil }
