@@ -33,6 +33,7 @@ type fakeDataPlane struct {
 	tables     map[string]fakeTable
 
 	writeErr      error
+	openWriterErr error // returned by OpenTableWriter when set
 	openReaderErr error
 	dead          bool // Interrupt or Close was called
 	interruptedF  bool
@@ -108,6 +109,9 @@ func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (Tab
 	p.opens++
 	if p.closed || (p.dead && !p.openAfterInterrupt) {
 		return nil, errFakePlaneDead
+	}
+	if p.openWriterErr != nil {
+		return nil, p.openWriterErr
 	}
 	if p.rejectLargeTypes && spec.Schema != nil {
 		for _, f := range spec.Schema.Fields() {

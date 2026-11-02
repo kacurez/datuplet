@@ -264,8 +264,15 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
   the table does not have, uses an unknown transform (`days`, `bucket[-1]`), a
   transform the column type does not allow, two time transforms on one column,
   or a partition name that collides with another column; or the existing table
-  is a partitioned format-version 3 table. Fix `partition_fields` (see
+  is a partitioned format-version 3 table, or its spec partitions by a nested
+  (struct) field. Fix `partition_fields` (see
   [known-limitations.md](known-limitations.md)).
+- The first chunk fails with InvalidArgument (HTTP 400): `column "<c>" has Arrow
+  type <X>, which cannot be converted to the table type <Y>`. The existing
+  table partitions by `<c>`, and the component writes that column with a type
+  the partition value cannot be computed from (e.g. a string into a `long`
+  column). Write the column with the table's type, or drop and recreate the
+  table.
 - The gateway log shows `goplane: warning: table <ns>.<table>: 32 partition
   files open (DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS); finishing the least
   recently written one after N distinct partition tuples`. The writer sees more

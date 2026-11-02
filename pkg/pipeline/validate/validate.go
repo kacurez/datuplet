@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/iceberg-go"
+
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"github.com/datuplet/datuplet/pkg/lib/secrets"
 	"github.com/datuplet/datuplet/pkg/pipeline/config"
@@ -49,13 +51,32 @@ const (
 	writeModeFullLoad = "FULL_LOAD"
 )
 
-// validPartitionTransforms lists the allowed partition transforms (Phase 1).
-var validPartitionTransforms = map[string]bool{
-	"identity": true,
-	"day":      true,
-	"month":    true,
-	"year":     true,
-	"hour":     true,
+// supportedPartitionTransforms is the user-facing list of partition
+// transforms the Data Gateway writes.
+const supportedPartitionTransforms = "identity, year, month, day, hour, void, bucket[N], truncate[W]"
+
+// parsePartitionTransform parses a transform as the Data Gateway does
+// (iceberg.ParseTransform, an unknown transform rejected) and accepts only its
+// canonical spelling, which the Pipeline CRD's pattern admits.
+func parsePartitionTransform(s string) (iceberg.Transform, bool) {
+	tr, err := iceberg.ParseTransform(s)
+	if err != nil {
+		return nil, false
+	}
+	if _, unknown := tr.(iceberg.UnknownTransform); unknown || tr.String() != s {
+		return nil, false
+	}
+	return tr, true
+}
+
+// isTimeTransform reports whether tr is year, month, day or hour: two of them
+// on one column are redundant, and the gateway rejects the spec.
+func isTimeTransform(tr iceberg.Transform) bool {
+	switch tr.(type) {
+	case iceberg.YearTransform, iceberg.MonthTransform, iceberg.DayTransform, iceberg.HourTransform:
+		return true
+	}
+	return false
 }
 
 // validColumnTypes lists the allowed types for an output table's explicit
@@ -588,7 +609,8 @@ func validatePartitionSpec(compName, tableName string, spec []datupletv1.Partiti
 	}
 
 	var findings []Finding
-	seen := make(map[string]bool)
+	seen := make(map[string]bool)         // source column + transform
+	timeSource := make(map[string]string) // source column -> its time transform
 	for i, field := range spec {
 		fieldPath := fmt.Sprintf("%s.partitionFields[%d]", tablePath, i)
 		if field.SourceColumn == "" {
@@ -604,22 +626,36 @@ func validatePartitionSpec(compName, tableName string, spec []datupletv1.Partiti
 				Message:  fmt.Sprintf("component %s, output table %s, partitionSpec[%d]: transform is required", compName, tableName, i),
 				Severity: severityError,
 			})
-		} else if !validPartitionTransforms[field.Transform] {
+		}
+		tr, ok := parsePartitionTransform(field.Transform)
+		if field.Transform != "" && !ok {
 			findings = append(findings, Finding{
 				Path:     fieldPath + ".transform",
-				Message:  fmt.Sprintf("component %s, output table %s, partitionSpec[%d]: invalid transform %q (supported: identity, day, month, year, hour)", compName, tableName, i, field.Transform),
+				Message:  fmt.Sprintf("component %s, output table %s, partitionSpec[%d]: invalid transform %q (supported: %s; N and W positive integers)", compName, tableName, i, field.Transform, supportedPartitionTransforms),
 				Severity: severityError,
 			})
 		}
-		if field.SourceColumn != "" {
-			if seen[field.SourceColumn] {
+		if field.SourceColumn == "" || !ok {
+			continue
+		}
+		key := field.SourceColumn + "\x00" + tr.String()
+		if seen[key] {
+			findings = append(findings, Finding{
+				Path:     fieldPath,
+				Message:  fmt.Sprintf("component %s, output table %s, partitionSpec: duplicate partition field %s(%s)", compName, tableName, tr, field.SourceColumn),
+				Severity: severityError,
+			})
+		}
+		seen[key] = true
+		if isTimeTransform(tr) {
+			if prev, dup := timeSource[field.SourceColumn]; dup && prev != tr.String() {
 				findings = append(findings, Finding{
-					Path:     fieldPath + ".sourceColumn",
-					Message:  fmt.Sprintf("component %s, output table %s, partitionSpec: duplicate source_column %q", compName, tableName, field.SourceColumn),
+					Path:     fieldPath + ".transform",
+					Message:  fmt.Sprintf("component %s, output table %s, partitionSpec: %s(%s) and %s(%s) are redundant; use one time transform per column", compName, tableName, prev, field.SourceColumn, tr, field.SourceColumn),
 					Severity: severityError,
 				})
 			}
-			seen[field.SourceColumn] = true
+			timeSource[field.SourceColumn] = tr.String()
 		}
 	}
 

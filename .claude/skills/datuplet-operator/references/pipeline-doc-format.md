@@ -117,7 +117,11 @@ run time — set the secret (project secrets API/UI) before triggering.
 
 An output table may declare partitioning under `partitionSpec` — a list where
 each entry has `source_column` (the data column to partition on) and `transform`
-(`identity` | `day` | `month` | `year` | `hour`):
+(`identity` | `year` | `month` | `day` | `hour` | `void` | `bucket[N]` |
+`truncate[W]`, N and W positive integers). One column may appear in several
+fields (e.g. `bucket[16]` and `truncate[4]`), but not twice with the same
+transform, and with at most one of `year`/`month`/`day`/`hour`. The spec applies
+when the gateway creates the table; an existing table keeps its own spec:
 
 ```yaml
 outputs:

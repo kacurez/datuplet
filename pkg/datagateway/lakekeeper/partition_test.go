@@ -101,3 +101,81 @@ func TestPartitionValidationErrors(t *testing.T) {
 		}
 	})
 }
+
+// createCapture records the options of every CreateTable.
+type createCapture struct {
+	catalog.Catalog
+	cfgs []catalog.CreateTableCfg
+}
+
+func (c *createCapture) CreateTable(ctx context.Context, ident icebergtable.Identifier, sc *iceberg.Schema, opts ...catalog.CreateTableOpt) (*icebergtable.Table, error) {
+	cfg := catalog.NewCreateTableCfg()
+	for _, o := range opts {
+		o(&cfg)
+	}
+	c.cfgs = append(c.cfgs, cfg)
+	return c.Catalog.CreateTable(ctx, ident, sc, opts...)
+}
+
+// A partitioned table is created as format version 2, so a catalog default of
+// v3 cannot create a table CheckWriteSpec then rejects; an unpartitioned one
+// keeps the catalog default.
+func TestPartitionedCreatePinsFormatV2(t *testing.T) {
+	sch := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
+	gw, err := dgschema.NewSchemaFromArrow(sch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp := func(context.Context) (*dgschema.Schema, error) { return gw, nil }
+	hc, err := hadoop.NewCatalog("unit", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := &createCapture{Catalog: hc}
+	tb, _, err := LoadOrCreateTable(context.Background(), cat, "ns", "part", sp, []PartitionField{{SourceColumn: "id", Transform: "bucket[4]"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cat.cfgs[0].Properties[icebergtable.PropertyFormatVersion]; got != "2" || tb.Metadata().Version() != 2 {
+		t.Fatalf("partitioned create: format-version property %q, table version %d; want 2", got, tb.Metadata().Version())
+	}
+	if _, _, err := LoadOrCreateTable(context.Background(), cat, "ns", "flat", sp, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, set := cat.cfgs[1].Properties[icebergtable.PropertyFormatVersion]; set {
+		t.Fatalf("unpartitioned create pinned a format version: %v", cat.cfgs[1].Properties)
+	}
+}
+
+// A spec sourced from a nested field is rejected, never bound to a same-named
+// top-level column.
+func TestPartitionNestedSourceRejected(t *testing.T) {
+	ctx := context.Background()
+	cat, err := hadoop.NewCatalog("unit", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.CreateNamespace(ctx, catalog.ToIdentifier("ns"), nil); err != nil {
+		t.Fatal(err)
+	}
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "meta", Type: &iceberg.StructType{FieldList: []iceberg.NestedField{
+			{ID: 3, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		}}})
+	fid := iceberg.PartitionDataIDStart
+	spec, err := iceberg.NewPartitionSpecOpts(iceberg.AddPartitionFieldByName("meta.id", "meta_id", iceberg.IdentityTransform{}, sc, &fid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(ctx, catalog.ToIdentifier("ns", "tbl"), sc, catalog.WithPartitionSpec(&spec)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = LoadOrCreateTable(ctx, cat, "ns", "tbl", nil, nil)
+	if !errors.Is(err, ErrInvalidPartition) || !strings.Contains(err.Error(), `"meta.id" is a nested field`) {
+		t.Fatalf("existing table: err = %v, want the nested-field rejection", err)
+	}
+	if _, err := BuildPartitionSpec([]PartitionField{{SourceColumn: "meta.id", Transform: "identity"}}, sc); !errors.Is(err, ErrInvalidPartition) {
+		t.Fatalf("BuildPartitionSpec(meta.id) err = %v, want ErrInvalidPartition", err)
+	}
+}

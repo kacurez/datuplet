@@ -52,9 +52,10 @@ func newPartitioner(spec iceberg.PartitionSpec, sc *iceberg.Schema, writeSchema 
 	for _, f := range spec.Fields() {
 		pf := partField{id: f.FieldID, name: f.Name, col: -1}
 		if _, isVoid := f.Transform.(iceberg.VoidTransform); !isVoid {
-			src, ok := sc.FindFieldByID(f.SourceID())
+			src, ok := topLevelByID(sc, f.SourceID())
 			if !ok {
-				return nil, invalidPartition("partition field %s: source field id %d is not in the table schema", f.Name, f.SourceID())
+				name, _ := sc.FindColumnName(f.SourceID())
+				return nil, invalidPartition("partition field %s: source field id %d (%q) is not a top-level column of the table schema", f.Name, f.SourceID(), name)
 			}
 			if !f.Transform.CanTransform(src.Type) {
 				return nil, invalidPartition("partition field %s: transform %s cannot be applied to column %q of type %s", f.Name, f.Transform, src.Name, src.Type)
@@ -75,6 +76,17 @@ func newPartitioner(spec iceberg.PartitionSpec, sc *iceberg.Schema, writeSchema 
 		p.fields = append(p.fields, pf)
 	}
 	return p, nil
+}
+
+// topLevelByID returns the top-level column of sc with field id; a nested
+// field is never bound to a same-named top-level writer column.
+func topLevelByID(sc *iceberg.Schema, id int) (iceberg.NestedField, bool) {
+	for _, f := range sc.Fields() {
+		if f.ID == id {
+			return f, true
+		}
+	}
+	return iceberg.NestedField{}, false
 }
 
 // transformFunc returns tr applied to a Go value of src's Iceberg type, with

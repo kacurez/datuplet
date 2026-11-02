@@ -1007,3 +1007,23 @@ func TestPartitionPathTooLong(t *testing.T) {
 		t.Fatalf("files written: %v", m)
 	}
 }
+
+// A spec field sourced from a nested column is never bound to a same-named
+// top-level writer column.
+func TestPartitionNestedSourceNotBound(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "meta", Type: &iceberg.StructType{FieldList: []iceberg.NestedField{
+			{ID: 3, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		}}})
+	fid := 1000
+	spec, err := iceberg.NewPartitionSpecOpts(iceberg.AddPartitionFieldByName("meta.id", "meta_id", iceberg.IdentityTransform{}, sc, &fid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
+	_, err = newPartitioner(spec, sc, writer)
+	if !errors.Is(err, datagateway.ErrInvalidPartition) || !strings.Contains(err.Error(), `"meta.id"`) {
+		t.Fatalf("err = %v, want ErrInvalidPartition naming meta.id", err)
+	}
+}

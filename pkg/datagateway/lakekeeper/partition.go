@@ -66,7 +66,13 @@ func LoadOrCreateTable(ctx context.Context, cat catalog.Catalog, ns, tbl string,
 		if err := ensureNamespace(ctx, cat, ns); err != nil {
 			return nil, "", err
 		}
-		t, err = cat.CreateTable(ctx, ident, icSchema, catalog.WithPartitionSpec(&spec))
+		opts := []catalog.CreateTableOpt{catalog.WithPartitionSpec(&spec)}
+		if spec.NumFields() > 0 {
+			// Pin v2: partitioned writes to v3 are rejected (CheckWriteSpec),
+			// so a catalog default of v3 must not create an unwritable table.
+			opts = append(opts, catalog.WithProperties(iceberg.Properties{icebergtable.PropertyFormatVersion: "2"}))
+		}
+		t, err = cat.CreateTable(ctx, ident, icSchema, opts...)
 		switch {
 		case err == nil:
 			created = true
@@ -95,7 +101,7 @@ func LoadOrCreateTable(ctx context.Context, cat catalog.Catalog, ns, tbl string,
 func BuildPartitionSpec(fields []PartitionField, sc *iceberg.Schema) (iceberg.PartitionSpec, error) {
 	opts := make([]iceberg.PartitionOption, 0, len(fields))
 	for i, f := range fields {
-		src, ok := sc.FindFieldByName(f.SourceColumn)
+		src, ok := topLevelField(sc, f.SourceColumn)
 		if !ok {
 			return iceberg.PartitionSpec{}, invalidPartition("partition field %s: source column %q is not in the table schema", f, f.SourceColumn)
 		}
@@ -154,11 +160,26 @@ func CheckWriteSpec(t *icebergtable.Table) error {
 		if _, isVoid := f.Transform.(iceberg.VoidTransform); isVoid {
 			continue
 		}
-		if _, ok := sc.FindFieldByID(f.SourceID()); !ok {
+		name, ok := sc.FindColumnName(f.SourceID())
+		if !ok {
 			return invalidPartition("partition field %s: source field id %d is not in the table schema", f.Name, f.SourceID())
+		}
+		if _, top := topLevelField(sc, name); !top {
+			return invalidPartition("partition field %s: source column %q is a nested field; only top-level columns can be written", f.Name, name)
 		}
 	}
 	return nil
+}
+
+// topLevelField returns the top-level column of sc named name; a nested
+// field ("a.b") is not one.
+func topLevelField(sc *iceberg.Schema, name string) (iceberg.NestedField, bool) {
+	for _, f := range sc.Fields() {
+		if f.Name == name {
+			return f, true
+		}
+	}
+	return iceberg.NestedField{}, false
 }
 
 // specDiffers returns the warning for an existing table whose current spec

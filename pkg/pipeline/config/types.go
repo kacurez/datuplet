@@ -126,7 +126,7 @@ type OutputTableSpec struct {
 // PartitionFieldSpec defines a single partition field.
 type PartitionFieldSpec struct {
 	SourceColumn string `yaml:"source_column" json:"source_column"` // Column name in the data
-	Transform    string `yaml:"transform" json:"transform"`         // Transform: identity, day, month, year, hour
+	Transform    string `yaml:"transform" json:"transform"`         // Transform: identity, year, month, day, hour, void, bucket[N], truncate[W]
 }
 
 // ColumnSpec defines a single column's name and type in an explicit output

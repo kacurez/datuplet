@@ -299,14 +299,10 @@ spec:
                                             minLength: 1
                                             type: string
                                           transform:
-                                            description: Transform is the partition transform
-                                              to apply.
-                                            enum:
-                                            - identity
-                                            - day
-                                            - month
-                                            - year
-                                            - hour
+                                            description: 'Transform is the partition transform
+                                              to apply: identity, year, month, day, hour, void,
+                                              bucket[N] or truncate[W] (N, W positive integers).'
+                                            pattern: '^(identity|year|month|day|hour|void|bucket\[[1-9][0-9]*\]|truncate\[[1-9][0-9]*\])$'
                                             type: string
                                         required:
                                         - sourceColumn

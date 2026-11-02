@@ -75,10 +75,10 @@ func partitionStatus(err error) error {
 }
 
 // partitionFieldsFor returns the configured partition_fields of (bucket,
-// table).
+// table), matching both exactly as writeModeForTable does.
 func (s *ServerV2) partitionFieldsFor(bucket, table string) []dglakekeeper.PartitionField {
 	for _, t := range s.config.OutputTables {
-		if t.Name == table && (t.Bucket == "" || t.Bucket == bucket) {
+		if t.Name == table && t.Bucket == bucket {
 			out := make([]dglakekeeper.PartitionField, len(t.PartitionFields))
 			for i, f := range t.PartitionFields {
 				out[i] = dglakekeeper.PartitionField{SourceColumn: f.SourceColumn, Transform: f.Transform}

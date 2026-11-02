@@ -5,6 +5,7 @@ package goplane
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,8 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/datuplet/datuplet/pkg/datagateway"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
@@ -245,5 +248,57 @@ func TestIntegrationServerPartitionedWrite(t *testing.T) {
 		if read[id] != 1 {
 			t.Fatalf("gateway read: id %d read %d times, want once (%v)", id, read[id], read)
 		}
+	}
+}
+
+// TestIntegrationServerPartitionTypePairError: an existing long column
+// partitioned by identity, written as a string column, fails the first chunk
+// with gRPC InvalidArgument and HTTP 400 (D6 at the RPC layer); nothing is
+// committed.
+func TestIntegrationServerPartitionTypePairError(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_part", "typed"
+	ctx := context.Background()
+	cat, err := resolver(t, fx).Catalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.CreateNamespace(ctx, catalog.ToIdentifier(ns), nil); err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
+		t.Fatal(err)
+	}
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String})
+	fid := iceberg.PartitionDataIDStart
+	spec, err := iceberg.NewPartitionSpecOpts(iceberg.AddPartitionFieldByName("id", "id", iceberg.IdentityTransform{}, sc, &fid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(ctx, catalog.ToIdentifier(ns, tbl), sc, catalog.WithPartitionSpec(&spec)); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	srv := startPartitionServer(t, fx, "0123456789abcdef-server-pair", ns, tbl, nil)
+
+	open, err := srv.OpenWriter(ctx, &pb.OpenWriterRequest{Bucket: ns, Table: tbl, InputFormat: pb.DataFormat_FORMAT_CSV,
+		Schema: &pb.Schema{Columns: []*pb.ColumnDef{{Name: "id", Type: "string", Nullable: true}, {Name: "name", Type: "string", Nullable: true}}}})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	_, err = srv.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: open.WriterId, Data: []byte("id,name\nx,a\n")})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "cannot be converted to the table type long") {
+		t.Fatalf("gRPC WriteChunk err = %v (code %s), want InvalidArgument naming the type pair", err, status.Code(err))
+	}
+	resp, err := http.Post(open.HttpEndpoint, "text/csv", strings.NewReader("id,name\nx,a\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "INVALID_ARGUMENT") {
+		t.Fatalf("HTTP = %d %s, want 400 INVALID_ARGUMENT", resp.StatusCode, body)
+	}
+	tb, err := cat.LoadTable(ctx, catalog.ToIdentifier(ns, tbl))
+	if err != nil || tb.CurrentSnapshot() != nil {
+		t.Fatalf("table after the rejected writes: snapshot %v, err %v; want none", tb.CurrentSnapshot(), err)
 	}
 }

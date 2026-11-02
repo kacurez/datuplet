@@ -3,6 +3,7 @@ package datagateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -81,6 +82,48 @@ func TestInferredSchemaPartitionErrorOnFirstChunk(t *testing.T) {
 		Schema: &pb.Schema{Columns: []*pb.ColumnDef{{Name: "id", Type: "int64", Nullable: true}}}})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("OpenWriter with schema err = %v, want InvalidArgument", err)
+	}
+}
+
+// The D6 (Arrow type, table type) check fails in the plane's
+// OpenTableWriter on the first chunk; that error reaches the client as gRPC
+// InvalidArgument and HTTP 400 (the real goplane error is pinned by
+// TestIntegrationServerPartitionedWrite and goplane's unit tests).
+func TestPartitionTypePairErrorAtRPC(t *testing.T) {
+	s, p, _ := partitionedServer(t, PartitionFieldConfig{SourceColumn: "id", Transform: "identity"})
+	p.openWriterErr = fmt.Errorf("goplane: table raw.orders: %w: partition field id: column \"id\" has Arrow type utf8, which cannot be converted to the table type long", ErrInvalidPartition)
+	ctx := context.Background()
+	open, err := s.OpenWriter(ctx, &pb.OpenWriterRequest{Bucket: "raw", Table: "orders", InputFormat: pb.DataFormat_FORMAT_CSV})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	_, err = s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: open.WriterId, Data: []byte("id\nabc\n")})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "cannot be converted to the table type long") {
+		t.Fatalf("gRPC WriteChunk err = %v, want InvalidArgument with the type pair", err)
+	}
+	resp := httpWrite(s, open.WriterId, []byte("id\nabc\n"))
+	if e := decodeHTTPError(t, resp); resp.Code != http.StatusBadRequest || e.Code != "INVALID_ARGUMENT" {
+		t.Fatalf("HTTP = %d %+v, want 400 INVALID_ARGUMENT", resp.Code, e)
+	}
+}
+
+// partition_fields of a same-named table in another bucket do not apply.
+func TestPartitionFieldsMatchBucketAndTable(t *testing.T) {
+	s, _ := newWriteTestServer(t, &Config{
+		DefaultBucket: "raw",
+		OutputTables: []OutputTableConfig{
+			{Name: "orders", Bucket: "", PartitionFields: []PartitionFieldConfig{{SourceColumn: "a", Transform: "identity"}}},
+			{Name: "orders", Bucket: "curated", PartitionFields: []PartitionFieldConfig{{SourceColumn: "b", Transform: "day"}}},
+		},
+	})
+	if got := s.partitionFieldsFor("raw", "orders"); len(got) != 0 {
+		t.Fatalf("raw.orders fields = %v, want none", got)
+	}
+	if got := s.partitionFieldsFor("curated", "orders"); len(got) != 1 || got[0].SourceColumn != "b" {
+		t.Fatalf("curated.orders fields = %v, want [day(b)]", got)
+	}
+	if got := s.partitionFieldsFor("other", "orders"); len(got) != 0 {
+		t.Fatalf("other.orders fields = %v, want none", got)
 	}
 }
 
