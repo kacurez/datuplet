@@ -23,8 +23,7 @@ func TestNewResolver_RequiresURL(t *testing.T) {
 }
 
 // TestNewResolver_OK: a non-empty URL succeeds. Constructor doesn't
-// dial lakekeeper — opening a connection is deferred to LoadOrCreate
-// / LoadTableForRead.
+// dial lakekeeper — opening a connection is deferred to LoadOrCreate.
 func TestNewResolver_OK(t *testing.T) {
 	r, err := NewResolver("http://example.invalid:8181/catalog", "datuplet", "jwt-1", "11111111-2222-3333-4444-555555555555")
 	if err != nil {
@@ -47,54 +46,10 @@ func TestNewResolver_OK(t *testing.T) {
 	}
 }
 
-// TestBuildBackend_FileScheme: a file:// data prefix yields a
-// LocalBackend and nil VendedCreds via the scheme dispatcher. Used by
-// tests + local-mode dev where no S3 client is needed.
-func TestBuildBackend_FileScheme(t *testing.T) {
-	r := &Resolver{URL: "http://example.invalid:8181/catalog", Warehouse: "datuplet"}
-	be, vc, err := r.buildBackend("file:///tmp/warehouse/raw/orders/data/", "raw", "orders")
-	if err != nil {
-		t.Fatalf("buildBackend file://: %v", err)
-	}
-	if be == nil {
-		t.Fatal("buildBackend file://: nil backend")
-	}
-	if vc != nil {
-		t.Error("buildBackend file://: VendedCreds should be nil for file:// (no STS)")
-	}
-}
-
-// TestBuildBackend_UnsupportedScheme: a path that's neither s3://, gs://,
-// nor file:// is rejected by the dispatcher. Catches a misconfigured
-// lakekeeper warehouse returning e.g. an HTTP URL.
-func TestBuildBackend_UnsupportedScheme(t *testing.T) {
-	r := &Resolver{URL: "http://example.invalid:8181/catalog", Warehouse: "datuplet"}
-	_, _, err := r.buildBackend("http://example.invalid/data/", "raw", "orders")
-	if err == nil {
-		t.Fatal("buildBackend http://: expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "unsupported scheme") {
-		t.Errorf("buildBackend http://: unexpected error: %v", err)
-	}
-}
-
-// TestBuildS3Backend_S3SchemeMissingBucket: an s3:// URL with no
-// bucket segment is rejected.
-func TestBuildS3Backend_S3SchemeMissingBucket(t *testing.T) {
-	r := &Resolver{URL: "http://example.invalid:8181/catalog", Warehouse: "datuplet"}
-	_, _, err := r.buildS3Backend("s3:///orphan-prefix/data/", "raw", "orders")
-	if err == nil {
-		t.Fatal("buildS3Backend s3:/// (empty bucket): expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "cannot derive bucket") {
-		t.Errorf("buildS3Backend s3:/// : unexpected error: %v", err)
-	}
-}
-
-// TestBuildS3Backend_S3WithToken: an s3:// data prefix with a real
-// bucket succeeds and VendedCreds is wired up. The token comes from
-// r.Token (single per-run JWT).
-func TestBuildS3Backend_S3WithToken(t *testing.T) {
+// TestWriteCreds_S3FetchesWithRunToken: an s3:// writer's VendedCreds
+// fetches STS credentials from lakekeeper with r.Token (single per-run JWT)
+// and resolves the warehouse prefix through /v1/config.
+func TestWriteCreds_S3FetchesWithRunToken(t *testing.T) {
 	stsResp := `{
 	  "config": {
 	    "s3.access-key-id":     "AKIA-VENDED",
@@ -126,15 +81,16 @@ func TestBuildS3Backend_S3WithToken(t *testing.T) {
 		Token:     "jwt-run-token",
 	}
 	dataPrefix := "s3://datuplet/" + warehouseUUID + "/019dceed-tbluuid/data/"
-	be, vc, err := r.buildS3Backend(dataPrefix, "raw", "orders")
+	vc, err := r.writeCreds(dataPrefix, "raw", "orders")
+	if err != nil || vc == nil {
+		t.Fatalf("writeCreds s3:// = %v, %v; want populated VendedCreds", vc, err)
+	}
+	creds, err := vc.Get(context.Background())
 	if err != nil {
-		t.Fatalf("buildS3Backend s3://: %v", err)
+		t.Fatalf("VendedCreds.Get: %v", err)
 	}
-	if be == nil {
-		t.Fatal("buildS3Backend s3://: nil backend")
-	}
-	if vc == nil {
-		t.Fatal("buildS3Backend s3://: nil VendedCreds, want populated")
+	if s3, ok := creds.(catalogwriter.S3Creds); !ok || s3.AccessKeyID != "AKIA-VENDED" {
+		t.Errorf("vended creds = %v, want the stub's S3 credentials", creds)
 	}
 	if vc.Namespace != "raw" || vc.Table != "orders" {
 		t.Errorf("VendedCreds (ns, tbl) = (%q, %q), want (raw, orders)", vc.Namespace, vc.Table)
@@ -154,46 +110,6 @@ func TestBuildS3Backend_S3WithToken(t *testing.T) {
 	}
 	if !strings.Contains(seenAuth, "jwt-run-token") {
 		t.Errorf("STS Authorization header = %q, want it to contain \"jwt-run-token\"", seenAuth)
-	}
-}
-
-// TestBuildBackendRejectsUnknownScheme: buildBackend must return an
-// "unsupported scheme" error for paths that are neither s3://, gs://, nor
-// file://. The error message must mention gs:// as a supported scheme so
-// operators know GCS is available.
-func TestBuildBackendRejectsUnknownScheme(t *testing.T) {
-	r := &Resolver{URL: "http://example.invalid:8181/catalog", Warehouse: "datuplet"}
-	_, _, err := r.buildBackend("azure://x/y", "ns", "tbl")
-	if err == nil || !strings.Contains(err.Error(), "unsupported scheme") {
-		t.Fatalf("expected unsupported-scheme error, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "gs://") {
-		t.Fatalf("error message should mention gs:// as a supported scheme; got %v", err)
-	}
-}
-
-// TestBuildBackendDispatchesGCS: a gs:// data prefix is routed to
-// buildGCSBackend via buildBackend. The returned backend must be non-nil,
-// VendedCreds must be non-nil, and ExpectedCredsType must be CredsTypeGCS.
-func TestBuildBackendDispatchesGCS(t *testing.T) {
-	r := &Resolver{
-		URL:       "http://test.example/catalog",
-		Warehouse: "test-warehouse",
-		ProjectID: "proj",
-		Token:     "fake-token",
-	}
-	be, vc, err := r.buildBackend("gs://test-bucket/some/prefix", "ns", "tbl")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if be == nil {
-		t.Fatal("nil backend")
-	}
-	if vc == nil {
-		t.Fatal("nil VendedCreds")
-	}
-	if vc.ExpectedCredsType != catalogwriter.CredsTypeGCS {
-		t.Fatalf("ExpectedCredsType = %q, want gcs", vc.ExpectedCredsType)
 	}
 }
 

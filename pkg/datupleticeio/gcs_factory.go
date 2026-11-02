@@ -108,8 +108,7 @@ func datupletGCSFactory(ctx context.Context, parsed *url.URL, props map[string]s
 		TokenType:   "Bearer",
 	}, refresh)
 
-	// HTTP transport composition (mirrors the WRITE-side pattern in
-	// pkg/datagateway/backend/gcs.go::NewGCSBackendWithProvider):
+	// HTTP transport composition:
 	//
 	//   gcp.DefaultTransport()   — net/http transport with GCP defaults
 	//     + gcp's TokenSource wrapper (adds Authorization header per

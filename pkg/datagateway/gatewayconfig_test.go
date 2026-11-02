@@ -123,9 +123,6 @@ func TestLoadConfigFile_OperatorShape(t *testing.T) {
 	if string(cfg.ComponentCfg) != `{"token":"$[api_token]","url":"https://example.test/api"}` {
 		t.Errorf("ComponentCfg = %s", cfg.ComponentCfg)
 	}
-	if cfg.Backend != nil {
-		t.Errorf("Backend must stay nil (static backends are the caller's concern)")
-	}
 }
 
 func TestLoadConfigFile_Defaults(t *testing.T) {

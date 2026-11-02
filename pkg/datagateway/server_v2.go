@@ -2,7 +2,7 @@
 //
 // Path Handling Design:
 // All storage paths flowing through DataGateway are treated as opaque URLs.
-// Any parsing or normalization must happen in the backend layer.
+// Any parsing or normalization must happen in the data plane.
 // Paths come from lakekeeper (per-table data prefix returned by
 // LoadTable / CreateTable) and are passed verbatim to the DataPlane.
 package datagateway
@@ -29,7 +29,6 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
 	"github.com/datuplet/datuplet/pkg/datagateway/jwks"
 	dglakekeeper "github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
@@ -46,12 +45,11 @@ type ServerV2 struct {
 	pb.UnimplementedDataGatewayServer
 
 	config    *Config
-	backend   backend.StorageBackend // read side only (static test backend)
 	allocator memory.Allocator
 	registry  *format.Registry
 
-	// plane writes (and, from Task 6, reads) table data. Built once by the
-	// DataPlaneFactory in NewServerV2; nil only in hand-built test servers.
+	// plane writes and reads table data. Built once by the DataPlaneFactory
+	// in NewServerV2; nil only in hand-built test servers.
 	plane DataPlane
 
 	writers map[string]*writerState
@@ -85,7 +83,8 @@ type ServerV2 struct {
 	cancelStop context.CancelFunc
 
 	// cancelled is set (under mu) by the cancel watcher before it snapshots
-	// the open writers; a writer published afterwards is aborted instead.
+	// the open writers and readers; one published afterwards is aborted or
+	// closed instead.
 	cancelled bool
 
 	// lakekeeperResolver is constructed at boot when Config.LakekeeperURL
@@ -95,9 +94,8 @@ type ServerV2 struct {
 	lakekeeperResolver tableResolver
 
 	// commitPool dispatches per-table iceberg commits inline after
-	// CloseWriter. nil when lakekeeperResolver is nil (test/static-backend
-	// mode). In that case CloseWriter still writes metadata but skips the
-	// commit dispatch.
+	// CloseWriter. nil when lakekeeperResolver is nil (test mode). In that
+	// case CloseWriter still writes metadata but skips the commit dispatch.
 	commitPool *CommitPool
 
 	// validatedClaims holds the validated run-token JWT claims set during
@@ -113,7 +111,6 @@ type ServerV2 struct {
 // table creates).
 type tableResolver interface {
 	LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sp dglakekeeper.SchemaProvider) (*dglakekeeper.WriterTarget, error)
-	LoadTableForRead(ctx context.Context, ns, tbl string) (*dglakekeeper.ReaderTarget, error)
 	Catalog(ctx context.Context) (catalog.Catalog, error)
 	Close() error
 }
@@ -163,28 +160,6 @@ type writerState struct {
 	committed bool
 }
 
-// readerState holds the state for an active reader.
-type readerState struct {
-	inputName string
-	tablePath string
-
-	// Backend reader
-	backendReader backend.Reader
-
-	// Output format adapter
-	adapter format.FormatAdapter
-
-	// Transform pipeline (optional)
-	pipeline *processor.Pipeline
-
-	// Schema
-	schema *schema.Schema
-
-	// Per-reader backend (vended-creds-backed minio backend, or static
-	// backend in test mode).
-	readerBackend backend.StorageBackend
-}
-
 // joinStoragePath joins a base path with a filename in a URL-safe way.
 // It handles both URL schemes (s3://, file://) and plain relative paths.
 // This avoids creating double slashes when basePath has a trailing slash.
@@ -211,10 +186,10 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 		}
 	}
 
-	// A static backend or local data dir would bypass the per-table
-	// vended-creds contract that lakekeeper routing requires.
-	if cfg.LakekeeperURL != "" && (cfg.Backend != nil || cfg.LocalDataDir != "") {
-		return nil, errors.New("data gateway: a static backend or local data dir must not be set when LakekeeperURL is configured")
+	// A local data dir would bypass the per-table vended-creds contract
+	// that lakekeeper routing requires.
+	if cfg.LakekeeperURL != "" && cfg.LocalDataDir != "" {
+		return nil, errors.New("data gateway: a local data dir must not be set when LakekeeperURL is configured")
 	}
 
 	httpAddr := cfg.HTTPAddr
@@ -243,7 +218,6 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 	}
 	s := &ServerV2{
 		config:          cfg,
-		backend:         cfg.Backend,
 		allocator:       memory.NewGoAllocator(),
 		registry:        format.DefaultRegistry(),
 		writers:         make(map[string]*writerState),
@@ -343,8 +317,8 @@ func (s *ServerV2) isCancelled() bool {
 }
 
 // watchCancel waits for the cancel annotation; on it, it cancels the commit
-// pool, interrupts the data plane, aborts every open writer and cancels ctx
-// (Serve watches it and stops the servers).
+// pool, interrupts the data plane, aborts every open writer, closes every
+// open reader and cancels ctx (Serve watches it and stops the servers).
 func (s *ServerV2) watchCancel(ctx context.Context, stop context.CancelFunc) {
 	if err := WatchCancelAnnotation(ctx, s.config.PodAnnotationsPath, s.config.CancelPollInterval); err != nil {
 		return // ctx done: server closing
@@ -362,12 +336,25 @@ func (s *ServerV2) watchCancel(ctx context.Context, stop context.CancelFunc) {
 			open = append(open, ws.tw)
 		}
 	}
+	readers := s.openReadersLocked()
 	s.mu.Unlock()
 	s.plane.Interrupt()
 	for _, tw := range open {
 		tw.Abort()
 	}
+	for _, rs := range readers {
+		rs.close()
+	}
 	stop()
+}
+
+// openReadersLocked returns the open readers; the caller holds s.mu.
+func (s *ServerV2) openReadersLocked() []*readerState {
+	out := make([]*readerState, 0, len(s.readers))
+	for _, rs := range s.readers {
+		out = append(out, rs)
+	}
+	return out
 }
 
 // validateRunTokenForBoot performs the JWT validation + raw-token read for DG
@@ -649,6 +636,12 @@ func (s *ServerV2) Close() error {
 
 	// Close the data plane once no commit can still be running; open
 	// writers and readers end with it.
+	s.mu.Lock()
+	readers := s.openReadersLocked()
+	s.mu.Unlock()
+	for _, rs := range readers {
+		rs.close()
+	}
 	if s.plane != nil {
 		if err := s.plane.Close(); err != nil {
 			log.Printf("Warning: data plane close error: %v", err)
@@ -665,51 +658,6 @@ func (s *ServerV2) Close() error {
 	}
 
 	return nil
-}
-
-// ============================================================================
-// Schema/Sampling RPCs
-// ============================================================================
-
-func (s *ServerV2) GetSchema(ctx context.Context, req *pb.GetSchemaRequest) (*pb.SchemaResponse, error) {
-	tablePath, ok := s.config.Inputs[req.InputName]
-	if !ok {
-		return nil, fmt.Errorf("unknown input: %s", req.InputName)
-	}
-
-	backendSchema, err := s.backend.GetSchema(ctx, tablePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get schema for %s: %w", req.InputName, err)
-	}
-
-	sch := backendSchemaToGatewaySchema(backendSchema)
-	return &pb.SchemaResponse{
-		Schema: schemaToProto(sch),
-	}, nil
-}
-
-func (s *ServerV2) GetSample(ctx context.Context, req *pb.GetSampleRequest) (*pb.SampleResponse, error) {
-	tablePath, ok := s.config.Inputs[req.InputName]
-	if !ok {
-		return nil, fmt.Errorf("unknown input: %s", req.InputName)
-	}
-
-	limit := int(req.Limit)
-	if limit <= 0 {
-		limit = 10
-	}
-
-	sample, err := s.backend.GetSample(ctx, tablePath, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get sample for %s: %w", req.InputName, err)
-	}
-
-	sch := backendSchemaToGatewaySchema(sample.Schema)
-	return &pb.SampleResponse{
-		Schema:        schemaToProto(sch),
-		Rows:          sample.Rows,
-		TotalEstimate: sample.TotalEstimate,
-	}, nil
 }
 
 // ============================================================================
@@ -811,42 +759,6 @@ func schemaToProto(s *schema.Schema) *pb.Schema {
 	}
 
 	return &pb.Schema{Columns: columns}
-}
-
-// gatewaySchemaToBackendSchema converts schema.Schema to backend.SchemaInfo.
-// Returns nil if input is nil.
-func gatewaySchemaToBackendSchema(sch *schema.Schema) *backend.SchemaInfo {
-	if sch == nil {
-		return nil
-	}
-	cols := make([]backend.ColumnInfo, len(sch.Columns()))
-	for i, c := range sch.Columns() {
-		cols[i] = backend.ColumnInfo{
-			Name:     c.Name,
-			Type:     c.Type.String(),
-			Nullable: c.Nullable,
-		}
-	}
-	return &backend.SchemaInfo{Columns: cols}
-}
-
-// backendSchemaToGatewaySchema converts backend.SchemaInfo to schema.Schema.
-func backendSchemaToGatewaySchema(backendSchema *backend.SchemaInfo) *schema.Schema {
-	if backendSchema == nil {
-		return nil
-	}
-
-	columns := make([]schema.ColumnDef, len(backendSchema.Columns))
-	for i, col := range backendSchema.Columns {
-		columns[i] = schema.ColumnDef{
-			Name:     col.Name,
-			Type:     schema.ParseDataType(col.Type),
-			Nullable: col.Nullable,
-		}
-	}
-
-	s, _ := schema.NewSchema(columns)
-	return s
 }
 
 // buildPipelineFromProcessors builds a transform pipeline from config processors.

@@ -519,7 +519,13 @@ func TestIntegrationAbortLeavesNoS3Object(t *testing.T) {
 // targets (see morTargetedProps).
 func createReadTable(t *testing.T, r *lakekeeper.Resolver, ns, tbl string) *lakekeeper.WriterTarget {
 	t.Helper()
-	target := createTable(t, r, ns, tbl, testSchema)
+	return createReadTableWith(t, r, ns, tbl, testSchema)
+}
+
+// createReadTableWith is createReadTable for a table with schema sch.
+func createReadTableWith(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, sch *arrow.Schema) *lakekeeper.WriterTarget {
+	t.Helper()
+	target := createTable(t, r, ns, tbl, sch)
 	tb := loadLK(t, r, ns, tbl)
 	if v := tb.Metadata().Version(); v != 2 {
 		t.Fatalf("table format version %d, want 2", v)

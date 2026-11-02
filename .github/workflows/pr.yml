@@ -46,7 +46,7 @@ jobs:
         # See RFC 019 §B.3-B.4 for what this covers.
         run: |
           go test -tags=integration -count=1 -timeout 10m \
-            ./pkg/datagateway/backend/... \
+            ./pkg/datagateway/goplane/... \
             ./pkg/datupleticeio/...
 
   duckdb-modules:

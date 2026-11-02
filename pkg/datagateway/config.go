@@ -2,8 +2,6 @@ package datagateway
 
 import (
 	"time"
-
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
 )
 
 // Config contains the gateway server configuration.
@@ -35,10 +33,7 @@ type Config struct {
 	BufferSize     int64  `yaml:"buffer_size,omitempty"`
 	RowGroupSize   int64  `yaml:"row_group_size,omitempty"`
 	TargetFileSize int64  `yaml:"target_file_size,omitempty"`
-	// Backend is a static storage backend for the read side in tests (Not
-	// serialized). Writes never use it.
-	Backend  backend.StorageBackend `yaml:"-"`
-	HTTPAddr string                 `yaml:"http_addr,omitempty"`
+	HTTPAddr       string `yaml:"http_addr,omitempty"`
 
 	// LocalDataDir (tests only; not serialized): with no LakekeeperURL,
 	// writer data prefixes are <LocalDataDir>/<bucket>/<table>/data/ and no
@@ -66,9 +61,9 @@ type Config struct {
 
 	// LakekeeperURL is the base URL of the Iceberg REST catalog (lakekeeper).
 	// When set, the gateway constructs a `pkg/datagateway/lakekeeper.Resolver`
-	// at boot and routes per-write/per-read requests through it for
-	// LoadOrCreate + vended-creds rotation. Empty = tests only (LocalDataDir
-	// for writes, Backend for reads).
+	// at boot and routes writes through it for LoadOrCreate + vended-creds
+	// rotation (the data plane loads tables for reads through it). Empty = tests only
+	// (LocalDataDir for writes).
 	LakekeeperURL string `yaml:"lakekeeper_url,omitempty"`
 
 	// PipelineAPIJWKSURL is the JWKS endpoint URL pipeline-api serves

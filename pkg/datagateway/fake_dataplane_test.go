@@ -27,9 +27,9 @@ import (
 type fakeDataPlane struct {
 	mu sync.Mutex
 
-	writers []*fakeTableWriter
-	readers []*fakeTableReader
-	tables  map[string]fakeTable
+	writers    []*fakeTableWriter
+	readerList []*fakeTableReader // every reader opened, in order
+	tables     map[string]fakeTable
 
 	writeErr      error
 	openReaderErr error
@@ -43,9 +43,23 @@ type fakeDataPlane struct {
 	// rejectLargeTypes makes OpenTableWriter refuse large_string /
 	// large_binary columns, as the DuckDB plane does (duckplane selectList).
 	rejectLargeTypes bool
-	// openAfterInterrupt lets OpenTableWriter succeed after Interrupt (not
-	// after Close), as the DuckDB plane does; writers opened then are live.
+	// openAfterInterrupt lets OpenTableWriter and OpenTableReader succeed
+	// after Interrupt (not after Close); writers and readers opened then are
+	// live.
 	openAfterInterrupt bool
+
+	// nextErr, when set, fails a reader's batch Next once that reader has
+	// returned nextErrAfter batches (counted across its parts).
+	nextErr      error
+	nextErrAfter int
+	nextErrOnce  bool // the injected Next failure fires once, then clears
+	// rawOpenErr, when set, fails every RawFile.Open.
+	rawOpenErr error
+	// beforeOpenReader, when set, runs at the start of OpenTableReader
+	// (before p.mu), so a test can pause an open across a cancel.
+	beforeOpenReader func()
+	// readerSpecs records the ReaderSpec of every OpenTableReader call.
+	readerSpecs []ReaderSpec
 }
 
 type fakeTable struct {
@@ -59,9 +73,17 @@ type fakePart struct {
 	raw     []byte
 	rows    int64
 	batches []arrow.RecordBatch
+	size    int64                // rawFakePartFunc only
+	open    func() io.ReadCloser // rawFakePartFunc only
 }
 
 func rawFakePart(b []byte, rows int64) fakePart { return fakePart{raw: b, rows: rows} }
+
+// rawFakePartFunc is a raw part of size bytes whose body comes from open
+// (wrapped so reader Close still closes it).
+func rawFakePartFunc(size, rows int64, open func() io.ReadCloser) fakePart {
+	return fakePart{raw: []byte{}, rows: rows, size: size, open: open}
+}
 
 func batchFakePart(batches ...arrow.RecordBatch) fakePart { return fakePart{batches: batches} }
 
@@ -74,12 +96,6 @@ func newFakeDataPlane() *fakeDataPlane {
 }
 
 var _ DataPlane = (*fakeDataPlane)(nil)
-
-func (p *fakeDataPlane) isDead() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.dead
-}
 
 func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (TableWriter, error) {
 	// Context ownership: the writer's lifetime never derives from the Open
@@ -104,9 +120,13 @@ func (p *fakeDataPlane) OpenTableWriter(_ context.Context, spec WriterSpec) (Tab
 }
 
 func (p *fakeDataPlane) OpenTableReader(_ context.Context, spec ReaderSpec) (TableReader, error) {
+	if p.beforeOpenReader != nil {
+		p.beforeOpenReader()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.dead {
+	p.readerSpecs = append(p.readerSpecs, spec)
+	if p.closed || (p.dead && !p.openAfterInterrupt) {
 		return nil, errFakePlaneDead
 	}
 	if p.openReaderErr != nil {
@@ -117,7 +137,7 @@ func (p *fakeDataPlane) OpenTableReader(_ context.Context, spec ReaderSpec) (Tab
 		return nil, fmt.Errorf("fake: unknown table %s.%s", spec.Namespace, spec.Table)
 	}
 	r := &fakeTableReader{plane: p, table: t}
-	p.readers = append(p.readers, r)
+	p.readerList = append(p.readerList, r)
 	return r, nil
 }
 
@@ -126,8 +146,50 @@ func (p *fakeDataPlane) Interrupt() {
 	p.interruptedF = true
 	p.dead = true
 	writers := append([]*fakeTableWriter(nil), p.writers...)
+	readers := append([]*fakeTableReader(nil), p.readerList...)
 	p.mu.Unlock()
 	terminateAll(writers)
+	interruptAll(readers)
+}
+
+// interruptAll fails every reader's later NextPart, Next and raw Open (each
+// under its own lock).
+func interruptAll(readers []*fakeTableReader) {
+	for _, r := range readers {
+		r.mu.Lock()
+		r.interrupted = true
+		r.mu.Unlock()
+	}
+}
+
+// readers returns every reader opened so far.
+func (p *fakeDataPlane) readers() []*fakeTableReader {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*fakeTableReader(nil), p.readerList...)
+}
+
+// failNext makes a reader's batch Next fail with err once that reader has
+// returned after batches.
+func (p *fakeDataPlane) failNext(err error, after int) {
+	p.mu.Lock()
+	p.nextErr, p.nextErrAfter, p.nextErrOnce = err, after, false
+	p.mu.Unlock()
+}
+
+// failNextOnce is failNext for a single (transient) failure: the next Next
+// after that one carries on with the following batch.
+func (p *fakeDataPlane) failNextOnce(err error, after int) {
+	p.mu.Lock()
+	p.nextErr, p.nextErrAfter, p.nextErrOnce = err, after, true
+	p.mu.Unlock()
+}
+
+// failRawOpen makes every RawFile.Open fail with err (nil clears it).
+func (p *fakeDataPlane) failRawOpen(err error) {
+	p.mu.Lock()
+	p.rawOpenErr = err
+	p.mu.Unlock()
 }
 
 // terminateAll marks each writer terminated and releases its batches, each
@@ -147,8 +209,10 @@ func (p *fakeDataPlane) Close() error {
 	p.closed = true
 	p.dead = true
 	writers := append([]*fakeTableWriter(nil), p.writers...)
+	readers := append([]*fakeTableReader(nil), p.readerList...)
 	p.mu.Unlock()
 	terminateAll(writers)
+	interruptAll(readers)
 	return nil
 }
 
@@ -175,22 +239,21 @@ func (p *fakeDataPlane) setTableParts(ns, table string, schema *arrow.Schema, pa
 // Closed, how many part streams were handed out, and how many of those were
 // Closed.
 func (p *fakeDataPlane) readerStats() (readers, readersClosed, streams, streamsClosed int) {
-	p.mu.Lock()
-	rs := append([]*fakeTableReader(nil), p.readers...)
-	p.mu.Unlock()
-	for _, r := range rs {
+	for _, r := range p.readers() {
 		r.mu.Lock()
+		closed := r.closes > 0
+		sts := append([]*fakeRecordStream(nil), r.streams...)
+		r.mu.Unlock()
 		readers++
-		if r.closed {
+		if closed {
 			readersClosed++
 		}
-		for _, st := range r.streams {
+		for _, st := range sts {
 			streams++
 			if st.isClosed() {
 				streamsClosed++
 			}
 		}
-		r.mu.Unlock()
 	}
 	return
 }
@@ -375,31 +438,42 @@ func (w *fakeTableWriter) recorded() []arrow.RecordBatch {
 }
 
 // fakeTableReader replays a fakeTable part by part and records its own Close
-// and the Close of every part stream it handed out.
+// calls and the Close of every part stream it handed out. Lock order:
+// fakeRecordStream.mu -> fakeTableReader.mu -> fakeDataPlane.mu.
 type fakeTableReader struct {
 	plane *fakeDataPlane
 	table fakeTable
 
-	mu      sync.Mutex
-	next    int
-	closed  bool
-	streams []*fakeRecordStream
-	rawOpen []*fakeRawBody
+	mu          sync.Mutex
+	next        int
+	served      int // batches returned by this reader's part streams
+	closes      int // Close calls
+	interrupted bool
+	streams     []*fakeRecordStream
+	rawOpen     []*fakeRawBody
 }
 
 func (r *fakeTableReader) Schema() *arrow.Schema { return r.table.schema }
+
+// liveLocked reports why the reader can no longer serve; the caller holds r.mu.
+func (r *fakeTableReader) liveLocked() error {
+	if r.interrupted {
+		return errFakePlaneDead
+	}
+	if r.closes > 0 {
+		return errors.New("fake: reader is closed")
+	}
+	return nil
+}
 
 func (r *fakeTableReader) NextPart(ctx context.Context) (ReadPart, error) {
 	if err := ctx.Err(); err != nil {
 		return ReadPart{}, err
 	}
-	if r.plane.isDead() {
-		return ReadPart{}, errFakePlaneDead
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		return ReadPart{}, errors.New("fake: NextPart on closed reader")
+	if err := r.liveLocked(); err != nil {
+		return ReadPart{}, err
 	}
 	if r.next >= len(r.table.parts) {
 		return ReadPart{}, io.EOF
@@ -407,57 +481,106 @@ func (r *fakeTableReader) NextPart(ctx context.Context) (ReadPart, error) {
 	fp := r.table.parts[r.next]
 	r.next++
 	if fp.isRaw() {
+		size := int64(len(fp.raw))
+		if fp.open != nil {
+			size = fp.size
+		}
 		return ReadPart{Raw: &RawFile{
 			Path: fmt.Sprintf("fake://part-%05d.parquet", r.next-1),
 			Rows: fp.rows,
-			Size: int64(len(fp.raw)),
-			Open: func(ctx context.Context) (io.ReadCloser, error) { return r.openRaw(ctx, fp.raw) },
+			Size: size,
+			Open: func(ctx context.Context) (io.ReadCloser, error) { return r.openRaw(ctx, fp) },
 		}}, nil
 	}
-	st := &fakeRecordStream{plane: r.plane, schema: r.table.schema, batches: fp.batches}
+	st := &fakeRecordStream{reader: r, schema: r.table.schema, batches: fp.batches}
 	r.streams = append(r.streams, st)
 	return ReadPart{Records: st}, nil
 }
 
-// openRaw hands out the raw bytes; it fails once the reader (or plane) is
-// closed, as a real raw Open would after its credentials/context are gone.
-func (r *fakeTableReader) openRaw(ctx context.Context, b []byte) (io.ReadCloser, error) {
+// openRaw hands out the raw bytes; it fails once the reader is closed or
+// interrupted, as a real raw Open would after its context is gone.
+func (r *fakeTableReader) openRaw(ctx context.Context, fp fakePart) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.plane.isDead() {
-		return nil, errFakePlaneDead
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		return nil, errors.New("fake: raw Open on closed reader")
+	if err := r.liveLocked(); err != nil {
+		return nil, err
 	}
-	body := &fakeRawBody{Reader: bytes.NewReader(b)}
+	r.plane.mu.Lock()
+	openErr := r.plane.rawOpenErr
+	r.plane.mu.Unlock()
+	if openErr != nil {
+		return nil, openErr
+	}
+	var rc io.ReadCloser = io.NopCloser(bytes.NewReader(fp.raw))
+	if fp.open != nil {
+		rc = fp.open()
+	}
+	body := &fakeRawBody{rc: rc}
 	r.rawOpen = append(r.rawOpen, body)
 	return body, nil
 }
 
-// Close closes the reader and every part stream still open (idempotent).
+// Close closes the reader, every part stream and every raw body still open
+// (idempotent; every call is counted).
 func (r *fakeTableReader) Close() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.closed = true
-	for _, st := range r.streams {
+	r.closes++
+	streams := append([]*fakeRecordStream(nil), r.streams...)
+	bodies := append([]*fakeRawBody(nil), r.rawOpen...)
+	r.mu.Unlock()
+	for _, st := range streams {
 		st.Close()
+	}
+	for _, b := range bodies {
+		b.Close()
 	}
 	return nil
 }
 
+// closeCount is the number of Close calls.
+func (r *fakeTableReader) closeCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closes
+}
+
+// fakeRawBody is a raw part body; Read fails once it is closed.
 type fakeRawBody struct {
-	*bytes.Reader
+	mu     sync.Mutex
+	rc     io.ReadCloser
 	closed bool
 }
 
-func (b *fakeRawBody) Close() error { b.closed = true; return nil }
+func (b *fakeRawBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, errors.New("fake: read of a closed raw body")
+	}
+	return b.rc.Read(p)
+}
+
+func (b *fakeRawBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+	return b.rc.Close()
+}
+
+func (b *fakeRawBody) isClosed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed
+}
 
 type fakeRecordStream struct {
-	plane   *fakeDataPlane
+	reader  *fakeTableReader
 	schema  *arrow.Schema
 	batches []arrow.RecordBatch
 
@@ -478,19 +601,32 @@ func (s *fakeRecordStream) Next(ctx context.Context) (arrow.RecordBatch, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s.plane.isDead() {
-		return nil, errFakePlaneDead
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	r, p := s.reader, s.reader.plane
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.liveLocked(); err != nil {
+		return nil, err
+	}
 	if s.closed {
 		return nil, errors.New("fake: Next on closed stream")
+	}
+	p.mu.Lock()
+	nextErr, after := p.nextErr, p.nextErrAfter
+	if nextErr != nil && r.served >= after && p.nextErrOnce {
+		p.nextErr = nil
+	}
+	p.mu.Unlock()
+	if nextErr != nil && r.served >= after {
+		return nil, nextErr
 	}
 	if s.next >= len(s.batches) {
 		return nil, io.EOF
 	}
 	b := s.batches[s.next]
 	s.next++
+	r.served++
 	b.Retain() // caller Releases
 	return b, nil
 }

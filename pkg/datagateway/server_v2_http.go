@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
@@ -247,7 +248,8 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 	return tw, responseSchema, nil
 }
 
-// handleRead handles HTTP GET requests for reading data.
+// handleRead serves the next chunk of a reader. The request ctx is not used
+// for the read: a client that goes away mid-chunk does not end the reader.
 func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.httpError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED")
@@ -262,87 +264,54 @@ func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Look up reader state
-	s.mu.RLock()
-	rs, ok := s.readers[readerID]
-	s.mu.RUnlock()
-
+	rs, ok := s.lookupReader(readerID)
 	if !ok {
 		s.httpError(w, http.StatusNotFound, fmt.Sprintf("unknown reader: %s", readerID), "READER_NOT_FOUND")
 		return
 	}
 
-	// Read a chunk from backend
-	chunk, err := rs.backendReader.ReadChunk()
-	if err == io.EOF {
-		// No more data
+	rs.serveMu.Lock()
+	defer rs.serveMu.Unlock()
+	chunk, err := rs.nextChunk(s.readChunkSize(), s.allocator)
+	if err != nil {
+		s.httpError(w, http.StatusInternalServerError, fmt.Sprintf("read error: %v", err), "READ_ERROR")
+		return
+	}
+	if chunk == nil {
+		// The last chunk was already served.
 		w.Header().Set("X-Datuplet-Is-Last", "true")
 		w.Header().Set("X-Datuplet-Rows", "0")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if err != nil {
-		s.httpError(w, http.StatusInternalServerError, fmt.Sprintf("read error: %v", err), "READ_ERROR")
-		return
-	}
 
-	// Process chunk (convert format if needed)
-	outputData, rowsInChunk, err := s.processReadChunk(rs, chunk)
-	if err != nil {
-		s.httpError(w, http.StatusInternalServerError, err.Error(), "PROCESS_ERROR")
-		return
+	size := int64(len(chunk.data))
+	if chunk.raw != nil {
+		defer chunk.raw.Close()
+		size = chunk.rawSize
 	}
-
-	// Set response headers
-	w.Header().Set("Content-Type", dataFormatToContentType(rs.adapter.Format()))
-	w.Header().Set("X-Datuplet-Rows", fmt.Sprintf("%d", rowsInChunk))
-	w.Header().Set("X-Datuplet-Is-Last", fmt.Sprintf("%t", chunk.IsLast))
+	w.Header().Set("Content-Type", dataFormatToContentType(rs.format))
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.Header().Set("X-Datuplet-Rows", strconv.FormatInt(chunk.rows, 10))
+	w.Header().Set("X-Datuplet-Is-Last", strconv.FormatBool(chunk.last))
 	w.WriteHeader(http.StatusOK)
-	w.Write(outputData)
-}
-
-// processReadChunk processes a read chunk (shared between gRPC and HTTP).
-func (s *ServerV2) processReadChunk(rs *readerState, chunk *backend.DataChunk) ([]byte, int64, error) {
-	// Determine input format from chunk
-	inputFormat := format.ParseDataFormat(chunk.Format)
-
-	// If same format and no transforms, pass through
-	if inputFormat == rs.adapter.Format() && rs.pipeline == nil {
-		return chunk.Data, chunk.RowsInChunk, nil
+	if chunk.raw == nil {
+		w.Write(chunk.data)
+		return
 	}
-
-	// Get input adapter
-	inputAdapter, err := s.registry.Get(inputFormat)
+	// A raw part streams straight from storage, never buffered whole. Past
+	// the headers a failure can only cut the body short (the client sees
+	// fewer bytes than Content-Length); the reader fails for good so a retry
+	// never skips this chunk.
+	n, err := io.Copy(w, io.LimitReader(chunk.raw, size))
+	if err == nil && n != size {
+		err = fmt.Errorf("data file ended after %d of %d bytes", n, size)
+	}
 	if err != nil {
-		return nil, 0, fmt.Errorf("unsupported input format: %s", inputFormat)
+		err = fmt.Errorf("stream data file: %w", err)
+		log.Printf("Warning: reader %s: %v", readerID, err)
+		rs.failServed(err)
 	}
-
-	// Parse to Arrow
-	record, _, err := inputAdapter.Parse(chunk.Data, rs.schema)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to parse chunk: %w", err)
-	}
-	defer record.Release()
-
-	// Apply transforms if configured
-	outputRecord := record
-	if rs.pipeline != nil {
-		outputRecord, err = rs.pipeline.Apply(record, s.allocator)
-		if err != nil {
-			return nil, 0, fmt.Errorf("transform failed: %w", err)
-		}
-		if outputRecord != record {
-			defer outputRecord.Release()
-		}
-	}
-
-	// Serialize to output format
-	outputData, err := rs.adapter.Serialize(outputRecord)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to serialize: %w", err)
-	}
-
-	return outputData, outputRecord.NumRows(), nil
 }
 
 // httpError sends an HTTP error response.
