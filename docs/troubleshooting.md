@@ -240,13 +240,17 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
 - There is no `files.json` (or `.run-state/`) breadcrumb any more; don't look
   for one. The commit-pool error in the gateway log is the place to start.
 - A read is slow on a table with merge-on-read deletes or an evolved schema.
-  The gateway does not log which data files it served raw and which it decoded;
-  a file is served raw only when it has no deletes and matches the table's
-  current schema (see [architecture.md](architecture.md)), so a table with
-  delete files, renamed/added/dropped columns or non-canonical types reads
-  through the slower decoded path. This is expected, not a failure — see
+  Each read logs one summary line in the gateway container when it ends:
+  `read summary: table=<ns>.<table> format=<fmt> raw_files=N decoded_files=N
+  rows=N bytes=N chunks=N outcome=<ok|error|cancelled> duration=<d>`.
+  A high `decoded_files` means the slower decoded path ran. A file is served raw
+  only when it has no deletes and matches the table's current schema (see
+  [architecture.md](architecture.md)), so a table with delete files,
+  renamed/added/dropped columns or non-canonical types decodes. `bytes` is what
+  the gateway produced for the client; `outcome=cancelled` means the reader was
+  closed before the last chunk was served. Expected, not a failure — see
   [known-limitations.md](known-limitations.md) for the delete-metrics
-  workaround.
+  workaround. Non-Parquet request formats always decode.
 
 ---
 

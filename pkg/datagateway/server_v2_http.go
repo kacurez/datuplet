@@ -297,6 +297,9 @@ func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if chunk.raw == nil {
 		w.Write(chunk.data)
+		if chunk.last {
+			rs.stats.finish("ok")
+		}
 		return
 	}
 	// A raw part streams straight from storage, never buffered whole. Past
@@ -311,6 +314,10 @@ func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 		err = fmt.Errorf("stream data file: %w", err)
 		log.Printf("Warning: reader %s: %v", readerID, err)
 		rs.failServed(err)
+		return
+	}
+	if chunk.last {
+		rs.stats.finish("ok")
 	}
 }
 

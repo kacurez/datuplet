@@ -75,6 +75,7 @@ type fakePart struct {
 	batches []arrow.RecordBatch
 	size    int64                // rawFakePartFunc only
 	open    func() io.ReadCloser // rawFakePartFunc only
+	files   int                  // decoded part only: ReadPart.Files (0 = unset)
 }
 
 func rawFakePart(b []byte, rows int64) fakePart { return fakePart{raw: b, rows: rows} }
@@ -494,7 +495,7 @@ func (r *fakeTableReader) NextPart(ctx context.Context) (ReadPart, error) {
 	}
 	st := &fakeRecordStream{reader: r, schema: r.table.schema, batches: fp.batches}
 	r.streams = append(r.streams, st)
-	return ReadPart{Records: st}, nil
+	return ReadPart{Records: st, Files: fp.files}, nil
 }
 
 // openRaw hands out the raw bytes; it fails once the reader is closed or

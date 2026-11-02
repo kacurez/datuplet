@@ -169,8 +169,9 @@ func (r *reader) NextPart(ctx context.Context) (datagateway.ReadPart, error) {
 		if err != nil {
 			return datagateway.ReadPart{}, err
 		}
+		files := len(r.tasks) - r.next
 		r.next = len(r.tasks)
-		return datagateway.ReadPart{Records: s}, nil
+		return datagateway.ReadPart{Records: s, Files: files}, nil
 	}
 	cctx, stop := callContext(ctx, r.ctx)
 	defer stop()
@@ -202,8 +203,9 @@ func (r *reader) NextPart(ctx context.Context) (datagateway.ReadPart, error) {
 	if err != nil {
 		return datagateway.ReadPart{}, err
 	}
+	files := end - r.next
 	r.next = end
-	return datagateway.ReadPart{Records: s}, nil
+	return datagateway.ReadPart{Records: s, Files: files}, nil
 }
 
 func (r *reader) rawAt(ctx context.Context, i int) (bool, error) {
