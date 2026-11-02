@@ -184,10 +184,72 @@ func TestPlaneCloseRejectsWritersOnceClosing(t *testing.T) {
 	}
 }
 
-// TestPlaneCloseRacesOpenTableWriter: writers opened concurrently with Close
-// are either rejected or admitted; every admitted one has finished (its run
-// goroutine exited) by the time Close returns and accepts no more batches.
-// Under -race, an admission escaping Close's wait is also a WaitGroup misuse.
+// TestPlaneCloseDuringAdmission: Close starts while OpenTableWriter is
+// admitting a writer (from the admission hook, under the plane lock). The
+// admitted writer's upload abort is held; Close must wait for it, so at the
+// moment Close returns the writer has finished and its abort completed.
+func TestPlaneCloseDuringAdmission(t *testing.T) {
+	p := New(Config{})
+	sink := &slowAbortSink{release: make(chan struct{}), abortStarted: make(chan struct{})}
+	opened := make(chan struct{})
+	p.openSink = func(ctx context.Context, _ map[string]string, _ string, _ *blob.WriterOptions) (io.WriteCloser, error) {
+		sink.ctx = ctx
+		close(opened)
+		return sink, nil
+	}
+	rec := batchWith(memory.NewGoAllocator(), testSchema, 0, 10)
+	defer rec.Release()
+
+	var admitted *writer
+	var doneAtReturn, abortedAtReturn bool
+	closed := make(chan struct{})
+	p.admitHook = func(w *writer) {
+		admitted = w
+		// Close starts now; it blocks on the plane lock this call holds.
+		go func() {
+			_ = p.Close()
+			doneAtReturn, abortedAtReturn = isClosed(w.done), sink.aborted.Load()
+			close(closed)
+		}()
+		// Give the writer an open upload before admission completes, so its
+		// cleanup is an abort Close has to wait for.
+		if err := w.Write(context.Background(), rec); err != nil {
+			t.Errorf("Write during admission: %v", err)
+			return
+		}
+		waitClosed(t, opened, "the writer opening its sink")
+	}
+	tw, err := p.OpenTableWriter(context.Background(), datagateway.WriterSpec{
+		DataPrefix: "file:///unused/", FilePrefix: "part-admit", Schema: testSchema,
+	})
+	if err != nil || tw != admitted {
+		t.Fatalf("OpenTableWriter = %v, %v; want the admitted writer", tw, err)
+	}
+
+	waitClosed(t, sink.abortStarted, "the writer's abort")
+	if isClosed(closed) {
+		t.Fatal("Close returned while the admitted writer's abort was blocked")
+	}
+	if _, err := p.OpenTableWriter(context.Background(), datagateway.WriterSpec{
+		DataPrefix: "file:///unused/", FilePrefix: "part-late", Schema: testSchema,
+	}); err == nil {
+		t.Fatal("OpenTableWriter while Close waits succeeded, want an error")
+	}
+	close(sink.release)
+	waitClosed(t, closed, "Close returning")
+	if !doneAtReturn || !abortedAtReturn {
+		t.Fatalf("at Close's return: writer finished %v, abort finished %v; want both", doneAtReturn, abortedAtReturn)
+	}
+	if n := sink.closes.Load(); n != 1 {
+		t.Errorf("sink closed %d times, want 1", n)
+	}
+}
+
+// TestPlaneCloseRacesOpenTableWriter (supplementary stress): writers opened
+// concurrently with Close are either rejected or admitted; every admitted
+// one has finished by the time the openers are joined and accepts no more
+// batches. Under -race, an admission escaping Close's wait is also a
+// WaitGroup misuse. TestPlaneCloseDuringAdmission is the deterministic case.
 func TestPlaneCloseRacesOpenTableWriter(t *testing.T) {
 	const openers = 8
 	rec := batchWith(memory.NewGoAllocator(), testSchema, 0, 1)

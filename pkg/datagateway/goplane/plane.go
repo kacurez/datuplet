@@ -108,6 +108,10 @@ type Plane struct {
 	// budgetHook, nil in production, sees each partitioned writer's
 	// row-group budget decisions from inside its run goroutine; tests set it.
 	budgetHook func(budgetEvent)
+	// admitHook, nil in production, runs in OpenTableWriter right after a
+	// writer is admitted (counted in Close's wait), still under mu; tests
+	// set it.
+	admitHook func(*writer)
 
 	mu      sync.Mutex
 	closed  bool           // set by Close: no new writers
@@ -202,6 +206,9 @@ func (p *Plane) OpenTableWriter(_ context.Context, spec datagateway.WriterSpec) 
 		<-w.done
 		p.writers.Done()
 	}()
+	if p.admitHook != nil {
+		p.admitHook(w)
+	}
 	return w, nil
 }
 
