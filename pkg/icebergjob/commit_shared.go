@@ -22,7 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -157,12 +159,33 @@ func CommitTable(
 	if err != nil {
 		return nil, fmt.Errorf("CommitTable: read manifest %s: %w", manifestPath, err)
 	}
-	return CommitTableFiles(ctx, cat, ident, m.DataPaths, mode, snapshotProps, "")
+	return CommitTableFiles(ctx, cat, ident, m.DataPaths, nil, mode, snapshotProps, "")
+}
+
+// PartitionedFiles carries the partition tuples of files written to a
+// partitioned table (spec decision 11): the spec id they were written under
+// and, parallel to the data paths, each file's tuple (partition field id ->
+// value, nil for a null; an entry for every field of the spec).
+type PartitionedFiles struct {
+	SpecID int
+	Tuples []map[int]any
+}
+
+// txnAddFiles is the unpartitioned APPEND commit (a seam for tests).
+var txnAddFiles = func(ctx context.Context, txn *icebergtable.Transaction, paths []string, props iceberg.Properties) error {
+	return txn.AddFiles(ctx, paths, props, false)
 }
 
 // CommitTableFiles is the in-memory-paths variant of CommitTable: the
 // caller supplies dataPaths directly instead of via a files.json URL.
 // Used by Data Gateway's inline commit path (RFC 021).
+//
+// part is nil for files of an unpartitioned spec: APPEND uses AddFiles and
+// FULL_LOAD ReplaceDataFiles. For a partitioned spec the DataFiles are built
+// once from each file's footer plus its explicit tuple, and every attempt
+// checks that the table's default spec is still part.SpecID before
+// AddDataFiles / ReplaceDataFilesWithDataFiles. FULL_LOAD replaces the
+// current snapshot's data files (never its delete files) on both paths.
 //
 // idempotencyKey, when non-empty, is (a) checked against existing
 // snapshot summaries (key "datuplet.commit-key") on every attempt — a
@@ -175,6 +198,7 @@ func CommitTableFiles(
 	cat catalog.Catalog,
 	ident icebergtable.Identifier,
 	dataPaths []string,
+	part *PartitionedFiles,
 	mode WriteMode,
 	snapshotProps iceberg.Properties,
 	idempotencyKey string,
@@ -205,6 +229,13 @@ func CommitTableFiles(
 	}
 	result := CommitResult{WriteMode: mode, SnapshotIDBefore: snapshotIDOrEmpty(tbl), DataFilesAdded: len(dataPaths)}
 
+	var dataFiles []iceberg.DataFile
+	if part != nil {
+		if dataFiles, err = buildDataFiles(ctx, tbl, dataPaths, part); err != nil {
+			return nil, err
+		}
+	}
+
 	runErr := catalogwriter.RetryOnConflict(ctx, catalogwriter.RetryOpts{}, func(ctx context.Context) error {
 		fresh, err := cat.LoadTable(ctx, ident)
 		if err != nil {
@@ -216,16 +247,35 @@ func CommitTableFiles(
 				return errIdempotencyHit
 			}
 		}
+		if part != nil {
+			if cur := fresh.Metadata().DefaultPartitionSpec(); cur != part.SpecID {
+				return fmt.Errorf("partition spec changed during the run (spec id %d → %d)", part.SpecID, cur)
+			}
+		}
 		txn := fresh.NewTransaction()
 		switch mode {
 		case WriteModeAppend:
-			if err := txn.AddFiles(ctx, dataPaths, props, false); err != nil {
+			if part != nil {
+				if err := txn.AddDataFiles(ctx, dataFiles, props); err != nil {
+					return err
+				}
+			} else if err := txnAddFiles(ctx, txn, dataPaths, props); err != nil {
 				return err
 			}
 		case WriteModeFullLoad:
-			oldPaths, err := listCurrentSnapshotFilePaths(ctx, fresh)
+			old, err := currentSnapshotDataFiles(ctx, fresh)
 			if err != nil {
 				return fmt.Errorf("list current snapshot files: %w", err)
+			}
+			if part != nil {
+				if err := txn.ReplaceDataFilesWithDataFiles(ctx, old, dataFiles, props); err != nil {
+					return err
+				}
+				break
+			}
+			oldPaths := make([]string, len(old))
+			for i, df := range old {
+				oldPaths[i] = df.FilePath()
 			}
 			if err := txn.ReplaceDataFiles(ctx, oldPaths, dataPaths, props); err != nil {
 				return err
@@ -347,17 +397,115 @@ func parseFilesManifest(body []byte) (*filesManifest, error) {
 	return m, nil
 }
 
-// listCurrentSnapshotFilePaths returns absolute file paths from the
-// table's current snapshot manifests. Used as the `filesToDelete`
-// argument to txn.ReplaceDataFiles for FULL_LOAD mode.
+// buildDataFiles builds the DataFile of each path once, before any commit
+// attempt: metrics from the file's footer (table.FileToDataFile with the
+// unpartitioned spec, as AddFiles computes them) plus the file's explicit
+// tuple, under the spec the files were written with. Tuples are never
+// inferred from statistics (FileToDataFile panics for bucket; truncated
+// string bounds are unsafe).
+func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string, part *PartitionedFiles) ([]iceberg.DataFile, error) {
+	if len(part.Tuples) != len(paths) {
+		return nil, fmt.Errorf("CommitTableFiles: %d partition tuples for %d files", len(part.Tuples), len(paths))
+	}
+	spec := tbl.Metadata().PartitionSpecByID(part.SpecID)
+	if spec == nil {
+		return nil, fmt.Errorf("partition spec changed during the run (spec id %d → %d)", part.SpecID, tbl.Metadata().DefaultPartitionSpec())
+	}
+	sc := tbl.Schema()
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open table FS: %w", err)
+	}
+	props := iceberg.Properties{}
+	for k, v := range tbl.Properties() {
+		props[k] = v
+	}
+	if _, ok := props[icebergtable.DefaultNameMappingKey]; !ok {
+		// As AddFiles: footers without field ids map by name.
+		m, err := json.Marshal(sc.NameMapping())
+		if err != nil {
+			return nil, err
+		}
+		props[icebergtable.DefaultNameMappingKey] = string(m)
+	}
+	logical := partitionLogicalTypes(*spec, sc)
+
+	out := make([]iceberg.DataFile, len(paths))
+	errs := make([]error, len(paths))
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+	var wg sync.WaitGroup
+	for i, path := range paths {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			stats, err := icebergtable.FileToDataFile(ctx, fs, path, sc, *iceberg.UnpartitionedSpec, 0, props)
+			if err != nil {
+				errs[i] = fmt.Errorf("read footer of %s: %w", path, err)
+				return
+			}
+			b, err := iceberg.NewDataFileBuilder(*spec, iceberg.EntryContentData, path, iceberg.ParquetFile,
+				part.Tuples[i], logical, nil, stats.Count(), stats.FileSizeBytes())
+			if err != nil {
+				errs[i] = fmt.Errorf("data file %s: %w", path, err)
+				return
+			}
+			if lb := stats.LowerBoundValues(); len(lb) > 0 {
+				b.LowerBoundValues(lb)
+			}
+			if ub := stats.UpperBoundValues(); len(ub) > 0 {
+				b.UpperBoundValues(ub)
+			}
+			b.ColumnSizes(stats.ColumnSizes()).ValueCounts(stats.ValueCounts()).
+				NullValueCounts(stats.NullValueCounts()).NaNValueCounts(stats.NaNValueCounts()).
+				SplitOffsets(stats.SplitOffsets())
+			out[i] = b.Build()
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// partitionLogicalTypes maps each partition field whose result type is
+// encoded as an Avro logical type to that type, as iceberg-go's own
+// DataFile construction does.
+func partitionLogicalTypes(spec iceberg.PartitionSpec, sc *iceberg.Schema) map[int]string {
+	out := map[int]string{}
+	for _, f := range spec.Fields() {
+		src, ok := sc.FindFieldByID(f.SourceID())
+		if !ok {
+			continue
+		}
+		switch f.Transform.ResultType(src.Type).(type) {
+		case iceberg.DateType:
+			out[f.FieldID] = "date"
+		case iceberg.TimeType:
+			out[f.FieldID] = "time-micros"
+		case iceberg.TimestampType, iceberg.TimestampTzType:
+			out[f.FieldID] = "timestamp-micros"
+		case iceberg.DecimalType:
+			out[f.FieldID] = "decimal"
+		case iceberg.UUIDType:
+			out[f.FieldID] = "uuid"
+		}
+	}
+	return out
+}
+
+// currentSnapshotDataFiles returns the data files (never position or
+// equality delete files) of the table's current snapshot: FULL_LOAD's
+// files to replace.
 //
 // Returns an empty slice when the table has no current snapshot
 // (initial FULL_LOAD into a fresh table) — iceberg-go's
-// ReplaceDataFiles handles the empty-delete + non-empty-add case by
-// delegating to AddFiles internally.
-func listCurrentSnapshotFilePaths(ctx context.Context, tbl *icebergtable.Table) ([]string, error) {
+// ReplaceDataFiles / ReplaceDataFilesWithDataFiles handle the
+// empty-delete + non-empty-add case by delegating to an append.
+func currentSnapshotDataFiles(ctx context.Context, tbl *icebergtable.Table) ([]iceberg.DataFile, error) {
 	if tbl == nil {
-		return nil, errors.New("listCurrentSnapshotFilePaths: nil table")
+		return nil, errors.New("currentSnapshotDataFiles: nil table")
 	}
 	snap := tbl.CurrentSnapshot()
 	if snap == nil {
@@ -371,7 +519,7 @@ func listCurrentSnapshotFilePaths(ctx context.Context, tbl *icebergtable.Table) 
 	if err != nil {
 		return nil, fmt.Errorf("read manifest list: %w", err)
 	}
-	var paths []string
+	var files []iceberg.DataFile
 	for _, mf := range manifests {
 		// discardDeleted=true: skip manifest entries marked DELETED so a
 		// previous overwrite-style commit's tombstones don't get
@@ -382,10 +530,12 @@ func listCurrentSnapshotFilePaths(ctx context.Context, tbl *icebergtable.Table) 
 			return nil, fmt.Errorf("fetch manifest entries: %w", err)
 		}
 		for _, entry := range entries {
-			paths = append(paths, entry.DataFile().FilePath())
+			if df := entry.DataFile(); df.ContentType() == iceberg.EntryContentData {
+				files = append(files, df)
+			}
 		}
 	}
-	return paths, nil
+	return files, nil
 }
 
 // snapshotIDOrEmpty returns the table's current snapshot ID as a

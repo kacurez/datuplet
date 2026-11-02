@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/pkg/datagateway/format"
@@ -63,7 +65,49 @@ func logWriterSchema(ws *writerState, source string) {
 		ws.writerID, ws.bucket, ws.table, source, len(cols), strings.Join(parts, ", "), truncated)
 }
 
+// partitionStatus returns a partitioning failure as gRPC InvalidArgument
+// (spec decision 2); other errors pass through.
+func partitionStatus(err error) error {
+	if err != nil && errors.Is(err, ErrInvalidPartition) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return err
+}
+
+// partitionFieldsFor returns the configured partition_fields of (bucket,
+// table).
+func (s *ServerV2) partitionFieldsFor(bucket, table string) []dglakekeeper.PartitionField {
+	for _, t := range s.config.OutputTables {
+		if t.Name == table && (t.Bucket == "" || t.Bucket == bucket) {
+			out := make([]dglakekeeper.PartitionField, len(t.PartitionFields))
+			for i, f := range t.PartitionFields {
+				out[i] = dglakekeeper.PartitionField{SourceColumn: f.SourceColumn, Transform: f.Transform}
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+// adoptTarget records a resolved write target on ws and logs, once per
+// writer, a configured partitioning the existing table does not have.
+func adoptTarget(ws *writerState, target *dglakekeeper.WriterTarget) {
+	ws.basePath = target.BasePath
+	ws.creds = credsSource(target.VendedCreds)
+	spec := target.Spec
+	ws.partSpec = &spec
+	ws.tableSchema = target.Schema
+	if target.SpecWarning != "" {
+		log.Printf("warning: writer=%s table=%s.%s: %s", ws.writerID, ws.bucket, ws.table, target.SpecWarning)
+	}
+}
+
 func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*pb.OpenWriterResponse, error) {
+	resp, err := s.openWriter(ctx, req)
+	return resp, partitionStatus(err)
+}
+
+func (s *ServerV2) openWriter(ctx context.Context, req *pb.OpenWriterRequest) (*pb.OpenWriterResponse, error) {
 	// Determine bucket and table from request
 	bucket := req.Bucket
 	table := req.Table
@@ -135,8 +179,8 @@ func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 	//      component supplied a schema (with the drop processors applied),
 	//      otherwise on the first chunk from the inferred schema.
 	//   2. LocalDataDir (tests): <LocalDataDir>/<bucket>/<table>/data/.
-	var basePath string
-	var creds CredsSource
+	var target *dglakekeeper.WriterTarget
+	var localBase string
 	switch {
 	case s.lakekeeperResolver != nil:
 		var sp dglakekeeper.SchemaProvider
@@ -147,19 +191,18 @@ func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 			}
 			sp = func(context.Context) (*schema.Schema, error) { return createSchema, nil }
 		}
-		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, bucket, table, sp)
+		var lkErr error
+		target, lkErr = s.lakekeeperResolver.LoadOrCreateForWrite(ctx, bucket, table, sp, s.partitionFieldsFor(bucket, table))
 		if lkErr != nil {
 			if sp != nil || !isSchemaDeferred(lkErr) {
 				return nil, fmt.Errorf("lakekeeper open writer: %w", lkErr)
 			}
 			// Schema-deferred: processParsedRecord creates the table once
 			// the first chunk's inferred schema is in hand.
-		} else {
-			basePath = target.BasePath
-			creds = credsSource(target.VendedCreds)
+			target = nil
 		}
 	case s.config.LocalDataDir != "":
-		basePath = joinStoragePath(s.config.LocalDataDir, bucket+"/"+table+"/data/")
+		localBase = joinStoragePath(s.config.LocalDataDir, bucket+"/"+table+"/data/")
 	default:
 		return nil, fmt.Errorf("no storage backend configured (need lakekeeper resolver or local data dir)")
 	}
@@ -173,8 +216,7 @@ func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 		outputName:     table, // Use table name as output name
 		bucket:         bucket,
 		table:          table,
-		basePath:       basePath,
-		creds:          creds,
+		basePath:       localBase,
 		inputFormat:    inputFormat,
 		adapter:        adapter,
 		pipeline:       pipeline,
@@ -182,18 +224,10 @@ func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 		schemaInferred: sch == nil,
 	}
 	ws := s.writers[writerID]
-	s.mu.Unlock()
-
-	// Partition specs never reached Iceberg (files were only placed in
-	// Hive-style directories); the data plane writes every table
-	// unpartitioned.
-	for _, t := range s.config.OutputTables {
-		if t.Name == table && len(t.PartitionFields) > 0 {
-			log.Printf("warning: writer=%s table=%s.%s: partition_fields %v are ignored; the table is written unpartitioned",
-				writerID, bucket, table, t.PartitionFields)
-			break
-		}
+	if target != nil {
+		adoptTarget(ws, target)
 	}
+	s.mu.Unlock()
 
 	// A component-supplied schema is known now; an inferred one is logged by
 	// processParsedRecord once the first chunk resolves it.
@@ -220,7 +254,8 @@ func (s *ServerV2) WriteChunk(ctx context.Context, req *pb.WriteChunkRequest) (*
 	}
 
 	// Use shared processing logic
-	return s.processWriteChunk(ctx, ws, req.Data)
+	resp, err := s.processWriteChunk(ctx, ws, req.Data)
+	return resp, partitionStatus(err)
 }
 
 func (s *ServerV2) CloseWriter(ctx context.Context, req *pb.CloseWriterRequest) (*pb.CloseWriterResponse, error) {
@@ -304,13 +339,20 @@ func (s *ServerV2) finalizeAndDispatch(ctx context.Context, ws *writerState, run
 	for i, f := range files {
 		paths[i] = f.Path
 	}
+	var part *icebergjob.PartitionedFiles
+	if files[0].Partition != nil {
+		part = &icebergjob.PartitionedFiles{SpecID: files[0].SpecID, Tuples: make([]map[int]any, len(files))}
+		for i, f := range files {
+			part.Tuples[i] = f.Partition
+		}
+	}
 	mode := icebergjob.WriteModeAppend
 	if m := s.writeModeForTable(ws.bucket, ws.table); m != "" {
 		mode = m
 	}
 	if err := s.commitPool.Dispatch(ctx, CommitJob{
 		WriterID: ws.writerID, Namespace: ws.bucket, Table: ws.table,
-		DataPaths: paths, Mode: mode, RunID: runID,
+		DataPaths: paths, Partition: part, Mode: mode, RunID: runID,
 	}); err != nil {
 		return fmt.Errorf("dispatch commit %s.%s: %w", ws.bucket, ws.table, err)
 	}

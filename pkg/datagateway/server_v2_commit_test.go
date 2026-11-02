@@ -29,7 +29,7 @@ func TestCloseWriter_DispatchesToPool(t *testing.T) {
 		MaxQueueSize: 16,
 		CatalogFn:    func(context.Context) (catalog.Catalog, error) { return nil, nil },
 		CommitFn: func(_ context.Context, _ catalog.Catalog, _ icebergtable.Identifier,
-			paths []string, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			paths []string, _ *icebergjob.PartitionedFiles, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
 			commitCalled++
 			return &icebergjob.CommitResult{DataFilesAdded: len(paths)}, nil
 		},
@@ -113,7 +113,7 @@ func TestCloseWriter_PoolError(t *testing.T) {
 		Workers: 1, MaxQueueSize: 8,
 		CatalogFn: func(context.Context) (catalog.Catalog, error) { return nil, nil },
 		CommitFn: func(context.Context, catalog.Catalog, icebergtable.Identifier,
-			[]string, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
+			[]string, *icebergjob.PartitionedFiles, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
 			return nil, errors.New("synthetic commit error")
 		},
 	})

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,32 @@ type TableLoader interface {
 // Config configures a Plane.
 type Config struct {
 	Tables TableLoader // nil: OpenTableReader returns an error
+	// MaxOpenPartitions caps the open files of one partitioned table writer
+	// (spec decision 9); <=0 means defaultMaxOpenPartitions.
+	MaxOpenPartitions int
+}
+
+// Open partition files per table writer: default and the bounds of
+// DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS.
+const (
+	defaultMaxOpenPartitions = 32
+	maxMaxOpenPartitions     = 1024
+	maxOpenPartitionsEnv     = "DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS"
+)
+
+// maxOpenPartitionsFromEnv reads DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS:
+// 1-1024; unset means the default, anything else the default and a warning.
+func maxOpenPartitionsFromEnv() int {
+	v, ok := os.LookupEnv(maxOpenPartitionsEnv)
+	if !ok || v == "" {
+		return defaultMaxOpenPartitions
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 1 || n > maxMaxOpenPartitions {
+		log.Printf("goplane: warning: %s=%q is not an integer in 1-%d; using %d", maxOpenPartitionsEnv, v, maxMaxOpenPartitions, defaultMaxOpenPartitions)
+		return defaultMaxOpenPartitions
+	}
+	return n
 }
 
 // Plane implements datagateway.DataPlane.
@@ -62,6 +90,9 @@ var _ datagateway.DataPlane = (*Plane)(nil)
 
 // New returns a Plane.
 func New(cfg Config) *Plane {
+	if cfg.MaxOpenPartitions <= 0 {
+		cfg.MaxOpenPartitions = defaultMaxOpenPartitions
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Plane{cfg: cfg, ctx: ctx, cancel: cancel, openSink: openIOSink, loadIO: iceio.LoadFS, readers: map[*reader]struct{}{}, closeWait: defaultCloseWait}
 }
@@ -69,7 +100,7 @@ func New(cfg Config) *Plane {
 // Factory builds the plane once boot validation has passed. With a
 // Lakekeeper URL, reads load tables through a lakekeeper.Resolver.
 func Factory(_ context.Context, boot datagateway.BootInfo) (datagateway.DataPlane, error) {
-	var cfg Config
+	cfg := Config{MaxOpenPartitions: maxOpenPartitionsFromEnv()}
 	if boot.LakekeeperURL != "" {
 		r, err := lakekeeper.NewResolver(boot.LakekeeperURL, boot.Warehouse, boot.Token, boot.ProjectID)
 		if err != nil {
@@ -114,6 +145,13 @@ func (p *Plane) OpenTableWriter(_ context.Context, spec datagateway.WriterSpec) 
 	if spec.RowGroupRows <= 0 {
 		spec.RowGroupRows = defaultRowGroupRows
 	}
+	var part *partitioner
+	if spec.PartitionSpec != nil && spec.PartitionSpec.NumFields() > 0 {
+		var err error
+		if part, err = newPartitioner(*spec.PartitionSpec, spec.TableSchema, spec.Schema); err != nil {
+			return nil, fmt.Errorf("goplane: table %s: %w", spec.Table, err)
+		}
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -122,7 +160,7 @@ func (p *Plane) OpenTableWriter(_ context.Context, spec datagateway.WriterSpec) 
 	if err := p.ctx.Err(); err != nil {
 		return nil, fmt.Errorf("goplane: plane closed: %w", err)
 	}
-	w := newWriter(p.ctx, spec, local, p.openSink)
+	w := newWriter(p.ctx, spec, local, p.openSink, part, p.cfg.MaxOpenPartitions)
 	p.writers.Add(1)
 	go func() {
 		<-w.done

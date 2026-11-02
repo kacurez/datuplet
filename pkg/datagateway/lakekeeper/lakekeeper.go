@@ -42,7 +42,6 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
-	"github.com/datuplet/datuplet/pkg/datagateway/manifest"
 	dgschema "github.com/datuplet/datuplet/pkg/datagateway/schema"
 	// Blank-import the centralised iceberg-go IO scheme registration package
 	// so isolated tests of this package (e.g. go test ./pkg/datagateway/lakekeeper/...)
@@ -107,6 +106,18 @@ type WriterTarget struct {
 	// credentials (STS for s3://, OAuth bearer for gs://) through one
 	// renewal cache. nil for file:// prefixes (local tests).
 	VendedCreds *catalogwriter.VendedCreds
+
+	// Spec and Schema are the table's current default partition spec and
+	// schema as the catalog returned them (field ids may be reassigned on
+	// create); FormatVersion is its format version. Writers partition by
+	// Spec (spec decisions 4-5).
+	Spec          iceberg.PartitionSpec
+	Schema        *iceberg.Schema
+	FormatVersion int
+
+	// SpecWarning is non-empty when the configured partition fields differ
+	// from an existing table's spec (the table's spec is used).
+	SpecWarning string
 }
 
 // SchemaProvider returns the gateway-side schema for a table. The
@@ -120,59 +131,28 @@ type SchemaProvider func(ctx context.Context) (*dgschema.Schema, error)
 // LoadOrCreateForWrite ensures (ns, tbl) exists in lakekeeper and
 // returns a WriterTarget rooted at the table's data prefix.
 //
-// Behaviour matrix:
+// Behaviour matrix (LoadOrCreateTable):
 //
-//   - Table exists → LoadTable; reuse existing schema; build
-//     WriterTarget at the loaded data path.
-//   - Table missing + schemaProvider returns a schema → ensure
-//     namespace, CreateTable with that schema, build WriterTarget at
-//     the new table's data path.
-//   - Table missing + schemaProvider is nil OR returns nil → return
+//   - Table exists -> LoadTable; reuse existing schema and partition spec;
+//     build WriterTarget at the loaded data path.
+//   - Table missing + schemaProvider returns a schema -> ensure
+//     namespace, CreateTable with that schema partitioned by fields,
+//     build WriterTarget at the new table's data path.
+//   - Table missing + schemaProvider is nil OR returns nil -> return
 //     an error. Callers must defer the call until they have a schema
 //     (typically until first chunk is parsed). Surfacing this as an
 //     explicit error matches the `OpenWriter` contract: schema is the
 //     load-bearing input.
-func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, schemaProvider SchemaProvider) (*WriterTarget, error) {
+//
+// Partitioning errors wrap ErrInvalidPartition.
+func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, schemaProvider SchemaProvider, fields []PartitionField) (*WriterTarget, error) {
 	cli, err := r.newClient(ctx, r.Token)
 	if err != nil {
 		return nil, fmt.Errorf("lakekeeper: new client: %w", err)
 	}
-
-	ident := catalog.ToIdentifier(ns, tbl)
-	t, err := cli.Catalog.LoadTable(ctx, ident)
+	t, warning, err := LoadOrCreateTable(ctx, cli.Catalog, ns, tbl, schemaProvider, fields)
 	if err != nil {
-		if !errors.Is(err, catalog.ErrNoSuchTable) {
-			return nil, fmt.Errorf("lakekeeper: load %s.%s: %w", ns, tbl, err)
-		}
-		if schemaProvider == nil {
-			return nil, fmt.Errorf("lakekeeper: table %s.%s missing and no schema available to create it", ns, tbl)
-		}
-		gwSchema, schErr := schemaProvider(ctx)
-		if schErr != nil {
-			return nil, fmt.Errorf("lakekeeper: schema provider for %s.%s: %w", ns, tbl, schErr)
-		}
-		if gwSchema == nil {
-			return nil, fmt.Errorf("lakekeeper: schema provider returned nil for %s.%s", ns, tbl)
-		}
-		if err := r.ensureNamespace(ctx, cli.Catalog, ns); err != nil {
-			return nil, err
-		}
-		icSchema := manifest.SchemaToIceberg(gwSchema)
-		if icSchema == nil {
-			return nil, fmt.Errorf("lakekeeper: cannot convert gateway schema for %s.%s", ns, tbl)
-		}
-		t, err = cli.Catalog.CreateTable(ctx, ident, icSchema)
-		if err != nil {
-			// Concurrent committer race: re-LoadTable.
-			if errors.Is(err, catalog.ErrTableAlreadyExists) {
-				t, err = cli.Catalog.LoadTable(ctx, ident)
-				if err != nil {
-					return nil, fmt.Errorf("lakekeeper: load %s.%s after race: %w", ns, tbl, err)
-				}
-			} else {
-				return nil, fmt.Errorf("lakekeeper: create %s.%s: %w", ns, tbl, err)
-			}
-		}
+		return nil, err
 	}
 
 	// Compute the data prefix from the loaded table's location. Both
@@ -189,8 +169,12 @@ func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sch
 		return nil, err
 	}
 	return &WriterTarget{
-		BasePath:    dataPrefix,
-		VendedCreds: vc,
+		BasePath:      dataPrefix,
+		VendedCreds:   vc,
+		Spec:          t.Spec(),
+		Schema:        t.Schema(),
+		FormatVersion: t.Metadata().Version(),
+		SpecWarning:   warning,
 	}, nil
 }
 
@@ -279,7 +263,7 @@ func (r *Resolver) newClient(ctx context.Context, token string) (*catalogwriter.
 
 // ensureNamespace mirrors icebergjob.ensureNamespace. Idempotent:
 // ErrNamespaceAlreadyExists is squashed.
-func (r *Resolver) ensureNamespace(ctx context.Context, cat catalogClient, ns string) error {
+func ensureNamespace(ctx context.Context, cat catalogClient, ns string) error {
 	id := catalog.ToIdentifier(ns)
 	exists, err := cat.CheckNamespaceExists(ctx, id)
 	if err == nil && exists {

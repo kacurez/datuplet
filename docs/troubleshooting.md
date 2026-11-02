@@ -255,6 +255,28 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
   the run cancelled) before the last chunk was delivered. Expected, not a failure — see
   [known-limitations.md](known-limitations.md) for the delete-metrics
   workaround. Non-Parquet request formats always decode.
+- The commit fails with `partition spec changed during the run (spec id X → Y)`.
+  The table's default partition spec changed between the write and the commit
+  (another client evolved it). The files were written for spec X and are not
+  committed; re-run the pipeline. This error is not retried.
+- `OpenWriter` or the first chunk fails with InvalidArgument (HTTP 400) and an
+  `invalid partitioning` message. An output's `partition_fields` names a column
+  the table does not have, uses an unknown transform (`days`, `bucket[-1]`), a
+  transform the column type does not allow, two time transforms on one column,
+  or a partition name that collides with another column; or the existing table
+  is a partitioned format-version 3 table. Fix `partition_fields` (see
+  [known-limitations.md](known-limitations.md)).
+- The gateway log shows `goplane: warning: table <ns>.<table>: 32 partition
+  files open (DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS); finishing the least
+  recently written one after N distinct partition tuples`. The writer sees more
+  distinct partition tuples than its open-file cap, so it writes more, smaller
+  files and commits get slower. Choose a coarser transform (e.g. `month`
+  instead of `day`, fewer buckets) or raise
+  `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (up to 1024) if the pod has memory
+  for it.
+- The gateway log shows `partition_fields [...] differ from the existing
+  table's partition spec [...]`. The table already existed with another spec,
+  which is used; drop the table to repartition it.
 
 ---
 

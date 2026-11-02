@@ -6,9 +6,15 @@ import (
 	"io"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/iceberg-go"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
+	dglakekeeper "github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
 )
+
+// ErrInvalidPartition marks a partitioning the gateway cannot write; it is
+// returned as gRPC InvalidArgument (HTTP 400).
+var ErrInvalidPartition = dglakekeeper.ErrInvalidPartition
 
 // BootInfo is what the data plane needs from boot validation; it is built by
 // NewServerV2 after validateRunTokenForBoot.
@@ -45,6 +51,15 @@ type WriterSpec struct {
 	Creds           CredsSource   // nil only for local-path prefixes (tests)
 	TargetFileBytes int64         // <=0 → 128 MiB
 	RowGroupRows    int64         // <=0 → 229376
+
+	// Table ("ns.table") names the table in logs.
+	Table string
+	// PartitionSpec and TableSchema are the table's current spec and schema
+	// (as the catalog returned them). A nil spec or one without fields
+	// writes unpartitioned files; otherwise every file holds one partition
+	// tuple of the spec.
+	PartitionSpec *iceberg.PartitionSpec
+	TableSchema   *iceberg.Schema
 }
 
 // WrittenFile is one Parquet file a TableWriter produced.
@@ -52,6 +67,11 @@ type WrittenFile struct {
 	Path  string
 	Rows  int64
 	Bytes int64
+	// SpecID is the partition spec the file was written under. Partition is
+	// its tuple (partition field id → value, nil for a null, an entry for
+	// every spec field); nil for a file of an unpartitioned spec.
+	SpecID    int
+	Partition map[int]any
 }
 
 // TableWriter accepts Arrow batches and produces Parquet files under

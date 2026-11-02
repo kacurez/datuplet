@@ -228,7 +228,10 @@ These are conventions a new contributor wouldn't infer from the code:
   (`pkg/datagateway/commit_pool.go`), which calls
   `icebergjob.CommitTableFiles` — `txn.AddFiles` (APPEND) or
   `txn.ReplaceDataFiles` (FULL_LOAD), 409-conflict retry, idempotency key
-  in the snapshot summary. The session Commit RPC is the barrier that
+  in the snapshot summary. Partitioned tables (spec from
+  `partition_fields` on create; an existing table's spec wins) get one
+  file per partition tuple and commit with explicit tuples via
+  `txn.AddDataFiles` / `txn.ReplaceDataFilesWithDataFiles`. The session Commit RPC is the barrier that
   drains the pool and reconciles per-writer results. Zero paths =
   success-zero.
 - **Per-run JWT**: pipeline-api mints **one RS256 JWT per run** via

@@ -100,7 +100,7 @@ type OutputTableConfig struct {
 	Bucket          string                 `yaml:"bucket"`                     // Bucket name
 	WriteMode       string                 `yaml:"write_mode"`                 // APPEND or FULL_LOAD
 	LogicalName     string                 `yaml:"logical_name,omitempty"`     // SDK-facing identifier (defaults to Name when empty)
-	PartitionFields []PartitionFieldConfig `yaml:"partition_fields,omitempty"` // Ignored with a warning (writes are unpartitioned)
+	PartitionFields []PartitionFieldConfig `yaml:"partition_fields,omitempty"` // Iceberg partition spec of a table the gateway creates
 
 	// Columns is an optional explicit column mapping (name+type). When set,
 	// the producer writes exactly these columns and infers nothing; empty =

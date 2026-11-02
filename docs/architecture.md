@@ -149,11 +149,17 @@ Responsibilities at boot:
 
 Responsibilities per write:
 - Calls Lakekeeper `LoadOrCreate` to get (or create) the table and STS credentials.
+  A new table is created with an Iceberg partition spec built from the
+  output's `partition_fields`; an existing table keeps its own spec.
 - Encodes incoming Arrow records to Parquet (ZSTD) with arrow-go `pqarrow` and
   streams each file to the table's data prefix as a multipart upload through
   iceberg-go IO, using STS-vended credentials (`pkg/datagateway/goplane`). A
   file rotates at about 512 MiB of uncompressed Arrow input (4 x the 128 MiB
   target file size). Nothing is staged on local disk.
+- For a partitioned table the writer splits each batch by partition tuple and
+  keeps one open file per tuple under `<data>/<field>=<value>/...`, at most
+  `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (default 32) at once; every file holds
+  exactly one tuple.
 - Writes no `files.json` or other marker object; the commit carries the audit
   properties.
 
@@ -163,7 +169,10 @@ Responsibilities per commit (RFC 021 — inline, no separate Job):
 - Each commit opens an Iceberg transaction at Lakekeeper via the
   `pkg/icebergjob` library: `txn.AddFiles` (APPEND) or `txn.ReplaceDataFiles`
   (FULL_LOAD), retried on 409 conflict with exponential backoff, with an
-  idempotency key stamped into the snapshot summary.
+  idempotency key stamped into the snapshot summary. A partitioned table's
+  files are committed with their explicit tuples through `txn.AddDataFiles` /
+  `txn.ReplaceDataFilesWithDataFiles`, after checking that the table's spec
+  did not change since the write. FULL_LOAD replaces data files only.
 - The session `Commit` RPC is the barrier: it drains the pool and reconciles
   per-writer results.
 

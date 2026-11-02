@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -60,7 +59,7 @@ type fakeResolver struct {
 	entered, release chan struct{}
 }
 
-func (r *fakeResolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sp dglakekeeper.SchemaProvider) (*dglakekeeper.WriterTarget, error) {
+func (r *fakeResolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sp dglakekeeper.SchemaProvider, _ []dglakekeeper.PartitionField) (*dglakekeeper.WriterTarget, error) {
 	r.mu.Lock()
 	r.calls++
 	r.mu.Unlock()
@@ -468,35 +467,6 @@ func TestExternalFilesRejected(t *testing.T) {
 	}
 }
 
-func TestPartitionFieldsIgnoredWithWarning(t *testing.T) {
-	var logBuf bytes.Buffer
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(os.Stderr)
-
-	s, p := newWriteTestServer(t, &Config{
-		OutputTables: []OutputTableConfig{{
-			Name: "orders", Bucket: "raw", WriteMode: "APPEND",
-			PartitionFields: []PartitionFieldConfig{{SourceColumn: "id", Transform: "identity"}},
-		}},
-	})
-	ctx := context.Background()
-	open, err := s.OpenWriter(ctx, &pb.OpenWriterRequest{Table: "orders", InputFormat: pb.DataFormat_FORMAT_CSV})
-	if err != nil {
-		t.Fatalf("OpenWriter: %v", err)
-	}
-	for _, chunk := range []string{"id,name\n1,a\n", "id,name\n2,b\n"} {
-		if _, err := s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: open.WriterId, Data: []byte(chunk)}); err != nil {
-			t.Fatalf("WriteChunk: %v", err)
-		}
-	}
-	if n := strings.Count(logBuf.String(), "partition_fields"); n != 1 {
-		t.Errorf("partition_fields warnings = %d, want 1; log:\n%s", n, logBuf.String())
-	}
-	if n := len(p.writers[0].recorded()); n != 2 {
-		t.Errorf("plane batches = %d, want 2 (written unpartitioned)", n)
-	}
-}
-
 // The cancel annotation interrupts the plane and aborts every open writer.
 func TestCancelInterruptsPlaneAndAbortsWriters(t *testing.T) {
 	annotations := filepath.Join(t.TempDir(), "annotations")
@@ -548,7 +518,7 @@ func TestCloseWriterDispatchesWrittenFiles(t *testing.T) {
 		Workers: 1, MaxQueueSize: 8,
 		CatalogFn: func(context.Context) (catalog.Catalog, error) { return nil, nil },
 		CommitFn: func(_ context.Context, _ catalog.Catalog, _ icebergtable.Identifier,
-			paths []string, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			paths []string, _ *icebergjob.PartitionedFiles, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
 			mu.Lock()
 			dispatched = append(dispatched, paths)
 			mu.Unlock()

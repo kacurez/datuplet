@@ -168,8 +168,31 @@ time is follow-up work.
 `pkg/datupleticeio`'s `gs://` factory with vended OAuth tokens. There is no GCS
 environment in CI; prove it on GKE before relying on it.
 
-**`partition_fields` are ignored.** A writer that sets them gets one warning
-and writes an unpartitioned table. Iceberg partition specs are not supported.
+**Partitioned tables: no spec evolution.** A table the gateway creates gets an
+Iceberg partition spec from the output's `partition_fields`; an existing table
+is always written with its own current spec. Changing `partition_fields` on an
+existing table only logs a warning naming both specs (FULL_LOAD replaces files,
+not the table); drop the table to change its partitioning.
+
+**Partitioned writes to format-version 3 tables are rejected.** iceberg-go
+v0.7.0 requires `first_row_id` on every v3 data file it adds, which the gateway
+cannot assign, so such a table fails the writer with InvalidArgument.
+Unpartitioned v3 tables are written as before.
+
+**Open partition files cost memory.** A partitioned table writer keeps up to
+`DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` files open (default 32, 1-1024). Each
+open file holds a row group under encode plus its upload buffers, so memory
+grows with the number of open files. There is no byte budget; the bound is a
+file count.
+
+**High partition cardinality makes many small files.** When a writer needs more
+open files than the cap, it finishes the least recently written file early
+(one warning per writer). Every tuple then becomes its own small file, and the
+commit reads one footer per file, so commits slow down too.
+
+**Partition paths are limited to 1 024-byte object keys.** An identity value
+is URL-escaped into the file path. A key over S3's 1 024-byte limit fails the
+write with an error naming the partition field; it is never truncated.
 
 **External data files are unsupported.** `external_files` fails the writer with
 `external data files are not supported`.

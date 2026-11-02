@@ -184,7 +184,7 @@ func TestWriterSingleFile(t *testing.T) {
 	}
 	// Close is idempotent.
 	again, err := w.Close(context.Background())
-	if err != nil || len(again) != 1 || again[0] != f {
+	if err != nil || len(again) != 1 || again[0].Path != f.Path || again[0].Rows != f.Rows {
 		t.Fatalf("second Close = %+v, %v", again, err)
 	}
 }

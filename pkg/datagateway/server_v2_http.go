@@ -3,6 +3,7 @@ package datagateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -78,6 +79,10 @@ func (s *ServerV2) handleWrite(w http.ResponseWriter, r *http.Request) {
 		resp, err = s.processWriteChunk(r.Context(), ws, data)
 	}
 	if err != nil {
+		if errors.Is(err, ErrInvalidPartition) {
+			s.httpError(w, http.StatusBadRequest, err.Error(), "INVALID_ARGUMENT")
+			return
+		}
 		s.httpError(w, http.StatusInternalServerError, err.Error(), "PROCESS_ERROR")
 		return
 	}
@@ -207,12 +212,11 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 			return nil, nil, fmt.Errorf("no write target for %s.%s", ws.bucket, ws.table)
 		}
 		sp := func(context.Context) (*schema.Schema, error) { return outSchema, nil }
-		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, ws.bucket, ws.table, sp)
+		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, ws.bucket, ws.table, sp, s.partitionFieldsFor(ws.bucket, ws.table))
 		if lkErr != nil {
 			return nil, nil, fmt.Errorf("lakekeeper deferred create %s.%s: %w", ws.bucket, ws.table, lkErr)
 		}
-		ws.basePath = target.BasePath
-		ws.creds = credsSource(target.VendedCreds)
+		adoptTarget(ws, target)
 	}
 
 	tw, err := s.plane.OpenTableWriter(ctx, WriterSpec{
@@ -221,6 +225,9 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 		Schema:          outSchema.ArrowSchema(),
 		Creds:           ws.creds,
 		TargetFileBytes: s.config.TargetFileSize,
+		Table:           ws.bucket + "." + ws.table,
+		PartitionSpec:   ws.partSpec,
+		TableSchema:     ws.tableSchema,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("open table writer %s.%s: %w", ws.bucket, ws.table, err)

@@ -159,7 +159,7 @@ func createTable(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, sch *arro
 		t.Fatalf("gateway schema: %v", err)
 	}
 	target, err := r.LoadOrCreateForWrite(context.Background(), ns, tbl,
-		func(context.Context) (*dgschema.Schema, error) { return gw, nil })
+		func(context.Context) (*dgschema.Schema, error) { return gw, nil }, nil)
 	if err != nil {
 		t.Fatalf("LoadOrCreateForWrite: %v", err)
 	}
@@ -215,7 +215,7 @@ func commit(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, files []dataga
 	if err != nil {
 		t.Fatalf("catalog: %v", err)
 	}
-	res, err := icebergjob.CommitTableFiles(context.Background(), cat, catalog.ToIdentifier(ns, tbl), paths(files), mode, nil, key)
+	res, err := icebergjob.CommitTableFiles(context.Background(), cat, catalog.ToIdentifier(ns, tbl), paths(files), nil, mode, nil, key)
 	if err != nil {
 		t.Fatalf("CommitTableFiles %s: %v", mode, err)
 	}
@@ -394,7 +394,7 @@ func TestIntegrationAddFilesPerType(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = icebergjob.CommitTableFiles(context.Background(), cat, catalog.ToIdentifier("gw_types", in.name),
-			paths(files), icebergjob.WriteModeAppend, nil, "k")
+			paths(files), nil, icebergjob.WriteModeAppend, nil, "k")
 		want, rejected := addFilesRejects[in.name]
 		switch {
 		case !rejected && err != nil:

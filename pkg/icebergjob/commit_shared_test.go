@@ -211,9 +211,9 @@ func TestCommitTable_AppendHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-commit LoadTable: %v", err)
 	}
-	postFiles, err := listCurrentSnapshotFilePaths(context.Background(), tbl)
+	postFiles, err := snapshotDataPaths(context.Background(), tbl)
 	if err != nil {
-		t.Fatalf("listCurrentSnapshotFilePaths: %v", err)
+		t.Fatalf("snapshotDataPaths: %v", err)
 	}
 	if len(postFiles) != 3 {
 		t.Errorf("post-commit file count=%d want 3 (paths=%v)", len(postFiles), postFiles)
@@ -284,9 +284,9 @@ func TestCommitTable_FullLoadHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-commit LoadTable: %v", err)
 	}
-	postFiles, err := listCurrentSnapshotFilePaths(context.Background(), tbl)
+	postFiles, err := snapshotDataPaths(context.Background(), tbl)
 	if err != nil {
-		t.Fatalf("listCurrentSnapshotFilePaths: %v", err)
+		t.Fatalf("snapshotDataPaths: %v", err)
 	}
 	if len(postFiles) != 1 {
 		t.Errorf("post-commit file count=%d want 1 (paths=%v)", len(postFiles), postFiles)
@@ -339,9 +339,9 @@ func TestCommitTable_FullLoad_FreshTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-commit LoadTable: %v", err)
 	}
-	postFiles, err := listCurrentSnapshotFilePaths(context.Background(), tbl)
+	postFiles, err := snapshotDataPaths(context.Background(), tbl)
 	if err != nil {
-		t.Fatalf("listCurrentSnapshotFilePaths: %v", err)
+		t.Fatalf("snapshotDataPaths: %v", err)
 	}
 	if len(postFiles) != 1 {
 		t.Errorf("post-commit file count=%d want 1 (paths=%v)", len(postFiles), postFiles)
@@ -481,7 +481,7 @@ func TestCommitTableFiles_StampsSnapshotProps(t *testing.T) {
 		"datuplet.pipeline-api": "datuplet-api",
 	}
 	res, err := CommitTableFiles(context.Background(), fx.cat, ident,
-		[]string{path}, WriteModeAppend, props, "commit-key-xyz")
+		[]string{path}, nil, WriteModeAppend, props, "commit-key-xyz")
 	if err != nil {
 		t.Fatalf("CommitTableFiles: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestCommitTableFiles_IdempotencyHit(t *testing.T) {
 	const key = "test-key-abc"
 
 	res1, err := CommitTableFiles(context.Background(), fx.cat, icebergtable.Identifier{"ns1", "idem_tbl"},
-		[]string{firstPath}, WriteModeAppend, nil, key)
+		[]string{firstPath}, nil, WriteModeAppend, nil, key)
 	if err != nil {
 		t.Fatalf("first CommitTableFiles: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestCommitTableFiles_IdempotencyHit(t *testing.T) {
 	// Second call: same key, different path — must be idempotency hit.
 	shouldNotBeAdded := fx.writeParquet("data/SHOULD_NOT_BE_ADDED.parquet", 999)
 	res2, err := CommitTableFiles(context.Background(), fx.cat, icebergtable.Identifier{"ns1", "idem_tbl"},
-		[]string{shouldNotBeAdded}, WriteModeAppend, nil, key)
+		[]string{shouldNotBeAdded}, nil, WriteModeAppend, nil, key)
 	if err != nil {
 		t.Fatalf("second CommitTableFiles: %v", err)
 	}
@@ -558,9 +558,9 @@ func TestCommitTableFiles_IdempotencyHit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-idempotency LoadTable: %v", err)
 	}
-	postFiles, err := listCurrentSnapshotFilePaths(context.Background(), tbl)
+	postFiles, err := snapshotDataPaths(context.Background(), tbl)
 	if err != nil {
-		t.Fatalf("listCurrentSnapshotFilePaths: %v", err)
+		t.Fatalf("snapshotDataPaths: %v", err)
 	}
 	if len(postFiles) != 1 {
 		t.Errorf("post-idempotency file count=%d want 1 (paths=%v)", len(postFiles), postFiles)
@@ -575,7 +575,7 @@ func TestCommitTableFiles_RejectsCallerCommitKey(t *testing.T) {
 	ctx := context.Background()
 	fx := newCommitSharedFixture(t, icebergtable.Identifier{"ns1", "tbl1"})
 	_, err := CommitTableFiles(ctx, fx.cat, icebergtable.Identifier{"ns1", "tbl1"},
-		[]string{"s3://b/data/a.parquet"}, WriteModeAppend,
+		[]string{"s3://b/data/a.parquet"}, nil, WriteModeAppend,
 		iceberg.Properties{"datuplet.commit-key": "x"}, "y")
 	if err == nil {
 		t.Fatal("expected error when caller sets snapshotProps[datuplet.commit-key]")

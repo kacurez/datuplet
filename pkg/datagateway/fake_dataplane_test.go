@@ -705,7 +705,7 @@ func TestFakeDataPlane_WriteCloseFiles(t *testing.T) {
 		t.Fatalf("files = %+v", files)
 	}
 	again, err := w.Close(context.Background())
-	if err != nil || len(again) != 1 || again[0] != files[0] {
+	if err != nil || len(again) != 1 || again[0].Path != files[0].Path || again[0].Rows != files[0].Rows {
 		t.Errorf("second Close = %+v, %v; want identical %+v", again, err, files)
 	}
 	w.Abort() // safe after Close

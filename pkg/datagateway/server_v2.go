@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/datuplet/datuplet/pkg/icebergjob"
@@ -107,7 +108,7 @@ type ServerV2 struct {
 // *lakekeeper.Resolver implements it (an interface so tests can observe
 // table creates).
 type tableResolver interface {
-	LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sp dglakekeeper.SchemaProvider) (*dglakekeeper.WriterTarget, error)
+	LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sp dglakekeeper.SchemaProvider, fields []dglakekeeper.PartitionField) (*dglakekeeper.WriterTarget, error)
 	Catalog(ctx context.Context) (catalog.Catalog, error)
 	Close() error
 }
@@ -120,6 +121,10 @@ type writerState struct {
 	table      string // Logical table (e.g., "orders") - used for logging/metadata only
 	basePath   string // Data prefix from lakekeeper (opaque, passed as-is to the plane); "" until the table exists
 	creds      CredsSource
+	// partSpec and tableSchema are the table's current partition spec and
+	// schema once it exists (nil without a catalog: unpartitioned).
+	partSpec    *iceberg.PartitionSpec
+	tableSchema *iceberg.Schema
 
 	// Input format for Content-Type validation
 	inputFormat format.DataFormat
@@ -252,8 +257,8 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 			Workers:      4,
 			MaxQueueSize: 256,
 			CatalogFn:    res.Catalog,
-			CommitFn: func(ctx context.Context, cat catalog.Catalog, ident icebergtable.Identifier, paths []string, mode icebergjob.WriteMode, key string) (*icebergjob.CommitResult, error) {
-				return icebergjob.CommitTableFiles(ctx, cat, ident, paths, mode, auditProps, key)
+			CommitFn: func(ctx context.Context, cat catalog.Catalog, ident icebergtable.Identifier, paths []string, part *icebergjob.PartitionedFiles, mode icebergjob.WriteMode, key string) (*icebergjob.CommitResult, error) {
+				return icebergjob.CommitTableFiles(ctx, cat, ident, paths, part, mode, auditProps, key)
 			},
 		})
 

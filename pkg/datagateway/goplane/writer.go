@@ -5,11 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"slices"
 	"sync"
 	"sync/atomic"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
@@ -32,9 +36,14 @@ var (
 )
 
 // writer is one TableWriter: Write queues batches on a channel of
-// channelBatches; one goroutine (run) encodes them into the current file.
+// channelBatches; one goroutine (run) encodes them into the current file or,
+// for a partitioned table, splits each dequeued batch by partition tuple
+// into up to maxOpen open files (spec decisions 8-9).
 type writer struct {
 	spec        datagateway.WriterSpec
+	specID      int
+	part        *partitioner // nil: unpartitioned, one file at a time (cur)
+	maxOpen     int
 	local       bool
 	openSink    sinkOpener
 	writeSchema *arrow.Schema // spec.Schema without PARQUET:field_id metadata
@@ -61,12 +70,21 @@ type writer struct {
 	cur   *dataFile
 	files []datagateway.WrittenFile
 	err   error
+
+	// Partitioned writers only; owned by run.
+	open    map[string]*dataFile // by tuple key
+	tick    uint64               // LRU clock
+	nextSeq int                  // writer-wide file sequence
+	seen    map[string]struct{}  // distinct tuples, until the first eviction
+	evicted bool
 }
 
-func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, open sinkOpener) *writer {
+func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, open sinkOpener, part *partitioner, maxOpen int) *writer {
 	ctx, cancel := context.WithCancelCause(parent)
 	w := &writer{
 		spec:        spec,
+		part:        part,
+		maxOpen:     maxOpen,
 		local:       local,
 		openSink:    open,
 		writeSchema: stripFieldIDMetadata(spec.Schema),
@@ -84,6 +102,13 @@ func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, 
 		closing:    make(chan struct{}),
 	}
 	w.idle = sync.NewCond(&w.mu)
+	if spec.PartitionSpec != nil {
+		w.specID = spec.PartitionSpec.ID()
+	}
+	if part != nil {
+		w.open = map[string]*dataFile{}
+		w.seen = map[string]struct{}{}
+	}
 	go w.run()
 	return w
 }
@@ -254,23 +279,54 @@ func (w *writer) process(rec arrow.RecordBatch) {
 }
 
 // fail records the first error, cancels the lifetime context (unblocking
-// Write) and aborts the in-flight file.
+// Write) and aborts every in-flight file, concurrently.
 func (w *writer) fail(err error) {
 	if w.err == nil {
 		w.err = err
 	}
 	w.cancel(err)
+	var files []*dataFile
 	if w.cur != nil {
-		w.cur.abort()
+		files = append(files, w.cur)
 		w.cur = nil
 	}
+	for key, f := range w.open {
+		files = append(files, f)
+		delete(w.open, key)
+	}
+	abortAll(files)
+}
+
+// abortAll aborts files concurrently, so the cleanup of many open uploads
+// (each S3 abort bounded on its own) fits plane Close's wait.
+func abortAll(files []*dataFile) {
+	if len(files) == 1 {
+		files[0].abort()
+		return
+	}
+	var wg sync.WaitGroup
+	for _, f := range files {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.abort()
+		}()
+	}
+	wg.Wait()
 }
 
 func (w *writer) finishLast() {
 	if w.err == nil && w.ctx.Err() != nil {
 		w.fail(w.failure())
 	}
-	if w.err != nil || w.cur == nil {
+	if w.err != nil {
+		return
+	}
+	if w.part != nil {
+		w.finishOpen()
+		return
+	}
+	if w.cur == nil {
 		return
 	}
 	f := w.cur
@@ -285,6 +341,9 @@ func (w *writer) finishLast() {
 func (w *writer) writeRecord(rec arrow.RecordBatch) error {
 	if rec.NumRows() == 0 {
 		return nil
+	}
+	if w.part != nil {
+		return w.writePartitioned(rec)
 	}
 	if w.cur == nil {
 		f, err := w.openFile(len(w.files))
@@ -312,9 +371,164 @@ func (w *writer) writeRecord(rec arrow.RecordBatch) error {
 	return nil
 }
 
+// finishOpen finishes every open partition file, in the order they were
+// opened; the first error aborts the rest.
+func (w *writer) finishOpen() {
+	files := make([]*dataFile, 0, len(w.open))
+	for _, f := range w.open {
+		files = append(files, f)
+	}
+	slices.SortFunc(files, func(a, b *dataFile) int { return a.seq - b.seq })
+	for _, f := range files {
+		delete(w.open, f.key)
+		if err := w.finish(f); err != nil {
+			w.fail(err)
+			return
+		}
+	}
+	w.cancel(errClosed) // release the lifetime context; the writer is done
+}
+
+// writePartitioned splits rec by partition tuple (first-seen order) and
+// writes each sub-batch to its tuple's open file.
+func (w *writer) writePartitioned(rec arrow.RecordBatch) error {
+	groups, err := w.part.split(rec)
+	if err != nil {
+		return err
+	}
+	out := rec
+	if !rec.Schema().Equal(w.writeSchema) {
+		out = array.NewRecordBatch(w.writeSchema, rec.Columns(), rec.NumRows())
+		defer out.Release()
+	}
+	parentBytes := recordBytes(rec)
+	for _, g := range groups {
+		if err := w.writeGroup(out, g, parentBytes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *writer) writeGroup(rec arrow.RecordBatch, g *rowGroup, parentBytes int64) error {
+	sub, fed, err := subBatch(w.ctx, rec, g, parentBytes)
+	if err != nil {
+		return err
+	}
+	defer sub.Release()
+	f := w.open[g.key]
+	if f == nil {
+		if f, err = w.openPartition(g); err != nil {
+			return err
+		}
+	}
+	if err := f.fw.WriteBuffered(sub); err != nil {
+		return fmt.Errorf("goplane: encode %s: %w", f.path, err)
+	}
+	f.rows += sub.NumRows()
+	f.fed += fed
+	w.tick++
+	f.lastUsed = w.tick
+	if f.fed >= rotationFactor*w.spec.TargetFileBytes {
+		delete(w.open, g.key)
+		return w.finish(f)
+	}
+	return nil
+}
+
+// subBatch returns the rows of g as a batch and the uncompressed bytes it
+// counts toward rotation: the whole batch, a zero-copy slice of a contiguous
+// run (parent bytes x rows / parent rows), or a Take of scattered rows (its
+// own buffers).
+func subBatch(ctx context.Context, rec arrow.RecordBatch, g *rowGroup, parentBytes int64) (arrow.RecordBatch, int64, error) {
+	n := len(g.rows)
+	if n == int(rec.NumRows()) {
+		rec.Retain()
+		return rec, parentBytes, nil
+	}
+	if g.contiguous() {
+		first := int64(g.rows[0])
+		return rec.NewSlice(first, first+int64(n)), parentBytes * int64(n) / rec.NumRows(), nil
+	}
+	ib := array.NewInt32Builder(memory.DefaultAllocator)
+	defer ib.Release()
+	ib.Reserve(n)
+	for _, r := range g.rows {
+		ib.UnsafeAppend(int32(r))
+	}
+	idx := ib.NewArray()
+	defer idx.Release()
+	cols := make([]arrow.Array, rec.NumCols())
+	defer func() {
+		for _, c := range cols {
+			if c != nil {
+				c.Release()
+			}
+		}
+	}()
+	for c := range cols {
+		var err error
+		if cols[c], err = compute.TakeArray(ctx, rec.Column(c), idx); err != nil {
+			return nil, 0, fmt.Errorf("goplane: split batch by partition: %w", err)
+		}
+	}
+	sub := array.NewRecordBatch(rec.Schema(), cols, int64(n))
+	return sub, recordBytes(sub), nil
+}
+
+// openPartition opens the file of g's tuple, first finishing the least
+// recently written open file when maxOpen files are open.
+func (w *writer) openPartition(g *rowGroup) (*dataFile, error) {
+	if w.seen != nil {
+		w.seen[g.key] = struct{}{}
+	}
+	if len(w.open) >= w.maxOpen {
+		if err := w.evictLRU(); err != nil {
+			return nil, err
+		}
+	}
+	partPath := w.part.path(g.tuple)
+	path := w.spec.DataPrefix + partPath + "/" + fmt.Sprintf("%s-%05d.parquet", w.spec.FilePrefix, w.nextSeq)
+	if err := checkKeyLength(path, partPath); err != nil {
+		return nil, err
+	}
+	f, err := w.openPath(path)
+	if err != nil {
+		return nil, err
+	}
+	f.seq, f.key, f.partition = w.nextSeq, g.key, g.tuple
+	w.nextSeq++
+	w.open[g.key] = f
+	return f, nil
+}
+
+// evictLRU finishes (and keeps for commit) the least recently written open
+// file; the first eviction of a writer logs one warning.
+func (w *writer) evictLRU() error {
+	var lru *dataFile
+	for _, f := range w.open {
+		if lru == nil || f.lastUsed < lru.lastUsed {
+			lru = f
+		}
+	}
+	if !w.evicted {
+		w.evicted = true
+		log.Printf("goplane: warning: table %s: %d partition files open (DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS); "+
+			"finishing the least recently written one after %d distinct partition tuples, so this writer produces more, smaller files",
+			w.spec.Table, w.maxOpen, len(w.seen))
+		w.seen = nil
+	}
+	delete(w.open, lru.key)
+	return w.finish(lru)
+}
+
 // openFile starts data file seq with the credentials current now.
 func (w *writer) openFile(seq int) (*dataFile, error) {
-	path := fmt.Sprintf("%s%s-%05d.parquet", w.spec.DataPrefix, w.spec.FilePrefix, seq)
+	return w.openPath(fmt.Sprintf("%s%s-%05d.parquet", w.spec.DataPrefix, w.spec.FilePrefix, seq))
+}
+
+// openPath starts the data file at path with the credentials current now.
+func (w *writer) openPath(path string) (*dataFile, error) {
 	props := map[string]string{}
 	if w.spec.Creds != nil {
 		c, err := currentCreds(w.ctx, w.spec.Creds)
@@ -354,7 +568,7 @@ func (w *writer) finish(f *dataFile) error {
 		return fmt.Errorf("goplane: upload %s: %w", f.path, err)
 	}
 	f.cancel()
-	w.files = append(w.files, datagateway.WrittenFile{Path: f.path, Rows: f.rows, Bytes: f.out.n})
+	w.files = append(w.files, datagateway.WrittenFile{Path: f.path, Rows: f.rows, Bytes: f.out.n, SpecID: w.specID, Partition: f.partition})
 	return nil
 }
 
@@ -370,6 +584,12 @@ type dataFile struct {
 	fw     *pqarrow.FileWriter
 	rows   int64
 	fed    int64 // uncompressed Arrow bytes fed
+
+	// Partitioned writers only.
+	seq       int
+	key       string
+	partition map[int]any
+	lastUsed  uint64
 
 	sinkClosed bool
 }
