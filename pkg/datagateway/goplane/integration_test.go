@@ -12,12 +12,15 @@ package goplane
 //	go test -count=1 -tags=integration -run Integration ./pkg/datagateway/goplane/ -v -timeout 15m
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -26,7 +29,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
 	"github.com/minio/minio-go/v7"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
@@ -504,4 +509,346 @@ func TestIntegrationAbortLeavesNoS3Object(t *testing.T) {
 	if _, err := core.ListObjectParts(ctx, siloBucket, key, uploadID, 0, 1000); err == nil {
 		t.Fatalf("upload %s still lists parts after Abort", uploadID)
 	}
+}
+
+// --- Reader (Task 5) ---
+
+// createReadTable creates a testSchema table in Lakekeeper and sets it up for
+// delete fixtures: format v2 asserted, merge-on-read deletes, and full
+// column metrics so a position-delete file stays on the data file it
+// targets (see morTargetedProps).
+func createReadTable(t *testing.T, r *lakekeeper.Resolver, ns, tbl string) *lakekeeper.WriterTarget {
+	t.Helper()
+	target := createTable(t, r, ns, tbl, testSchema)
+	tb := loadLK(t, r, ns, tbl)
+	if v := tb.Metadata().Version(); v != 2 {
+		t.Fatalf("table format version %d, want 2", v)
+	}
+	txn := tb.NewTransaction()
+	if err := txn.SetProperties(iceberg.Properties{
+		table.WriteDeleteModeKey:         table.WriteModeMergeOnRead,
+		"write.metadata.metrics.default": "full",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txn.Commit(context.Background()); err != nil {
+		t.Fatalf("set properties: %v", err)
+	}
+	return target
+}
+
+func loadLK(t *testing.T, r *lakekeeper.Resolver, ns, tbl string) *table.Table {
+	t.Helper()
+	cat, err := r.Catalog(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, err := cat.LoadTable(context.Background(), catalog.ToIdentifier(ns, tbl))
+	if err != nil {
+		t.Fatalf("LoadTable: %v", err)
+	}
+	return tb
+}
+
+// writeIDs writes ids [start, start+n) as one file; a third (string) column
+// of sch, if any, gets "extra-<id>".
+func writeIDs(t *testing.T, p *Plane, target *lakekeeper.WriterTarget, filePrefix string, sch *arrow.Schema, start, n int) datagateway.WrittenFile {
+	t.Helper()
+	w, err := p.OpenTableWriter(context.Background(), datagateway.WriterSpec{
+		DataPrefix: target.BasePath, FilePrefix: filePrefix, Schema: sch, Creds: target.VendedCreds,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := batch(testSchema, start, n)
+	if sch.NumFields() > 2 {
+		sb := array.NewStringBuilder(memory.NewGoAllocator())
+		for i := 0; i < n; i++ {
+			sb.Append(fmt.Sprintf("extra-%d", start+i))
+		}
+		ea := sb.NewArray()
+		sb.Release()
+		full := array.NewRecordBatch(sch, []arrow.Array{rec.Column(0), rec.Column(1), ea}, int64(n))
+		ea.Release()
+		rec.Release()
+		rec = full
+	}
+	err = w.Write(context.Background(), rec)
+	rec.Release()
+	if err != nil {
+		w.Abort()
+		t.Fatal(err)
+	}
+	files, err := w.Close(context.Background())
+	if err != nil || len(files) != 1 {
+		t.Fatalf("Close = %+v, %v", files, err)
+	}
+	return files[0]
+}
+
+func lkDelete(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, expr iceberg.BooleanExpression) {
+	t.Helper()
+	txn := loadLK(t, r, ns, tbl).NewTransaction()
+	if err := txn.Delete(context.Background(), expr, nil); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := txn.Commit(context.Background()); err != nil {
+		t.Fatalf("Delete commit: %v", err)
+	}
+}
+
+func lkTaskFor(t *testing.T, r *lakekeeper.Resolver, ns, tbl, path string) table.FileScanTask {
+	t.Helper()
+	tasks, err := loadLK(t, r, ns, tbl).Scan().PlanFiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range tasks {
+		if task.File.FilePath() == path {
+			return task
+		}
+	}
+	t.Fatalf("no task for %s", path)
+	return table.FileScanTask{}
+}
+
+func openLKReader(t *testing.T, p *Plane, ns, tbl string, raw bool) datagateway.TableReader {
+	t.Helper()
+	tr, err := p.OpenTableReader(context.Background(), datagateway.ReaderSpec{Namespace: ns, Table: tbl, RawParquet: raw})
+	if err != nil {
+		t.Fatalf("OpenTableReader: %v", err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	return tr
+}
+
+func objectBytes(t *testing.T, fx *fixture, path string) []byte {
+	t.Helper()
+	key := strings.TrimPrefix(path, "s3://"+siloBucket+"/")
+	obj, err := fx.siloCore(t).Client.GetObject(context.Background(), siloBucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer obj.Close()
+	b, err := io.ReadAll(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestIntegrationReadRawAndDecoded(t *testing.T) {
+	fx := sharedFixture(t)
+	r := resolver(t, fx)
+	p := New(Config{Tables: ResolverTables{Resolver: r}})
+	defer p.Close()
+	const ns, tbl = "gw_read", "raw_and_decoded"
+	target := createReadTable(t, r, ns, tbl)
+	clean := writeIDs(t, p, target, "part-read0001-w1", testSchema, 0, 100)
+	dirty := writeIDs(t, p, target, "part-read0001-w2", testSchema, 100, 100)
+	commit(t, r, ns, tbl, []datagateway.WrittenFile{clean, dirty}, icebergjob.WriteModeAppend, "key-read1")
+	lkDelete(t, r, ns, tbl, iceberg.EqualTo(iceberg.Reference("id"), int64(150)))
+	if task := lkTaskFor(t, r, ns, tbl, dirty.Path); len(task.DeleteFiles) == 0 {
+		t.Fatalf("dirty file's task has no position delete files: %+v", task)
+	}
+	if task := lkTaskFor(t, r, ns, tbl, clean.Path); hasDeletes(task) {
+		t.Fatal("clean file's task carries delete files")
+	}
+
+	tr := openLKReader(t, p, ns, tbl, true)
+	ctx := context.Background()
+	var gotRaw, gotDecoded int
+	var ids []int64
+	for {
+		part, err := tr.NextPart(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("NextPart: %v", err)
+		}
+		if part.Raw != nil {
+			gotRaw++
+			if part.Raw.Path != clean.Path || part.Raw.Rows != 100 || part.Raw.Size != clean.Bytes {
+				t.Fatalf("raw part %+v, want %s", part.Raw, clean.Path)
+			}
+			rc, err := part.Raw.Open(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := io.ReadAll(rc)
+			_ = rc.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(b, objectBytes(t, fx, clean.Path)) {
+				t.Fatal("raw part bytes differ from the stored object")
+			}
+			sch, recs := readParquetBytes(t, b)
+			if !sameNamesAndTypes(sch, tr.Schema()) {
+				t.Fatalf("raw schema %s != %s", sch, tr.Schema())
+			}
+			ids = append(ids, summarize(t, "raw", recs).ids...)
+			continue
+		}
+		gotDecoded++
+		var recs []arrow.RecordBatch
+		for {
+			rec, err := part.Records.Next(ctx)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Next: %v", err)
+			}
+			if !rec.Schema().Equal(tr.Schema()) {
+				t.Fatalf("decoded schema %s != %s", rec.Schema(), tr.Schema())
+			}
+			recs = append(recs, rec)
+		}
+		_ = part.Records.Close()
+		ids = append(ids, summarize(t, "decoded", recs).ids...)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if gotRaw != 1 || gotDecoded != 1 || !equalIDs(ids, idRange(0, 200, 150)) {
+		t.Fatalf("raw %d decoded %d, %d ids", gotRaw, gotDecoded, len(ids))
+	}
+}
+
+func TestIntegrationReadAfterSchemaEvolution(t *testing.T) {
+	fx := sharedFixture(t)
+	r := resolver(t, fx)
+	p := New(Config{Tables: ResolverTables{Resolver: r}})
+	defer p.Close()
+	const ns, tbl = "gw_read", "evolved"
+	target := createReadTable(t, r, ns, tbl)
+	old := writeIDs(t, p, target, "part-evol0001-w1", testSchema, 0, 10)
+	commit(t, r, ns, tbl, []datagateway.WrittenFile{old}, icebergjob.WriteModeAppend, "key-evol1")
+
+	tb := loadLK(t, r, ns, tbl)
+	txn := tb.NewTransaction()
+	if err := txn.UpdateSchema(true, false, table.WithNameMapping(tb.NameMapping())).
+		AddColumn([]string{"extra"}, iceberg.PrimitiveTypes.String, "", false, nil).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txn.Commit(context.Background()); err != nil {
+		t.Fatalf("schema commit: %v", err)
+	}
+	wide := arrow.NewSchema(append(testSchema.Fields(), arrow.Field{Name: "extra", Type: arrow.BinaryTypes.String, Nullable: true}), nil)
+	fresh := writeIDs(t, p, target, "part-evol0002-w1", wide, 10, 10)
+	commit(t, r, ns, tbl, []datagateway.WrittenFile{fresh}, icebergjob.WriteModeAppend, "key-evol2")
+
+	parts := readParts(t, openLKReader(t, p, ns, tbl, true))
+	byKind := map[string]partSummary{}
+	for _, part := range parts {
+		byKind[part.kind] = part
+	}
+	if len(parts) != 2 || byKind["raw"].path != fresh.Path || byKind["decoded"].rows != 10 {
+		t.Fatalf("parts %s", kinds(parts))
+	}
+	for _, v := range byKind["decoded"].cols[2] {
+		if v != nil {
+			t.Fatalf("old file's new column not null: %v", byKind["decoded"].cols[2])
+		}
+	}
+	if fmt.Sprint(byKind["raw"].cols[2][0]) != "extra-10" {
+		t.Fatalf("new file's column %v", byKind["raw"].cols[2])
+	}
+}
+
+// countingLoader hands the reader invalidatingCreds (one Lakekeeper round
+// trip per Get) over the resolver's vended credentials.
+type countingLoader struct {
+	r     *lakekeeper.Resolver
+	creds *invalidatingCreds
+}
+
+func (l *countingLoader) LoadTable(ctx context.Context, ns, tbl string) (*table.Table, datagateway.CredsSource, error) {
+	t, vc, err := l.r.LoadTableForScan(ctx, ns, tbl)
+	if err != nil {
+		return nil, nil, err
+	}
+	l.creds = &invalidatingCreds{vc: vc}
+	return t, l.creds, nil
+}
+
+func (l *countingLoader) gets() int {
+	l.creds.mu.Lock()
+	defer l.creds.mu.Unlock()
+	return len(l.creds.keys)
+}
+
+func TestIntegrationReadCredsInvalidate(t *testing.T) {
+	fx := sharedFixture(t)
+	r := resolver(t, fx)
+	loader := &countingLoader{r: r}
+	p := New(Config{Tables: loader})
+	defer p.Close()
+	const ns, tbl = "gw_read", "creds"
+	target := createReadTable(t, r, ns, tbl)
+	f1 := writeIDs(t, p, target, "part-creds001-w1", testSchema, 0, 10)
+	f2 := writeIDs(t, p, target, "part-creds001-w2", testSchema, 10, 10)
+	commit(t, r, ns, tbl, []datagateway.WrittenFile{f1, f2}, icebergjob.WriteModeAppend, "key-creds")
+	ctx := context.Background()
+
+	// Raw: every Open fetches credentials anew.
+	tr := openLKReader(t, p, ns, tbl, true)
+	raws := 0
+	for {
+		part, err := tr.NextPart(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil || part.Raw == nil {
+			t.Fatalf("NextPart = %+v, %v", part, err)
+		}
+		before := loader.gets()
+		rc, err := part.Raw.Open(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, rc); err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+		if got := loader.gets() - before; got != 1 {
+			t.Fatalf("raw Open fetched credentials %d times, want 1", got)
+		}
+		raws++
+	}
+	if raws != 2 {
+		t.Fatalf("%d raw parts, want 2", raws)
+	}
+
+	// Decoded: one fetch per file (one ReadTasks call each) within one run.
+	tr = openLKReader(t, p, ns, tbl, false)
+	part, err := tr.NextPart(ctx)
+	if err != nil || part.Records == nil {
+		t.Fatalf("NextPart = %+v, %v", part, err)
+	}
+	before := loader.gets()
+	var n int64
+	for {
+		rec, err := part.Records.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		n += rec.NumRows()
+		rec.Release()
+	}
+	_ = part.Records.Close()
+	if got := loader.gets() - before; n != 20 || got != 2 {
+		t.Fatalf("decoded %d rows with %d credential fetches, want 20 rows / 2 fetches", n, got)
+	}
+	loader.creds.mu.Lock()
+	distinct := map[string]bool{}
+	for _, k := range loader.creds.keys {
+		distinct[k] = true
+	}
+	fetches := len(loader.creds.keys)
+	loader.creds.mu.Unlock()
+	t.Logf("%d credential fetches, %d distinct vended access keys", fetches, len(distinct))
 }

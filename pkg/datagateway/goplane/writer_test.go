@@ -667,19 +667,6 @@ func TestWriteRejectsSchemaMismatch(t *testing.T) {
 	}
 }
 
-func TestOpenTableReaderNotImplemented(t *testing.T) {
-	p := New(Config{})
-	defer p.Close()
-	if _, err := p.OpenTableReader(context.Background(), datagateway.ReaderSpec{Namespace: "n", Table: "t"}); err == nil {
-		t.Fatal("reads should not be implemented yet")
-	}
-	dp, err := Factory(context.Background(), datagateway.BootInfo{})
-	if err != nil || dp == nil {
-		t.Fatalf("Factory = %v, %v", dp, err)
-	}
-	_ = dp.Close()
-}
-
 // blockingSink blocks every Write until release is closed.
 type blockingSink struct {
 	release chan struct{}

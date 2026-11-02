@@ -317,6 +317,29 @@ func (r *Resolver) LoadTableForRead(ctx context.Context, ns, tbl string) (*Reade
 	}, nil
 }
 
+// LoadTableForScan loads (ns, tbl) for an iceberg-go scan and returns the
+// table's vended credential source, built as the write path builds it
+// (nil for file:// tables).
+func (r *Resolver) LoadTableForScan(ctx context.Context, ns, tbl string) (*icebergtable.Table, *catalogwriter.VendedCreds, error) {
+	cli, err := r.newClient(ctx, r.Token)
+	if err != nil {
+		return nil, nil, fmt.Errorf("lakekeeper: new client: %w", err)
+	}
+	t, err := cli.Catalog.LoadTable(ctx, catalog.ToIdentifier(ns, tbl))
+	if err != nil {
+		return nil, nil, fmt.Errorf("lakekeeper: load %s.%s for scan: %w", ns, tbl, err)
+	}
+	loc := t.Location()
+	if loc == "" {
+		return nil, nil, fmt.Errorf("lakekeeper: table %s.%s has empty location", ns, tbl)
+	}
+	vc, err := r.writeCreds(strings.TrimRight(loc, "/")+"/data/", ns, tbl)
+	if err != nil {
+		return nil, nil, err
+	}
+	return t, vc, nil
+}
+
 // Catalog returns an iceberg catalog handle bound to the resolver's run
 // token. A fresh *catalogwriter.Client is opened per call (same pattern
 // as LoadTableForRead / LoadOrCreateForWrite) — there is no shared
