@@ -241,9 +241,10 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 		fmt.Sprintf("LAKEKEEPER__PG_DATABASE_URL_WRITE=postgres://postgres:%s@127.0.0.1:%d/lakekeeper", pgPassword, f.pgPort),
 		"LAKEKEEPER__PG_ENCRYPTION_KEY=" + lkEncryptionKey,
 		fmt.Sprintf("LAKEKEEPER__LISTEN_PORT=%d", f.lkPort),
+		fmt.Sprintf("LAKEKEEPER__METRICS_PORT=%d", freePort(t)),
 	}
-	runOneShot(ctx, t, "dq-it-lk-migrate", lkEnv, "quay.io/lakekeeper/catalog:v0.12.1", "migrate")
-	runDetachedEnv(t, "dq-it-lk", lkEnv, "quay.io/lakekeeper/catalog:v0.12.1", "serve")
+	runOneShot(ctx, t, "dq-it-lk-migrate", lkEnv, "quay.io/lakekeeper/catalog:v0.14.2", "migrate")
+	runDetachedEnv(t, "dq-it-lk", lkEnv, "quay.io/lakekeeper/catalog:v0.14.2", "serve")
 	waitHTTP(ctx, t, f.lakekeeperBase()+"/health")
 
 	bootstrapLakekeeper(ctx, t, f)

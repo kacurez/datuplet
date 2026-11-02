@@ -17,14 +17,12 @@ Two chart values must match at all times:
 | Chart | Value key | Role |
 |---|---|---|
 | `charts/datuplet-app/values.yaml` | `fgaModel.version` | Phase 3 origin — used by authz-bootstrap to write the pin tuple and by pipeline-api's `OPENFGA_MODEL_VERSION` env |
-| `charts/datuplet-lakekeeper/values.yaml` | `platform.fgaModelVersion` | Phase 4 mirror — used by the `lakekeeper-config` Secret's `LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION` env |
+| `charts/datuplet-lakekeeper/values.yaml` | `platform.fgaModelVersion` | Phase 4 mirror — used by the `wait-for-fga-pin` hook and the `wait-for-fga-store` initContainer (via the `lakekeeper-config` Secret's `DATUPLET_FGA_MODEL_VERSION` key) to wait for the pin |
 
-Both must be bumped together when the model changes. If they diverge, pipeline-api and
-lakekeeper will resolve different model IDs and authorization checks will behave inconsistently.
-
-**Known gap:** CI enforces DSL changes → version bump in `datuplet-app` but does NOT enforce
-cross-chart value sync between `fgaModel.version` (app) and `platform.fgaModelVersion`
-(lakekeeper). Operators must bump both manually. See [docs/known-limitations.md](known-limitations.md).
+Both must equal the active model version of the pinned Lakekeeper image (4.13 for v0.14.2):
+Lakekeeper has no setting that selects a model version, it looks up the pin of its hard-coded
+active version (see "Re-forking from upstream Lakekeeper"). `scripts/verify-versions.sh` (a PR
+CI check) fails if the two values drift.
 
 ## Additive vs breaking changes
 
@@ -36,9 +34,9 @@ cross-chart value sync between `fgaModel.version` (app) and `platform.fgaModelVe
 5. `helm upgrade datuplet-lakekeeper charts/datuplet-lakekeeper -n datuplet --wait --wait-for-jobs`
 
 Authz-bootstrap finds no pin tuple for the new version, uploads the model, writes the pin,
-and exits 0. Pipeline-api rolls out with the new `OPENFGA_MODEL_VERSION` env; lakekeeper
-picks up the matching `LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION` from the re-rendered
-`lakekeeper-config` Secret.
+and exits 0. Pipeline-api rolls out with the new `OPENFGA_MODEL_VERSION` env. Lakekeeper keeps
+using the pin of its own active version, so a model version that differs from it reaches
+pipeline-api only.
 
 **Breaking** (rename a type, remove a relation, change semantics) — **not supported by helm
 upgrade in v0.1**. Process:
@@ -126,9 +124,8 @@ The workflow `.github/workflows/fga-version-check.yml` fails any PR that modifie
 `charts/datuplet-app/values.yaml`. This is belt-and-suspenders with the runtime
 drift detection above.
 
-**CI gap:** the workflow enforces DSL → version coupling within `datuplet-app` but does NOT
-detect drift between `fgaModel.version` (app) and `platform.fgaModelVersion` (lakekeeper).
-Cross-chart sync is the operator's responsibility on upgrade.
+Cross-chart drift between `fgaModel.version` (app) and `platform.fgaModelVersion`
+(lakekeeper) is caught by `scripts/verify-versions.sh` in PR CI.
 
 ## Further reading
 

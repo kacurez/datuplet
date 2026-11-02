@@ -12,9 +12,11 @@ checklist per dependency — what CI cannot see.
    - `pkg/datagateway/lakekeeper/` (resolver: table create/load + vended creds)
    - `pkg/catalogwriter/` (REST client + VendedCreds)
    - `pkg/pipelineapi/storage/catalog_proxy.go` (catalog proxy)
-3. `platform.fgaModelVersion` does NOT move with lakekeeper versions — it
-   tracks Datuplet's FGA DSL only (docs/fga-model-upgrades.md). Bump it
-   only if datuplet's model changed.
+3. The FGA model version (`fgaModel.version` = `platform.fgaModelVersion`)
+   must equal the new Lakekeeper's active model version (4.13 for v0.14.2).
+   A Lakekeeper bump that moves the active version means a re-fork of the
+   model (docs/fga-model-upgrades.md, "Re-forking from upstream Lakekeeper")
+   and a fresh install, never an in-place upgrade.
 4. Gate: `make e2e-k8s` (full suite exercises catalog + STS paths).
 5. Upgrade order on clusters: `upgrade.sh --phase lakekeeper` alone is
    fine; app does not need a simultaneous bump unless the REST API broke.

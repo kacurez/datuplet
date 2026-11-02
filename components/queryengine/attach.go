@@ -51,8 +51,8 @@ const catalogSecretName = "lk_tok"
 
 // attachCatalog wires the embedded DuckDB engine to a lakekeeper iceberg-REST
 // catalog using the canonical form proven by RFC 022 Spike 0.1 and re-proven on
-// DuckDB 2.0.0 (lakekeeper v0.12.1 + DuckDB 2.0.0 iceberg ext, spike report
-// 2026-10-28). It MUST run after openEngine and BEFORE lock(): ATTACH needs
+// DuckDB 2.0.0 (DuckDB 2.0.0 iceberg ext; spike report 2026-10-28 on lakekeeper
+// v0.12.1, integration tests on v0.14.2). It MUST run after openEngine and BEFORE lock(): ATTACH needs
 // mutable config, and the first secret op initializes DuckDB's secret manager
 // via the local stored-secrets dir — which lock()'s disabled_filesystems would
 // block.

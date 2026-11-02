@@ -150,6 +150,11 @@ follow-up work.
 a relation) require a full cluster teardown and re-registration. Automated migration
 tooling is follow-up work.
 
+**The FGA model version is tied to the Lakekeeper image.** Lakekeeper uses the pin of its
+hard-coded active model version (4.13 for v0.14.2), so `fgaModel.version` must equal it. A
+Lakekeeper bump that moves the active version needs a re-fork and a fresh install. See
+[docs/fga-model-upgrades.md](fga-model-upgrades.md).
+
 ---
 
 ## Pipeline operator + inline commits

@@ -30,7 +30,7 @@ const (
 	siloBucket       = "gw-it-bucket"
 	pgPassword       = "gw-it-pg-pw"
 	lkEncryptionKey  = "gw-it-throwaway-encryption-key"
-	lakekeeperImage  = "quay.io/lakekeeper/catalog:v0.12.1"
+	lakekeeperImage  = "quay.io/lakekeeper/catalog:v0.14.2"
 	// dummyCatalogJWT is never validated (Lakekeeper authn is off).
 	dummyCatalogJWT = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJndyJ9.c2ln"
 	// siloImage: the pinned drop-in from charts/datuplet-infra/values.yaml.

@@ -110,7 +110,8 @@ func (m *Manager) CreateProject(ctx context.Context, name string) (string, error
 // DeleteProject DELETEs /management/v1/project/{id}. The endpoint is
 // marked deprecated in lakekeeper's OpenAPI in favour of
 // `DELETE /management/v1/project` + `x-project-id` header, but the
-// path-based form is still accepted and is more ergonomic; we'll switch
+// path-based form is still accepted (v0.14.2: operationId
+// delete_project_by_id_deprecated) and is more ergonomic; we'll switch
 // when lakekeeper drops it.
 //
 // Returns nil on 204 (success) AND on 404 (already gone) so callers can
