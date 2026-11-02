@@ -19,7 +19,8 @@ partitioning** over restoring that layout.
    iceberg-go row-filter scans) prune files.
 2. Transforms: `identity`, `year`, `month`, `day`, `hour`, `bucket[N]`, `truncate[W]`, `void`, on the source types
    Iceberg allows for each.
-3. Unpartitioned tables keep exactly today's code path and performance (no routing, commit via `AddFiles`).
+3. Unpartitioned tables keep today's code path and performance (no routing, commit via `AddFiles`), except the
+   decision 11 fix that FULL_LOAD replaces data files only.
 4. The number of open files per table writer is bounded; the memory that bound implies is measured in Task 9.
 
 ## Non-goals
@@ -62,19 +63,21 @@ partitioning** over restoring that layout.
    `InvalidArgument`; present in the table schema but absent from the writer's Arrow schema → the partition value is
    null for every row.
 6. **Tuple computation.** The source type is the **table schema's** Iceberg type for the source field (looked up by
-   name in the writer's Arrow record). Arrow values convert to the Go types iceberg-go's transformers assert
-   (`transforms.go:573-627, 731-812, 994-1245`):
-   - int8/int16/int32/uint8/uint16 → `int32`; int64/uint32 → `int64`; uint64 > MaxInt64 → write error (as R3c);
-   - date32 → `iceberg.Date` (days); date64 → `iceberg.Date` via floor division of ms by 86 400 000;
-   - timestamp of any unit, with or without zone → `iceberg.Timestamp` microseconds via floor division
-     (s ×1e6, ms ×1e3, ns ÷1e3 floor); timestamptz vs timestamp follows the table type;
-   - string/large_string → `string`; binary → `[]byte`; decimal128 → `iceberg.Decimal`; bool → `bool`;
-   - anything else on a non-`void` field → write error naming column and type.
-   The tuple value is the transformer's result typed per `Transform.ResultType` (`int32` for
-   year/month/hour/bucket, `iceberg.Date` for day, source type for identity/truncate). Null source → null value.
-   The tuple map has an entry for **every** spec field id — `nil` for nulls and for every `void` field — because the
-   commit validator requires presence (`table/transaction.go:1071-1078`); do not copy `FileToDataFile`'s
-   drop-nil pattern.
+   name in the writer's Arrow record), and Arrow values convert to the **Go type of that Iceberg type** — the type
+   iceberg-go's transformers assert against the table column (`transforms.go:482-490, 573-627, 731-812, 994-1245`):
+   - Iceberg `int` → `int32` (from int8/int16/int32/uint8/uint16 Arrow); `long` → `int64` (from any signed int,
+     uint8/16/32; uint64 > MaxInt64 → write error, as R3c); `float` → `float32`; `double` → `float64` (from
+     float32/float64); `boolean` → `bool`; `string` → `string`; `binary`/`fixed` → `[]byte`; `decimal` →
+     `iceberg.Decimal`;
+   - `date` → `iceberg.Date` (date32 days; date64 ms floor-divided by 86 400 000);
+   - `timestamp` / `timestamptz` → `iceberg.Timestamp` microseconds (any Arrow timestamp unit, floor division:
+     s ×1e6, ms ×1e3, ns ÷1e3);
+   - each (Arrow type, table type) pair of a non-`void` source field is checked **once when the writer resolves the
+     spec**; an unsupported pair → `InvalidArgument` naming column and both types (not one error per batch).
+   The tuple value is the transformer's result typed per `Transform.ResultType` (`int32` for year/month/hour/bucket,
+   `iceberg.Date` for day, the source Go type for identity/truncate). Null source → null value. The tuple map has an
+   entry for **every** spec field id — `nil` for nulls and for every `void` field — because the commit validator
+   requires presence (`table/transaction.go:1071-1078`); do not copy `FileToDataFile`'s drop-nil pattern.
 7. **Grouping key.** Rows are grouped by a canonical byte encoding of the tuple (type tag + value bytes; strings and
    `[]byte` by content; floats by IEEE bits with NaN canonicalised; nil distinct), not by Go map equality.
 8. **Writer structure (goplane).** One table writer keeps today's single queue (capacity 4) and single `run`
@@ -85,7 +88,8 @@ partitioning** over restoring that layout.
    counted from the sub-batch's own buffers (`compute.Take` output) or, for a slice, as parent bytes × slice rows /
    parent rows. File sequence numbers come from one writer-wide counter. `fail`, `finishLast`, `Abort`, plane
    `Close`/`Interrupt` and context cancellation act on **every** open file (cancel IO context, close sink, abort
-   multipart, remove local partials); any one file's error aborts all open files and fails the writer. Unpartitioned
+   multipart, remove local partials); any one file's error aborts all open files and fails the writer. Aborts of open files run **concurrently** (each still
+   bounded at 30 s by R3a), so cleanup of up to 32 files fits within plane Close's 30 s wait. Unpartitioned
    specs keep today's single-file path unchanged.
 9. **Open-file cap.** At most `MaxOpenPartitions` open files per table writer — default 32; env
    `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (1–1024; invalid → default + warning), read once in `goplane.Factory` into
