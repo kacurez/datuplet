@@ -78,18 +78,15 @@ to a human/automation account) to retrieve audit entries.
 
 ## Upgrade
 
-**Breaking FGA model changes are manual.** When an OpenFGA DSL change renames or
-removes a relation, existing tuples (project_admin, server-admin) need rewriting.
-The only supported path today is: tear down the CNPG cluster (wipes OpenFGA +
-Lakekeeper DBs), upgrade both charts, re-run `register.sh`. See
-[docs/fga-model-upgrades.md](fga-model-upgrades.md).
+**FGA model changes are fresh-install only.** Any DSL change is made at the same version
+and takes effect only on a fresh install (`install.sh` + `register.sh`); there is no
+upgrade or tuple-rewrite path. See [docs/fga-model-upgrades.md](fga-model-upgrades.md).
 
 **`platform.fgaModelVersion` cross-chart drift.** `charts/datuplet-app/values.yaml`
 (`fgaModel.version`) and `charts/datuplet-lakekeeper/values.yaml`
-(`platform.fgaModelVersion`) must be bumped together on every FGA model upgrade. CI
+(`platform.fgaModelVersion`) must stay equal (both = Lakekeeper's active model version). CI
 enforces DSL→version coupling within `datuplet-app` (the `fga-version-check` workflow)
-**and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4). Still bump both
-values together — the check fails the PR if they drift.
+**and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4).
 
 **Upgrade support statement (0.x).** Upgrades are tested for exactly one
 hop — latest published release → next (the `upgrade-e2e` workflow).
@@ -145,10 +142,6 @@ follow-up work.
 ---
 
 ## FGA model
-
-**No automated FGA tuple migration tooling.** Breaking DSL changes (rename/remove
-a relation) require a full cluster teardown and re-registration. Automated migration
-tooling is follow-up work.
 
 **The FGA model version is tied to the Lakekeeper image.** Lakekeeper uses the pin of its
 hard-coded active model version (4.13 for v0.14.2), so `fgaModel.version` must equal it. A

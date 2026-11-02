@@ -131,7 +131,7 @@ Full diagram and component descriptions: [docs/architecture.md](docs/architectur
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common failures and fixes |
 | [docs/known-limitations.md](docs/known-limitations.md) | Known gaps for 0.1 |
 | [docs/postgres-migrations.md](docs/postgres-migrations.md) | DB migration discipline |
-| [docs/fga-model-upgrades.md](docs/fga-model-upgrades.md) | FGA model upgrade procedure |
+| [docs/fga-model-upgrades.md](docs/fga-model-upgrades.md) | FGA model changes (fresh install only) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 
 ---

@@ -324,9 +324,10 @@ These are conventions a new contributor wouldn't infer from the code:
   active model version (4.13 for v0.14.2) — Lakekeeper has no setting that
   selects a model, it looks up the pin of its hard-coded version. A
   Lakekeeper bump means a model re-fork (`docs/fga-model-upgrades.md`) and a
-  fresh install. CI enforces DSL→version coupling in `datuplet-app`
-  (`fga-version-check.yml`) and cross-chart equality
-  (`scripts/verify-versions.sh`).
+  fresh install; any other DSL change stays at the same version and is
+  fresh-install only (no upgrade or tuple-rewrite path). CI checks
+  cross-chart equality (`scripts/verify-versions.sh`); `fga-version-check.yml`
+  still demands a version bump on DSL changes, which conflicts with that rule.
 - **`pg-lakekeeper` + `pg-lakekeeper-pw` Secrets** are created in the
   `infra` chart's keygen Job and consumed cross-phase by the `lakekeeper`
   chart's lakekeeper Deployment.
