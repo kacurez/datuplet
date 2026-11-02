@@ -416,6 +416,10 @@ func TestOpenFGARealModelAccessMatrix(t *testing.T) {
 		row{reader, "can_read_data", sib, false},
 		row{nobody, "can_get_metadata", n, false},
 		row{nobody, "can_use", w, false},
+		// Upstream 4.13: granting data_admin needs security_admin, not data_admin.
+		row{editor, "can_grant_data_admin", p, false},
+		row{admin, "can_grant_data_admin", p, true},
+		row{nobody, "can_grant_data_admin", p, false},
 	)
 
 	for _, r := range rows {

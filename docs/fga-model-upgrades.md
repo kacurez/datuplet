@@ -87,6 +87,11 @@ version):
 
    Upstream's granted vs `_effective` split decides where an extension lands: actions read
    the `_effective` twin, so extensions feed the twin, not the bare (granted-only) relation.
+
+   Intended, accepted behaviour change in 4.13: project `can_grant_data_admin` is
+   `security_admin or admin from server`, so editors (`data_admin`) can no longer grant
+   `data_admin` through Lakekeeper's permissions API. Datuplet itself never calls that API.
+   Both authz tests pin this.
 3. Update `datuplet-app.fgaModelComponents` in `charts/datuplet-app/templates/_helpers.tpl` to
    list `fga.mod`'s components in order. It feeds both the bootstrap DSL hash and the
    ConfigMap volume items.

@@ -106,6 +106,7 @@ func TestFGAModelCompiles(t *testing.T) {
 			{"user:viewer", "viewer", p},
 			{"user:editor", "editor", p},
 			{"user:reader", "explicit_reader", tbl},
+			{"user:admin", "project_admin", p},
 		})
 		cases := []struct {
 			user, rel, obj string
@@ -131,6 +132,10 @@ func TestFGAModelCompiles(t *testing.T) {
 			{"user:reader", "datuplet_member", p, false},
 			{"user:nobody", "can_read_data", tbl, false},
 			{"user:nobody", "describe_effective", p, false},
+			// Upstream 4.13: granting data_admin needs security_admin, not data_admin.
+			{"user:editor", "can_grant_data_admin", p, false},
+			{"user:admin", "can_grant_data_admin", p, true},
+			{"user:nobody", "can_grant_data_admin", p, false},
 		}
 		for _, c := range cases {
 			if got := e.check(c.user, c.rel, c.obj, 0); got != c.want {
