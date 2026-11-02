@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	openfgaImage = "openfga/openfga:v1.15.0"
+	openfgaImage = "openfga/openfga:v1.22.1"
 	openfgaPort  = "8080/tcp"
 )
 

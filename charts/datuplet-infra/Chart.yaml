@@ -14,7 +14,7 @@ maintainers:
 
 dependencies:
   - name: openfga
-    version: "0.3.3"
+    version: "0.3.19"
     repository: https://openfga.github.io/helm-charts
     condition: openfga.enabled
   - name: minio

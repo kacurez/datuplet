@@ -50,6 +50,7 @@ checklist per dependency — what CI cannot see.
    an engine bump does not change them; authz-bootstrap's hash pin
    guards against silent drift.
 3. Gate: e2e (authz-bootstrap + storage-browse scenarios cover FGA).
+4. Current pins: OpenFGA v1.22.1 (chart 0.3.19), `openfga/cli` v0.8.2 (`fga model write --file` + `--config` verified). The `pkg/pipelineapi/authz` integration test image (`openfga_integration_test.go`) is pinned by hand to the same engine version.
 
 ## MinIO (charts/datuplet-infra, dep `minio`)
 1. Dev/e2e-only backend (production = external S3/GCS). Diff root-cred
