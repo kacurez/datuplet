@@ -33,7 +33,10 @@ var testSchema = arrow.NewSchema([]arrow.Field{
 // batch builds n rows of testSchema (or sch, which must have the same types)
 // with ids starting at start.
 func batch(sch *arrow.Schema, start, n int) arrow.RecordBatch {
-	mem := memory.NewGoAllocator()
+	return batchWith(memory.NewGoAllocator(), sch, start, n)
+}
+
+func batchWith(mem memory.Allocator, sch *arrow.Schema, start, n int) arrow.RecordBatch {
 	ib := array.NewInt64Builder(mem)
 	sb := array.NewStringBuilder(mem)
 	defer ib.Release()
@@ -727,6 +730,156 @@ func TestWriterBackpressureAndQueuedBytes(t *testing.T) {
 	if got := w.QueuedBytes(); got != int64(channelBatches)*size {
 		t.Fatalf("QueuedBytes after the timed-out Write = %d", got)
 	}
+	close(sink.release)
+	files, err := w.Close(context.Background())
+	if err != nil || len(files) != 1 || files[0].Rows != 10*(1+channelBatches) {
+		t.Fatalf("Close = %+v, %v", files, err)
+	}
+	if w.QueuedBytes() != 0 {
+		t.Fatalf("QueuedBytes after Close = %d", w.QueuedBytes())
+	}
+}
+
+// stallSink blocks every Write until release is closed or its upload context
+// is cancelled (as a real streamed upload does).
+type stallSink struct {
+	ctx              context.Context
+	release          chan struct{}
+	closes           atomic.Int32
+	cancelledAtClose atomic.Bool
+}
+
+func (s *stallSink) Write(p []byte) (int, error) {
+	select {
+	case <-s.release:
+		return len(p), nil
+	case <-s.ctx.Done():
+		return 0, s.ctx.Err()
+	}
+}
+
+func (s *stallSink) Close() error {
+	s.closes.Add(1)
+	s.cancelledAtClose.Store(s.ctx.Err() != nil)
+	return nil
+}
+
+// TestWriterExitsOnPlaneCancel: plane Close or Interrupt alone (no writer
+// Close/Abort) ends the writer goroutine, releases every batch it holds,
+// aborts the in-flight upload, and later Write/Close fail without blocking.
+func TestWriterExitsOnPlaneCancel(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel func(*Plane)
+	}{
+		{"Close", func(p *Plane) { _ = p.Close() }},
+		{"Interrupt", func(p *Plane) { p.Interrupt() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+			p := New(Config{})
+			sink := &stallSink{release: make(chan struct{})}
+			opened := make(chan struct{})
+			p.openSink = func(ctx context.Context, _ map[string]string, _ string) (io.WriteCloser, error) {
+				sink.ctx = ctx
+				close(opened)
+				return sink, nil
+			}
+			w := openWriter(t, p, datagateway.WriterSpec{DataPrefix: "file:///unused/"}).(*writer)
+			for i := 0; i < 1+channelBatches; i++ { // one in the encoder, the rest queued
+				rec := batchWith(mem, testSchema, i*10, 10)
+				if err := w.Write(context.Background(), rec); err != nil {
+					t.Fatalf("Write %d: %v", i, err)
+				}
+				rec.Release()
+			}
+			<-opened
+			tc.cancel(p)
+			select {
+			case <-w.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("writer goroutine still running after plane cancellation")
+			}
+			if n := mem.CurrentAlloc(); n != 0 {
+				t.Fatalf("%d bytes of batches not released", n)
+			}
+			if sink.closes.Load() != 1 || !sink.cancelledAtClose.Load() {
+				t.Fatalf("upload not aborted: closes %d, cancelled at close %v", sink.closes.Load(), sink.cancelledAtClose.Load())
+			}
+			start := time.Now()
+			rec := batch(testSchema, 0, 1)
+			werr := w.Write(context.Background(), rec)
+			rec.Release()
+			_, cerr := w.Close(context.Background())
+			if werr == nil || cerr == nil || time.Since(start) > time.Second {
+				t.Fatalf("after plane cancel: Write %v, Close %v, took %v", werr, cerr, time.Since(start))
+			}
+			w.Abort()
+		})
+	}
+}
+
+// TestWriteCloseHonourDeadlinesUnderBackpressure: with the sink stalled and
+// the queue full, a Write and a Close with short deadlines return
+// DeadlineExceeded promptly while another Write is blocked, and the blocked
+// sender is not counted in QueuedBytes.
+func TestWriteCloseHonourDeadlinesUnderBackpressure(t *testing.T) {
+	p := New(Config{})
+	defer p.Close()
+	sink := &blockingSink{release: make(chan struct{})}
+	p.openSink = func(context.Context, map[string]string, string) (io.WriteCloser, error) { return sink, nil }
+	w := openWriter(t, p, datagateway.WriterSpec{DataPrefix: "file:///unused/"}).(*writer)
+	one := batch(testSchema, 0, 10)
+	size := recordBytes(one)
+	one.Release()
+	write(t, w, batch(testSchema, 0, 10))
+	for deadline := time.Now().Add(5 * time.Second); w.QueuedBytes() != 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("first batch never left the channel")
+		}
+	}
+	for i := 0; i < channelBatches; i++ {
+		write(t, w, batch(testSchema, 0, 10))
+	}
+
+	blocked := make(chan error, 1)
+	go func() {
+		rec := batch(testSchema, 0, 10)
+		defer rec.Release()
+		blocked <- w.Write(context.Background(), rec)
+	}()
+	time.Sleep(50 * time.Millisecond) // let the fifth sender block
+
+	if got := w.QueuedBytes(); got != int64(channelBatches)*size {
+		t.Fatalf("QueuedBytes with a blocked sender = %d, want %d", got, int64(channelBatches)*size)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	rec := batch(testSchema, 0, 10)
+	err := w.Write(ctx, rec)
+	rec.Release()
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("concurrent Write = %v after %v, want DeadlineExceeded promptly", err, time.Since(start))
+	}
+
+	cctx, ccancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer ccancel()
+	start = time.Now()
+	if _, err := w.Close(cctx); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("concurrent Close = %v after %v, want DeadlineExceeded promptly", err, time.Since(start))
+	}
+	// Close stopped admission: the blocked sender gives up.
+	select {
+	case err := <-blocked:
+		if err == nil {
+			t.Fatal("blocked Write succeeded after Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Write still blocked after Close")
+	}
+
 	close(sink.release)
 	files, err := w.Close(context.Background())
 	if err != nil || len(files) != 1 || files[0].Rows != 10*(1+channelBatches) {

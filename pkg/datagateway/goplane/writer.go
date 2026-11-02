@@ -43,12 +43,19 @@ type writer struct {
 
 	ctx    context.Context // lifetime; its cause is the writer's failure
 	cancel context.CancelCauseFunc
-	ch     chan arrow.RecordBatch
+	ch     chan arrow.RecordBatch // never closed; admission ends via closing
 	done   chan struct{}
 	queued atomic.Int64
 
-	mu       sync.Mutex // serializes sends on ch with closing it
-	chClosed bool
+	// Admission. mu is never held while blocked: senders register in
+	// sending, then select on the send, closing, the lifetime and their ctx.
+	// Once closing is closed no new sender registers, and run drains ch only
+	// after sending reached zero, so no batch is left behind in ch.
+	mu        sync.Mutex
+	idle      *sync.Cond // signalled when sending drops to zero
+	sending   int
+	closing   chan struct{}
+	isClosing bool
 
 	// Owned by run until done is closed, then read-only.
 	cur   *dataFile
@@ -74,12 +81,17 @@ func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, 
 		cancel:     cancel,
 		ch:         make(chan arrow.RecordBatch, channelBatches),
 		done:       make(chan struct{}),
+		closing:    make(chan struct{}),
 	}
+	w.idle = sync.NewCond(&w.mu)
 	go w.run()
 	return w
 }
 
-func (w *writer) QueuedBytes() int64 { return w.queued.Load() }
+// QueuedBytes is the size of the batches waiting in the channel. The count is
+// added after a send lands and subtracted when run dequeues, so it can dip
+// below zero for an instant; it is reported as zero then.
+func (w *writer) QueuedBytes() int64 { return max(0, w.queued.Load()) }
 
 // Write queues rec (retaining it) and blocks while the channel is full. ctx
 // bounds only this call.
@@ -87,27 +99,38 @@ func (w *writer) Write(ctx context.Context, rec arrow.RecordBatch) error {
 	if err := w.checkRecord(rec); err != nil {
 		return err
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.ctx.Err() != nil {
 		return w.failure()
 	}
-	if w.chClosed {
+	w.mu.Lock()
+	if w.isClosing {
+		w.mu.Unlock()
 		return errClosed
 	}
+	w.sending++
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		if w.sending--; w.sending == 0 {
+			w.idle.Broadcast()
+		}
+		w.mu.Unlock()
+	}()
+
 	size := recordBytes(rec)
 	rec.Retain()
-	w.queued.Add(size)
 	select {
 	case w.ch <- rec:
+		w.queued.Add(size)
 		return nil
 	case <-w.ctx.Done():
 		rec.Release()
-		w.queued.Add(-size)
 		return w.failure()
+	case <-w.closing:
+		rec.Release()
+		return errClosed
 	case <-ctx.Done():
 		rec.Release()
-		w.queued.Add(-size)
 		return ctx.Err()
 	}
 }
@@ -115,7 +138,7 @@ func (w *writer) Write(ctx context.Context, rec arrow.RecordBatch) error {
 // Close flushes the last file and returns every file written. A second call
 // returns the same result. ctx bounds only the wait.
 func (w *writer) Close(ctx context.Context) ([]datagateway.WrittenFile, error) {
-	w.closeChannel()
+	w.stopAdmission()
 	select {
 	case <-w.done:
 	case <-ctx.Done():
@@ -136,17 +159,38 @@ func (w *writer) Abort() {
 	default:
 	}
 	w.cancel(errAborted)
-	w.closeChannel()
+	w.stopAdmission()
 	<-w.done
 }
 
-func (w *writer) closeChannel() {
+// stopAdmission makes every pending and later Write fail with errClosed.
+func (w *writer) stopAdmission() {
 	w.mu.Lock()
-	if !w.chClosed {
-		w.chClosed = true
-		close(w.ch)
+	if !w.isClosing {
+		w.isClosing = true
+		close(w.closing)
 	}
 	w.mu.Unlock()
+}
+
+// drain stops admission, waits until no sender is inside Write, and then
+// returns the batches still in the channel (nothing can be added after).
+func (w *writer) drain() []arrow.RecordBatch {
+	w.stopAdmission()
+	w.mu.Lock()
+	for w.sending > 0 {
+		w.idle.Wait()
+	}
+	w.mu.Unlock()
+	var out []arrow.RecordBatch
+	for {
+		select {
+		case rec := <-w.ch:
+			out = append(out, rec)
+		default:
+			return out
+		}
+	}
 }
 
 // failure is the error a cancelled lifetime context stands for.
@@ -177,30 +221,36 @@ func (w *writer) run() {
 	defer close(w.done)
 	for {
 		select {
-		case rec, ok := <-w.ch:
-			if !ok {
-				w.finishLast()
-				return
+		case rec := <-w.ch:
+			w.process(rec)
+		case <-w.closing: // Close or Abort
+			for _, rec := range w.drain() {
+				w.process(rec)
 			}
-			w.queued.Add(-recordBytes(rec)) // no longer waiting in the channel
-			if w.err == nil && w.ctx.Err() != nil {
-				w.fail(w.failure())
-			}
-			if w.err == nil {
-				if err := w.writeRecord(rec); err != nil {
-					w.fail(err)
-				}
-			}
-			rec.Release()
-		case <-w.ctx.Done():
+			w.finishLast()
+			return
+		case <-w.ctx.Done(): // failure, Abort, plane Close / Interrupt
 			w.fail(w.failure())
-			for rec := range w.ch { // until Close / Abort closes it
+			for _, rec := range w.drain() {
 				w.queued.Add(-recordBytes(rec))
 				rec.Release()
 			}
 			return
 		}
 	}
+}
+
+func (w *writer) process(rec arrow.RecordBatch) {
+	w.queued.Add(-recordBytes(rec)) // no longer waiting in the channel
+	if w.err == nil && w.ctx.Err() != nil {
+		w.fail(w.failure())
+	}
+	if w.err == nil {
+		if err := w.writeRecord(rec); err != nil {
+			w.fail(err)
+		}
+	}
+	rec.Release()
 }
 
 // fail records the first error, cancels the lifetime context (unblocking
