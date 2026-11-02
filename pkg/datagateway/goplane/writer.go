@@ -110,10 +110,7 @@ func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, 
 		openSink:    open,
 		writeSchema: stripFieldIDMetadata(spec.Schema),
 		props: parquet.NewWriterProperties(
-			parquet.WithCompression(compress.Codecs.Zstd),
-			parquet.WithDictionaryDefault(true),
-			parquet.WithStats(true),
-			parquet.WithMaxRowGroupLength(spec.RowGroupRows),
+			writerProps(spec, part != nil)...,
 		),
 		arrowProps: pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
 		ctx:        ctx,
@@ -134,6 +131,28 @@ func newWriter(parent context.Context, spec datagateway.WriterSpec, local bool, 
 	}
 	go w.run()
 	return w
+}
+
+// partitionDictionaryPageBytes caps each column's dictionary in a
+// partitioned writer's open files: a high-cardinality column falls back to
+// PLAIN (releasing its dictionary encoder) after 64 KiB instead of arrow-go's
+// 1 MiB default (spec decision 9, rev 6). A var only so tests can compare
+// against the default.
+var partitionDictionaryPageBytes int64 = 64 << 10
+
+// writerProps are the Parquet writer properties (spec, Write path 4-5);
+// partitioned writers also cap dictionary pages.
+func writerProps(spec datagateway.WriterSpec, partitioned bool) []parquet.WriterProperty {
+	props := []parquet.WriterProperty{
+		parquet.WithCompression(compress.Codecs.Zstd),
+		parquet.WithDictionaryDefault(true),
+		parquet.WithStats(true),
+		parquet.WithMaxRowGroupLength(spec.RowGroupRows),
+	}
+	if partitioned {
+		props = append(props, parquet.WithDictionaryPageSizeLimit(partitionDictionaryPageBytes))
+	}
+	return props
 }
 
 // QueuedBytes is the size of the batches waiting in the channel. The count is

@@ -120,6 +120,14 @@ partitioning** over restoring that layout.
      file's upload through `blobfs.FileIO.NewWriter(ctx, path, true, &blob.WriterOptions{BufferSize: 5 MiB,
      MaxConcurrency: 1})` (5 MiB = the S3 minimum part size), about 10 MiB per open file; other IO implementations
      (local `file://`, GCS) keep their defaults. Unpartitioned writers keep the defaults (throughput).
+   - **Dictionary encoders (rev 6, heap profile; maintainer: "Yes, cap dictionaries").** Smaller uploads barely moved
+     memory (bucket[8] 1 172 MiB, bucket[16] 1 355 MiB). A heap profile of bucket[16] at peak (968 MB in use) put ~99 %
+     under `pqarrow.WriteBuffered`: dictionary-encoder hash tables ~450 MB (float64 288, int64 97, int32 64), dictionary
+     and value buffers ~270 MB, buffered pages ~160 MB, zstd ~64 MB. Every column of every open file keeps a dictionary
+     until it exceeds `DictionaryPageSizeLimit` (arrow-go default 1 MiB) and falls back to PLAIN; a new row group starts
+     a new dictionary. Partitioned writers therefore set `parquet.WithDictionaryPageSizeLimit(64 KiB)`, so
+     high-cardinality columns fall back early while low-cardinality ones stay dictionary-encoded. Unpartitioned writers
+     keep the default. The rev 4 byte budget and rev 5 upload sizes stay (harmless, and they bound their own parts).
    - `MaxOpenPartitions` default lowers from 32 to **16**, same env `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (1–1024).
      Each open file also holds upload buffers (an S3 multipart part is ≥ 5 MiB), which the byte budget cannot
      shrink, so the cap bounds that part. A sub-batch for a tuple not open while at the cap finishes the
