@@ -31,7 +31,7 @@ partitioning** over restoring that layout.
   `ReplaceDataFilesWithDataFiles` require `first_row_id` on every v3 DataFile (`table/transaction.go:1167-1171`), which
   the gateway cannot assign. Such a table fails the writer (decision 3). Unpartitioned v3 tables keep today's
   `AddFiles` path.
-- A byte budget for open partition files (maintainer: count cap + measurement; revisit after Task 9).
+- (Rev 4 removes the former non-goal "byte budget for open partition files": Task 9 measured it as needed.)
 
 ## Decisions
 
@@ -91,12 +91,29 @@ partitioning** over restoring that layout.
    multipart, remove local partials); any one file's error aborts all open files and fails the writer. Aborts of open files run **concurrently** (each still
    bounded at 30 s by R3a), so cleanup of up to 32 files fits within plane Close's 30 s wait. Unpartitioned
    specs keep today's single-file path unchanged.
-9. **Open-file cap.** At most `MaxOpenPartitions` open files per table writer — default 32; env
-   `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (1–1024; invalid → default + warning), read once in `goplane.Factory` into
-   the plane config. A sub-batch for a tuple that is not open while at the cap first finishes the least-recently-
-   written file (completed and kept for commit). The first eviction per writer logs one warning (table, cap,
-   distinct tuples so far). Memory grows with open files (each holds a row group under encode plus upload buffers);
-   the bound is measured in Task 9, not assumed.
+9. **Open files and memory (rev 4, after Task 9 measurements; maintainer: "continue as you suggest").** Task 9
+   measured ~82 MiB per open partition file (a full 229 376-row row group buffered in the encoder): bucket[8] peaked
+   at 1 174 MiB vs 517 MiB unpartitioned. A **shared row-group byte budget** now bounds that:
+   - `PartitionBufferBytes` — default 256 MiB, env `DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES` (16 MiB–8 GiB, invalid →
+     default + warning), read once in `goplane.Factory`. It applies to **partitioned** writers only; unpartitioned
+     writers keep today's row-group rule unchanged.
+   - Buffered bytes of an open file = `pqarrow.FileWriter.RowGroupTotalCompressedBytes()` plus
+     `RowGroupTotalBytesWritten()` of its current buffered row group (what the encoder holds in memory).
+   - Before writing a sub-batch to file *f*: if *f*'s buffered bytes ≥ `PartitionBufferBytes / openFiles`
+     (its fair share at that moment), *f* first ends its row group (`NewBufferedRowGroupChecked`, which flushes it
+     to the upload stream). After the write, while the sum over all open files exceeds `PartitionBufferBytes`, the
+     file with the most buffered bytes ends its row group. So memory held in encoders stays ≤ budget + one
+     sub-batch, row groups shrink as more files are open (1 file: up to the full budget or 229 376 rows; 8 files:
+     ~32 MiB each; 16: ~16 MiB), and every partition still gets one file (until rotation).
+   - `MaxOpenPartitions` default lowers from 32 to **16**, same env `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (1–1024).
+     Each open file also holds upload buffers (an S3 multipart part is ≥ 5 MiB), which the byte budget cannot
+     shrink, so the cap bounds that part. A sub-batch for a tuple not open while at the cap finishes the
+     least-recently-written file, as before.
+   - **More distinct tuples per batch than the cap** (Task 9: bucket[200] → 48 324 files of ~41 rows, 532 s, 43 s
+     commit) cannot be streamed cheaply. The first eviction's warning now says so and names the remedy: cluster the
+     input by the partition column(s) or use a coarser transform. In addition, when a writer closes having produced
+     more than 4 × distinct-tuples files, it logs one summary warning (table, files, tuples). Documented in
+     `known-limitations.md` and `troubleshooting.md` with the Task 9 numbers.
 10. **File paths.** `<DataPrefix><PartitionToPath(tuple, schema)>/<FilePrefix>-<seq>.parquet` via
     `PartitionSpec.PartitionToPath`, joined by concatenation. A resulting object key over 1 024 bytes → write error
     naming the field (S3 key limit), not a truncated path.
@@ -142,7 +159,7 @@ partitioning** over restoring that layout.
 
 ## Risks
 
-- Memory per open file (~one row group under encode + upload part buffers) × up to 32 — measured in Task 9; byte
-  budget deferred.
+- Memory: encoder buffers bounded by `PartitionBufferBytes` (rev 4); upload part buffers × up to 16 open files remain
+  outside the budget — re-measured in Task 9.
 - Scalar per-row transform evaluation; CPU measured in Task 9.
 - High cardinality per batch yields many small files and a footer read per file at commit.
