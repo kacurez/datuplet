@@ -211,6 +211,18 @@ func TestIntegrationServerPartitionedWrite(t *testing.T) {
 	}
 
 	// The gateway's read returns every row (D12: reads unchanged).
+	read := serverReadIDs(t, srv, ns, tbl)
+	for id := int64(0); id <= 8; id++ {
+		if read[id] != 1 {
+			t.Fatalf("gateway read: id %d read %d times, want once (%v)", id, read[id], read)
+		}
+	}
+}
+
+// serverReadIDs reads ns.tbl through the server as Parquet chunks and returns
+// how often each id was read.
+func serverReadIDs(t *testing.T, srv *datagateway.ServerV2, ns, tbl string) map[int64]int {
+	t.Helper()
 	ctx := context.Background()
 	open, err := srv.OpenReader(ctx, &pb.OpenReaderRequest{Bucket: ns, Table: tbl, OutputFormat: pb.DataFormat_FORMAT_PARQUET})
 	if err != nil {
@@ -244,11 +256,7 @@ func TestIntegrationServerPartitionedWrite(t *testing.T) {
 			break
 		}
 	}
-	for id := int64(0); id <= 8; id++ {
-		if read[id] != 1 {
-			t.Fatalf("gateway read: id %d read %d times, want once (%v)", id, read[id], read)
-		}
-	}
+	return read
 }
 
 // TestIntegrationServerPartitionTypePairError: an existing long column

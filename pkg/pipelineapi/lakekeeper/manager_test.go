@@ -282,3 +282,41 @@ func TestEnsureGCSWarehouseInProjectRedactsInvalidKeyJSON(t *testing.T) {
 		t.Errorf("expected error to mention 'invalid'; got: %v", err)
 	}
 }
+
+// TestWarehouseBodyAllowsV3: the S3 and GCS create bodies allow format
+// versions 1-3 and default new tables to v3.
+func TestWarehouseBodyAllowsV3(t *testing.T) {
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fakeListResponse())
+		case http.MethodPost:
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer srv.Close()
+
+	mgr := newTestManager(t, srv)
+	if err := mgr.EnsureS3WarehouseInProject(t.Context(), "proj-1", "wh-s3", S3WarehouseProfile{
+		Bucket: "b", Endpoint: "http://minio", AccessKey: "ak", SecretKey: "sk",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.EnsureGCSWarehouseInProject(t.Context(), "proj-1", "wh-gcs", GCSWarehouseProfile{
+		Bucket: "b", StsEnabled: true, CredentialType: "system-identity",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("%d POSTs, want 2", len(bodies))
+	}
+	for _, b := range bodies {
+		if !strings.Contains(b, `"allowed-format-versions":[1,2,3]`) || !strings.Contains(b, `"default-format-version":3`) {
+			t.Errorf("body lacks the v3 format-version policy: %s", b)
+		}
+	}
+}

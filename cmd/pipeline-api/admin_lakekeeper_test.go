@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -511,5 +512,26 @@ func TestPostJSON_WarehouseError_RedactsBody(t *testing.T) {
 	// The echoed payload will contain the key name; body is not redacted here.
 	if !strings.Contains(err.Error(), "400") {
 		t.Errorf("non-redacted error should include status code; got: %v", err)
+	}
+}
+
+// TestWarehouseBodyAllowsV3: S3 and GCS warehouses allow format versions 1-3
+// and default new tables to v3.
+func TestWarehouseBodyAllowsV3(t *testing.T) {
+	for _, spec := range []warehouseSpec{
+		{WarehouseName: "wh", Type: "s3", S3: &s3Spec{Bucket: "b", Endpoint: "http://minio:9000", AccessKey: "ak", SecretKey: "sk"}},
+		{WarehouseName: "wh", Type: "gcs", GCS: &gcsSpec{Bucket: "b", StsEnabled: true, CredentialType: "system-identity"}},
+	} {
+		body, err := buildWarehouseBody(spec)
+		if err != nil {
+			t.Fatalf("%s: %v", spec.Type, err)
+		}
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `"allowed-format-versions":[1,2,3]`) || !strings.Contains(string(b), `"default-format-version":3`) {
+			t.Errorf("%s body lacks the v3 format-version policy: %s", spec.Type, b)
+		}
 	}
 }

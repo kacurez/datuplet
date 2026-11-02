@@ -66,40 +66,6 @@ func TestPartitionValidationErrors(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("partitioned v3 table", func(t *testing.T) {
-		cat, err := hadoop.NewCatalog("unit", t.TempDir(), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx := context.Background()
-		if err := cat.CreateNamespace(ctx, catalog.ToIdentifier("ns"), nil); err != nil {
-			t.Fatal(err)
-		}
-		sc := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64})
-		id := iceberg.PartitionDataIDStart
-		spec, err := iceberg.NewPartitionSpecOpts(iceberg.AddPartitionFieldByName("id", "id", iceberg.IdentityTransform{}, sc, &id))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := cat.CreateTable(ctx, catalog.ToIdentifier("ns", "tbl"), sc, catalog.WithPartitionSpec(&spec),
-			catalog.WithProperties(iceberg.Properties{icebergtable.PropertyFormatVersion: "3"})); err != nil {
-			t.Fatal(err)
-		}
-		_, _, err = LoadOrCreateTable(ctx, cat, "ns", "tbl", sp, nil)
-		if !errors.Is(err, ErrInvalidPartition) || !strings.Contains(err.Error(), "format-version 3") {
-			t.Fatalf("err = %v, want the v3 rejection", err)
-		}
-
-		// An unpartitioned v3 table keeps the AddFiles path.
-		if _, err := cat.CreateTable(ctx, catalog.ToIdentifier("ns", "flat"), sc,
-			catalog.WithProperties(iceberg.Properties{icebergtable.PropertyFormatVersion: "3"})); err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := LoadOrCreateTable(ctx, cat, "ns", "flat", sp, nil); err != nil {
-			t.Fatalf("unpartitioned v3: %v", err)
-		}
-	})
 }
 
 // createCapture records the options of every CreateTable.
@@ -117,33 +83,125 @@ func (c *createCapture) CreateTable(ctx context.Context, ident icebergtable.Iden
 	return c.Catalog.CreateTable(ctx, ident, sc, opts...)
 }
 
-// A partitioned table is created as format version 2, so a catalog default of
-// v3 cannot create a table CheckWriteSpec then rejects; an unpartitioned one
-// keeps the catalog default.
-func TestPartitionedCreatePinsFormatV2(t *testing.T) {
-	sch := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
-	gw, err := dgschema.NewSchemaFromArrow(sch)
+func idSchemaProvider(t *testing.T) SchemaProvider {
+	t.Helper()
+	gw, err := dgschema.NewSchemaFromArrow(arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sp := func(context.Context) (*dgschema.Schema, error) { return gw, nil }
+	return func(context.Context) (*dgschema.Schema, error) { return gw, nil }
+}
+
+func idPartitionSpec(t *testing.T, sc *iceberg.Schema) iceberg.PartitionSpec {
+	t.Helper()
+	id := iceberg.PartitionDataIDStart
+	spec, err := iceberg.NewPartitionSpecOpts(iceberg.AddPartitionFieldByName("id", "id", iceberg.IdentityTransform{}, sc, &id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return spec
+}
+
+// createdTables creates ns.part (bucket[4](id)) and ns.flat (unpartitioned)
+// through LoadOrCreateTable and returns them with the captured create options.
+func createdTables(t *testing.T) (part, flat *icebergtable.Table, cfgs []catalog.CreateTableCfg) {
+	t.Helper()
+	sp := idSchemaProvider(t)
 	hc, err := hadoop.NewCatalog("unit", t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cat := &createCapture{Catalog: hc}
-	tb, _, err := LoadOrCreateTable(context.Background(), cat, "ns", "part", sp, []PartitionField{{SourceColumn: "id", Transform: "bucket[4]"}})
+	part, _, err = LoadOrCreateTable(context.Background(), cat, "ns", "part", sp, []PartitionField{{SourceColumn: "id", Transform: "bucket[4]"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cat.cfgs[0].Properties[icebergtable.PropertyFormatVersion]; got != "2" || tb.Metadata().Version() != 2 {
-		t.Fatalf("partitioned create: format-version property %q, table version %d; want 2", got, tb.Metadata().Version())
-	}
-	if _, _, err := LoadOrCreateTable(context.Background(), cat, "ns", "flat", sp, nil); err != nil {
+	flat, _, err = LoadOrCreateTable(context.Background(), cat, "ns", "flat", sp, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, set := cat.cfgs[1].Properties[icebergtable.PropertyFormatVersion]; set {
-		t.Fatalf("unpartitioned create pinned a format version: %v", cat.cfgs[1].Properties)
+	return part, flat, cat.cfgs
+}
+
+// Every table the gateway creates is format version 3, partitioned or not.
+func TestCreateTableIsV3(t *testing.T) {
+	part, flat, cfgs := createdTables(t)
+	for i, tb := range []*icebergtable.Table{part, flat} {
+		if got := cfgs[i].Properties[icebergtable.PropertyFormatVersion]; got != "3" || tb.Metadata().Version() != 3 {
+			t.Errorf("%s: format-version property %q, table version %d; want 3", tb.Identifier(), got, tb.Metadata().Version())
+		}
+	}
+	if ps, fs := part.Spec(), flat.Spec(); ps.NumFields() != 1 || fs.NumFields() != 0 {
+		t.Fatalf("specs: part %v, flat %v", ps, fs)
+	}
+}
+
+// Every created table disables iceberg-go's internal commit retry, which would
+// re-base the snapshot's first-row-id but not explicit per-file row ids.
+func TestCreateTableDisablesInternalRetry(t *testing.T) {
+	part, flat, cfgs := createdTables(t)
+	for i, tb := range []*icebergtable.Table{part, flat} {
+		if got := cfgs[i].Properties[icebergtable.CommitNumRetriesKey]; got != "0" {
+			t.Errorf("%s: create property %s = %q, want \"0\"", tb.Identifier(), icebergtable.CommitNumRetriesKey, got)
+		}
+		if got := tb.Properties()[icebergtable.CommitNumRetriesKey]; got != "0" {
+			t.Errorf("%s: table property %s = %q, want \"0\"", tb.Identifier(), icebergtable.CommitNumRetriesKey, got)
+		}
+	}
+}
+
+// An existing partitioned v3 table whose commit.retry.num-retries is above 0
+// is rejected at resolve, naming the property; 0 or unset is writable, and an
+// unpartitioned table (manifest-inherited row ids) is never rejected.
+func TestPartitionedV3RejectsInternalRetriesAtResolve(t *testing.T) {
+	ctx := context.Background()
+	cat, err := hadoop.NewCatalog("unit", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.CreateNamespace(ctx, catalog.ToIdentifier("ns"), nil); err != nil {
+		t.Fatal(err)
+	}
+	sc := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64})
+	spec := idPartitionSpec(t, sc)
+	for _, tc := range []struct {
+		name        string
+		partitioned bool
+		version     string
+		retries     string // "" = unset
+		wantErr     bool
+	}{
+		{"part_v3_retries_3", true, "3", "3", true},
+		{"part_v3_retries_1", true, "3", "1", true},
+		{"part_v3_retries_0", true, "3", "0", false},
+		{"part_v3_unset", true, "3", "", false},
+		{"part_v2_retries_3", true, "2", "3", false},
+		{"flat_v3_retries_3", false, "3", "3", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			props := iceberg.Properties{icebergtable.PropertyFormatVersion: tc.version}
+			if tc.retries != "" {
+				props[icebergtable.CommitNumRetriesKey] = tc.retries
+			}
+			opts := []catalog.CreateTableOpt{catalog.WithProperties(props)}
+			if tc.partitioned {
+				opts = append(opts, catalog.WithPartitionSpec(&spec))
+			}
+			if _, err := cat.CreateTable(ctx, catalog.ToIdentifier("ns", tc.name), sc, opts...); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := LoadOrCreateTable(ctx, cat, "ns", tc.name, nil, nil)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("err = %v, want writable", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvalidPartition) || !strings.Contains(err.Error(), "commit.retry.num-retries") ||
+				!strings.Contains(err.Error(), "table ns."+tc.name) {
+				t.Fatalf("err = %v, want ErrInvalidPartition naming commit.retry.num-retries and the table", err)
+			}
+		})
 	}
 }
 

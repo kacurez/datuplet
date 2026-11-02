@@ -313,7 +313,9 @@ func (m *Manager) EnsureS3WarehouseInProject(ctx context.Context, projectID, war
 			"aws-access-key-id":     profile.AccessKey,
 			"aws-secret-access-key": profile.SecretKey,
 		},
-		"delete-profile": map[string]any{"type": "hard"},
+		"delete-profile":          map[string]any{"type": "hard"},
+		"allowed-format-versions": []int{1, 2, 3},
+		"default-format-version":  3,
 	}
 	return m.createWarehouseInProject(ctx, projectID, body)
 }
@@ -379,11 +381,13 @@ func (m *Manager) EnsureGCSWarehouseInProject(ctx context.Context, projectID, wa
 	}
 
 	body := map[string]any{
-		"warehouse-name":     warehouseName,
-		"project-id":         projectID,
-		"storage-profile":    storageProfile,
-		"storage-credential": storageCred,
-		"delete-profile":     map[string]any{"type": "hard"},
+		"warehouse-name":          warehouseName,
+		"project-id":              projectID,
+		"storage-profile":         storageProfile,
+		"storage-credential":      storageCred,
+		"delete-profile":          map[string]any{"type": "hard"},
+		"allowed-format-versions": []int{1, 2, 3},
+		"default-format-version":  3,
 	}
 	return m.createWarehouseInProject(ctx, projectID, body)
 }

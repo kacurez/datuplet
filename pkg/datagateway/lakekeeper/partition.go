@@ -66,13 +66,13 @@ func LoadOrCreateTable(ctx context.Context, cat catalog.Catalog, ns, tbl string,
 		if err := ensureNamespace(ctx, cat, ns); err != nil {
 			return nil, "", err
 		}
-		opts := []catalog.CreateTableOpt{catalog.WithPartitionSpec(&spec)}
-		if spec.NumFields() > 0 {
-			// Pin v2: partitioned writes to v3 are rejected (CheckWriteSpec),
-			// so a catalog default of v3 must not create an unwritable table.
-			opts = append(opts, catalog.WithProperties(iceberg.Properties{icebergtable.PropertyFormatVersion: "2"}))
-		}
-		t, err = cat.CreateTable(ctx, ident, icSchema, opts...)
+		// No iceberg-go internal commit retry: it re-bases the snapshot's
+		// first-row-id but not the explicit per-file row ids of a
+		// partitioned v3 commit (spec decision B3).
+		t, err = cat.CreateTable(ctx, ident, icSchema, catalog.WithPartitionSpec(&spec), catalog.WithProperties(iceberg.Properties{
+			icebergtable.PropertyFormatVersion: "3",
+			icebergtable.CommitNumRetriesKey:   "0",
+		}))
 		switch {
 		case err == nil:
 			created = true
@@ -142,15 +142,18 @@ func parseTransform(s string) (iceberg.Transform, error) {
 
 // CheckWriteSpec checks that the gateway can write t partitioned by its
 // current spec: no unknown transform, every source column in the table schema,
-// and a format version below 3 for a partitioned table (iceberg-go's
-// AddDataFiles requires first_row_id on v3). Errors wrap ErrInvalidPartition.
+// and, for a v3 table, an effective commit.retry.num-retries of 0 (partitioned
+// v3 commits assign explicit first_row_ids, which iceberg-go's internal retry
+// does not re-base). Errors wrap ErrInvalidPartition.
 func CheckWriteSpec(t *icebergtable.Table) error {
 	spec := t.Spec()
 	if spec.NumFields() == 0 {
 		return nil
 	}
 	if v := t.Metadata().Version(); v >= 3 {
-		return invalidPartition("partitioned writes to format-version %d tables are not supported", v)
+		if n := t.Properties().GetUInt64(icebergtable.CommitNumRetriesKey, icebergtable.CommitNumRetriesDefault); n > 0 {
+			return invalidPartition("partitioned format-version %d table has %s=%d; the gateway needs it 0 or unset", v, icebergtable.CommitNumRetriesKey, n)
+		}
 	}
 	sc := t.Schema()
 	for _, f := range spec.Fields() {

@@ -175,7 +175,9 @@ func createWarehouse(ctx context.Context, t *testing.T, f *fixture) string {
 			"type": "s3", "credential-type": "access-key",
 			"aws-access-key-id": siloRootUser, "aws-secret-access-key": siloRootPassword,
 		},
-		"delete-profile": map[string]any{"type": "hard"},
+		"delete-profile":          map[string]any{"type": "hard"},
+		"allowed-format-versions": []int{1, 2, 3},
+		"default-format-version":  3,
 	}, http.StatusCreated)
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, f.lakekeeperBase()+"/management/v1/warehouse", nil)
