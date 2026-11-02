@@ -18,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
 
 	"github.com/datuplet/datuplet/pkg/datagateway"
 	"github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
@@ -616,6 +617,131 @@ func TestManySmallFilesSummaryWarning(t *testing.T) {
 				if !strings.Contains(out, want) || !strings.Contains(out, "coarser transform") {
 					t.Errorf("summary warning lacks %q or the remedy: %s", want, out)
 				}
+			}
+		})
+	}
+}
+
+// committedFiles returns the data files of the table's current snapshot by
+// path.
+func committedFiles(t *testing.T, tb *table.Table) map[string]iceberg.DataFile {
+	t.Helper()
+	fs, err := tb.FS(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mfs, err := tb.CurrentSnapshot().Manifests(fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]iceberg.DataFile{}
+	for _, mf := range mfs {
+		entries, err := mf.FetchEntries(fs, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			out[e.DataFile().FilePath()] = e.DataFile()
+		}
+	}
+	return out
+}
+
+func boundOf(t *testing.T, typ iceberg.Type, b []byte) string {
+	t.Helper()
+	if b == nil {
+		return "<none>"
+	}
+	lit, err := iceberg.LiteralFromBytes(typ, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lit.String()
+}
+
+// A budget flush followed by close, or by LRU eviction, ends tuple 0's file
+// with a 0-row row group; its committed metrics still carry the
+// non-partition columns' bounds and null counts, and a row filter on one
+// prunes the file.
+func TestPartitionBudgetEmptyRowGroupKeepsMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		maxOpen int
+		batches [][]int64
+	}{
+		// Tuple 1's write takes the sum over 16 MiB; tuple 0, the largest,
+		// ends its row group and gets no more rows before close.
+		{"close", 0, [][]int64{repeatKey(0, 48000), repeatKey(1, 32000)}},
+		// Same, then tuple 2 evicts tuple 0 (cap 2).
+		{"eviction", 2, [][]int64{repeatKey(0, 48000), repeatKey(1, 32000), repeatKey(2, 100)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pt := newPartTable(t, wideSchema, lakekeeper.PartitionField{SourceColumn: "k", Transform: "identity"})
+			pt.p.cfg.PartitionBufferBytes = 16 << 20
+			if tc.maxOpen > 0 {
+				pt.p.cfg.MaxOpenPartitions = tc.maxOpen
+			}
+			bl := &budgetLog{}
+			pt.p.budgetHook = bl.hook
+			rng := rand.New(rand.NewSource(5))
+			var recs []arrow.RecordBatch
+			next := 0
+			for _, keys := range tc.batches {
+				recs = append(recs, wideBatch(rng, next, keys))
+				next += len(keys)
+			}
+			files := pt.write(pt.spec(), recs...)
+			if len(files) != len(tc.batches) {
+				t.Fatalf("files = %d, want %d", len(files), len(tc.batches))
+			}
+			spec := pt.tbl.Spec()
+			var zero string
+			for _, f := range files {
+				if f.Partition[spec.Field(0).FieldID].(int64) == 0 {
+					zero = f.Path
+				}
+			}
+			if rows, empty := rowGroupShape(t, zero); empty == 0 || fmt.Sprint(rows) != "[48000]" {
+				t.Fatalf("tuple 0's file has row groups %v and %d empty; want [48000] and a trailing empty one", rows, empty)
+			}
+			if bl.count("largest") == 0 {
+				t.Fatal("no budget flush happened")
+			}
+			pt.commit(files, icebergjob.WriteModeAppend)
+
+			tb := pt.reload()
+			df := committedFiles(t, tb)[zero]
+			if df == nil {
+				t.Fatalf("%s not committed", zero)
+			}
+			sc := tb.Schema()
+			want := map[string][2]string{
+				"id":  {"0", "47999"},
+				"cat": {"category-00", "category-15"},
+				"num": {"0", fmt.Sprint(47999 * 7)},
+			}
+			for name, bounds := range want {
+				fld, _ := sc.FindFieldByName(name)
+				lo := boundOf(t, fld.Type, df.LowerBoundValues()[fld.ID])
+				hi := boundOf(t, fld.Type, df.UpperBoundValues()[fld.ID])
+				if lo != bounds[0] || hi != bounds[1] {
+					t.Errorf("%s bounds [%s, %s], want [%s, %s]", name, lo, hi, bounds[0], bounds[1])
+				}
+				if n, ok := df.NullValueCounts()[fld.ID]; !ok || n != 0 {
+					t.Errorf("%s null count %d (present %v), want 0", name, n, ok)
+				}
+			}
+			blob, _ := sc.FindFieldByName("blob")
+			if _, ok := df.LowerBoundValues()[blob.ID]; !ok {
+				t.Error("blob has no lower bound")
+			}
+
+			planned, ids := pt.scan(iceberg.GreaterThanEqual(iceberg.Reference("id"), int64(48000)))
+			if planned != len(files)-1 {
+				t.Errorf("id >= 48000 planned %d files, want %d (tuple 0's pruned by its bounds)", planned, len(files)-1)
+			}
+			if len(ids) != next-48000 {
+				t.Errorf("id >= 48000 read %d rows, want %d", len(ids), next-48000)
 			}
 		})
 	}

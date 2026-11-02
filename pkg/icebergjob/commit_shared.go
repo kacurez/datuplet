@@ -17,17 +17,24 @@
 package icebergjob
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/apache/arrow-go/v18/parquet/file"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
@@ -324,8 +331,8 @@ func findSnapshotByCommitKey(tbl *icebergtable.Table, key string) string {
 // Backends seen in the wild:
 //   - s3:        `NoSuchKey`, `404`, "key does not exist"
 //   - GCS:       "object doesn't exist" (note the contraction — doesn't,
-//                so `strings.Contains(msg, "not exist")` does NOT match),
-//                and a gocloud `(code=NotFound)` suffix on the wrapped error
+//     so `strings.Contains(msg, "not exist")` does NOT match),
+//     and a gocloud `(code=NotFound)` suffix on the wrapped error
 //   - localfs:   "no such file or directory"
 //   - iceberg-go's own paths: "not found"
 func isNotFoundErr(err error) bool {
@@ -439,13 +446,13 @@ func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			stats, err := icebergtable.FileToDataFile(ctx, fs, path, sc, *iceberg.UnpartitionedSpec, 0, props)
+			stats, size, err := footerMetrics(ctx, fs, path, sc, props)
 			if err != nil {
 				errs[i] = fmt.Errorf("read footer of %s: %w", path, err)
 				return
 			}
 			b, err := iceberg.NewDataFileBuilder(*spec, iceberg.EntryContentData, path, iceberg.ParquetFile,
-				part.Tuples[i], logical, nil, stats.Count(), stats.FileSizeBytes())
+				part.Tuples[i], logical, nil, stats.Count(), size)
 			if err != nil {
 				errs[i] = fmt.Errorf("data file %s: %w", path, err)
 				return
@@ -468,6 +475,92 @@ func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string
 	}
 	return out, nil
 }
+
+// footerMetrics returns table.FileToDataFile's metrics (unpartitioned spec)
+// for the Parquet file at path, computed over its non-empty row groups only,
+// and the file's size. A 0-row row group (the gateway's partitioned writer
+// can end a file with one after a budget flush) has no column statistics,
+// and iceberg-go would then drop every column's bounds and null counts for
+// the whole file. The footer is read once; FileToDataFile runs on a copy of
+// it, without the empty row groups, served from memory.
+func footerMetrics(ctx context.Context, fs iceio.IO, path string, sc *iceberg.Schema, props iceberg.Properties) (iceberg.DataFile, int64, error) {
+	f, err := fs.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	rdr, err := file.NewParquetReader(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	md := rdr.MetaData()
+	size := md.GetSourceFileSize()
+	keep := make([]int, 0, md.NumRowGroups())
+	for i := 0; i < md.NumRowGroups(); i++ {
+		if md.RowGroup(i).NumRows() > 0 {
+			keep = append(keep, i)
+		}
+	}
+	if len(keep) < md.NumRowGroups() {
+		if md, err = md.Subset(keep); err != nil {
+			_ = rdr.Close()
+			return nil, 0, err
+		}
+	}
+	var footer bytes.Buffer
+	footer.WriteString("PAR1")
+	n, err := md.WriteTo(&footer, nil)
+	_ = rdr.Close()
+	if err != nil {
+		return nil, 0, fmt.Errorf("serialize footer: %w", err)
+	}
+	footer.Write(binary.LittleEndian.AppendUint32(nil, uint32(n)))
+	footer.WriteString("PAR1")
+	stats, err := icebergtable.FileToDataFile(ctx, footerIO{path: path, data: footer.Bytes()}, path, sc, *iceberg.UnpartitionedSpec, 0, props)
+	if err != nil {
+		return nil, 0, err
+	}
+	return stats, size, nil
+}
+
+// footerIO serves one Parquet footer (no column data) as the file at path;
+// FileToDataFile reads nothing else.
+type footerIO struct {
+	path string
+	data []byte
+}
+
+func (o footerIO) Open(name string) (iceio.File, error) {
+	if name != o.path {
+		return nil, &iofs.PathError{Op: "open", Path: name, Err: iofs.ErrNotExist}
+	}
+	return &footerFile{Reader: bytes.NewReader(o.data), name: name, size: int64(len(o.data))}, nil
+}
+
+func (o footerIO) Remove(name string) error {
+	return &iofs.PathError{Op: "remove", Path: name, Err: iofs.ErrPermission}
+}
+
+type footerFile struct {
+	*bytes.Reader
+	name string
+	size int64
+}
+
+func (f *footerFile) Stat() (iofs.FileInfo, error) { return footerInfo{f.name, f.size}, nil }
+func (f *footerFile) Close() error                 { return nil }
+
+type footerInfo struct {
+	name string
+	size int64
+}
+
+func (i footerInfo) Name() string        { return i.name }
+func (i footerInfo) Size() int64         { return i.size }
+func (i footerInfo) Mode() iofs.FileMode { return 0o444 }
+func (i footerInfo) ModTime() time.Time  { return time.Time{} }
+func (i footerInfo) IsDir() bool         { return false }
+func (i footerInfo) Sys() any            { return nil }
 
 // partitionLogicalTypes maps each partition field whose result type is
 // encoded as an Avro logical type to that type, as iceberg-go's own
