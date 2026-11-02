@@ -718,3 +718,186 @@ func TestCoalesceSplits(t *testing.T) {
 		t.Fatalf("coalesced %v, want %s", desc, want)
 	}
 }
+
+// countingIO wraps the plane's IO loader and counts files opened and closed
+// (a file closed twice counts twice).
+type countingIO struct {
+	mu             sync.Mutex
+	opened, closed int
+}
+
+type countingFS struct {
+	iceio.IO
+	c *countingIO
+}
+
+type countingFile struct {
+	iceio.File
+	c *countingIO
+}
+
+func (fs countingFS) Open(name string) (iceio.File, error) {
+	f, err := fs.IO.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	fs.c.mu.Lock()
+	fs.c.opened++
+	fs.c.mu.Unlock()
+	return countingFile{File: f, c: fs.c}, nil
+}
+
+func (f countingFile) Close() error {
+	f.c.mu.Lock()
+	f.c.closed++
+	f.c.mu.Unlock()
+	return f.File.Close()
+}
+
+func (c *countingIO) counts() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.opened, c.closed
+}
+
+func countIO(p *Plane) *countingIO {
+	c := &countingIO{}
+	p.loadIO = func(ctx context.Context, props map[string]string, location string) (iceio.IO, error) {
+		fsys, err := iceio.LoadFS(ctx, props, location)
+		if err != nil {
+			return nil, err
+		}
+		return countingFS{IO: fsys, c: c}, nil
+	}
+	return c
+}
+
+// rawPart opens a reader over one clean file and returns its raw part.
+func rawPart(t *testing.T, f *tfx) (*reader, *datagateway.RawFile) {
+	t.Helper()
+	r := f.open(true)
+	part, err := r.NextPart(context.Background())
+	if err != nil || part.Raw == nil {
+		t.Fatalf("NextPart = %+v, %v", part, err)
+	}
+	return r, part.Raw
+}
+
+func TestReaderCloseClosesOpenRawBodies(t *testing.T) {
+	ends := map[string]func(*tfx, *reader){
+		"reader Close":    func(_ *tfx, r *reader) { _ = r.Close() },
+		"plane Interrupt": func(f *tfx, _ *reader) { f.p.Interrupt() },
+		"plane Close":     func(f *tfx, _ *reader) { _ = f.p.Close() },
+	}
+	for name, end := range ends {
+		t.Run(name, func(t *testing.T) {
+			f := newTable(t, readSchema, morProps("2"))
+			f.addFiles(f.writeFile(0, 100, 0))
+			c := countIO(f.p)
+			r, raw := rawPart(t, f)
+			body, err := raw.Open(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, 8)
+			if _, err := io.ReadFull(body, buf); err != nil {
+				t.Fatalf("first read: %v", err)
+			}
+			opened, closed := c.counts()
+			end(f, r)
+			// Interrupt / plane Close reach the bodies through the reader's
+			// lifetime context, asynchronously.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				if o, cl := c.counts(); o-cl == opened-closed-1 {
+					break
+				}
+				if time.Now().After(deadline) {
+					o, cl := c.counts()
+					t.Fatalf("raw body's file not closed: opened %d closed %d (before end: %d/%d)", o, cl, opened, closed)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if _, err := body.Read(buf); err == nil {
+				t.Fatal("Read on a raw body succeeded after the reader ended")
+			}
+			if err := body.Close(); err != nil {
+				t.Fatalf("body Close after reader end: %v", err)
+			}
+			if err := body.Close(); err != nil {
+				t.Fatalf("second body Close: %v", err)
+			}
+			if o, cl := c.counts(); o != cl {
+				t.Fatalf("files opened %d, closed %d", o, cl)
+			}
+			if _, err := raw.Open(context.Background()); err == nil {
+				t.Fatal("Open after the reader ended succeeded")
+			}
+		})
+	}
+}
+
+func TestRawBodyCloseUntracksAndIsIdempotent(t *testing.T) {
+	f := newTable(t, readSchema, morProps("2"))
+	f.addFiles(f.writeFile(0, 10, 0))
+	c := countIO(f.p)
+	r, raw := rawPart(t, f)
+	body, err := raw.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	r.mu.Lock()
+	tracked := len(r.bodies)
+	r.mu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("%d bodies still tracked", tracked)
+	}
+	_ = r.Close()
+	if o, cl := c.counts(); o != cl {
+		t.Fatalf("files opened %d, closed %d (a file closed twice or leaked)", o, cl)
+	}
+}
+
+func TestRawOpenRacesReaderClose(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		f := newTable(t, readSchema, morProps("2"))
+		f.addFiles(f.writeFile(0, 10, 0))
+		c := countIO(f.p)
+		r, raw := rawPart(t, f)
+		var wg sync.WaitGroup
+		bodies := make(chan io.ReadCloser, 8)
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if b, err := raw.Open(context.Background()); err == nil {
+					bodies <- b
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = r.Close()
+		}()
+		wg.Wait()
+		close(bodies)
+		buf := make([]byte, 1)
+		for b := range bodies {
+			if _, err := b.Read(buf); err == nil {
+				t.Fatal("a body opened before Close is still readable after it")
+			}
+			_ = b.Close()
+		}
+		if o, cl := c.counts(); o != cl {
+			t.Fatalf("iteration %d: files opened %d, closed %d", i, o, cl)
+		}
+		_ = f.p.Close()
+	}
+}

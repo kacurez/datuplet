@@ -48,6 +48,7 @@ type reader struct {
 	mu      sync.Mutex
 	closed  bool
 	streams map[*taskStream]struct{}
+	bodies  map[*rawBody]struct{} // raw bodies opened and not yet closed
 }
 
 func (p *Plane) openReader(ctx context.Context, spec datagateway.ReaderSpec) (*reader, error) {
@@ -62,7 +63,11 @@ func (p *Plane) openReader(ctx context.Context, spec datagateway.ReaderSpec) (*r
 	lctx, cancel := context.WithCancel(p.ctx)
 	p.mu.Unlock()
 
-	r := &reader{spec: spec, loadIO: p.loadIO, ctx: lctx, cancel: cancel, streams: map[*taskStream]struct{}{}}
+	r := &reader{spec: spec, loadIO: p.loadIO, ctx: lctx, cancel: cancel, streams: map[*taskStream]struct{}{},
+		bodies: map[*rawBody]struct{}{}}
+	// Interrupt and plane Close end the lifetime without calling Close: open
+	// raw bodies (an *os.File ignores cancellation) are closed here too.
+	context.AfterFunc(lctx, r.closeBodies)
 	if err := r.init(ctx, p.cfg.Tables); err != nil {
 		cancel()
 		if r.scan != nil {
@@ -225,7 +230,7 @@ func (r *reader) openRaw(ctx context.Context, path string) (io.ReadCloser, error
 				cancel()
 				return nil, fmt.Errorf("goplane: open %s: %w", path, context.Cause(ctx))
 			}
-			return &rawBody{File: f, cancel: cancel}, nil
+			return r.track(&rawBody{r: r, f: f, cancel: cancel})
 		}
 		err = fmt.Errorf("goplane: open %s: %w", path, err)
 	}
@@ -234,15 +239,74 @@ func (r *reader) openRaw(ctx context.Context, path string) (io.ReadCloser, error
 	return nil, err
 }
 
+// track registers b unless the reader has ended (Close, Interrupt, plane
+// Close), in which case b is closed and an error returned.
+func (r *reader) track(b *rawBody) (io.ReadCloser, error) {
+	r.mu.Lock()
+	if r.closed || r.ctx.Err() != nil {
+		r.mu.Unlock()
+		b.shut()
+		return nil, errReaderClosed
+	}
+	r.bodies[b] = struct{}{}
+	r.mu.Unlock()
+	return b, nil
+}
+
+// closeBodies closes every tracked raw body; later reads on them fail.
+func (r *reader) closeBodies() {
+	r.mu.Lock()
+	bodies := make([]*rawBody, 0, len(r.bodies))
+	for b := range r.bodies {
+		bodies = append(bodies, b)
+	}
+	clear(r.bodies)
+	r.mu.Unlock()
+	for _, b := range bodies {
+		b.shut()
+	}
+}
+
+// rawBody is an open raw data file. Close is idempotent; once the body or
+// its reader is closed, Read returns an error.
 type rawBody struct {
-	iceio.File
+	r      *reader
+	f      iceio.File
 	cancel context.CancelFunc
+
+	mu       sync.Mutex
+	closed   bool
+	closeErr error
+}
+
+func (b *rawBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	closed := b.closed
+	b.mu.Unlock()
+	if closed {
+		return 0, errReaderClosed
+	}
+	return b.f.Read(p)
 }
 
 func (b *rawBody) Close() error {
-	err := b.File.Close()
-	b.cancel()
-	return err
+	b.r.mu.Lock()
+	delete(b.r.bodies, b)
+	b.r.mu.Unlock()
+	return b.shut()
+}
+
+// shut cancels the body's context (unblocking a remote read), then closes
+// the file, once.
+func (b *rawBody) shut() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.closed {
+		b.closed = true
+		b.cancel()
+		b.closeErr = b.f.Close()
+	}
+	return b.closeErr
 }
 
 // Close stops every in-flight read of this reader and closes every part
@@ -260,6 +324,7 @@ func (r *reader) Close() error {
 	}
 	r.mu.Unlock()
 	r.cancel()
+	r.closeBodies()
 	for _, s := range streams {
 		_ = s.Close()
 	}

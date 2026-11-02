@@ -47,12 +47,12 @@ func (r *reader) footerSchema(ctx context.Context, path string) (*arrow.Schema, 
 	if err != nil {
 		return nil, fmt.Errorf("goplane: open %s: %w", path, err)
 	}
-	defer f.Close()
 	pr, err := file.NewParquetReader(f)
 	if err != nil {
+		_ = f.Close()
 		return nil, fmt.Errorf("goplane: footer of %s: %w", path, err)
 	}
-	defer pr.Close()
+	defer pr.Close() // closes f
 	md := pr.MetaData()
 	sch, err := pqarrow.FromParquet(md.Schema, &pqarrow.ArrowReadProperties{}, md.KeyValueMetadata())
 	if err != nil {
