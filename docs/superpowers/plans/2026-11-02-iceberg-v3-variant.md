@@ -56,7 +56,7 @@
    - viewer, editor, explicit_reader and project_admin keep exactly today's pipeline-api and Lakekeeper permissions, including ancestor discovery for a table shared on its own.
    - A non-member is denied.
    - Covered by the Task 2 tests and the Task 3 e2e FGA matrix.
-2. **Upgrade order.** Lakekeeper v0.14.2 must not migrate before the 4.13 pin exists. Otherwise it installs the upstream model without the Datuplet extensions. Covered by the Task 3 guard and its tests.
+2. **Fresh-install order.** On a fresh install, Lakekeeper v0.14.2 must start only after our 4.13 pin exists. Otherwise it installs the upstream model without the Datuplet extensions. The existing `wait-for-fga-pin` hook enforces this. It is verified by the Task 3 e2e, which installs from scratch and passes the FGA matrix and apps.
 3. **Overlapping row ids on partitioned v3.** They can come from a retry, two commits in a row, FULL_LOAD, or `commit.retry.num-retries` above 0, including a value set mid-commit. Covered by the Task 4 tests.
 4. **VARIANT losing data silently.**
    - Output that comes back null or as mangled CSV.
@@ -122,21 +122,15 @@ Steps:
 - [ ] **Step 4:** Gates, plus `make test-authz-integration`, `scripts/verify-versions.sh` and `helm template datuplet-app`.
 - [ ] **Step 5:** Commit `feat(authz)!: FGA model re-forked from Lakekeeper 4.13; pipeline-api checks describe_effective`.
 
-### Task 3: Lakekeeper v0.14.2 + pre-Lakekeeper guard (then e2e)
+### Task 3: Lakekeeper v0.14.2 (then e2e)
 
-**Model:** opus. **Spec:** A4, A5, A6.
+**Model:** opus. **Spec:** A4, A5 (no upgrade path), A6.
 
 **Files:**
 - `charts/datuplet-lakekeeper/Chart.yaml`: `lakekeeper` `0.10.0` → `0.13.0`. `helm dependency update`.
 - `values.yaml:52-58`: image tag `v0.14.2`, and update the comment.
 - `templates/config-secret.yaml`: remove `LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION` and its comments at `:13-16,41-48`. Do not add `AUTHORIZATION_MODEL_VERSION`.
 - Regenerate the goldens in `charts/datuplet-lakekeeper/_render/*.golden.yaml`.
-- `scripts/upgrade.sh`: a separate pre-Lakekeeper guard (A5).
-  - It runs right before the lakekeeper phase, whether that phase runs alone or as part of `all`.
-  - It reads the *target* chart's effective `platform.fgaModelVersion`.
-  - It checks that the pin tuple exists, the bootstrap migration marker exists, and the pinned model id resolves. Any failure aborts the upgrade.
-  - The post-app `fga_sync_warn` (`:118-121,137`) stays a warning.
-  - A stub-backed shell test covers: missing pin, pin without a marker, unresolvable model, and app-then-lakekeeper success.
 - Fixture pins to `v0.14.2`:
   - `pkg/datagateway/goplane/fixture_test.go:33`;
   - `components/queryengine/integration_test.go:283`;
@@ -144,18 +138,17 @@ Steps:
   - the comment at `components/queryengine/attach.go:54`.
 - `pkg/pipelineapi/lakekeeper/manager.go:110-130`: a comment that the endpoint is deprecated.
 - Docs:
-  - `docs/dependency-upgrades.md`: the FGA version tracks Lakekeeper's active model; rollback means a DB restore; the `--timeout` note.
+  - `docs/dependency-upgrades.md`: the FGA version must equal Lakekeeper's active model version (4.13 for v0.14.2). Bumping Lakekeeper means a re-fork and a fresh install, never an in-place upgrade.
   - `docs/fga-model-upgrades.md`.
   - CLAUDE.md: FGA versioning, and the cross-chart CI drift check that exists.
   - `docs/known-limitations.md`.
 
 Steps:
-- [ ] **Step 1:** Make the changes and add the guard tests.
+- [ ] **Step 1:** Make the changes.
 - [ ] **Step 2:** Gates, plus `helm lint` for every chart and `make chart-render-check`. Run the integration goplane tests on v0.14.2. If the pre-existing golden drift changes, record that.
-- [ ] **Step 3:** Commit `chore(deps)!: Lakekeeper v0.14.2 (chart 0.13.0); enforce FGA pin before lakekeeper upgrade`.
+- [ ] **Step 3:** Commit `chore(deps)!: Lakekeeper v0.14.2 (chart 0.13.0)`.
 - [ ] **Step 4 (controller): Phase A e2e.**
   - `make e2e-k8s` on OrbStack, using the isolated kubeconfig and `datuplet-e2e`. All scenarios must PASS, including the FGA matrix and apps.
-  - A fresh install followed by an `upgrade.sh` pass in a scratch namespace.
   - Docker cleanup.
   - On failure, collect the Lakekeeper, OpenFGA and pipeline-api logs and stop for the maintainer.
 

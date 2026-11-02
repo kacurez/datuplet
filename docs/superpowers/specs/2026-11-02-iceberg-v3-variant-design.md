@@ -39,7 +39,7 @@ Evidence:
 - `timestamp_ns`.
 - Writing deletes from the gateway.
 - Changing the frozen contract: `api/proto/gateway/v2/gateway.proto` messages, `sdk/go`, `components/*`. The exceptions are the queryengine change in D9 and the e2e fixture data.
-- A Lakekeeper DB downgrade path. Datuplet is greenfield and nothing is deployed (main spec non-goal "Any migration").
+- **Any migration, upgrade or downgrade path**, for charts, the Lakekeeper DB, the FGA store or tables. Datuplet is always installed from scratch (maintainer: "no migration ever!"). That excludes `upgrade.sh` changes, upgrade tests, rollback procedures and upgrade notes.
 
 ## Decisions
 
@@ -61,7 +61,7 @@ Also bump the integration-test image (`pkg/pipelineapi/authz/openfga_integration
   - `editor`, `viewer` and `datuplet_member` stay defined on `project`.
 - Version **exactly `4.13`** in both charts (`charts/datuplet-app/values.yaml:48-49`, `charts/datuplet-lakekeeper/values.yaml:19`). Lakekeeper v0.14.2 looks up its hard-coded active version 4.13 (`migration-v0.14.2.rs:115-116`). With our 4.13 pin present first, Lakekeeper's own OpenFGA migration does nothing.
 - `bootstrap-job.yaml` hard-codes the component file list in two places (`:304` hash, `:322-336` volume items). Both must list the 11 components. Fold the list into one helper, so the next re-fork cannot miss a file.
-- No tuple rewrite is needed. 4.13's bare relations still exist, as granted-only, and the `_effective` relations include them. Greenfield policy (`docs/fga-model-upgrades.md`) still applies to deployed stores.
+- No tuple rewrite or store migration: stores are always created fresh (A5).
 - New: a Go test compiles `fga.mod` and its components with the OpenFGA language package. It asserts:
   - the model compiles;
   - the extension relations exist;
@@ -87,17 +87,10 @@ Also update the comments in `authz/middleware.go:14,41-43`, the 8 test seeds in 
   - `docs/dependency-upgrades.md:15-17` (FGA version now moves with Lakekeeper's active version);
   - CLAUDE.md.
 
-**A5. Upgrade ordering is enforced, not just documented.**
-- The `datuplet-app` phase must write the 4.13 pin before `datuplet-lakekeeper` v0.14.2 runs its migration.
-- `scripts/upgrade.sh` gets a **separate pre-Lakekeeper guard**, run right before the lakekeeper phase, whether that phase is invoked alone or as part of `all`. Using the *target* chart's effective `platform.fgaModelVersion`, it checks that:
-  - the pin tuple exists;
-  - the bootstrap's migration marker for that version exists;
-  - the pinned model id resolves in the store.
-
-  If any check fails, it aborts with a message to run the app phase first.
-- The existing post-app-phase `fga_sync_warn` (`:118-121,137`) stays a warning. During `--phase all` it fires on an intentional transitional mismatch.
-- The lakekeeper chart's `wait-for-fga-pin` hook (`templates/bootstrap/wait-for-fga-pin-job.yaml:27`) already runs on install and upgrade, so a fresh install orders correctly.
-- Install keeps `--timeout 10m` (`scripts/install.sh:171`), because the 0.14 migration can take minutes.
+**A5. Install from scratch only — no upgrade or migration path (maintainer, 2026-11-02: "no migration ever!").**
+- Datuplet is installed fresh with `scripts/install.sh`. This plan adds no upgrade guard, no migration step, no rollback procedure and no upgrade tests.
+- Ordering on a fresh install is already enforced: the lakekeeper chart's `wait-for-fga-pin` hook (`templates/bootstrap/wait-for-fga-pin-job.yaml:27`) blocks until the app chart has written our 4.13 pin. Lakekeeper's own OpenFGA migration then finds 4.13 present and does nothing (A2).
+- `scripts/upgrade.sh` is not changed by this plan.
 
 **A6. Other Lakekeeper changes.** We are unaffected by:
 - the authn rule changes (we set neither `OPENID_SCOPE` nor `OPENID_PROVIDERS__*`);
@@ -107,7 +100,7 @@ Also update the comments in `authz/middleware.go:14,41-43`, the 8 test seeds in 
 - the permissions-API changes (we don't call them);
 - the deprecated `DELETE /management/v1/project/{id}`, which still works. Leave it, with a comment.
 
-We benefit from concurrent commits now returning 409 instead of 503, which `RetryOnConflict` handles. Rollback needs a Lakekeeper DB restore: migrations are one-way from 0.13. This goes in the upgrade notes.
+We benefit from concurrent commits now returning 409 instead of 503, which `RetryOnConflict` handles.
 
 ### Iceberg v3 (Phase B)
 
@@ -234,7 +227,6 @@ sql-transform reads its inputs as `FORMAT_PARQUET`, so it gets real VARIANT colu
 ## Risks
 
 - **FGA re-fork mistakes** would silently widen or narrow access. Mitigation: the compile test, the integration test against the real model, and the FGA-matrix e2e.
-- **Lakekeeper migration is one-way.** Dev stacks reinstall; documented.
 - **VARIANT JSON fidelity.** Numbers are kept exact through `UseNumber` and raw tokens, and integers above 2^53 stay exact. Representations arrow-go cannot keep exact go in known-limitations.
 - **duckdb-go cannot scan VARIANT or JSON result values faithfully** (C6). Preview projects `::JSON::VARCHAR`; user SQL gets a clear error.
 - **e2e infrastructure:** Docker Hub pull limits.
