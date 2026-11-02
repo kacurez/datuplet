@@ -114,6 +114,11 @@ func runGateway(opts gatewayOptions, getenv func(string) string) int {
 // exits 20: exiting at once would make the kubelet restart the sidecar and
 // race the component's call again.
 func runGatewayWith(opts gatewayOptions, getenv func(string) string, hooks gatewayHooks) int {
+	if limit, applied := datagateway.ApplyMemoryLimit(os.Getenv, os.ReadFile); applied {
+		log.Printf("datuplet-gateway: cgroup memory limit %d bytes; Go memory limit set to 70%%", limit)
+	} else {
+		log.Printf("datuplet-gateway: Go memory limit not applied (GOMEMLIMIT set or no cgroup limit)")
+	}
 	log.Printf("datuplet-gateway: starting %s iteration_id=%s run_id=%s",
 		datagateway.GatewayBuildInfo(), orNone(getenv("DATUPLET_ITERATION_ID")), orNone(getenv("RUN_ID")))
 

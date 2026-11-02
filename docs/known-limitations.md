@@ -162,6 +162,55 @@ time is follow-up work.
 
 ---
 
+## Data Gateway data plane (pure Go, iceberg-go v0.7.0)
+
+**GCS is unverified on the Go data plane.** Writes and reads go through
+`pkg/datupleticeio`'s `gs://` factory with vended OAuth tokens. There is no GCS
+environment in CI; prove it on GKE before relying on it.
+
+**`partition_fields` are ignored.** A writer that sets them gets one warning
+and writes an unpartitioned table. Iceberg partition specs are not supported.
+
+**External data files are unsupported.** `external_files` fails the writer with
+`external data files are not supported`.
+
+**No `files.json` breadcrumb.** The per-table `files.json`, `_schema-*.json` and
+`_manifest-*.json` objects are no longer written; commits are inline and carry
+the audit properties in the snapshot summary. Tooling that listed them must read
+the snapshot instead.
+
+**`FULL_LOAD` with zero rows does not truncate.** A writer that closes with no
+rows writes no file and commits nothing (SKIPPED), so the table keeps its data.
+
+**Raw passthrough falls back to decode for non-canonical types.** A data file is
+served as-is only when its Parquet-derived Arrow schema equals the table's
+current schema. Files with int8/int16/uint\*, ms/ns timestamps, or any schema
+change since they were written are decoded and re-encoded: correct, but slower.
+
+**Writer failure after rotation leaves orphans (R3b).** If a writer fails after
+rotating, the files from its earlier rotations stay in storage as uncommitted
+objects (as before). They are not referenced by any snapshot.
+
+**Some types do not round-trip through iceberg-go v0.7.0 (R3c).** `AddFiles`
+rejects nanosecond timestamps, and uint64 values above `MaxInt64` cannot be
+read. The read failure surfaces when that chunk is served, not at `OpenReader`.
+
+**A merge-on-read delete makes every file of the table decode (M5c).**
+iceberg-go v0.7.0 matches an unpartitioned position-delete file to data files by
+its `file_path` bounds. Under the default `truncate(16)` metrics those bounds
+cover every file, so one delete file sends every data file of the table through
+the decoded path instead of raw. Results stay correct; reads are slower. The
+workaround is the table property `write.metadata.metrics.default=full`.
+
+**Cancel-path abort is unbounded for non-S3 sinks (M4b).** On the
+cancel-annotation path, aborting an open upload has no overall time bound for
+non-S3 sinks. S3 aborts are bounded at 30 s each.
+
+**Empty `FORMAT_ARROW_IPC` reads return one zero-row batch.** The chunk is the
+single last chunk, with the SDK wire schema.
+
+---
+
 ## JWT handling
 
 **pipeline-api key rotation drops in-flight run tokens.** Run tokens carry a 24 h

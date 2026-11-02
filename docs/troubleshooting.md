@@ -237,11 +237,16 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
   (`catalogwriter.RetryOnConflict`) was exhausted. This happens when multiple
   runs write to the same table concurrently; retries are automatic, but a
   persistent conflict surfaces as a failed commit in the gateway log.
-- `files.json` at `<table-base>/.run-state/<run-id>/files.json` is written as
-  an audit breadcrumb only — its absence or a write failure is a logged
-  warning, not the cause of a commit failure. Don't treat a missing
-  `files.json` as the root cause; look at the commit-pool error in the gateway
-  log instead.
+- There is no `files.json` (or `.run-state/`) breadcrumb any more; don't look
+  for one. The commit-pool error in the gateway log is the place to start.
+- A read is slow on a table with merge-on-read deletes or an evolved schema.
+  The gateway does not log which data files it served raw and which it decoded;
+  a file is served raw only when it has no deletes and matches the table's
+  current schema (see [architecture.md](architecture.md)), so a table with
+  delete files, renamed/added/dropped columns or non-canonical types reads
+  through the slower decoded path. This is expected, not a failure — see
+  [known-limitations.md](known-limitations.md) for the delete-metrics
+  workaround.
 
 ---
 
@@ -266,11 +271,13 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
 - Lakekeeper returned a 409 conflict and the retry budget was exhausted. This
   happens when multiple runs write to the same table concurrently. The next run
   will succeed; the failed run's data is orphaned in S3 but not committed.
-- The `files.json` path is wrong. Confirm by listing the prefix directly in S3:
+- The data files were written but never committed. List the table's data prefix
+  directly in S3 and compare with the table's snapshot (files from a failed
+  writer stay in storage uncommitted):
   ```bash
   # For MinIO:
   kubectl exec -n datuplet deploy/minio -- \
-    mc ls local/datuplet/<table-uuid>/.run-state/<run-id>/
+    mc ls local/datuplet/<table-uuid>/data/
   ```
 - The Pipeline's output bucket does not match a registered Lakekeeper namespace.
   Check that the namespace exists in Lakekeeper: open the Storage tab in the UI

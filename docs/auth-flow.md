@@ -170,7 +170,6 @@ DG sidecar (run identity)             lakekeeper REST          OpenFGA (lakekeep
        |    STS creds scoped to table prefix|                         |
        |                                    |                         |
        | write parquet via STS creds        |                         |
-       | write files.json via STS creds     |                         |
 ```
 
 **Actor:** Synthetic run user (`user:oidc~<run-uuid>`).

@@ -19,6 +19,21 @@ checklist per dependency — what CI cannot see.
 5. Upgrade order on clusters: `upgrade.sh --phase lakekeeper` alone is
    fine; app does not need a simultaneous bump unless the REST API broke.
 
+## iceberg-go / arrow-go (root, `components/queryengine`, `tests/e2e`)
+1. Pinned at iceberg-go v0.7.0 with arrow-go v18.8.0 (MVS pulls the arrow-go
+   floor); keep every module that imports iceberg-go on the same version
+   (`make tidy` covers all modules).
+2. Re-check the touchpoints: `pkg/datagateway/goplane/` (write path:
+   pqarrow + `io.LoadFS` upload; read path: `Scan.PlanFiles` / `ReadTasks`),
+   `pkg/icebergjob/` (`AddFiles` / `ReplaceDataFiles`), `pkg/catalogwriter/`,
+   `pkg/datupleticeio/` (`gs://` factory) and `pkg/datagateway/lakekeeper/`.
+3. The raw-read eligibility rule depends on iceberg-go's task splitting
+   (`read.split.target-size`), delete-file matching and name-mapping
+   behaviour; the known v0.7.0 quirks are listed in known-limitations.md.
+   Re-run the `integration`-tagged goplane tests after a bump.
+4. Gate: `go test -tags=integration ./pkg/datagateway/goplane/...
+   ./pkg/datupleticeio/...` + `make e2e-k8s`.
+
 ## CloudNativePG (charts/datuplet-operators, dep `cloudnative-pg`)
 1. Read CNPG upgrade notes for operator→cluster compatibility (the
    operator must be upgraded before Cluster CRs that use new fields).
