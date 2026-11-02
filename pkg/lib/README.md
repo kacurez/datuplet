@@ -12,7 +12,6 @@ This directory contains **domain-agnostic infrastructure libraries** that are re
 **What**: Simple MinIO/S3 client with 3 operations: Read, Write, List
 **Used by**:
 - `pkg/pipeline` (pipeline execution)
-- `pkg/tablecommit` (files.json read path)
 - `pkg/pipelineapi/storage` (catalog browse via lakekeeper)
 - `cmd/datuplet` (CLI commands)
 
@@ -51,11 +50,11 @@ This directory contains **domain-agnostic infrastructure libraries** that are re
 ### What Does NOT Belong in lib/
 
 ❌ **Domain logic** (stays at `pkg/` top-level):
-- `pkg/tablecommit` - Iceberg commit logic
+- `pkg/icebergjob` - Iceberg commit logic
 - `pkg/datagateway` - Data transformation
 - `pkg/pipeline` - Pipeline execution
 
-Even though tablecommit is reused by CLI and operators, it contains Datuplet-specific domain logic and stays at top-level.
+Even though icebergjob is shared, it contains Datuplet-specific domain logic and stays at top-level.
 
 ❌ **Single-use libraries**:
 - If only one service uses it, nest under that service
@@ -88,13 +87,13 @@ import "github.com/datuplet/datuplet/pkg/lib/orchestrator"
 
 ✅ **Depend on each other** (when needed):
 ```go
-import "github.com/datuplet/datuplet/pkg/tablecommit"  // Domain logic
+import "github.com/datuplet/datuplet/pkg/icebergjob"  // Domain logic
 ```
 
 ❌ **lib/ packages CANNOT import services**:
 ```go
 // WRONG - lib/ importing domain logic
-import "github.com/datuplet/datuplet/pkg/tablecommit"  // NO!
+import "github.com/datuplet/datuplet/pkg/icebergjob"  // NO!
 ```
 
 ## Future Extensions
@@ -118,7 +117,7 @@ If YES to all 4, it belongs in `pkg/lib/`.
 - `pkg/lib/cache/` - Generic caching (Redis, in-memory)
 
 ❌ **Bad candidates** (domain logic, stay at pkg/ top-level):
-- `pkg/iceberg/` - Iceberg operations (use `pkg/tablecommit`)
+- `pkg/iceberg/` - Iceberg operations (use `pkg/icebergjob`)
 - `pkg/datagateway/processor/` - Data transformations (use `pkg/datagateway/processor`)
 - `pkg/catalog/` - Table catalog (Datuplet-specific)
 

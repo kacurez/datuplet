@@ -255,8 +255,12 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 	return tw, responseSchema, nil
 }
 
-// handleRead serves the next chunk of a reader. The request ctx is not used
-// for the read: a client that goes away mid-chunk does not end the reader.
+// handleRead serves the next chunk of a reader. The request ctx does not
+// bound producing the chunk: a client that goes away mid-request does not
+// cancel the read. A write of the chunk that fails while the handler runs
+// fails the reader for good (a sticky error, so a retry never skips the
+// chunk). Bytes net/http still buffers after the handler returns are not
+// observed: a failure to deliver them is not seen here.
 func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.httpError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED")

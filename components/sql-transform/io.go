@@ -323,8 +323,8 @@ func checkOutputTypes(ctx context.Context, conn *sql.Conn, outs []sdk.OutputTabl
 // writeOutput materializes one DuckDB table to local parquet then streams
 // it to DG via OpenWriter + WriteChunk. The DG writer handles parquet
 // re-emission to the iceberg target prefix using lakekeeper-vended creds
-// and commits the iceberg transaction inline (RFC 021). The per-target
-// files.json is a recovery/observability breadcrumb, not an iceberg-job input.
+// and commits the iceberg transaction inline (RFC 021); the snapshot summary
+// is the audit record (no files.json breadcrumb).
 //
 // Returns the row count of the produced output (best-effort — DG also
 // reports total_rows on Close).
