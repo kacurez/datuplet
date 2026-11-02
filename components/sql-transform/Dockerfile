@@ -1,7 +1,7 @@
 # Multi-stage build for sql-transform component (RFC 010)
 # Note: Uses Debian base (not Alpine) — DuckDB prebuilt library requires glibc.
 # syntax=docker/dockerfile:1.4
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 
 WORKDIR /build
 

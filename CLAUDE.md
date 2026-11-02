@@ -11,12 +11,16 @@ between 0.x releases.
 Datuplet is a streaming ETL platform for pipelines with limited local disk.
 Components process data in chunks via Apache Iceberg on object storage
 (MinIO / S3 / GCS). A **Data Gateway sidecar** handles all storage I/O on
-behalf of each component, so component SDKs stay ~300 LOC per language.
+behalf of each component, so component SDKs stay ~300 LOC per language. The
+gateway's data plane (`pkg/datagateway/goplane`) is pure Go on arrow-go
+`pqarrow` and iceberg-go v0.7.0: writes encode Parquet and stream it to
+storage, reads plan the Iceberg snapshot and serve each data file raw or
+decoded.
 
 **Key architectural principle:** storage paths flow through the system as
 **opaque strings**. Lakekeeper allocates the per-table data prefix; the
-Data Gateway passes whatever URL it gets back verbatim; only the backend
-layer interprets URLs.
+Data Gateway passes whatever URL it gets back verbatim; only the data plane
+(`goplane` and iceberg-go IO) interprets URLs.
 
 Primary languages: Go (backend, operators, CLI), YAML (K8s manifests),
 Shell (automation). TypeScript only in
@@ -43,8 +47,8 @@ Test gates — `go test ./...` must stay green on a bare machine:
   unless `TEST_DATABASE_URL` points at a Postgres, e.g.
   `postgres://postgres:test@localhost:55432/test?sslmode=disable`.
 - `//go:build integration` tests need Docker (testcontainers). CI runs
-  `go test -tags=integration ./pkg/datagateway/backend/... ./pkg/datupleticeio/...`
-  (fake-gcs-server). `pkg/pipelineapi/authz` has an OpenFGA test under the
+  `go test -tags=integration ./pkg/datagateway/goplane/... ./pkg/datupleticeio/...`
+  (Postgres + Lakekeeper + silo fixtures, fake-gcs-server). `pkg/pipelineapi/authz` has an OpenFGA test under the
   same tag that CI does not run.
 - The e2e suite (`tests/e2e/`, its own module) gates on `E2E_K8S=1`; without
   it every scenario SKIPs. `E2E_REQUIRE=1` turns a bootstrap failure into a
@@ -79,7 +83,7 @@ OrbStack dev loop (namespace `datuplet`; `K8S_NS=datuplet-e2e` retargets):
 `.github/workflows/pr.yml` runs on every PR and push to `main`:
 
 1. `go vet ./...`, `go test -count=1 ./...`, then the `integration`-tagged
-   GCS/datupleticeio tests.
+   goplane/datupleticeio tests.
 2. `helm dependency build` + `helm lint` + `helm template`, once per chart.
 3. `scripts/verify-versions.sh` — chart versions and component tag in sync.
 4. `make sync-component-schemas` + `git diff --exit-code` on the chart copies.
@@ -172,15 +176,17 @@ These are conventions a new contributor wouldn't infer from the code:
 - **Never use `filepath.Join` or `path.Join` for storage paths** — they
   corrupt URLs (e.g., `s3://bucket` becomes `s3:/bucket`). Use the
   package-local `joinStoragePath()` helper (defined in
-  `pkg/datagateway/server_v2.go`, `pkg/datagateway/partition/router.go`,
-  `pkg/datagateway/buffer/manager.go`).
+  `pkg/datagateway/server_v2.go`); `pkg/datagateway/goplane` concatenates the
+  lakekeeper-allocated data prefix with the file name.
 - **`pkg/lib/datalake/` is metadata-only fallback I/O** (Read / Write / List),
-  used by the pipeline-api storage walker fallback. **`pkg/datagateway/backend/`**
-  is the full data-plane abstraction (buffering, format conversion, backends).
-  Don't confuse the two.
-- **Buffer package (`pkg/datagateway/buffer/`) outputs Parquet only.** For
-  other formats on read, use `pkg/datagateway/format/` adapters to convert
-  on the fly.
+  used by the pipeline-api storage walker fallback. **`pkg/datagateway/goplane/`**
+  is the full data plane (Parquet encode + streamed upload, snapshot planning,
+  raw/decoded reads). Don't confuse the two.
+- **The Go writer outputs Parquet only** (`pqarrow`, ZSTD). The read path
+  serves a data file raw (its bytes are the `FORMAT_PARQUET` chunk) only when
+  Iceberg semantics would not change it (no deletes, current schema, same
+  field ids); otherwise iceberg-go decodes it. Other formats on read go
+  through the `pkg/datagateway/format/` adapters.
 - **Exit code contract**: `0=Succeeded`, `1=FailedUser`, `>=20=FailedApplication`.
   Status messages use the `DUPLET_STATUS_MESSAGE:` prefix in stdout.
 - **CRD manifests are manually maintained** in `charts/datuplet-app/crds/`
@@ -215,18 +221,17 @@ These are conventions a new contributor wouldn't infer from the code:
   (`pkg/pipelineapi/storage/catalog_proxy.go`) when
   `DATUPLET_LAKEKEEPER_URL` is set, falling back to a directory walker
   for tests + local-mode-without-lakekeeper.
-- **Per-table files.json manifests**: Data Gateway writes one `files.json`
-  per `(namespace, table)` at `<table-base>/.run-state/<run-id>/files.json`
-  (inside the table's lakekeeper-managed prefix). Wire shape in
-  `pkg/datagateway/files_manifest.go`:
-  `{"run_id":"...", "namespace":"...", "table":"...", "paths":[...]}`.
-  Since RFC 021 the manifest is an audit breadcrumb (write failure is a
-  logged warning, not fatal): commits happen inline in the Data Gateway.
-  CloseWriter dispatches the writer's parquet paths to the commit pool
+- **Commits are inline in the Data Gateway; there is no files.json.** The
+  per-table `files.json` breadcrumb and `_schema-*`/`_manifest-*` files were
+  removed with the Go data plane. `CloseWriter` closes the goplane writer
+  and dispatches the writer's parquet paths to the commit pool
   (`pkg/datagateway/commit_pool.go`), which calls
   `icebergjob.CommitTableFiles` — `txn.AddFiles` (APPEND) or
   `txn.ReplaceDataFiles` (FULL_LOAD), 409-conflict retry, idempotency key
-  in the snapshot summary. The session Commit RPC is the barrier that
+  in the snapshot summary. Partitioned tables (spec from
+  `partition_fields` on create; an existing table's spec wins) get one
+  file per partition tuple and commit with explicit tuples via
+  `txn.AddDataFiles` / `txn.ReplaceDataFilesWithDataFiles`. The session Commit RPC is the barrier that
   drains the pool and reconciles per-writer results. Zero paths =
   success-zero.
 - **Per-run JWT**: pipeline-api mints **one RS256 JWT per run** via
@@ -353,8 +358,8 @@ These are conventions a new contributor wouldn't infer from the code:
 |-----------|---------|
 | `pkg/pipeline/config/` | Envelope-free PipelineDoc parser (shared by operator + pipeline-api; RFC 027). |
 | `pkg/pipeline/schemalint/` | Form-Subset linter for `components/*/schema.json` (RFC 027). |
-| `pkg/datagateway/` | Data Gateway service (format conversion, processors, buffering). |
-| `pkg/datagateway/backend/` | Storage backends (MinIO/S3, GCS, local FS). |
+| `pkg/datagateway/` | Data Gateway service (format conversion, processors, commit pool, `DataPlane` interface). |
+| `pkg/datagateway/goplane/` | Pure-Go data plane: pqarrow writer with streamed upload, iceberg-go read planning (raw / decoded). |
 | `pkg/datagateway/lakekeeper/` | Data Gateway's lakekeeper resolver. |
 | `pkg/datupleticeio/` | iceberg-go `gs://` IO factory override (vended OAuth tokens). |
 | `pkg/icebergjob/` | Shared iceberg-commit library (`CommitTableFiles` / `CommitTable`); used by the DG commit pool. |

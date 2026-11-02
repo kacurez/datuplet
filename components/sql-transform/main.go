@@ -17,7 +17,7 @@
 //   4. Streams each declared output back through the SDK's OpenWriter +
 //      WriteChunk path so DG owns parquet emission to the iceberg target
 //      prefix. DG commits the iceberg transaction inline (RFC 021); the
-//      per-target files.json is a recovery/observability breadcrumb only.
+//      snapshot summary is the audit record (no files.json breadcrumb).
 //
 // The component never touches S3 — DG mediates both sides (read + write).
 package main
@@ -161,7 +161,7 @@ func run(ctx context.Context) error {
 		client.Log(ctx, "INFO", fmt.Sprintf("output %s.%s wrote %d rows", out.Bucket, out.Table, rows)) //nolint:errcheck
 	}
 
-	// Commit (DG runs the inline iceberg transaction; files.json is a breadcrumb only).
+	// Commit (DG runs the inline iceberg transaction).
 	// result.Success must be checked: a per-table commit failure (e.g. an
 	// iceberg schema conflict) comes back as a successful RPC carrying
 	// Success=false, so discarding the result would report this component as

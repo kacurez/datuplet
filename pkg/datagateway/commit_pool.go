@@ -33,7 +33,11 @@ var ErrCommitQueueFull = errors.New("commit pool: queue full")
 type CommitJob struct {
 	WriterID, Namespace, Table, RunID string
 	DataPaths                         []string
-	Mode                              icebergjob.WriteMode
+	// Partition carries the files' spec id and per-file tuples (parallel
+	// to DataPaths) for a partitioned table; nil for an unpartitioned one.
+	// The idempotency key stays computed from the paths only.
+	Partition *icebergjob.PartitionedFiles
+	Mode      icebergjob.WriteMode
 }
 
 type CommitResult struct {
@@ -48,7 +52,7 @@ type CommitResult struct {
 
 // CommitFunc is the test seam (prod adapter calls icebergjob.CommitTableFiles).
 type CommitFunc func(ctx context.Context, cat catalog.Catalog,
-	ident icebergtable.Identifier, paths []string,
+	ident icebergtable.Identifier, paths []string, part *icebergjob.PartitionedFiles,
 	mode icebergjob.WriteMode, idempotencyKey string) (*icebergjob.CommitResult, error)
 
 type CommitPoolConfig struct {
@@ -141,7 +145,7 @@ func (p *CommitPool) run(sid uint64, j CommitJob) {
 		p.record(sid, cr)
 		return
 	}
-	res, err := p.cfg.CommitFn(p.parentCtx, cat, icebergtable.Identifier{j.Namespace, j.Table}, j.DataPaths, j.Mode, key)
+	res, err := p.cfg.CommitFn(p.parentCtx, cat, icebergtable.Identifier{j.Namespace, j.Table}, j.DataPaths, j.Partition, j.Mode, key)
 	cr.Duration = time.Since(start)
 	if err != nil {
 		cr.Err = err

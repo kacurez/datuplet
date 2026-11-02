@@ -2,14 +2,12 @@ package datagateway
 
 import (
 	"time"
-
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
 )
 
 // Config contains the gateway server configuration.
 type Config struct {
-	RunID string `yaml:"run_id,omitempty"` // Unique run identifier for this pipeline execution
-	ComponentName  string `yaml:"component_name,omitempty"`
+	RunID         string `yaml:"run_id,omitempty"` // Unique run identifier for this pipeline execution
+	ComponentName string `yaml:"component_name,omitempty"`
 
 	// Bucket-based access control
 	InputBuckets  []string `yaml:"input_buckets,omitempty"`  // Buckets component can read from
@@ -30,13 +28,17 @@ type Config struct {
 	Inputs  map[string]string       `yaml:"inputs,omitempty"`  // logical name -> table path
 	Outputs map[string]OutputConfig `yaml:"outputs,omitempty"` // logical name -> output config
 
-	ComponentCfg     []byte                 `yaml:"config,omitempty"` // Component-specific JSON config
-	ChunkSize        int64                  `yaml:"chunk_size,omitempty"`
-	BufferSize       int64                  `yaml:"buffer_size,omitempty"`
-	RowGroupSize     int64                  `yaml:"row_group_size,omitempty"`
-	TargetFileSize   int64                  `yaml:"target_file_size,omitempty"`
-	Backend  backend.StorageBackend `yaml:"-"` // Not serialized
-	HTTPAddr string                 `yaml:"http_addr,omitempty"`
+	ComponentCfg   []byte `yaml:"config,omitempty"` // Component-specific JSON config
+	ChunkSize      int64  `yaml:"chunk_size,omitempty"`
+	BufferSize     int64  `yaml:"buffer_size,omitempty"`
+	RowGroupSize   int64  `yaml:"row_group_size,omitempty"`
+	TargetFileSize int64  `yaml:"target_file_size,omitempty"`
+	HTTPAddr       string `yaml:"http_addr,omitempty"`
+
+	// LocalDataDir (tests only; not serialized): with no LakekeeperURL,
+	// writer data prefixes are <LocalDataDir>/<bucket>/<table>/data/ and no
+	// commit is dispatched. Empty with no LakekeeperURL = OpenWriter fails.
+	LocalDataDir string `yaml:"-"`
 
 	// RunTokenPath is the filesystem path to the mounted run-token Secret.
 	// When non-empty and the file exists, the gateway reads it at boot.
@@ -59,9 +61,9 @@ type Config struct {
 
 	// LakekeeperURL is the base URL of the Iceberg REST catalog (lakekeeper).
 	// When set, the gateway constructs a `pkg/datagateway/lakekeeper.Resolver`
-	// at boot and routes per-write/per-read requests through it for
-	// LoadOrCreate + vended-creds rotation. Empty = static-backend mode
-	// (tests + dev only).
+	// at boot and routes writes through it for LoadOrCreate + vended-creds
+	// rotation (the data plane loads tables for reads through it). Empty = tests only
+	// (LocalDataDir for writes).
 	LakekeeperURL string `yaml:"lakekeeper_url,omitempty"`
 
 	// PipelineAPIJWKSURL is the JWKS endpoint URL pipeline-api serves
@@ -77,13 +79,6 @@ type Config struct {
 	// empty, no resolution is attempted and any $[name] reference in ComponentCfg
 	// causes NewServerV2 to fail.
 	SecretsDir string `yaml:"secrets_dir,omitempty"`
-
-	// Storage credentials for native S3 components (StorageBootstrap)
-	S3Endpoint   string `yaml:"s3_endpoint,omitempty"`
-	S3AccessKey  string `yaml:"s3_access_key,omitempty"`
-	S3SecretKey  string `yaml:"s3_secret_key,omitempty"`
-	S3Region     string `yaml:"s3_region,omitempty"`
-	S3BucketName string `yaml:"s3_bucket_name,omitempty"`
 }
 
 // InputTableConfig defines a specific table input.
@@ -105,7 +100,7 @@ type OutputTableConfig struct {
 	Bucket          string                 `yaml:"bucket"`                     // Bucket name
 	WriteMode       string                 `yaml:"write_mode"`                 // APPEND or FULL_LOAD
 	LogicalName     string                 `yaml:"logical_name,omitempty"`     // SDK-facing identifier (defaults to Name when empty)
-	PartitionFields []PartitionFieldConfig `yaml:"partition_fields,omitempty"` // Optional partition spec
+	PartitionFields []PartitionFieldConfig `yaml:"partition_fields,omitempty"` // Iceberg partition spec of a table the gateway creates
 
 	// Columns is an optional explicit column mapping (name+type). When set,
 	// the producer writes exactly these columns and infers nothing; empty =
@@ -129,6 +124,15 @@ type ColumnConfig struct {
 // GetRunID returns the run ID.
 func (c *Config) GetRunID() string {
 	return c.RunID
+}
+
+// HTTPListenAddr is the HTTP data plane's listen address: HTTPAddr, else
+// ":50052".
+func (c *Config) HTTPListenAddr() string {
+	if c.HTTPAddr == "" {
+		return ":50052"
+	}
+	return c.HTTPAddr
 }
 
 // OutputConfig contains output path and optional processors.

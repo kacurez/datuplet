@@ -6,9 +6,9 @@
 // existing pieces:
 //
 //   - `pkg/catalogwriter` — Client (REST catalog), VendedCreds (STS
-//     fetch + 50%-elapsed renewal contract), AWSCredentialsProvider.
-//   - `pkg/datagateway/backend` — the StorageBackend abstraction the
-//     buffer manager writes through.
+//     fetch + 50%-elapsed renewal contract).
+//   - the data plane (`pkg/datagateway.DataPlane`), which writes the
+//     table's Parquet files with those credentials.
 //   - lakekeeper itself — owns table location allocation; the only
 //     party that knows the per-table S3 prefix vended STS will accept.
 //
@@ -20,16 +20,15 @@
 //     from the gateway-side schema. (DG owns table creation rather
 //     than TableCommit because vended STS scoped to the table prefix
 //     can only be issued once the table exists in lakekeeper.)
-//  3. Construct a vended-creds-backed MinIO backend rooted at the
-//     table's data path (per iceberg-go's LocationProvider).
+//  3. Return the table's data prefix plus a VendedCreds credential
+//     source the data plane writes it with.
 //
-// Reads use Resolver.LoadTableForRead which returns the parquet path
-// list under the current snapshot plus a similar minio backend. The
-// run-token map provides the read-intent JWT.
+// Reads do not go through the Resolver: the data plane ATTACHes the
+// catalog itself.
 //
 // The package is deliberately small: production logic lives in the
-// callers (server_v2_writing.go, server_v2_reading.go). This file
-// only owns the catalog-and-creds plumbing.
+// callers (server_v2_writing.go, the commit pool). This file only owns
+// the catalog-and-creds plumbing.
 package lakekeeper
 
 import (
@@ -43,8 +42,6 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
-	"github.com/datuplet/datuplet/pkg/datagateway/manifest"
 	dgschema "github.com/datuplet/datuplet/pkg/datagateway/schema"
 	// Blank-import the centralised iceberg-go IO scheme registration package
 	// so isolated tests of this package (e.g. go test ./pkg/datagateway/lakekeeper/...)
@@ -55,13 +52,13 @@ import (
 	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
-// Resolver translates (namespace, table) into a writable / readable
-// per-table location plus a backend.StorageBackend.
+// Resolver translates (namespace, table) into a writable per-table
+// location plus its vended credentials.
 //
 // Lakekeeper REST + vended-creds STS is the only supported catalog backend.
 //
 // One Resolver instance is created per gateway (cheap; just config),
-// then shared across writers/readers. The actual catalog client is
+// then shared across writers. The actual catalog client is
 // short-lived and re-opened per call to keep the auth path simple
 // (per-call bearer attach) and to dodge any iceberg-go session
 // affinity gotchas.
@@ -99,39 +96,28 @@ func (r *Resolver) Close() error {
 
 // WriterTarget describes a writable per-table location.
 type WriterTarget struct {
-	// BasePath is the s3:// URL the BufferManager should write parquet
+	// BasePath is the opaque data prefix the data plane writes parquet
 	// files under (e.g. s3://warehouse/<warehouse-uuid>/<table-uuid>/data/).
 	// The trailing slash is included so joinStoragePath builds a clean
 	// child URL.
 	BasePath string
 
-	// Backend wraps a minio-go client whose credentials are sourced from
-	// `pkg/catalogwriter.VendedCreds` — every PutObject call retrieves a
-	// fresh-or-cached STS credential pair via the renewal contract.
-	Backend backend.StorageBackend
-
-	// VendedCreds is held so the caller can poll LastError() for
-	// observability, and so renewals stay coordinated through one cache.
+	// VendedCreds sources the table's lakekeeper-vended storage
+	// credentials (STS for s3://, OAuth bearer for gs://) through one
+	// renewal cache. nil for file:// prefixes (local tests).
 	VendedCreds *catalogwriter.VendedCreds
-}
 
-// ReaderTarget describes a readable per-table snapshot.
-type ReaderTarget struct {
-	// DataFiles is the list of parquet paths under the current snapshot.
-	// Always s3:// or file:// URLs; empty when the table has no data.
-	DataFiles []string
+	// Spec and Schema are the table's current default partition spec and
+	// schema as the catalog returned them (field ids may be reassigned on
+	// create); FormatVersion is its format version. Writers partition by
+	// Spec (spec decisions 4-5).
+	Spec          iceberg.PartitionSpec
+	Schema        *iceberg.Schema
+	FormatVersion int
 
-	// SchemaJSON is the iceberg-go schema serialised to JSON. Empty when
-	// the table has no current schema (shouldn't happen in practice —
-	// CreateTable always sets one).
-	SchemaJSON []byte
-
-	// TotalRows is the sum of record counts across DataFiles.
-	TotalRows int64
-
-	// Backend reads parquet via vended STS creds, same shape as
-	// WriterTarget.Backend.
-	Backend backend.StorageBackend
+	// SpecWarning is non-empty when the configured partition fields differ
+	// from an existing table's spec (the table's spec is used).
+	SpecWarning string
 }
 
 // SchemaProvider returns the gateway-side schema for a table. The
@@ -145,59 +131,28 @@ type SchemaProvider func(ctx context.Context) (*dgschema.Schema, error)
 // LoadOrCreateForWrite ensures (ns, tbl) exists in lakekeeper and
 // returns a WriterTarget rooted at the table's data prefix.
 //
-// Behaviour matrix:
+// Behaviour matrix (LoadOrCreateTable):
 //
-//   - Table exists → LoadTable; reuse existing schema; build
-//     WriterTarget at the loaded data path.
-//   - Table missing + schemaProvider returns a schema → ensure
-//     namespace, CreateTable with that schema, build WriterTarget at
-//     the new table's data path.
-//   - Table missing + schemaProvider is nil OR returns nil → return
+//   - Table exists -> LoadTable; reuse existing schema and partition spec;
+//     build WriterTarget at the loaded data path.
+//   - Table missing + schemaProvider returns a schema -> ensure
+//     namespace, CreateTable with that schema partitioned by fields,
+//     build WriterTarget at the new table's data path.
+//   - Table missing + schemaProvider is nil OR returns nil -> return
 //     an error. Callers must defer the call until they have a schema
 //     (typically until first chunk is parsed). Surfacing this as an
 //     explicit error matches the `OpenWriter` contract: schema is the
 //     load-bearing input.
-func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, schemaProvider SchemaProvider) (*WriterTarget, error) {
+//
+// Partitioning errors wrap ErrInvalidPartition.
+func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, schemaProvider SchemaProvider, fields []PartitionField) (*WriterTarget, error) {
 	cli, err := r.newClient(ctx, r.Token)
 	if err != nil {
 		return nil, fmt.Errorf("lakekeeper: new client: %w", err)
 	}
-
-	ident := catalog.ToIdentifier(ns, tbl)
-	t, err := cli.Catalog.LoadTable(ctx, ident)
+	t, warning, err := LoadOrCreateTable(ctx, cli.Catalog, ns, tbl, schemaProvider, fields)
 	if err != nil {
-		if !errors.Is(err, catalog.ErrNoSuchTable) {
-			return nil, fmt.Errorf("lakekeeper: load %s.%s: %w", ns, tbl, err)
-		}
-		if schemaProvider == nil {
-			return nil, fmt.Errorf("lakekeeper: table %s.%s missing and no schema available to create it", ns, tbl)
-		}
-		gwSchema, schErr := schemaProvider(ctx)
-		if schErr != nil {
-			return nil, fmt.Errorf("lakekeeper: schema provider for %s.%s: %w", ns, tbl, schErr)
-		}
-		if gwSchema == nil {
-			return nil, fmt.Errorf("lakekeeper: schema provider returned nil for %s.%s", ns, tbl)
-		}
-		if err := r.ensureNamespace(ctx, cli.Catalog, ns); err != nil {
-			return nil, err
-		}
-		icSchema := manifest.SchemaToIceberg(gwSchema)
-		if icSchema == nil {
-			return nil, fmt.Errorf("lakekeeper: cannot convert gateway schema for %s.%s", ns, tbl)
-		}
-		t, err = cli.Catalog.CreateTable(ctx, ident, icSchema)
-		if err != nil {
-			// Concurrent committer race: re-LoadTable.
-			if errors.Is(err, catalog.ErrTableAlreadyExists) {
-				t, err = cli.Catalog.LoadTable(ctx, ident)
-				if err != nil {
-					return nil, fmt.Errorf("lakekeeper: load %s.%s after race: %w", ns, tbl, err)
-				}
-			} else {
-				return nil, fmt.Errorf("lakekeeper: create %s.%s: %w", ns, tbl, err)
-			}
-		}
+		return nil, err
 	}
 
 	// Compute the data prefix from the loaded table's location. Both
@@ -209,89 +164,80 @@ func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sch
 	}
 	dataPrefix := strings.TrimRight(loc, "/") + "/data/"
 
-	be, vc, err := r.buildBackend(dataPrefix, ns, tbl)
+	vc, err := r.writeCreds(dataPrefix, ns, tbl)
 	if err != nil {
 		return nil, err
 	}
 	return &WriterTarget{
-		BasePath:    dataPrefix,
-		Backend:     be,
-		VendedCreds: vc,
+		BasePath:      dataPrefix,
+		VendedCreds:   vc,
+		Spec:          t.Spec(),
+		Schema:        t.Schema(),
+		FormatVersion: t.Metadata().Version(),
+		SpecWarning:   warning,
 	}, nil
 }
 
-// LoadTableForRead returns the parquet paths in the current snapshot
-// plus a vended-creds-backed backend the caller can read them through.
-// On a cold-start table (no current snapshot) DataFiles is empty.
-func (r *Resolver) LoadTableForRead(ctx context.Context, ns, tbl string) (*ReaderTarget, error) {
+// writeCreds returns the vended credentials a writer of (ns, tbl) uses for
+// dataPrefix: S3 STS for s3://, GCS OAuth bearer for gs://, nil for file://.
+func (r *Resolver) writeCreds(dataPrefix, ns, tbl string) (*catalogwriter.VendedCreds, error) {
+	switch {
+	case strings.HasPrefix(dataPrefix, "file://"):
+		return nil, nil
+	case strings.HasPrefix(dataPrefix, "s3://"):
+		return r.newVendedCreds(ns, tbl, catalogwriter.CredsTypeS3), nil
+	case strings.HasPrefix(dataPrefix, "gs://"):
+		return r.newVendedCreds(ns, tbl, catalogwriter.CredsTypeGCS), nil
+	default:
+		return nil, fmt.Errorf("lakekeeper: unsupported scheme in %q (need s3://, gs://, or file://)", dataPrefix)
+	}
+}
+
+// newVendedCreds builds the per-table credential source. VendedCreds
+// discovers the per-warehouse REST URL prefix lazily on first fetch via
+// `GET /v1/config?warehouse=<name>` (matching iceberg-go's REST catalog
+// handshake). The data-path UUID embedded in the data prefix is NOT
+// necessarily the warehouse-id used in the REST URL — lakekeeper assigns
+// separate identifiers — so deriving the prefix from the path is unsafe.
+func (r *Resolver) newVendedCreds(ns, tbl string, typ catalogwriter.CredsType) *catalogwriter.VendedCreds {
+	tok := r.Token
+	return &catalogwriter.VendedCreds{
+		LakekeeperURL:     r.URL,
+		WarehouseName:     r.Warehouse,
+		ProjectID:         r.ProjectID,
+		Namespace:         ns,
+		Table:             tbl,
+		TokenProvider:     func(context.Context) (string, error) { return tok, nil },
+		ExpectedCredsType: typ,
+	}
+}
+
+// LoadTableForScan loads (ns, tbl) for an iceberg-go scan and returns the
+// table's vended credential source, built as the write path builds it
+// (nil for file:// tables).
+func (r *Resolver) LoadTableForScan(ctx context.Context, ns, tbl string) (*icebergtable.Table, *catalogwriter.VendedCreds, error) {
 	cli, err := r.newClient(ctx, r.Token)
 	if err != nil {
-		return nil, fmt.Errorf("lakekeeper: new client: %w", err)
+		return nil, nil, fmt.Errorf("lakekeeper: new client: %w", err)
 	}
 	t, err := cli.Catalog.LoadTable(ctx, catalog.ToIdentifier(ns, tbl))
 	if err != nil {
-		return nil, fmt.Errorf("lakekeeper: load %s.%s for read: %w", ns, tbl, err)
+		return nil, nil, fmt.Errorf("lakekeeper: load %s.%s for scan: %w", ns, tbl, err)
 	}
-
-	// SchemaJSON: marshal the iceberg-go schema as JSON so the existing
-	// gateway-side parser (parseIcebergSchemaJSON) can consume it
-	// without changing its shape.
-	var schemaBytes []byte
-	if sch := t.Schema(); sch != nil {
-		schemaBytes, _ = sch.MarshalJSON()
-	}
-
-	// Walk the current snapshot's manifests for data file paths +
-	// total row count. Empty when the table is brand-new (no snapshot
-	// yet) — callers handle that as "no rows to read".
-	var dataFiles []string
-	var totalRows int64
-	if cur := t.CurrentSnapshot(); cur != nil {
-		fs, fsErr := t.FS(ctx)
-		if fsErr != nil {
-			return nil, fmt.Errorf("lakekeeper: open table FS for %s.%s: %w", ns, tbl, fsErr)
-		}
-		manifests, mErr := cur.Manifests(fs)
-		if mErr != nil {
-			return nil, fmt.Errorf("lakekeeper: list manifests for %s.%s: %w", ns, tbl, mErr)
-		}
-		for _, m := range manifests {
-			entries, eErr := m.FetchEntries(fs, true)
-			if eErr != nil {
-				return nil, fmt.Errorf("lakekeeper: fetch manifest entries for %s.%s: %w", ns, tbl, eErr)
-			}
-			for _, e := range entries {
-				df := e.DataFile()
-				if df == nil {
-					continue
-				}
-				dataFiles = append(dataFiles, df.FilePath())
-				totalRows += df.Count()
-			}
-		}
-	}
-
 	loc := t.Location()
 	if loc == "" {
-		return nil, fmt.Errorf("lakekeeper: table %s.%s has empty location", ns, tbl)
+		return nil, nil, fmt.Errorf("lakekeeper: table %s.%s has empty location", ns, tbl)
 	}
-	dataPrefix := strings.TrimRight(loc, "/") + "/data/"
-	be, _, err := r.buildBackend(dataPrefix, ns, tbl)
+	vc, err := r.writeCreds(strings.TrimRight(loc, "/")+"/data/", ns, tbl)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	return &ReaderTarget{
-		DataFiles:  dataFiles,
-		SchemaJSON: schemaBytes,
-		TotalRows:  totalRows,
-		Backend:    be,
-	}, nil
+	return t, vc, nil
 }
 
 // Catalog returns an iceberg catalog handle bound to the resolver's run
 // token. A fresh *catalogwriter.Client is opened per call (same pattern
-// as LoadTableForRead / LoadOrCreateForWrite) — there is no shared
+// as LoadOrCreateForWrite) — there is no shared
 // catalog state, so no lifecycle coupling with concurrent callers.
 // Used by the inline commit pool (RFC 021).
 func (r *Resolver) Catalog(ctx context.Context) (catalog.Catalog, error) {
@@ -315,106 +261,9 @@ func (r *Resolver) newClient(ctx context.Context, token string) (*catalogwriter.
 	})
 }
 
-// buildBackend dispatches to the scheme-appropriate backend constructor.
-// Supported schemes: s3://, gs://, file://. Unknown schemes return an
-// "unsupported scheme" error that names all three supported variants so
-// operators can diagnose a misconfigured lakekeeper warehouse quickly.
-func (r *Resolver) buildBackend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
-	switch {
-	case strings.HasPrefix(dataPrefix, "file://"):
-		return backend.NewLocalBackend(backend.LocalConfig{}), nil, nil
-	case strings.HasPrefix(dataPrefix, "s3://"):
-		return r.buildS3Backend(dataPrefix, ns, tbl)
-	case strings.HasPrefix(dataPrefix, "gs://"):
-		return r.buildGCSBackend(dataPrefix, ns, tbl)
-	default:
-		return nil, nil, fmt.Errorf("lakekeeper: unsupported scheme in %q (need s3://, gs://, or file://)", dataPrefix)
-	}
-}
-
-// buildS3Backend constructs a backend.StorageBackend for `s3://...`
-// data prefixes by wiring `pkg/catalogwriter.VendedCreds` into a
-// minio-go credentials provider. Returns the backend, the vendedCreds
-// (so callers can observe LastError), and any setup error.
-func (r *Resolver) buildS3Backend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
-	tok := r.Token
-	tp := func(context.Context) (string, error) { return tok, nil }
-	// VendedCreds discovers the per-warehouse REST URL prefix lazily on
-	// first fetch via `GET /v1/config?warehouse=<name>` (matching
-	// iceberg-go's REST catalog handshake). The data-path UUID embedded
-	// in `dataPrefix` is NOT necessarily the warehouse-id used in the
-	// REST URL — lakekeeper assigns separate identifiers — so deriving
-	// prefix from the path string is unsafe.
-	vc := &catalogwriter.VendedCreds{
-		LakekeeperURL:     r.URL,
-		WarehouseName:     r.Warehouse,
-		ProjectID:         r.ProjectID,
-		Namespace:         ns,
-		Table:             tbl,
-		TokenProvider:     tp,
-		ExpectedCredsType: catalogwriter.CredsTypeS3,
-	}
-
-	// Bucket name comes from the table prefix. iceberg-go writes the
-	// scheme as `s3://<bucket>/<warehouse-uuid>/...`; everything after
-	// the bucket lands in the object key, so the backend itself only
-	// needs the bucket name.
-	rest := strings.TrimPrefix(dataPrefix, "s3://")
-	parts := strings.SplitN(rest, "/", 2)
-	bucket := parts[0]
-	if bucket == "" {
-		return nil, nil, fmt.Errorf("lakekeeper: cannot derive bucket from %q", dataPrefix)
-	}
-
-	be, err := backend.NewMinIOBackendWithProvider(backend.MinIOProviderConfig{
-		Bucket:      bucket,
-		VendedCreds: vc,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("lakekeeper: build vended-creds minio backend: %w", err)
-	}
-	return be, vc, nil
-}
-
-// buildGCSBackend mirrors buildS3Backend for `gs://...` data prefixes,
-// wiring lakekeeper-vended GCS credentials into a GCS storage backend.
-// Returns the backend, the VendedCreds (for observability), and any setup error.
-func (r *Resolver) buildGCSBackend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
-	tok := r.Token
-	tp := func(context.Context) (string, error) { return tok, nil }
-	vc := &catalogwriter.VendedCreds{
-		LakekeeperURL:     r.URL,
-		WarehouseName:     r.Warehouse,
-		ProjectID:         r.ProjectID,
-		Namespace:         ns,
-		Table:             tbl,
-		TokenProvider:     tp,
-		ExpectedCredsType: catalogwriter.CredsTypeGCS,
-	}
-
-	// Bucket name comes from the table prefix. lakekeeper writes the
-	// scheme as `gs://<bucket>/<warehouse-uuid>/...`; only the bucket
-	// name is needed by the backend.
-	rest := strings.TrimPrefix(dataPrefix, "gs://")
-	parts := strings.SplitN(rest, "/", 2)
-	bucket := parts[0]
-	if bucket == "" {
-		return nil, nil, fmt.Errorf("lakekeeper: cannot derive bucket from %q", dataPrefix)
-	}
-
-	be, err := backend.NewGCSBackendWithProvider(backend.GCSProviderConfig{
-		Bucket:      bucket,
-		VendedCreds: vc,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("lakekeeper: build vended-creds gcs backend: %w", err)
-	}
-	return be, vc, nil
-}
-
 // ensureNamespace mirrors icebergjob.ensureNamespace. Idempotent:
 // ErrNamespaceAlreadyExists is squashed.
-func (r *Resolver) ensureNamespace(ctx context.Context, cat catalogClient, ns string) error {
+func ensureNamespace(ctx context.Context, cat catalogClient, ns string) error {
 	id := catalog.ToIdentifier(ns)
 	exists, err := cat.CheckNamespaceExists(ctx, id)
 	if err == nil && exists {

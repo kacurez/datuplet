@@ -21,7 +21,7 @@ func TestCommitPool_DispatchAndBarrier(t *testing.T) {
 	pool := NewCommitPool(CommitPoolConfig{
 		Workers: 4, MaxQueueSize: 16, CatalogFn: okCatalogFn,
 		CommitFn: func(_ context.Context, _ catalog.Catalog, _ icebergtable.Identifier,
-			paths []string, mode icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			paths []string, _ *icebergjob.PartitionedFiles, mode icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
 			n.Add(1)
 			return &icebergjob.CommitResult{DataFilesAdded: len(paths), WriteMode: mode}, nil
 		},
@@ -46,7 +46,7 @@ func TestCommitPool_QueueOverflow(t *testing.T) {
 	pool := NewCommitPool(CommitPoolConfig{
 		Workers: 1, MaxQueueSize: 2, CatalogFn: okCatalogFn,
 		CommitFn: func(context.Context, catalog.Catalog, icebergtable.Identifier,
-			[]string, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
+			[]string, *icebergjob.PartitionedFiles, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
 			<-block
 			return &icebergjob.CommitResult{}, nil
 		},
@@ -73,7 +73,7 @@ func TestCommitPool_PartialFailureAggregated(t *testing.T) {
 	pool := NewCommitPool(CommitPoolConfig{
 		Workers: 2, MaxQueueSize: 8, CatalogFn: okCatalogFn,
 		CommitFn: func(_ context.Context, _ catalog.Catalog, ident icebergtable.Identifier,
-			_ []string, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			_ []string, _ *icebergjob.PartitionedFiles, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
 			if ident[1] == "fail" {
 				return nil, errors.New("synthetic")
 			}
@@ -101,7 +101,7 @@ func TestCommitPool_CancelUnblocksInFlight(t *testing.T) {
 	pool := NewCommitPool(CommitPoolConfig{
 		Workers: 2, MaxQueueSize: 4, CatalogFn: okCatalogFn,
 		CommitFn: func(ctx context.Context, _ catalog.Catalog, _ icebergtable.Identifier,
-			_ []string, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			_ []string, _ *icebergjob.PartitionedFiles, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
 			started <- struct{}{}
 			<-ctx.Done()
 			return nil, ctx.Err()
@@ -126,7 +126,7 @@ func TestCommitPool_CancelUnblocksInFlight(t *testing.T) {
 func TestCommitPool_WaitRespectsDeadline(t *testing.T) {
 	never := make(chan struct{})
 	pool := NewCommitPool(CommitPoolConfig{Workers: 1, MaxQueueSize: 4, CatalogFn: okCatalogFn,
-		CommitFn: func(context.Context, catalog.Catalog, icebergtable.Identifier, []string, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
+		CommitFn: func(context.Context, catalog.Catalog, icebergtable.Identifier, []string, *icebergjob.PartitionedFiles, icebergjob.WriteMode, string) (*icebergjob.CommitResult, error) {
 			<-never // block forever, ignore cancellation
 			return &icebergjob.CommitResult{}, nil
 		}})
@@ -143,7 +143,7 @@ func TestCommitPool_WaitRespectsDeadline(t *testing.T) {
 
 func TestCommitPool_ReuseAcrossSessions(t *testing.T) {
 	pool := NewCommitPool(CommitPoolConfig{Workers: 2, MaxQueueSize: 8, CatalogFn: okCatalogFn,
-		CommitFn: func(_ context.Context, _ catalog.Catalog, _ icebergtable.Identifier, paths []string, mode icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+		CommitFn: func(_ context.Context, _ catalog.Catalog, _ icebergtable.Identifier, paths []string, _ *icebergjob.PartitionedFiles, mode icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
 			return &icebergjob.CommitResult{DataFilesAdded: len(paths), WriteMode: mode}, nil
 		}})
 	defer pool.Cancel()

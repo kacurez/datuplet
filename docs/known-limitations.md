@@ -162,6 +162,88 @@ time is follow-up work.
 
 ---
 
+## Data Gateway data plane (pure Go, iceberg-go v0.7.0)
+
+**GCS is unverified on the Go data plane.** Writes and reads go through
+`pkg/datupleticeio`'s `gs://` factory with vended OAuth tokens. There is no GCS
+environment in CI; prove it on GKE before relying on it.
+
+**Partitioned tables: no spec evolution.** A table the gateway creates gets an
+Iceberg partition spec from the output's `partition_fields`; an existing table
+is always written with its own current spec. Changing `partition_fields` on an
+existing table only logs a warning naming both specs (FULL_LOAD replaces files,
+not the table); drop the table to change its partitioning.
+
+**Partitioned writes to format-version 3 tables are rejected.** iceberg-go
+v0.7.0 requires `first_row_id` on every v3 data file it adds, which the gateway
+cannot assign, so such a table fails the writer with InvalidArgument.
+Unpartitioned v3 tables are written as before.
+
+**Open partition files cost memory.** A partitioned table writer keeps up to
+`DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` files open (default 16, 1-1024). Without
+a limit each open file buffers a full row group (measured ~82 MiB per file:
+`bucket[8]` peaked at 1 174 MiB against 517 MiB unpartitioned). The open files
+of one writer therefore share a row-group budget,
+`DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES` (default 256 MiB, 16 MiB-8 GiB):
+a file ends its row group early once it holds its share of the budget, and the
+largest one does while the sum is over it, so row groups get smaller as more
+files are open. The budget counts encoded pages only (not encoder state,
+dictionaries or upload buffers, at least 5 MiB per open S3 upload), so it is a
+flush trigger, not a hard memory bound. Unpartitioned writers are unaffected.
+
+**High partition cardinality makes many small files.** When a batch spreads
+over more distinct tuples than the open-file cap, the writer finishes the least
+recently written file early (one warning per writer). Every tuple then becomes
+its own small file and the commit reads one footer per file: `bucket[200]` over
+the same data wrote 48 324 files of ~41 rows in 532 s, 43 s of it commit. A
+writer that ends with more than 4 files per distinct tuple logs a summary
+warning. Cluster (sort) the input by the partition column(s) or use a coarser
+transform; raising the cap only helps while the pod has memory for it.
+
+**Partition paths are limited to 1 024-byte object keys.** An identity value
+is URL-escaped into the file path. A key over S3's 1 024-byte limit fails the
+write with an error naming the partition field; it is never truncated.
+
+**External data files are unsupported.** `external_files` fails the writer with
+`external data files are not supported`.
+
+**No `files.json` breadcrumb.** The per-table `files.json`, `_schema-*.json` and
+`_manifest-*.json` objects are no longer written; commits are inline and carry
+the audit properties in the snapshot summary. Tooling that listed them must read
+the snapshot instead.
+
+**`FULL_LOAD` with zero rows does not truncate.** A writer that closes with no
+rows writes no file and commits nothing (SKIPPED), so the table keeps its data.
+
+**Raw passthrough falls back to decode for non-canonical types.** A data file is
+served as-is only when its Parquet-derived Arrow schema equals the table's
+current schema. Files with int8/int16/uint\*, ms/ns timestamps, or any schema
+change since they were written are decoded and re-encoded: correct, but slower.
+
+**Writer failure after rotation leaves orphans (R3b).** If a writer fails after
+rotating, the files from its earlier rotations stay in storage as uncommitted
+objects (as before). They are not referenced by any snapshot.
+
+**Some types do not round-trip through iceberg-go v0.7.0 (R3c).** `AddFiles`
+rejects nanosecond timestamps, and uint64 values above `MaxInt64` cannot be
+read. The read failure surfaces when that chunk is served, not at `OpenReader`.
+
+**A merge-on-read delete makes every file of the table decode (M5c).**
+iceberg-go v0.7.0 matches an unpartitioned position-delete file to data files by
+its `file_path` bounds. Under the default `truncate(16)` metrics those bounds
+cover every file, so one delete file sends every data file of the table through
+the decoded path instead of raw. Results stay correct; reads are slower. The
+workaround is the table property `write.metadata.metrics.default=full`.
+
+**Cancel-path abort is unbounded for non-S3 sinks (M4b).** On the
+cancel-annotation path, aborting an open upload has no overall time bound for
+non-S3 sinks. S3 aborts are bounded at 30 s each.
+
+**Empty `FORMAT_ARROW_IPC` reads return one zero-row batch.** The chunk is the
+single last chunk, with the SDK wire schema.
+
+---
+
 ## JWT handling
 
 **pipeline-api key rotation drops in-flight run tokens.** Run tokens carry a 24 h

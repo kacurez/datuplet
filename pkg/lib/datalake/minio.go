@@ -52,7 +52,7 @@ func NewMinIODataLake(cfg Config) (*MinIODataLake, error) {
 	// so callers can pass either shape: strip http:// or https:// and
 	// flip UseSSL accordingly. Any explicit cfg.UseSSL=true wins
 	// (defensive for the bare-host case where the caller knows TLS is
-	// in use). Mirrors splitEndpoint in pkg/datagateway/backend/minio.go.
+	// in use).
 	endpoint, useSSL := normalizeMinIOEndpoint(cfg.Endpoint, cfg.UseSSL)
 
 	client, err := minio.New(endpoint, &minio.Options{

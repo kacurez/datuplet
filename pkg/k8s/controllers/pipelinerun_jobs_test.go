@@ -331,6 +331,9 @@ func TestGenerateGatewayConfig_OutputTableColumns(t *testing.T) {
 					Name: "with_partition", Bucket: "curated", WriteMode: "APPEND",
 					PartitionFields: []datupletv1.PartitionFieldSpec{
 						{SourceColumn: "created", Transform: "day"},
+						{SourceColumn: "id", Transform: "bucket[16]"},
+						{SourceColumn: "id", Transform: "truncate[4]"},
+						{SourceColumn: "note", Transform: "void"},
 					},
 				},
 			},
@@ -393,11 +396,17 @@ func TestGenerateGatewayConfig_OutputTableColumns(t *testing.T) {
 		t.Fatalf("output_tables missing entry %q\ndoc:\n%s", "with_partition", y)
 	}
 	pfs, ok := withPart["partition_fields"].([]any)
-	if !ok || len(pfs) != 1 {
+	if !ok || len(pfs) != 4 {
 		t.Fatalf("with_partition.partition_fields missing or wrong length; got %T (%v)\ndoc:\n%s", withPart["partition_fields"], withPart["partition_fields"], y)
 	}
 	if pf, _ := pfs[0].(map[string]any); pf["source_column"] != "created" || pf["transform"] != "day" {
 		t.Errorf("partition_fields[0] = %v, want {source_column: created, transform: day}\ndoc:\n%s", pf, y)
+	}
+	// bucket/truncate/void reach the gateway verbatim, in order.
+	for i, want := range [][2]string{{"id", "bucket[16]"}, {"id", "truncate[4]"}, {"note", "void"}} {
+		if pf, _ := pfs[i+1].(map[string]any); pf["source_column"] != want[0] || pf["transform"] != want[1] {
+			t.Errorf("partition_fields[%d] = %v, want {source_column: %s, transform: %s}", i+1, pf, want[0], want[1])
+		}
 	}
 }
 

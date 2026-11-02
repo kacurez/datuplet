@@ -8,7 +8,7 @@
 # (which is DuckDB-specific and does not apply here).
 #
 # syntax=docker/dockerfile:1.4
-FROM golang:1.25-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 

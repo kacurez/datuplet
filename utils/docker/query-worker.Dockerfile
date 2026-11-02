@@ -20,7 +20,7 @@
 #   hitting the network.
 #
 # syntax=docker/dockerfile:1.4
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 
 WORKDIR /build
 

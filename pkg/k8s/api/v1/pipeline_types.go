@@ -265,8 +265,9 @@ type PartitionFieldSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	SourceColumn string `json:"sourceColumn"`
 
-	// Transform is the partition transform to apply.
-	// +kubebuilder:validation:Enum=identity;day;month;year;hour
+	// Transform is the partition transform to apply: identity, year, month,
+	// day, hour, void, bucket[N] or truncate[W] (N, W integers 1-2147483647).
+	// +kubebuilder:validation:Pattern=`^(identity|year|month|day|hour|void|bucket\[([1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])\]|truncate\[([1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])\])$`
 	Transform string `json:"transform"`
 }
 

@@ -87,7 +87,10 @@ uses it directly to obtain the initial GSA token — the GKE metadata server ste
 is skipped. The CAB downscope step is identical in both modes.
 
 The Data Gateway renews credentials at 50 % of their issued TTL (minimum 60 s
-interval). On cancellation, FGA tuple deletion prevents renewal; the credential
+interval). Each uploaded file and each raw open or decoded read task starts with
+credentials that have at least `max(2 min, 25 % of the TTL)` left; otherwise
+they are re-fetched once, and the operation fails if they are still too short.
+On cancellation, FGA tuple deletion prevents renewal; the credential
 expires within the STS / CAB TTL (≤15 min for STS, ≤1 h for GCS CAB tokens).
 
 ---
@@ -146,10 +149,20 @@ Responsibilities at boot:
 
 Responsibilities per write:
 - Calls Lakekeeper `LoadOrCreate` to get (or create) the table and STS credentials.
-- Buffers incoming data (up to 128 MB per file), converts to Parquet, writes via
-  STS-vended S3 credentials.
-- Writes a `files.json` audit breadcrumb at
-  `<table-base>/.run-state/<run-id>/files.json` listing the written parquet paths.
+  A new table is created with an Iceberg partition spec built from the
+  output's `partition_fields`; an existing table keeps its own spec.
+- Encodes incoming Arrow records to Parquet (ZSTD) with arrow-go `pqarrow` and
+  streams each file to the table's data prefix as a multipart upload through
+  iceberg-go IO, using STS-vended credentials (`pkg/datagateway/goplane`). A
+  file rotates at about 512 MiB of uncompressed Arrow input (4 x the 128 MiB
+  target file size). Nothing is staged on local disk.
+- For a partitioned table the writer splits each batch by partition tuple and
+  keeps one open file per tuple under `<data>/<field>=<value>/...`, at most
+  `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` (default 16) at once, sharing a
+  `DATUPLET_GATEWAY_PARTITION_BUFFER_BYTES` (default 256 MiB) row-group budget;
+  every file holds exactly one tuple.
+- Writes no `files.json` or other marker object; the commit carries the audit
+  properties.
 
 Responsibilities per commit (RFC 021 — inline, no separate Job):
 - On `CloseWriter`, dispatches the writer's parquet paths to an in-process
@@ -157,14 +170,24 @@ Responsibilities per commit (RFC 021 — inline, no separate Job):
 - Each commit opens an Iceberg transaction at Lakekeeper via the
   `pkg/icebergjob` library: `txn.AddFiles` (APPEND) or `txn.ReplaceDataFiles`
   (FULL_LOAD), retried on 409 conflict with exponential backoff, with an
-  idempotency key stamped into the snapshot summary.
+  idempotency key stamped into the snapshot summary. A partitioned table's
+  files are committed with their explicit tuples through `txn.AddDataFiles` /
+  `txn.ReplaceDataFilesWithDataFiles`, after checking that the table's spec
+  did not change since the write. FULL_LOAD replaces data files only.
 - The session `Commit` RPC is the barrier: it drains the pool and reconciles
   per-writer results.
 
 Responsibilities per read:
-- Fetches the current Iceberg snapshot from Lakekeeper.
-- Streams parquet row-groups to the component in the requested format (Parquet,
-  Arrow IPC, CSV, JSON).
+- Loads the table through Lakekeeper and plans the current snapshot with
+  iceberg-go (`Scan.PlanFiles`).
+- Serves each data file either **raw** or **decoded**. A file is raw (its bytes
+  are the `FORMAT_PARQUET` chunk, streamed straight from storage over HTTP)
+  only when Iceberg semantics would not change it: whole file, no delete files
+  or deletion vectors, Parquet, the same Arrow schema as the table's current
+  schema, and the same field ids. Everything else (deletes, added, dropped or
+  renamed columns, widened types, split ranges, non-Parquet) is decoded by
+  iceberg-go (`Scan.ReadTasks`) and re-encoded per chunk. Non-Parquet request
+  formats (Arrow IPC, CSV, JSON) always decode.
 
 ### Lakekeeper
 
@@ -213,12 +236,12 @@ A complete pipeline run from trigger to committed Iceberg table:
    gRPC.
 
 4. **Write.** Component calls `OpenWriter` → DG calls Lakekeeper `LoadOrCreate`
-   table, receives STS credentials, writes parquet to S3/GCS. DG accumulates
-   chunks into 128 MB parquet files.
+   table, receives STS credentials, and streams each chunk through the Go
+   writer (pqarrow, ZSTD) into a multipart upload of the current parquet file;
+   the file rotates at the size cap.
 
-5. **Finalize.** Component closes each writer → DG writes a `files.json` audit
-   breadcrumb per table inside the table's Iceberg-managed prefix and dispatches
-   the writer's parquet paths to its inline commit pool.
+5. **Finalize.** Component closes each writer → DG completes the last upload and
+   dispatches the writer's parquet paths to its inline commit pool.
 
 6. **Commit.** The pool opens an iceberg-go transaction against Lakekeeper,
    `AddFiles` / `ReplaceDataFiles`, commits (retrying on 409 conflict). The

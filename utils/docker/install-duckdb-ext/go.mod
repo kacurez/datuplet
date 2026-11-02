@@ -1,6 +1,6 @@
 module ext-installer
 
-go 1.25.7
+go 1.27.3
 
 require github.com/duckdb/duckdb-go/v2 v2.20000.0
 

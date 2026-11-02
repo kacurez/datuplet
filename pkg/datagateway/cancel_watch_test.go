@@ -165,11 +165,10 @@ func TestCancelAnnotation_CancelsCommitPool(t *testing.T) {
 		RunID:              "cancel-pool-test-run",
 		ComponentName:      "test",
 		DefaultBucket:      "raw",
-		Backend:            newMockBackend(),
 		PodAnnotationsPath: annotationsPath,
 		CancelPollInterval: 50 * time.Millisecond,
 	}
-	server := NewServerV2(cfg)
+	server := mustNewServerV2(t, cfg)
 
 	// blockCh lets the test control when the CommitFn unblocks.
 	// The CommitFn blocks until its context is cancelled.
@@ -180,7 +179,7 @@ func TestCancelAnnotation_CancelsCommitPool(t *testing.T) {
 		MaxQueueSize: 16,
 		CatalogFn:    func(context.Context) (catalog.Catalog, error) { return nil, nil },
 		CommitFn: func(ctx context.Context, _ catalog.Catalog, _ icebergtable.Identifier,
-			_ []string, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
+			_ []string, _ *icebergjob.PartitionedFiles, _ icebergjob.WriteMode, _ string) (*icebergjob.CommitResult, error) {
 			// Signal that the commit goroutine is running, then block until
 			// the pool's context is cancelled.
 			commitStarted <- struct{}{}

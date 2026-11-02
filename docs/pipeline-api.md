@@ -126,6 +126,21 @@ the offending column) when a value does not fit its declared type — a
 class of problem no doc-time check could ever catch, since it depends on
 the data the run actually sees.
 
+### Output partitioning (`outputs.tables[].partitionSpec`)
+
+An explicit output table can declare an Iceberg partition spec: a list of
+`{source_column, transform}` entries. `transform` is one of `identity`,
+`year`, `month`, `day`, `hour`, `void`, `bucket[N]` or `truncate[W]` (N and W
+integers 1-2147483647, written exactly so). One column may appear in several
+entries (e.g. `bucket[16]` and `truncate[4]`), but not twice with the same
+transform, and with at most one of `year`/`month`/`day`/`hour`. These rules are
+checked at `PUT`/`validate` time; the CRD carries the same transform pattern.
+The Data Gateway creates a new table with this spec and writes one file per
+partition tuple. Whether the column exists and the transform suits its type is
+checked when the table is created (an InvalidArgument from the writer). An
+existing table keeps its own spec; see
+[known-limitations.md](known-limitations.md).
+
 ### API contract
 
 | Endpoint | Behavior |
