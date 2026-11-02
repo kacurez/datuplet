@@ -246,9 +246,13 @@ kubectl logs -n datuplet <component-pod-name> -c gateway
   A high `decoded_files` means the slower decoded path ran. A file is served raw
   only when it has no deletes and matches the table's current schema (see
   [architecture.md](architecture.md)), so a table with delete files,
-  renamed/added/dropped columns or non-canonical types decodes. `bytes` is what
-  the gateway produced for the client; `outcome=cancelled` means the reader was
-  closed before the last chunk was served. Expected, not a failure — see
+  renamed/added/dropped columns or non-canonical types decodes. `rows` and
+  `bytes` are what the gateway produced, not what the client confirmed.
+  `decoded_files` counts decoded scan tasks that were actually started, so it
+  can exceed the number of distinct files when a large file is split into
+  several tasks that are not coalesced. `outcome=error` includes a failed write
+  or send to the client; `outcome=cancelled` means the reader was closed (or
+  the run cancelled) before the last chunk was delivered. Expected, not a failure — see
   [known-limitations.md](known-limitations.md) for the delete-metrics
   workaround. Non-Parquet request formats always decode.
 

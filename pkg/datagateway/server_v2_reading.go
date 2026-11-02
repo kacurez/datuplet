@@ -60,9 +60,6 @@ type readerState struct {
 	nextRaw    *RawFile
 	pendingErr error
 	partsEOF   bool
-	// pendingFiles is the decoded file count of the part pending belongs to,
-	// credited to stats when its first chunk is produced.
-	pendingFiles int
 	// err is the reader's first failure (a Next while filling a chunk, a raw
 	// open or stream, an encode, or pendingErr once returned); every later
 	// chunk returns it, so a retried read never skips the failed chunk's rows.
@@ -283,7 +280,7 @@ func (rs *readerState) rawChunk() (*readChunk, error) {
 	rs.lookahead()
 	last := rs.exhausted()
 	rs.done = last
-	rs.stats.addRawFile()
+	rs.stats.rawFiles++
 	rs.stats.addChunk(rf.Size, rf.Rows)
 	return &readChunk{raw: body, rawSize: rf.Size, rows: rf.Rows, last: last}, nil
 }
@@ -305,10 +302,6 @@ func (rs *readerState) recordsChunk(limit int64, mem memory.Allocator) (*readChu
 	}
 	add(rs.pending)
 	rs.pending = nil
-	if rs.pendingFiles > 0 {
-		rs.stats.addDecodedFiles(rs.pendingFiles)
-		rs.pendingFiles = 0
-	}
 	for size < limit && rs.cur != nil {
 		b, err := rs.cur.Next(rs.ctx)
 		switch {
@@ -367,7 +360,9 @@ func (rs *readerState) lookahead() {
 			return
 		case part.Records != nil:
 			rs.cur = part.Records
-			rs.pendingFiles = max(part.Files, 1)
+			if part.Started != nil {
+				rs.stats.decodedStarts = append(rs.stats.decodedStarts, part.Started)
+			}
 		default:
 			rs.pendingErr = errors.New("data plane returned an empty read part")
 			return
@@ -396,7 +391,7 @@ func (rs *readerState) closeCur() {
 // the caller holds rs.mu.
 func (rs *readerState) fail(err error) error {
 	rs.err = err
-	rs.stats.finish("error")
+	rs.stats.finishLocked(rs.failOutcome())
 	if rs.pending != nil {
 		rs.pending.Release()
 		rs.pending = nil
@@ -404,6 +399,22 @@ func (rs *readerState) fail(err error) error {
 	rs.nextRaw = nil
 	rs.closeCur()
 	return err
+}
+
+// failOutcome is the summary outcome for a sticky failure: a failure caused by
+// the reader's own cancellation is "cancelled"; the caller holds rs.mu.
+func (rs *readerState) failOutcome() string {
+	if rs.ctx.Err() != nil {
+		return "cancelled"
+	}
+	return "error"
+}
+
+// finishOK ends the summary after the last chunk was delivered whole.
+func (rs *readerState) finishOK() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.stats.finishLocked("ok")
 }
 
 // failServed records a failure met while delivering an already produced
@@ -437,10 +448,10 @@ func (rs *readerState) readRawFull(c *readChunk) ([]byte, error) {
 // reader, which closes its open part streams and raw bodies. Idempotent.
 func (rs *readerState) close() {
 	rs.closeOnce.Do(func() {
-		rs.stats.finish("cancelled")
 		rs.cancel()
 		rs.mu.Lock()
 		rs.closed = true
+		rs.stats.finishLocked("cancelled")
 		if rs.pending != nil {
 			rs.pending.Release()
 			rs.pending = nil
@@ -498,10 +509,12 @@ func (s *ServerV2) sendNextChunk(rs *readerState, stream pb.DataGateway_ReadChun
 		RowsInChunk: chunk.rows,
 		IsLast:      chunk.last,
 	}); err != nil {
+		err = fmt.Errorf("send chunk: %w", err)
+		rs.failServed(err)
 		return true, err
 	}
 	if chunk.last {
-		rs.stats.finish("ok")
+		rs.finishOK()
 	}
 	return chunk.last, nil
 }

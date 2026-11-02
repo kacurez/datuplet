@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -123,4 +125,106 @@ func TestReadSummaryCancelledAndNoSecrets(t *testing.T) {
 	if strings.Contains(lines()[0], secret) || strings.Contains(lines()[0], "fake://") {
 		t.Errorf("summary leaks body or path: %q", lines()[0])
 	}
+}
+
+type failingWriter struct{ *httptest.ResponseRecorder }
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("client went away") }
+
+type failingSendStream struct{ mockReadChunkStream }
+
+func (*failingSendStream) Send(*pb.DataChunk) error { return errors.New("transport closed") }
+
+// A decoded HTTP chunk whose write fails finalizes the summary as error and
+// fails the reader for good (as a failed raw stream does), so a retry never
+// silently skips the undelivered chunk.
+func TestReadSummaryHTTPWriteFailure(t *testing.T) {
+	lines := captureLog(t)
+	s, p := newWriteTestServer(t, &Config{})
+	sch, a := idNameBatch(t, memory.NewGoAllocator(), 1, 2)
+	defer a.Release()
+	p.setTableParts("raw", "w", sch, batchFakePart(a))
+
+	resp := openTestReader(t, s, "w", pb.DataFormat_FORMAT_PARQUET)
+	s.handleRead(failingWriter{httptest.NewRecorder()}, httptest.NewRequest(http.MethodGet, "/data/read/"+resp.ReaderId, nil))
+	if c := httpReadChunk(t, s, resp.ReaderId); c.status != http.StatusInternalServerError {
+		t.Errorf("retry after a failed write: HTTP %d, want 500 (reader failed for good)", c.status)
+	}
+	s.CloseReader(context.Background(), &pb.CloseReaderRequest{ReaderId: resp.ReaderId})
+	wantSummary(t, lines(), "table=raw.w", "decoded_files=1", "chunks=1", "outcome=error")
+}
+
+func TestReadSummaryGRPCSendFailure(t *testing.T) {
+	lines := captureLog(t)
+	s, p := newWriteTestServer(t, &Config{})
+	sch, a := idNameBatch(t, memory.NewGoAllocator(), 1, 2)
+	defer a.Release()
+	p.setTableParts("raw", "g", sch, batchFakePart(a))
+
+	resp := openTestReader(t, s, "g", pb.DataFormat_FORMAT_PARQUET)
+	stream := &failingSendStream{mockReadChunkStream{ctx: context.Background()}}
+	if err := s.ReadChunk(&pb.ReadChunkRequest{ReaderId: resp.ReaderId}, stream); err == nil {
+		t.Fatal("ReadChunk succeeded, want the send error")
+	}
+	s.CloseReader(context.Background(), &pb.CloseReaderRequest{ReaderId: resp.ReaderId})
+	wantSummary(t, lines(), "table=raw.g", "outcome=error")
+}
+
+// close() racing chunk production: the raw open is held inside nextChunk, the
+// close starts meanwhile and must wait for the production to finish, so the
+// summary's counters agree with each other.
+func TestReadSummaryCloseDuringProduction(t *testing.T) {
+	lines := captureLog(t)
+	s, p := newWriteTestServer(t, &Config{})
+	sch, a := idNameBatch(t, memory.NewGoAllocator(), 1, 2)
+	defer a.Release()
+	entered, release := make(chan struct{}), make(chan struct{})
+	body := []byte("0123456789")
+	p.setTableParts("raw", "race", sch, rawFakePartFunc(int64(len(body)), 7, func() io.ReadCloser {
+		close(entered)
+		<-release
+		return io.NopCloser(bytes.NewReader(body))
+	}))
+	resp := openTestReader(t, s, "race", pb.DataFormat_FORMAT_PARQUET)
+	rs, _ := s.lookupReader(resp.ReaderId)
+
+	produced := make(chan struct{})
+	go func() {
+		defer close(produced)
+		if c, err := rs.nextChunk(1<<20, memory.NewGoAllocator()); err == nil && c != nil {
+			c.raw.Close()
+		}
+	}()
+	<-entered
+	closed := make(chan struct{})
+	go func() { defer close(closed); rs.close() }()
+	close(release)
+	<-produced
+	<-closed
+	wantSummary(t, lines(), "raw_files=1", "chunks=1", "rows=7", "bytes=10", "outcome=cancelled")
+}
+
+func TestReadSummaryDecodedCounts(t *testing.T) {
+	// An empty decoded part of 2 tasks still counts both tasks.
+	lines := captureLog(t)
+	s, p := newWriteTestServer(t, &Config{})
+	sch, a := idNameBatch(t, memory.NewGoAllocator(), 1, 2)
+	defer a.Release()
+	empty := batchFakePart()
+	empty.files = 2
+	p.setTableParts("raw", "empty", sch, empty)
+	resp := openTestReader(t, s, "empty", pb.DataFormat_FORMAT_PARQUET)
+	drainHTTP(t, s, resp.ReaderId)
+	wantSummary(t, lines(), "table=raw.empty", "decoded_files=2", "rows=0", "outcome=ok")
+
+	// Interruption partway through a 3-task part: only started tasks count.
+	lines = captureLog(t)
+	s, p = newWriteTestServer(t, &Config{ChunkSize: 1})
+	part := batchFakePart(a, a, a)
+	part.files = 3
+	p.setTableParts("raw", "partial", sch, part)
+	resp = openTestReader(t, s, "partial", pb.DataFormat_FORMAT_PARQUET)
+	httpReadChunk(t, s, resp.ReaderId) // chunk 1; the lookahead has started task 2
+	s.CloseReader(context.Background(), &pb.CloseReaderRequest{ReaderId: resp.ReaderId})
+	wantSummary(t, lines(), "table=raw.partial", "decoded_files=2", "chunks=1", "outcome=cancelled")
 }

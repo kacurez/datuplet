@@ -1048,3 +1048,39 @@ func TestRawBodyReadsRaceShutdown(t *testing.T) {
 		})
 	}
 }
+
+// ReadPart.Started counts tasks as the stream starts them, not as planned.
+func TestDecodedPartStartedCountsTasksLazily(t *testing.T) {
+	f := newTable(t, readSchema, morProps("2"))
+	f.addFiles(f.writeFile(0, 10, 0), f.writeFile(10, 10, 0))
+	r := f.open(false)
+	part, err := r.NextPart(context.Background())
+	if err != nil || part.Records == nil || part.Started == nil {
+		t.Fatalf("NextPart = %+v, %v", part, err)
+	}
+	defer part.Records.Close()
+	if got := part.Started(); got != 0 {
+		t.Errorf("Started before Next = %d, want 0", got)
+	}
+	rec, err := part.Records.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Release()
+	if got := part.Started(); got != 1 {
+		t.Errorf("Started after the first file's batch = %d, want 1 of 2 planned", got)
+	}
+	for {
+		rec, err := part.Records.Next(context.Background())
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.Release()
+	}
+	if got := part.Started(); got != 2 {
+		t.Errorf("Started at EOF = %d, want 2", got)
+	}
+}

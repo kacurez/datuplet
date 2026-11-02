@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -75,7 +76,7 @@ type fakePart struct {
 	batches []arrow.RecordBatch
 	size    int64                // rawFakePartFunc only
 	open    func() io.ReadCloser // rawFakePartFunc only
-	files   int                  // decoded part only: ReadPart.Files (0 = unset)
+	files   int                  // decoded part only: tasks the fake reports as started once Next ran (0 = 1)
 }
 
 func rawFakePart(b []byte, rows int64) fakePart { return fakePart{raw: b, rows: rows} }
@@ -493,9 +494,9 @@ func (r *fakeTableReader) NextPart(ctx context.Context) (ReadPart, error) {
 			Open: func(ctx context.Context) (io.ReadCloser, error) { return r.openRaw(ctx, fp) },
 		}}, nil
 	}
-	st := &fakeRecordStream{reader: r, schema: r.table.schema, batches: fp.batches}
+	st := &fakeRecordStream{reader: r, schema: r.table.schema, batches: fp.batches, files: fp.files}
 	r.streams = append(r.streams, st)
-	return ReadPart{Records: st, Files: fp.files}, nil
+	return ReadPart{Records: st, Started: st.tasksStarted}, nil
 }
 
 // openRaw hands out the raw bytes; it fails once the reader is closed or
@@ -584,11 +585,17 @@ type fakeRecordStream struct {
 	reader  *fakeTableReader
 	schema  *arrow.Schema
 	batches []arrow.RecordBatch
+	files   int // tasks the part stands for (0 = 1); one batch per task
 
-	mu     sync.Mutex
-	next   int
-	closed bool
+	mu      sync.Mutex
+	next    int
+	closed  bool
+	started atomic.Int64 // tasks started, as a plane would report
 }
+
+// tasksStarted: a task starts when its batch is produced; reaching the end
+// (even with no batches) starts all of the part's tasks.
+func (s *fakeRecordStream) tasksStarted() int { return int(s.started.Load()) }
 
 func (s *fakeRecordStream) isClosed() bool {
 	s.mu.Lock()
@@ -623,10 +630,12 @@ func (s *fakeRecordStream) Next(ctx context.Context) (arrow.RecordBatch, error) 
 		return nil, nextErr
 	}
 	if s.next >= len(s.batches) {
+		s.started.Store(int64(max(s.files, 1)))
 		return nil, io.EOF
 	}
 	b := s.batches[s.next]
 	s.next++
+	s.started.Store(int64(min(max(s.files, 1), s.next)))
 	r.served++
 	b.Retain() // caller Releases
 	return b, nil

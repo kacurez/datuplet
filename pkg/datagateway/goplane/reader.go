@@ -7,6 +7,7 @@ import (
 	"io"
 	"iter"
 	"sync"
+	"sync/atomic"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -169,9 +170,8 @@ func (r *reader) NextPart(ctx context.Context) (datagateway.ReadPart, error) {
 		if err != nil {
 			return datagateway.ReadPart{}, err
 		}
-		files := len(r.tasks) - r.next
 		r.next = len(r.tasks)
-		return datagateway.ReadPart{Records: s, Files: files}, nil
+		return datagateway.ReadPart{Records: s, Started: s.tasksStarted}, nil
 	}
 	cctx, stop := callContext(ctx, r.ctx)
 	defer stop()
@@ -203,9 +203,8 @@ func (r *reader) NextPart(ctx context.Context) (datagateway.ReadPart, error) {
 	if err != nil {
 		return datagateway.ReadPart{}, err
 	}
-	files := end - r.next
 	r.next = end
-	return datagateway.ReadPart{Records: s, Files: files}, nil
+	return datagateway.ReadPart{Records: s, Started: s.tasksStarted}, nil
 }
 
 func (r *reader) rawAt(ctx context.Context, i int) (bool, error) {
@@ -381,14 +380,18 @@ type taskStream struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu   sync.Mutex
-	i    int // next task to start
-	pull func() (arrow.RecordBatch, error, bool)
-	stop func()
-	err  error // sticky: io.EOF, a failure, or errStreamClosed
+	mu      sync.Mutex
+	i       int          // next task to start
+	started atomic.Int64 // tasks started (mirrors i; readable without mu)
+	pull    func() (arrow.RecordBatch, error, bool)
+	stop    func()
+	err     error // sticky: io.EOF, a failure, or errStreamClosed
 }
 
 func (s *taskStream) Schema() *arrow.Schema { return s.r.schema }
+
+// tasksStarted reports how many tasks have begun decoding.
+func (s *taskStream) tasksStarted() int { return int(s.started.Load()) }
 
 // Next returns the next decoded batch. ctx bounds this call; cancelling it
 // mid-call fails the stream.
@@ -413,6 +416,7 @@ func (s *taskStream) Next(ctx context.Context) (arrow.RecordBatch, error) {
 			}
 			task := s.tasks[s.i]
 			s.i++
+			s.started.Add(1)
 			_, seq, err := s.r.scan.ReadTasks(s.ctx, []table.FileScanTask{task})
 			if err != nil {
 				return nil, s.fail(fmt.Errorf("goplane: read %s: %w", task.File.FilePath(), err), ctx)

@@ -296,9 +296,18 @@ func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Datuplet-Is-Last", strconv.FormatBool(chunk.last))
 	w.WriteHeader(http.StatusOK)
 	if chunk.raw == nil {
-		w.Write(chunk.data)
+		n, err := w.Write(chunk.data)
+		if err == nil && n != len(chunk.data) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			err = fmt.Errorf("write chunk: %w", err)
+			log.Printf("Warning: reader %s: %v", readerID, err)
+			rs.failServed(err)
+			return
+		}
 		if chunk.last {
-			rs.stats.finish("ok")
+			rs.finishOK()
 		}
 		return
 	}
@@ -317,7 +326,7 @@ func (s *ServerV2) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if chunk.last {
-		rs.stats.finish("ok")
+		rs.finishOK()
 	}
 }
 

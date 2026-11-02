@@ -85,7 +85,9 @@ type RecordStream interface {
 type ReadPart struct {
 	Raw     *RawFile
 	Records RecordStream // decoded batches with TableReader.Schema(); the caller closes it
-	Files   int          // Records only: data files (tasks) decoded into this part; 0 counts as 1 (summary log)
+	// Started, for a Records part, reports how many scan tasks the part has
+	// started decoding so far (summary log only); safe to call concurrently.
+	Started func() int
 }
 
 // RawFile is a data file that can be served byte-for-byte.
