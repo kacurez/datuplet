@@ -17,9 +17,9 @@ import (
 // The chain is upward:
 // the leaf `editor` tuple we write is included in `data_admin`'s union
 // (`data_admin: [user, role#assignee] or project_admin or editor`),
-// `data_admin` flows into `modify` and `describe`, and lakekeeper
-// further chains those through namespace.modify → table.modify →
-// can_write_data on the catalog side. So a project-level `editor`
+// `data_admin` flows into `describe_effective` and warehouse
+// `modify_effective`, and lakekeeper further chains those through
+// namespace → table `modify_effective` → can_write_data on the catalog side. So a project-level `editor`
 // grant is the simplest correct shape that covers every namespace +
 // table the pipeline references.)
 type PipelineIntent struct {

@@ -484,11 +484,11 @@ func (b *K8sBackend) annotateRunPodsCancelled(ctx context.Context, namespace, ru
 //
 // Asymmetry — leaf write, canonical check: we WRITE the leaf relation
 // (`editor` / `viewer`), but pipeline-api handlers and lakekeeper CHECK
-// canonical relations (`data_admin` / `describe`) that resolve UPWARD
+// canonical relations (`data_admin` / `describe_effective`) that resolve UPWARD
 // through the FGA model union (`data_admin: ... or editor`). The leaf
 // shape keeps tuples auditable as Datuplet roles; the upward resolution
 // is what lets a Datuplet `editor` grant satisfy lakekeeper's
-// `can_list_warehouses → can_get_metadata → describe → data_admin`
+// `can_list_warehouses → can_get_metadata → describe_effective → data_admin`
 // chain on tables. Inverting either side breaks Bug C all over again.
 //
 // Returns nil when the lakekeeper project ID is empty (project not yet

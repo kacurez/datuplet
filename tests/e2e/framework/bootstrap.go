@@ -41,7 +41,7 @@ type FGAHarness struct {
 	// this with NewOpenFGAAuthorizer.
 	OpenFGAStoreID string
 
-	// OpenFGAModelID is the ULID of the collaboration-4.4 model
+	// OpenFGAModelID is the ULID of the collaboration-4.13 model
 	// (Datuplet's extended version). Required by NewOpenFGAAuthorizer.
 	OpenFGAModelID string
 
@@ -101,9 +101,9 @@ type FGABootstrapConfig struct {
 	OpenFGAStoreName string
 
 	// OpenFGAModelVersion is the collaboration model version label
-	// (e.g. "4.4"). The bootstrap reads the version-pin tuple to
+	// (e.g. "4.13"). The bootstrap reads the version-pin tuple to
 	// resolve this to a model ID. Default kept in lockstep with the
-	// Helm chart's CONFIGURED_MODEL_VERSION.
+	// datuplet-app chart's fgaModel.version.
 	OpenFGAModelVersion string
 
 	// LakekeeperURL is the management base URL
@@ -158,10 +158,9 @@ func (c FGABootstrapConfig) Defaults() FGABootstrapConfig {
 		out.OpenFGAStoreName = "datuplet"
 	}
 	if out.OpenFGAModelVersion == "" {
-		// Default "4.4" matches the chart's
-		// LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION pin. Override via
-		// the test config if a future bump lands.
-		out.OpenFGAModelVersion = "4.4"
+		// Default matches the datuplet-app chart's fgaModel.version.
+		// Override via the test config if a future bump lands.
+		out.OpenFGAModelVersion = "4.13"
 	}
 	if out.LakekeeperURL == "" {
 		if env := os.Getenv("DATUPLET_LAKEKEEPER_URL"); env != "" {

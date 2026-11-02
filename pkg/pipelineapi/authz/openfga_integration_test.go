@@ -26,6 +26,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const (
@@ -144,6 +145,36 @@ func uploadMinimalModel(t *testing.T, baseURL, storeID string) string {
 	id, ok := result["authorization_model_id"].(string)
 	if !ok {
 		t.Fatalf("upload model response missing authorization_model_id: %s", b)
+	}
+	return id
+}
+
+// uploadChartModel uploads the model the datuplet-app chart ships (fga.mod +
+// components, compiled as the authz-bootstrap Job does) and returns its ID.
+func uploadChartModel(t *testing.T, baseURL, storeID string) string {
+	t.Helper()
+	model, _ := loadChartFGAModel(t)
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(model)
+	if err != nil {
+		t.Fatalf("marshal model: %v", err)
+	}
+	resp, err := http.Post(
+		fmt.Sprintf("%s/stores/%s/authorization-models", baseURL, storeID),
+		"application/json",
+		strings.NewReader(string(body)),
+	)
+	if err != nil {
+		t.Fatalf("upload model: %v", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	if err := json.Unmarshal(b, &result); err != nil {
+		t.Fatalf("parse upload model response: %v", err)
+	}
+	id, ok := result["authorization_model_id"].(string)
+	if !ok {
+		t.Fatalf("upload model response (HTTP %d) missing authorization_model_id: %s", resp.StatusCode, b)
 	}
 	return id
 }
@@ -309,5 +340,91 @@ func TestOpenFGA_BatchCheck(t *testing.T) {
 	}
 	if results[1] {
 		t.Error("BatchCheck[1]: expected allowed=false for non-granted tuple")
+	}
+}
+
+// TestOpenFGARealModelAccessMatrix runs the chart's FGA model on a real
+// OpenFGA server and checks the relations pipeline-api and lakekeeper rely on.
+func TestOpenFGARealModelAccessMatrix(t *testing.T) {
+	baseURL := startOpenFGA(t)
+	storeID := createStore(t, baseURL)
+	modelID := uploadChartModel(t, baseURL, storeID)
+	authzr := newTestAuthorizer(t, baseURL, storeID, modelID)
+	ctx := context.Background()
+
+	obj := func(s string) Object {
+		o, err := ParseObject(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	const (
+		p   = "project:p"
+		w   = "warehouse:w"
+		n   = "namespace:n"
+		tbl = "lakekeeper_table:t"
+		sib = "lakekeeper_table:sibling"
+	)
+	viewer := UserObject("viewer").String()
+	editor := UserObject("editor").String()
+	reader := UserObject("reader").String()
+	admin := UserObject("admin").String()
+	nobody := UserObject("nobody").String()
+
+	// Hierarchy tuples in the shape lakekeeper writes them.
+	if err := authzr.WriteTuples(ctx, []Tuple{
+		{User: p, Relation: "project", Object: obj(w)},
+		{User: w, Relation: "warehouse", Object: obj(p)},
+		{User: w, Relation: "parent", Object: obj(n)},
+		{User: n, Relation: "namespace", Object: obj(w)},
+		{User: n, Relation: "parent", Object: obj(tbl)},
+		{User: tbl, Relation: "child", Object: obj(n)},
+		{User: n, Relation: "parent", Object: obj(sib)},
+		{User: sib, Relation: "child", Object: obj(n)},
+		{User: viewer, Relation: RelationViewer, Object: obj(p)},
+		{User: editor, Relation: RelationEditor, Object: obj(p)},
+		{User: reader, Relation: "explicit_reader", Object: obj(tbl)},
+		{User: admin, Relation: "project_admin", Object: obj(p)},
+	}); err != nil {
+		t.Fatalf("WriteTuples: %v", err)
+	}
+
+	type row struct {
+		user, rel, obj string
+		want           bool
+	}
+	var rows []row
+	projectAndTable := func(user string, describe, dataAdmin, member, read, write bool) {
+		rows = append(rows,
+			row{user, "describe_effective", p, describe},
+			row{user, "data_admin", p, dataAdmin},
+			row{user, "datuplet_member", p, member},
+			row{user, "can_read_data", tbl, read},
+			row{user, "can_write_data", tbl, write},
+		)
+	}
+	projectAndTable(viewer, true, false, true, true, false)
+	projectAndTable(editor, true, true, true, true, true)
+	projectAndTable(reader, false, false, false, true, false)
+	projectAndTable(admin, true, true, true, true, true)
+	projectAndTable(nobody, false, false, false, false, false)
+	rows = append(rows,
+		row{reader, "can_get_metadata", n, true},
+		row{reader, "can_use", w, true},
+		row{reader, "can_get_config", w, true},
+		row{reader, "can_read_data", sib, false},
+		row{nobody, "can_get_metadata", n, false},
+		row{nobody, "can_use", w, false},
+	)
+
+	for _, r := range rows {
+		got, err := authzr.Check(ctx, r.user, r.rel, obj(r.obj))
+		if err != nil {
+			t.Fatalf("Check %s %s %s: %v", r.user, r.rel, r.obj, err)
+		}
+		if got != r.want {
+			t.Errorf("%s %s %s = %v, want %v", r.user, r.rel, r.obj, got, r.want)
+		}
 	}
 }

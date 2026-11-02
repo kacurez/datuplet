@@ -85,9 +85,9 @@ stringData:
   # (4.3 for lakekeeper 0.12.0). Without this lakekeeper fails at startup
   # with "Active authorization model with version 4.3 not found in OpenFGA."
   # because we pin our merged Datuplet+lakekeeper DSL as version
-  # 4.4.
+  # 4.13.
   # Also tells lakekeeper to skip its own FGA migration.
-  LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION: "4.4"
+  LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION: "4.13"
 ---
 # Source: datuplet-lakekeeper/charts/lakekeeper/templates/catalog/catalog-service.yaml
 apiVersion: v1
@@ -694,7 +694,7 @@ spec:
             # Secret is a main-chart resource that doesn't exist when pre-install
             # hooks run.
             - name: FGA_MODEL_VERSION
-              value: "4.4"
+              value: "4.13"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }

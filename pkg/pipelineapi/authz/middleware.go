@@ -38,7 +38,7 @@
 //	if err != nil { writeError(w, http.StatusBadRequest, ...); return }
 //	allowed, err := authzr.Check(r.Context(),
 //	    authz.UserObject(user.ID.String()).String(),
-//	    "describe", // or "data_admin" for writes — canonical lakekeeper
+//	    "describe_effective", // or "data_admin" for writes — canonical lakekeeper
 //	    // relations the editor/viewer leaf tuples chain into via the FGA
 //	    // model, so a Datuplet `editor` grant satisfies `data_admin` checks.
 //	    authz.ProjectObject(<lakekeeper-project-id-for-pid>))

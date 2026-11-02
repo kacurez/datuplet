@@ -6,7 +6,7 @@
 // Cluster-mode handler tests use this fake to write FGA tuples for the
 // relations mustHaveRelation checks. Because the fake is exact-match
 // only (no chain inheritance), tests seed the canonical relations the
-// handlers query directly — `data_admin` for writes, `describe` for
+// handlers query directly — `data_admin` for writes, `describe_effective` for
 // reads — not the leaf Datuplet roles (`editor` / `viewer`) that would
 // chain into them in real OpenFGA. See seedProjectAuthz in
 // pkg/pipelineapi/http/run_handlers_test.go for the seeding pattern.

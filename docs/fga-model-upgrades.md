@@ -57,6 +57,46 @@ Existing durable FGA tuples (project_admin, server-admin) need manual rewriting 
 are renamed or removed. No automated tooling today — use `curl` against the OpenFGA API or
 `pipeline-api admin grant`. See [docs/known-limitations.md](known-limitations.md).
 
+## Re-forking from upstream Lakekeeper
+
+Our model is Lakekeeper's model plus four Datuplet extensions. The current fork is
+Lakekeeper **4.13** (shipped with Lakekeeper v0.14.2). The version must be **exactly** the
+version Lakekeeper hard-codes as active (`AuthorizationModelVersion` in its OpenFGA migration
+module); Lakekeeper looks up that version's pin and, finding ours, does not upload its own
+model. Do not set `LAKEKEEPER__OPENFGA__AUTHORIZATION_MODEL_VERSION`.
+
+Recipe for the next Lakekeeper bump (`<tag>` = Lakekeeper release, `<v>` = its active model
+version):
+
+1. Fetch the upstream components:
+   ```bash
+   gh api "repos/lakekeeper/lakekeeper/contents/authz/openfga/v<v>?ref=<tag>" --jq '.[].path'
+   gh api "repos/lakekeeper/lakekeeper/contents/authz/openfga/v<v>/components/<file>?ref=<tag>" \
+     --jq .content | base64 -d > charts/datuplet-app/files/fga/components/<file>
+   ```
+   Copy `fga.mod` the same way. Replace every component (`git rm` the ones upstream dropped).
+2. Re-apply the extensions, each marked `DATUPLET EXTENSION` in the DSL. On 4.13:
+   - `project.fga`: `editor`, `viewer` and
+     `datuplet_member: editor or viewer or project_admin or security_admin`;
+     `data_admin: … or editor` (reaches table `can_write_data` through warehouse
+     `modify_effective … or data_admin from project`);
+     `select_effective: … or viewer` (reaches table `can_read_data`).
+   - `lakekeeper_table.fga`: `explicit_reader: [user, role#assignee]`, added to
+     `select_effective` **and** `visible_below`. Without `visible_below`, a single-table share
+     loses namespace `can_get_metadata` and warehouse `can_use` / `can_get_config`.
+
+   Upstream's granted vs `_effective` split decides where an extension lands: actions read
+   the `_effective` twin, so extensions feed the twin, not the bare (granted-only) relation.
+3. Update `datuplet-app.fgaModelComponents` in `charts/datuplet-app/templates/_helpers.tpl` to
+   list `fga.mod`'s components in order. It feeds both the bootstrap DSL hash and the
+   ConfigMap volume items.
+4. Set `fgaModel.version` and `platform.fgaModelVersion` to `<v>`.
+5. Check pipeline-api's relation names against the new model (since 4.13 project reads check
+   `describe_effective`; `describe` matches direct grants only).
+6. Verify: `go test ./pkg/pipelineapi/authz/ -run TestFGAModelCompiles` (compiles the model,
+   checks component lists and extension chains) and `make test-authz-integration` (runs the
+   access matrix on a real OpenFGA server), then `make e2e-k8s`.
+
 ## Hash drift detection
 
 Authz-bootstrap computes a SHA-256 hash of all DSL files at chart-render time and stores it

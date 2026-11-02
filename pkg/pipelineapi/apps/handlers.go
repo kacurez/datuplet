@@ -28,11 +28,11 @@ import (
 )
 
 // FGA relations gating the author routes. Deliberately the same two the
-// pipeline routes use (pipeline_handlers.go): reads take "describe", writes
+// pipeline routes use (pipeline_handlers.go): reads take "describe_effective", writes
 // take "data_admin". A non-member of the project holds neither, so every
 // route 403s for them.
 const (
-	relationRead  = "describe"
+	relationRead  = "describe_effective"
 	relationWrite = "data_admin"
 )
 
@@ -479,7 +479,7 @@ func (h *Handlers) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 
 // handleListTokens lists appID's viewer tokens (spec §5.1/§5.3): token_id,
 // created_at, revoked_at — never a secret or salt, since Store.ListTokens's
-// SELECT never reads those columns. Gated on relationRead ("describe"),
+// SELECT never reads those columns. Gated on relationRead ("describe_effective"),
 // the same relation every other read route (list/get/logs) uses — this is
 // a read, not a mutation, so it does not take relationWrite like
 // create/delete.

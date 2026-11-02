@@ -46,7 +46,7 @@ image:
 # See docs/fga-model-upgrades.md for the upgrade procedure.
 # The model IS Datuplet's schema, so its version belongs in the app release chart.
 fgaModel:
-  version: "4.4"
+  version: "4.13"
 
 # datuplet-infra coordinates.
 # These MUST match the values.yaml fields of the infra install.

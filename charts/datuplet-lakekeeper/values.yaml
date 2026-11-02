@@ -16,7 +16,7 @@ tolerations: []
 platform:
   # Source: charts/datuplet-app/values.yaml :: fgaModel.version
   # The lakekeeper-config Secret pins lakekeeper to this model version.
-  fgaModelVersion: "4.4"
+  fgaModelVersion: "4.13"
   # Source: charts/datuplet-app/values.yaml :: platform.openfgaStoreName
   openfgaStoreName: datuplet
   # Set LAKEKEEPER__ENABLE_GCP_SYSTEM_CREDENTIALS=true so Lakekeeper accepts

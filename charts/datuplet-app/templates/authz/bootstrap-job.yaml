@@ -301,7 +301,11 @@ spec:
           env:
             # Computed at chart-render time: SHA-256 of all DSL files combined.
             - name: FGA_DSL_HASH
-              value: "{{ printf "%s%s%s%s%s%s%s%s%s%s" (.Files.Get "files/fga/fga.mod") (.Files.Get "files/fga/components/lakekeeper_table.fga") (.Files.Get "files/fga/components/lakekeeper_view.fga") (.Files.Get "files/fga/components/model_version.fga") (.Files.Get "files/fga/components/namespace.fga") (.Files.Get "files/fga/components/project.fga") (.Files.Get "files/fga/components/role.fga") (.Files.Get "files/fga/components/server.fga") (.Files.Get "files/fga/components/user.fga") (.Files.Get "files/fga/components/warehouse.fga") | sha256sum }}"
+              {{- $dsl := .Files.Get "files/fga/fga.mod" }}
+              {{- range include "datuplet-app.fgaModelComponents" . | splitList "\n" }}
+              {{- $dsl = print $dsl ($.Files.Get (printf "files/fga/components/%s" .)) }}
+              {{- end }}
+              value: {{ $dsl | sha256sum | quote }}
             - name: FGA_VERSION
               value: {{ .Values.fgaModel.version | quote }}
             - name: OPENFGA_API_KEY
@@ -324,16 +328,10 @@ spec:
           configMap:
             name: {{ include "datuplet-app.prefix" . }}fga-model
             items:
-              - { key: fga.mod,                path: fga.mod }
-              - { key: model_version.fga,      path: components/model_version.fga }
-              - { key: user.fga,               path: components/user.fga }
-              - { key: role.fga,               path: components/role.fga }
-              - { key: server.fga,             path: components/server.fga }
-              - { key: project.fga,            path: components/project.fga }
-              - { key: warehouse.fga,          path: components/warehouse.fga }
-              - { key: namespace.fga,          path: components/namespace.fga }
-              - { key: lakekeeper_table.fga,   path: components/lakekeeper_table.fga }
-              - { key: lakekeeper_view.fga,    path: components/lakekeeper_view.fga }
+              - { key: fga.mod, path: fga.mod }
+{{- range include "datuplet-app.fgaModelComponents" . | splitList "\n" }}
+              - { key: {{ . }}, path: components/{{ . }} }
+{{- end }}
         - name: shared
           emptyDir:
             medium: Memory

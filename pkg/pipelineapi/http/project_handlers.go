@@ -70,7 +70,7 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed, checkErr := s.authzr.Check(r.Context(),
 		authz.UserObject(user.ID.String()).String(),
-		"describe",
+		"describe_effective",
 		authz.ProjectObject(p.LakekeeperProjectID))
 	if errors.Is(checkErr, authz.ErrAuthzUnavailable) {
 		writeError(w, http.StatusServiceUnavailable, "authz backend unavailable")
