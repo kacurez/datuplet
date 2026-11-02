@@ -48,8 +48,9 @@ kubectl logs -n datuplet job/datuplet-app-authz-bootstrap-1
   Then re-run `helm upgrade datuplet-app charts/datuplet-app -n datuplet --wait --wait-for-jobs`.
 - Phase 2 (`datuplet-infra`) is not fully installed. Run
   `kubectl get pods -n datuplet` and ensure all Phase 2 pods are Running/Completed.
-- DSL hash mismatch: the DSL changed under an existing store. Model changes need a fresh
-  install; see [docs/fga-model-upgrades.md](fga-model-upgrades.md).
+- DSL hash mismatch: the DSL changed while the sentinel ConfigMap holds the old hash for
+  this version. Model changes need a fresh install; see
+  [docs/fga-model-upgrades.md](fga-model-upgrades.md).
 
 ---
 

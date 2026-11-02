@@ -79,8 +79,11 @@ to a human/automation account) to retrieve audit entries.
 ## Upgrade
 
 **FGA model changes are fresh-install only.** Any DSL change is made at the same version
-and takes effect only on a fresh install (`install.sh` + `register.sh`); there is no
-upgrade or tuple-rewrite path. See [docs/fga-model-upgrades.md](fga-model-upgrades.md).
+and takes effect only on a fresh install (`install.sh`); there is no upgrade or
+tuple-rewrite path. Nothing fully enforces this on an existing install: authz-bootstrap
+refuses to re-pin only while its sentinel ConfigMap holds the old DSL hash, and re-pins
+to the edited model when the sentinel is missing. See
+[docs/fga-model-upgrades.md](fga-model-upgrades.md).
 
 **`platform.fgaModelVersion` cross-chart drift.** `charts/datuplet-app/values.yaml`
 (`fgaModel.version`) and `charts/datuplet-lakekeeper/values.yaml`

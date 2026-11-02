@@ -5,7 +5,7 @@ The OpenFGA authorization model is stored as DSL files in
 `charts/datuplet-app/values.yaml`. **The FGA model lives in Phase 3 (`datuplet-app`).**
 
 The authz-bootstrap Job (a `pre-install,pre-upgrade` hook in `datuplet-app`) uploads the model
-into a new store on install and writes the version pin tuple.
+on every run and writes the version pin tuple when the rules in "Hash drift detection" allow.
 
 ## The version is Lakekeeper's active model version
 
@@ -33,8 +33,8 @@ Any DSL change, additive or breaking, is made the same way:
    Do not bump `fgaModel.version` / `platform.fgaModelVersion`; they move only with a
    Lakekeeper re-fork (below).
 2. Verify (step 6 of the re-fork recipe).
-3. Install fresh with `scripts/install.sh` into a new cluster or namespace, then
-   `scripts/register.sh`. Never `helm upgrade` an existing install onto a changed model.
+3. Install fresh with `scripts/install.sh` (it runs `register.sh` at the end) into a new
+   cluster or namespace. Never `helm upgrade` an existing install onto a changed model.
 
 ## Re-forking from upstream Lakekeeper
 
@@ -86,15 +86,21 @@ version):
 Authz-bootstrap computes a SHA-256 hash of all DSL files at chart-render time and stores it,
 keyed by version, in a sentinel ConfigMap `<release>-fga-version-sentinel` next to the pin.
 
+Every run first uploads the rendered model into the store (the `model-write` initContainer),
+then the `apply` container decides whether to pin it:
+
 | State | Outcome |
 |---|---|
-| No pin for this version (fresh install, new store) | Upload model, write pin + hash to sentinel |
-| Pin exists, hash matches | Skip — idempotent no-op |
-| Pin exists, hash **differs** | **Fail** — the job refuses to upload |
+| No pin for this version (fresh install, new store) | Pin the uploaded model, write hash to sentinel |
+| Pin exists, sentinel hash matches | Exit 0, pin unchanged (the uploaded copy stays unpinned) |
+| Pin exists, sentinel hash **differs** | **Fail** (exit 1), pin unchanged — the uploaded copy stays unpinned |
+| Pin exists, **no sentinel hash** for this version | Re-pin to the newly uploaded model, write hash to sentinel |
 
-Because model changes keep the same version, re-running the bootstrap against an
-**existing** store after editing the DSL hits the last row and the job refuses. That is
-intended: model changes take effect only through a fresh install, whose new store has no pin.
+So the hash check prevents re-pinning, not uploading. Re-running the bootstrap against an
+existing install after editing the DSL at the same version fails the job and leaves the old
+pin, as long as that install's sentinel ConfigMap still holds the hash. If the sentinel (or
+its key) is missing, the job silently re-pins the version to the edited model. Model changes
+are meant to take effect only through a fresh install, whose new store has no pin.
 
 ## CI policy
 
