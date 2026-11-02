@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,5 +201,82 @@ func TestGatewaySuccessfulBootAnswersGetConfig(t *testing.T) {
 	}
 	if !plane.closed.Load() {
 		t.Error("plane not closed on shutdown")
+	}
+}
+
+// A boot error that embeds the run token is served redacted over gRPC and
+// HTTP, and the process still exits 20 after the hold.
+func TestGatewayBootErrorOmitsRunToken(t *testing.T) {
+	const sig = "c2lnbmF0dXJlLXNlY3JldC1zaWduYXR1cmU"
+	const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZWNyZXQtcnVuLXRva2VuLXBheWxvYWQifQ." + sig
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpAddr := l.Addr().String()
+	l.Close()
+
+	addrCh := make(chan net.Addr, 1)
+	hooks := gatewayHooks{
+		signals:         make(chan os.Signal, 1),
+		bootFailureHold: 1500 * time.Millisecond,
+		httpAddr:        httpAddr,
+		listening:       func(a net.Addr) { addrCh <- a },
+		newServer: func(*datagateway.Config, datagateway.DataPlaneFactory) (*datagateway.ServerV2, error) {
+			return nil, errors.New("boot failed with token " + token)
+		},
+	}
+	opts := gatewayOptions{configPath: writeGatewayConfig(t), addr: "127.0.0.1:0", mode: "gateway", runTokenPath: tokenPath}
+	exit := make(chan int, 1)
+	go func() { exit <- runGatewayWith(opts, func(string) string { return "" }, hooks) }()
+	addr := <-addrCh
+
+	conn, err := grpc.NewClient(addr.String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, err = pb.NewDataGatewayClient(conn).GetConfig(context.Background(), &pb.GetConfigRequest{})
+	if st, _ := status.FromError(err); st.Code() != codes.Unavailable {
+		t.Fatalf("GetConfig: %v, want Unavailable", err)
+	}
+	if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), sig) {
+		t.Errorf("gRPC boot error leaks the token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "boot failed with token") {
+		t.Errorf("gRPC boot error lost its text: %v", err)
+	}
+
+	var resp *http.Response
+	for i := 0; i < 100; i++ {
+		resp, err = http.Get("http://" + httpAddr + "/data/read/x")
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("HTTP: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("HTTP status = %d, want 503", resp.StatusCode)
+	}
+	if strings.Contains(string(body), token) || strings.Contains(string(body), sig) {
+		t.Errorf("HTTP boot error leaks the token: %s", body)
+	}
+
+	select {
+	case code := <-exit:
+		if code != gatewayExitApplication {
+			t.Errorf("exit = %d, want %d", code, gatewayExitApplication)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("gateway did not exit after the hold")
 	}
 }

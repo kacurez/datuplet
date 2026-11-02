@@ -432,6 +432,7 @@ func TestHealthNotServingUntilReady(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { s.Close() })
 		h.gate.Ready(s)
 		if got := check(t, h); got != grpc_health_v1.HealthCheckResponse_SERVING {
 			t.Errorf("after Ready: %v, want SERVING", got)
@@ -458,8 +459,8 @@ func TestGateWaitReturnsOnCancel(t *testing.T) {
 	go func() { done <- g.wait(ctx) }()
 	select {
 	case err := <-done:
-		if status.Code(err) != codes.Canceled {
-			t.Errorf("wait = %v, want Canceled", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("wait = %v, want context.Canceled", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("wait did not return within 1s of a cancelled ctx")

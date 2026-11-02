@@ -50,7 +50,7 @@ func NewBootGate() *BootGate {
 				return handler(ctx, req)
 			}
 			if err := g.wait(ctx); err != nil {
-				return nil, err
+				return nil, waitStatus(err)
 			}
 			return handler(ctx, req)
 		}),
@@ -59,7 +59,7 @@ func NewBootGate() *BootGate {
 				return handler(srv, ss)
 			}
 			if err := g.wait(ss.Context()); err != nil {
-				return err
+				return waitStatus(err)
 			}
 			return handler(srv, ss)
 		}),
@@ -82,8 +82,8 @@ func isHealthMethod(fullMethod string) bool {
 	return strings.HasPrefix(fullMethod, "/grpc.health.v1.Health/")
 }
 
-// wait blocks until boot ends or ctx is done; it returns the gRPC status a
-// gated call fails with, or nil once the server is ready.
+// wait blocks until boot ends or ctx is done; it returns ctx.Err() on
+// cancellation, the Unavailable status of a failed boot, or nil once ready.
 func (g *BootGate) wait(ctx context.Context) error {
 	select {
 	case <-g.done:
@@ -91,13 +91,21 @@ func (g *BootGate) wait(ctx context.Context) error {
 		select {
 		case <-g.done:
 		default:
-			return status.FromContextError(ctx.Err()).Err()
+			return ctx.Err()
 		}
 	}
 	if g.err != nil {
 		return status.Error(codes.Unavailable, "gateway boot failed: "+g.err.Error())
 	}
 	return nil
+}
+
+// waitStatus turns a wait error into the gRPC status the call fails with.
+func waitStatus(err error) error {
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.FromContextError(err).Err()
 }
 
 func (g *BootGate) serveHTTPRequest(w http.ResponseWriter, r *http.Request) {

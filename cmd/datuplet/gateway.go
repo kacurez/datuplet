@@ -95,6 +95,9 @@ type gatewayHooks struct {
 	bootFailureHold time.Duration
 	// httpAddr replaces the config's HTTP listen address when non-empty.
 	httpAddr string
+	// newServer replaces datagateway.NewServerV2 (called with the resolved
+	// plane factory).
+	newServer func(*datagateway.Config, datagateway.DataPlaneFactory) (*datagateway.ServerV2, error)
 	// listening is called with the gRPC address once it is bound.
 	listening func(net.Addr)
 }
@@ -216,7 +219,11 @@ func bootGateway(opts gatewayOptions, hooks gatewayHooks, gate *datagateway.Boot
 	if newPlane == nil {
 		newPlane = goplane.Factory
 	}
-	return datagateway.NewServerV2(cfg, newPlane)
+	newServer := hooks.newServer
+	if newServer == nil {
+		newServer = datagateway.NewServerV2
+	}
+	return newServer(cfg, newPlane)
 }
 
 func closeGatewayServer(server *datagateway.ServerV2) {
