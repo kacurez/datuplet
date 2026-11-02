@@ -1,8 +1,10 @@
 package main
 
 import (
-	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -10,189 +12,137 @@ import (
 	"time"
 
 	"github.com/datuplet/datuplet/pkg/datagateway"
-	"github.com/datuplet/datuplet/pkg/datagateway/backend"
+	"github.com/datuplet/datuplet/pkg/datagateway/goplane"
 )
 
-func runGateway(mode, configPath, dataDir, addr, runTokenPath, podAnnotationsPath string) error {
-	iterationID := os.Getenv("DATUPLET_ITERATION_ID")
-	if iterationID == "" {
-		iterationID = "(none)"
+// gatewayExitApplication is the exit code for a boot or serve failure
+// (exit-code contract: >= 20 is an application failure).
+const gatewayExitApplication = 20
+
+type gatewayOptions struct {
+	configPath         string
+	addr               string
+	runTokenPath       string
+	podAnnotationsPath string
+	mode               string // "minio" / "local" when given (names the component), else "gateway"
+}
+
+// gatewayMain runs `datuplet gateway` (the Data Gateway sidecar) and returns
+// the process exit code: 0 clean shutdown, 20 boot or serve failure, non-zero
+// on a usage error.
+func gatewayMain(args []string, getenv func(string) string, stderr io.Writer) int {
+	opts, err := parseGatewayFlags(args, getenv, stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return 0
 	}
-	runIDEnv := os.Getenv("RUN_ID")
-	if runIDEnv == "" {
-		runIDEnv = "(none)"
-	}
-	log.Printf("datuplet-gateway: starting %s iteration_id=%s run_id=%s",
-		datagateway.GatewayBuildInfo(), iterationID, runIDEnv)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Println("\nReceived shutdown signal...")
-		cancel()
-	}()
-
-	cfg, err := datagateway.LoadGatewayConfigFile(configPath)
 	if err != nil {
-		return err
+		return 2
 	}
+	return runGateway(opts, getenv)
+}
 
-	var be backend.StorageBackend
-	var chunkSize int64
-
-	switch mode {
-	case "local":
-		// Apply defaults for local mode
-		if dataDir != "" && dataDir != "./data" {
-			cfg.DataDir = dataDir
-		}
-		if cfg.DataDir == "" {
-			cfg.DataDir = "./data"
-		}
-		if cfg.Local.InputFormat == "" {
-			cfg.Local.InputFormat = "auto"
-		}
-		if cfg.Local.OutputFormat == "" {
-			cfg.Local.OutputFormat = "csv"
-		}
-
-		// Use mode-specific chunk_size if set (backward compat), otherwise datagateway.chunk_size
-		chunkSize = cfg.Gateway.ChunkSize
-		if cfg.Local.ChunkSize > 0 {
-			chunkSize = cfg.Local.ChunkSize
-		}
-		be = backend.NewLocalBackend(backend.LocalConfig{
-			DataDir:      cfg.DataDir,
-			InputFormat:  cfg.Local.InputFormat,
-			OutputFormat: cfg.Local.OutputFormat,
-			ChunkSize:    cfg.Local.ChunkSize,
-		})
-
-		fmt.Println("Data Gateway starting in LOCAL mode")
-		fmt.Printf("Data directory: %s\n", cfg.DataDir)
-
-	case "minio":
-		// Try to get credentials from environment first
-		if cfg.MinIO.Endpoint == "" {
-			cfg.MinIO.Endpoint = os.Getenv("MINIO_ENDPOINT")
-		}
-		if cfg.MinIO.Bucket == "" {
-			cfg.MinIO.Bucket = os.Getenv("MINIO_BUCKET")
-		}
-		if cfg.MinIO.AccessKey == "" {
-			cfg.MinIO.AccessKey = os.Getenv("MINIO_ACCESS_KEY")
-			if cfg.MinIO.AccessKey == "" {
-				cfg.MinIO.AccessKey = os.Getenv("AWS_ACCESS_KEY_ID")
-			}
-		}
-		if cfg.MinIO.SecretKey == "" {
-			cfg.MinIO.SecretKey = os.Getenv("MINIO_SECRET_KEY")
-			if cfg.MinIO.SecretKey == "" {
-				cfg.MinIO.SecretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
-			}
-		}
-
-		// When lakekeeper is configured, storage paths come from the
-		// catalog and credentials are vended STS — DG instantiates per-
-		// table minio backends itself, so the static `be` stays nil.
-		//
-		// Local-file mode: when neither LakekeeperURL nor MinIO endpoint is
-		// set AND DATUPLET_STORAGE_TYPE=filesystem, leave be=nil. NewServerV2
-		// detects the env var and wires the SQLite resolver instead. A non-nil
-		// static backend would cause a fatal in NewServerV2 when it also finds
-		// a resolver.
-		if cfg.LakekeeperURL != "" {
-			fmt.Printf("Lakekeeper mode enabled: %s\n", cfg.LakekeeperURL)
-			be = nil
-			chunkSize = cfg.Gateway.ChunkSize
-		} else if cfg.MinIO.Endpoint == "" && os.Getenv("DATUPLET_STORAGE_TYPE") == "filesystem" {
-			// Local-file mode: SQLite resolver is wired by NewServerV2.
-			be = nil
-			chunkSize = cfg.Gateway.ChunkSize
-			fmt.Printf("Data Gateway starting in LOCAL-FILE mode (SQLite catalog)\n")
-		} else {
-			// Direct MinIO mode - validate config
-			if cfg.MinIO.Endpoint == "" || cfg.MinIO.Bucket == "" {
-				return fmt.Errorf("MinIO endpoint and bucket are required when lakekeeper is not configured")
-			}
-
-			// Use mode-specific chunk_size if set (backward compat), otherwise datagateway.chunk_size
-			chunkSize = cfg.Gateway.ChunkSize
-			if cfg.MinIO.ChunkSize > 0 {
-				chunkSize = cfg.MinIO.ChunkSize
-			}
-			minioBe, err := backend.NewMinIOBackend(backend.MinIOConfig{
-				Endpoint:  cfg.MinIO.Endpoint,
-				Bucket:    cfg.MinIO.Bucket,
-				AccessKey: cfg.MinIO.AccessKey,
-				SecretKey: cfg.MinIO.SecretKey,
-				Region:    cfg.MinIO.Region,
-				UseSSL:    cfg.MinIO.UseSSL,
-				ChunkSize: cfg.MinIO.ChunkSize,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to create MinIO backend: %w", err)
-			}
-			be = minioBe
-
-			fmt.Println("Data Gateway starting in MINIO mode")
-			fmt.Printf("Endpoint: %s, Bucket: %s\n", cfg.MinIO.Endpoint, cfg.MinIO.Bucket)
-		}
-
-	default:
-		return fmt.Errorf("unknown mode: %s", mode)
+// parseGatewayFlags parses the sidecar flags. --minio and --local are
+// accepted (the operator passes --minio) and only name the component;
+// --data-dir is accepted and ignored. --run-token-path and
+// --pod-annotations-path fall back to RUN_TOKEN_PATH / POD_ANNOTATIONS_PATH.
+func parseGatewayFlags(args []string, getenv func(string) string, stderr io.Writer) (gatewayOptions, error) {
+	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	local := fs.Bool("local", false, "Accepted for compatibility (names the component)")
+	minio := fs.Bool("minio", false, "Accepted for compatibility; the operator passes it (names the component)")
+	configPath := fs.String("config", "", "Path to the gateway config file (YAML, required)")
+	fs.String("data-dir", "./data", "Accepted and ignored")
+	addr := fs.String("addr", ":50051", "gRPC server address (the HTTP data plane listens on :50052)")
+	runTokenPath := fs.String("run-token-path", "", "Path to the mounted run-token file (K8s typically sets /var/run/secrets/datuplet-runtoken/token). Also RUN_TOKEN_PATH env var.")
+	podAnnotationsPath := fs.String("pod-annotations-path", "", "Path to the kubelet downward-API pod-annotations file (K8s typically sets /etc/podinfo/annotations). When set, the gateway polls the file every 5s and exits cleanly on `datuplet.io/cancel=true`. Also POD_ANNOTATIONS_PATH env var.")
+	if err := fs.Parse(args); err != nil {
+		return gatewayOptions{}, err
 	}
-
-	// Convert the parsed YAML into the gateway Config (shared loader).
-	gatewayCfg := cfg.ToConfig(runTokenPath, podAnnotationsPath)
-
-	// Determine run ID (from config or generate)
-	if gatewayCfg.RunID == "" {
-		gatewayCfg.RunID = fmt.Sprintf("%s-%d", mode, time.Now().Unix())
+	if *configPath == "" {
+		fmt.Fprintln(stderr, "datuplet gateway: --config is required")
+		fs.Usage()
+		return gatewayOptions{}, errors.New("--config is required")
 	}
-	gatewayCfg.ComponentName = fmt.Sprintf("%s-component", mode)
-	gatewayCfg.ChunkSize = chunkSize
-	gatewayCfg.Backend = be
+	opts := gatewayOptions{
+		configPath:         *configPath,
+		addr:               *addr,
+		runTokenPath:       resolveRunTokenPath(*runTokenPath, getenv("RUN_TOKEN_PATH")),
+		podAnnotationsPath: resolveRunTokenPath(*podAnnotationsPath, getenv("POD_ANNOTATIONS_PATH")),
+		mode:               "gateway",
+	}
+	switch {
+	case *minio:
+		opts.mode = "minio"
+	case *local:
+		opts.mode = "local"
+	}
+	return opts, nil
+}
 
-	// Start Pyroscope continuous profiling when DATUPLET_GATEWAY_PROFILING is set.
-	// Returns nil when disabled. Defer the stop so it runs on graceful shutdown.
+func runGateway(opts gatewayOptions, getenv func(string) string) int {
+	log.Printf("datuplet-gateway: starting %s iteration_id=%s run_id=%s",
+		datagateway.GatewayBuildInfo(), orNone(getenv("DATUPLET_ITERATION_ID")), orNone(getenv("RUN_ID")))
+
+	cfg, err := datagateway.LoadConfigFile(opts.configPath, opts.runTokenPath, opts.podAnnotationsPath)
+	if err != nil {
+		log.Printf("datuplet-gateway: %v", err)
+		return gatewayExitApplication
+	}
+	if cfg.RunID == "" {
+		cfg.RunID = fmt.Sprintf("%s-%d", opts.mode, time.Now().Unix())
+	}
+	cfg.ComponentName = opts.mode + "-component"
+
+	// Pyroscope continuous profiling when DATUPLET_GATEWAY_PROFILING is set.
 	if stopProfiling := datagateway.StartProfilingIfEnabled(); stopProfiling != nil {
 		defer func() {
 			if err := stopProfiling(); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: pyroscope stop error: %v\n", err)
+				log.Printf("datuplet-gateway: pyroscope stop error: %v", err)
 			}
 		}()
 	}
 
-	// Create and start v2 server
-	server := datagateway.NewServerV2(gatewayCfg)
-
-	if len(cfg.Component.Inputs) > 0 {
-		fmt.Printf("Inputs: %v\n", cfg.Component.Inputs)
+	server, err := datagateway.NewServerV2(cfg, goplane.Factory)
+	if err != nil {
+		log.Printf("datuplet-gateway: %v", err)
+		return gatewayExitApplication
 	}
 
-	// Run server (blocks until shutdown or error)
-	// ServeWithHTTP starts both gRPC (for control) and HTTP (for data transfer)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	// ServeWithHTTP starts both gRPC (control) and HTTP (data transfer); it
+	// returns after a graceful stop (Close, or the cancel annotation).
 	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.ServeWithHTTP(addr)
-	}()
+	go func() { errCh <- server.ServeWithHTTP(opts.addr) }()
 
 	select {
 	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		fmt.Println("Shutting down datagateway...")
-		if cerr := server.Close(); cerr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: server Close error: %v\n", cerr)
+		closeGatewayServer(server)
+		if err != nil {
+			log.Printf("datuplet-gateway: serve: %v", err)
+			return gatewayExitApplication
 		}
-		// Wait for Serve to return after graceful stop so we don't drop in-flight RPCs.
+		return 0
+	case sig := <-sigCh:
+		log.Printf("datuplet-gateway: received %s; shutting down", sig)
+		closeGatewayServer(server)
+		// Wait for Serve to return after the graceful stop so in-flight RPCs finish.
 		<-errCh
-		return nil
+		return 0
 	}
+}
+
+func closeGatewayServer(server *datagateway.ServerV2) {
+	if err := server.Close(); err != nil {
+		log.Printf("datuplet-gateway: close: %v", err)
+	}
+}
+
+func orNone(v string) string {
+	if v == "" {
+		return "(none)"
+	}
+	return v
 }

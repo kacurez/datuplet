@@ -10,9 +10,7 @@ import (
 
 // GatewayConfig is the configuration file format for the
 type GatewayConfig struct {
-	Mode          string `yaml:"mode"`
 	RunID         string `yaml:"run_id"`
-	DataDir       string `yaml:"data_dir"`
 	LakekeeperURL string `yaml:"lakekeeper_url,omitempty"` // Lakekeeper REST catalog base URL
 	// PipelineAPIJWKSURL is the JWKS endpoint pipeline-api serves.
 	// The operator injects this whenever LakekeeperURL is set; DG validates
@@ -22,13 +20,6 @@ type GatewayConfig struct {
 	// SecretsDir is the directory where $[name] secret references are resolved from.
 	// One file per name; file contents == value. Leave empty to disable resolution.
 	SecretsDir string `yaml:"secrets_dir,omitempty"`
-
-	// S3 credentials for StorageBootstrap (native S3 components like DuckDB)
-	S3Endpoint   string `yaml:"s3_endpoint,omitempty"`
-	S3AccessKey  string `yaml:"s3_access_key,omitempty"`
-	S3SecretKey  string `yaml:"s3_secret_key,omitempty"`
-	S3Region     string `yaml:"s3_region,omitempty"`
-	S3BucketName string `yaml:"s3_bucket_name,omitempty"`
 
 	// Bucket-based access control (top-level)
 	InputBuckets     []string                  `yaml:"input_buckets,omitempty"`
@@ -62,22 +53,6 @@ type GatewayConfig struct {
 		// Legacy outputs (deprecated)
 		LegacyOutputs map[string]GatewayOutputConfig `yaml:"legacy_outputs,omitempty"`
 	} `yaml:"component"`
-
-	Local struct {
-		InputFormat  string `yaml:"input_format"`
-		OutputFormat string `yaml:"output_format"`
-		ChunkSize    int64  `yaml:"chunk_size"` // Deprecated: use chunk_size
-	} `yaml:"local"`
-
-	MinIO struct {
-		Endpoint  string `yaml:"endpoint"`
-		Bucket    string `yaml:"bucket"`
-		AccessKey string `yaml:"access_key"`
-		SecretKey string `yaml:"secret_key"`
-		Region    string `yaml:"region"`
-		UseSSL    bool   `yaml:"use_ssl"`
-		ChunkSize int64  `yaml:"chunk_size"` // Deprecated: use chunk_size
-	} `yaml:"minio"`
 }
 
 // GatewayOutputConfig supports both string and full output config (legacy format).
@@ -154,10 +129,8 @@ func LoadGatewayConfigFile(path string) (*GatewayConfig, error) {
 	return &cfg, nil
 }
 
-// LoadConfigFile loads the gateway YAML into a Config. It does no
-// static-backend construction (local / direct-MinIO dev modes build their own
-// Backend and may override ChunkSize on the returned Config), and leaves
-// RunID empty when the file has none.
+// LoadConfigFile loads the gateway YAML into a Config (the datagateway
+// binary's loader). It leaves RunID and ComponentName to the caller.
 func LoadConfigFile(configPath, runTokenPath, podAnnotationsPath string) (*Config, error) {
 	cfg, err := LoadGatewayConfigFile(configPath)
 	if err != nil {
@@ -189,13 +162,6 @@ func (cfg *GatewayConfig) ToConfig(runTokenPath, podAnnotationsPath string) *Con
 		RunTokenPath:       runTokenPath,
 		PodAnnotationsPath: podAnnotationsPath,
 		SecretsDir:         cfg.SecretsDir,
-
-		// S3 credentials for StorageBootstrap (native S3 components)
-		S3Endpoint:   cfg.S3Endpoint,
-		S3AccessKey:  cfg.S3AccessKey,
-		S3SecretKey:  cfg.S3SecretKey,
-		S3Region:     cfg.S3Region,
-		S3BucketName: cfg.S3BucketName,
 
 		// Bucket-based access control
 		InputBuckets:     cfg.InputBuckets,

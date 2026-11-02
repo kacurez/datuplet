@@ -20,12 +20,11 @@
 //     from the gateway-side schema. (DG owns table creation rather
 //     than TableCommit because vended STS scoped to the table prefix
 //     can only be issued once the table exists in lakekeeper.)
-//  3. Construct a vended-creds-backed MinIO backend rooted at the
-//     table's data path (per iceberg-go's LocationProvider).
+//  3. Return the table's data prefix plus a VendedCreds credential
+//     source the data plane writes it with.
 //
 // Reads use Resolver.LoadTableForRead which returns the parquet path
-// list under the current snapshot plus a similar minio backend. The
-// run-token map provides the read-intent JWT.
+// list under the current snapshot plus a vended-creds-backed backend.
 //
 // The package is deliberately small: production logic lives in the
 // callers (server_v2_writing.go, server_v2_reading.go). This file
@@ -99,19 +98,15 @@ func (r *Resolver) Close() error {
 
 // WriterTarget describes a writable per-table location.
 type WriterTarget struct {
-	// BasePath is the s3:// URL the BufferManager should write parquet
+	// BasePath is the opaque data prefix the data plane writes parquet
 	// files under (e.g. s3://warehouse/<warehouse-uuid>/<table-uuid>/data/).
 	// The trailing slash is included so joinStoragePath builds a clean
 	// child URL.
 	BasePath string
 
-	// Backend wraps a minio-go client whose credentials are sourced from
-	// `pkg/catalogwriter.VendedCreds` — every PutObject call retrieves a
-	// fresh-or-cached STS credential pair via the renewal contract.
-	Backend backend.StorageBackend
-
-	// VendedCreds is held so the caller can poll LastError() for
-	// observability, and so renewals stay coordinated through one cache.
+	// VendedCreds sources the table's lakekeeper-vended storage
+	// credentials (STS for s3://, OAuth bearer for gs://) through one
+	// renewal cache. nil for file:// prefixes (local tests).
 	VendedCreds *catalogwriter.VendedCreds
 }
 
@@ -209,15 +204,48 @@ func (r *Resolver) LoadOrCreateForWrite(ctx context.Context, ns, tbl string, sch
 	}
 	dataPrefix := strings.TrimRight(loc, "/") + "/data/"
 
-	be, vc, err := r.buildBackend(dataPrefix, ns, tbl)
+	vc, err := r.writeCreds(dataPrefix, ns, tbl)
 	if err != nil {
 		return nil, err
 	}
 	return &WriterTarget{
 		BasePath:    dataPrefix,
-		Backend:     be,
 		VendedCreds: vc,
 	}, nil
+}
+
+// writeCreds returns the vended credentials a writer of (ns, tbl) uses for
+// dataPrefix: S3 STS for s3://, GCS OAuth bearer for gs://, nil for file://.
+func (r *Resolver) writeCreds(dataPrefix, ns, tbl string) (*catalogwriter.VendedCreds, error) {
+	switch {
+	case strings.HasPrefix(dataPrefix, "file://"):
+		return nil, nil
+	case strings.HasPrefix(dataPrefix, "s3://"):
+		return r.newVendedCreds(ns, tbl, catalogwriter.CredsTypeS3), nil
+	case strings.HasPrefix(dataPrefix, "gs://"):
+		return r.newVendedCreds(ns, tbl, catalogwriter.CredsTypeGCS), nil
+	default:
+		return nil, fmt.Errorf("lakekeeper: unsupported scheme in %q (need s3://, gs://, or file://)", dataPrefix)
+	}
+}
+
+// newVendedCreds builds the per-table credential source. VendedCreds
+// discovers the per-warehouse REST URL prefix lazily on first fetch via
+// `GET /v1/config?warehouse=<name>` (matching iceberg-go's REST catalog
+// handshake). The data-path UUID embedded in the data prefix is NOT
+// necessarily the warehouse-id used in the REST URL — lakekeeper assigns
+// separate identifiers — so deriving the prefix from the path is unsafe.
+func (r *Resolver) newVendedCreds(ns, tbl string, typ catalogwriter.CredsType) *catalogwriter.VendedCreds {
+	tok := r.Token
+	return &catalogwriter.VendedCreds{
+		LakekeeperURL:     r.URL,
+		WarehouseName:     r.Warehouse,
+		ProjectID:         r.ProjectID,
+		Namespace:         ns,
+		Table:             tbl,
+		TokenProvider:     func(context.Context) (string, error) { return tok, nil },
+		ExpectedCredsType: typ,
+	}
 }
 
 // LoadTableForRead returns the parquet paths in the current snapshot
@@ -337,23 +365,7 @@ func (r *Resolver) buildBackend(dataPrefix, ns, tbl string) (backend.StorageBack
 // minio-go credentials provider. Returns the backend, the vendedCreds
 // (so callers can observe LastError), and any setup error.
 func (r *Resolver) buildS3Backend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
-	tok := r.Token
-	tp := func(context.Context) (string, error) { return tok, nil }
-	// VendedCreds discovers the per-warehouse REST URL prefix lazily on
-	// first fetch via `GET /v1/config?warehouse=<name>` (matching
-	// iceberg-go's REST catalog handshake). The data-path UUID embedded
-	// in `dataPrefix` is NOT necessarily the warehouse-id used in the
-	// REST URL — lakekeeper assigns separate identifiers — so deriving
-	// prefix from the path string is unsafe.
-	vc := &catalogwriter.VendedCreds{
-		LakekeeperURL:     r.URL,
-		WarehouseName:     r.Warehouse,
-		ProjectID:         r.ProjectID,
-		Namespace:         ns,
-		Table:             tbl,
-		TokenProvider:     tp,
-		ExpectedCredsType: catalogwriter.CredsTypeS3,
-	}
+	vc := r.newVendedCreds(ns, tbl, catalogwriter.CredsTypeS3)
 
 	// Bucket name comes from the table prefix. iceberg-go writes the
 	// scheme as `s3://<bucket>/<warehouse-uuid>/...`; everything after
@@ -380,17 +392,7 @@ func (r *Resolver) buildS3Backend(dataPrefix, ns, tbl string) (backend.StorageBa
 // wiring lakekeeper-vended GCS credentials into a GCS storage backend.
 // Returns the backend, the VendedCreds (for observability), and any setup error.
 func (r *Resolver) buildGCSBackend(dataPrefix, ns, tbl string) (backend.StorageBackend, *catalogwriter.VendedCreds, error) {
-	tok := r.Token
-	tp := func(context.Context) (string, error) { return tok, nil }
-	vc := &catalogwriter.VendedCreds{
-		LakekeeperURL:     r.URL,
-		WarehouseName:     r.Warehouse,
-		ProjectID:         r.ProjectID,
-		Namespace:         ns,
-		Table:             tbl,
-		TokenProvider:     tp,
-		ExpectedCredsType: catalogwriter.CredsTypeGCS,
-	}
+	vc := r.newVendedCreds(ns, tbl, catalogwriter.CredsTypeGCS)
 
 	// Bucket name comes from the table prefix. lakekeeper writes the
 	// scheme as `gs://<bucket>/<warehouse-uuid>/...`; only the bucket
