@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -719,11 +720,14 @@ func TestCoalesceSplits(t *testing.T) {
 	}
 }
 
-// countingIO wraps the plane's IO loader and counts files opened and closed
-// (a file closed twice counts twice).
+// countingIO wraps the plane's IO loader: it counts files opened and closed
+// (a file closed twice counts twice) and records any Read that overlaps a
+// Close of the same file, or starts after it.
 type countingIO struct {
 	mu             sync.Mutex
 	opened, closed int
+	violations     []string
+	closes         chan struct{} // one value per file Close (non-blocking send)
 }
 
 type countingFS struct {
@@ -733,7 +737,9 @@ type countingFS struct {
 
 type countingFile struct {
 	iceio.File
-	c *countingIO
+	c      *countingIO
+	inRead atomic.Int32
+	shut   atomic.Bool
 }
 
 func (fs countingFS) Open(name string) (iceio.File, error) {
@@ -744,14 +750,41 @@ func (fs countingFS) Open(name string) (iceio.File, error) {
 	fs.c.mu.Lock()
 	fs.c.opened++
 	fs.c.mu.Unlock()
-	return countingFile{File: f, c: fs.c}, nil
+	return &countingFile{File: f, c: fs.c}, nil
 }
 
-func (f countingFile) Close() error {
+func (f *countingFile) violation(v string) {
+	f.c.mu.Lock()
+	f.c.violations = append(f.c.violations, v)
+	f.c.mu.Unlock()
+}
+
+func (f *countingFile) Read(p []byte) (int, error) {
+	if f.inRead.Add(1) != 1 {
+		f.violation("concurrent Reads")
+	}
+	defer f.inRead.Add(-1)
+	if f.shut.Load() {
+		f.violation("Read after Close")
+	}
+	time.Sleep(20 * time.Microsecond) // widen the window a racing Close could hit
+	return f.File.Read(p)
+}
+
+func (f *countingFile) Close() error {
+	if f.inRead.Load() != 0 {
+		f.violation("Close during Read")
+	}
+	f.shut.Store(true)
+	err := f.File.Close()
 	f.c.mu.Lock()
 	f.c.closed++
 	f.c.mu.Unlock()
-	return f.File.Close()
+	select {
+	case f.c.closes <- struct{}{}:
+	default:
+	}
+	return err
 }
 
 func (c *countingIO) counts() (int, int) {
@@ -760,8 +793,14 @@ func (c *countingIO) counts() (int, int) {
 	return c.opened, c.closed
 }
 
+func (c *countingIO) problems() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.violations...)
+}
+
 func countIO(p *Plane) *countingIO {
-	c := &countingIO{}
+	c := &countingIO{closes: make(chan struct{}, 64)}
 	p.loadIO = func(ctx context.Context, props map[string]string, location string) (iceio.IO, error) {
 		fsys, err := iceio.LoadFS(ctx, props, location)
 		if err != nil {
@@ -783,56 +822,115 @@ func rawPart(t *testing.T, f *tfx) (*reader, *datagateway.RawFile) {
 	return r, part.Raw
 }
 
-func TestReaderCloseClosesOpenRawBodies(t *testing.T) {
-	ends := map[string]func(*tfx, *reader){
-		"reader Close":    func(_ *tfx, r *reader) { _ = r.Close() },
-		"plane Interrupt": func(f *tfx, _ *reader) { f.p.Interrupt() },
-		"plane Close":     func(f *tfx, _ *reader) { _ = f.p.Close() },
+// openBody opens raw and reads a few bytes from it.
+func openBody(t *testing.T, raw *datagateway.RawFile) io.ReadCloser {
+	t.Helper()
+	body, err := raw.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for name, end := range ends {
+	if _, err := io.ReadFull(body, make([]byte, 8)); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	return body
+}
+
+// assertBodyClosed checks that every file opened is closed, the body no
+// longer reads, and its Close is a no-op.
+func assertBodyClosed(t *testing.T, c *countingIO, body io.ReadCloser) {
+	t.Helper()
+	if o, cl := c.counts(); o != cl {
+		t.Fatalf("files opened %d, closed %d", o, cl)
+	}
+	if _, err := body.Read(make([]byte, 8)); err == nil {
+		t.Fatal("Read on a raw body succeeded after the reader ended")
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("body Close after reader end: %v", err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("second body Close: %v", err)
+	}
+	if o, cl := c.counts(); o != cl {
+		t.Fatalf("after body Close: files opened %d, closed %d", o, cl)
+	}
+	if p := c.problems(); len(p) != 0 {
+		t.Fatalf("Read/Close violations: %v", p)
+	}
+}
+
+// Reader Close and plane Close are synchronous: when they return, every raw
+// body is closed (no waiting in the test).
+func TestReaderCloseClosesOpenRawBodies(t *testing.T) {
+	for name, end := range map[string]func(*tfx, *reader){
+		"reader Close": func(_ *tfx, r *reader) { _ = r.Close() },
+		"plane Close":  func(f *tfx, _ *reader) { _ = f.p.Close() },
+	} {
 		t.Run(name, func(t *testing.T) {
 			f := newTable(t, readSchema, morProps("2"))
 			f.addFiles(f.writeFile(0, 100, 0))
 			c := countIO(f.p)
 			r, raw := rawPart(t, f)
-			body, err := raw.Open(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			buf := make([]byte, 8)
-			if _, err := io.ReadFull(body, buf); err != nil {
-				t.Fatalf("first read: %v", err)
-			}
-			opened, closed := c.counts()
+			body := openBody(t, raw)
 			end(f, r)
-			// Interrupt / plane Close reach the bodies through the reader's
-			// lifetime context, asynchronously.
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				if o, cl := c.counts(); o-cl == opened-closed-1 {
-					break
-				}
-				if time.Now().After(deadline) {
-					o, cl := c.counts()
-					t.Fatalf("raw body's file not closed: opened %d closed %d (before end: %d/%d)", o, cl, opened, closed)
-				}
-				time.Sleep(time.Millisecond)
-			}
-			if _, err := body.Read(buf); err == nil {
-				t.Fatal("Read on a raw body succeeded after the reader ended")
-			}
-			if err := body.Close(); err != nil {
-				t.Fatalf("body Close after reader end: %v", err)
-			}
-			if err := body.Close(); err != nil {
-				t.Fatalf("second body Close: %v", err)
-			}
-			if o, cl := c.counts(); o != cl {
-				t.Fatalf("files opened %d, closed %d", o, cl)
-			}
+			assertBodyClosed(t, c, body)
 			if _, err := raw.Open(context.Background()); err == nil {
 				t.Fatal("Open after the reader ended succeeded")
 			}
+		})
+	}
+}
+
+// Interrupt closes bodies asynchronously (it returns at once by contract);
+// the test waits for the file's Close event.
+func TestInterruptClosesOpenRawBodies(t *testing.T) {
+	f := newTable(t, readSchema, morProps("2"))
+	f.addFiles(f.writeFile(0, 100, 0))
+	c := countIO(f.p)
+	_, raw := rawPart(t, f)
+	body := openBody(t, raw)
+	for len(c.closes) > 0 { // footer reads' closes
+		<-c.closes
+	}
+	f.p.Interrupt()
+	select {
+	case <-c.closes:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Interrupt did not close the open raw body")
+	}
+	assertBodyClosed(t, c, body)
+}
+
+// The asynchronous close path snapshots the bodies and stalls before closing
+// them; reader Close, plane Close and a body's own Close must still return
+// only after the file is closed.
+func TestCloseWaitsForStalledAsyncBodyClose(t *testing.T) {
+	for name, end := range map[string]func(*tfx, *reader, io.ReadCloser){
+		"reader Close": func(_ *tfx, r *reader, _ io.ReadCloser) { _ = r.Close() },
+		"plane Close":  func(f *tfx, _ *reader, _ io.ReadCloser) { _ = f.p.Close() },
+		"body Close":   func(_ *tfx, _ *reader, b io.ReadCloser) { _ = b.Close() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newTable(t, readSchema, morProps("2"))
+			f.addFiles(f.writeFile(0, 100, 0))
+			c := countIO(f.p)
+			r, raw := rawPart(t, f)
+			paused, release := make(chan struct{}), make(chan struct{})
+			r.asyncPause = func() {
+				close(paused)
+				<-release
+			}
+			body := openBody(t, raw)
+			f.p.Interrupt() // starts the asynchronous path
+			<-paused        // it holds its snapshot and has closed nothing
+			end(f, r, body)
+			if o, cl := c.counts(); o != cl {
+				close(release)
+				t.Fatalf("%s returned with a body open: files opened %d, closed %d", name, o, cl)
+			}
+			close(release)
+			r.closeBodies(false)
+			assertBodyClosed(t, c, body)
 		})
 	}
 }
@@ -899,5 +997,54 @@ func TestRawOpenRacesReaderClose(t *testing.T) {
 			t.Fatalf("iteration %d: files opened %d, closed %d", i, o, cl)
 		}
 		_ = f.p.Close()
+	}
+}
+
+// Concurrent Read loops on one body overlap the reader ending; the
+// underlying Read and Close of the file must never overlap.
+func TestRawBodyReadsRaceShutdown(t *testing.T) {
+	ends := map[string]func(*tfx, *reader, io.ReadCloser){
+		"reader Close": func(_ *tfx, r *reader, _ io.ReadCloser) { _ = r.Close() },
+		"Interrupt":    func(f *tfx, _ *reader, _ io.ReadCloser) { f.p.Interrupt() },
+		"plane Close":  func(f *tfx, _ *reader, _ io.ReadCloser) { _ = f.p.Close() },
+		"body Close":   func(_ *tfx, _ *reader, b io.ReadCloser) { _ = b.Close() },
+	}
+	for name, end := range ends {
+		t.Run(name, func(t *testing.T) {
+			for i := 0; i < 10; i++ {
+				f := newTable(t, readSchema, morProps("2"))
+				f.addFiles(f.writeFile(0, 2000, 0))
+				c := countIO(f.p)
+				r, raw := rawPart(t, f)
+				body := openBody(t, raw)
+				var wg sync.WaitGroup
+				started := make(chan struct{}, 4)
+				for range 4 {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						buf := make([]byte, 16)
+						started <- struct{}{}
+						for {
+							if _, err := body.Read(buf); errors.Is(err, errReaderClosed) {
+								return
+							}
+						}
+					}()
+				}
+				for range 4 {
+					<-started
+				}
+				end(f, r, body)
+				r.closeBodies(false) // Interrupt is asynchronous; this waits for it
+				wg.Wait()
+				if p := c.problems(); len(p) != 0 {
+					t.Fatalf("iteration %d: %v", i, p)
+				}
+				if o, cl := c.counts(); o != cl {
+					t.Fatalf("iteration %d: files opened %d, closed %d", i, o, cl)
+				}
+			}
+		})
 	}
 }

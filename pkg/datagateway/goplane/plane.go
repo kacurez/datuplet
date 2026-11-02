@@ -51,6 +51,7 @@ type Plane struct {
 	mu      sync.Mutex
 	closed  bool           // set by Close: no new writers
 	writers sync.WaitGroup // one per writer goroutine not yet exited
+	readers map[*reader]struct{}
 }
 
 // defaultCloseWait bounds Close's wait for writer upload cleanup (sink
@@ -62,7 +63,7 @@ var _ datagateway.DataPlane = (*Plane)(nil)
 // New returns a Plane.
 func New(cfg Config) *Plane {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Plane{cfg: cfg, ctx: ctx, cancel: cancel, openSink: openIOSink, loadIO: iceio.LoadFS, closeWait: defaultCloseWait}
+	return &Plane{cfg: cfg, ctx: ctx, cancel: cancel, openSink: openIOSink, loadIO: iceio.LoadFS, readers: map[*reader]struct{}{}, closeWait: defaultCloseWait}
 }
 
 // Factory builds the plane once boot validation has passed. With a
@@ -142,15 +143,26 @@ func (p *Plane) OpenTableReader(ctx context.Context, spec datagateway.ReaderSpec
 // Abort, waits for it).
 func (p *Plane) Interrupt() { p.cancel() }
 
-// Close stops admission, aborts every in-flight writer and read, and waits until every
-// writer goroutine has finished its upload cleanup (sink close, multipart
-// abort), bounded by closeWait; on timeout it logs a warning and returns.
+// Close stops admission, aborts every in-flight writer and read, closes
+// every open raw body of every reader (returning only once they are closed),
+// and waits until every writer goroutine has finished its upload cleanup
+// (sink close, multipart abort), bounded by closeWait; on timeout it logs a
+// warning and returns.
 // Safe to call more than once.
 func (p *Plane) Close() error {
 	p.mu.Lock()
 	p.closed = true
+	readers := make([]*reader, 0, len(p.readers))
+	for r := range p.readers {
+		readers = append(readers, r)
+	}
 	p.mu.Unlock()
 	p.cancel()
+	// Raw bodies are closed before Close returns (cancellation has already
+	// released any read blocked on remote storage).
+	for _, r := range readers {
+		r.closeBodies(false)
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -165,6 +177,13 @@ func (p *Plane) Close() error {
 		log.Printf("goplane: warning: writer upload cleanup still running after %s; closing anyway", p.closeWait)
 	}
 	return nil
+}
+
+// forget drops a closed (or never opened) reader from plane Close's list.
+func (p *Plane) forget(r *reader) {
+	p.mu.Lock()
+	delete(p.readers, r)
+	p.mu.Unlock()
 }
 
 // isLocalPrefix reports whether a data prefix is a local path (tests): it

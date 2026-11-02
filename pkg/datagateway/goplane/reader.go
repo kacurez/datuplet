@@ -45,6 +45,11 @@ type reader struct {
 	raw   []int8               // eligibility memo per task: 0 unknown, 1 raw, -1 decoded
 	next  int
 
+	plane *Plane
+	// asyncPause, when set (tests), runs on the asynchronous close path after
+	// it took its snapshot of bodies and before it closes them.
+	asyncPause func()
+
 	mu      sync.Mutex
 	closed  bool
 	streams map[*taskStream]struct{}
@@ -61,14 +66,17 @@ func (p *Plane) openReader(ctx context.Context, spec datagateway.ReaderSpec) (*r
 		return nil, errors.New("goplane: plane closed")
 	}
 	lctx, cancel := context.WithCancel(p.ctx)
+	r := &reader{spec: spec, loadIO: p.loadIO, ctx: lctx, cancel: cancel, streams: map[*taskStream]struct{}{},
+		bodies: map[*rawBody]struct{}{}, plane: p}
+	p.readers[r] = struct{}{}
 	p.mu.Unlock()
 
-	r := &reader{spec: spec, loadIO: p.loadIO, ctx: lctx, cancel: cancel, streams: map[*taskStream]struct{}{},
-		bodies: map[*rawBody]struct{}{}}
-	// Interrupt and plane Close end the lifetime without calling Close: open
-	// raw bodies (an *os.File ignores cancellation) are closed here too.
-	context.AfterFunc(lctx, r.closeBodies)
+	// Interrupt ends the lifetime without calling Close: open raw bodies (an
+	// *os.File ignores cancellation) are closed here too. Plane Close and
+	// reader Close also close them synchronously.
+	context.AfterFunc(lctx, func() { r.closeBodies(true) })
 	if err := r.init(ctx, p.cfg.Tables); err != nil {
+		p.forget(r)
 		cancel()
 		if r.scan != nil {
 			_ = r.scan.Close()
@@ -253,70 +261,85 @@ func (r *reader) track(b *rawBody) (io.ReadCloser, error) {
 	return b, nil
 }
 
-// closeBodies closes every tracked raw body; later reads on them fail.
-func (r *reader) closeBodies() {
+// closeBodies closes every tracked raw body and returns once each is
+// closed; later reads on them fail. Bodies stay registered until their close
+// has completed, and shut is itself a barrier (it returns only after the
+// file is closed, whichever caller closed it), so concurrent callers — the
+// asynchronous cancel path, reader Close, plane Close, a body's own Close —
+// all return only after the files are closed.
+func (r *reader) closeBodies(async bool) {
 	r.mu.Lock()
 	bodies := make([]*rawBody, 0, len(r.bodies))
 	for b := range r.bodies {
 		bodies = append(bodies, b)
 	}
-	clear(r.bodies)
 	r.mu.Unlock()
-	for _, b := range bodies {
-		b.shut()
+	if async && r.asyncPause != nil {
+		r.asyncPause()
 	}
+	for _, b := range bodies {
+		_ = b.shut()
+	}
+	r.mu.Lock()
+	for _, b := range bodies {
+		delete(r.bodies, b)
+	}
+	r.mu.Unlock()
 }
 
 // rawBody is an open raw data file. Close is idempotent; once the body or
-// its reader is closed, Read returns an error.
+// its reader is closed, Read returns an error. The underlying Read and Close
+// are serialized under ioMu (gocloud's blob.Reader is not safe for a Close
+// concurrent with a Read).
 type rawBody struct {
 	r      *reader
 	f      iceio.File
 	cancel context.CancelFunc
 
-	mu       sync.Mutex
-	closed   bool
+	ioMu     sync.Mutex
+	closed   bool // guarded by ioMu
 	closeErr error
 }
 
 func (b *rawBody) Read(p []byte) (int, error) {
-	b.mu.Lock()
-	closed := b.closed
-	b.mu.Unlock()
-	if closed {
+	b.ioMu.Lock()
+	defer b.ioMu.Unlock()
+	if b.closed {
 		return 0, errReaderClosed
 	}
 	return b.f.Read(p)
 }
 
+// Close closes the file, then untracks the body.
 func (b *rawBody) Close() error {
+	err := b.shut()
 	b.r.mu.Lock()
 	delete(b.r.bodies, b)
 	b.r.mu.Unlock()
-	return b.shut()
+	return err
 }
 
-// shut cancels the body's context (unblocking a remote read), then closes
-// the file, once.
+// shut cancels the body's context first (that releases a Read blocked on
+// remote storage; a local Read in progress just finishes), then takes the
+// I/O lock and closes the file once. It returns only after the file is
+// closed, whoever closed it.
 func (b *rawBody) shut() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.cancel()
+	b.ioMu.Lock()
+	defer b.ioMu.Unlock()
 	if !b.closed {
 		b.closed = true
-		b.cancel()
 		b.closeErr = b.f.Close()
 	}
 	return b.closeErr
 }
 
-// Close stops every in-flight read of this reader and closes every part
-// stream still open. Idempotent.
+// Close stops every in-flight read of this reader, closes every raw body
+// and part stream still open, and returns only once they are closed.
+// Idempotent; a second call also waits for the bodies.
 func (r *reader) Close() error {
 	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil
-	}
+	first := !r.closed
 	r.closed = true
 	streams := make([]*taskStream, 0, len(r.streams))
 	for s := range r.streams {
@@ -324,10 +347,14 @@ func (r *reader) Close() error {
 	}
 	r.mu.Unlock()
 	r.cancel()
-	r.closeBodies()
+	r.closeBodies(false)
 	for _, s := range streams {
 		_ = s.Close()
 	}
+	if !first {
+		return nil
+	}
+	r.plane.forget(r)
 	return r.scan.Close()
 }
 
