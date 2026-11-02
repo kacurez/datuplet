@@ -174,10 +174,14 @@ func TestPartitionBufferTriggerKeepsSumUnderBudget(t *testing.T) {
 			}
 		}
 	}
-	if enforced == 0 || bl.count("share") == 0 || bl.count("largest") == 0 || other == 0 {
-		t.Fatalf("enforced %d, share flushes %d, largest flushes %d (%d of another file): the budget never triggered every path",
-			enforced, bl.count("share"), bl.count("largest"), other)
+	// Which file is largest among equals follows map order, so a flush of a
+	// file other than the one written is not guaranteed here; the
+	// FlushErrorCleansAll and EmptyRowGroupKeepsMetrics tests force one.
+	if enforced == 0 || bl.count("share") == 0 || bl.count("largest") == 0 {
+		t.Fatalf("enforced %d, share flushes %d, largest flushes %d: the budget never triggered every path",
+			enforced, bl.count("share"), bl.count("largest"))
 	}
+	t.Logf("largest flushes of another file: %d", other)
 
 	if len(files) != 8 {
 		t.Fatalf("files = %d, want one per tuple (8)", len(files))

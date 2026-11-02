@@ -494,12 +494,13 @@ func footerMetrics(ctx context.Context, fs iceio.IO, path string, sc *iceberg.Sc
 	if err != nil {
 		return nil, 0, err
 	}
+	// Closed once, also when the reader constructor panics (the reader's
+	// Close only closes f).
+	defer f.Close()
 	rdr, err := file.NewParquetReader(f)
 	if err != nil {
-		_ = f.Close()
 		return nil, 0, err
 	}
-	defer rdr.Close()
 	md := rdr.MetaData()
 	// An encrypted file with a plaintext footer opens without keys; its
 	// footer cannot be re-serialized without an encryptor.

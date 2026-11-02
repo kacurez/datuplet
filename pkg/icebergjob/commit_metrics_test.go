@@ -1,13 +1,18 @@
 package icebergjob
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	iofs "io/fs"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -254,3 +259,67 @@ type panicIO struct{}
 
 func (panicIO) Open(string) (iceio.File, error) { panic("boom") }
 func (panicIO) Remove(string) error             { return nil }
+
+// negativeChildrenFooter is a Parquet file whose footer (Thrift compact)
+// declares a root schema element with num_children = -1; arrow-go's reader
+// constructor panics on it.
+func negativeChildrenFooter() []byte {
+	meta := []byte{
+		0x15, 0x02, // 1: version = 1
+		0x19, 0x1c, // 2: schema, list of 1 struct
+		0x48, 0x04, 'r', 'o', 'o', 't', // 4: name = "root"
+		0x15, 0x01, // 5: num_children = -1
+		0x00,       // end SchemaElement
+		0x16, 0x00, // 3: num_rows = 0
+		0x19, 0x0c, // 4: row_groups, empty list
+		0x00, // end FileMetaData
+	}
+	out := append([]byte("PAR1"), meta...)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(meta)))
+	return append(out, "PAR1"...)
+}
+
+// countingIO serves data as every file and counts closes.
+type countingIO struct {
+	data   []byte
+	closes *atomic.Int32
+}
+
+func (c countingIO) Open(name string) (iceio.File, error) {
+	return &countingFile{Reader: bytes.NewReader(c.data), closes: c.closes, size: int64(len(c.data))}, nil
+}
+func (countingIO) Remove(string) error { return nil }
+
+type countingFile struct {
+	*bytes.Reader
+	closes *atomic.Int32
+	size   int64
+}
+
+func (f *countingFile) Stat() (iofs.FileInfo, error) { return footerInfo{"f.parquet", f.size}, nil }
+func (f *countingFile) Close() error                 { f.closes.Add(1); return nil }
+
+// A reader constructor panic is recovered into an error and the opened file
+// is closed exactly once; a valid file is closed exactly once too.
+func TestFooterMetricsClosesFileOnce(t *testing.T) {
+	var closes atomic.Int32
+	df, size, err := footerMetrics(context.Background(), countingIO{data: negativeChildrenFooter(), closes: &closes}, "f.parquet", metricsIceberg, metricsProps(t))
+	if err == nil || !strings.Contains(err.Error(), "parquet footer:") || df != nil || size != 0 {
+		t.Fatalf("footerMetrics = %v, %d, %v; want nil, 0 and the recovered constructor panic", df, size, err)
+	}
+	if n := closes.Load(); n != 1 {
+		t.Fatalf("file closed %d times, want 1", n)
+	}
+
+	valid, err := os.ReadFile(writeGroups(t, "ok.parquet", idRange(0, 10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closes.Store(0)
+	if _, _, err := footerMetrics(context.Background(), countingIO{data: valid, closes: &closes}, "f.parquet", metricsIceberg, metricsProps(t)); err != nil {
+		t.Fatal(err)
+	}
+	if n := closes.Load(); n != 1 {
+		t.Fatalf("valid file closed %d times, want 1", n)
+	}
+}
