@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGatewaySubcommandFlags(t *testing.T) {
@@ -54,9 +55,19 @@ func TestGatewaySubcommandFlags(t *testing.T) {
 		}
 	})
 
+	// Boot failures are served until the hold, then exit 20 (the hold is
+	// shortened so the tests do not wait 10 minutes).
+	runShort := func(args []string) int {
+		opts, err := parseGatewayFlags(args, noEnv, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("parseGatewayFlags: %v", err)
+		}
+		opts.addr = "127.0.0.1:0"
+		return runGatewayWith(opts, noEnv, gatewayHooks{bootFailureHold: 50 * time.Millisecond, httpAddr: "127.0.0.1:0"})
+	}
+
 	t.Run("config-load failure exits 20", func(t *testing.T) {
-		// A config path that cannot be read fails before any listener binds.
-		if code := gatewayMain([]string{"--minio", "--config", t.TempDir() + "/missing.yaml"}, noEnv, &bytes.Buffer{}); code != gatewayExitApplication {
+		if code := runShort([]string{"--minio", "--config", t.TempDir() + "/missing.yaml"}); code != gatewayExitApplication {
 			t.Errorf("exit code = %d, want %d", code, gatewayExitApplication)
 		}
 	})
@@ -68,8 +79,7 @@ func TestGatewaySubcommandFlags(t *testing.T) {
 		if err := os.WriteFile(cfgPath, []byte("run_id: r1\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		args := []string{"--minio", "--config", cfgPath, "--run-token-path", dir + "/token"}
-		if code := gatewayMain(args, noEnv, &bytes.Buffer{}); code != gatewayExitApplication {
+		if code := runShort([]string{"--minio", "--config", cfgPath, "--run-token-path", dir + "/token"}); code != gatewayExitApplication {
 			t.Errorf("exit code = %d, want %d", code, gatewayExitApplication)
 		}
 	})

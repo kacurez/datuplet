@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -79,19 +80,61 @@ func parseGatewayFlags(args []string, getenv func(string) string, stderr io.Writ
 	return opts, nil
 }
 
+// gatewayBootFailureHold bounds how long a gateway whose boot failed keeps
+// serving the boot error before it exits.
+const gatewayBootFailureHold = 10 * time.Minute
+
+// gatewayHooks lets tests drive runGatewayWith without a real plane or
+// process signals. The zero value is production.
+type gatewayHooks struct {
+	// newPlane replaces goplane.Factory.
+	newPlane datagateway.DataPlaneFactory
+	// signals replaces SIGINT/SIGTERM delivery.
+	signals chan os.Signal
+	// bootFailureHold replaces gatewayBootFailureHold when non-zero.
+	bootFailureHold time.Duration
+	// httpAddr replaces the config's HTTP listen address when non-empty.
+	httpAddr string
+	// listening is called with the gRPC address once it is bound.
+	listening func(net.Addr)
+}
+
 func runGateway(opts gatewayOptions, getenv func(string) string) int {
+	return runGatewayWith(opts, getenv, gatewayHooks{})
+}
+
+// runGatewayWith listens before it boots: the component container starts with
+// this process and its SDK makes a single GetConfig call, so the gRPC listener
+// is bound first and the HTTP one as soon as the config is loaded; both hold
+// every request until boot ends. A failed boot is served as the error (gRPC
+// Unavailable / HTTP 503) until SIGTERM/SIGINT or the hold, then the gateway
+// exits 20: exiting at once would make the kubelet restart the sidecar and
+// race the component's call again.
+func runGatewayWith(opts gatewayOptions, getenv func(string) string, hooks gatewayHooks) int {
 	log.Printf("datuplet-gateway: starting %s iteration_id=%s run_id=%s",
 		datagateway.GatewayBuildInfo(), orNone(getenv("DATUPLET_ITERATION_ID")), orNone(getenv("RUN_ID")))
 
-	cfg, err := datagateway.LoadConfigFile(opts.configPath, opts.runTokenPath, opts.podAnnotationsPath)
+	// Registered before boot: the kubelet may stop the sidecar while it is
+	// still booting. A signal caught during boot is handled once boot returns.
+	sigCh := hooks.signals
+	if sigCh == nil {
+		sigCh = make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigCh)
+	}
+
+	grpcLis, err := net.Listen("tcp", opts.addr)
 	if err != nil {
-		log.Printf("datuplet-gateway: %v", err)
+		log.Printf("datuplet-gateway: listen %s: %v", opts.addr, err)
 		return gatewayExitApplication
 	}
-	if cfg.RunID == "" {
-		cfg.RunID = fmt.Sprintf("%s-%d", opts.mode, time.Now().Unix())
+	gate := datagateway.NewBootGate()
+	// Each serve goroutine sends once; buffered so neither blocks.
+	serveErr := make(chan error, 2)
+	go func() { serveErr <- gate.ServeGRPC(grpcLis) }()
+	if hooks.listening != nil {
+		hooks.listening(grpcLis.Addr())
 	}
-	cfg.ComponentName = opts.mode + "-component"
 
 	// Pyroscope continuous profiling when DATUPLET_GATEWAY_PROFILING is set.
 	if stopProfiling := datagateway.StartProfilingIfEnabled(); stopProfiling != nil {
@@ -102,23 +145,35 @@ func runGateway(opts gatewayOptions, getenv func(string) string) int {
 		}()
 	}
 
-	server, err := datagateway.NewServerV2(cfg, goplane.Factory)
+	server, err := bootGateway(opts, hooks, gate, serveErr)
 	if err != nil {
-		log.Printf("datuplet-gateway: %v", err)
+		err = datagateway.SanitizeBootError(err, opts.runTokenPath)
+		gate.Fail(err)
+		hold := gatewayBootFailureHold
+		if hooks.bootFailureHold > 0 {
+			hold = hooks.bootFailureHold
+		}
+		log.Printf("datuplet-gateway: boot failed: %v; serving the error for at most %s", err, hold)
+		timer := time.NewTimer(hold)
+		defer timer.Stop()
+		select {
+		case sig := <-sigCh:
+			log.Printf("datuplet-gateway: received %s after a failed boot; shutting down", sig)
+		case <-timer.C:
+			log.Printf("datuplet-gateway: boot error served for %s; exiting", hold)
+		case err := <-serveErr:
+			if err != nil {
+				log.Printf("datuplet-gateway: serve: %v", err)
+			}
+		}
+		gate.Stop()
 		return gatewayExitApplication
 	}
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	// ServeWithHTTP starts both gRPC (control) and HTTP (data transfer); it
-	// returns after a graceful stop (Close, or the cancel annotation).
-	errCh := make(chan error, 1)
-	go func() { errCh <- server.ServeWithHTTP(opts.addr) }()
+	gate.Ready(server)
 
 	select {
-	case err := <-errCh:
+	case err := <-serveErr:
+		// A graceful stop (the cancel annotation) or a serve failure.
 		closeGatewayServer(server)
 		if err != nil {
 			log.Printf("datuplet-gateway: serve: %v", err)
@@ -129,9 +184,39 @@ func runGateway(opts gatewayOptions, getenv func(string) string) int {
 		log.Printf("datuplet-gateway: received %s; shutting down", sig)
 		closeGatewayServer(server)
 		// Wait for Serve to return after the graceful stop so in-flight RPCs finish.
-		<-errCh
+		<-serveErr
 		return 0
 	}
+}
+
+// bootGateway loads the config, binds and serves the HTTP listener, then
+// builds the server (run-token validation, secrets, commit pool, data plane).
+func bootGateway(opts gatewayOptions, hooks gatewayHooks, gate *datagateway.BootGate, serveErr chan<- error) (*datagateway.ServerV2, error) {
+	cfg, err := datagateway.LoadConfigFile(opts.configPath, opts.runTokenPath, opts.podAnnotationsPath)
+	if err != nil {
+		return nil, err
+	}
+	if hooks.httpAddr != "" {
+		cfg.HTTPAddr = hooks.httpAddr
+	}
+	// Bound before boot completes, so a GetConfig that advertises the HTTP
+	// endpoint never points at an unbound port.
+	httpLis, err := net.Listen("tcp", cfg.HTTPListenAddr())
+	if err != nil {
+		return nil, fmt.Errorf("listen %s (HTTP): %w", cfg.HTTPListenAddr(), err)
+	}
+	go func() { serveErr <- gate.ServeDataHTTP(httpLis) }()
+
+	if cfg.RunID == "" {
+		cfg.RunID = fmt.Sprintf("%s-%d", opts.mode, time.Now().Unix())
+	}
+	cfg.ComponentName = opts.mode + "-component"
+
+	newPlane := hooks.newPlane
+	if newPlane == nil {
+		newPlane = goplane.Factory
+	}
+	return datagateway.NewServerV2(cfg, newPlane)
 }
 
 func closeGatewayServer(server *datagateway.ServerV2) {
