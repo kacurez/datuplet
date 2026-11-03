@@ -13,8 +13,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   v3 tables are supported (the gateway assigns each file's `first_row_id`),
   and reads apply v3 deletion vectors. Existing v2 tables stay v2.
 - **VARIANT columns.** Declare an output column with `type: variant` in
-  `columns` (v3 tables only). Values are stored unshredded and served as JSON
-  text in every read format; storage preview shows them as JSON.
+  `columns` (v3 tables only). Values are stored unshredded. `FORMAT_PARQUET`
+  reads return a real VARIANT; the other read formats and storage preview
+  serve them as JSON.
 - **Read-only catalog proxy in the query engine.** `query-worker` and
   `datuplet-query` reach Lakekeeper through an in-process loopback proxy that
   allows only GET/HEAD and refuses every other catalog request, so user SQL
