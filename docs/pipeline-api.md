@@ -156,7 +156,8 @@ parses. Objects, arrays, numbers and `null` are stored as-is. Boolean values
 fail the run as a type violation (exit code 1, the message names the column
 as `string`). Plain string values (`"hello"`) fail the write as invalid JSON.
 Strings that look like numbers or booleans (`"42"`, `"true"`) are stored as
-the parsed JSON value (the number `42`, the boolean `true`), not as a string.
+the parsed JSON value (the number `42`, the boolean `true`), not as a string,
+and the string `"null"` becomes SQL NULL.
 Components that write Arrow or Parquet variant, or JSON-quoted text, are not
 affected.
 

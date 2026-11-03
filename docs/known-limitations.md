@@ -91,9 +91,9 @@ to the edited model when the sentinel is missing. See
 enforces DSL→version coupling within `datuplet-app` (the `fga-version-check` workflow)
 **and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4).
 
-**Upgrade support statement (0.x).** Upgrades are tested for exactly one
-hop — latest published release → next.
-Skipping releases is best-effort. Upgrades are forward-only: `upgrade.sh`
+**Upgrade support statement (0.x).** There is no in-place upgrade path to
+this release: it moves to Lakekeeper v0.14.2, OpenFGA v1.22.1 and FGA model
+4.13, so it needs a fresh install. Upgrades are forward-only: `upgrade.sh`
 uses no `--atomic` and there is no rollback path for hook Jobs, CRD
 applies, or DB migrations — recovery is fix-and-re-run. See
 [docs/dependency-upgrades.md](dependency-upgrades.md) for the per-dependency

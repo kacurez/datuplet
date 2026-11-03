@@ -112,15 +112,14 @@ it is idempotent and safe to re-run.
 
 ## Upgrade
 
-Upgrade phases independently based on what changed:
+This release has no in-place upgrade path: it moves to Lakekeeper v0.14.2,
+OpenFGA v1.22.1 and FGA model 4.13, so it needs a fresh install.
+
+`upgrade.sh` re-applies a Datuplet release (Phase 3 only). It applies the
+chart's CRDs first (helm never upgrades crds/), then upgrades datuplet-app:
 
 ```bash
-# The common case — a Datuplet release (Phase 3 only). Applies the chart's
-# CRDs first (helm never upgrades crds/), then upgrades datuplet-app:
 ./scripts/upgrade.sh --namespace datuplet --phase app
-
-# Everything (dependency bumps):
-./scripts/upgrade.sh --namespace datuplet --phase all
 ```
 
 Upgrades are **forward-only**: no `--atomic`, no `helm rollback` (hook
