@@ -12,6 +12,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
@@ -153,6 +154,11 @@ func (a *JSONAdapter) Serialize(record arrow.Record) ([]byte, error) {
 	return json.Marshal(objects)
 }
 
+// failedValue makes json.Marshal fail with err instead of emitting a value.
+type failedValue struct{ err error }
+
+func (f failedValue) MarshalJSON() ([]byte, error) { return nil, f.err }
+
 // extractColumnValue extracts a typed value from an Arrow column.
 func extractColumnValue(col arrow.Array, idx int) any {
 	switch arr := col.(type) {
@@ -184,6 +190,12 @@ func extractColumnValue(col arrow.Array, idx int) any {
 		return days.ToTime().Format("2006-01-02")
 	case *array.Binary:
 		return string(arr.Value(idx))
+	case *extensions.VariantArray:
+		b, err := VariantJSON(arr, idx)
+		if err != nil {
+			return failedValue{err}
+		}
+		return json.RawMessage(b)
 	default:
 		return nil
 	}

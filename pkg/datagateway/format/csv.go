@@ -196,7 +196,17 @@ func (a *CSVAdapter) Serialize(record arrow.Record) ([]byte, error) {
 	for rowIdx := 0; rowIdx < numRows; rowIdx++ {
 		for colIdx := 0; colIdx < numCols; colIdx++ {
 			col := record.Column(colIdx)
-			if col.IsNull(rowIdx) {
+			if va, ok := col.(*extensions.VariantArray); ok {
+				if IsSQLNullVariant(va, rowIdx) {
+					row[colIdx] = a.serializeOpts.NullString
+				} else {
+					b, err := VariantJSON(va, rowIdx)
+					if err != nil {
+						return nil, fmt.Errorf("CSV row %d, column %d: %w", rowIdx, colIdx, err)
+					}
+					row[colIdx] = string(b)
+				}
+			} else if col.IsNull(rowIdx) {
 				row[colIdx] = a.serializeOpts.NullString
 			} else {
 				row[colIdx] = formatColumnValue(col, rowIdx)

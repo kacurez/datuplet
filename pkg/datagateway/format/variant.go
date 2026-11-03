@@ -104,3 +104,23 @@ func appendVariantFromInterface(b *extensions.VariantBuilder, value any) error {
 	}
 	return appendVariantJSONText(b, data)
 }
+
+// VariantJSON renders row i of a variant array as JSON text; the value's
+// numbers are written exactly. A SQL NULL row is the caller's to detect
+// (arr.Storage().IsNull(i)); a variant JSON null renders as null.
+func VariantJSON(arr *extensions.VariantArray, i int) ([]byte, error) {
+	if arr.IsNull(i) {
+		return []byte("null"), nil
+	}
+	v, err := arr.Value(i)
+	if err != nil {
+		return nil, fmt.Errorf("row %d: %w", i, err)
+	}
+	return v.MarshalJSON()
+}
+
+// IsSQLNullVariant reports whether row i of arr is SQL NULL, as opposed to a
+// variant JSON null.
+func IsSQLNullVariant(arr *extensions.VariantArray, i int) bool {
+	return arr.Storage().IsNull(i)
+}

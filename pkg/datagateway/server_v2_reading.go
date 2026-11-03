@@ -177,7 +177,8 @@ func (s *ServerV2) OpenReader(ctx context.Context, req *pb.OpenReaderRequest) (*
 }
 
 // arrowSchemaToProto describes a plane reader's schema; a column whose Arrow
-// type has no gateway type is reported as string. FieldId and Nullable are
+// type has no gateway type, or is a variant (the frozen SDK has no variant
+// type), is reported as string. FieldId and Nullable are
 // not catalog-sourced on this path: FieldId is 0 (unknown; the Iceberg field
 // ids are not read) and Nullable is the plane's Arrow flag, not the Iceberg
 // required flag.
@@ -186,6 +187,9 @@ func arrowSchemaToProto(sch *arrow.Schema) *pb.Schema {
 	for i, f := range sch.Fields() {
 		dt, err := schema.FromArrowType(f.Type)
 		if err != nil {
+			dt = schema.TypeString
+		}
+		if dt == schema.TypeVariant {
 			dt = schema.TypeString
 		}
 		out.Columns[i] = &pb.ColumnDef{Name: f.Name, Type: dt.String(), Nullable: f.Nullable}

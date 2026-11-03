@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
@@ -109,6 +110,14 @@ func castToWire(rec arrow.RecordBatch, wire *arrow.Schema, mem memory.Allocator)
 			cols[i] = col
 			continue
 		}
+		if va, ok := col.(*extensions.VariantArray); ok {
+			c, err := variantToJSONText(va, mem)
+			if err != nil {
+				return nil, fmt.Errorf("cast column %q from %s to %s: %w", f.Name, col.DataType(), f.Type, err)
+			}
+			cols[i] = c
+			continue
+		}
 		c, err := compute.CastArray(ctx, col, wireCastOptions(f.Type))
 		if err != nil {
 			return nil, fmt.Errorf("cast column %q from %s to %s: %w", f.Name, col.DataType(), f.Type, err)
@@ -118,6 +127,26 @@ func castToWire(rec arrow.RecordBatch, wire *arrow.Schema, mem memory.Allocator)
 	return array.NewRecordBatch(wire, cols, rec.NumRows()), nil
 }
 
+// variantToJSONText renders a variant column as utf8 JSON text: SQL NULL
+// stays null, a variant JSON null becomes the text null.
+func variantToJSONText(va *extensions.VariantArray, mem memory.Allocator) (arrow.Array, error) {
+	b := array.NewStringBuilder(mem)
+	defer b.Release()
+	b.Reserve(va.Len())
+	for i := 0; i < va.Len(); i++ {
+		if format.IsSQLNullVariant(va, i) {
+			b.AppendNull()
+			continue
+		}
+		text, err := format.VariantJSON(va, i)
+		if err != nil {
+			return nil, err
+		}
+		b.Append(string(text))
+	}
+	return b.NewArray(), nil
+}
+
 // checkWireCasts fails when a column of sch has no cast to its type in wire.
 func checkWireCasts(sch, wire *arrow.Schema) error {
 	if sch.NumFields() != wire.NumFields() {
@@ -125,7 +154,16 @@ func checkWireCasts(sch, wire *arrow.Schema) error {
 	}
 	for i, f := range sch.Fields() {
 		to := wire.Field(i).Type
-		if arrow.TypeEqual(f.Type, to) || compute.CanCast(f.Type, to) {
+		if arrow.TypeEqual(f.Type, to) {
+			continue
+		}
+		if _, ok := f.Type.(*extensions.VariantType); ok {
+			if to.ID() == arrow.STRING {
+				continue
+			}
+			return fmt.Errorf("column %q: type %s has no cast to the SDK wire type %s", f.Name, f.Type, to)
+		}
+		if compute.CanCast(f.Type, to) {
 			continue
 		}
 		return fmt.Errorf("column %q: type %s has no cast to the SDK wire type %s", f.Name, f.Type, to)
