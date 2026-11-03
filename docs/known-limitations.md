@@ -92,7 +92,7 @@ enforces DSL→version coupling within `datuplet-app` (the `fga-version-check` w
 **and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4).
 
 **Upgrade support statement (0.x).** Upgrades are tested for exactly one
-hop — latest published release → next (the `upgrade-e2e` workflow).
+hop — latest published release → next.
 Skipping releases is best-effort. Upgrades are forward-only: `upgrade.sh`
 uses no `--atomic` and there is no rollback path for hook Jobs, CRD
 applies, or DB migrations — recovery is fix-and-re-run. See

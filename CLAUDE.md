@@ -93,8 +93,7 @@ OrbStack dev loop (namespace `datuplet`; `K8S_NS=datuplet-e2e` retargets):
 
 Not in PR CI, so run them yourself before a PR: `deadcode` and the chart
 golden-render diff (both only in `make lint`), and the OpenFGA integration
-test. The e2e suite runs in `e2e.yml` on the same triggers; `upgrade-e2e.yml`
-runs on pushes to `main`, label-gated PRs, or manual dispatch;
+test. The e2e suite runs in `e2e.yml` on the same triggers;
 `fga-version-check.yml` fires only on FGA model/values changes;
 `release*.yml` is maintainer territory.
 
