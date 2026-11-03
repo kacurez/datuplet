@@ -174,7 +174,7 @@ We benefit from concurrent commits now returning 409 instead of 503, which `Retr
 | `FORMAT_JSON` / `FORMAT_JSONL` | The JSON value embedded as JSON, not as a quoted string |
 | `FORMAT_CSV` | JSON text |
 
-`checkWireCasts` does not rely on `compute.CanCast` for variant, which reports true but fails at run time. It renders through `VariantArray.Value(i).MarshalJSON()`.
+`checkWireCasts` does not rely on `compute.CanCast` for variant, which reports true but fails at run time. It renders through `format.VariantJSON`, our own renderer, not `VariantArray.Value(i).MarshalJSON()`. Two accepted differences from the library renderer: zone-less timestamps and times render as zone-less UTC wall clock, and JSON/JSONL output does not HTML-escape `<`, `>` or `&`.
 
 sql-transform reads its inputs as `FORMAT_PARQUET`, so it gets real VARIANT columns, raw or decoded.
 

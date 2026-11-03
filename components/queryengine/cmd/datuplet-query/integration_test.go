@@ -257,7 +257,7 @@ func (f *fixture) teardown() { removeLeftovers() }
 
 func removeLeftovers() {
 	for _, name := range []string{"dq-it-lk", "dq-it-lk-migrate", "dq-it-minio", "dq-it-pg", "dq-it-mc"} {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", "-v", name).Run()
 	}
 }
 

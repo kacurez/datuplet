@@ -102,7 +102,7 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 
 func removeContainers() {
 	for _, name := range fixtureContainers {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", "-v", name).Run()
 	}
 }
 

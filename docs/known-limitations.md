@@ -175,10 +175,42 @@ is always written with its own current spec. Changing `partition_fields` on an
 existing table only logs a warning naming both specs (FULL_LOAD replaces files,
 not the table); drop the table to change its partitioning.
 
-**Partitioned writes to format-version 3 tables are rejected.** iceberg-go
-v0.7.0 requires `first_row_id` on every v3 data file it adds, which the gateway
-cannot assign, so such a table fails the writer with InvalidArgument.
-Unpartitioned v3 tables are written as before.
+**Iceberg v3 is the default for new tables.** The gateway creates every new
+table as format-version 3, and Lakekeeper warehouses default to v3. Existing v2
+tables are loaded and written as they are. v3 readers see deletion vectors as
+deletes, so a file with one is decoded rather than served raw (see M5c below).
+
+**Partitioned v3 commits need `commit.retry.num-retries` of 0.** The gateway
+assigns each file's `first_row_id` itself; iceberg-go's internal commit retry
+would not re-base those values and row-id ranges could overlap. Gateway-created
+tables set the property to 0. A partitioned v3 table with a larger value fails
+the writer at resolve with InvalidArgument, and a value set between resolve and
+commit fails the commit (FailedApplication, not retried). Set it back to 0.
+
+**VARIANT columns.** Declare them with `type: variant` in the output `columns`
+(see [pipeline-api.md](pipeline-api.md#raw-json-into-variant)).
+- Stored unshredded, v3 tables only, and not usable as a partition source. The
+  column has no column metrics (iceberg-go `AddFiles` skips variant stats).
+- Text input is parsed as one strict JSON value. A JSON `null` and the text
+  `"null"` both become SQL NULL, as do the CSV null tokens (`""`, `NA`, `N/A`,
+  `None`, `nil`, `\N`). A variant null arriving as Arrow/Parquet stays a variant
+  null.
+- Integer and decimal literals keep their exact value up to 38 significant
+  digits; more than 38 significant or fractional digits fails the write naming
+  the row and column. Exponent literals (`1.5e300`) are stored as double and can
+  lose precision; `-0.0` loses its sign.
+- JSON decoding keeps exact number text, so nested JSON in a *string* column
+  also keeps `1.0` as `1.0` and large integers exact.
+- If a concurrent create gives the table a variant column this writer did not
+  declare, the write fails with InvalidArgument / HTTP 400 naming the column.
+  Declare the column (or re-`OpenWriter`).
+- Reads render a variant as JSON text (Arrow IPC, CSV) or embedded JSON (JSON,
+  JSONL); `FORMAT_PARQUET` returns a real VARIANT.
+- Queries return a clear error for a top-level VARIANT or JSON result column;
+  use `col::JSON::VARCHAR`. Nested ones (`STRUCT(a VARIANT)`, `VARIANT[]`,
+  `JSON[]`) still get the driver's opaque error or `map[...]` text. Storage
+  preview does the cast itself and loads the table schema first, so a missing
+  table is a 404.
 
 **Open partition files cost memory.** A partitioned table writer keeps up to
 `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` files open (default 16, 1-1024). Without

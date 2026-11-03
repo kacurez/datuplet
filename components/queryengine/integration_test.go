@@ -295,13 +295,13 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 
 func (f *fixture) teardown() {
 	for _, name := range []string{"qe-it-lk", "qe-it-lk-migrate", "qe-it-minio", "qe-it-pg", "qe-it-mc"} {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", "-v", name).Run()
 	}
 }
 
 func removeLeftovers() {
 	for _, name := range []string{"qe-it-lk", "qe-it-lk-migrate", "qe-it-minio", "qe-it-pg", "qe-it-mc"} {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", "-v", name).Run()
 	}
 }
 

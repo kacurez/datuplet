@@ -81,8 +81,7 @@ func runLockdownDenyIntegration(ctx context.Context, t *testing.T, e *engine, en
 	// The ad-hoc query surface is read-only by product definition, so
 	// attachCatalog attaches lk READ_ONLY and DuckDB refuses these writes before
 	// any catalog write request (binding the scan still reads catalog metadata
-	// and storage). These assertions await a live run (they need the fixture
-	// images); until then they are compile-checked only. Defence in depth:
+	// and storage). Defence in depth:
 	// lakekeeper's FGA grant stays the per-principal authorization of record (a
 	// viewer is vended read-only STS and lakekeeper rejects its commits). The
 	// fixture runs authorization=allowall and vends read-WRITE credentials, so a
