@@ -319,6 +319,8 @@ longer returned.
 
 **Statically linked `tpch`/`tpcds` are reachable post-lock.** DuckDB 2.0.0 links the benchmark generators into the engine (`dbgen`, `dsdgen`, `tpch_queries()`, `tpcds_queries()`). The generators write into the CURRENT catalog, which is the attached lakekeeper catalog; because it is attached read-only, `CALL dbgen()` / `dsdgen()` against it fail before any catalog write request (binding may still read catalog metadata). Aimed at the in-memory `memory` catalog they still generate data in RAM, bounded by `memory_limit` and the request timeout; a statically linked extension has no runtime off-switch. `TestStaticallyLinkedExtensions` pins the exact set of statically linked extensions that `duckdb_extensions()` lists, and `TestLockdownDenyAttachedReadOnly` proves the refusal. That pin cannot see everything `libduckdb` links: v0.20000.0 links and registers nine components, and the two capability-style ones, `duckdb_httplib` and `duckdb_loadable_extensions`, are never listed by `duckdb_extensions()` and no API exposes them, so a change to them on a bindings bump goes unnoticed by the test.
 
+**A refused `iceberg_rewrite_data_files` can leave orphan files.** The engine's read-only catalog proxy refuses the commit, so table state never changes, but the extension writes manifests and a manifest list before committing and does not delete them on failure. For a principal with read-write vended credentials (editor and above) a rewrite attempt therefore leaves unreferenced metadata files in the table's storage prefix; a viewer's read-only credentials cannot write them.
+
 ---
 
 ## Pipeline config (schema-first, RFC 027)

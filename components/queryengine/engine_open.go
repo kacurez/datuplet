@@ -30,6 +30,9 @@ type engine struct {
 	// running untrusted user SQL against a half-applied or unlocked posture
 	// is forbidden.
 	locked bool
+	// catalogProxy is the read-only loopback catalog proxy attachCatalog
+	// started; Close shuts it down.
+	catalogProxy *readOnlyCatalogProxy
 }
 
 // defaultTimeout is the floor applied when Request.Timeout is unset or
@@ -148,6 +151,9 @@ func (e *engine) Close() error {
 	}
 	if e.db != nil {
 		errs = append(errs, e.db.Close())
+	}
+	if e.catalogProxy != nil {
+		errs = append(errs, e.catalogProxy.Close())
 	}
 	return errors.Join(errs...)
 }

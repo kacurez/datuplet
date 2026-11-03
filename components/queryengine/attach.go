@@ -133,18 +133,32 @@ func attachCatalog(ctx context.Context, e *engine, r Request) error {
 	// stage-create and /v1/transactions/commit endpoints on the locked engine.
 	// TestLockdownDenyAttachedReadOnly proves exactly its listed statements
 	// against a fake catalog; UPDATE/DELETE/iceberg_rewrite_data_files are only
-	// asserted by the integration test. This is defence in depth: lakekeeper's
-	// FGA grant and the vended credentials remain the authorization of record.
+	// asserted by the integration test.
+	//
+	// READ_ONLY alone is not enough: an extension function whose bind never
+	// registers a DB modification skips DuckDB's read-only check —
+	// iceberg_rewrite_data_files (duckdb-iceberg 4c0c0874) commits a replace
+	// snapshot on a READ_ONLY attach. So lk attaches through an in-process
+	// loopback proxy that refuses every catalog write request (catalog_proxy.go);
+	// enforcement is the proxy plus READ_ONLY. This is defence in depth:
+	// lakekeeper's FGA grant and the vended credentials remain the authorization
+	// of record.
+	proxy, err := startReadOnlyCatalogProxy(r.LakekeeperURL)
+	if err != nil {
+		return fmt.Errorf("start read-only catalog proxy: %w", err)
+	}
+	e.catalogProxy = proxy
 	attach := fmt.Sprintf(
 		"ATTACH '%s' AS %s (TYPE ICEBERG, URI '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials', READ_ONLY)",
-		escapeSQL(r.Warehouse), catalogAlias, escapeSQL(r.LakekeeperURL), catalogSecretName,
+		escapeSQL(r.Warehouse), catalogAlias, escapeSQL(proxy.url), catalogSecretName,
 	)
 	if _, err := e.conn.ExecContext(ctx, attach); err != nil {
 		// The ATTACH text carries no secret (the JWT lives in the secret, not
 		// here), but the underlying error CAN echo the endpoint/warehouse,
 		// which is fine to surface. Keep the statement text out anyway to avoid
-		// any future drift where a literal becomes sensitive.
-		return fmt.Errorf("ATTACH catalog %s: %w", catalogAlias, err)
+		// any future drift where a literal becomes sensitive. The error names
+		// the loopback proxy, so name the real catalog too.
+		return fmt.Errorf("ATTACH catalog %s (via read-only proxy to %s): %w", catalogAlias, r.LakekeeperURL, err)
 	}
 
 	// Name resolution (Spike 0.1 §4): `USE lk` alone FAILS — an iceberg catalog

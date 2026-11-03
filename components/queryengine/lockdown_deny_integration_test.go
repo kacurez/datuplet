@@ -77,6 +77,7 @@ func runLockdownDenyIntegration(ctx context.Context, t *testing.T, e *engine, en
 	}
 
 	// --- iceberg WRITE paths must be refused by the READ_ONLY attach --------
+	// (or, for iceberg_rewrite_data_files, by the read-only catalog proxy)
 	// The ad-hoc query surface is read-only by product definition, so
 	// attachCatalog attaches lk READ_ONLY and DuckDB refuses these writes before
 	// any catalog write request (binding the scan still reads catalog metadata
@@ -97,9 +98,23 @@ func runLockdownDenyIntegration(ctx context.Context, t *testing.T, e *engine, en
 	}
 	for _, p := range writes {
 		t.Run("iceberg-write/"+p.name, func(t *testing.T) {
+			before := postsSnapshots(ctx, t, e)
 			_, err := e.conn.ExecContext(ctx, p.stmt)
 			if err == nil {
 				t.Fatalf("SECURITY HOLE: %q SUCCEEDED on the read-only attached catalog.\n  stmt: %s", p.name, p.stmt)
+			}
+			if after := postsSnapshots(ctx, t, e); after != before {
+				t.Fatalf("SECURITY HOLE: %q failed but changed qe.posts snapshots: %s -> %s", p.name, before, after)
+			}
+			// iceberg_rewrite_data_files never registers a DB modification at
+			// bind (duckdb-iceberg 4c0c0874), so the READ_ONLY attach does not
+			// fire; the read-only catalog proxy refuses its commit instead.
+			if p.name == "iceberg_rewrite_data_files" {
+				if !strings.Contains(err.Error(), catalogWriteRefused) {
+					t.Fatalf("%q must be refused by the read-only catalog proxy, got: %v", p.name, err)
+				}
+				t.Logf("refused by the read-only catalog proxy: %v", err)
+				return
 			}
 			if !readOnlyDeny.MatchString(err.Error()) {
 				t.Fatalf("%q must be refused by the READ_ONLY attach, got a different error: %v", p.name, err)
@@ -124,4 +139,17 @@ func runLockdownDenyIntegration(ctx context.Context, t *testing.T, e *engine, en
 			len(entries), names)
 	}
 	t.Logf("invariant holds: engine temp dir %q is file-free after all iceberg probes", engineTempDir)
+}
+
+// postsSnapshots renders qe.posts' snapshot list as read through the attached
+// catalog, so a refused write can be shown to leave table state unchanged.
+func postsSnapshots(ctx context.Context, t *testing.T, e *engine) string {
+	t.Helper()
+	var s string
+	if err := e.conn.QueryRowContext(ctx,
+		`SELECT string_agg(snapshot_id::VARCHAR, ',' ORDER BY sequence_number) FROM iceberg_snapshots('lk.qe.posts')`,
+	).Scan(&s); err != nil {
+		t.Fatalf("read qe.posts snapshots: %v", err)
+	}
+	return s
 }
