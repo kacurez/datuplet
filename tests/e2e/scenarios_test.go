@@ -40,6 +40,7 @@ import (
 	"github.com/apache/iceberg-go"
 
 	gatewaypb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
+	"github.com/datuplet/datuplet/pkg/pipeline/config"
 	"github.com/datuplet/datuplet/tests/e2e/framework"
 )
 
@@ -232,6 +233,10 @@ func TestV3VariantPartitioned(t *testing.T) {
 		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 	framework.RequireDuckDBV2(t)
+	// Resolved before any run: these helpers may skip, and a skip after the
+	// runs would hide the delete / decoded-file assertions.
+	adminSession, queryPID := getAdminSession(t), getQueryProjectID(t)
+	assertSameTransformSQL(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
@@ -266,11 +271,20 @@ func TestV3VariantPartitioned(t *testing.T) {
 
 	framework.AssertIcebergTable(t, target, rawNS, "events", 3, []string{"identity(category)", "bucket[4](id)"})
 	framework.AssertIcebergTable(t, target, outNS, "events_out", 3, nil)
+	framework.AssertIcebergColumnTypes(t, target, rawNS, "events", map[string]iceberg.Type{
+		"category": iceberg.PrimitiveTypes.String,
+		"id":       iceberg.PrimitiveTypes.Int64,
+		"payload":  iceberg.VariantType{},
+	})
+	framework.AssertIcebergColumnTypes(t, target, outNS, "events_out", map[string]iceberg.Type{
+		"payload": iceberg.VariantType{},
+		"derived": iceberg.VariantType{},
+	})
 	framework.AssertVariantJSON(t, target, rawNS, "events", "payload", payloads)
 	framework.AssertVariantJSON(t, target, outNS, "events_out", "payload", payloads)
 	framework.AssertVariantJSON(t, target, outNS, "events_out", "derived", derived)
 
-	assertVariantPreview(t, ctx, rawNS, "events", payloads)
+	assertVariantPreview(t, ctx, adminSession, queryPID, rawNS, "events", payloads)
 	assertGatewayJSONRead(t, ctx, kb, rawNS, "events", payloads)
 
 	// id 2 shares the (alpha, bucket 0) file with id 1, so the delete leaves
@@ -310,6 +324,40 @@ func TestV3VariantPartitioned(t *testing.T) {
 	framework.AssertVariantJSON(t, target, outNS, "events_out", "derived", derived)
 }
 
+// assertSameTransformSQL checks that the rendered v3-variant.yaml and
+// v3-variant-rerun.yaml carry byte-equal transform-stage SQL, so the re-run
+// repeats exactly the first run's transform.
+func assertSameTransformSQL(t *testing.T) {
+	t.Helper()
+	sqlOf := func(fixture string) string {
+		rendered, err := framework.RenderPipeline(filepath.Join("pipelines", "k8s", fixture), framework.TemplateVars{RunPrefix: runPrefix})
+		if err != nil {
+			t.Fatalf("render %s: %v", fixture, err)
+		}
+		defer os.Remove(rendered)
+		raw, err := os.ReadFile(rendered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc, err := config.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", fixture, err)
+		}
+		for _, st := range doc.Stages {
+			if st.Name == "transform" && len(st.Components) == 1 {
+				if sql, ok := st.Components[0].Config["sql"].(string); ok && sql != "" {
+					return sql
+				}
+			}
+		}
+		t.Fatalf("%s: no transform stage with a single component carrying config.sql", fixture)
+		return ""
+	}
+	if a, b := sqlOf("v3-variant.yaml"), sqlOf("v3-variant-rerun.yaml"); a != b {
+		t.Fatalf("transform SQL differs between v3-variant.yaml and v3-variant-rerun.yaml:\n%s\n---\n%s", a, b)
+	}
+}
+
 // loadVariantFixture returns the fixture's payloads and the transform's
 // expected derived values ({"id", "category"}), keyed by id, as exact JSON.
 func loadVariantFixture(t *testing.T) (payloads, derived map[int64]any) {
@@ -340,9 +388,9 @@ func loadVariantFixture(t *testing.T) (payloads, derived map[int64]any) {
 
 // assertVariantPreview checks that the query-worker storage preview returns
 // the payload column as JSON text equal to want.
-func assertVariantPreview(t *testing.T, ctx context.Context, ns, table string, want map[int64]any) {
+func assertVariantPreview(t *testing.T, ctx context.Context, session, pid, ns, table string, want map[int64]any) {
 	t.Helper()
-	status, body, err := storageGETPreview(ctx, getAdminSession(t), getQueryProjectID(t), ns, table)
+	status, body, err := storageGETPreview(ctx, session, pid, ns, table)
 	if err != nil {
 		t.Fatalf("storage preview %s.%s: %v", ns, table, err)
 	}

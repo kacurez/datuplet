@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/apache/iceberg-go"
 )
 
 // QueryTarget describes how to reach Iceberg tables for assertions.
@@ -315,5 +317,31 @@ func AssertIcebergTable(t *testing.T, target QueryTarget, bucket, table string, 
 	}
 	if !reflect.DeepEqual(got, wantPartition) {
 		t.Errorf("%s/%s: partition spec %v, want %v", bucket, table, got, wantPartition)
+	}
+}
+
+// AssertIcebergColumnTypes checks that bucket.table's current schema has each
+// named column with exactly the given Iceberg type (e.g. iceberg.VariantType{}),
+// so a variant that came back as a string column fails.
+func AssertIcebergColumnTypes(t *testing.T, target QueryTarget, bucket, table string, want map[string]iceberg.Type) {
+	t.Helper()
+	if target.Resolver == nil {
+		t.Fatalf("AssertIcebergColumnTypes %s/%s: query target has no lakekeeper resolver", bucket, table)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tbl, err := target.Resolver.LoadTable(ctx, bucket, table)
+	if err != nil {
+		t.Fatalf("load %s/%s: %v", bucket, table, err)
+	}
+	for name, wantType := range want {
+		f, ok := tbl.Schema().FindFieldByName(name)
+		if !ok {
+			t.Errorf("%s/%s: no column %q in schema %s", bucket, table, name, tbl.Schema())
+			continue
+		}
+		if !f.Type.Equals(wantType) {
+			t.Errorf("%s/%s: column %q is %s, want %s", bucket, table, name, f.Type, wantType)
+		}
 	}
 }
