@@ -3,7 +3,10 @@ package format
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -84,7 +87,10 @@ func appendVariantJSONText(b *extensions.VariantBuilder, text []byte) error {
 	if err := json.Unmarshal(text, &raw); err != nil {
 		return fmt.Errorf("invalid JSON for variant: %w", err)
 	}
-	v, err := variant.ParseJSONBytes(raw, false)
+	if err := checkVariantNumbers(raw); err != nil {
+		return err
+	}
+	v, err := parseVariantJSON(raw)
 	if err != nil {
 		return fmt.Errorf("invalid JSON for variant: %w", err)
 	}
@@ -94,6 +100,48 @@ func appendVariantJSONText(b *extensions.VariantBuilder, text []byte) error {
 	}
 	b.Append(v)
 	return nil
+}
+
+// maxVariantDecimalDigits is the precision of the variant decimal16 type.
+const maxVariantDecimalDigits = 38
+
+// checkVariantNumbers rejects an integer or decimal literal anywhere in the
+// JSON value raw whose significant digits (leading zeros not counted) or
+// fractional digits exceed 38: arrow-go v18.8.0's ParseJSONBytes panics on
+// some of them (decimal128 FitsInPrecision) and turns others into doubles.
+// Exponent literals are left to ParseJSONBytes (they become doubles).
+func checkVariantNumbers(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("invalid JSON for variant: %w", err)
+		}
+		n, ok := tok.(json.Number)
+		if !ok || strings.ContainsAny(string(n), "eE") {
+			continue
+		}
+		intPart, frac, _ := strings.Cut(strings.TrimPrefix(string(n), "-"), ".")
+		digits := strings.TrimLeft(intPart+frac, "0")
+		if len(digits) > maxVariantDecimalDigits || len(frac) > maxVariantDecimalDigits {
+			return fmt.Errorf("invalid JSON for variant: number %s exceeds %d digits of precision", n, maxVariantDecimalDigits)
+		}
+	}
+}
+
+// parseVariantJSON is variant.ParseJSONBytes with a panic turned into an
+// error, so no input can crash the gateway.
+func parseVariantJSON(raw []byte) (v variant.Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("variant parse failed: %v", r)
+		}
+	}()
+	return variant.ParseJSONBytes(raw, false)
 }
 
 // appendVariantFromInterface appends a JSON-native value (decoded with

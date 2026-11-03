@@ -283,3 +283,95 @@ func TestVariantNormalizesEveryLayout(t *testing.T) {
 		}
 	})
 }
+
+// Number literals beyond 38 digits of precision are rejected with an error
+// (arrow-go v18.8.0's ParseJSONBytes panics on some and turns others into
+// doubles); 38 digits are exact; exponent forms behave as before. Text,
+// CSV and JSON-native paths alike.
+func TestVariantNumberPrecision(t *testing.T) {
+	d38 := strings.Repeat("9", 38)
+	rejected := []string{
+		"1" + strings.Repeat("0", 38),       // panicked in arrow-go
+		"0." + strings.Repeat("1", 39),      // panicked
+		"[" + strings.Repeat("1", 39) + "]", // panicked, nested
+		`{"a":{"b":[1,` + "1" + strings.Repeat("0", 38) + `]}}`,
+		"0." + strings.Repeat("0", 40) + "1", // scale beyond 38, panicked
+		strings.Repeat("9", 39),              // used to become a double
+		"-" + strings.Repeat("1", 40),        // used to become a double
+		"1." + strings.Repeat("0", 38),       // trailing fractional zeros count
+	}
+	accepted := map[string]string{
+		d38:                              d38,
+		"-" + d38:                        "-" + d38,
+		"0." + strings.Repeat("1", 38):   "0." + strings.Repeat("1", 38),
+		"0.00" + strings.Repeat("1", 36): "0.00" + strings.Repeat("1", 36), // leading zeros are not significant
+		"1." + strings.Repeat("0", 37):   "1." + strings.Repeat("0", 37),
+		"1.5e300":                        "1.5e+300",
+		"[1.5e300]":                      "[1.5e+300]",
+		"-0":                             "0",
+	}
+
+	b := extensions.NewVariantBuilder(memory.DefaultAllocator, extensions.NewDefaultVariantType())
+	defer b.Release()
+	for _, lit := range rejected {
+		if err := appendVariantJSONText(b, []byte(lit)); err == nil || !strings.Contains(err.Error(), "exceeds 38 digits of precision") {
+			t.Errorf("text %.45s: err = %v, want the 38-digit precision error", lit, err)
+		}
+	}
+	if err := appendVariantJSONText(b, []byte("1e400")); err == nil || !strings.Contains(err.Error(), "invalid JSON for variant") {
+		t.Errorf("1e400: err = %v, want the invalid JSON error as before", err)
+	}
+	if _, err := parseVariantJSON([]byte("1" + strings.Repeat("0", 38))); err == nil {
+		t.Error("parseVariantJSON: arrow-go panic not turned into an error")
+	}
+
+	// text (Arrow utf8): the error names the row.
+	sb := array.NewStringBuilder(memory.DefaultAllocator)
+	var texts, want []string
+	for lit, w := range accepted {
+		texts, want = append(texts, lit), append(want, w)
+	}
+	sb.AppendValues(texts, nil)
+	arr := sb.NewArray()
+	defer arr.Release()
+	out, err := ToCanonicalVariant(arr, memory.DefaultAllocator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Release()
+	if got := variantValues(t, out); !reflect.DeepEqual(got, want) {
+		t.Fatalf("accepted values\n got %v\nwant %v", got, want)
+	}
+	sb.AppendValues([]string{"1", rejected[0]}, nil)
+	bad := sb.NewArray()
+	defer bad.Release()
+	if _, err := ToCanonicalVariant(bad, memory.DefaultAllocator); err == nil || !strings.Contains(err.Error(), "row 1") || !strings.Contains(err.Error(), "exceeds 38 digits") {
+		t.Fatalf("utf8 err = %v, want row 1 and the precision error", err)
+	}
+
+	// CSV: row and column named.
+	_, _, err = NewCSVAdapter(nil, nil).Parse([]byte("id,v\n1,"+d38+"\n2,"+rejected[5]+"\n"), variantSchema(t))
+	if err == nil || !strings.Contains(err.Error(), `row 1, column "v"`) || !strings.Contains(err.Error(), "exceeds 38 digits") {
+		t.Fatalf("csv err = %v, want row 1, column v and the precision error", err)
+	}
+
+	// JSON-native (json.Number), bare and nested, JSON and JSONL.
+	for _, lit := range []string{rejected[0], `{"n":[` + rejected[5] + `]}`} {
+		_, _, err := NewJSONAdapter(nil, nil).Parse([]byte(`[{"id":1,"v":1},{"id":2,"v":`+lit+`}]`), variantSchema(t))
+		if err == nil || !strings.Contains(err.Error(), `row 1, column "v"`) || !strings.Contains(err.Error(), "exceeds 38 digits") {
+			t.Fatalf("json %.40s: err = %v, want row 1, column v and the precision error", lit, err)
+		}
+		_, _, err = NewJSONLAdapter(nil, nil).ParseReader(strings.NewReader(`{"id":2,"v":`+lit+`}`), variantSchema(t))
+		if err == nil || !strings.Contains(err.Error(), `column "v"`) || !strings.Contains(err.Error(), "exceeds 38 digits") {
+			t.Fatalf("jsonl %.40s: err = %v, want column v and the precision error", lit, err)
+		}
+	}
+	rec, _, err := NewJSONAdapter(nil, nil).Parse([]byte(`[{"id":1,"v":`+d38+`},{"id":2,"v":{"x":1.5e300}}]`), variantSchema(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Release()
+	if got := variantValues(t, rec.Column(1)); !reflect.DeepEqual(got, []string{d38, `{"x":1.5e+300}`}) {
+		t.Fatalf("json accepted values %v", got)
+	}
+}
