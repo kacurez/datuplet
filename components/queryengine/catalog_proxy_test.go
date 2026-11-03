@@ -11,9 +11,10 @@ import (
 )
 
 // TestReadOnlyCatalogProxy drives the proxy against an httptest upstream: reads
-// and the metrics report pass through with the bearer intact, every write is
-// refused with the iceberg-shaped 403 and never reaches the upstream, and the
-// /v1/config uri is pointed back at the proxy.
+// pass through with the bearer intact; every other request (every POST, the
+// metrics report and escaped-path tricks included) is refused with the
+// iceberg-shaped 403 and never reaches the upstream; and the /v1/config uri is
+// pointed back at the proxy.
 func TestReadOnlyCatalogProxy(t *testing.T) {
 	const bearer = "Bearer test-token"
 	var (
@@ -67,7 +68,6 @@ func TestReadOnlyCatalogProxy(t *testing.T) {
 	forwarded := []struct{ method, path string }{
 		{http.MethodGet, "/v1/p/namespaces/ns/tables/t"},
 		{http.MethodHead, "/v1/p/namespaces/ns/tables/t"},
-		{http.MethodPost, "/v1/p/namespaces/ns/tables/t/metrics"},
 	}
 	for _, c := range forwarded {
 		n := upstreamHits()
@@ -82,6 +82,10 @@ func TestReadOnlyCatalogProxy(t *testing.T) {
 	refused := []struct{ method, path string }{
 		{http.MethodPost, "/v1/p/transactions/commit"},
 		{http.MethodPost, "/v1/p/namespaces/ns/tables/t"},
+		{http.MethodPost, "/v1/p/namespaces/ns/tables/t/metrics"},
+		{http.MethodPost, "/v1/p/namespaces/ns/tables/metrics"},
+		{http.MethodPost, "/v1/p/namespaces/ns/tables/t%2Fmetrics"},
+		{http.MethodPost, "/v1/p/tables/rename%2Ftables%2Fx%2Fmetrics"},
 		{http.MethodPost, "/v1/p/namespaces/ns/tables/t/../../../../transactions/commit/../metrics"},
 		{http.MethodPost, "/v1/p/namespaces"},
 		{http.MethodDelete, "/v1/p/namespaces/ns/tables/t"},

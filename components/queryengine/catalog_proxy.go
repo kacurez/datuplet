@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 )
@@ -21,7 +20,7 @@ const catalogWriteRefused = "read-only query engine: catalog write refused"
 
 // readOnlyCatalogProxy fronts the lakekeeper iceberg-REST catalog for one
 // engine on a loopback port and refuses every catalog write: any method other
-// than GET/HEAD, except the POST .../metrics scan report. It is the catalog-side
+// than GET/HEAD, including every POST. It is the catalog-side
 // guarantee that user SQL cannot commit, independent of whether an
 // iceberg-extension function honours the READ_ONLY attach
 // (iceberg_rewrite_data_files in duckdb-iceberg 4c0c0874 does not).
@@ -113,16 +112,7 @@ func (p *readOnlyCatalogProxy) rewriteConfig(resp *http.Response) error {
 }
 
 func catalogRequestAllowed(r *http.Request) bool {
-	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		return true
-	case http.MethodPost:
-		// The scan report, POST /v1/{prefix}/namespaces/{ns}/tables/{t}/metrics.
-		// A cleaned path only, so "/commit/../metrics" cannot pass the suffix test.
-		p := r.URL.Path
-		return path.Clean(p) == p && strings.Contains(p, "/tables/") && strings.HasSuffix(p, "/metrics")
-	}
-	return false
+	return r.Method == http.MethodGet || r.Method == http.MethodHead
 }
 
 func writeIcebergError(w http.ResponseWriter, code int, typ, msg string) {

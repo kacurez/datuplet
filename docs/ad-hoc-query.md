@@ -41,8 +41,8 @@ Read-only is enforced in two independent layers.
   4c0c0874) never declares its write, so DuckDB's read-only check does not
   fire and it commits a `replace` snapshot on a `READ_ONLY` attach. The engine
   therefore attaches through an in-process loopback proxy that forwards only
-  catalog reads (GET / HEAD and the POST `.../metrics` scan report), refuses
-  every other request with a 403 (`read-only query engine: catalog write
+  catalog reads (GET / HEAD), refuses every other request, every POST
+  included, with a 403 (`read-only query engine: catalog write
   refused`), and rewrites the `/v1/config` `uri` so the catalog cannot steer
   the extension past it. Engine enforcement is the proxy plus the `READ_ONLY`
   attach.
