@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 )
 
 // DataType represents a supported data type in the gateway.
@@ -22,6 +23,7 @@ const (
 	TypeTimestamp        // Timestamp with microsecond precision, UTC timezone
 	TypeDate             // Date without time component (days since Unix epoch)
 	TypeBinary           // Raw binary data
+	TypeVariant          // Semi-structured Parquet/Iceberg VARIANT
 )
 
 // String returns the string representation of the DataType.
@@ -45,6 +47,8 @@ func (dt DataType) String() string {
 		return "date"
 	case TypeBinary:
 		return "binary"
+	case TypeVariant:
+		return "variant"
 	default:
 		return "unknown"
 	}
@@ -72,6 +76,8 @@ func ParseDataType(s string) DataType {
 		return TypeDate
 	case "binary":
 		return TypeBinary
+	case "variant":
+		return TypeVariant
 	default:
 		return TypeUnknown
 	}
@@ -217,13 +223,20 @@ func ToArrowType(dt DataType) (arrow.DataType, error) {
 		return arrow.FixedWidthTypes.Date32, nil
 	case TypeBinary:
 		return arrow.BinaryTypes.Binary, nil
+	case TypeVariant:
+		return extensions.NewDefaultVariantType(), nil
 	default:
 		return nil, fmt.Errorf("unsupported data type: %v", dt)
 	}
 }
 
-// FromArrowType converts an Arrow DataType to a gateway DataType.
+// FromArrowType converts an Arrow DataType to a gateway DataType. Any
+// variant layout (shredded, large-binary or dictionary storage) is
+// TypeVariant.
 func FromArrowType(at arrow.DataType) (DataType, error) {
+	if _, ok := at.(*extensions.VariantType); ok {
+		return TypeVariant, nil
+	}
 	switch at.ID() {
 	case arrow.INT64:
 		return TypeInt64, nil

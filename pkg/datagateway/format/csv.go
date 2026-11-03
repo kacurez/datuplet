@@ -8,6 +8,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
@@ -160,6 +161,8 @@ func appendCSVValue(builder array.Builder, dataType schema.DataType, value strin
 	case schema.TypeBinary:
 		builder.(*array.BinaryBuilder).Append([]byte(value))
 		return nil
+	case schema.TypeVariant:
+		return appendVariantJSONText(builder.(*extensions.VariantBuilder), []byte(value))
 	default:
 		return fmt.Errorf("unsupported type: %v", dataType)
 	}

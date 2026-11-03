@@ -556,6 +556,10 @@ func createV2Table(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, sch *ar
 	if err != nil {
 		t.Fatal(err)
 	}
+	icSchema, err := manifest.SchemaToIceberg(gw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cat, err := r.Catalog(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -563,7 +567,7 @@ func createV2Table(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, sch *ar
 	if err := cat.CreateNamespace(ctx, catalog.ToIdentifier(ns), nil); err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
 		t.Fatal(err)
 	}
-	if _, err := cat.CreateTable(ctx, catalog.ToIdentifier(ns, tbl), manifest.SchemaToIceberg(gw),
+	if _, err := cat.CreateTable(ctx, catalog.ToIdentifier(ns, tbl), icSchema,
 		catalog.WithProperties(iceberg.Properties{table.PropertyFormatVersion: "2"})); err != nil {
 		t.Fatalf("CreateTable v2: %v", err)
 	}

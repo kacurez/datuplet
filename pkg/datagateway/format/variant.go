@@ -1,0 +1,106 @@
+package format
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/variant"
+)
+
+// IsCanonicalVariant reports whether dt is exactly the canonical variant
+// layout, extensions.NewDefaultVariantType().
+func IsCanonicalVariant(dt arrow.DataType) bool {
+	return arrow.TypeEqual(dt, extensions.NewDefaultVariantType())
+}
+
+// CanConvertToVariant reports whether ToCanonicalVariant accepts a column of
+// type dt.
+func CanConvertToVariant(dt arrow.DataType) bool {
+	if _, ok := dt.(*extensions.VariantType); ok {
+		return true
+	}
+	switch dt.ID() {
+	case arrow.STRING, arrow.LARGE_STRING:
+		return true
+	}
+	return false
+}
+
+// ToCanonicalVariant converts arr into the canonical variant layout:
+//   - the canonical layout is retained as is;
+//   - any other variant layout (shredded, large-binary or dictionary
+//     storage) is rebuilt value by value; physically null rows stay null;
+//   - text (utf8, large_utf8) is parsed as JSON text; JSON null is SQL NULL,
+//     and invalid JSON is an error naming the row.
+//
+// The caller releases the result.
+func ToCanonicalVariant(arr arrow.Array, mem memory.Allocator) (arrow.Array, error) {
+	if va, ok := arr.(*extensions.VariantArray); ok && IsCanonicalVariant(va.DataType()) {
+		arr.Retain()
+		return arr, nil
+	}
+	b := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer b.Release()
+	b.Reserve(arr.Len())
+	switch a := arr.(type) {
+	case *extensions.VariantArray:
+		storage := a.Storage()
+		for i := 0; i < a.Len(); i++ {
+			if storage.IsNull(i) {
+				b.AppendNull()
+				continue
+			}
+			v, err := a.Value(i)
+			if err != nil {
+				return nil, fmt.Errorf("row %d: %w", i, err)
+			}
+			b.Append(v)
+		}
+	case array.StringLike:
+		for i := 0; i < a.Len(); i++ {
+			if a.IsNull(i) {
+				b.AppendNull()
+				continue
+			}
+			if err := appendVariantJSONText(b, []byte(a.Value(i))); err != nil {
+				return nil, fmt.Errorf("row %d: %w", i, err)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("cannot convert %s to variant", arr.DataType())
+	}
+	return b.NewArray(), nil
+}
+
+// appendVariantJSONText parses text as exactly one JSON value (numbers kept
+// exact) and appends it; JSON null appends SQL NULL.
+func appendVariantJSONText(b *extensions.VariantBuilder, text []byte) error {
+	var raw json.RawMessage
+	if err := json.Unmarshal(text, &raw); err != nil {
+		return fmt.Errorf("invalid JSON for variant: %w", err)
+	}
+	v, err := variant.ParseJSONBytes(raw, false)
+	if err != nil {
+		return fmt.Errorf("invalid JSON for variant: %w", err)
+	}
+	if v.Type() == variant.Null {
+		b.AppendNull()
+		return nil
+	}
+	b.Append(v)
+	return nil
+}
+
+// appendVariantFromInterface appends a JSON-native value (decoded with
+// json.Decoder.UseNumber) as is: strings stay variant strings.
+func appendVariantFromInterface(b *extensions.VariantBuilder, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("cannot JSON-encode %T for variant column: %w", value, err)
+	}
+	return appendVariantJSONText(b, data)
+}

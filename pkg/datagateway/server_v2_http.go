@@ -3,7 +3,6 @@ package datagateway
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -79,7 +78,7 @@ func (s *ServerV2) handleWrite(w http.ResponseWriter, r *http.Request) {
 		resp, err = s.processWriteChunk(r.Context(), ws, data)
 	}
 	if err != nil {
-		if errors.Is(err, ErrInvalidPartition) {
+		if isInvalidArgument(err) {
 			s.httpError(w, http.StatusBadRequest, err.Error(), "INVALID_ARGUMENT")
 			return
 		}
@@ -109,7 +108,7 @@ func (s *ServerV2) processWriteChunk(ctx context.Context, ws *writerState, data 
 	Debugf("processWriteChunk: writer=%s bytes=%d format=%s", ws.writerID, len(data), ws.inputFormat)
 
 	// Parse input data to Arrow
-	record, inferredSchema, err := ws.adapter.Parse(data, ws.schema)
+	record, inferredSchema, err := parseChunk(ws, data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse input: %w", err)
 	}
@@ -118,12 +117,41 @@ func (s *ServerV2) processWriteChunk(ctx context.Context, ws *writerState, data 
 	return s.processParsedRecord(ctx, ws, record, inferredSchema)
 }
 
+// parseChunk parses data with ws's input schema. A first chunk of a text
+// format whose inferred schema lacks a declared variant column is parsed
+// again with it, so JSON keeps its JSON-native values (spec C4).
+func parseChunk(ws *writerState, data []byte) (arrow.Record, *schema.Schema, error) {
+	in := ws.schema
+	record, inferred, err := ws.adapter.Parse(data, in)
+	if err != nil || in != nil || inferred == nil || !isTextFormat(ws.inputFormat) {
+		return record, inferred, err
+	}
+	over, changed, err := overlayVariant(inferred, ws.variantCols)
+	if err != nil || !changed {
+		if err != nil {
+			record.Release()
+			return nil, nil, err
+		}
+		return record, inferred, nil
+	}
+	record.Release()
+	return ws.adapter.Parse(data, over)
+}
+
 // processWriteChunkReader is the streaming-ingest sibling of
 // processWriteChunk. It parses directly off r (the HTTP request body) via a
 // StreamingAdapter, avoiding the io.ReadAll copy of the whole chunk — the
 // gateway's #1 ingest allocation site (run 40556560 profile).
 func (s *ServerV2) processWriteChunkReader(ctx context.Context, ws *writerState, r io.Reader, sa format.StreamingAdapter) (*pb.WriteChunkResponse, error) {
 	Debugf("processWriteChunkReader: writer=%s format=%s mode=streaming", ws.writerID, ws.inputFormat)
+	if ws.schema == nil && len(ws.variantCols) > 0 && isTextFormat(ws.inputFormat) {
+		// The schema-less first chunk may be parsed twice (parseChunk).
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read body: %w", err)
+		}
+		return s.processWriteChunk(ctx, ws, data)
+	}
 
 	record, inferredSchema, err := sa.ParseReader(r, ws.schema)
 	if err != nil {
@@ -136,10 +164,11 @@ func (s *ServerV2) processWriteChunkReader(ctx context.Context, ws *writerState,
 
 // processParsedRecord holds the post-parse write path shared by the
 // buffered (processWriteChunk) and streaming (processWriteChunkReader)
-// entry points: the drop pipeline, today's record-type acceptance check on
-// the post-drop record, first-chunk setup (deferred create, plane writer
-// open) and the plane Write. The type check runs before any create or open,
-// so a rejected first chunk fails with the "buffer error" class.
+// entry points: the drop pipeline, first-chunk setup (deferred create, plane
+// writer open), normalizing the post-drop record to the destination schema
+// (variant columns, spec C4), today's record-type acceptance check and the
+// plane Write. The first chunk's types are checked before any create or
+// open, so a rejected first chunk fails with the "buffer error" class.
 func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, record arrow.Record, inferredSchema *schema.Schema) (*pb.WriteChunkResponse, error) {
 	// Apply transforms if configured
 	outputRecord := record
@@ -154,39 +183,56 @@ func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, rec
 		}
 	}
 
-	tw, responseSchema, err := s.ensureTableWriter(ctx, ws, inferredSchema, outputRecord.Schema())
+	tw, dest, responseSchema, err := s.ensureTableWriter(ctx, ws, inferredSchema, outputRecord.Schema())
 	if err != nil {
 		return nil, err
 	}
-	if err := tw.Write(ctx, outputRecord); err != nil {
+	rec, err := normalizeRecord(outputRecord, dest, s.allocator)
+	if err != nil {
+		return nil, fmt.Errorf("write error: %w", err)
+	}
+	defer rec.Release()
+	if err := acceptRecordTypes(rec.Schema(), dest); err != nil {
+		return nil, fmt.Errorf("buffer error: %w", err)
+	}
+	if err := tw.Write(ctx, rec); err != nil {
 		return nil, fmt.Errorf("write error: %w", err)
 	}
 
 	return &pb.WriteChunkResponse{
-		RowsAccepted:    outputRecord.NumRows(),
+		RowsAccepted:    rec.NumRows(),
 		BufferSizeBytes: tw.QueuedBytes(),
 		InferredSchema:  responseSchema,
 	}, nil
 }
 
-// ensureTableWriter checks the post-drop record schema recSchema against the
-// writer's output schema (the plane only ever receives the types today's
-// write path accepted; a non-canonical type in a dropped column never gets
-// here) and returns ws's plane writer, opening it on the first chunk: the
-// input schema is the component's or the first chunk's inferred one, the
-// table (when not created at OpenWriter) is created with its post-drop form,
-// and the writer is opened with that post-drop schema. Serialized under
+// acceptFirstRecord checks the first chunk's post-drop schema recSchema,
+// normalized, against the destination schema dest.
+func acceptFirstRecord(recSchema *arrow.Schema, dest *schema.Schema) error {
+	norm, err := normalizedSchema(recSchema, dest.ArrowSchema())
+	if err != nil {
+		return err
+	}
+	return acceptRecordTypes(norm, dest.ArrowSchema())
+}
+
+// ensureTableWriter returns ws's plane writer and its (destination) schema,
+// opening it on the first chunk: the input schema is the component's or the
+// first chunk's inferred one; the destination schema is its post-drop form
+// with the declared and the table's variant columns (spec C4); the table
+// (when not created at OpenWriter) is created with the destination schema,
+// which is then re-resolved against the table as the catalog returned it (an
+// existing table, or one a concurrent create won the race with); the writer
+// is opened with that destination schema. The first chunk's post-drop
+// schema recSchema is checked before any create or open. Serialized under
 // ws.initMu so parallel first chunks open one writer. Fails once the run is
 // cancelled; a writer opened across the cancel is aborted. The inferred
 // schema is returned (for the response) only by the call that adopted it.
-func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, inferred *schema.Schema, recSchema *arrow.Schema) (TableWriter, *pb.Schema, error) {
+func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, inferred *schema.Schema, recSchema *arrow.Schema) (TableWriter, *arrow.Schema, *pb.Schema, error) {
 	ws.initMu.Lock()
 	defer ws.initMu.Unlock()
 	if ws.tw != nil {
-		if err := acceptRecordTypes(recSchema, ws.outputSchema.ArrowSchema()); err != nil {
-			return nil, nil, fmt.Errorf("buffer error: %w", err)
-		}
-		return ws.tw, nil, nil
+		return ws.tw, ws.outputSchema.ArrowSchema(), nil, nil
 	}
 
 	inSchema, fromInference := ws.schema, false
@@ -194,35 +240,43 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 		inSchema, fromInference = inferred, true
 	}
 	if inSchema == nil {
-		return nil, nil, fmt.Errorf("cannot create table %s.%s: no schema (request didn't supply one and inference failed)", ws.bucket, ws.table)
+		return nil, nil, nil, fmt.Errorf("cannot create table %s.%s: no schema (request didn't supply one and inference failed)", ws.bucket, ws.table)
 	}
 	outSchema, err := outputSchemaFor(inSchema, ws.pipeline)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to compute output schema: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to compute output schema: %w", err)
 	}
-	if err := acceptRecordTypes(recSchema, outSchema.ArrowSchema()); err != nil {
-		return nil, nil, fmt.Errorf("buffer error: %w", err)
+	dest, err := variantDestination(outSchema, ws.variantCols, ws.tableSchema, ws.formatVersion)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := acceptFirstRecord(recSchema, dest); err != nil {
+		return nil, nil, nil, fmt.Errorf("buffer error: %w", err)
 	}
 	if s.isCancelled() {
-		return nil, nil, errRunCancelled
+		return nil, nil, nil, errRunCancelled
 	}
 
 	if ws.basePath == "" {
 		if s.lakekeeperResolver == nil {
-			return nil, nil, fmt.Errorf("no write target for %s.%s", ws.bucket, ws.table)
+			return nil, nil, nil, fmt.Errorf("no write target for %s.%s", ws.bucket, ws.table)
 		}
-		sp := func(context.Context) (*schema.Schema, error) { return outSchema, nil }
+		createSchema := dest
+		sp := func(context.Context) (*schema.Schema, error) { return createSchema, nil }
 		target, lkErr := s.lakekeeperResolver.LoadOrCreateForWrite(ctx, ws.bucket, ws.table, sp, s.partitionFieldsFor(ws.bucket, ws.table))
 		if lkErr != nil {
-			return nil, nil, fmt.Errorf("lakekeeper deferred create %s.%s: %w", ws.bucket, ws.table, lkErr)
+			return nil, nil, nil, fmt.Errorf("lakekeeper deferred create %s.%s: %w", ws.bucket, ws.table, lkErr)
 		}
 		adoptTarget(ws, target)
+		if dest, err = variantDestination(outSchema, ws.variantCols, ws.tableSchema, ws.formatVersion); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 
 	tw, err := s.plane.OpenTableWriter(ctx, WriterSpec{
 		DataPrefix:      ws.basePath,
 		FilePrefix:      filePrefix(s.config.GetRunID(), ws.writerID),
-		Schema:          outSchema.ArrowSchema(),
+		Schema:          dest.ArrowSchema(),
 		Creds:           ws.creds,
 		TargetFileBytes: s.config.TargetFileSize,
 		Table:           ws.bucket + "." + ws.table,
@@ -230,7 +284,7 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 		TableSchema:     ws.tableSchema,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("open table writer %s.%s: %w", ws.bucket, ws.table, err)
+		return nil, nil, nil, fmt.Errorf("open table writer %s.%s: %w", ws.bucket, ws.table, err)
 	}
 
 	// Publish under s.mu, the lock the cancel watcher sets s.cancelled and
@@ -240,10 +294,10 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 	if s.cancelled {
 		s.mu.Unlock()
 		tw.Abort()
-		return nil, nil, errRunCancelled
+		return nil, nil, nil, errRunCancelled
 	}
 	ws.schema = inSchema
-	ws.outputSchema = outSchema
+	ws.outputSchema = dest
 	ws.tw = tw
 	s.mu.Unlock()
 
@@ -252,7 +306,7 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 		responseSchema = schemaToProto(inSchema)
 		logWriterSchema(ws, "gateway-inferred")
 	}
-	return tw, responseSchema, nil
+	return tw, dest.ArrowSchema(), responseSchema, nil
 }
 
 // handleRead serves the next chunk of a reader. The request ctx does not

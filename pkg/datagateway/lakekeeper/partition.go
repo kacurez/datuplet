@@ -55,9 +55,9 @@ func LoadOrCreateTable(ctx context.Context, cat catalog.Catalog, ns, tbl string,
 		if gwSchema == nil {
 			return nil, "", fmt.Errorf("lakekeeper: schema provider returned nil for %s.%s", ns, tbl)
 		}
-		icSchema := manifest.SchemaToIceberg(gwSchema)
-		if icSchema == nil {
-			return nil, "", fmt.Errorf("lakekeeper: cannot convert gateway schema for %s.%s", ns, tbl)
+		icSchema, convErr := manifest.SchemaToIceberg(gwSchema)
+		if convErr != nil {
+			return nil, "", fmt.Errorf("lakekeeper: cannot convert gateway schema for %s.%s: %w", ns, tbl, convErr)
 		}
 		spec, specErr := BuildPartitionSpec(fields, icSchema)
 		if specErr != nil {
@@ -109,7 +109,10 @@ func BuildPartitionSpec(fields []PartitionField, sc *iceberg.Schema) (iceberg.Pa
 		if err != nil {
 			return iceberg.PartitionSpec{}, invalidPartition("partition field %s: %v", f, err)
 		}
-		if !tr.CanTransform(src.Type) {
+		// iceberg-go rejects a variant source itself (NewPartitionSpecOpts);
+		// its error is the one surfaced.
+		_, isVariant := src.Type.(iceberg.VariantType)
+		if !isVariant && !tr.CanTransform(src.Type) {
 			return iceberg.PartitionSpec{}, invalidPartition("partition field %s: transform %s cannot be applied to column %q of type %s", f, tr, src.Name, src.Type)
 		}
 		name, err := iceberg.GeneratePartitionFieldName(sc, iceberg.PartitionField{SourceIDs: []int{src.ID}, Transform: tr})
@@ -121,7 +124,7 @@ func BuildPartitionSpec(fields []PartitionField, sc *iceberg.Schema) (iceberg.Pa
 	}
 	spec, err := iceberg.NewPartitionSpecOpts(opts...)
 	if err != nil {
-		return iceberg.PartitionSpec{}, invalidPartition("partition_fields %v: %v", fields, err)
+		return iceberg.PartitionSpec{}, fmt.Errorf("%w: partition_fields %v: %w", ErrInvalidPartition, fields, err)
 	}
 	return spec, nil
 }

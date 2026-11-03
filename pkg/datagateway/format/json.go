@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -53,11 +54,29 @@ func (a *JSONAdapter) Format() DataFormat {
 func (a *JSONAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
 	// Parse JSON array
 	var objects []map[string]any
-	if err := json.Unmarshal(data, &objects); err != nil {
+	if err := decodeJSON(data, &objects); err != nil {
 		return nil, nil, fmt.Errorf("failed to parse JSON array: %w", err)
 	}
 
 	return a.parseObjects(objects, s)
+}
+
+// decodeJSON is json.Unmarshal (trailing data is an error) with numbers kept
+// exact as json.Number: a variant column stores them as is, every other
+// column converts them as float64, as before.
+func decodeJSON(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+		return errors.New("invalid character after top-level value")
+	}
+	return nil
 }
 
 // parseObjects converts a slice of JSON objects to an Arrow RecordBatch.
@@ -233,7 +252,7 @@ func (a *JSONLAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *sche
 		}
 
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+		if err := decodeJSON([]byte(line), &obj); err != nil {
 			return nil, nil, fmt.Errorf("failed to parse JSON at line %d: %w", lineNum, err)
 		}
 		objects = append(objects, obj)
@@ -313,7 +332,7 @@ func (a *JSONLAdapter) parseWithKnownSchema(r io.Reader, s *schema.Schema) (arro
 		// allocator can reuse the same memory arena for each — Go's
 		// runtime hits this pattern hard but cheaply.
 		var obj map[string]any
-		if err := json.Unmarshal(line, &obj); err != nil {
+		if err := decodeJSON(line, &obj); err != nil {
 			return nil, nil, fmt.Errorf("failed to parse JSON at line %d: %w", lineNum, err)
 		}
 		for colIdx := 0; colIdx < s.NumColumns(); colIdx++ {
