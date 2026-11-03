@@ -178,7 +178,8 @@ not the table); drop the table to change its partitioning.
 **Iceberg v3 is the default for new tables.** The gateway creates every new
 table as format-version 3, and Lakekeeper warehouses default to v3. Existing v2
 tables are loaded and written as they are. v3 readers see deletion vectors as
-deletes, so a file with one is decoded rather than served raw (see M5c below).
+deletes: only the file a deletion vector applies to is decoded, and the other
+files stay raw (M5c below concerns position-delete files, not deletion vectors).
 
 **Partitioned v3 commits need `commit.retry.num-retries` of 0.** The gateway
 assigns each file's `first_row_id` itself; iceberg-go's internal commit retry
@@ -191,10 +192,14 @@ commit fails the commit (FailedApplication, not retried). Set it back to 0.
 (see [pipeline-api.md](pipeline-api.md#raw-json-into-variant)).
 - Stored unshredded, v3 tables only, and not usable as a partition source. The
   column has no column metrics (iceberg-go `AddFiles` skips variant stats).
-- Text input is parsed as one strict JSON value. A JSON `null` and the text
-  `"null"` both become SQL NULL, as do the CSV null tokens (`""`, `NA`, `N/A`,
-  `None`, `nil`, `\N`). A variant null arriving as Arrow/Parquet stays a variant
-  null.
+- Text input (a column the component sends as string, or CSV) is parsed as one
+  strict JSON value. A bare `null` becomes SQL NULL; a quoted `"null"` is
+  stored as the variant string "null". CSV null tokens (for example `""`, `NA`,
+  `null`, `\N`; configurable) become SQL NULL. An encoded variant null arriving
+  as Arrow/Parquet stays a variant null.
+- JSON/JSONL (JSON-native) input stores each value as it is: a JSON `null`
+  becomes SQL NULL, strings stay variant strings (`"42"` and `"null"` stay
+  strings), and numbers, booleans, objects and arrays keep their JSON values.
 - Integer and decimal literals keep their exact value up to 38 significant
   digits; more than 38 significant or fractional digits fails the write naming
   the row and column. Exponent literals (`1.5e300`) are stored as double and can
@@ -205,9 +210,10 @@ commit fails the commit (FailedApplication, not retried). Set it back to 0.
   declare, the write fails with InvalidArgument / HTTP 400 naming the column.
   Declare the column (or re-`OpenWriter`).
 - Reads render a variant as JSON text (Arrow IPC, CSV) or embedded JSON (JSON,
-  JSONL); `FORMAT_PARQUET` returns a real VARIANT.
+  JSONL); `FORMAT_PARQUET` returns a real VARIANT. Empty arrays and objects
+  render exactly in the text formats.
 - Queries return a clear error for a top-level VARIANT or JSON result column;
-  use `col::JSON::VARCHAR`. Nested ones (`STRUCT(a VARIANT)`, `VARIANT[]`,
+  use `col::JSON::VARCHAR` for VARIANT, `col::VARCHAR` for JSON. Nested ones (`STRUCT(a VARIANT)`, `VARIANT[]`,
   `JSON[]`) still get the driver's opaque error or `map[...]` text. Storage
   preview does the cast itself and loads the table schema first, so a missing
   table is a 404.
