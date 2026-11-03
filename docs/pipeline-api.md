@@ -87,7 +87,7 @@ outputs:
 `columns` is `[]{name, type}` (`pkg/pipeline/config.ColumnSpec`, carried
 through the CRD and the Data Gateway's `ComponentConfig.OutputConfig` to the
 SDK as `sdk.OutputTableRef.Columns`); `type` is one of `int`, `long`,
-`float`, `double`, `boolean`, `string` — the vocabulary
+`float`, `double`, `boolean`, `string`, `variant` — the vocabulary
 `sdk/go/arrow.ArrowTypeFor` resolves as follows (all nullable):
 
 | declared | Arrow / Iceberg | notes |
@@ -97,6 +97,7 @@ SDK as `sdk.OutputTableRef.Columns`); `type` is one of `int`, `long`,
 | `float`, `double` | Float64 | |
 | `boolean` | Boolean | |
 | `string` | String (utf8) | keeps the value's exact source text |
+| `variant` | Iceberg v3 VARIANT | the gateway stores the column as VARIANT (the table is created as format v3). The component is told the column is `string` and sends JSON text, which the gateway parses; invalid JSON fails the write naming the row and column |
 
 Narrowing to 32-bit is only offered for a **declared** `int` because the
 declaration is your assertion about the range; type *inference* never chooses
@@ -112,7 +113,7 @@ component's docs, e.g.
 
 `columns`' **shape** is validated at `PUT`/`validate` time by the pipeline-doc
 layer (`validateColumnSpec` in `pkg/pipeline/validate/validate.go`): an empty
-or duplicate `name`, or a `type` outside the six-value vocabulary, is a
+or duplicate `name`, or a `type` outside the seven-value vocabulary, is a
 `severity: "error"` finding — the same 400-blocks-the-save contract as any
 other PUT-time validation failure (see [API contract](#api-contract) above).
 The CRD's own OpenAPI schema carries the identical `type` enum as a second
@@ -125,6 +126,32 @@ given record, and fails the run (exit code 1, `TypeViolationError` naming
 the offending column) when a value does not fit its declared type — a
 class of problem no doc-time check could ever catch, since it depends on
 the data the run actually sees.
+
+#### Raw JSON into VARIANT
+
+To land nested JSON objects as a VARIANT column, declare the column as
+`variant`. Declared `columns` select the columns for components that honour
+them (such as http-json-extractor), so **declare every column the table
+needs**, including partition sources: a field that is not declared is not
+written.
+
+```yaml
+outputs:
+  tables:
+    - name: events
+      bucket: raw
+      writeMode: APPEND
+      partitionSpec:
+        - { source_column: category, transform: identity }
+        - { source_column: id, transform: "bucket[4]" }
+      columns:
+        - { name: category, type: string }
+        - { name: id, type: long }
+        - { name: payload, type: variant }   # nested objects/arrays stored as VARIANT
+```
+
+CRDs are hand-maintained: on a running cluster, `make k8s-reload-crds` is
+needed for the CRD's `variant` enum value.
 
 ### Output partitioning (`outputs.tables[].partitionSpec`)
 

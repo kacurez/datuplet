@@ -1,8 +1,12 @@
 package validate
 
 import (
+	"os"
+	"sort"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 )
@@ -610,4 +614,100 @@ func findByPath(t *testing.T, fs []Finding, path string) Finding {
 	}
 	t.Fatalf("no finding at path %q, got %+v", path, fs)
 	return Finding{}
+}
+
+func columnsPipelineYAML(typ string) string {
+	return `apiVersion: datuplet.io/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+spec:
+  stages:
+    - name: extract
+      components:
+        - name: extractor
+          component: extractor
+          outputs:
+            tables:
+              - name: summary
+                bucket: curated
+                columns:
+                  - name: payload
+                    type: ` + typ + `
+`
+}
+
+func TestValidateColumnsVariant(t *testing.T) {
+	_, findings, err := ValidatePipeline([]byte(columnsPipelineYAML("variant")), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("variant column type: want no findings, got %+v", findings)
+	}
+
+	_, findings, err = ValidatePipeline([]byte(columnsPipelineYAML("json")), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || !strings.Contains(findings[0].Message, "variant") {
+		t.Fatalf("invalid type message must list variant, got %+v", findings)
+	}
+}
+
+func columnTypeEnum(node any) []string {
+	switch n := node.(type) {
+	case map[string]any:
+		if props, ok := n["properties"].(map[string]any); ok {
+			if cols, ok := props["columns"].(map[string]any); ok {
+				if items, ok := cols["items"].(map[string]any); ok {
+					if ip, ok := items["properties"].(map[string]any); ok {
+						if typ, ok := ip["type"].(map[string]any); ok {
+							var out []string
+							for _, v := range typ["enum"].([]any) {
+								out = append(out, v.(string))
+							}
+							return out
+						}
+					}
+				}
+			}
+		}
+		for _, v := range n {
+			if e := columnTypeEnum(v); e != nil {
+				return e
+			}
+		}
+	case []any:
+		for _, v := range n {
+			if e := columnTypeEnum(v); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+func TestColumnTypeEnumMatchesCRD(t *testing.T) {
+	raw, err := os.ReadFile("../../../charts/datuplet-app/crds/datuplet.io_pipelines.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	crd := columnTypeEnum(doc)
+	if len(crd) == 0 {
+		t.Fatal("columns type enum not found in the CRD")
+	}
+	var want []string
+	for typ := range validColumnTypes {
+		want = append(want, typ)
+	}
+	sort.Strings(crd)
+	sort.Strings(want)
+	if strings.Join(crd, ",") != strings.Join(want, ",") {
+		t.Fatalf("CRD enum %v != validator vocabulary %v", crd, want)
+	}
 }

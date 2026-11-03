@@ -627,3 +627,33 @@ func envVarValue(envs []corev1.EnvVar, name string) string {
 	}
 	return ""
 }
+
+func TestOperatorPassesVariantColumn(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	comp := &datupletv1.ComponentSpec{
+		Name:      "c1",
+		Component: "comp-a",
+		Outputs: &datupletv1.OutputSpec{Tables: []datupletv1.OutputTableSpec{{
+			Name: "t", Bucket: "curated", WriteMode: "APPEND",
+			Columns: []datupletv1.ColumnSpec{{Name: "id", Type: "long"}, {Name: "payload", Type: "variant"}},
+		}}},
+	}
+	y, err := r.generateGatewayConfig(minimalPipelineRun(), minimalPipeline(), comp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		OutputTables []struct {
+			Columns []struct {
+				Name string `yaml:"name"`
+				Type string `yaml:"type"`
+			} `yaml:"columns"`
+		} `yaml:"output_tables"`
+	}
+	if err := yaml.Unmarshal([]byte(y), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.OutputTables) != 1 || len(doc.OutputTables[0].Columns) != 2 || doc.OutputTables[0].Columns[1].Name != "payload" || doc.OutputTables[0].Columns[1].Type != "variant" {
+		t.Fatalf("variant column not passed through unchanged:\n%s", y)
+	}
+}

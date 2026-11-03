@@ -268,6 +268,7 @@ spec:
                                             - double
                                             - boolean
                                             - string
+                                            - variant
                                             type: string
                                         required:
                                         - name

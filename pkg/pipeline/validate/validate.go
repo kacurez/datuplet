@@ -88,6 +88,7 @@ var validColumnTypes = map[string]bool{
 	"double":  true,
 	"boolean": true,
 	"string":  true,
+	"variant": true,
 }
 
 // ValidatePipeline strict-decodes YAML into a datupletv1.Pipeline and runs the
@@ -693,7 +694,7 @@ func validateColumnSpec(compName, tableName string, cols []datupletv1.ColumnSpec
 		if !validColumnTypes[col.Type] {
 			findings = append(findings, Finding{
 				Path:     colPath + ".type",
-				Message:  fmt.Sprintf("component %s, output table %s, columns[%d]: invalid type %q (supported: int, long, float, double, boolean, string)", compName, tableName, i, col.Type),
+				Message:  fmt.Sprintf("component %s, output table %s, columns[%d]: invalid type %q (supported: int, long, float, double, boolean, string, variant)", compName, tableName, i, col.Type),
 				Severity: severityError,
 			})
 		}

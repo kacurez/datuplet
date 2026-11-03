@@ -527,9 +527,13 @@ func (s *ServerV2) GetConfig(ctx context.Context, req *pb.GetConfigRequest) (*pb
 	for _, t := range s.config.OutputTables {
 		var columns []*pb.ColumnConfig
 		for _, c := range t.Columns {
+			typ := c.Type
+			if typ == schema.TypeVariant.String() {
+				typ = schema.TypeString.String()
+			}
 			columns = append(columns, &pb.ColumnConfig{
 				Name: c.Name,
-				Type: c.Type,
+				Type: typ,
 			})
 		}
 		outputConfig.Tables = append(outputConfig.Tables, &pb.TableOutputConfig{
