@@ -257,3 +257,36 @@ func TestAppQuery_GateStillEnforced(t *testing.T) {
 		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestAppQuery_VariantResultErrorReachesCaller asserts the query-worker's
+// clear VARIANT-result error (components/queryengine checkResultType, sent as
+// 400 sql_error) reaches the app caller verbatim.
+func TestAppQuery_VariantResultErrorReachesCaller(t *testing.T) {
+	signer := testSigner(t)
+	tok, _, err := tokens.MintAppToken(signer, uuid.NewString(), "lk-proj")
+	if err != nil {
+		t.Fatalf("MintAppToken: %v", err)
+	}
+	const msg = `column "payload" is VARIANT, which query results cannot return; select payload::JSON::VARCHAR instead`
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": msg, "kind": "sql_error"})
+	}))
+	defer worker.Close()
+
+	core := newAppCore(t, worker.URL, signer)
+	rec := httptest.NewRecorder()
+	core.AppHTTPHandler().ServeHTTP(rec, appQueryRequest(uuid.NewString(), tok.Reveal(), `{"sql":"SELECT payload FROM lk.ns.events"}`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct{ Error, Kind string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error != msg || body.Kind != "sql_error" {
+		t.Fatalf("body = %+v, want error %q kind sql_error", body, msg)
+	}
+}

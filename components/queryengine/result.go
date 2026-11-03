@@ -39,6 +39,9 @@ func buildResult(rows *sql.Rows, maxRows, maxBytes int) (*Result, error) {
 	schema := make([]Column, len(colTypes))
 	for i, ct := range colTypes {
 		schema[i] = Column{Name: ct.Name(), Type: ct.DatabaseTypeName()}
+		if err := checkResultType(schema[i]); err != nil {
+			return nil, err
+		}
 	}
 
 	res := &Result{
@@ -141,6 +144,20 @@ func buildResult(rows *sql.Rows, maxRows, maxBytes int) (*Result, error) {
 	}
 
 	return res, nil
+}
+
+// checkResultType rejects result column types duckdb-go cannot return
+// faithfully: it cannot scan VARIANT at all, and it decodes JSON into Go maps
+// that normalizeValue would render as "map[...]" text. The caller casts to
+// JSON text instead.
+func checkResultType(c Column) error {
+	switch c.Type {
+	case "VARIANT":
+		return fmt.Errorf("column %q is VARIANT, which query results cannot return; select %s::JSON::VARCHAR instead", c.Name, c.Name)
+	case "JSON":
+		return fmt.Errorf("column %q is JSON, which query results cannot return; select %s::VARCHAR instead", c.Name, c.Name)
+	}
+	return nil
 }
 
 // normalizeValue converts a value as scanned from duckdb-go's database/sql

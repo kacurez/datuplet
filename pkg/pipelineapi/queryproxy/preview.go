@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -26,8 +27,12 @@ type PreviewLimits struct {
 // storage.ValidIdentifier — QuoteIdent here is defense in depth. Previews
 // hold their own per-principal gate (cap 1) so they never starve, or get
 // starved by, console queries. One query_audit record is emitted.
-func (c *Core) Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table string, lim PreviewLimits) (*Result, *QueryError) {
-	sql := fmt.Sprintf("SELECT * FROM lk.%s.%s LIMIT %d", QuoteIdent(ns), QuoteIdent(table), lim.MaxRows)
+//
+// variantCols names the table's VARIANT columns (from its Iceberg schema).
+// They are projected as JSON text: duckdb-go cannot scan VARIANT, and a
+// direct ::VARCHAR yields DuckDB display text rather than JSON.
+func (c *Core) Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table string, variantCols []string, lim PreviewLimits) (*Result, *QueryError) {
+	sql := fmt.Sprintf("SELECT %s FROM lk.%s.%s LIMIT %d", previewProjection(variantCols), QuoteIdent(ns), QuoteIdent(table), lim.MaxRows)
 
 	start := time.Now()
 	rec := &auditRecord{principal: sub, outcome: "internal", statementHash: statementHash(sql)}
@@ -61,4 +66,16 @@ func (c *Core) Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table s
 		return nil, &QueryError{http.StatusBadGateway, "internal", "malformed worker response"}
 	}
 	return &res, nil
+}
+
+func previewProjection(variantCols []string) string {
+	if len(variantCols) == 0 {
+		return "*"
+	}
+	repl := make([]string, len(variantCols))
+	for i, c := range variantCols {
+		q := QuoteIdent(c)
+		repl[i] = q + "::JSON::VARCHAR AS " + q
+	}
+	return "* REPLACE (" + strings.Join(repl, ", ") + ")"
 }
