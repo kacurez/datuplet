@@ -26,11 +26,20 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go"
+
+	gatewaypb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 	"github.com/datuplet/datuplet/tests/e2e/framework"
 )
 
@@ -203,4 +212,221 @@ func TestBigDataJoinProof(t *testing.T) {
 		},
 	}
 	framework.RunScenario(t, sc, runPrefix, pipelinesDir)
+}
+
+// TestV3VariantPartitioned proves partitioned Iceberg v3 + VARIANT end to end
+// on the cluster. http-json-extractor lands manifests/variant-events.json
+// (nested objects and arrays, integers above 2^53) as a VARIANT column in a
+// table partitioned by identity(category) and bucket[4](id); sql-transform
+// carries the payload into a second table and adds a derived variant. It then
+// checks both tables' metadata and payloads (duckdb CLI 2.x), a query-worker
+// preview, a gateway FORMAT_JSON read, and, after an iceberg-go merge-on-read
+// delete of one row, a re-run of the transform that the gateway serves with
+// exactly one decoded file.
+func TestV3VariantPartitioned(t *testing.T) {
+	h := framework.SharedHarness()
+	if h == nil {
+		framework.SkipOrFail(t, "K8s e2e requires E2E_K8S=1 and SetupFGABootstrap to have run in TestMain — see framework/bootstrap.go")
+	}
+	if err := framework.PreCheck(); err != nil {
+		framework.SkipOrFail(t, "precheck failed: %v", err)
+	}
+	framework.RequireDuckDBV2(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	payloads, derived := loadVariantFixture(t)
+	kb, err := framework.NewK8sBackend(h, runPrefix)
+	if err != nil {
+		t.Fatalf("init K8s backend: %v", err)
+	}
+	defer kb.Cleanup(context.Background())
+	target := framework.NewK8sQueryTarget(ctx, t, h)
+	rawNS, outNS := runPrefix+"-v3raw", runPrefix+"-v3out"
+
+	run := func(fixture string) *framework.RunResult {
+		t.Helper()
+		rendered, err := framework.RenderPipeline(filepath.Join("pipelines", "k8s", fixture), framework.TemplateVars{RunPrefix: runPrefix})
+		if err != nil {
+			t.Fatalf("render %s: %v", fixture, err)
+		}
+		defer os.Remove(rendered)
+		res, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3", Timeout: 5 * time.Minute})
+		if err != nil {
+			t.Fatalf("run %s: %v", fixture, err)
+		}
+		if !res.Success {
+			t.Fatalf("run %s failed (exit %d, %s): %s\nlogs:\n%s", fixture, res.ExitCode, res.FailureType, res.StatusMessage, res.Logs)
+		}
+		return res
+	}
+
+	run("v3-variant.yaml")
+
+	framework.AssertIcebergTable(t, target, rawNS, "events", 3, []string{"identity(category)", "bucket[4](id)"})
+	framework.AssertIcebergTable(t, target, outNS, "events_out", 3, nil)
+	framework.AssertVariantJSON(t, target, rawNS, "events", "payload", payloads)
+	framework.AssertVariantJSON(t, target, outNS, "events_out", "payload", payloads)
+	framework.AssertVariantJSON(t, target, outNS, "events_out", "derived", derived)
+
+	assertVariantPreview(t, ctx, rawNS, "events", payloads)
+	assertGatewayJSONRead(t, ctx, kb, rawNS, "events", payloads)
+
+	// id 2 shares the (alpha, bucket 0) file with id 1, so the delete leaves
+	// a deletion vector on that file rather than dropping a whole file.
+	const deletedID = 2
+	del, err := framework.DeleteRowsMergeOnRead(ctx, h, rawNS, "events", iceberg.EqualTo(iceberg.Reference("id"), int64(deletedID)))
+	if err != nil {
+		t.Fatalf("merge-on-read delete of id %d: %v", deletedID, err)
+	}
+	if del.FilesWithDV != 1 || del.FilesWithDelete != 0 || del.DataFiles < 2 {
+		t.Fatalf("after the delete: %+v; want one deletion vector, no other delete files, several data files", del)
+	}
+	delete(payloads, deletedID)
+	delete(derived, deletedID)
+
+	rerun := run("v3-variant-rerun.yaml")
+	summary := framework.FindReadSummary(rerun.Logs, rawNS, "events")
+	if summary == "" {
+		t.Fatalf("no gateway read summary for %s.events in the re-run logs:\n%s", rawNS, rerun.Logs)
+	}
+	got := framework.ParseReadSummary(summary)
+	want := map[string]string{
+		"raw_files":     strconv.Itoa(del.DataFiles - 1),
+		"decoded_files": "1",
+		"rows":          strconv.Itoa(len(payloads)),
+		"outcome":       "ok",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("re-run read summary %s=%q, want %q (%s)", k, got[k], v, summary)
+		}
+	}
+	t.Logf("re-run read: %s", summary)
+
+	framework.AssertVariantJSON(t, target, rawNS, "events", "payload", payloads)
+	framework.AssertVariantJSON(t, target, outNS, "events_out", "payload", payloads)
+	framework.AssertVariantJSON(t, target, outNS, "events_out", "derived", derived)
+}
+
+// loadVariantFixture returns the fixture's payloads and the transform's
+// expected derived values ({"id", "category"}), keyed by id, as exact JSON.
+func loadVariantFixture(t *testing.T) (payloads, derived map[int64]any) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("manifests", "variant-events.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []struct {
+		Category string          `json:"category"`
+		ID       int64           `json:"id"`
+		Payload  json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("variant-events.json: %v", err)
+	}
+	payloads, derived = map[int64]any{}, map[int64]any{}
+	for _, r := range rows {
+		v, err := framework.ParseJSONExact(r.Payload)
+		if err != nil {
+			t.Fatalf("variant-events.json id %d: %v", r.ID, err)
+		}
+		payloads[r.ID] = v
+		derived[r.ID] = map[string]any{"id": json.Number(strconv.FormatInt(r.ID, 10)), "category": r.Category}
+	}
+	return payloads, derived
+}
+
+// assertVariantPreview checks that the query-worker storage preview returns
+// the payload column as JSON text equal to want.
+func assertVariantPreview(t *testing.T, ctx context.Context, ns, table string, want map[int64]any) {
+	t.Helper()
+	status, body, err := storageGETPreview(ctx, getAdminSession(t), getQueryProjectID(t), ns, table)
+	if err != nil {
+		t.Fatalf("storage preview %s.%s: %v", ns, table, err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("storage preview %s.%s: status %d: %s", ns, table, status, truncateLog(body, 1024))
+	}
+	var resp struct {
+		Columns []struct{ Name, Type string } `json:"columns"`
+		Rows    [][]json.RawMessage           `json:"rows"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("storage preview body: %v: %s", err, truncateLog(body, 1024))
+	}
+	idCol, payloadCol := -1, -1
+	for i, c := range resp.Columns {
+		switch c.Name {
+		case "id":
+			idCol = i
+		case "payload":
+			payloadCol = i
+		}
+	}
+	if idCol < 0 || payloadCol < 0 {
+		t.Fatalf("storage preview columns %v lack id or payload", resp.Columns)
+	}
+	got := map[int64]any{}
+	for _, row := range resp.Rows {
+		id, err := strconv.ParseInt(string(row[idCol]), 10, 64)
+		if err != nil {
+			t.Fatalf("preview id %s: %v", row[idCol], err)
+		}
+		var text string
+		if err := json.Unmarshal(row[payloadCol], &text); err != nil {
+			t.Fatalf("preview payload for id %d is %s, want JSON text: %v", id, row[payloadCol], err)
+		}
+		v, err := framework.ParseJSONExact([]byte(text))
+		if err != nil {
+			t.Fatalf("preview payload for id %d: %q is not JSON: %v", id, text, err)
+		}
+		got[id] = v
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("preview payloads:\n got  %v\n want %v", got, want)
+	}
+}
+
+// assertGatewayJSONRead reads ns.table as FORMAT_JSON through a live run's
+// Data Gateway and checks the payloads come back embedded as JSON values
+// (objects and arrays, not strings) equal to want.
+func assertGatewayJSONRead(t *testing.T, ctx context.Context, kb *framework.K8sBackend, ns, table string, want map[int64]any) {
+	t.Helper()
+	holder, err := framework.RenderPipeline(filepath.Join("pipelines", "k8s", "v3-variant-holder.yaml"), framework.TemplateVars{RunPrefix: runPrefix})
+	if err != nil {
+		t.Fatalf("render holder pipeline: %v", err)
+	}
+	defer os.Remove(holder)
+	read, err := framework.ReadThroughRunGateway(ctx, kb, holder, "holder", ns, table, gatewaypb.DataFormat_FORMAT_JSON)
+	if err != nil {
+		t.Fatalf("gateway FORMAT_JSON read of %s.%s: %v", ns, table, err)
+	}
+	got := map[int64]any{}
+	for _, chunk := range read.Chunks {
+		var rows []map[string]json.RawMessage
+		if err := json.Unmarshal(chunk, &rows); err != nil {
+			t.Fatalf("gateway JSON chunk: %v: %s", err, truncateLog(chunk, 1024))
+		}
+		for _, row := range rows {
+			id, err := strconv.ParseInt(string(row["id"]), 10, 64)
+			if err != nil {
+				t.Fatalf("gateway JSON id %s: %v", row["id"], err)
+			}
+			p := bytes.TrimSpace(row["payload"])
+			if len(p) == 0 || (p[0] != '{' && p[0] != '[') {
+				t.Fatalf("gateway JSON payload for id %d is %s, want an embedded object or array", id, p)
+			}
+			v, err := framework.ParseJSONExact(p)
+			if err != nil {
+				t.Fatalf("gateway JSON payload for id %d: %v", id, err)
+			}
+			got[id] = v
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("gateway FORMAT_JSON payloads:\n got  %v\n want %v", got, want)
+	}
+	t.Logf("gateway FORMAT_JSON read: %s", read.Summary)
 }

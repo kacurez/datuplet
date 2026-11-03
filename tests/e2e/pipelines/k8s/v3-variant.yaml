@@ -1,0 +1,49 @@
+# v3 + VARIANT scenario (TestV3VariantPartitioned): http-json-extractor lands
+# nested JSON payloads as a VARIANT column in a partitioned v3 table, then
+# sql-transform carries the payload through and adds a derived variant.
+# v3-variant-rerun.yaml repeats the transform stage after the test deletes a
+# row merge-on-read; keep the two SQL statements identical.
+name: "{{.RunPrefix}}-v3-variant"
+stages:
+  - name: extract
+    components:
+      - name: events-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/variant-events"
+          table_name: events
+        outputs:
+          tables:
+            - name: events
+              bucket: "{{.RunPrefix}}-v3raw"
+              writeMode: FULL_LOAD
+              partitionSpec:
+                - { source_column: category, transform: identity }
+                - { source_column: id, transform: "bucket[4]" }
+              columns:
+                - { name: category, type: string }
+                - { name: id, type: long }
+                - { name: payload, type: variant }
+
+  - name: transform
+    components:
+      - name: variant-transform
+        component: sql-transform
+        version: dev
+        inputs:
+          tables:
+            - bucket: "{{.RunPrefix}}-v3raw"
+              table: events
+        outputs:
+          tables:
+            - name: events_out
+              bucket: "{{.RunPrefix}}-v3out"
+              writeMode: FULL_LOAD
+        config:
+          sql: |
+            CREATE TABLE events_out AS
+            SELECT id, category, payload,
+                   json_object('id', id, 'category', category)::VARIANT AS derived
+            FROM events
+            ORDER BY id;

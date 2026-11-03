@@ -143,12 +143,7 @@ func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir strin
 	// Build query target for K8s MinIO via NodePort, with a
 	// lakekeeper-vended Resolver so assertions hit lakekeeper-allocated
 	// UUID-keyed paths.
-	queryTarget := k8sQueryTarget(t)
-	resolver, err := buildK8sVerifier(ctx, h)
-	if err != nil {
-		t.Fatalf("build lakekeeper verifier: %v", err)
-	}
-	queryTarget.Resolver = resolver
+	queryTarget := NewK8sQueryTarget(ctx, t, h)
 
 	vars := TemplateVars{RunPrefix: runPrefix}
 
@@ -251,6 +246,20 @@ func RunScenario(t *testing.T, sc Scenario, runPrefix string, pipelinesDir strin
 			t.Errorf("unknown assertion type: %q", a.Type)
 		}
 	}
+}
+
+// NewK8sQueryTarget is the query target scenario assertions read through:
+// K8s MinIO via NodePort (or a port-forward) plus a lakekeeper resolver as
+// alice.
+func NewK8sQueryTarget(ctx context.Context, t *testing.T, h *FGAHarness) QueryTarget {
+	t.Helper()
+	target := k8sQueryTarget(t)
+	resolver, err := buildK8sVerifier(ctx, h)
+	if err != nil {
+		t.Fatalf("build lakekeeper verifier: %v", err)
+	}
+	target.Resolver = resolver
+	return target
 }
 
 // buildK8sVerifier opens a lakekeeper REST catalog connection scoped

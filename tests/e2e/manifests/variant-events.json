@@ -1,0 +1,10 @@
+[
+  {"category": "alpha", "id": 1, "payload": {"user": {"name": "Ana", "tags": ["admin", "ops"]}, "big": 9007199254740993, "active": true}},
+  {"category": "alpha", "id": 2, "payload": {"user": {"name": "Bo \"the\" builder", "tags": []}, "big": 9223372036854775807, "nested": {"deep": {"deeper": "ok"}}}},
+  {"category": "alpha", "id": 3, "payload": [1, "two", {"three": 3}, [4, 5]]},
+  {"category": "beta", "id": 4, "payload": {"event": "click", "count": 42, "unicode": "žluťoučký kůň"}},
+  {"category": "beta", "id": 5, "payload": {"event": "view", "ids": [9007199254740995, 18014398509481985], "meta": {"source": "e2e"}}},
+  {"category": "beta", "id": 6, "payload": [{"k": "a"}, {"k": "b", "n": -9007199254740993}]},
+  {"category": "gamma", "id": 7, "payload": {"empty": {}, "list": [], "flag": false}},
+  {"category": "gamma", "id": 8, "payload": {"text": "line1\nline2", "num": 0}}
+]

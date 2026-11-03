@@ -1,0 +1,27 @@
+# Transform stage of v3-variant.yaml on its own: TestV3VariantPartitioned
+# re-runs it after a merge-on-read delete in the events table, so the gateway
+# serves one file decoded and the rest raw. Keep the SQL identical to
+# v3-variant.yaml.
+name: "{{.RunPrefix}}-v3-variant-rerun"
+stages:
+  - name: transform
+    components:
+      - name: variant-transform
+        component: sql-transform
+        version: dev
+        inputs:
+          tables:
+            - bucket: "{{.RunPrefix}}-v3raw"
+              table: events
+        outputs:
+          tables:
+            - name: events_out
+              bucket: "{{.RunPrefix}}-v3out"
+              writeMode: FULL_LOAD
+        config:
+          sql: |
+            CREATE TABLE events_out AS
+            SELECT id, category, payload,
+                   json_object('id', id, 'category', category)::VARIANT AS derived
+            FROM events
+            ORDER BY id;

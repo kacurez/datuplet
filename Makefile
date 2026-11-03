@@ -238,6 +238,7 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	kubectl -n datuplet-e2e create configmap e2e-http-fixture-data \
 	  --from-file=posts.json=tests/e2e/manifests/posts.json \
 	  --from-file=users.json=tests/e2e/manifests/users.json \
+	  --from-file=variant-events.json=tests/e2e/manifests/variant-events.json \
 	  --dry-run=client -o yaml | kubectl apply -n datuplet-e2e -f -
 	kubectl apply -n datuplet-e2e -f tests/e2e/manifests/http-fixture.yaml
 	kubectl -n datuplet-e2e rollout status deploy/e2e-http-fixture --timeout=60s

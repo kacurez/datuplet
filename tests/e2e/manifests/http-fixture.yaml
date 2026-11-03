@@ -5,8 +5,10 @@
 # committed posts.json / users.json snapshots (originally curled from
 # https://jsonplaceholder.typicode.com/{posts,users}) at /posts and /users,
 # so the e2e data path has zero outbound network. The data ConfigMap
-# (e2e-http-fixture-data, keys posts.json + users.json) is created
+# (e2e-http-fixture-data, keys posts.json + users.json + variant-events.json) is created
 # separately from file by `make e2e-k8s-deploy` to keep this manifest small.
+# variant-events.json (nested JSON payloads for the v3 + VARIANT scenario) is
+# served the same way at /variant-events.
 #
 # Reached by component pods (running in per-project namespaces) via the
 # cross-namespace Service DNS FQDN:
@@ -26,6 +28,10 @@ data:
       location /users {
         default_type application/json;
         alias /data/users.json;
+      }
+      location /variant-events {
+        default_type application/json;
+        alias /data/variant-events.json;
       }
     }
 ---
