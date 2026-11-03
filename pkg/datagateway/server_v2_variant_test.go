@@ -336,11 +336,74 @@ func (c *raceCatalog) LoadTable(ctx context.Context, ident icebergtable.Identifi
 	return c.Catalog.LoadTable(ctx, ident)
 }
 
-// A concurrent create that wins the race with a variant column: the table
-// is re-loaded and the destination re-resolved, so this writer's text
-// column is written as variant.
+// A concurrent create that wins the race with a variant column this writer
+// did not declare: the table is re-loaded and the destination re-resolved,
+// and the chunk fails (InvalidArgument naming the column) instead of
+// reinterpreting values parsed without the variant hint (a JSON "42" would
+// become the number 42). Nothing is written or committed.
 func TestVariantConcurrentCreateRace(t *testing.T) {
-	s, p := newWriteTestServer(t, &Config{DefaultBucket: "raw"})
+	jsonl := "{\"id\":1,\"v\":\"42\"}\n"
+	for _, tc := range []struct {
+		name string
+		fmt  pb.DataFormat
+		body func(t *testing.T) []byte
+	}{
+		{"json", pb.DataFormat_FORMAT_JSON, func(*testing.T) []byte { return []byte(`[{"id":1,"v":"42"}]`) }},
+		{"jsonl", pb.DataFormat_FORMAT_JSONL, func(*testing.T) []byte { return []byte(jsonl) }},
+		{"arrow utf8", pb.DataFormat_FORMAT_ARROW_IPC, func(t *testing.T) []byte {
+			rec := textBatch(t, `42`)
+			defer rec.Release()
+			return ipcPayload(t, rec)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, p := newWriteTestServer(t, &Config{DefaultBucket: "raw"})
+			cat, err := hadoop.NewCatalog("unit", t.TempDir(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rc := &raceCatalog{Catalog: cat}
+			rc.other = func() { createOrders(t, cat, "3", idField, variantField) }
+			s.lakekeeperResolver = &raceResolver{cat: rc}
+			ctx := context.Background()
+			open, err := s.OpenWriter(ctx, &pb.OpenWriterRequest{Table: "orders", InputFormat: tc.fmt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 2; i++ { // the writer stays unopened: every retry fails the same way
+				resp := httpWrite(s, open.WriterId, tc.body(t))
+				if e := decodeHTTPError(t, resp); resp.Code != http.StatusBadRequest || e.Code != "INVALID_ARGUMENT" ||
+					!strings.Contains(e.Error, `column "v"`) || !strings.Contains(e.Error, "did not declare it variant") {
+					t.Fatalf("chunk %d = %d %+v, want 400 INVALID_ARGUMENT naming v", i, resp.Code, e)
+				}
+			}
+			_, err = s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: open.WriterId, Data: tc.body(t)})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("gRPC WriteChunk err = %v, want InvalidArgument", err)
+			}
+			if len(p.writers) != 0 {
+				t.Fatalf("plane writers opened: %d", len(p.writers))
+			}
+			if _, err := s.CloseWriter(ctx, &pb.CloseWriterRequest{WriterId: open.WriterId}); err != nil {
+				t.Fatalf("CloseWriter: %v", err)
+			}
+			tb, err := cat.LoadTable(ctx, catalog.ToIdentifier("raw", "orders"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if f, _ := tb.Schema().FindFieldByName("v"); !isIcebergVariant(f.Type) {
+				t.Fatalf("table v is %v, want the racing writer's variant", f.Type)
+			}
+			if snap := tb.CurrentSnapshot(); snap != nil {
+				t.Fatalf("table has snapshot %d, want nothing committed", snap.SnapshotID)
+			}
+		})
+	}
+}
+
+// A declared variant column survives the same race: the chunk is written.
+func TestVariantConcurrentCreateRaceDeclared(t *testing.T) {
+	s, p := newWriteTestServer(t, variantColumnsConfig(ColumnConfig{Name: "v", Type: "variant"}))
 	cat, err := hadoop.NewCatalog("unit", t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -348,25 +411,16 @@ func TestVariantConcurrentCreateRace(t *testing.T) {
 	rc := &raceCatalog{Catalog: cat}
 	rc.other = func() { createOrders(t, cat, "3", idField, variantField) }
 	s.lakekeeperResolver = &raceResolver{cat: rc}
-	ctx := context.Background()
-	open, err := s.OpenWriter(ctx, &pb.OpenWriterRequest{Table: "orders", InputFormat: pb.DataFormat_FORMAT_ARROW_IPC})
+	open, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Table: "orders", InputFormat: pb.DataFormat_FORMAT_JSON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := textBatch(t, `{"a":1}`, `"s"`)
-	defer rec.Release()
-	mustOK(t, s, open.WriterId, ipcPayload(t, rec))
+	mustOK(t, s, open.WriterId, []byte(`[{"id":1,"v":"42"}]`))
 	w, batches := writtenBatches(t, p)
-	checkCanonical(t, w.spec.Schema, 1)
-	if got, want := variantJSON(t, batches[0].Column(1)), []string{`{"a":1}`, `"s"`}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("values %v, want %v", got, want)
-	}
-	tb, err := cat.LoadTable(ctx, catalog.ToIdentifier("raw", "orders"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f, _ := tb.Schema().FindFieldByName("v"); !isIcebergVariant(f.Type) {
-		t.Fatalf("table v is %v, want the racing writer's variant", f.Type)
+	vi := w.spec.Schema.FieldIndices("v")[0]
+	checkCanonical(t, w.spec.Schema, vi)
+	if got := variantJSON(t, batches[0].Column(vi)); !reflect.DeepEqual(got, []string{`"42"`}) {
+		t.Fatalf("values %v, want [\"42\"]", got)
 	}
 }
 

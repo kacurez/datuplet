@@ -120,6 +120,22 @@ func variantDestination(out *schema.Schema, declared map[string]bool, table *ice
 	return schema.NewSchemaFromArrow(arrow.NewSchema(fields, &md))
 }
 
+// checkUndeclaredVariant fails a first chunk whose destination has a
+// variant column this writer neither declared nor parsed as variant (the
+// table was created concurrently after OpenWriter): its values were parsed
+// without the variant hint (a JSON string "42" would turn into the number
+// 42), so the chunk is rejected rather than reinterpreted. Table variant
+// columns known at OpenWriter are in ws.variantCols and pass.
+func checkUndeclaredVariant(ws *writerState, out, dest *schema.Schema) error {
+	for i := 0; i < out.NumColumns(); i++ {
+		col := out.Column(i)
+		if dest.Column(i).Type == schema.TypeVariant && col.Type != schema.TypeVariant && !ws.variantCols[col.Name] {
+			return invalidVariant("column %q: table %s.%s has it as variant (created concurrently) but this writer did not declare it variant; declare it in the output columns or the component schema", col.Name, ws.bucket, ws.table)
+		}
+	}
+	return nil
+}
+
 // isTextFormat reports whether f's adapter builds records from a gateway
 // schema (CSV, JSON, JSONL), so a variant column can be parsed as variant.
 func isTextFormat(f format.DataFormat) bool {

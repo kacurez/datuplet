@@ -250,6 +250,9 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	if err := checkUndeclaredVariant(ws, outSchema, dest); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := acceptFirstRecord(recSchema, dest); err != nil {
 		return nil, nil, nil, fmt.Errorf("buffer error: %w", err)
 	}
@@ -270,6 +273,12 @@ func (s *ServerV2) ensureTableWriter(ctx context.Context, ws *writerState, infer
 		adoptTarget(ws, target)
 		if dest, err = variantDestination(outSchema, ws.variantCols, ws.tableSchema, ws.formatVersion); err != nil {
 			return nil, nil, nil, err
+		}
+		if err := checkUndeclaredVariant(ws, outSchema, dest); err != nil {
+			return nil, nil, nil, err
+		}
+		if err := acceptFirstRecord(recSchema, dest); err != nil {
+			return nil, nil, nil, fmt.Errorf("buffer error: %w", err)
 		}
 	}
 
