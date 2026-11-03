@@ -142,22 +142,41 @@ func (a *JSONAdapter) Serialize(record arrow.Record) ([]byte, error) {
 			if col.IsNull(rowIdx) {
 				obj[fieldName] = nil
 			} else {
-				obj[fieldName] = extractColumnValue(col, rowIdx)
+				val := extractColumnValue(col, rowIdx)
+				if fv, ok := val.(failedValue); ok {
+					return nil, fmt.Errorf("row %d, column %q: %w", rowIdx, fieldName, fv.err)
+				}
+				obj[fieldName] = val
 			}
 		}
 		objects[rowIdx] = obj
 	}
 
 	if a.serializeOpts.Pretty {
-		return json.MarshalIndent(objects, "", "  ")
+		return marshalNoHTMLEscape(objects, "  ")
 	}
-	return json.Marshal(objects)
+	return marshalNoHTMLEscape(objects, "")
 }
 
-// failedValue makes json.Marshal fail with err instead of emitting a value.
-type failedValue struct{ err error }
+// marshalNoHTMLEscape is json.Marshal (json.MarshalIndent with a non-empty
+// indent) without escaping <, > and & in strings, which would also rewrite
+// embedded variant JSON.
+func marshalNoHTMLEscape(v any, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent != "" {
+		enc.SetIndent("", indent)
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
 
-func (f failedValue) MarshalJSON() ([]byte, error) { return nil, f.err }
+// failedValue is what extractColumnValue returns for a value it cannot
+// render; Serialize turns it into an error naming the column.
+type failedValue struct{ err error }
 
 // extractColumnValue extracts a typed value from an Arrow column.
 func extractColumnValue(col arrow.Array, idx int) any {
@@ -410,11 +429,15 @@ func (a *JSONLAdapter) Serialize(record arrow.Record) ([]byte, error) {
 			if col.IsNull(rowIdx) {
 				obj[fieldName] = nil
 			} else {
-				obj[fieldName] = extractColumnValue(col, rowIdx)
+				val := extractColumnValue(col, rowIdx)
+				if fv, ok := val.(failedValue); ok {
+					return nil, fmt.Errorf("row %d, column %q: %w", rowIdx, fieldName, fv.err)
+				}
+				obj[fieldName] = val
 			}
 		}
 
-		line, err := json.Marshal(obj)
+		line, err := marshalNoHTMLEscape(obj, "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to serialize row %d: %w", rowIdx, err)
 		}

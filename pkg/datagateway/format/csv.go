@@ -202,7 +202,7 @@ func (a *CSVAdapter) Serialize(record arrow.Record) ([]byte, error) {
 				} else {
 					b, err := VariantJSON(va, rowIdx)
 					if err != nil {
-						return nil, fmt.Errorf("CSV row %d, column %d: %w", rowIdx, colIdx, err)
+						return nil, fmt.Errorf("CSV row %d, column %q: %w", rowIdx, arrowSchema.Field(colIdx).Name, err)
 					}
 					row[colIdx] = string(b)
 				}

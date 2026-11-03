@@ -1,6 +1,7 @@
 package format
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -116,7 +117,84 @@ func VariantJSON(arr *extensions.VariantArray, i int) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("row %d: %w", i, err)
 	}
-	return v.MarshalJSON()
+	var buf bytes.Buffer
+	if err := writeVariantJSON(&buf, v); err != nil {
+		return nil, fmt.Errorf("row %d: %w", i, err)
+	}
+	return buf.Bytes(), nil
+}
+
+// writeVariantJSON walks v by type. It does not use variant.Value.MarshalJSON
+// for containers: arrow-go renders an empty array as null. Strings are not
+// HTML-escaped. Primitives other than strings, and the zone-less temporal
+// types, delegate to arrow-go's rendering (exact ints and decimals, base64
+// binary, UUID text, UTC timestamps).
+func writeVariantJSON(buf *bytes.Buffer, v variant.Value) error {
+	switch v.Type() {
+	case variant.Object:
+		obj := v.Value().(variant.ObjectValue)
+		buf.WriteByte('{')
+		for i := uint32(0); i < obj.NumElements(); i++ {
+			f, err := obj.FieldAt(i)
+			if err != nil {
+				return err
+			}
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeJSONString(buf, f.Key); err != nil {
+				return err
+			}
+			buf.WriteByte(':')
+			if err := writeVariantJSON(buf, f.Value); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+		return nil
+	case variant.Array:
+		arr := v.Value().(variant.ArrayValue)
+		buf.WriteByte('[')
+		for i := uint32(0); i < arr.Len(); i++ {
+			el, err := arr.Value(i)
+			if err != nil {
+				return err
+			}
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeVariantJSON(buf, el); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+		return nil
+	case variant.String:
+		return writeJSONString(buf, v.Value().(string))
+	case variant.TimestampMicrosNTZ:
+		return writeJSONString(buf, v.Value().(arrow.Timestamp).ToTime(arrow.Microsecond).Format("2006-01-02 15:04:05.999999"))
+	case variant.TimestampNanosNTZ:
+		return writeJSONString(buf, v.Value().(arrow.Timestamp).ToTime(arrow.Nanosecond).Format("2006-01-02 15:04:05.999999999"))
+	case variant.Time:
+		return writeJSONString(buf, v.Value().(arrow.Time64).ToTime(arrow.Microsecond).Format("15:04:05.999999"))
+	default:
+		b, err := v.MarshalJSON()
+		if err != nil {
+			return err
+		}
+		buf.Write(b)
+		return nil
+	}
+}
+
+func writeJSONString(buf *bytes.Buffer, s string) error {
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		return err
+	}
+	buf.Truncate(buf.Len() - 1) // Encode appends a newline
+	return nil
 }
 
 // IsSQLNullVariant reports whether row i of arr is SQL NULL, as opposed to a

@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -15,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/variant"
 
+	"github.com/datuplet/datuplet/pkg/datagateway/format"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
 )
 
@@ -241,5 +243,108 @@ func TestReadVariantParquetRawAndDecoded(t *testing.T) {
 			t.Errorf("chunk %d v\n got %q\nwant %q", i, got, want)
 		}
 		tbl.Release()
+	}
+}
+
+// Empty arrays survive every text format (arrow-go's own rendering turns
+// them into null), and strings are not HTML-escaped.
+func TestReadVariantEmptyArraysAndHTMLInText(t *testing.T) {
+	rows := []string{`[]`, `{"t":[]}`, `[[]]`, `{}`, `"a<b&c>"`}
+	_, a := variantBatchOf(t, rows)
+	defer a.Release()
+	s := variantReadServerBatches(t, 1<<30, a)
+	want := []string{`[]`, `{"t":[]}`, `[[]]`, `{}`, `"a<b&c>"`}
+
+	resp := openTestReader(t, s, "events", pb.DataFormat_FORMAT_ARROW_IPC)
+	r, err := ipc.NewReader(bytes.NewReader(drainHTTP(t, s, resp.ReaderId)[0].data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Release()
+	if !r.Next() {
+		t.Fatal(r.Err())
+	}
+	col := r.RecordBatch().Column(1).(*array.String)
+	for i, w := range want {
+		if col.Value(i) != w {
+			t.Errorf("IPC row %d = %s, want %s", i, col.Value(i), w)
+		}
+	}
+
+	resp = openTestReader(t, s, "events", pb.DataFormat_FORMAT_CSV)
+	recs, err := csv.NewReader(bytes.NewReader(drainHTTP(t, s, resp.ReaderId)[0].data)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, w := range want {
+		if recs[i+1][1] != w {
+			t.Errorf("CSV row %d = %s, want %s", i+1, recs[i+1][1], w)
+		}
+	}
+
+	resp = openTestReader(t, s, "events", pb.DataFormat_FORMAT_JSONL)
+	sc := bufio.NewScanner(bytes.NewReader(drainHTTP(t, s, resp.ReaderId)[0].data))
+	for i := 0; sc.Scan(); i++ {
+		if got, w := sc.Text(), `{"id":`+strconv.Itoa(i+1)+`,"v":`+want[i]+`}`; got != w {
+			t.Errorf("JSONL row %d = %s, want %s", i, got, w)
+		}
+	}
+
+	resp = openTestReader(t, s, "events", pb.DataFormat_FORMAT_JSON)
+	if got := string(drainHTTP(t, s, resp.ReaderId)[0].data); !bytes.Contains([]byte(got), []byte(`"v":[]`)) || !bytes.Contains([]byte(got), []byte(`"v":"a<b&c>"`)) {
+		t.Errorf("JSON = %s, want empty array and unescaped string", got)
+	}
+}
+
+// A non-canonical variant layout (large_binary storage) reads like the
+// canonical one in the text formats.
+func TestEncodeChunkNonCanonicalVariantLayout(t *testing.T) {
+	storage := arrow.StructOf(
+		arrow.Field{Name: "metadata", Type: arrow.BinaryTypes.LargeBinary},
+		arrow.Field{Name: "value", Type: arrow.BinaryTypes.LargeBinary})
+	vt, err := extensions.NewVariantType(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vb := extensions.NewVariantBuilder(memory.DefaultAllocator, vt)
+	for _, js := range []string{`{"a":[]}`, `[1,"x"]`} {
+		v, err := variant.ParseJSON(js, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vb.Append(v)
+	}
+	vb.AppendNull()
+	va := vb.NewArray()
+	vb.Release()
+	defer va.Release()
+	sch := arrow.NewSchema([]arrow.Field{{Name: "v", Type: vt, Nullable: true}}, nil)
+	rec := array.NewRecordBatch(sch, []arrow.Array{va}, 3)
+	defer rec.Release()
+
+	adapter, _ := format.DefaultRegistry().Get(format.FormatJSONL)
+	data, err := encodeChunk(format.FormatJSONL, adapter, sch, nil, []arrow.RecordBatch{rec}, memory.NewGoAllocator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "{\"v\":{\"a\":[]}}\n{\"v\":[1,\"x\"]}\n{\"v\":null}\n"; string(data) != want {
+		t.Errorf("JSONL = %q, want %q", data, want)
+	}
+	wire := arrow.NewSchema([]arrow.Field{{Name: "v", Type: arrow.BinaryTypes.String, Nullable: true}}, nil)
+	data, err = encodeChunk(format.FormatArrowIPC, nil, sch, wire, []arrow.RecordBatch{rec}, memory.NewGoAllocator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := ipc.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Release()
+	if !r.Next() {
+		t.Fatal(r.Err())
+	}
+	col := r.RecordBatch().Column(0).(*array.String)
+	if col.Value(0) != `{"a":[]}` || col.Value(1) != `[1,"x"]` || !col.IsNull(2) {
+		t.Errorf("IPC = %v", col)
 	}
 }
