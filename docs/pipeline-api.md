@@ -97,7 +97,7 @@ SDK as `sdk.OutputTableRef.Columns`); `type` is one of `int`, `long`,
 | `float`, `double` | Float64 | |
 | `boolean` | Boolean | |
 | `string` | String (utf8) | keeps the value's exact source text |
-| `variant` | Iceberg v3 VARIANT | the gateway stores the column as VARIANT (the table is created as format v3). The component is told the column is `string` and sends JSON text, which the gateway parses; invalid JSON fails the write naming the row and column |
+| `variant` | Iceberg v3 VARIANT | the gateway stores the column as VARIANT (the table is created as format v3). The component is told the column is `string` and sends JSON text, which the gateway parses; invalid JSON fails the write naming the row and column. Scalar caveat for components told `string`: see [Raw JSON into VARIANT](#raw-json-into-variant) |
 
 Narrowing to 32-bit is only offered for a **declared** `int` because the
 declaration is your assertion about the range; type *inference* never chooses
@@ -149,6 +149,16 @@ outputs:
         - { name: id, type: long }
         - { name: payload, type: variant }   # nested objects/arrays stored as VARIANT
 ```
+
+**Scalar payloads.** A component that is told the column is `string` (for
+example http-json-extractor) sends the value as JSON text, which the gateway
+parses. Objects, arrays, numbers and `null` are stored as-is. Boolean values
+fail the run as a type violation (exit code 1, the message names the column
+as `string`). Plain string values (`"hello"`) fail the write as invalid JSON.
+Strings that look like numbers or booleans (`"42"`, `"true"`) are stored as
+the parsed JSON value (the number `42`, the boolean `true`), not as a string.
+Components that write Arrow or Parquet variant, or JSON-quoted text, are not
+affected.
 
 CRDs are hand-maintained: on a running cluster, `make k8s-reload-crds` is
 needed for the CRD's `variant` enum value.
