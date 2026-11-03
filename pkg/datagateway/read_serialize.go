@@ -140,7 +140,7 @@ func variantToJSONText(va *extensions.VariantArray, mem memory.Allocator) (arrow
 		}
 		text, err := format.VariantJSON(va, i)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("row %d: %w", i, err)
 		}
 		b.Append(string(text))
 	}

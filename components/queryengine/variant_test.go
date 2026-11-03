@@ -62,7 +62,10 @@ func TestPreviewProjectsVariantAsJSONText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run (control): %v", err)
 	}
-	display, _ := res.Rows[0][0].(string)
+	display, ok := res.Rows[0][0].(string)
+	if !ok {
+		t.Fatalf("direct ::VARCHAR = %T %v, want string", res.Rows[0][0], res.Rows[0][0])
+	}
 	if got, err := decodeJSONExact(t, display); err == nil && reflect.DeepEqual(got, want) {
 		t.Fatalf("direct ::VARCHAR unexpectedly produced equal JSON: %q", display)
 	}

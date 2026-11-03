@@ -162,3 +162,16 @@ func TestReadOnlyCatalogProxyUpstreamError(t *testing.T) {
 		t.Fatal("proxy still serving after Close")
 	}
 }
+
+// TestReadOnlyCatalogProxyIgnoresEnvProxy keeps catalog traffic (bearer JWT
+// out, vended credentials back) off any HTTP(S)_PROXY set on the workload.
+func TestReadOnlyCatalogProxyIgnoresEnvProxy(t *testing.T) {
+	p, err := startReadOnlyCatalogProxy("http://127.0.0.1:1/catalog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if p.transport.Proxy != nil {
+		t.Fatal("catalog proxy transport honours HTTP(S)_PROXY/NO_PROXY; want Proxy nil")
+	}
+}

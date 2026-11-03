@@ -49,6 +49,7 @@ func startReadOnlyCatalogProxy(upstream string) (*readOnlyCatalogProxy, error) {
 		transport: http.DefaultTransport.(*http.Transport).Clone(),
 		url:       "http://" + ln.Addr().String() + strings.TrimSuffix(target.Path, "/"),
 	}
+	p.transport.Proxy = nil
 
 	rp := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: target.Scheme, Host: target.Host})
 	rp.Transport = p.transport

@@ -156,27 +156,29 @@ func appendVariantFromInterface(b *extensions.VariantBuilder, value any) error {
 
 // VariantJSON renders row i of a variant array as JSON text; the value's
 // numbers are written exactly. A SQL NULL row is the caller's to detect
-// (arr.Storage().IsNull(i)); a variant JSON null renders as null.
+// (arr.Storage().IsNull(i)); a variant JSON null renders as null. Errors do
+// not name the row; the caller does.
 func VariantJSON(arr *extensions.VariantArray, i int) ([]byte, error) {
 	if arr.IsNull(i) {
 		return []byte("null"), nil
 	}
 	v, err := arr.Value(i)
 	if err != nil {
-		return nil, fmt.Errorf("row %d: %w", i, err)
+		return nil, err
 	}
 	var buf bytes.Buffer
 	if err := writeVariantJSON(&buf, v); err != nil {
-		return nil, fmt.Errorf("row %d: %w", i, err)
+		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
 // writeVariantJSON walks v by type. It does not use variant.Value.MarshalJSON
 // for containers: arrow-go renders an empty array as null. Strings are not
-// HTML-escaped. Primitives other than strings, and the zone-less temporal
-// types, delegate to arrow-go's rendering (exact ints and decimals, base64
-// binary, UUID text, UTC timestamps).
+// HTML-escaped. The zone-less temporal types (timestamp NTZ, time) are
+// rendered here as the UTC wall clock, since arrow-go would use the local
+// zone. The other primitives delegate to arrow-go's rendering (exact ints and
+// decimals, base64 binary, UUID text, UTC timestamps, dates).
 func writeVariantJSON(buf *bytes.Buffer, v variant.Value) error {
 	switch v.Type() {
 	case variant.Object:

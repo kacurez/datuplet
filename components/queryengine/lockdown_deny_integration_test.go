@@ -85,7 +85,8 @@ func runLockdownDenyIntegration(ctx context.Context, t *testing.T, e *engine, en
 	// lakekeeper's FGA grant stays the per-principal authorization of record (a
 	// viewer is vended read-only STS and lakekeeper rejects its commits). The
 	// fixture runs authorization=allowall and vends read-WRITE credentials, so a
-	// success here could only mean the engine flag is gone. UPDATE, DELETE and
+	// success here could only mean the READ_ONLY attach and the read-only
+	// catalog proxy both stopped refusing it. UPDATE, DELETE and
 	// iceberg_rewrite_data_files first bind a scan of the table, which needs the
 	// real vended credentials — that is why they are asserted here and not only
 	// in the fake-catalog matrix.
