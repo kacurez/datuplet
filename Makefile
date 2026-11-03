@@ -9,7 +9,7 @@ export DOCKER_BUILDKIT=1
 	extractor-local \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-app-worker docker-build-k8s \
 	clean clean-go-git-cache \
-	test e2e e2e-k8s e2e-k8s-gcs e2e-all \
+	test test-authz-integration e2e e2e-k8s e2e-k8s-gcs e2e-all \
 	deploy-local deploy-local-helm undeploy-local k8s-smoke \
 	k8s-reload-crds k8s-rebuild-operators k8s-rebuild-services \
 	k8s-retry-simple k8s-retry-duckdb k8s-retry-full \
@@ -194,6 +194,9 @@ kill-port-forward-minio-k8s: ## Kill the MinIO K8s port-forward
 test: ## Run all unit tests
 	go test -v ./...
 
+test-authz-integration: ## Run the OpenFGA authz integration tests against the chart's FGA model (needs Docker)
+	go test -v -count=1 -tags=integration ./pkg/pipelineapi/authz/... -run 'TestOpenFGA'
+
 e2e: e2e-k8s ## Run e2e (K8s tier — the only supported deployment surface)
 
 e2e-k8s: docker-build-k8s build-components-e2e e2e-k8s-deploy ## Run e2e against helm-installed charts in namespace datuplet-e2e (build images + deploy + test + teardown)
@@ -235,6 +238,7 @@ e2e-k8s-deploy: ## Deploy + test + teardown (images must already be present on t
 	kubectl -n datuplet-e2e create configmap e2e-http-fixture-data \
 	  --from-file=posts.json=tests/e2e/manifests/posts.json \
 	  --from-file=users.json=tests/e2e/manifests/users.json \
+	  --from-file=variant-events.json=tests/e2e/manifests/variant-events.json \
 	  --dry-run=client -o yaml | kubectl apply -n datuplet-e2e -f -
 	kubectl apply -n datuplet-e2e -f tests/e2e/manifests/http-fixture.yaml
 	kubectl -n datuplet-e2e rollout status deploy/e2e-http-fixture --timeout=60s

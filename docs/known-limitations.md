@@ -78,22 +78,22 @@ to a human/automation account) to retrieve audit entries.
 
 ## Upgrade
 
-**Breaking FGA model changes are manual.** When an OpenFGA DSL change renames or
-removes a relation, existing tuples (project_admin, server-admin) need rewriting.
-The only supported path today is: tear down the CNPG cluster (wipes OpenFGA +
-Lakekeeper DBs), upgrade both charts, re-run `register.sh`. See
+**FGA model changes are fresh-install only.** Any DSL change is made at the same version
+and takes effect only on a fresh install (`install.sh`); there is no upgrade or
+tuple-rewrite path. Nothing fully enforces this on an existing install: authz-bootstrap
+refuses to re-pin only while its sentinel ConfigMap holds the old DSL hash, and re-pins
+to the edited model when the sentinel is missing. See
 [docs/fga-model-upgrades.md](fga-model-upgrades.md).
 
 **`platform.fgaModelVersion` cross-chart drift.** `charts/datuplet-app/values.yaml`
 (`fgaModel.version`) and `charts/datuplet-lakekeeper/values.yaml`
-(`platform.fgaModelVersion`) must be bumped together on every FGA model upgrade. CI
+(`platform.fgaModelVersion`) must stay equal (both = Lakekeeper's active model version). CI
 enforces DSL→version coupling within `datuplet-app` (the `fga-version-check` workflow)
-**and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4). Still bump both
-values together — the check fails the PR if they drift.
+**and** cross-chart sync (the `verify-versions` PR check, RFC 024 W4).
 
-**Upgrade support statement (0.x).** Upgrades are tested for exactly one
-hop — latest published release → next (the `upgrade-e2e` workflow).
-Skipping releases is best-effort. Upgrades are forward-only: `upgrade.sh`
+**Upgrade support statement (0.x).** There is no in-place upgrade path to
+this release: it moves to Lakekeeper v0.14.2, OpenFGA v1.22.1 and FGA model
+4.13, so it needs a fresh install. Upgrades are forward-only: `upgrade.sh`
 uses no `--atomic` and there is no rollback path for hook Jobs, CRD
 applies, or DB migrations — recovery is fix-and-re-run. See
 [docs/dependency-upgrades.md](dependency-upgrades.md) for the per-dependency
@@ -146,9 +146,10 @@ follow-up work.
 
 ## FGA model
 
-**No automated FGA tuple migration tooling.** Breaking DSL changes (rename/remove
-a relation) require a full cluster teardown and re-registration. Automated migration
-tooling is follow-up work.
+**The FGA model version is tied to the Lakekeeper image.** Lakekeeper uses the pin of its
+hard-coded active model version (4.13 for v0.14.2), so `fgaModel.version` must equal it. A
+Lakekeeper bump that moves the active version needs a re-fork and a fresh install. See
+[docs/fga-model-upgrades.md](fga-model-upgrades.md).
 
 ---
 
@@ -174,10 +175,48 @@ is always written with its own current spec. Changing `partition_fields` on an
 existing table only logs a warning naming both specs (FULL_LOAD replaces files,
 not the table); drop the table to change its partitioning.
 
-**Partitioned writes to format-version 3 tables are rejected.** iceberg-go
-v0.7.0 requires `first_row_id` on every v3 data file it adds, which the gateway
-cannot assign, so such a table fails the writer with InvalidArgument.
-Unpartitioned v3 tables are written as before.
+**Iceberg v3 is the default for new tables.** The gateway creates every new
+table as format-version 3, and Lakekeeper warehouses default to v3. Existing v2
+tables are loaded and written as they are. v3 readers see deletion vectors as
+deletes: only the file a deletion vector applies to is decoded, and the other
+files stay raw (M5c below concerns position-delete files, not deletion vectors).
+
+**Partitioned v3 commits need `commit.retry.num-retries` of 0.** The gateway
+assigns each file's `first_row_id` itself; iceberg-go's internal commit retry
+would not re-base those values and row-id ranges could overlap. Gateway-created
+tables set the property to 0. A partitioned v3 table with a larger value fails
+the writer at resolve with InvalidArgument, and a value set between resolve and
+commit fails the commit (FailedApplication, not retried). Set it back to 0.
+
+**VARIANT columns.** Declare them with `type: variant` in the output `columns`
+(see [pipeline-api.md](pipeline-api.md#raw-json-into-variant)).
+- Stored unshredded, v3 tables only, and not usable as a partition source. The
+  column has no column metrics (iceberg-go `AddFiles` skips variant stats).
+- Text input (a column the component sends as string, or CSV) is parsed as one
+  strict JSON value. A bare `null` becomes SQL NULL; a quoted `"null"` is
+  stored as the variant string "null". CSV null tokens (for example `""`, `NA`,
+  `null`, `\N`; configurable) become SQL NULL. An encoded variant null arriving
+  as Arrow/Parquet stays a variant null.
+- JSON/JSONL (JSON-native) input stores each value as it is: a JSON `null`
+  becomes SQL NULL, strings stay variant strings (`"42"` and `"null"` stay
+  strings), and numbers, booleans, objects and arrays keep their JSON values.
+- Integer and decimal literals keep their exact value up to 38 significant
+  digits; more than 38 significant or fractional digits fails the write naming
+  the row and column. Exponent literals (`1.5e300`) are stored as double and can
+  lose precision; `-0.0` loses its sign.
+- JSON decoding keeps exact number text, so nested JSON in a *string* column
+  also keeps `1.0` as `1.0` and large integers exact.
+- If a concurrent create gives the table a variant column this writer did not
+  declare, the write fails with InvalidArgument / HTTP 400 naming the column.
+  Declare the column (or re-`OpenWriter`).
+- Reads render a variant as JSON text (Arrow IPC, CSV) or embedded JSON (JSON,
+  JSONL); `FORMAT_PARQUET` returns a real VARIANT. Empty arrays and objects
+  render exactly in the text formats.
+- Queries return a clear error for a top-level VARIANT or JSON result column;
+  use `col::JSON::VARCHAR` for VARIANT, `col::VARCHAR` for JSON. Nested ones (`STRUCT(a VARIANT)`, `VARIANT[]`,
+  `JSON[]`) still get the driver's opaque error or `map[...]` text. Storage
+  preview does the cast itself and loads the table schema first, so a missing
+  table is a 404.
 
 **Open partition files cost memory.** A partitioned table writer keeps up to
 `DATUPLET_GATEWAY_MAX_OPEN_PARTITIONS` files open (default 16, 1-1024). Without
@@ -317,6 +356,8 @@ longer returned.
 **Async read-ahead shares `memory_limit`.** DuckDB 2.0 keeps multiple object-storage reads in flight; the read-ahead budget is bounded by the same `memory_limit` the worker sets, so read-ahead can make a wide scan reach `memory_limit` sooner than on 1.5. Because the locked engine cannot spill to disk, the query then fails (reported as a local-file-access policy error) rather than slowing down; raise the worker's memory limit for such scans. No separate knob is exposed.
 
 **Statically linked `tpch`/`tpcds` are reachable post-lock.** DuckDB 2.0.0 links the benchmark generators into the engine (`dbgen`, `dsdgen`, `tpch_queries()`, `tpcds_queries()`). The generators write into the CURRENT catalog, which is the attached lakekeeper catalog; because it is attached read-only, `CALL dbgen()` / `dsdgen()` against it fail before any catalog write request (binding may still read catalog metadata). Aimed at the in-memory `memory` catalog they still generate data in RAM, bounded by `memory_limit` and the request timeout; a statically linked extension has no runtime off-switch. `TestStaticallyLinkedExtensions` pins the exact set of statically linked extensions that `duckdb_extensions()` lists, and `TestLockdownDenyAttachedReadOnly` proves the refusal. That pin cannot see everything `libduckdb` links: v0.20000.0 links and registers nine components, and the two capability-style ones, `duckdb_httplib` and `duckdb_loadable_extensions`, are never listed by `duckdb_extensions()` and no API exposes them, so a change to them on a bindings bump goes unnoticed by the test.
+
+**A refused `iceberg_rewrite_data_files` can leave orphan files.** The engine's read-only catalog proxy refuses the commit, so table state never changes, but the extension writes manifests and a manifest list before committing and does not delete them on failure. For a principal with read-write vended credentials (editor and above) a rewrite attempt therefore leaves unreferenced metadata files in the table's storage prefix; a viewer's read-only credentials cannot write them.
 
 ---
 

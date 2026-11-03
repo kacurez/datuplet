@@ -65,10 +65,16 @@ func logWriterSchema(ws *writerState, source string) {
 		ws.writerID, ws.bucket, ws.table, source, len(cols), strings.Join(parts, ", "), truncated)
 }
 
-// partitionStatus returns a partitioning failure as gRPC InvalidArgument
-// (spec decision 2); other errors pass through.
+// isInvalidArgument reports whether err is a partitioning or variant
+// failure the caller must fix (gRPC InvalidArgument, HTTP 400).
+func isInvalidArgument(err error) bool {
+	return errors.Is(err, ErrInvalidPartition) || errors.Is(err, ErrInvalidVariant)
+}
+
+// partitionStatus returns a partitioning or variant failure as gRPC
+// InvalidArgument (spec decision 2, C2); other errors pass through.
 func partitionStatus(err error) error {
-	if err != nil && errors.Is(err, ErrInvalidPartition) {
+	if err != nil && isInvalidArgument(err) {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return err
@@ -97,6 +103,7 @@ func adoptTarget(ws *writerState, target *dglakekeeper.WriterTarget) {
 	spec := target.Spec
 	ws.partSpec = &spec
 	ws.tableSchema = target.Schema
+	ws.formatVersion = target.FormatVersion
 	if target.SpecWarning != "" {
 		log.Printf("warning: writer=%s table=%s.%s: %s", ws.writerID, ws.bucket, ws.table, target.SpecWarning)
 	}
@@ -179,15 +186,25 @@ func (s *ServerV2) openWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 	//      component supplied a schema (with the drop processors applied),
 	//      otherwise on the first chunk from the inferred schema.
 	//   2. LocalDataDir (tests): <LocalDataDir>/<bucket>/<table>/data/.
+	//
+	// Declared variant columns (spec C3a, C3c) are in the created table's
+	// schema; an existing table's types win (C3b).
+	variantCols := s.configuredVariantColumns(bucket, table)
+	var outSchema *schema.Schema
+	if sch != nil {
+		if outSchema, err = outputSchemaFor(sch, pipeline); err != nil {
+			return nil, fmt.Errorf("failed to compute output schema: %w", err)
+		}
+	}
 	var target *dglakekeeper.WriterTarget
 	var localBase string
 	switch {
 	case s.lakekeeperResolver != nil:
 		var sp dglakekeeper.SchemaProvider
-		if sch != nil {
-			createSchema, schErr := outputSchemaFor(sch, pipeline)
+		if outSchema != nil {
+			createSchema, schErr := variantDestination(outSchema, variantCols, nil, 0)
 			if schErr != nil {
-				return nil, fmt.Errorf("failed to compute output schema: %w", schErr)
+				return nil, schErr
 			}
 			sp = func(context.Context) (*schema.Schema, error) { return createSchema, nil }
 		}
@@ -207,6 +224,26 @@ func (s *ServerV2) openWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 		return nil, fmt.Errorf("no storage backend configured (need lakekeeper resolver or local data dir)")
 	}
 
+	if target != nil {
+		// Writer resolution fails before any upload on a variant column the
+		// table cannot take (spec C2, C3b).
+		if outSchema != nil {
+			if _, err := variantDestination(outSchema, variantCols, target.Schema, target.FormatVersion); err != nil {
+				return nil, err
+			}
+		} else if err := checkVariantTarget(sortedNames(variantCols), target.Schema, target.FormatVersion); err != nil {
+			return nil, err
+		}
+		addTableVariantColumns(variantCols, target.Schema)
+	}
+	// Text formats parse declared variant columns as variant, so JSON keeps
+	// its JSON-native values (spec C4).
+	if sch != nil && isTextFormat(inputFormat) {
+		if sch, _, err = overlayVariant(sch, variantCols); err != nil {
+			return nil, fmt.Errorf("invalid schema: %w", err)
+		}
+	}
+
 	// Generate writer ID and store state
 	s.mu.Lock()
 	s.writerCounter++
@@ -222,6 +259,7 @@ func (s *ServerV2) openWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 		pipeline:       pipeline,
 		schema:         sch,
 		schemaInferred: sch == nil,
+		variantCols:    variantCols,
 	}
 	ws := s.writers[writerID]
 	if target != nil {
@@ -421,9 +459,12 @@ func schemasCompatible(a, b *arrow.Schema) bool {
 }
 
 // writableArrowType reports whether today's write path accepted a column of
-// this type (large_string / large_binary and nested types were rejected).
+// this type (large_string / large_binary and nested types were rejected),
+// or it is the canonical variant layout.
 func writableArrowType(dt arrow.DataType) bool {
 	switch dt.ID() {
+	case arrow.EXTENSION:
+		return format.IsCanonicalVariant(dt)
 	case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64,
 		arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64,
 		arrow.FLOAT32, arrow.FLOAT64, arrow.BOOL, arrow.STRING, arrow.BINARY,

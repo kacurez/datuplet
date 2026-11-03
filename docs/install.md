@@ -112,15 +112,14 @@ it is idempotent and safe to re-run.
 
 ## Upgrade
 
-Upgrade phases independently based on what changed:
+This release has no in-place upgrade path: it moves to Lakekeeper v0.14.2,
+OpenFGA v1.22.1 and FGA model 4.13, so it needs a fresh install.
+
+`upgrade.sh` re-applies a Datuplet release (Phase 3 only). It applies the
+chart's CRDs first (helm never upgrades crds/), then upgrades datuplet-app:
 
 ```bash
-# The common case — a Datuplet release (Phase 3 only). Applies the chart's
-# CRDs first (helm never upgrades crds/), then upgrades datuplet-app:
 ./scripts/upgrade.sh --namespace datuplet --phase app
-
-# Everything (dependency bumps, FGA model changes):
-./scripts/upgrade.sh --namespace datuplet --phase all
 ```
 
 Upgrades are **forward-only**: no `--atomic`, no `helm rollback` (hook
@@ -132,8 +131,8 @@ Recovery from a failed upgrade is: fix the cause, re-run the same command.
 
 `register.sh` is NOT re-run on upgrade unless adding new warehouses or projects.
 
-For FGA model changes (DSL or version bump), see `docs/fga-model-upgrades.md` for the
-version-bump procedure and the cross-chart `platform.fgaModelVersion` coupling requirement.
+FGA model changes are not upgrades: they need a fresh install. See
+`docs/fga-model-upgrades.md`.
 
 ## Local development (OrbStack)
 
@@ -204,5 +203,5 @@ remains a separate opt-in (`allowClientSideQuery=true`). See
 
 - `docs/ad-hoc-query.md` — ad-hoc SQL query service (console, REST, CLI) + how to enable it.
 - `docs/postgres-migrations.md` — DB migration discipline.
-- `docs/fga-model-upgrades.md` — FGA model upgrade procedure.
+- `docs/fga-model-upgrades.md` — FGA model changes (fresh install only).
 - `docs/known-limitations.md` — known limitations for 0.1.

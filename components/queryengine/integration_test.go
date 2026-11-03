@@ -279,9 +279,10 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 		fmt.Sprintf("LAKEKEEPER__PG_DATABASE_URL_WRITE=postgres://postgres:%s@127.0.0.1:%d/lakekeeper", pgPassword, f.pgPort),
 		"LAKEKEEPER__PG_ENCRYPTION_KEY=" + lkEncryptionKey,
 		fmt.Sprintf("LAKEKEEPER__LISTEN_PORT=%d", f.lkPort),
+		fmt.Sprintf("LAKEKEEPER__METRICS_PORT=%d", freePort(t)),
 	}
-	runOneShot(ctx, t, "qe-it-lk-migrate", lkEnv, "quay.io/lakekeeper/catalog:v0.12.1", "migrate")
-	runDetachedEnv(t, "qe-it-lk", lkEnv, "quay.io/lakekeeper/catalog:v0.12.1", "serve")
+	runOneShot(ctx, t, "qe-it-lk-migrate", lkEnv, "quay.io/lakekeeper/catalog:v0.14.2", "migrate")
+	runDetachedEnv(t, "qe-it-lk", lkEnv, "quay.io/lakekeeper/catalog:v0.14.2", "serve")
 	waitHTTP(ctx, t, f.lakekeeperBase()+"/health")
 
 	// 4. Bootstrap + create the S3 warehouse (no JWT — authn disabled).
@@ -294,13 +295,13 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 
 func (f *fixture) teardown() {
 	for _, name := range []string{"qe-it-lk", "qe-it-lk-migrate", "qe-it-minio", "qe-it-pg", "qe-it-mc"} {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", "-v", name).Run()
 	}
 }
 
 func removeLeftovers() {
 	for _, name := range []string{"qe-it-lk", "qe-it-lk-migrate", "qe-it-minio", "qe-it-pg", "qe-it-mc"} {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", "-v", name).Run()
 	}
 }
 

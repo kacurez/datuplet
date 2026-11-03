@@ -3,6 +3,8 @@ package manifest
 import (
 	"testing"
 
+	"github.com/apache/iceberg-go"
+
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
 )
 
@@ -80,7 +82,10 @@ func TestSchemaToIceberg(t *testing.T) {
 			}
 
 			// Convert to Iceberg
-			icebergSchema := SchemaToIceberg(gatewaySchema)
+			icebergSchema, err := SchemaToIceberg(gatewaySchema)
+			if err != nil {
+				t.Fatalf("SchemaToIceberg: %v", err)
+			}
 
 			if icebergSchema == nil {
 				t.Fatal("SchemaToIceberg returned nil")
@@ -109,8 +114,30 @@ func TestSchemaToIceberg(t *testing.T) {
 }
 
 func TestSchemaToIcebergNil(t *testing.T) {
-	result := SchemaToIceberg(nil)
-	if result != nil {
+	result, err := SchemaToIceberg(nil)
+	if result != nil || err != nil {
 		t.Error("Expected nil for nil input")
+	}
+}
+
+// A variant column maps to the Iceberg variant type; an unknown type is an
+// error, not silently a string column.
+func TestUnknownTypeNoLongerMapsToString(t *testing.T) {
+	if typ, err := dataTypeToIceberg(schema.TypeUnknown); err == nil {
+		t.Fatalf("TypeUnknown mapped to %v, want an error", typ)
+	}
+	if typ, err := dataTypeToIceberg(schema.DataType(99)); err == nil {
+		t.Fatalf("DataType(99) mapped to %v, want an error", typ)
+	}
+	s, err := schema.NewSchema([]schema.ColumnDef{{Name: "v", Type: schema.TypeVariant, Nullable: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic, err := SchemaToIceberg(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ic.Field(0).Type.(iceberg.VariantType); !ok {
+		t.Fatalf("variant column maps to %v, want iceberg variant", ic.Field(0).Type)
 	}
 }

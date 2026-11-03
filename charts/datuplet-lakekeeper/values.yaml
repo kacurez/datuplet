@@ -15,8 +15,9 @@ tolerations: []
 # lakekeeper needs. MUST match the originating chart's values.
 platform:
   # Source: charts/datuplet-app/values.yaml :: fgaModel.version
-  # The lakekeeper-config Secret pins lakekeeper to this model version.
-  fgaModelVersion: "4.4"
+  # Must equal the active model version of the pinned Lakekeeper image
+  # (4.13 for v0.14.2); see docs/fga-model-upgrades.md.
+  fgaModelVersion: "4.13"
   # Source: charts/datuplet-app/values.yaml :: platform.openfgaStoreName
   openfgaStoreName: datuplet
   # Set LAKEKEEPER__ENABLE_GCP_SYSTEM_CREDENTIALS=true so Lakekeeper accepts
@@ -50,12 +51,12 @@ lakekeeper:
   # alongside other main resources, completes, then check-db unblocks.
   helmWait: true
   catalog:
-    # Pin lakekeeper to v0.12.1. The FGA DSL files in
+    # Pin lakekeeper to v0.14.2. The FGA DSL files in
     # charts/datuplet-app/files/fga/components/ are forked from
-    # lakekeeper v0.12.1's model. The subchart's default tag may lag
+    # lakekeeper v0.14.2's model (4.13). The subchart's default tag may lag
     # behind; pin so binary and forked model versions match.
     image:
-      tag: v0.12.1
+      tag: v0.14.2
     podLabels:
       app.kubernetes.io/part-of: datuplet
       app.kubernetes.io/name: lakekeeper
@@ -63,6 +64,7 @@ lakekeeper:
     #   pg-lakekeeper       → POSTGRES_HOST/PORT/DB/USER (created by infra's
     #                          postgres/connection-secret-lakekeeper.yaml)
     #   lakekeeper-config   → LAKEKEEPER__OPENFGA__* + LAKEKEEPER__OPENID_*
+    #                          + DATUPLET_FGA_MODEL_VERSION
     #                          (parent-rendered in this chart, see
     #                          templates/config-secret.yaml)
     extraEnvFrom:
@@ -111,7 +113,7 @@ lakekeeper:
             set -eu
             FGA_HTTP="http://openfga.$POD_NAMESPACE.svc.cluster.local:8080"
             # VERSION sourced from the parent-rendered lakekeeper-config Secret
-            # (LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION) via secretKeyRef
+            # (DATUPLET_FGA_MODEL_VERSION) via secretKeyRef
             # on the env block below. Single source of truth =
             # .Values.platform.fgaModelVersion — no hardcoded version drift.
             VERSION="$FGA_MODEL_VERSION"
@@ -158,7 +160,7 @@ lakekeeper:
             valueFrom:
               secretKeyRef:
                 name: lakekeeper-config
-                key: LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION
+                key: DATUPLET_FGA_MODEL_VERSION
         securityContext:
           allowPrivilegeEscalation: false
           capabilities: { drop: ["ALL"] }

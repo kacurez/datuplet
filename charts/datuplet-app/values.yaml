@@ -46,7 +46,7 @@ image:
 # See docs/fga-model-upgrades.md for the upgrade procedure.
 # The model IS Datuplet's schema, so its version belongs in the app release chart.
 fgaModel:
-  version: "4.4"
+  version: "4.13"
 
 # datuplet-infra coordinates.
 # These MUST match the values.yaml fields of the infra install.
@@ -422,7 +422,7 @@ bootstrap:
     # amd64+arm64).
     kubectl: "alpine/k8s:1.31.12"
     # openfga/cli used by authz-bootstrap model-write initContainer.
-    openfgaCli: "openfga/cli:v0.6.2"
+    openfgaCli: "openfga/cli:v0.8.2"
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 200m, memory: 256Mi }

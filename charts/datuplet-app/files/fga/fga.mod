@@ -9,3 +9,5 @@ contents:
   - components/namespace.fga
   - components/lakekeeper_table.fga
   - components/lakekeeper_view.fga
+  - components/lakekeeper_generic_table.fga
+  - components/lakekeeper_catalog_tag.fga

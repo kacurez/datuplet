@@ -7,11 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/apache/iceberg-go"
 )
 
 // QueryTarget describes how to reach Iceberg tables for assertions.
@@ -225,4 +228,120 @@ func keys(m map[string]string) []string {
 	}
 	sort.Strings(ks)
 	return ks
+}
+
+// RequireDuckDBV2 fails the test unless the duckdb CLI is 2.x: reading v3
+// tables and VARIANT needs DuckDB 2.0 (e2e.yml installs v2.0.0). It never
+// skips, so a missing or old CLI cannot pass as green.
+func RequireDuckDBV2(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command("duckdb", "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("duckdb CLI unavailable; the v3/VARIANT assertions need DuckDB 2.x: %v\n%s", err, out)
+	}
+	if v := strings.TrimSpace(string(out)); !strings.HasPrefix(v, "v2.") {
+		t.Fatalf("duckdb CLI is %q; the v3/VARIANT assertions need DuckDB 2.x (e2e.yml installs v2.0.0)", v)
+	}
+}
+
+// ParseJSONExact decodes JSON text keeping every number exact (json.Number),
+// so integers above 2^53 compare by their digits.
+func ParseJSONExact(text []byte) (any, error) {
+	dec := json.NewDecoder(strings.NewReader(string(text)))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("trailing data after JSON value")
+	}
+	return v, nil
+}
+
+// AssertVariantJSON checks that variant column col of bucket.table, read by
+// the duckdb CLI as col::JSON::VARCHAR, equals want row for row (keyed by the
+// table's id column), compared as parsed JSON with exact numbers.
+func AssertVariantJSON(t *testing.T, target QueryTarget, bucket, table, col string, want map[int64]any) {
+	t.Helper()
+	rows, err := duckdbQuery(target, bucket, table,
+		fmt.Sprintf("SELECT id, %s::JSON::VARCHAR AS v FROM {{TABLE}} ORDER BY id", col))
+	if err != nil {
+		t.Fatalf("variant query failed for %s/%s.%s: %v", bucket, table, col, err)
+	}
+	got := make(map[int64]any, len(rows))
+	for _, row := range rows {
+		id, err := toInt(row["id"])
+		if err != nil {
+			t.Fatalf("%s/%s: id %v: %v", bucket, table, row["id"], err)
+		}
+		text, ok := row["v"].(string)
+		if !ok {
+			t.Fatalf("%s/%s.%s id %d: got %T %v, want JSON text", bucket, table, col, id, row["v"], row["v"])
+		}
+		v, err := ParseJSONExact([]byte(text))
+		if err != nil {
+			t.Fatalf("%s/%s.%s id %d: %q is not JSON: %v", bucket, table, col, id, text, err)
+		}
+		got[int64(id)] = v
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s/%s.%s as JSON:\n got  %v\n want %v", bucket, table, col, got, want)
+	}
+}
+
+// AssertIcebergTable checks bucket.table's format version and partition
+// spec, given as "transform(source)" entries (empty for unpartitioned).
+func AssertIcebergTable(t *testing.T, target QueryTarget, bucket, table string, wantVersion int, wantPartition []string) {
+	t.Helper()
+	if target.Resolver == nil {
+		t.Fatalf("AssertIcebergTable %s/%s: query target has no lakekeeper resolver", bucket, table)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tbl, err := target.Resolver.LoadTable(ctx, bucket, table)
+	if err != nil {
+		t.Fatalf("load %s/%s: %v", bucket, table, err)
+	}
+	if v := tbl.Metadata().Version(); v != wantVersion {
+		t.Errorf("%s/%s: format version %d, want %d", bucket, table, v, wantVersion)
+	}
+	spec := tbl.Spec()
+	got := []string{}
+	for _, f := range spec.Fields() {
+		src, _ := tbl.Schema().FindColumnName(f.SourceID())
+		got = append(got, fmt.Sprintf("%s(%s)", f.Transform, src))
+	}
+	if wantPartition == nil {
+		wantPartition = []string{}
+	}
+	if !reflect.DeepEqual(got, wantPartition) {
+		t.Errorf("%s/%s: partition spec %v, want %v", bucket, table, got, wantPartition)
+	}
+}
+
+// AssertIcebergColumnTypes checks that bucket.table's current schema has each
+// named column with exactly the given Iceberg type (e.g. iceberg.VariantType{}),
+// so a variant that came back as a string column fails.
+func AssertIcebergColumnTypes(t *testing.T, target QueryTarget, bucket, table string, want map[string]iceberg.Type) {
+	t.Helper()
+	if target.Resolver == nil {
+		t.Fatalf("AssertIcebergColumnTypes %s/%s: query target has no lakekeeper resolver", bucket, table)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tbl, err := target.Resolver.LoadTable(ctx, bucket, table)
+	if err != nil {
+		t.Fatalf("load %s/%s: %v", bucket, table, err)
+	}
+	for name, wantType := range want {
+		f, ok := tbl.Schema().FindFieldByName(name)
+		if !ok {
+			t.Errorf("%s/%s: no column %q in schema %s", bucket, table, name, tbl.Schema())
+			continue
+		}
+		if !f.Type.Equals(wantType) {
+			t.Errorf("%s/%s: column %q is %s, want %s", bucket, table, name, f.Type, wantType)
+		}
+	}
 }

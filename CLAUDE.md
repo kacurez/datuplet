@@ -93,8 +93,7 @@ OrbStack dev loop (namespace `datuplet`; `K8S_NS=datuplet-e2e` retargets):
 
 Not in PR CI, so run them yourself before a PR: `deadcode` and the chart
 golden-render diff (both only in `make lint`), and the OpenFGA integration
-test. The e2e suite runs in `e2e.yml` on the same triggers; `upgrade-e2e.yml`
-runs on pushes to `main`, label-gated PRs, or manual dispatch;
+test. The e2e suite runs in `e2e.yml` on the same triggers;
 `fga-version-check.yml` fires only on FGA model/values changes;
 `release*.yml` is maintainer territory.
 
@@ -320,9 +319,14 @@ These are conventions a new contributor wouldn't infer from the code:
   the file back via the SDK.
 - **FGA model versioning**: `fgaModel.version` in
   `datuplet-app/values.yaml` and `platform.fgaModelVersion` in
-  `datuplet-lakekeeper/values.yaml` must be kept in sync on FGA model
-  upgrades. CI enforces the DSL→version coupling in `datuplet-app` but
-  does NOT enforce cross-chart drift — reviewers must catch that manually.
+  `datuplet-lakekeeper/values.yaml` must both equal the pinned Lakekeeper's
+  active model version (4.13 for v0.14.2) — Lakekeeper has no setting that
+  selects a model, it looks up the pin of its hard-coded version. A
+  Lakekeeper bump means a model re-fork (`docs/fga-model-upgrades.md`) and a
+  fresh install; any other DSL change stays at the same version and is
+  fresh-install only (no upgrade or tuple-rewrite path). CI checks
+  cross-chart equality (`scripts/verify-versions.sh`); `fga-version-check.yml`
+  still demands a version bump on DSL changes, which conflicts with that rule.
 - **`pg-lakekeeper` + `pg-lakekeeper-pw` Secrets** are created in the
   `infra` chart's keygen Job and consumed cross-phase by the `lakekeeper`
   chart's lakekeeper Deployment.

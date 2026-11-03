@@ -8,6 +8,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
@@ -160,6 +161,8 @@ func appendCSVValue(builder array.Builder, dataType schema.DataType, value strin
 	case schema.TypeBinary:
 		builder.(*array.BinaryBuilder).Append([]byte(value))
 		return nil
+	case schema.TypeVariant:
+		return appendVariantJSONText(builder.(*extensions.VariantBuilder), []byte(value))
 	default:
 		return fmt.Errorf("unsupported type: %v", dataType)
 	}
@@ -193,7 +196,17 @@ func (a *CSVAdapter) Serialize(record arrow.Record) ([]byte, error) {
 	for rowIdx := 0; rowIdx < numRows; rowIdx++ {
 		for colIdx := 0; colIdx < numCols; colIdx++ {
 			col := record.Column(colIdx)
-			if col.IsNull(rowIdx) {
+			if va, ok := col.(*extensions.VariantArray); ok {
+				if IsSQLNullVariant(va, rowIdx) {
+					row[colIdx] = a.serializeOpts.NullString
+				} else {
+					b, err := VariantJSON(va, rowIdx)
+					if err != nil {
+						return nil, fmt.Errorf("CSV row %d, column %q: %w", rowIdx, arrowSchema.Field(colIdx).Name, err)
+					}
+					row[colIdx] = string(b)
+				}
+			} else if col.IsNull(rowIdx) {
 				row[colIdx] = a.serializeOpts.NullString
 			} else {
 				row[colIdx] = formatColumnValue(col, rowIdx)

@@ -6,7 +6,7 @@ metadata:
   name: lakekeeper
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    helm.sh/chart: datuplet-lakekeeper-0.13.3
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -20,10 +20,10 @@ metadata:
   name: lakekeeper-config-envs
   namespace: default
   labels:
-    helm.sh/chart: lakekeeper-0.10.0
+    helm.sh/chart: lakekeeper-0.13.0
     app.kubernetes.io/name: lakekeeper
     app.kubernetes.io/instance: release-name
-    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/version: "0.14.2"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: lakekeeper
     app.kubernetes.io/component: config
@@ -60,7 +60,7 @@ metadata:
   name: lakekeeper-config
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    helm.sh/chart: datuplet-lakekeeper-0.13.3
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -80,14 +80,11 @@ stringData:
   LAKEKEEPER__OPENID_PROVIDER_URI: "http://pipeline-api.default.svc.cluster.local:8081"
   LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS: "datuplet-api"
   LAKEKEEPER__OPENID_AUDIENCE: "datuplet-catalog"
-  # Tells lakekeeper to use OUR pinned model (model_version:collaboration-X)
-  # written by datuplet-app's authz-bootstrap instead of its compiled-in default
-  # (4.3 for lakekeeper 0.12.0). Without this lakekeeper fails at startup
-  # with "Active authorization model with version 4.3 not found in OpenFGA."
-  # because we pin our merged Datuplet+lakekeeper DSL as version
-  # 4.4.
-  # Also tells lakekeeper to skip its own FGA migration.
-  LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION: "4.4"
+  # Read only by the wait-for-fga-store initContainer (values.yaml); Lakekeeper
+  # ignores non-LAKEKEEPER__ keys. Lakekeeper itself finds our pin because
+  # fgaModelVersion equals its hard-coded active model version
+  # (docs/fga-model-upgrades.md).
+  DATUPLET_FGA_MODEL_VERSION: "4.13"
 ---
 # Source: datuplet-lakekeeper/charts/lakekeeper/templates/catalog/catalog-service.yaml
 apiVersion: v1
@@ -96,10 +93,10 @@ metadata:
   name: lakekeeper
   namespace: default
   labels:
-    helm.sh/chart: lakekeeper-0.10.0
+    helm.sh/chart: lakekeeper-0.13.0
     app.kubernetes.io/name: lakekeeper
     app.kubernetes.io/instance: release-name
-    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/version: "0.14.2"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: lakekeeper
     app.kubernetes.io/component: catalog
@@ -123,10 +120,10 @@ metadata:
   name: lakekeeper
   namespace: default
   labels:
-    helm.sh/chart: lakekeeper-0.10.0
+    helm.sh/chart: lakekeeper-0.13.0
     app.kubernetes.io/name: lakekeeper
     app.kubernetes.io/instance: release-name
-    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/version: "0.14.2"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: lakekeeper
     app.kubernetes.io/component: catalog
@@ -145,13 +142,13 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/secret-config-envs: 6c834eb1422e72bc5a4f99af25e058231769b409aa4e25da287f1e01246364d1
+        checksum/secret-config-envs: 9bde8b30127b9a4de26995bedfa770374af52d453b97c6ae609e732ce41000cd
         cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
       labels:
-        helm.sh/chart: lakekeeper-0.10.0
+        helm.sh/chart: lakekeeper-0.13.0
         app.kubernetes.io/name: lakekeeper
         app.kubernetes.io/instance: release-name
-        app.kubernetes.io/version: "0.12.0"
+        app.kubernetes.io/version: "0.14.2"
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/part-of: lakekeeper
         app.kubernetes.io/component: catalog
@@ -166,7 +163,7 @@ spec:
             set -eu
             FGA_HTTP="http://openfga.$POD_NAMESPACE.svc.cluster.local:8080"
             # VERSION sourced from the parent-rendered lakekeeper-config Secret
-            # (LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION) via secretKeyRef
+            # (DATUPLET_FGA_MODEL_VERSION) via secretKeyRef
             # on the env block below. Single source of truth =
             # .Values.platform.fgaModelVersion — no hardcoded version drift.
             VERSION="$FGA_MODEL_VERSION"
@@ -212,7 +209,7 @@ spec:
           - name: FGA_MODEL_VERSION
             valueFrom:
               secretKeyRef:
-                key: LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION
+                key: DATUPLET_FGA_MODEL_VERSION
                 name: lakekeeper-config
           image: alpine/k8s:1.31.12
           imagePullPolicy: IfNotPresent
@@ -262,7 +259,7 @@ spec:
               type: RuntimeDefault        
         
         - name: check-db  
-          image: quay.io/lakekeeper/catalog:v0.12.1
+          image: quay.io/lakekeeper/catalog:v0.14.2
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 65532
@@ -308,7 +305,7 @@ spec:
             - "2"
       containers:
         - name: lakekeeper          
-          image: quay.io/lakekeeper/catalog:v0.12.1
+          image: quay.io/lakekeeper/catalog:v0.14.2
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 65532
@@ -378,10 +375,10 @@ metadata:
   name: lakekeeper-db-migration-1
   namespace: default
   labels:
-    helm.sh/chart: lakekeeper-0.10.0
+    helm.sh/chart: lakekeeper-0.13.0
     app.kubernetes.io/name: lakekeeper
     app.kubernetes.io/instance: release-name
-    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/version: "0.14.2"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: lakekeeper
     app.kubernetes.io/component: db-migration
@@ -394,12 +391,12 @@ spec:
     metadata:
       name: "lakekeeper-migration"
       annotations:
-        checksum/secret-config-envs: 6c834eb1422e72bc5a4f99af25e058231769b409aa4e25da287f1e01246364d1
+        checksum/secret-config-envs: 9bde8b30127b9a4de26995bedfa770374af52d453b97c6ae609e732ce41000cd
       labels:
-        helm.sh/chart: lakekeeper-0.10.0
+        helm.sh/chart: lakekeeper-0.13.0
         app.kubernetes.io/name: lakekeeper
         app.kubernetes.io/instance: release-name
-        app.kubernetes.io/version: "0.12.0"
+        app.kubernetes.io/version: "0.14.2"
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/part-of: lakekeeper
         app.kubernetes.io/component: db-migration
@@ -409,7 +406,7 @@ spec:
       initContainers:        
         
         - name: check-db  
-          image: quay.io/lakekeeper/catalog:v0.12.1
+          image: quay.io/lakekeeper/catalog:v0.14.2
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 65532
@@ -455,7 +452,7 @@ spec:
             - "2"
       containers:
         - name: migration          
-          image: quay.io/lakekeeper/catalog:v0.12.1
+          image: quay.io/lakekeeper/catalog:v0.14.2
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 65532
@@ -502,7 +499,7 @@ metadata:
   name: datuplet-lakekeeper-bootstrap
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    helm.sh/chart: datuplet-lakekeeper-0.13.3
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -518,7 +515,7 @@ metadata:
   name: datuplet-lakekeeper-bootstrap
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    helm.sh/chart: datuplet-lakekeeper-0.13.3
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -539,7 +536,7 @@ metadata:
   name: datuplet-lakekeeper-bootstrap
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    helm.sh/chart: datuplet-lakekeeper-0.13.3
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -563,10 +560,10 @@ metadata:
   name: "lakekeeper-test-bootstrap"
   namespace: default
   labels:
-    helm.sh/chart: lakekeeper-0.10.0
+    helm.sh/chart: lakekeeper-0.13.0
     app.kubernetes.io/name: lakekeeper
     app.kubernetes.io/instance: release-name
-    app.kubernetes.io/version: "0.12.0"
+    app.kubernetes.io/version: "0.14.2"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: lakekeeper
     component: catalog
@@ -615,7 +612,7 @@ metadata:
   name: wait-for-fga-pin
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.1.0
+    helm.sh/chart: datuplet-lakekeeper-0.13.3
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -694,7 +691,7 @@ spec:
             # Secret is a main-chart resource that doesn't exist when pre-install
             # hooks run.
             - name: FGA_MODEL_VERSION
-              value: "4.4"
+              value: "4.13"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }

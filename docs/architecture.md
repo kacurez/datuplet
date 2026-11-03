@@ -174,6 +174,12 @@ Responsibilities per commit (RFC 021 — inline, no separate Job):
   files are committed with their explicit tuples through `txn.AddDataFiles` /
   `txn.ReplaceDataFilesWithDataFiles`, after checking that the table's spec
   did not change since the write. FULL_LOAD replaces data files only.
+- New tables are created as Iceberg format-version 3 (existing tables keep
+  their version). On v3, partitioned commits assign each file's `first_row_id`
+  per attempt and require `commit.retry.num-retries` of 0, so iceberg-go's
+  internal retry cannot overlap row-id ranges. A VARIANT column is written
+  unshredded in v3 tables only (see
+  [known-limitations.md](known-limitations.md)).
 - The session `Commit` RPC is the barrier: it drains the pool and reconciles
   per-writer results.
 

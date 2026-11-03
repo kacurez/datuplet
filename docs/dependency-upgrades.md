@@ -12,12 +12,12 @@ checklist per dependency — what CI cannot see.
    - `pkg/datagateway/lakekeeper/` (resolver: table create/load + vended creds)
    - `pkg/catalogwriter/` (REST client + VendedCreds)
    - `pkg/pipelineapi/storage/catalog_proxy.go` (catalog proxy)
-3. `platform.fgaModelVersion` does NOT move with lakekeeper versions — it
-   tracks Datuplet's FGA DSL only (docs/fga-model-upgrades.md). Bump it
-   only if datuplet's model changed.
+3. The FGA model version (`fgaModel.version` = `platform.fgaModelVersion`)
+   must equal the new Lakekeeper's active model version (4.13 for v0.14.2).
+   A Lakekeeper bump that moves the active version means a re-fork of the
+   model (docs/fga-model-upgrades.md, "Re-forking from upstream Lakekeeper")
+   and a fresh install, never an in-place upgrade.
 4. Gate: `make e2e-k8s` (full suite exercises catalog + STS paths).
-5. Upgrade order on clusters: `upgrade.sh --phase lakekeeper` alone is
-   fine; app does not need a simultaneous bump unless the REST API broke.
 
 ## iceberg-go / arrow-go (root, `components/queryengine`, `tests/e2e`)
 1. Pinned at iceberg-go v0.7.0 with arrow-go v18.8.0 (MVS pulls the arrow-go
@@ -50,6 +50,7 @@ checklist per dependency — what CI cannot see.
    an engine bump does not change them; authz-bootstrap's hash pin
    guards against silent drift.
 3. Gate: e2e (authz-bootstrap + storage-browse scenarios cover FGA).
+4. Current pins: OpenFGA v1.22.1 (chart 0.3.19), `openfga/cli` v0.8.2 (`fga model write --file` + `--config` verified). The `pkg/pipelineapi/authz` integration test image (`openfga_integration_test.go`) is pinned by hand to the same engine version.
 
 ## MinIO (charts/datuplet-infra, dep `minio`)
 1. Dev/e2e-only backend (production = external S3/GCS). Diff root-cred

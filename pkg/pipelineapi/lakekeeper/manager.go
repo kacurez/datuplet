@@ -110,7 +110,8 @@ func (m *Manager) CreateProject(ctx context.Context, name string) (string, error
 // DeleteProject DELETEs /management/v1/project/{id}. The endpoint is
 // marked deprecated in lakekeeper's OpenAPI in favour of
 // `DELETE /management/v1/project` + `x-project-id` header, but the
-// path-based form is still accepted and is more ergonomic; we'll switch
+// path-based form is still accepted (v0.14.2: operationId
+// delete_project_by_id_deprecated) and is more ergonomic; we'll switch
 // when lakekeeper drops it.
 //
 // Returns nil on 204 (success) AND on 404 (already gone) so callers can
@@ -312,7 +313,9 @@ func (m *Manager) EnsureS3WarehouseInProject(ctx context.Context, projectID, war
 			"aws-access-key-id":     profile.AccessKey,
 			"aws-secret-access-key": profile.SecretKey,
 		},
-		"delete-profile": map[string]any{"type": "hard"},
+		"delete-profile":          map[string]any{"type": "hard"},
+		"allowed-format-versions": []int{1, 2, 3},
+		"default-format-version":  3,
 	}
 	return m.createWarehouseInProject(ctx, projectID, body)
 }
@@ -378,11 +381,13 @@ func (m *Manager) EnsureGCSWarehouseInProject(ctx context.Context, projectID, wa
 	}
 
 	body := map[string]any{
-		"warehouse-name":     warehouseName,
-		"project-id":         projectID,
-		"storage-profile":    storageProfile,
-		"storage-credential": storageCred,
-		"delete-profile":     map[string]any{"type": "hard"},
+		"warehouse-name":          warehouseName,
+		"project-id":              projectID,
+		"storage-profile":         storageProfile,
+		"storage-credential":      storageCred,
+		"delete-profile":          map[string]any{"type": "hard"},
+		"allowed-format-versions": []int{1, 2, 3},
+		"default-format-version":  3,
 	}
 	return m.createWarehouseInProject(ctx, projectID, body)
 }

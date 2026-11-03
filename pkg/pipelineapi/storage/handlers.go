@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
@@ -55,7 +56,7 @@ type HTTPHandlers struct {
 // SELECT ... LIMIT statement through the query-worker (RFC 025 §4.1).
 // queryproxy.Core satisfies it; tests use a fake.
 type PreviewRunner interface {
-	Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table string, lim queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError)
+	Preview(ctx context.Context, sub, qualifiedWarehouse, ns, table string, variantCols []string, lim queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError)
 }
 
 // PreviewResponse is the JSON body returned by the preview handler.
@@ -222,7 +223,11 @@ func (h *HTTPHandlers) loadRequestedTable(w http.ResponseWriter, r *http.Request
 	if !validateTableIdentifiers(w, ns, name) {
 		return nil, "", false
 	}
+	return h.loadTable(w, r, pid, lkPID, ns, name)
+}
 
+// loadTable is loadRequestedTable after the project + identifier prologue.
+func (h *HTTPHandlers) loadTable(w http.ResponseWriter, r *http.Request, pid uuid.UUID, lkPID, ns, name string) (tbl *table.Table, metaURI string, ok bool) {
 	if h.Svc.LakekeeperURL != "" {
 		warehouse, gerr := h.resolveWarehouse(r.Context(), lkPID)
 		if gerr != nil {
@@ -487,9 +492,10 @@ func (h *HTTPHandlers) TableSchema(w http.ResponseWriter, r *http.Request) {
 // Preview handles GET /api/v1/storage/projects/{pid}/tables/{ns}/{t}/preview.
 // The data read runs inside the query-worker sandbox (RFC 025 §4.1);
 // pipeline-api never touches parquet bytes. Column types are DuckDB type
-// names (e.g. VARCHAR), not Iceberg ones — a documented v3 change.
+// names (e.g. VARCHAR), not Iceberg ones — a documented v3 change. The table
+// schema is loaded only to find VARIANT columns, which preview as JSON text.
 func (h *HTTPHandlers) Preview(w http.ResponseWriter, r *http.Request) {
-	_, lkPID, ok := h.resolveProject(w, r) // shared projectgate prologue (Task 0.2)
+	pid, lkPID, ok := h.resolveProject(w, r) // shared projectgate prologue (Task 0.2)
 	if !ok {
 		return
 	}
@@ -510,7 +516,17 @@ func (h *HTTPHandlers) Preview(w http.ResponseWriter, r *http.Request) {
 		writeGateErrResp(w, gerr)
 		return
 	}
-	res, qerr := h.Query.Preview(r.Context(), u.ID.String(), lkPID+"/"+warehouse, ns, name,
+	tbl, _, ok := h.loadTable(w, r, pid, lkPID, ns, name)
+	if !ok {
+		return
+	}
+	var variantCols []string
+	for _, f := range tbl.Schema().Fields() {
+		if _, isVariant := f.Type.(iceberg.VariantType); isVariant {
+			variantCols = append(variantCols, f.Name)
+		}
+	}
+	res, qerr := h.Query.Preview(r.Context(), u.ID.String(), lkPID+"/"+warehouse, ns, name, variantCols,
 		queryproxy.PreviewLimits{TimeoutS: 30, MaxRows: previewRowCap, MaxBytes: previewByteCap})
 	if qerr != nil {
 		msg := qerr.Msg

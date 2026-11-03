@@ -1,89 +1,116 @@
-# FGA Model Upgrades
+# FGA Model Changes
 
 The OpenFGA authorization model is stored as DSL files in
-`charts/datuplet-app/files/fga/` and managed via the `fgaModel.version` chart value in
-`charts/datuplet-app/values.yaml`. **The FGA model lives in Phase 3 (`datuplet-app`)** because
-it is Datuplet's authorization schema — it changes when Datuplet changes, not when
-infrastructure changes.
+`charts/datuplet-app/files/fga/` and versioned by the `fgaModel.version` chart value in
+`charts/datuplet-app/values.yaml`. **The FGA model lives in Phase 3 (`datuplet-app`).**
 
 The authz-bootstrap Job (a `pre-install,pre-upgrade` hook in `datuplet-app`) uploads the model
-on first install and skips the upload on subsequent installs when the version pin already exists
-with a matching DSL hash.
+on every run and writes the version pin tuple when the rules in "Hash drift detection" allow.
 
-## `fgaModel.version` is the source of truth
+## The version is Lakekeeper's active model version
 
 Two chart values must match at all times:
 
 | Chart | Value key | Role |
 |---|---|---|
 | `charts/datuplet-app/values.yaml` | `fgaModel.version` | Phase 3 origin — used by authz-bootstrap to write the pin tuple and by pipeline-api's `OPENFGA_MODEL_VERSION` env |
-| `charts/datuplet-lakekeeper/values.yaml` | `platform.fgaModelVersion` | Phase 4 mirror — used by the `lakekeeper-config` Secret's `LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION` env |
+| `charts/datuplet-lakekeeper/values.yaml` | `platform.fgaModelVersion` | Phase 4 mirror — used by the `wait-for-fga-pin` hook and the `wait-for-fga-store` initContainer (via the `lakekeeper-config` Secret's `DATUPLET_FGA_MODEL_VERSION` key) to wait for the pin |
 
-Both must be bumped together when the model changes. If they diverge, pipeline-api and
-lakekeeper will resolve different model IDs and authorization checks will behave inconsistently.
+Both always equal the active model version of the pinned Lakekeeper image (4.13 for v0.14.2).
+Lakekeeper has no setting that selects a model version: it looks up the pin of its hard-coded
+active version (see "Re-forking from upstream Lakekeeper"). Any other version would leave
+pipeline-api and Lakekeeper on different models. `scripts/verify-versions.sh` (a PR CI check)
+fails if the two values drift.
 
-**Known gap:** CI enforces DSL changes → version bump in `datuplet-app` but does NOT enforce
-cross-chart value sync between `fgaModel.version` (app) and `platform.fgaModelVersion`
-(lakekeeper). Operators must bump both manually. See [docs/known-limitations.md](known-limitations.md).
+## Changing the model: fresh install only
 
-## Additive vs breaking changes
+Datuplet is always installed fresh. There is no upgrade, migration or tuple-rewrite path
+for the FGA model.
 
-**Additive** (new type, new relation, new tuple condition — the common case):
-1. Edit DSL files in `charts/datuplet-app/files/fga/components/*.fga`.
-2. Bump `fgaModel.version` in `charts/datuplet-app/values.yaml`.
-3. Bump `platform.fgaModelVersion` in `charts/datuplet-lakekeeper/values.yaml` to match.
-4. `helm upgrade datuplet-app charts/datuplet-app -n datuplet --wait --wait-for-jobs`
-5. `helm upgrade datuplet-lakekeeper charts/datuplet-lakekeeper -n datuplet --wait --wait-for-jobs`
+Any DSL change, additive or breaking, is made the same way:
 
-Authz-bootstrap finds no pin tuple for the new version, uploads the model, writes the pin,
-and exits 0. Pipeline-api rolls out with the new `OPENFGA_MODEL_VERSION` env; lakekeeper
-picks up the matching `LAKEKEEPER__OPENFGA__CONFIGURED_MODEL_VERSION` from the re-rendered
-`lakekeeper-config` Secret.
+1. Edit the fork in `charts/datuplet-app/files/fga/components/*.fga` **at the same version**.
+   Do not bump `fgaModel.version` / `platform.fgaModelVersion`; they move only with a
+   Lakekeeper re-fork (below).
+2. Verify (step 6 of the re-fork recipe).
+3. Install fresh with `scripts/install.sh` (it runs `register.sh` at the end) into a new
+   cluster or namespace. Never `helm upgrade` an existing install onto a changed model.
 
-**Breaking** (rename a type, remove a relation, change semantics) — **not supported by helm
-upgrade in v0.1**. Process:
+## Re-forking from upstream Lakekeeper
 
-1. Tear down the CNPG cluster to wipe the openfga DB (and lakekeeper DB):
+Our model is Lakekeeper's model plus four Datuplet extensions. The current fork is
+Lakekeeper **4.13** (shipped with Lakekeeper v0.14.2). The version must be **exactly** the
+version Lakekeeper hard-codes as active (`AuthorizationModelVersion` in its OpenFGA migration
+module); Lakekeeper looks up that version's pin and, finding ours, does not upload its own
+model. Do not set `LAKEKEEPER__OPENFGA__AUTHORIZATION_MODEL_VERSION`.
+
+Recipe for the next Lakekeeper bump (`<tag>` = Lakekeeper release, `<v>` = its active model
+version):
+
+1. Fetch the upstream components:
    ```bash
-   kubectl delete cluster.postgresql.cnpg.io pg -n datuplet
+   gh api "repos/lakekeeper/lakekeeper/contents/authz/openfga/v<v>?ref=<tag>" --jq '.[].path'
+   gh api "repos/lakekeeper/lakekeeper/contents/authz/openfga/v<v>/components/<file>?ref=<tag>" \
+     --jq .content | base64 -d > charts/datuplet-app/files/fga/components/<file>
    ```
-2. `helm upgrade datuplet-app charts/datuplet-app -n datuplet \`
-   `  --set fgaModel.version=<new-version> --wait --wait-for-jobs`
-3. `helm upgrade datuplet-lakekeeper charts/datuplet-lakekeeper -n datuplet \`
-   `  --set platform.fgaModelVersion=<new-version> --wait --wait-for-jobs`
-4. `./scripts/register.sh --namespace datuplet`  (re-bootstrap warehouse + admin user)
+   Copy `fga.mod` the same way. Replace every component (`git rm` the ones upstream dropped).
+2. Re-apply the extensions, each marked `DATUPLET EXTENSION` in the DSL. On 4.13:
+   - `project.fga`: `editor`, `viewer` and
+     `datuplet_member: editor or viewer or project_admin or security_admin`;
+     `data_admin: … or editor` (reaches table `can_write_data` through warehouse
+     `modify_effective … or data_admin from project`);
+     `select_effective: … or viewer` (reaches table `can_read_data`).
+   - `lakekeeper_table.fga`: `explicit_reader: [user, role#assignee]`, added to
+     `select_effective` **and** `visible_below`. Without `visible_below`, a single-table share
+     loses namespace `can_get_metadata` and warehouse `can_use` / `can_get_config`.
 
-Existing durable FGA tuples (project_admin, server-admin) need manual rewriting when relations
-are renamed or removed. No automated tooling today — use `curl` against the OpenFGA API or
-`pipeline-api admin grant`. See [docs/known-limitations.md](known-limitations.md).
+   Upstream's granted vs `_effective` split decides where an extension lands: actions read
+   the `_effective` twin, so extensions feed the twin, not the bare (granted-only) relation.
+
+   Intended, accepted behaviour change in 4.13: project `can_grant_data_admin` is
+   `security_admin or admin from server`, so editors (`data_admin`) can no longer grant
+   `data_admin` through Lakekeeper's permissions API. Datuplet itself never calls that API.
+   Both authz tests pin this.
+3. Update `datuplet-app.fgaModelComponents` in `charts/datuplet-app/templates/_helpers.tpl` to
+   list `fga.mod`'s components in order. It feeds both the bootstrap DSL hash and the
+   ConfigMap volume items.
+4. Set `fgaModel.version` and `platform.fgaModelVersion` to `<v>`.
+5. Check pipeline-api's relation names against the new model (since 4.13 project reads check
+   `describe_effective`; `describe` matches direct grants only).
+6. Verify: `go test ./pkg/pipelineapi/authz/ -run TestFGAModelCompiles` (compiles the model,
+   checks component lists and extension chains) and `make test-authz-integration` (runs the
+   access matrix on a real OpenFGA server), then `make e2e-k8s`.
 
 ## Hash drift detection
 
-Authz-bootstrap computes a SHA-256 hash of all DSL files at chart-render time and stores it
-in a sentinel ConfigMap `<release>-fga-version-sentinel` alongside the version pin.
+Authz-bootstrap computes a SHA-256 hash of all DSL files at chart-render time and stores it,
+keyed by version, in a sentinel ConfigMap `<release>-fga-version-sentinel` next to the pin.
 
-On each re-run (helm upgrade), the bootstrap logic applies one of three outcomes:
+Every run first uploads the rendered model into the store (the `model-write` initContainer),
+then the `apply` container decides whether to pin it:
 
 | State | Outcome |
 |---|---|
-| Pin doesn't exist for this version | Upload model, write pin + hash to sentinel |
-| Pin exists, hash matches | Skip — idempotent no-op |
-| Pin exists, hash **differs** | **FAIL LOUDLY** — DSL changed without bumping `fgaModel.version` |
+| No pin for this version (fresh install, new store) | Pin the uploaded model, write hash to sentinel |
+| Pin exists, sentinel hash matches | Exit 0, pin unchanged (the uploaded copy stays unpinned) |
+| Pin exists, sentinel hash **differs** | **Fail** (exit 1), pin unchanged — the uploaded copy stays unpinned |
+| Pin exists, **no sentinel hash** for this version | Re-pin to the newly uploaded model, write hash to sentinel |
 
-The fail-loud case catches the operator error of editing DSL files and running `helm upgrade`
-without bumping the version. The old model remains pinned; the DSL change never takes effect
-until the version is bumped.
+So the hash check prevents re-pinning, not uploading. Re-running the bootstrap against an
+existing install after editing the DSL at the same version fails the job and leaves the old
+pin, as long as that install's sentinel ConfigMap still holds the hash. If the sentinel (or
+its key) is missing, the job silently re-pins the version to the edited model. Model changes
+are meant to take effect only through a fresh install, whose new store has no pin.
 
 ## CI policy
 
-The workflow `.github/workflows/fga-version-check.yml` fails any PR that modifies
-`charts/datuplet-app/files/fga/**` without also bumping `fgaModel.version` in
-`charts/datuplet-app/values.yaml`. This is belt-and-suspenders with the runtime
-drift detection above.
+Cross-chart drift between `fgaModel.version` (app) and `platform.fgaModelVersion`
+(lakekeeper) is caught by `scripts/verify-versions.sh` in PR CI.
 
-**CI gap:** the workflow enforces DSL → version coupling within `datuplet-app` but does NOT
-detect drift between `fgaModel.version` (app) and `platform.fgaModelVersion` (lakekeeper).
-Cross-chart sync is the operator's responsibility on upgrade.
+The workflow `.github/workflows/fga-version-check.yml` still fails any PR that modifies
+`charts/datuplet-app/files/fga/**` without bumping `fgaModel.version`. That predates the
+fresh-install rule and conflicts with step 1 above; a DSL-only change needs the workflow
+relaxed first.
 
 ## Further reading
 

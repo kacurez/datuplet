@@ -37,6 +37,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/pkg/datagateway"
 	"github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
+	"github.com/datuplet/datuplet/pkg/datagateway/manifest"
 	dgschema "github.com/datuplet/datuplet/pkg/datagateway/schema"
 	"github.com/datuplet/datuplet/pkg/icebergjob"
 )
@@ -522,13 +523,16 @@ func createReadTable(t *testing.T, r *lakekeeper.Resolver, ns, tbl string) *lake
 	return createReadTableWith(t, r, ns, tbl, testSchema)
 }
 
-// createReadTableWith is createReadTable for a table with schema sch.
+// createReadTableWith is createReadTable for a table with schema sch. The
+// table is created as format version 2 (position-delete files) before the
+// gateway resolves it, which must keep it v2.
 func createReadTableWith(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, sch *arrow.Schema) *lakekeeper.WriterTarget {
 	t.Helper()
+	createV2Table(t, r, ns, tbl, sch)
 	target := createTable(t, r, ns, tbl, sch)
 	tb := loadLK(t, r, ns, tbl)
-	if v := tb.Metadata().Version(); v != 2 {
-		t.Fatalf("table format version %d, want 2", v)
+	if v := tb.Metadata().Version(); v != 2 || target.FormatVersion != 2 {
+		t.Fatalf("table format version %d (target %d), want 2", v, target.FormatVersion)
 	}
 	txn := tb.NewTransaction()
 	if err := txn.SetProperties(iceberg.Properties{
@@ -541,6 +545,32 @@ func createReadTableWith(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, s
 		t.Fatalf("set properties: %v", err)
 	}
 	return target
+}
+
+// createV2Table creates ns.tbl with schema sch as a format version 2 table,
+// outside the gateway.
+func createV2Table(t *testing.T, r *lakekeeper.Resolver, ns, tbl string, sch *arrow.Schema) {
+	t.Helper()
+	ctx := context.Background()
+	gw, err := dgschema.NewSchemaFromArrow(sch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	icSchema, err := manifest.SchemaToIceberg(gw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat, err := r.Catalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.CreateNamespace(ctx, catalog.ToIdentifier(ns), nil); err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(ctx, catalog.ToIdentifier(ns, tbl), icSchema,
+		catalog.WithProperties(iceberg.Properties{table.PropertyFormatVersion: "2"})); err != nil {
+		t.Fatalf("CreateTable v2: %v", err)
+	}
 }
 
 func loadLK(t *testing.T, r *lakekeeper.Resolver, ns, tbl string) *table.Table {

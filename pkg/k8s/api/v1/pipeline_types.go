@@ -279,7 +279,7 @@ type ColumnSpec struct {
 	Name string `json:"name"`
 
 	// Type is the column's data type.
-	// +kubebuilder:validation:Enum=int;long;float;double;boolean;string
+	// +kubebuilder:validation:Enum=int;long;float;double;boolean;string;variant
 	Type string `json:"type"`
 }
 

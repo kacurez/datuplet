@@ -14,6 +14,25 @@ pipeline no longer rewrites values). Usage:
 {{- /* Empty prefix — namespace disambiguates cross-install collisions. */ -}}
 {{- end -}}
 
+{{/*
+datuplet-app.fgaModelComponents — the FGA model component files, one per line,
+in fga.mod order. Single source for the authz-bootstrap DSL hash and its
+ConfigMap volume items; keep in sync with files/fga/fga.mod.
+*/}}
+{{- define "datuplet-app.fgaModelComponents" -}}
+model_version.fga
+user.fga
+role.fga
+server.fga
+project.fga
+warehouse.fga
+namespace.fga
+lakekeeper_table.fga
+lakekeeper_view.fga
+lakekeeper_generic_table.fga
+lakekeeper_catalog_tag.fga
+{{- end -}}
+
 {{- define "datuplet-app.labels" -}}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}

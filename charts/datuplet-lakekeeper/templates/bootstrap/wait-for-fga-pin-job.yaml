@@ -2,9 +2,10 @@
 wait-for-fga-pin: pre-install Job that waits for the FGA model pin tuple.
 
 Polls OpenFGA for the FGA model pin tuple written by datuplet-app's
-authz-bootstrap (Phase 3). Lakekeeper hard-exits at startup if the
-pinned model version is missing — this Job gives a fast, actionable
-error at helm install time instead of CrashLoopBackOff on the Pod.
+authz-bootstrap (Phase 3). Without the pin, Lakekeeper's db-migration
+would upload its upstream model under the same version and bypass the
+Datuplet extensions — this Job orders the install and gives a fast,
+actionable error at helm install time.
 
 Defense in depth: the wait-for-fga-store initContainer in values.yaml
 stays; this Job gives faster operator feedback at install time while

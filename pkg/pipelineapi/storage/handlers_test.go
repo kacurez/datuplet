@@ -9,8 +9,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
 
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
@@ -303,11 +307,14 @@ func TestTableSchema_Success(t *testing.T) {
 type fakePreviewRunner struct {
 	res  *queryproxy.Result
 	qerr *queryproxy.QueryError
-	got  struct{ warehouse, ns, table string }
+	got  struct {
+		warehouse, ns, table string
+		variantCols          []string
+	}
 }
 
-func (f *fakePreviewRunner) Preview(_ context.Context, _, warehouse, ns, table string, _ queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError) {
-	f.got.warehouse, f.got.ns, f.got.table = warehouse, ns, table
+func (f *fakePreviewRunner) Preview(_ context.Context, _, warehouse, ns, table string, variantCols []string, _ queryproxy.PreviewLimits) (*queryproxy.Result, *queryproxy.QueryError) {
+	f.got.warehouse, f.got.ns, f.got.table, f.got.variantCols = warehouse, ns, table, variantCols
 	return f.res, f.qerr
 }
 
@@ -315,10 +322,9 @@ func (f *fakePreviewRunner) Preview(_ context.Context, _, warehouse, ns, table s
 // resolves for the preview tests below.
 const previewWarehouseName = "mywarehouse"
 
-// newPreviewTestServer wires just the Preview route against h. Preview no
-// longer touches h.Svc (the query-worker owns the data read), so these
-// tests build a minimal HTTPHandlers instead of reusing the fixture-walker
-// newTestServer harness.
+// newPreviewTestServer wires just the Preview route against h. Preview reads
+// only the table schema through h.Svc (the query-worker owns the data read),
+// so these tests pair the fixture-walker Service with a projectgatetest gate.
 func newPreviewTestServer(t *testing.T, h *HTTPHandlers, resolver auth.UserResolver) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -339,6 +345,7 @@ func TestPreview_Success(t *testing.T) {
 		Truncated: true,
 	}}
 	h := &HTTPHandlers{
+		Svc:   makeFixtureServiceWithLK(t),
 		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
 		Query: runner,
 	}
@@ -371,6 +378,60 @@ func TestPreview_Success(t *testing.T) {
 	}
 	if want := fixtureLakekeeperProjectID + "/" + previewWarehouseName; runner.got.warehouse != want {
 		t.Errorf("runner got warehouse = %q, want %q", runner.got.warehouse, want)
+	}
+}
+
+// TestPreview_PassesVariantColumns asserts Preview reads the table's Iceberg
+// schema and hands its VARIANT columns to the runner, which projects them as
+// JSON text.
+func TestPreview_PassesVariantColumns(t *testing.T) {
+	svc := makeFixtureServiceWithLK(t)
+	writeVariantTable(t, strings.TrimPrefix(svc.WarehouseURI, "file://"))
+	runner := &fakePreviewRunner{res: &queryproxy.Result{}}
+	h := &HTTPHandlers{
+		Svc:   svc,
+		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
+		Query: runner,
+	}
+	srv := newPreviewTestServer(t, h, stubResolver{})
+
+	resp, err := http.Get(srv.URL + "/api/v1/storage/projects/" + fixtureProjectID + "/tables/public/events/preview")
+	if err != nil {
+		t.Fatalf("GET preview: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if want := []string{"payload"}; !reflect.DeepEqual(runner.got.variantCols, want) {
+		t.Fatalf("variantCols = %q, want %q", runner.got.variantCols, want)
+	}
+}
+
+// writeVariantTable writes a snapshot-less format-version 3 table
+// public/events (id long, payload variant) under warehouse.
+func writeVariantTable(t *testing.T, warehouse string) {
+	t.Helper()
+	tableDir := filepath.Join(warehouse, testdata.ProjectRoot(), "public", "events")
+	metadataDir := filepath.Join(tableDir, "metadata")
+	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sch := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	md, err := table.NewMetadata(sch, iceberg.UnpartitionedSpec, table.UnsortedSortOrder,
+		"file://"+tableDir, iceberg.Properties{"format-version": "3"})
+	if err != nil {
+		t.Fatalf("new metadata: %v", err)
+	}
+	raw, err := json.Marshal(md)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(metadataDir, "v1.metadata.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -409,6 +470,7 @@ func TestPreview_QueryDisabled(t *testing.T) {
 func TestPreview_ResultTooLarge(t *testing.T) {
 	runner := &fakePreviewRunner{qerr: &queryproxy.QueryError{Status: http.StatusRequestEntityTooLarge, Kind: "result_too_large", Msg: "result too large"}}
 	h := &HTTPHandlers{
+		Svc:   makeFixtureServiceWithLK(t),
 		Gate:  projectgatetest.AllowAll(fixtureLakekeeperProjectID, previewWarehouseName),
 		Query: runner,
 	}

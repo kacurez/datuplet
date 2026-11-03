@@ -225,8 +225,8 @@ typed inference to fit reliably.
 
 **Declared output columns.** A pipeline doc can declare, for this
 component's output table, an explicit `{name, type}` column mapping under
-`outputs.tables[].columns` (`int`/`long`/`float`/`double`/`boolean`/`string`
-— see [docs/pipeline-api.md](pipeline-api.md#output-column-mapping-outputstablescolumns)). When
+`outputs.tables[].columns` (`int`/`long`/`float`/`double`/`boolean`/`string`/`variant`
+— see [docs/pipeline-api.md](pipeline-api.md#output-column-mapping-outputstablescolumns); for `variant`, including how scalar values behave, see [Raw JSON into VARIANT](pipeline-api.md#raw-json-into-variant)). When
 present it overrides `schema_inference` and column inference entirely: only
 the mapped columns are written, with the mapped types, from every record —
 no sampling, no inference for that table. `fields` still composes with a

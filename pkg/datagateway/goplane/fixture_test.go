@@ -30,7 +30,7 @@ const (
 	siloBucket       = "gw-it-bucket"
 	pgPassword       = "gw-it-pg-pw"
 	lkEncryptionKey  = "gw-it-throwaway-encryption-key"
-	lakekeeperImage  = "quay.io/lakekeeper/catalog:v0.12.1"
+	lakekeeperImage  = "quay.io/lakekeeper/catalog:v0.14.2"
 	// dummyCatalogJWT is never validated (Lakekeeper authn is off).
 	dummyCatalogJWT = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJndyJ9.c2ln"
 	// siloImage: the pinned drop-in from charts/datuplet-infra/values.yaml.
@@ -102,7 +102,7 @@ func provision(ctx context.Context, t *testing.T) *fixture {
 
 func removeContainers() {
 	for _, name := range fixtureContainers {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", "-v", name).Run()
 	}
 }
 
@@ -175,7 +175,9 @@ func createWarehouse(ctx context.Context, t *testing.T, f *fixture) string {
 			"type": "s3", "credential-type": "access-key",
 			"aws-access-key-id": siloRootUser, "aws-secret-access-key": siloRootPassword,
 		},
-		"delete-profile": map[string]any{"type": "hard"},
+		"delete-profile":          map[string]any{"type": "hard"},
+		"allowed-format-versions": []int{1, 2, 3},
+		"default-format-version":  3,
 	}, http.StatusCreated)
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, f.lakekeeperBase()+"/management/v1/warehouse", nil)

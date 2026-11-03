@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Upload + trigger + await one pipeline through the public REST API — the
-# same path a user takes. Used by release-verify and upgrade-e2e workflows.
+# same path a user takes. Used by the release-verify workflow.
 set -euo pipefail
 BASE_URL=${BASE_URL:-http://localhost:30081}
 EMAIL=${DATUPLET_ADMIN_EMAIL:?set DATUPLET_ADMIN_EMAIL}
@@ -37,7 +37,6 @@ RUN_ID=$(curl -fsS -b "$JAR" -X POST \
   "$BASE_URL/api/v1/projects/$PID/pipelines/$NAME/runs" | jq -r '.id')
 [ -n "$RUN_ID" ] && [ "$RUN_ID" != null ] || { echo "FATAL: trigger returned no run id" >&2; exit 2; }
 echo "run id: $RUN_ID"
-echo "$RUN_ID" > /tmp/datuplet-last-run-id   # consumed by upgrade-e2e's post-upgrade assert
 
 deadline=$(( $(date +%s) + TIMEOUT_S ))
 while [ "$(date +%s)" -lt "$deadline" ]; do

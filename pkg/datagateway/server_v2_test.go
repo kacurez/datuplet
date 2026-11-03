@@ -741,3 +741,25 @@ func TestValidateRunTokenForBoot_MissingRUNID(t *testing.T) {
 
 // Ensure the test file uses context (avoids unused import if no other test needs it).
 var _ = context.Background
+
+func TestGetConfigAdvertisesVariantAsString(t *testing.T) {
+	s := mustNewServerV2(t, &Config{
+		RunID:         "test-exec",
+		ComponentName: "test-component",
+		OutputTables: []OutputTableConfig{{
+			Name: "events", Bucket: "raw", WriteMode: "APPEND",
+			Columns: []ColumnConfig{{Name: "id", Type: "long"}, {Name: "payload", Type: "variant"}},
+		}},
+	})
+	resp, err := s.GetConfig(context.Background(), &pb.GetConfigRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := resp.OutputConfig.Tables[0].Columns
+	if len(cols) != 2 || cols[0].Type != "long" || cols[1].Name != "payload" || cols[1].Type != "string" {
+		t.Fatalf("GetConfig columns = %v, want long + payload advertised as string", cols)
+	}
+	if got := s.config.OutputTables[0].Columns[1].Type; got != "variant" {
+		t.Fatalf("internal declaration mutated to %q, want variant", got)
+	}
+}

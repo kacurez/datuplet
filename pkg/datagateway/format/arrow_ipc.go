@@ -8,6 +8,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
@@ -193,13 +194,21 @@ func validateSchemaMatch(expected, actual *arrow.Schema) error {
 				i, expField.Name, actField.Name)
 		}
 
-		if !arrow.TypeEqual(expField.Type, actField.Type) {
+		if !arrow.TypeEqual(expField.Type, actField.Type) && !bothVariant(expField.Type, actField.Type) {
 			return fmt.Errorf("field %q type mismatch: expected %v, got %v",
 				expField.Name, expField.Type, actField.Type)
 		}
 	}
 
 	return nil
+}
+
+// bothVariant reports whether a and b are both variant types, whatever their
+// layouts: the write path converts every layout to the canonical one.
+func bothVariant(a, b arrow.DataType) bool {
+	_, aok := a.(*extensions.VariantType)
+	_, bok := b.(*extensions.VariantType)
+	return aok && bok
 }
 
 // emptyRecord creates an empty record with the given schema.

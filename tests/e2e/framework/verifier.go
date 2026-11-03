@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/apache/iceberg-go/catalog"
+	icebergtable "github.com/apache/iceberg-go/table"
 
 	"github.com/datuplet/datuplet/pkg/catalogwriter"
 )
@@ -59,8 +60,31 @@ func NewVerifier(ctx context.Context, h *FGAHarness, tokenProvider catalogwriter
 // TTL). Shape is typically `s3://<warehouse>/<storage-uuid>/<table-uuid>/`;
 // DuckDB consumes it directly.
 func (v *LakekeeperVerifier) LocationFor(ctx context.Context, namespace, table string) (string, error) {
+	tbl, err := v.LoadTable(ctx, namespace, table)
+	if err != nil {
+		return "", err
+	}
+	return tbl.Location(), nil
+}
+
+// LoadTable loads (namespace, table) from lakekeeper through a fresh catalog
+// client (see LocationFor). The table's metadata is complete; its IO uses the
+// vended in-cluster endpoint, which the host may not reach.
+func (v *LakekeeperVerifier) LoadTable(ctx context.Context, namespace, table string) (*icebergtable.Table, error) {
+	cat, err := v.catalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tbl, err := cat.LoadTable(ctx, catalog.ToIdentifier(namespace, table))
+	if err != nil {
+		return nil, fmt.Errorf("LoadTable %s.%s: %w", namespace, table, err)
+	}
+	return tbl, nil
+}
+
+func (v *LakekeeperVerifier) catalog(ctx context.Context) (catalog.Catalog, error) {
 	if v == nil || v.harness == nil {
-		return "", errors.New("LakekeeperVerifier: not initialised")
+		return nil, errors.New("LakekeeperVerifier: not initialised")
 	}
 	cli, err := catalogwriter.NewClient(ctx, catalogwriter.ClientConfig{
 		Name:          "datuplet-e2e-verifier",
@@ -70,11 +94,7 @@ func (v *LakekeeperVerifier) LocationFor(ctx context.Context, namespace, table s
 		TokenProvider: v.provider,
 	})
 	if err != nil {
-		return "", fmt.Errorf("open lakekeeper catalog: %w", err)
+		return nil, fmt.Errorf("open lakekeeper catalog: %w", err)
 	}
-	tbl, err := cli.Catalog.LoadTable(ctx, catalog.ToIdentifier(namespace, table))
-	if err != nil {
-		return "", fmt.Errorf("LoadTable %s.%s: %w", namespace, table, err)
-	}
-	return tbl.Location(), nil
+	return cli.Catalog, nil
 }

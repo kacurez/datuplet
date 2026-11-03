@@ -6,7 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Iceberg v3 tables.** The Data Gateway creates every new table as
+  format-version 3, and new Lakekeeper warehouses default to v3. Partitioned
+  v3 tables are supported (the gateway assigns each file's `first_row_id`),
+  and reads apply v3 deletion vectors. Existing v2 tables stay v2.
+- **VARIANT columns.** Declare an output column with `type: variant` in
+  `columns` (v3 tables only). Values are stored unshredded. `FORMAT_PARQUET`
+  reads return a real VARIANT; the other read formats and storage preview
+  serve them as JSON.
+- **Read-only catalog proxy in the query engine.** `query-worker` and
+  `datuplet-query` reach Lakekeeper through an in-process loopback proxy that
+  allows only GET/HEAD and refuses every other catalog request, so user SQL
+  cannot commit even through an iceberg function that skips the `READ_ONLY`
+  attach check.
+
 ### Removed
+
+- **The `upgrade-e2e` CI lane** (`.github/workflows/upgrade-e2e.yml`,
+  `tests/upgrade-e2e/`). Datuplet is installed fresh; there is no in-place
+  upgrade path to test.
 
 - **`datuplet run --remote`, `datuplet sample`, `datuplet test-component`.**
   All local-Docker execution is gone; `datuplet trigger` (cluster-side runs)
@@ -30,6 +50,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING: Lakekeeper v0.14.2, OpenFGA v1.22.1, FGA model 4.13; fresh
+  install required.** There is no in-place upgrade path from an earlier
+  release. The FGA model is re-forked from Lakekeeper's 4.13 model, and
+  pipeline-api's read checks use `describe_effective`.
+- **BREAKING: editors can no longer grant `data_admin`.** Upstream 4.13
+  restricts that grant to `security_admin` (for example a project admin).
+- **BREAKING: query results with a VARIANT or JSON column fail.**
+  `datuplet query` and app queries return an error naming the column and the
+  cast to use: `<col>::JSON::VARCHAR` for VARIANT, `<col>::VARCHAR` for JSON.
 - **DuckDB 2.0.0 LTS** in `sql-transform`, `query-worker` and `datuplet-query`
   (`duckdb-go/v2 v2.20000.0`, was 1.5.3). The e2e DuckDB CLI is pinned to
   2.0.0, and both DuckDB images now prove at build time that the baked

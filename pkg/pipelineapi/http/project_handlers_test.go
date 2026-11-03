@@ -121,8 +121,8 @@ func TestGetProject_Allowed(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
 
-	// handleGetProject checks "describe".
-	cookie, _, p := seedProject(t, ts, pool, fakeAuthz, "lk-test-uuid-get-allowed", "describe")
+	// handleGetProject checks "describe_effective".
+	cookie, _, p := seedProject(t, ts, pool, fakeAuthz, "lk-test-uuid-get-allowed", "describe_effective")
 
 	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+p.ID.String(), nil)
 	req.AddCookie(cookie)

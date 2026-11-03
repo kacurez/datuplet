@@ -478,7 +478,7 @@ func (s *Server) storedPipelineSpec(ctx context.Context, projectID uuid.UUID, na
 }
 
 func (s *Server) handleListPipelines(w http.ResponseWriter, r *http.Request) {
-	_, projectID, ok := s.mustHaveRelation(w, r, "describe")
+	_, projectID, ok := s.mustHaveRelation(w, r, "describe_effective")
 	if !ok {
 		return
 	}
@@ -495,7 +495,7 @@ func (s *Server) handleListPipelines(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetPipeline(w http.ResponseWriter, r *http.Request) {
-	_, projectID, ok := s.mustHaveRelation(w, r, "describe")
+	_, projectID, ok := s.mustHaveRelation(w, r, "describe_effective")
 	if !ok {
 		return
 	}

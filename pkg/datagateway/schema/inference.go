@@ -323,6 +323,13 @@ func InferSchemaFromJSON(objects []map[string]interface{}) (*Schema, error) {
 // appendStringFromInterface will actually store in the string column.
 func jsonValueToString(val any) string {
 	switch v := val.(type) {
+	case json.Number:
+		// Decoded with UseNumber: infer from the float64 the value used to
+		// decode to, so inference is unchanged.
+		if f, err := v.Float64(); err == nil {
+			return fmt.Sprintf("%v", f)
+		}
+		return v.String()
 	case map[string]any, []any, []map[string]any:
 		data, err := json.Marshal(v)
 		if err == nil {

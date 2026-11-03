@@ -9,6 +9,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 )
 
 // String to typed value conversion functions for Arrow builders.
@@ -116,6 +117,16 @@ func appendValueFromInterface(builder array.Builder, value any) error {
 	if value == nil {
 		builder.AppendNull()
 		return nil
+	}
+	if vb, ok := builder.(*extensions.VariantBuilder); ok {
+		return appendVariantFromInterface(vb, value)
+	}
+	if n, ok := value.(json.Number); ok {
+		f, err := n.Float64()
+		if err != nil {
+			return fmt.Errorf("cannot convert number %s: %w", n, err)
+		}
+		value = f
 	}
 
 	switch b := builder.(type) {

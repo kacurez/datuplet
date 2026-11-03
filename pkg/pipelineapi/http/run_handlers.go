@@ -145,7 +145,7 @@ type runsPageJSON struct {
 }
 
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
-	_, projectID, ok := s.mustHaveRelation(w, r, "describe")
+	_, projectID, ok := s.mustHaveRelation(w, r, "describe_effective")
 	if !ok {
 		return
 	}
@@ -198,7 +198,7 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
-	_, projectID, ok := s.mustHaveRelation(w, r, "describe")
+	_, projectID, ok := s.mustHaveRelation(w, r, "describe_effective")
 	if !ok {
 		return
 	}

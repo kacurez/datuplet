@@ -1,9 +1,9 @@
 dependencies:
 - name: openfga
   repository: https://openfga.github.io/helm-charts
-  version: 0.3.3
+  version: 0.3.19
 - name: minio
   repository: https://charts.min.io/
   version: 5.4.0
-digest: sha256:1310f7bc24643eb37663a14781e013aef472391861226a5627dd13834b4e43ff
-generated: "2026-07-12T10:21:26.956769+02:00"
+digest: sha256:27fd2e0379db15d1b840ed2cc9917087ea7a89d72e64ebc4c1e7ccea3ea8fb3a
+generated: "2026-11-02T20:54:25.225209+01:00"

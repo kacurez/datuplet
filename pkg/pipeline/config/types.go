@@ -133,7 +133,7 @@ type PartitionFieldSpec struct {
 // column mapping (see OutputTableSpec.Columns).
 type ColumnSpec struct {
 	Name string `yaml:"name" json:"name"` // Column name
-	Type string `yaml:"type" json:"type"` // int, long, float, double, boolean, string
+	Type string `yaml:"type" json:"type"` // int, long, float, double, boolean, string, variant
 }
 
 // Processor defines a data processor operation applied by the gateway.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/schema"
@@ -53,11 +55,29 @@ func (a *JSONAdapter) Format() DataFormat {
 func (a *JSONAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *schema.Schema, error) {
 	// Parse JSON array
 	var objects []map[string]any
-	if err := json.Unmarshal(data, &objects); err != nil {
+	if err := decodeJSON(data, &objects); err != nil {
 		return nil, nil, fmt.Errorf("failed to parse JSON array: %w", err)
 	}
 
 	return a.parseObjects(objects, s)
+}
+
+// decodeJSON is json.Unmarshal (trailing data is an error) with numbers kept
+// exact as json.Number: a variant column stores them as is, every other
+// column converts them as float64, as before.
+func decodeJSON(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+		return errors.New("invalid character after top-level value")
+	}
+	return nil
 }
 
 // parseObjects converts a slice of JSON objects to an Arrow RecordBatch.
@@ -122,17 +142,41 @@ func (a *JSONAdapter) Serialize(record arrow.Record) ([]byte, error) {
 			if col.IsNull(rowIdx) {
 				obj[fieldName] = nil
 			} else {
-				obj[fieldName] = extractColumnValue(col, rowIdx)
+				val := extractColumnValue(col, rowIdx)
+				if fv, ok := val.(failedValue); ok {
+					return nil, fmt.Errorf("row %d, column %q: %w", rowIdx, fieldName, fv.err)
+				}
+				obj[fieldName] = val
 			}
 		}
 		objects[rowIdx] = obj
 	}
 
 	if a.serializeOpts.Pretty {
-		return json.MarshalIndent(objects, "", "  ")
+		return marshalNoHTMLEscape(objects, "  ")
 	}
-	return json.Marshal(objects)
+	return marshalNoHTMLEscape(objects, "")
 }
+
+// marshalNoHTMLEscape is json.Marshal (json.MarshalIndent with a non-empty
+// indent) without escaping <, > and & in strings, which would also rewrite
+// embedded variant JSON.
+func marshalNoHTMLEscape(v any, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent != "" {
+		enc.SetIndent("", indent)
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
+// failedValue is what extractColumnValue returns for a value it cannot
+// render; Serialize turns it into an error naming the column.
+type failedValue struct{ err error }
 
 // extractColumnValue extracts a typed value from an Arrow column.
 func extractColumnValue(col arrow.Array, idx int) any {
@@ -165,6 +209,12 @@ func extractColumnValue(col arrow.Array, idx int) any {
 		return days.ToTime().Format("2006-01-02")
 	case *array.Binary:
 		return string(arr.Value(idx))
+	case *extensions.VariantArray:
+		b, err := VariantJSON(arr, idx)
+		if err != nil {
+			return failedValue{err}
+		}
+		return json.RawMessage(b)
 	default:
 		return nil
 	}
@@ -233,7 +283,7 @@ func (a *JSONLAdapter) Parse(data []byte, s *schema.Schema) (arrow.Record, *sche
 		}
 
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+		if err := decodeJSON([]byte(line), &obj); err != nil {
 			return nil, nil, fmt.Errorf("failed to parse JSON at line %d: %w", lineNum, err)
 		}
 		objects = append(objects, obj)
@@ -313,7 +363,7 @@ func (a *JSONLAdapter) parseWithKnownSchema(r io.Reader, s *schema.Schema) (arro
 		// allocator can reuse the same memory arena for each — Go's
 		// runtime hits this pattern hard but cheaply.
 		var obj map[string]any
-		if err := json.Unmarshal(line, &obj); err != nil {
+		if err := decodeJSON(line, &obj); err != nil {
 			return nil, nil, fmt.Errorf("failed to parse JSON at line %d: %w", lineNum, err)
 		}
 		for colIdx := 0; colIdx < s.NumColumns(); colIdx++ {
@@ -379,11 +429,15 @@ func (a *JSONLAdapter) Serialize(record arrow.Record) ([]byte, error) {
 			if col.IsNull(rowIdx) {
 				obj[fieldName] = nil
 			} else {
-				obj[fieldName] = extractColumnValue(col, rowIdx)
+				val := extractColumnValue(col, rowIdx)
+				if fv, ok := val.(failedValue); ok {
+					return nil, fmt.Errorf("row %d, column %q: %w", rowIdx, fieldName, fv.err)
+				}
+				obj[fieldName] = val
 			}
 		}
 
-		line, err := json.Marshal(obj)
+		line, err := marshalNoHTMLEscape(obj, "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to serialize row %d: %w", rowIdx, err)
 		}

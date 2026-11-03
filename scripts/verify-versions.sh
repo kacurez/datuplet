@@ -70,8 +70,8 @@ done
 # 5. Built-in component tag: stable v-shaped + local build tag in lockstep. The
 # built-in ComponentDefinitions use components.tag as a STABLE version, which the
 # reconciler requires to match ^v\d+\.\d+\.\d+$; and the Makefile COMPONENT_TAG
-# (what build-components-local tags local images) must equal it, or deploy-local /
-# upgrade-e2e built-ins resolve to an image that was never built. (appVersion sync
+# (what build-components-local tags local images) must equal it, or deploy-local
+# built-ins resolve to an image that was never built. (appVersion sync
 # is a RELEASE-time concern — release.yml verify-tag enforces components.tag=v<tag>.)
 ct=$(yq '.components.tag' charts/datuplet-app/values.yaml)
 [[ "$ct" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \

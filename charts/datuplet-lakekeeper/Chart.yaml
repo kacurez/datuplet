@@ -13,7 +13,7 @@ maintainers:
 
 dependencies:
   - name: lakekeeper
-    version: "0.10.0"
+    version: "0.13.0"
     repository: https://lakekeeper.github.io/lakekeeper-charts
     condition: lakekeeper.enabled
     alias: lakekeeper

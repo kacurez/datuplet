@@ -183,6 +183,15 @@ var txnAddFiles = func(ctx context.Context, txn *icebergtable.Transaction, paths
 	return txn.AddFiles(ctx, paths, props, false)
 }
 
+// assignFirstRowIDs sets each file's first_row_id to next plus the record
+// counts of the files before it, in CommitJob path order (a seam for tests).
+var assignFirstRowIDs = func(builders []*iceberg.DataFileBuilder, files []iceberg.DataFile, next int64) {
+	for i, b := range builders {
+		b.FirstRowID(next)
+		next += files[i].Count()
+	}
+}
+
 // CommitTableFiles is the in-memory-paths variant of CommitTable: the
 // caller supplies dataPaths directly instead of via a files.json URL.
 // Used by Data Gateway's inline commit path (RFC 021).
@@ -191,8 +200,11 @@ var txnAddFiles = func(ctx context.Context, txn *icebergtable.Transaction, paths
 // FULL_LOAD ReplaceDataFiles. For a partitioned spec the DataFiles are built
 // once from each file's footer plus its explicit tuple, and every attempt
 // checks that the table's default spec is still part.SpecID before
-// AddDataFiles / ReplaceDataFilesWithDataFiles. FULL_LOAD replaces the
-// current snapshot's data files (never its delete files) on both paths.
+// AddDataFiles / ReplaceDataFilesWithDataFiles. On a v3 table every attempt
+// then fails, unretried, when the fresh table's commit.retry.num-retries is
+// above 0, and otherwise assigns each file first_row_id from the fresh
+// table's next-row-id. FULL_LOAD replaces the current snapshot's data files
+// (never its delete files) on both paths.
 //
 // idempotencyKey, when non-empty, is (a) checked against existing
 // snapshot summaries (key "datuplet.commit-key") on every attempt — a
@@ -237,8 +249,9 @@ func CommitTableFiles(
 	result := CommitResult{WriteMode: mode, SnapshotIDBefore: snapshotIDOrEmpty(tbl), DataFilesAdded: len(dataPaths)}
 
 	var dataFiles []iceberg.DataFile
+	var builders []*iceberg.DataFileBuilder
 	if part != nil {
-		if dataFiles, err = buildDataFiles(ctx, tbl, dataPaths, part); err != nil {
+		if dataFiles, builders, err = buildDataFiles(ctx, tbl, dataPaths, part); err != nil {
 			return nil, err
 		}
 	}
@@ -257,6 +270,13 @@ func CommitTableFiles(
 		if part != nil {
 			if cur := fresh.Metadata().DefaultPartitionSpec(); cur != part.SpecID {
 				return fmt.Errorf("partition spec changed during the run (spec id %d → %d)", part.SpecID, cur)
+			}
+			if fresh.Metadata().Version() >= 3 {
+				if n := fresh.Properties().GetUInt64(icebergtable.CommitNumRetriesKey, icebergtable.CommitNumRetriesDefault); n > 0 {
+					return fmt.Errorf("table %v has %s=%d: partitioned v3 commits assign explicit first_row_ids, which iceberg-go's internal retry does not re-base; set it to 0",
+						ident, icebergtable.CommitNumRetriesKey, n)
+				}
+				assignFirstRowIDs(builders, dataFiles, fresh.Metadata().NextRowID())
 			}
 		}
 		txn := fresh.NewTransaction()
@@ -409,19 +429,20 @@ func parseFilesManifest(body []byte) (*filesManifest, error) {
 // unpartitioned spec, as AddFiles computes them) plus the file's explicit
 // tuple, under the spec the files were written with. Tuples are never
 // inferred from statistics (FileToDataFile panics for bucket; truncated
-// string bounds are unsafe).
-func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string, part *PartitionedFiles) ([]iceberg.DataFile, error) {
+// string bounds are unsafe). The builders are returned too: Build returns the
+// builder's own DataFile, so a v3 commit sets first_row_id on each attempt.
+func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string, part *PartitionedFiles) ([]iceberg.DataFile, []*iceberg.DataFileBuilder, error) {
 	if len(part.Tuples) != len(paths) {
-		return nil, fmt.Errorf("CommitTableFiles: %d partition tuples for %d files", len(part.Tuples), len(paths))
+		return nil, nil, fmt.Errorf("CommitTableFiles: %d partition tuples for %d files", len(part.Tuples), len(paths))
 	}
 	spec := tbl.Metadata().PartitionSpecByID(part.SpecID)
 	if spec == nil {
-		return nil, fmt.Errorf("partition spec changed during the run (spec id %d → %d)", part.SpecID, tbl.Metadata().DefaultPartitionSpec())
+		return nil, nil, fmt.Errorf("partition spec changed during the run (spec id %d → %d)", part.SpecID, tbl.Metadata().DefaultPartitionSpec())
 	}
 	sc := tbl.Schema()
 	fs, err := tbl.FS(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("open table FS: %w", err)
+		return nil, nil, fmt.Errorf("open table FS: %w", err)
 	}
 	props := iceberg.Properties{}
 	for k, v := range tbl.Properties() {
@@ -431,13 +452,14 @@ func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string
 		// As AddFiles: footers without field ids map by name.
 		m, err := json.Marshal(sc.NameMapping())
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		props[icebergtable.DefaultNameMappingKey] = string(m)
 	}
 	logical := partitionLogicalTypes(*spec, sc)
 
 	out := make([]iceberg.DataFile, len(paths))
+	builders := make([]*iceberg.DataFileBuilder, len(paths))
 	errs := make([]error, len(paths))
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 	var wg sync.WaitGroup
@@ -467,13 +489,14 @@ func buildDataFiles(ctx context.Context, tbl *icebergtable.Table, paths []string
 				NullValueCounts(stats.NullValueCounts()).NaNValueCounts(stats.NaNValueCounts()).
 				SplitOffsets(stats.SplitOffsets())
 			out[i] = b.Build()
+			builders[i] = b
 		}()
 	}
 	wg.Wait()
 	if err := errors.Join(errs...); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	return out, builders, nil
 }
 
 // footerMetrics returns table.FileToDataFile's metrics (unpartitioned spec)

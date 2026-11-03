@@ -580,7 +580,7 @@ func TestInternalSessionsVerify_ForwardsCredentialHeaders(t *testing.T) {
 	}
 	// The membership answer must come from a project-scoped FGA check on the
 	// LAKEKEEPER project id, for the session user.
-	wantCheck := "user:oidc~" + h.resolver.user.ID.String() + "|describe|project:lk-project-1"
+	wantCheck := "user:oidc~" + h.resolver.user.ID.String() + "|describe_effective|project:lk-project-1"
 	if len(h.authz.checked) != 1 || h.authz.checked[0] != wantCheck {
 		t.Errorf("authz checks = %v, want [%s]", h.authz.checked, wantCheck)
 	}
@@ -588,7 +588,7 @@ func TestInternalSessionsVerify_ForwardsCredentialHeaders(t *testing.T) {
 
 // TestInternalSessionsVerify_NotAMemberAnswers covers the honest "no" answers,
 // all of which are a 200 {project_member: false} — never an error:
-//   - a session user who lacks `describe` on the project;
+//   - a session user who lacks `describe_effective` on the project;
 //   - no session at all (NOT a 401: on the internal surface 401 means exactly
 //     one thing, a bad service credential, and app-worker must be able to tell
 //     the two apart) — no FGA check may run for it;

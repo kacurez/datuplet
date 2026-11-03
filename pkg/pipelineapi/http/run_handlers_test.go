@@ -123,7 +123,7 @@ func freshServerWithK8sClient(t *testing.T, c client.Client) (*httptest.Server, 
 // The fake Authorizer is exact-match-only (no inheritance), so we write
 // the concrete relations the handlers actually check:
 //   - write handlers check "data_admin"
-//   - read handlers check "describe"
+//   - read handlers check "describe_effective"
 //
 // "editor" seeds data_admin (write) + describe (read).
 // "viewer"  seeds describe only.
@@ -135,8 +135,8 @@ func seedProjectAuthz(t *testing.T, pool *pgxpool.Pool, fakeAuthz *authztest.Fak
 	}
 	userStr := authz.UserObject(userID.String()).String()
 	projObj := authz.ProjectObject(lkID)
-	// Read access: handlers check "describe".
-	fakeAuthz.Allow(userStr, "describe", projObj)
+	// Read access: handlers check "describe_effective".
+	fakeAuthz.Allow(userStr, "describe_effective", projObj)
 	if role == "editor" {
 		// Write access: handlers check "data_admin".
 		fakeAuthz.Allow(userStr, "data_admin", projObj)
@@ -173,7 +173,7 @@ func TestTriggerRun_HappyPath(t *testing.T) {
 }
 
 // TestTriggerRun_ViewerForbidden confirms a user seeded with the
-// `viewer` role (read-only — only `describe` is granted) is rejected
+// `viewer` role (read-only — only `describe_effective` is granted) is rejected
 // from the trigger handler. Trigger requires `data_admin`; the fake
 // Authorizer does not chain, so a viewer never satisfies it. Anchors
 // the negative path of seedProjectAuthz so the read/write split is

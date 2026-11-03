@@ -51,14 +51,14 @@ func TestCorePreview_SQLShapeAndGate(t *testing.T) {
 	}
 	outCh := make(chan previewOut, 1)
 	go func() {
-		res, qerr := core.Preview(ctxUser, sub, "p/w", "my-ns", "users", lim)
+		res, qerr := core.Preview(ctxUser, sub, "p/w", "my-ns", "users", nil, lim)
 		outCh <- previewOut{res, qerr}
 	}()
 
 	gotSQL := <-sqlCh // first preview is in-flight and holds the gate slot
 
 	// Second concurrent preview for the SAME principal must bounce (cap 1).
-	if _, qerr := core.Preview(ctxUser, sub, "p/w", "my-ns", "users", lim); qerr == nil || qerr.Status != http.StatusTooManyRequests {
+	if _, qerr := core.Preview(ctxUser, sub, "p/w", "my-ns", "users", nil, lim); qerr == nil || qerr.Status != http.StatusTooManyRequests {
 		t.Fatalf("second concurrent preview = %+v, want 429", qerr)
 	}
 	close(block)
@@ -102,7 +102,7 @@ func TestCorePreview_RateLimitEmitsAudit(t *testing.T) {
 	}
 	defer core.h.previewGate.Release(sub)
 
-	_, qerr := core.Preview(ctxUser, sub, "p/w", "my-ns", "users", lim)
+	_, qerr := core.Preview(ctxUser, sub, "p/w", "my-ns", "users", nil, lim)
 	if qerr == nil || qerr.Status != http.StatusTooManyRequests || qerr.Kind != "rate_limited" {
 		t.Fatalf("Preview = %+v, want 429 rate_limited", qerr)
 	}
@@ -116,5 +116,38 @@ func TestCorePreview_RateLimitEmitsAudit(t *testing.T) {
 	}
 	if delta := counterDelta(counter, "rate_limited", 0); delta != 1 {
 		t.Errorf("counter[rate_limited] delta = %v, want 1", delta)
+	}
+}
+
+// TestCorePreview_ProjectsVariantColumns asserts variant columns are projected
+// as JSON text (col::JSON::VARCHAR) — a direct ::VARCHAR yields DuckDB display
+// text, and duckdb-go cannot scan VARIANT at all. The DuckDB-side behaviour of
+// this exact projection is pinned in components/queryengine
+// (TestPreviewProjectsVariantAsJSONText).
+func TestCorePreview_ProjectsVariantColumns(t *testing.T) {
+	sqlCh := make(chan string, 1)
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body workerRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sqlCh <- body.SQL
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"schema":[],"rows":[],"truncated":false,"stats":{"duration_ms":1}}`))
+	}))
+	defer worker.Close()
+
+	core, err := NewCore(Config{WorkerURL: worker.URL, Gate: projectgatetest.AllowAll("p", "w")}, testSigner(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	subID := uuid.New()
+	ctxUser := auth.WithCtxUser(context.Background(), &store.User{ID: subID, Email: "t@e.c"})
+	lim := PreviewLimits{TimeoutS: 30, MaxRows: 100, MaxBytes: 1 << 20}
+
+	if _, qerr := core.Preview(ctxUser, subID.String(), "p/w", "my-ns", "events", []string{"payload", `odd"name`}, lim); qerr != nil {
+		t.Fatalf("Preview: %+v", qerr)
+	}
+	want := `SELECT * REPLACE ("payload"::JSON::VARCHAR AS "payload", "odd""name"::JSON::VARCHAR AS "odd""name") FROM lk."my-ns"."events" LIMIT 100`
+	if got := <-sqlCh; got != want {
+		t.Fatalf("sql = %q, want %q", got, want)
 	}
 }

@@ -26,7 +26,8 @@ Each line is a bug class that has shipped or nearly shipped here.
   catches it.
 - **FGA model** (`charts/datuplet-app/files/fga/`): `fgaModel.version`
   bumped in one chart but not `platform.fgaModelVersion` in
-  `datuplet-lakekeeper`. CI checks within `datuplet-app` only.
+  `datuplet-lakekeeper` (`scripts/verify-versions.sh` catches it in CI),
+  or a version that differs from the pinned Lakekeeper's active one.
 - **e2e** (`tests/e2e/`): a scenario that SKIPs instead of failing. The
   suite once went fake-green for weeks because the `duckdb` CLI was
   missing on the runner. A green e2e with zero assertions is red.

@@ -207,7 +207,7 @@ func TestPutPipeline_JSON_GetReturnsDocObject_ListHasDescription(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
 
-	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-json-get", "data_admin", "describe")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-json-get", "data_admin", "describe_effective")
 
 	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
 	putResp := putJSON(t, base+"/etl", []byte(pipelineDocWithDescription), cookie)
@@ -271,7 +271,7 @@ func TestGetPipeline_FormatYAML(t *testing.T) {
 	ts, pool, fakeAuthz, cleanup := freshServer(t)
 	defer cleanup()
 
-	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-format-yaml", "data_admin", "describe")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-format-yaml", "data_admin", "describe_effective")
 
 	base := ts.URL + "/api/v1/projects/" + proj.ID.String() + "/pipelines"
 	putResp := putYAML(t, base+"/etl", []byte(pipelineDocWithDescription), cookie)
@@ -591,7 +591,7 @@ func TestListPipelines_EmptyDescriptionKeyPresent(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-list-empty-desc", "describe")
+	cookie, _, proj := seedProject(t, ts, pool, fakeAuthz, "lk-list-empty-desc", "describe_effective")
 	_, _ = store.CreatePipeline(ctx, pool, proj.ID, "etl", "", []byte(validPipelineYAML))
 
 	req, _ := stdhttp.NewRequest("GET", ts.URL+"/api/v1/projects/"+proj.ID.String()+"/pipelines", nil)

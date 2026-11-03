@@ -36,13 +36,21 @@ Read-only is enforced in two independent layers.
   iceberg extension's `iceberg_rollback_to_snapshot` and
   `set/remove_iceberg_*_properties`, the statically linked `dbgen` / `dsdgen`
   aimed at the catalog, and a re-ATTACH with the stored secret. UPDATE, DELETE
-  and `iceberg_rewrite_data_files` are asserted by the integration test, which
-  awaits a live run.
+  and `iceberg_rewrite_data_files` are asserted by the integration test.
+  The attach alone is not enough: `iceberg_rewrite_data_files` (duckdb-iceberg
+  4c0c0874) never declares its write, so DuckDB's read-only check does not
+  fire and it commits a `replace` snapshot on a `READ_ONLY` attach. The engine
+  therefore attaches through an in-process loopback proxy that forwards only
+  catalog reads (GET / HEAD), refuses every other request, every POST
+  included, with a 403 (`read-only query engine: catalog write
+  refused`), and rewrites the `/v1/config` `uri` so the catalog cannot steer
+  the extension past it. Engine enforcement is the proxy plus the `READ_ONLY`
+  attach.
 - **Catalog.** Lakekeeper's FGA grant decides what the principal may do: a
   viewer receives read-only vended credentials and lakekeeper rejects its
   commits.
 
-The engine flag is defence in depth; FGA remains the authorization of record.
+The engine layer is defence in depth; FGA remains the authorization of record.
 
 ---
 

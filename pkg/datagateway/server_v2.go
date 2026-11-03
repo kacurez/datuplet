@@ -125,6 +125,13 @@ type writerState struct {
 	// schema once it exists (nil without a catalog: unpartitioned).
 	partSpec    *iceberg.PartitionSpec
 	tableSchema *iceberg.Schema
+	// formatVersion is the table's format version once it exists (0 =
+	// unknown).
+	formatVersion int
+	// variantCols are the columns declared variant (output columns, spec
+	// C3c) and the table's variant columns when it existed at OpenWriter.
+	// Read-only once the writer is published.
+	variantCols map[string]bool
 
 	// Input format for Content-Type validation
 	inputFormat format.DataFormat
@@ -138,8 +145,10 @@ type writerState struct {
 	// schema is the input (pre-drop) schema records are parsed with:
 	// component-supplied, or inferred from the first chunk.
 	schema *schema.Schema
-	// outputSchema is schema after the drop processors: the table schema,
-	// the plane writer's schema, and what every record must match.
+	// outputSchema is the destination schema: schema after the drop
+	// processors with its variant columns (spec C4) in the canonical
+	// layout. It is the table schema, the plane writer's schema, and what
+	// every normalized record must match.
 	outputSchema   *schema.Schema
 	schemaInferred bool
 
@@ -518,9 +527,13 @@ func (s *ServerV2) GetConfig(ctx context.Context, req *pb.GetConfigRequest) (*pb
 	for _, t := range s.config.OutputTables {
 		var columns []*pb.ColumnConfig
 		for _, c := range t.Columns {
+			typ := c.Type
+			if typ == schema.TypeVariant.String() {
+				typ = schema.TypeString.String()
+			}
 			columns = append(columns, &pb.ColumnConfig{
 				Name: c.Name,
-				Type: c.Type,
+				Type: typ,
 			})
 		}
 		outputConfig.Tables = append(outputConfig.Tables, &pb.TableOutputConfig{

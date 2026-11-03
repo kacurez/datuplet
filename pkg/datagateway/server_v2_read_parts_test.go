@@ -14,6 +14,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc/codes"
@@ -309,7 +310,7 @@ func TestSDKWireSchemaMatchesSDK(t *testing.T) {
 	// Every type string arrowSchemaToProto can emit is one the SDK accepts.
 	for _, at := range []arrow.DataType{
 		arrow.PrimitiveTypes.Int8, arrow.PrimitiveTypes.Uint64, arrow.BinaryTypes.LargeString,
-		arrow.FixedWidthTypes.Date64, arrow.ListOf(arrow.PrimitiveTypes.Int32), &arrow.Decimal128Type{Precision: 10, Scale: 2},
+		arrow.FixedWidthTypes.Date64, arrow.ListOf(arrow.PrimitiveTypes.Int32), &arrow.Decimal128Type{Precision: 10, Scale: 2}, extensions.NewDefaultVariantType(),
 	} {
 		ps := arrowSchemaToProto(arrow.NewSchema([]arrow.Field{{Name: "c", Type: at}}, nil))
 		if _, err := sdkWireSchema(ps); err != nil {

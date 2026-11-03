@@ -138,7 +138,9 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 				"aws-access-key-id":     spec.S3.AccessKey,
 				"aws-secret-access-key": spec.S3.SecretKey,
 			},
-			"delete-profile": map[string]any{"type": "hard"},
+			"delete-profile":          map[string]any{"type": "hard"},
+			"allowed-format-versions": []int{1, 2, 3},
+			"default-format-version":  3,
 		}, nil
 	case "gcs":
 		if spec.GCS == nil {
@@ -178,11 +180,13 @@ func buildWarehouseBody(spec warehouseSpec) (map[string]any, error) {
 			}
 		}
 		return map[string]any{
-			"warehouse-name":     spec.WarehouseName,
-			"project-id":         spec.LakekeeperProjectID,
-			"storage-profile":    profile,
-			"storage-credential": storageCred,
-			"delete-profile":     map[string]any{"type": "hard"},
+			"warehouse-name":          spec.WarehouseName,
+			"project-id":              spec.LakekeeperProjectID,
+			"storage-profile":         profile,
+			"storage-credential":      storageCred,
+			"delete-profile":          map[string]any{"type": "hard"},
+			"allowed-format-versions": []int{1, 2, 3},
+			"default-format-version":  3,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown warehouse type %q (want s3 or gcs)", spec.Type)
