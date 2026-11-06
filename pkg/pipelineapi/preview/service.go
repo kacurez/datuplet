@@ -38,6 +38,7 @@ const (
 	tokenSlack                             = 10 * time.Minute
 	defaultPurgeWait, defaultPollInterval  = 90 * time.Second, 2 * time.Second
 	detachedTimeout                        = 10 * time.Second
+	tupleDeleteTimeout                     = 5 * time.Second
 	sweeperSubjectPrefix                   = "preview-sweeper-"
 	sweeperTokenLifetime                   = 5 * time.Minute
 	cancelledMessage                       = "cancelled by user"
@@ -225,11 +226,18 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (*CreateResponse,
 	}, nil
 }
 
-// failCreate marks an inserted preview FailedApplication and drops its
-// tuple, on a context detached from the request. It returns cause.
+// failCreate removes whatever K8s objects a failed create left, marks the
+// preview FailedApplication and drops its tuple, on a context detached from
+// the request. It returns cause.
 func (s *Service) failCreate(ctx context.Context, p *store.Preview, cause error) error {
 	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedTimeout)
 	defer cancel()
+	if err := s.deletePipelineRun(bg, p); err != nil {
+		log.Printf("pipeline-api: preview %s: %v (sweeper retries)", p.ID, err)
+	}
+	if err := s.deleteTokenSecret(bg, p); err != nil {
+		log.Printf("pipeline-api: preview %s: %v (sweeper retries)", p.ID, err)
+	}
 	now := s.d.Now().UTC()
 	if _, err := store.UpdatePreviewPhase(bg, s.d.DB, p.ID, store.UpdatePreviewPhaseOpts{
 		Phase: phaseFailedApplication, Message: cause.Error(), CompletedAt: &now,
@@ -278,7 +286,10 @@ func (s *Service) cancel(ctx context.Context, p *store.Preview) error {
 // stop revokes the preview's lakekeeper access first (a failure is logged and
 // left to the sweeper), then signals its pods and deletes its PipelineRun.
 func (s *Service) stop(ctx context.Context, p *store.Preview) error {
-	if err := s.deleteOwnTuple(ctx, p); err != nil {
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), tupleDeleteTimeout)
+	err := s.deleteOwnTuple(bg, p)
+	cancel()
+	if err != nil {
 		log.Printf("pipeline-api: preview %s: %v (sweeper retries)", p.ID, err)
 	}
 	s.annotatePodsCancelled(ctx, p)

@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	corev1 "k8s.io/api/core/v1"
@@ -25,7 +26,10 @@ import (
 // sweepLockKey is the pg advisory lock ("prev") that elects one sweeping replica.
 const sweepLockKey int64 = 0x70726576
 
-const sweepBatch = 100
+const (
+	sweepBatch    = 100
+	unlockTimeout = 5 * time.Second
+)
 
 var sweepFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "pipelineapi_preview_sweep_failures_total",
@@ -73,20 +77,35 @@ func (s *Service) sweepIfLeader(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("acquire conn: %w", err)
 	}
-	defer conn.Release()
 	var got bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, sweepLockKey).Scan(&got); err != nil {
+		conn.Release()
 		return false, fmt.Errorf("try advisory lock: %w", err)
 	}
 	if !got {
+		conn.Release()
 		return false, nil
 	}
-	defer func() {
-		if _, err := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, sweepLockKey); err != nil {
-			log.Printf("pipeline-api: preview sweep: advisory unlock: %v", err)
-		}
-	}()
+	defer unlockSweep(ctx, conn)
 	return true, s.SweepOnce(ctx)
+}
+
+// unlockSweep releases the sweep lock and returns conn to the pool. When the
+// unlock cannot be confirmed the connection is closed instead, which drops
+// the session lock rather than parking it in the pool.
+func unlockSweep(ctx context.Context, conn *pgxpool.Conn) {
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
+	defer cancel()
+	var unlocked bool
+	err := conn.QueryRow(uctx, `SELECT pg_advisory_unlock($1)`, sweepLockKey).Scan(&unlocked)
+	if err == nil && unlocked {
+		conn.Release()
+		return
+	}
+	log.Printf("pipeline-api: preview sweep: advisory unlock (unlocked=%v): %v; closing connection", unlocked, err)
+	if cerr := conn.Hijack().Close(uctx); cerr != nil {
+		log.Printf("pipeline-api: preview sweep: close connection: %v", cerr)
+	}
 }
 
 // SweepOnce deletes the run-identity tuples of terminal previews and purges
@@ -205,7 +224,7 @@ func (s *Service) gone(ctx context.Context, p *store.Preview) (bool, error) {
 
 // purgeNamespaces grants the per-preview sweeper identity editor for the
 // duration of the purge only, then verifies every namespace is empty.
-func (s *Service) purgeNamespaces(ctx context.Context, p *store.Preview) error {
+func (s *Service) purgeNamespaces(ctx context.Context, p *store.Preview) (err error) {
 	sw := sweeperSubjectPrefix + p.ID.String()
 	lk := p.LakekeeperProjectID
 	if s.tuplesEnabled(lk) {
@@ -215,10 +234,16 @@ func (s *Service) purgeNamespaces(ctx context.Context, p *store.Preview) error {
 		defer func() {
 			bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedTimeout)
 			defer cancel()
-			if err := authz.DeleteProjectTuple(bg, s.d.Authz, sw, authz.RelationEditor, lk); err != nil {
-				sweepFailures.WithLabelValues("tuple").Inc()
-				log.Printf("pipeline-api: preview %s: delete sweeper tuple: %v", p.ID, err)
+			derr := authz.DeleteProjectTuple(bg, s.d.Authz, sw, authz.RelationEditor, lk)
+			if derr == nil {
+				return
 			}
+			if err == nil {
+				err = &stepError{"tuple", fmt.Errorf("delete sweeper tuple: %w", derr)}
+				return
+			}
+			sweepFailures.WithLabelValues("tuple").Inc()
+			log.Printf("pipeline-api: preview %s: delete sweeper tuple: %v", p.ID, derr)
 		}()
 	}
 	tp := func(context.Context) (string, error) {

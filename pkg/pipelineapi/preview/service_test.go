@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -74,9 +75,10 @@ func indexOf(events []string, pred func(string) bool, last bool) int {
 }
 
 type fakeAuthz struct {
-	rec    *recorder
-	mu     sync.Mutex
-	tuples map[authz.Tuple]bool
+	rec       *recorder
+	mu        sync.Mutex
+	tuples    map[authz.Tuple]bool
+	deleteErr func(user string) error
 }
 
 func (f *fakeAuthz) Check(context.Context, string, string, authz.Object) (bool, error) {
@@ -105,6 +107,11 @@ func (f *fakeAuthz) DeleteTuples(_ context.Context, ts []authz.Tuple) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, t := range ts {
+		if f.deleteErr != nil {
+			if err := f.deleteErr(t.User); err != nil {
+				return err
+			}
+		}
 		if !f.tuples[t] {
 			return errors.New("cannot delete a tuple which does not exist")
 		}
@@ -522,5 +529,10 @@ func TestCreate_FailureAfterInsertMarksFailed(t *testing.T) {
 	}
 	if e.az.count() != 0 {
 		t.Errorf("tuple left behind: %v", e.az.tuples)
+	}
+	sec := &corev1.Secret{}
+	err = e.svc.d.K8s.Get(e.ctx, types.NamespacedName{Name: "runtoken-" + p.ID.String(), Namespace: testK8sNS}, sec)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("run-token Secret left behind after a failed create: %v", err)
 	}
 }

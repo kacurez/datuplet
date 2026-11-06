@@ -113,6 +113,35 @@ func TestPurge_SweeperTupleRemovedOnError(t *testing.T) {
 	}
 }
 
+func TestPurge_FailedSweeperTupleDeleteKeepsRowUncleaned(t *testing.T) {
+	e := newEnv(t, roomyCaps)
+	resp := e.create("a")
+	e.seedTables(resp)
+	e.finish(resp.ID, time.Now())
+	sweeper := authz.UserObject("preview-sweeper-" + resp.ID.String()).String()
+	e.az.deleteErr = func(user string) error {
+		if user == sweeper {
+			return errors.New("openfga down")
+		}
+		return nil
+	}
+
+	if err := e.svc.Purge(e.ctx, e.get(resp.ID)); err == nil || !strings.Contains(err.Error(), "sweeper tuple") {
+		t.Fatalf("Purge should report the leaked sweeper tuple, got %v", err)
+	}
+	if p := e.get(resp.ID); p.CleanedAt != nil {
+		t.Fatal("cleaned_at set while the sweeper tuple is still granted")
+	}
+
+	e.az.deleteErr = nil
+	if err := e.svc.Purge(e.ctx, e.get(resp.ID)); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if p := e.get(resp.ID); p.CleanedAt == nil || e.az.has("preview-sweeper-"+resp.ID.String()) {
+		t.Errorf("retry did not clean up: cleaned_at=%v sweeper tuple=%v", p.CleanedAt, e.az.has("preview-sweeper-"+resp.ID.String()))
+	}
+}
+
 func TestPurge_RetriesAfterPartialFailure(t *testing.T) {
 	e := newEnv(t, roomyCaps)
 	resp := e.create("a")
@@ -207,6 +236,13 @@ func TestSweepIfLeader_SkipsWhenLockHeld(t *testing.T) {
 	}
 	if got, err := e.svc.sweepIfLeader(e.ctx); !got || err != nil {
 		t.Fatalf("lock free: got=%v err=%v", got, err)
+	}
+	var relocked bool
+	if err := conn.QueryRow(e.ctx, `SELECT pg_try_advisory_lock($1)`, sweepLockKey).Scan(&relocked); err != nil || !relocked {
+		t.Fatalf("sweep lock not released after a sweep: got=%v err=%v", relocked, err)
+	}
+	if _, err := conn.Exec(e.ctx, `SELECT pg_advisory_unlock($1)`, sweepLockKey); err != nil {
+		t.Fatal(err)
 	}
 }
 
