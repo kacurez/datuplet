@@ -26,34 +26,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Gateway rejects writes to undeclared buckets.** A component that opens a writer for a bucket not in its `outputs` now gets PermissionDenied and the run fails, instead of the gateway creating that table.
 
-### Removed
-
-- **The `upgrade-e2e` CI lane** (`.github/workflows/upgrade-e2e.yml`,
-  `tests/upgrade-e2e/`). Datuplet is installed fresh; there is no in-place
-  upgrade path to test.
-
-- **`datuplet run --remote`, `datuplet sample`, `datuplet test-component`.**
-  All local-Docker execution is gone; `datuplet trigger` (cluster-side runs)
-  is the supported path. The local runner had been broken since the run-token
-  hardening + RFC 021 (gateway boot validation + inline commits).
-- **iceberg-job image and `datuplet iceberg-job` subcommand.** Dead since
-  RFC 021 moved commits into the Data Gateway sidecar; the operator chart no
-  longer sets `ICEBERG_JOB_IMAGE` and `image.icebergJob` values are removed.
-- **`pkg/lib/orchestrator` and `pkg/pipeline` runner** (internal packages);
-  `pkg/pipeline/config` (the YAML spec parser) is unchanged.
-- **Python SDK (`sdk/python`, `sdk/python-sandbox`).** The Go SDK
-  (`sdk/go`, `sdk/go/arrow`) is the only supported component SDK.
-- **`pandas-transform`, `finnhub-extractor`, `stdout-writer` built-in
-  components** (images, ComponentDefinitions, chart schemas). The remaining
-  built-ins are `data-generator`, `http-json-extractor`, `sql-transform`.
-  `helm upgrade` removes the chart-owned ComponentDefinitions; ones registered
-  outside the chart (e.g. with `components.builtins=false`) stay on an
-  existing cluster until
-  `kubectl delete componentdefinition finnhub-extractor stdout-writer pandas-transform`.
-- **`tests/integration/`** (the parked integration-test module).
-
-### Changed
-
 - **BREAKING: Lakekeeper v0.14.2, OpenFGA v1.22.1, FGA model 4.13; fresh
   install required.** There is no in-place upgrade path from an earlier
   release. The FGA model is re-forked from Lakekeeper's 4.13 model, and
@@ -96,6 +68,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   anonymous pulls (2026-09-24), which broke every fresh install, `deploy-local`
   and e2e. Same S3 API and on-disk format; existing MinIO volumes are read in
   place.
+
+### Removed
+
+- **The `upgrade-e2e` CI lane** (`.github/workflows/upgrade-e2e.yml`,
+  `tests/upgrade-e2e/`). Datuplet is installed fresh; there is no in-place
+  upgrade path to test.
+
+- **`datuplet run --remote`, `datuplet sample`, `datuplet test-component`.**
+  All local-Docker execution is gone; `datuplet trigger` (cluster-side runs)
+  is the supported path. The local runner had been broken since the run-token
+  hardening + RFC 021 (gateway boot validation + inline commits).
+- **iceberg-job image and `datuplet iceberg-job` subcommand.** Dead since
+  RFC 021 moved commits into the Data Gateway sidecar; the operator chart no
+  longer sets `ICEBERG_JOB_IMAGE` and `image.icebergJob` values are removed.
+- **`pkg/lib/orchestrator` and `pkg/pipeline` runner** (internal packages);
+  `pkg/pipeline/config` (the YAML spec parser) is unchanged.
+- **Python SDK (`sdk/python`, `sdk/python-sandbox`).** The Go SDK
+  (`sdk/go`, `sdk/go/arrow`) is the only supported component SDK.
+- **`pandas-transform`, `finnhub-extractor`, `stdout-writer` built-in
+  components** (images, ComponentDefinitions, chart schemas). The remaining
+  built-ins are `data-generator`, `http-json-extractor`, `sql-transform`.
+  `helm upgrade` removes the chart-owned ComponentDefinitions; ones registered
+  outside the chart (e.g. with `components.builtins=false`) stay on an
+  existing cluster until
+  `kubectl delete componentdefinition finnhub-extractor stdout-writer pandas-transform`.
+- **`tests/integration/`** (the parked integration-test module).
 
 ## [0.2.1] — 2026-05-19
 

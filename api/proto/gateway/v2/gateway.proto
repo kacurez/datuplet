@@ -98,6 +98,8 @@ message ComponentConfig {
   // Legacy fields (deprecated - use bucket-based access)
   map<string, string> inputs = 10;        // name -> table_path (deprecated)
   map<string, string> outputs = 11;       // name -> table_path (deprecated)
+
+  int64 preview_row_limit = 16;           // >0 in a preview run: rows per output table the gateway keeps
 }
 
 // InputTableConfig defines a specific table input.
@@ -180,6 +182,7 @@ message WriteChunkResponse {
   int64 rows_accepted = 1;
   int64 buffer_size_bytes = 2;            // Current buffer size (for monitoring)
   Schema inferred_schema = 3;             // Populated on first chunk if schema was inferred
+  bool limit_reached = 4;                 // preview row cap reached for this table; later rows are discarded
 }
 
 message CloseWriterRequest {

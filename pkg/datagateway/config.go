@@ -28,6 +28,10 @@ type Config struct {
 	Inputs  map[string]string       `yaml:"inputs,omitempty"`  // logical name -> table path
 	Outputs map[string]OutputConfig `yaml:"outputs,omitempty"` // logical name -> output config
 
+	// Preview is set only for a preview run; RowLimit caps rows kept per
+	// output table.
+	Preview *PreviewConfig `yaml:"preview,omitempty"`
+
 	ComponentCfg   []byte `yaml:"config,omitempty"` // Component-specific JSON config
 	ChunkSize      int64  `yaml:"chunk_size,omitempty"`
 	BufferSize     int64  `yaml:"buffer_size,omitempty"`
@@ -146,4 +150,10 @@ type OutputConfig struct {
 type ProcessorConfig struct {
 	Type    string   `yaml:"type"`    // Processor type: "drop"
 	Columns []string `yaml:"columns"` // For drop: columns to remove
+}
+
+// PreviewConfig marks a preview run and carries its per-table row cap.
+type PreviewConfig struct {
+	ID       string `yaml:"id"`
+	RowLimit int64  `yaml:"row_limit"`
 }

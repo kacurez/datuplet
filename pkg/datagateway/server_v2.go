@@ -51,6 +51,10 @@ type ServerV2 struct {
 	// in NewServerV2; nil only in hand-built test servers.
 	plane DataPlane
 
+	// rowCap enforces the preview row limit per output table; nil outside
+	// preview runs.
+	rowCap *rowCap
+
 	writers map[string]*writerState
 	readers map[string]*readerState
 
@@ -233,6 +237,9 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 		httpAddr:        httpAddr,
 		runToken:        runToken,
 		validatedClaims: validatedClaims,
+	}
+	if cfg.Preview != nil && cfg.Preview.RowLimit > 0 {
+		s.rowCap = newRowCap(cfg.Preview.RowLimit)
 	}
 
 	// When LakekeeperURL is configured, construct the catalog resolver.
@@ -555,15 +562,20 @@ func (s *ServerV2) GetConfig(ctx context.Context, req *pb.GetConfigRequest) (*pb
 
 	// StorageBootstrap (direct storage access for native components) is no
 	// longer built: all component data flows through the gateway.
+	var previewRowLimit int64
+	if s.config.Preview != nil {
+		previewRowLimit = s.config.Preview.RowLimit
+	}
 	return &pb.ComponentConfig{
-		ExecutionId:   s.config.RunID,
-		ComponentName: s.config.ComponentName,
-		InputBuckets:  s.config.InputBuckets,
-		OutputBuckets: s.config.OutputBuckets,
-		InputTables:   inputTables,
-		OutputConfig:  outputConfig,
-		Config:        s.config.ComponentCfg,
-		ChunkSize:     s.config.ChunkSize,
+		PreviewRowLimit: previewRowLimit,
+		ExecutionId:     s.config.RunID,
+		ComponentName:   s.config.ComponentName,
+		InputBuckets:    s.config.InputBuckets,
+		OutputBuckets:   s.config.OutputBuckets,
+		InputTables:     inputTables,
+		OutputConfig:    outputConfig,
+		Config:          s.config.ComponentCfg,
+		ChunkSize:       s.config.ChunkSize,
 		// Legacy fields
 		Inputs:  s.config.Inputs,
 		Outputs: outputPaths,
