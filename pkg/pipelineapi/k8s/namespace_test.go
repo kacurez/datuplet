@@ -125,14 +125,14 @@ func TestEnsureProjectNamespace_SecretsRBACIdempotent(t *testing.T) {
 	if err := c.List(context.Background(), roles, client.InNamespace(ns)); err != nil {
 		t.Fatalf("list Roles: %v", err)
 	}
-	if len(roles.Items) != 2 {
-		t.Errorf("want 2 Roles after two Ensures, got %d", len(roles.Items))
+	if len(roles.Items) != 3 {
+		t.Errorf("want 3 Roles after two Ensures, got %d", len(roles.Items))
 	}
 	bindings := &rbacv1.RoleBindingList{}
 	if err := c.List(context.Background(), bindings, client.InNamespace(ns)); err != nil {
 		t.Fatalf("list RoleBindings: %v", err)
 	}
-	if len(bindings.Items) != 2 {
-		t.Errorf("want 2 RoleBindings after two Ensures, got %d", len(bindings.Items))
+	if len(bindings.Items) != 3 {
+		t.Errorf("want 3 RoleBindings after two Ensures, got %d", len(bindings.Items))
 	}
 }

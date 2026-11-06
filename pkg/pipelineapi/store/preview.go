@@ -88,8 +88,8 @@ func scanPreview(row pgx.Row) (*Preview, error) {
 }
 
 // InsertPreview enforces the caps and inserts p under a per-project advisory
-// lock so concurrent creates cannot overshoot them. Cleaned rows are evicted
-// oldest-first to stay within MaxPerProject.
+// lock so concurrent creates cannot overshoot them. Cleaned rows whose FGA
+// tuple is gone are evicted oldest-first to stay within MaxPerProject.
 func InsertPreview(ctx context.Context, pool *pgxpool.Pool, p *Preview, caps PreviewCaps) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -104,7 +104,7 @@ func InsertPreview(ctx context.Context, pool *pgxpool.Pool, p *Preview, caps Pre
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM previews WHERE id IN (
 			  SELECT id FROM previews
-			   WHERE project_id = $1 AND cleaned_at IS NOT NULL
+			   WHERE project_id = $1 AND cleaned_at IS NOT NULL AND fga_tuple_deleted_at IS NOT NULL
 			   ORDER BY created_at ASC, id ASC
 			   LIMIT GREATEST(0, (SELECT count(*) FROM previews WHERE project_id = $1) - $2 + 1))`,
 			p.ProjectID, caps.MaxPerProject); err != nil {
@@ -113,8 +113,8 @@ func InsertPreview(ctx context.Context, pool *pgxpool.Pool, p *Preview, caps Pre
 	}
 	var capErr PreviewCapError
 	if err := tx.QueryRow(ctx, `
-		SELECT count(*) FILTER (WHERE phase IN ('Pending','Running') AND workspace = $2),
-		       count(*) FILTER (WHERE phase IN ('Pending','Running')),
+		SELECT count(*) FILTER (WHERE phase IN ('Pending','Running') AND cleaned_at IS NULL AND workspace = $2),
+		       count(*) FILTER (WHERE phase IN ('Pending','Running') AND cleaned_at IS NULL),
 		       count(*) FILTER (WHERE cleaned_at IS NULL)
 		  FROM previews WHERE project_id = $1`, p.ProjectID, p.Workspace,
 	).Scan(&capErr.RunningInWorkspace, &capErr.RunningInProject, &capErr.LiveInProject); err != nil {

@@ -71,6 +71,9 @@ func TestInsertPreview_EvictsOldestCleaned(t *testing.T) {
 		if err := store.MarkPreviewCleaned(ctx, pool, p.ID, time.Now(), false); err != nil {
 			t.Fatalf("clean: %v", err)
 		}
+		if err := store.MarkPreviewTupleDeleted(ctx, pool, p.ID, time.Now()); err != nil {
+			t.Fatalf("tuple deleted: %v", err)
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if err := store.InsertPreview(ctx, pool, newPreview(pid, "a"), caps); err != nil {
@@ -81,6 +84,52 @@ func TestInsertPreview_EvictsOldestCleaned(t *testing.T) {
 	}
 	if _, err := store.GetPreviewByID(ctx, pool, newer.ID); err != nil {
 		t.Errorf("newer cleaned row should survive: %v", err)
+	}
+}
+
+func TestInsertPreview_CleanedPendingNotRunning(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	pid := seedProject(t, pool)
+	caps := store.PreviewCaps{RunningPerWorkspace: 2, RunningPerProject: 2, MaxPerProject: 50}
+
+	for i := 0; i < 2; i++ {
+		p := newPreview(pid, "a")
+		if err := store.InsertPreview(ctx, pool, p, caps); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+		if err := store.MarkPreviewCleaned(ctx, pool, p.ID, time.Now(), false); err != nil {
+			t.Fatalf("clean: %v", err)
+		}
+	}
+	if err := store.InsertPreview(ctx, pool, newPreview(pid, "a"), caps); err != nil {
+		t.Fatalf("cleaned Pending rows must not count as running: %v", err)
+	}
+}
+
+func TestInsertPreview_KeepsCleanedRowWithLiveTuple(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	pid := seedProject(t, pool)
+	caps := store.PreviewCaps{RunningPerWorkspace: 5, RunningPerProject: 5, MaxPerProject: 1}
+
+	old := newPreview(pid, "a")
+	if err := store.InsertPreview(ctx, pool, old, caps); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdatePreviewPhase(ctx, pool, old.ID, store.UpdatePreviewPhaseOpts{Phase: "Succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkPreviewCleaned(ctx, pool, old.ID, time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertPreview(ctx, pool, newPreview(pid, "a"), caps); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := store.GetPreviewByID(ctx, pool, old.ID); err != nil {
+		t.Errorf("cleaned row whose tuple is not deleted must not be evicted: %v", err)
 	}
 }
 

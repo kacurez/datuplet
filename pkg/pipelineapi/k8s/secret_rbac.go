@@ -27,6 +27,9 @@ const (
 	// A separate Role (not a second binding to SecretsRoleName) so the
 	// operator never gains list/update/delete on Secrets.
 	SecretsOperatorRoleName = "datuplet-secrets-operator"
+	// PodLogsRoleName lets pipeline-api read the pods and logs of a
+	// project namespace, for preview result log tails.
+	PodLogsRoleName = "datuplet-pod-logs"
 
 	// pipelineAPIServiceAccount / pipelineOperatorServiceAccount are the SA
 	// names the charts create in the install namespace; the RoleBindings
@@ -66,9 +69,9 @@ func installNamespace() string {
 	return DefaultInstallNamespace
 }
 
-// ensureSecretsRBAC creates the two per-namespace secret Roles + their
-// RoleBindings in namespace. Each object is Get-before-Create (idempotent);
-// existing objects are left untouched. Called by EnsureProjectNamespace so
+// ensureSecretsRBAC creates the two per-namespace secret Roles, the pod-logs
+// Role, and their RoleBindings in namespace. Each object is Get-before-Create
+// (idempotent); existing objects are left untouched. Called by EnsureProjectNamespace so
 // namespace + secret RBAC are always ensured together on every ensure path.
 func ensureSecretsRBAC(ctx context.Context, c client.Client, namespace string) error {
 	saNS := installNamespace()
@@ -79,14 +82,34 @@ func ensureSecretsRBAC(ctx context.Context, c client.Client, namespace string) e
 	if err := ensureSecretRole(ctx, c, namespace, SecretsOperatorRoleName, secretVerbsOperator); err != nil {
 		return err
 	}
+	if err := ensureRole(ctx, c, namespace, PodLogsRoleName, podLogsRules); err != nil {
+		return err
+	}
 	if err := ensureRoleBinding(ctx, c, namespace, SecretsRoleName, pipelineAPIServiceAccount, saNS); err != nil {
+		return err
+	}
+	if err := ensureRoleBinding(ctx, c, namespace, PodLogsRoleName, pipelineAPIServiceAccount, saNS); err != nil {
 		return err
 	}
 	return ensureRoleBinding(ctx, c, namespace, SecretsOperatorRoleName, pipelineOperatorServiceAccount, saNS)
 }
 
+var podLogsRules = []rbacv1.PolicyRule{
+	{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list"}},
+	{APIGroups: []string{""}, Resources: []string{"pods/log"}, Verbs: []string{"get"}},
+}
+
 // ensureSecretRole creates a Role granting verbs on `secrets` in namespace.
 func ensureSecretRole(ctx context.Context, c client.Client, namespace, name string, verbs []string) error {
+	return ensureRole(ctx, c, namespace, name, []rbacv1.PolicyRule{{
+		APIGroups: []string{""},
+		Resources: []string{"secrets"},
+		Verbs:     verbs,
+	}})
+}
+
+// ensureRole creates a Role with rules in namespace if it is missing.
+func ensureRole(ctx context.Context, c client.Client, namespace, name string, rules []rbacv1.PolicyRule) error {
 	existing := &rbacv1.Role{}
 	err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, existing)
 	if err == nil {
@@ -97,11 +120,7 @@ func ensureSecretRole(ctx context.Context, c client.Client, namespace, name stri
 	}
 	role := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     verbs,
-		}},
+		Rules:      rules,
 	}
 	if err := c.Create(ctx, role); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create role %s/%s: %w", namespace, name, err)

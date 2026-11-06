@@ -42,7 +42,7 @@ func (d *DBPreviewUpdater) Update(ctx context.Context, s RunStatus) (bool, error
 	if err != nil {
 		return false, fmt.Errorf("lookup preview: %w", err)
 	}
-	if s.Namespace != p.K8sNamespace || s.PipelineRunName != "preview-"+p.ID.String() {
+	if s.Namespace != p.K8sNamespace || s.PipelineRunName != PreviewPipelineRunName(p.ID) {
 		return false, nil
 	}
 	return store.UpdatePreviewPhase(ctx, d.pool, p.ID, store.UpdatePreviewPhaseOpts{
