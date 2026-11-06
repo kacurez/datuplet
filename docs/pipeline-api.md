@@ -250,8 +250,9 @@ a cap.
 | Previews not yet cleaned up, per project | `previews.maxPerProject` | `DATUPLET_PREVIEW_MAX_PER_PROJECT` | 50 |
 
 **Lifecycle.** `Pending` -> `Running` -> a terminal phase (`Succeeded`,
-`FailedUser`, `FailedApplication`, `Cancelled`, `Expired`). A preview expires at
-`created + timeout + ttl`; a sweeper in pipeline-api cancels, purges the scratch
+`FailedUser`, `FailedApplication`, `Cancelled`, `Expired`). A preview's `expires_at` starts at
+`created + timeout + ttl`; once it reaches a terminal phase it resets to
+`completed_at + ttl_seconds`; a sweeper in pipeline-api cancels, purges the scratch
 tables, drops the namespaces and deletes the PipelineRun.
 
 **Result document.** Top level: `id`, `workspace`, `phase`, `message`,
@@ -266,7 +267,7 @@ caches it; this can take up to ~30 s per table. Until then `result_ready` is
 - `stages[]`: `name`, `phase`, `duration_ms`, `message`, `components[]` with
   `name`, `phase`, `exit_code`, `message`, `log_tail` (component container) and
   `gateway_log_tail` (gateway sidecar), both last 200 lines, filled only for failed
-  components (`null` otherwise). Log tails exist only while the Job pods do (up to 1 h after the stage finishes). A
+  components (`null` otherwise, or when the tail is empty or could not be fetched). Log tails exist only while the Job pods do (up to 1 h after the stage finishes). A
   component that hit the preview timeout carries its last log line in `message`.
 - `outputs[]`: `stage`, `component`, `bucket` and `table` (logical, as in the
   doc), `scratch_table` (`<scratch namespace>.<table>`, queryable with

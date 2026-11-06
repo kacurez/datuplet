@@ -133,7 +133,7 @@ the scratch copy. When done, tear down:
 datuplet preview delete --workspace <task-slug> --all
 ```
 
-Fix the doc and re-preview until it is clean, then save it.
+Other flags: `--no-wait` (print the id and return; fetch later with `datuplet preview get --json <id>`, add `--resample` to retry missing samples). Fix the doc and re-preview until it is clean, then save it.
 
 ### 4. Save it
 

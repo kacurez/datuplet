@@ -309,7 +309,7 @@ How to read it:
 
 - `phase` plus per-stage and per-component `phase` / `message` tell you what
   failed; a failed component also carries `log_tail` / `gateway_log_tail`
-  (last 200 lines; `null` for components that did not fail). Exit code: `0` Succeeded, `1`
+  (last 200 lines; `null` for components that did not fail, and also when the tail is empty or could not be fetched). Exit code: `0` Succeeded, `1`
   FailedUser / Cancelled / Expired / timed out / validation or cap error
   (fix the doc or clean up), `20` FailedApplication or a transport/5xx failure.
 - `outputs[]` has one entry per table the preview wrote. `rows` is the row
@@ -340,10 +340,11 @@ Other subcommands (see `datuplet preview help`):
 
 ```bash
 datuplet preview list                      # previews in $DATUPLET_WORKSPACE (--workspace '*' lists every workspace)
-datuplet preview get <id> --json           # the result document again
+datuplet preview get --json <id>           # the result document again (--resample retries missing samples)
 datuplet preview cancel <id>               # stop a running preview; the running stage's output is discarded
 datuplet preview delete <id>               # purge one preview and its scratch tables
 datuplet preview delete --workspace events-etl-task --all    # tear down the whole workspace
+datuplet preview --no-wait -f events-etl.yaml                # print the id and return; poll with get
 ```
 
 Behaviour that differs from a real run:

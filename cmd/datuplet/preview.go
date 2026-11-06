@@ -95,7 +95,7 @@ type previewListResp struct {
 func previewHelpText() string {
 	return `preview subcommands:
   [run] -f <file|-> [flags]       create a preview, wait for the result document, print it
-  get <id> [--json]               print a preview's result document
+  get [--json] [--resample] <id>  print a preview's result document
   list [--workspace W|'*']        list previews
   delete <id>                     purge one preview
   delete --workspace W --all      purge every preview in a workspace
@@ -532,7 +532,7 @@ func runPreviewGet(args []string) error {
 		return previewParseErr(err)
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: datuplet preview get <id> [--json] [--resample]")
+		return fmt.Errorf("usage: datuplet preview get [--json] [--resample] <id>")
 	}
 	resolved, base, err := c.resolve()
 	if err != nil {
