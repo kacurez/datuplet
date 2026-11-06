@@ -160,6 +160,17 @@ func main() {
 			os.Exit(code)
 		}
 
+	case "preview":
+		if err := runPreview(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			code := 1
+			var ece *exitCodeErr
+			if errors.As(err, &ece) {
+				code = ece.code
+			}
+			os.Exit(code)
+		}
+
 	case "components":
 		if err := runComponents(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -223,6 +234,7 @@ Commands:
   login                  Authenticate to a Datuplet cluster (stores token + cluster config)
   trigger                Trigger a cluster-side pipeline run (via PipelineRun CRD)
   pipeline               CRUD for pipeline specs (list, get, put, delete, validate)
+  preview                Run a pipeline doc against scratch tables (run, get, list, delete, cancel)
   runs                   List runs (filter by pipeline/phase) and get run detail + timeline
   components             Browse the component catalog (list, get --schema)
   apps                   Manage user apps (init, put, get, list, delete, render, promote, token)
