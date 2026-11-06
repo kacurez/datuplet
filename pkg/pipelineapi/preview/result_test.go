@@ -38,10 +38,22 @@ type resultCatalog struct {
 	tables map[string]map[string]*TableInfo
 	lists  map[string]int
 	loads  int
+	// gate, when set, blocks ListTables until closed or ctx is done;
+	// entered is closed on the first blocked call.
+	gate, entered chan struct{}
+	enterOnce     sync.Once
 }
 
-func (c *resultCatalog) ListTables(_ context.Context, ns string) ([]string, error) {
+func (c *resultCatalog) ListTables(ctx context.Context, ns string) ([]string, error) {
 	time.Sleep(20 * time.Millisecond)
+	if c.gate != nil {
+		c.enterOnce.Do(func() { close(c.entered) })
+		select {
+		case <-c.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lists[ns]++
@@ -437,6 +449,63 @@ func TestGet_ConcurrentAssembleOnce(t *testing.T) {
 		if lists[ns] != 1 {
 			t.Errorf("ListTables(%s) called %d times", ns, lists[ns])
 		}
+	}
+}
+
+func TestGet_CleanedBeforeAssembly(t *testing.T) {
+	r := newResultEnv(t)
+	r.seed("pv-ab12cd34-raw", "data", &TableInfo{TotalRecords: 1})
+	r.insert("Succeeded", succeededStages())
+	if err := store.MarkPreviewCleaned(context.Background(), r.pool, testID, time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	res := r.mustGet(false)
+	if !res.ResultReady || res.Outputs == nil || len(res.Outputs) != 0 || len(res.Stages) != 2 {
+		t.Errorf("result = %+v", res)
+	}
+	if len(res.Warnings) != 1 || res.Warnings[0] != "outputs purged before the result was assembled" {
+		t.Errorf("warnings = %q", res.Warnings)
+	}
+	if lists, loads := r.rcat.calls(); len(lists) != 0 || loads != 0 || r.sampler.count() != 0 {
+		t.Errorf("cleaned preview touched catalog/sampler: %v %d %d", lists, loads, r.sampler.count())
+	}
+	if p := r.get(testID); p.Result == nil {
+		t.Error("result not cached")
+	}
+}
+
+func TestGet_FirstCallerCancelledStillAssembles(t *testing.T) {
+	r := newResultEnv(t)
+	r.seed("pv-ab12cd34-raw", "data", &TableInfo{Columns: []Column{{Name: "id", Type: "long"}}, TotalRecords: 1})
+	r.insert("Succeeded", succeededStages())
+	r.rcat.gate, r.rcat.entered = make(chan struct{}), make(chan struct{})
+
+	ctx1, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+	go func() { _, _ = r.svc.Get(ctx1, r.pid, testID, false) }()
+	<-r.rcat.entered
+
+	second := make(chan error, 1)
+	go func() {
+		res, err := r.svc.Get(r.ctx, r.pid, testID, false)
+		if err == nil && (!res.ResultReady || len(res.Outputs) != 1) {
+			err = errors.New("incomplete result")
+		}
+		second <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	close(r.rcat.gate)
+
+	if err := <-second; err != nil {
+		t.Fatalf("second Get: %v", err)
+	}
+	if lists, _ := r.rcat.calls(); lists["pv-ab12cd34-raw"] != 1 {
+		t.Errorf("ListTables(raw) called %d times; the cancelled flight was redone", lists["pv-ab12cd34-raw"])
+	}
+	if p := r.get(testID); p.Result == nil {
+		t.Error("result not cached")
 	}
 }
 

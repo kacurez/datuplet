@@ -22,6 +22,10 @@ const (
 	logTailLines       = 200
 	samplesUnavailable = "samples unavailable: query service disabled"
 	sampleSkipPrefix   = "sample skipped for "
+	outputsPurged      = "outputs purged before the result was assembled"
+	// assembleTimeout bounds an assembly, which outlives the request that
+	// started it so callers joined to the flight still get the document.
+	assembleTimeout = 3 * time.Minute
 )
 
 // Result is the preview result document (GET /previews/{id}).
@@ -118,7 +122,9 @@ func (s *Service) Get(ctx context.Context, projectID, id uuid.UUID, resample boo
 	}
 	if isTerminal(p.Phase) && (p.Result == nil || resample) {
 		v, err, _ := s.flight.Do(id.String(), func() (any, error) {
-			return s.assemble(ctx, projectID, id, resample)
+			actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), assembleTimeout)
+			defer cancel()
+			return s.assemble(actx, projectID, id, resample)
 		})
 		if err != nil {
 			return nil, err
@@ -189,6 +195,10 @@ func (s *Service) build(ctx context.Context, p *store.Preview) (*cachedResult, e
 		body.Stages = append(body.Stages, r)
 	}
 
+	if p.CleanedAt != nil {
+		body.Warnings = append(body.Warnings, outputsPurged)
+		return body, nil
+	}
 	doc, err := docOf(p)
 	if err != nil {
 		return nil, err
