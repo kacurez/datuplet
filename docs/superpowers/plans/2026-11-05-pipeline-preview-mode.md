@@ -26,6 +26,9 @@
 - PipelineRun name `"preview-" + previewID.String()`; run-token Secret `"runtoken-" + previewID.String()`; synthesized doc name `"preview-" + id8`.
 - Terminal phases: `Succeeded, FailedUser, FailedApplication, Cancelled, Expired`. Running phases: `Pending, Running`.
 - CLI exit codes: `0` Succeeded; `1` FailedUser / Cancelled / Expired / timed out / validation 400; `20` FailedApplication or transport/5xx.
+- **Kubernetes safety:** the default kube context on this machine is a real GKE cluster. Never run `kubectl`, `helm` or any `make k8s-*`/`e2e-*` target without first exporting an isolated OrbStack kubeconfig: `kubectl config view --minify --flatten --context orbstack > "$TMPDIR/orbstack.kubeconfig"; export KUBECONFIG="$TMPDIR/orbstack.kubeconfig"`, then confirm `kubectl config current-context` prints `orbstack`. Unit tasks (1-11) never touch a cluster.
+- Never `git stash`. Stop any Docker container you start (`docker stop`) before reporting.
+- Purge identity: subject `"preview-sweeper-" + previewID.String()` (never the preview's own run identity). Its `editor` project tuple is written with `authz.WriteProjectTuple` immediately before a purge and removed with `authz.DeleteProjectTuple` immediately after.
 
 ## Review Focus
 
@@ -83,7 +86,8 @@
 - [ ] **Step 2:** `go test ./pkg/datagateway/ -run 'TestOpenWriter_(Undeclared|Declared|NoDeclared)' -v` → FAIL.
 - [ ] **Step 3:** Implement the check in `openWriter` and `declaredOutputBucket`.
 - [ ] **Step 4:** Same command → PASS; then `go test ./pkg/datagateway/...` → PASS (fix any existing test that wrote to an undeclared bucket by declaring it in its config, never by weakening the fence).
-- [ ] **Step 5:** CHANGELOG `### Changed`: "**Gateway rejects writes to undeclared buckets.** A component that opens a writer for a bucket not in its `outputs` now fails with PermissionDenied (FailedUser) instead of creating the table." Add the same sentence to known-limitations under the Data Gateway section.
+- [ ] **Step 4b:** `go test -tags=integration ./pkg/datagateway/goplane/...` (needs Docker; CI runs it) → PASS.
+- [ ] **Step 5:** CHANGELOG `### Changed`: "**Gateway rejects writes to undeclared buckets.** A component that opens a writer for a bucket not in its `outputs` now gets PermissionDenied and the run fails, instead of the gateway creating that table." Add the same sentence to known-limitations under the Data Gateway section.
 - [ ] **Step 6: Commit** `feat(gateway): fence writes to the component's declared output buckets`.
 
 ---
@@ -91,7 +95,7 @@
 ### Task 2: Gateway preview row cap + `limit_reached`
 
 **Files:**
-- Modify: `api/proto/gateway/v2/gateway.proto` (`WriteChunkResponse`: `bool limit_reached = 4; // preview row cap reached for this table; later rows are discarded`)
+- Modify: `api/proto/gateway/v2/gateway.proto` (`WriteChunkResponse`: `bool limit_reached = 4; // preview row cap reached for this table; later rows are discarded`; `ComponentConfig`: `int64 preview_row_limit = 16; // >0 in a preview run: rows per output table the gateway keeps`). `GetConfig` (`server_v2.go`) fills `PreviewRowLimit` from `Config.Preview.RowLimit`; add a `TestGetConfig_PreviewRowLimit` test.
 - Regenerate: `pkg/datagateway/proto/v2/gateway.pb.go`, `gateway_grpc.pb.go`, and the duplicate `api/proto/gateway/v2/gateway.pb.go`, `gateway_grpc.pb.go`
 - Modify: `pkg/datagateway/gatewayconfig.go`, `pkg/datagateway/config.go` (and `ToConfig`)
 - Create: `pkg/datagateway/row_cap.go`
@@ -129,26 +133,27 @@
 
 **Files:**
 - Modify: `sdk/go/client.go` (`Writer` field `limitReached bool`, set in `writeChunkHTTP` from JSON `limit_reached` and in `writeChunkGRPC` from `resp.LimitReached`; `WriteResult.LimitReached bool`)
-- Modify: `sdk/go/arrow/typed_sink.go`, `sdk/go/arrow/inferring_sink.go`
-- Modify: `components/http-json-extractor/main.go` (paginated loop and single-request path), `components/data-generator/*.go` (random-mode emit loop)
-- Test: `sdk/go/writer_batching_test.go` (or new `sdk/go/limit_test.go`), `sdk/go/arrow/typed_sink_test.go`, `components/http-json-extractor/stream_test.go` (or the existing pagination test file), `components/data-generator/arrow_writer_test.go`
+- Modify: `sdk/go/client.go` `Config` (`PreviewRowLimit`, filled in `Config()` from the GetConfig response)
+- Modify: `components/http-json-extractor/main.go`, `columns.go` (paginated loop, single-request path, sink batch rows), `components/data-generator/*.go` (random-mode emit loop, sink batch rows)
+- Test: `sdk/go/limit_test.go` (new), `sdk/go/config_test.go`, `components/http-json-extractor/*_test.go`, `components/data-generator/config_test.go`
 
 **Interfaces:**
-- `func (w *Writer) LimitReached() bool` — sticky once any response carried it. **Not an error:** the Arrow sinks treat write errors as sticky failures, so the signal is an accessor (deliberate deviation from the spec's sentinel-error wording; behaviour is the same — the component stops and exits 0).
-- `func (s *Sink) LimitReached() bool` — `s.writer` implements `interface{ LimitReached() bool }` and returns true; false when no writer opened.
-- `func (s *InferringSink) LimitReached() bool` — delegates to its core `*Sink` (false before adoption).
-- http-json-extractor: in `runPaginatedExtraction`, after each page's `decodeRecords`, `if sink.LimitReached() { client.Log(ctx,"INFO","Preview row limit reached, stopping pagination"); break }`; inside the decode callback, once `sink.LimitReached()` return a sentinel that stops decoding the page early (treat it as non-error). Exit path unchanged (Finish, commit, status 0).
-- data-generator: in the random emit loop, after each flush boundary check the sink/writer `LimitReached()` and stop that table.
+- `sdk.Config.PreviewRowLimit int64` (from `ComponentConfig.preview_row_limit`, Task 2); 0 outside previews.
+- `func (w *Writer) LimitReached() bool` — sticky once any response carried it. **Not an error:** the Arrow sinks treat write errors as sticky failures, so the signal is an accessor (deliberate deviation from the spec's sentinel-error wording; behaviour is the same — the component stops and exits 0). `WriteResult.LimitReached bool` likewise.
+- The speed win comes from the components knowing the cap up front (the sinks flush every 8192 rows and the SDK writer batches 1 MiB, so a gateway-side signal arrives far too late for a 1 000-row cap):
+  - http-json-extractor: effective record cap `= min(nonzero(pagination.max_records), PreviewRowLimit)` when `PreviewRowLimit > 0`, applied to the paginated loop (stop paginating once reached, same path as `max_records`) **and** to the single-request path (stop decoding after the cap). Sink batch rows `= min(DefaultBatchRows, PreviewRowLimit)` via `dgarrow.WithBatchRows`.
+  - data-generator: effective `rowsCount = min(nonzero(limit.rowsCount), PreviewRowLimit)` when `PreviewRowLimit > 0` (a `sizeInBytes`/`timeoutInSeconds`-only limit also stops at the cap); batch rows capped the same way.
+  - The gateway cap (Task 2) stays the backstop for components that ignore the field.
 
 - [ ] **Step 1: Write failing tests.**
   - SDK `TestWriter_LimitReachedFromHTTP`: httptest server answering `{"rows_accepted":2,"limit_reached":true}` → after `WriteChunk`, `w.LimitReached() == true` and `res.LimitReached == true`; a previous response without the field leaves it false.
-  - SDK arrow `TestSink_LimitReachedDelegates`: fake `ChunkWriter` that also implements `LimitReached() bool` returning true after first Write → `sink.LimitReached()` false before flush, true after; `RowDone`/`Finish` return no error.
-  - extractor `TestPagination_StopsOnLimitReached`: httptest API serving 5 pages of 10 records with `page_size:10`; fake gateway write path reporting `limit_reached` after 15 rows → pages fetched `== 2` (assert via request counter), exit without error. Use the test seams the existing pagination tests use.
-  - data-generator `TestRandom_StopsOnLimitReached`: rowsCount 100000, fake writer reporting limit after first flush → generated rows `<= DefaultBatchRows*2`.
-- [ ] **Step 2:** Run in each module (`cd sdk/go && go test ./... -run LimitReached`; same in `sdk/go/arrow`, `components/http-json-extractor`, `components/data-generator`) → FAIL.
+  - SDK `TestConfig_PreviewRowLimit`: GetConfig fake returning `PreviewRowLimit: 7` (use the existing `config_test.go` seam) → `c.Config().PreviewRowLimit == 7`.
+  - extractor `TestEffectiveRecordCap`: table over (max_records, preview) = (0,0)→0, (0,1000)→1000, (500,1000)→500, (5000,1000)→1000. Wire the result into both paths; if the pagination loop has an existing unit seam (check `stream_test.go`), add `TestPagination_StopsAtPreviewCap` (5 pages × 10, cap 15 → 2 pages requested); otherwise test the cap helper only.
+  - data-generator `TestEffectiveRowsCount`: same table shape for `rowsCount`, plus sizeInBytes-only limit with preview 1000 → 1000.
+- [ ] **Step 2:** Run in each module (`cd sdk/go && go test ./... -run 'LimitReached|PreviewRowLimit'`; `components/http-json-extractor` and `components/data-generator` `-run 'Effective|PreviewCap'`) → FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** `go test ./...` in `sdk/go`, `sdk/go/arrow`, `components/http-json-extractor`, `components/data-generator` → PASS.
-- [ ] **Step 5: Commit** `feat(sdk): expose preview row-limit signal; built-ins stop producing at the cap`.
+- [ ] **Step 5: Commit** `feat(sdk): expose the preview row limit; built-ins stop producing at the cap`.
 
 ---
 
@@ -172,7 +177,8 @@
       TimeoutSeconds int64  `json:"timeoutSeconds"`
   }
   ```
-  `PipelineRef` json tag becomes `json:"pipelineRef,omitempty"`.
+  `PipelineRef` stays a non-pointer struct (an empty `{name:""}` passes the CRD since `pipelineRef` is no longer required); do not change its tag.
+- Operator RBAC: add `patch` to the `pods` verbs in `charts/datuplet-app/templates/pipeline-operator/rbac.yaml` so `propagateCancelToPods` actually works (today it fails silently).
 - `handlePending`: when `pr.Spec.PipelineSpec != nil`, build `pipeline := &datupletv1.Pipeline{ObjectMeta: metav1.ObjectMeta{Name: pr.Name, Namespace: pr.Namespace, Generation: 0}, Spec: *pr.Spec.PipelineSpec.DeepCopy()}` and skip the Get + not-found retry; all four downstream uses take this value unchanged. Neither set → FailedUser `"spec.pipelineRef or spec.pipelineSpec is required"`.
 - Jobs: `BackoffLimit: int32Ptr(0)` when `pr.Spec.Preview != nil`, else 1.
 - Gateway config: when `pr.Spec.Preview != nil`, `configMap["preview"] = map[string]any{"id": pr.Spec.Preview.ID, "row_limit": pr.Spec.Preview.RowLimit}`.
@@ -234,8 +240,9 @@
       FGATupleDeletedAt, StartedAt, CompletedAt, CleanedAt *time.Time; CreatedAt, ExpiresAt time.Time }
   var ErrPreviewNotFound = errors.New("preview not found")
   type PreviewCaps struct { RunningPerWorkspace, RunningPerProject, MaxPerProject int }
-  var ErrPreviewCap = errors.New("preview cap reached") // wrapped in *PreviewCapError{RunningInWorkspace, RunningInProject int}
-  func InsertPreview(ctx, pool, p *Preview, caps PreviewCaps) error // tx: pg_advisory_xact_lock(hashtext('previews:'||project_id)); delete oldest cleaned rows beyond MaxPerProject; count running; insert
+  var ErrPreviewCap = errors.New("preview cap reached")
+  type PreviewCapError struct{ RunningInWorkspace, RunningInProject, LiveInProject int } // Error() text names the counts; Is(target) reports target == ErrPreviewCap
+  func InsertPreview(ctx, pool, p *Preview, caps PreviewCaps) error // tx: pg_advisory_xact_lock(hashtext('previews:'||project_id)); delete oldest cleaned rows while total rows >= MaxPerProject; count running (ws + project) and live (cleaned_at IS NULL) rows; any cap hit → *PreviewCapError; insert
   func GetPreview(ctx, pool, projectID, id uuid.UUID) (*Preview, error)
   func GetPreviewByID(ctx, pool, id uuid.UUID) (*Preview, error)
   func ListPreviews(ctx, pool, projectID uuid.UUID, workspace string /* "*" = all */, limit int, cursor string) ([]Preview, string, error)
@@ -271,7 +278,14 @@
 - Create: `pkg/pipelineapi/preview/service.go`, `catalog.go`, `sweep.go`, `service_test.go`, `sweep_test.go`
 
 **Interfaces:**
-- `pkg8s.CreatePreviewOpts{ Namespace string; PreviewID uuid.UUID; Token string; Spec datupletv1.PipelineSpec; Preview datupletv1.PreviewSpec }`, `func CreatePreviewResources(ctx, c client.Client, o CreatePreviewOpts) error` — same 4 steps as `CreateRunResources` with the names/labels from Global Constraints (Secret label `datuplet.io/preview-id`).
+- `pkg8s.CreatePreviewOpts{ Namespace string; PreviewID uuid.UUID; Token string; Spec datupletv1.PipelineSpec; Preview datupletv1.PreviewSpec }`, `func CreatePreviewResources(ctx, c client.Client, o CreatePreviewOpts) error` — same 4 steps as `CreateRunResources` with the names/labels from Global Constraints (Secret label `datuplet.io/preview-id`). The PipelineRun **must** set `Spec.RunID = PreviewID.String()` (else the controller generates a random id, `$RUN_ID` mismatches the token's `run_id`, and the sidecar fails at boot) and `Spec.RunTokenRef = &RunTokenRef{Name: "runtoken-"+id}`.
+- Move-in from Task 8 (Task 7's `Deps` needs them; Task 8 implements them) — declare in `catalog.go`:
+  ```go
+  type Sampler interface { Sample(ctx context.Context, qualifiedWarehouse, ns, table string, variantCols []string, rows int) (*Sample, error) } // qualifiedWarehouse = lakekeeper_project_id + "/" + warehouse from the row
+  type Sample struct { Columns []SampleColumn `json:"columns"`; Rows [][]any `json:"rows"`; Truncated bool `json:"truncated"` }
+  type SampleColumn struct { Name string `json:"name"`; Type string `json:"type"` }
+  type LogTailer interface { Tail(ctx context.Context, namespace, jobName, container string, lines int64) (string, error) }
+  ```
 - `secret_rbac.go`: `ensureSecretsRBAC` also ensures Role `datuplet-pod-logs` (`pods: get,list`; `pods/log: get`) + RoleBinding to the pipeline-api SA. Constant `PodLogsRoleName = "datuplet-pod-logs"`.
 - `catalog.go`:
   ```go
@@ -293,7 +307,10 @@
       ProjectNS runbackend.ProjectNS; WarehouseResolver func(ctx context.Context, lkProjectID string) (string, error)
       Catalogs CatalogFactory; UserCatalogToken catalogwriter.TokenProvider // impersonation for ctx user (storage Service.Minter)
       Sampler Sampler; Logs LogTailer; Caps store.PreviewCaps; Now func() time.Time; Audience string
+      PurgeWait time.Duration // max wait for the preview's pods to disappear before purging; default 90s; tests use ~100ms
+      PollInterval time.Duration // default 2s
   }
+  func (s *Service) List(ctx context.Context, projectID uuid.UUID, workspace string, limit int, cursor string) ([]store.Preview, string, error)
   type Service struct{ /* deps */ }
   func New(d Deps) *Service
   type CreateRequest struct { ProjectID, UserID uuid.UUID; Doc *config.Pipeline; Workspace string; RowLimit, TimeoutSeconds, TTLSeconds int; UntilStage string }
@@ -305,15 +322,15 @@
   var ErrBadRequest = errors.New("bad preview request") // wrap with fmt.Errorf("%w: …")
   ```
   Create order: apply defaults/bounds (out of range → `ErrBadRequest`) → `Rewrite` → re-validate rewritten JSON with `validate.ValidatePipelineDoc(json, rewritten.Name, nil, nil)` (error finding → internal error) → `ProjectNS.Ensure` → project row for `LakekeeperProjectID` → `WarehouseResolver` → `store.InsertPreview` (caps) → FGA `WriteTuples([{User: authz.UserObject(id).String(), Relation: authz.RelationEditor, Object: authz.ProjectObject(lk)}])` (skip when lk == "") → `tokens.MintRunToken(ctx, signer, RunSpec{RunID:id, ProjectID:lk, PipelineName:rewritten.Name, Warehouse, Audience, Lifetime: timeout+10m})` → `config.DocToCR` → `CreatePreviewResources`. Any failure after insert → `UpdatePreviewPhase(FailedApplication, message)` + delete tuple (detached ctx), return error.
-  Cancel (runs/k8s.go pattern): delete tuple first (+`MarkPreviewTupleDeleted`), annotate pods `datuplet.io/run-id=<id>` with cancel, delete PipelineRun `preview-<id>`, set phase `Cancelled` "cancelled by user" when non-terminal.
+  Cancel (runs/k8s.go pattern): delete tuple first (`authz.DeleteProjectTuple`, tolerates missing; then `MarkPreviewTupleDeleted`), annotate pods `datuplet.io/run-id=<id>` with cancel, delete PipelineRun `preview-<id>` with `client.PropagationPolicy(metav1.DeletePropagationForeground)`, then when non-terminal `UpdatePreviewPhase(Phase:"Cancelled", Message:"cancelled by user", CompletedAt:&now)` (so `expires_at` resets to completed_at + ttl).
 - `sweep.go`:
   ```go
-  func (s *Service) SweepOnce(ctx context.Context) error // the three steps of spec §4.7, each per-row error logged + counted, never aborting other rows
+  func (s *Service) SweepOnce(ctx context.Context) error // ONLY steps 1 (tuple delete at terminal) and 3 (expire → Purge) of spec §4.7; result assembly is NOT here (it needs a user identity — Task 8 does it on GET). Each per-row error logged + counted, never aborting other rows
   func (s *Service) Purge(ctx context.Context, p *store.Preview) error
   func (s *Service) RunSweeper(ctx context.Context, interval time.Duration) // ticker; each tick: conn := pool.Acquire; SELECT pg_try_advisory_lock(0x70726576); if got → SweepOnce; pg_advisory_unlock; Release
   var sweepFailures = prometheus counter vec "pipelineapi_preview_sweep_failures_total" label "step" (tuple|purge|cancel)
   ```
-  Purge order: if non-terminal → Cancel; wait (poll 2 s, max 60 s) until PipelineRun `preview-<id>` is NotFound, else return error (retry next tick); if `fga_tuple_deleted_at != nil` re-write the tuple; catalog via `s.Catalogs(ctx, serviceTokenFor(id), lk, warehouse)` where `serviceTokenFor` returns `tokens.MintServiceToken(signer, ServiceTokenSpec{Subject: id.String(), Audience: s.audience, Lifetime: 5*time.Minute})`; for each scratch namespace: `ListTables` → `PurgeTable` each → `DropNamespace`; verify `ListTables` empty for all; delete tuple; `MarkPreviewCleaned(expired: phase non-terminal)`.
+  Purge order: if non-terminal → Cancel; else if the preview's own tuple is still present delete it; delete PipelineRun `preview-<id>` (Foreground, NotFound ok); wait (poll `PollInterval`, max `PurgeWait`) until the PipelineRun is NotFound **and** no Pod labelled `datuplet.io/run-id=<id>` remains in the namespace, else return error (retry next tick); sweeper subject `sw := "preview-sweeper-"+id`; `authz.WriteProjectTuple(ctx, authz, sw, authz.RelationEditor, lk)` (skip when lk == ""); catalog via `s.Catalogs(ctx, tp, lk, warehouse)` where `tp` returns `tokens.MintServiceToken(signer, ServiceTokenSpec{Subject: sw, Audience: s.audience, Lifetime: 5*time.Minute})`; for each scratch namespace: `ListTables` → `PurgeTable` each → `DropNamespace`; verify `ListTables` empty for all; `defer authz.DeleteProjectTuple(…, sw, …)` (always, also on error); `MarkPreviewCleaned(expired: phase non-terminal)`.
 
 - [ ] **Step 1: Write failing tests** with fakes (`fakeCatalog` map-based, fake authorizer recording writes/deletes, controller-runtime fake client; DB tests gated on `TEST_DATABASE_URL`):
   - `TestCreatePreviewResources_Labels` (no DB): PipelineRun name `preview-<id>`, label preview-id, no run-id label, `Spec.PipelineSpec` and `Spec.Preview` set, Secret owner ref.
@@ -322,9 +339,10 @@
   - `TestCreate_RejectsOutOfRange` (no DB): `RowLimit: 0`→ default, `RowLimit: 200000` → `ErrBadRequest`; workspace `"Bad_WS"` → `ErrBadRequest`.
   - `TestCreate_RunningCapPerWorkspace` (DB): third in ws `a` → `store.ErrPreviewCap`, no tuple written, no PipelineRun.
   - `TestSweep_DeletesTupleAtTerminal` (DB): Succeeded row → tuple deleted, `fga_tuple_deleted_at` set, scratch tables untouched.
-  - `TestPurge_PurgesAndDropsNamespaces` (DB): fake catalog with 2 tables in 2 namespaces → all purged, namespaces dropped, `cleaned_at` set, tuple re-written then deleted (order asserted on the fake authorizer).
+  - `TestPurge_PurgesAndDropsNamespaces` (DB): fake catalog with 2 tables in 2 namespaces → all purged, namespaces dropped, `cleaned_at` set; the fake authorizer saw write(`preview-sweeper-<id>`) before the first purge and delete(`preview-sweeper-<id>`) after the last, and never re-wrote the preview's own identity.
+  - `TestPurge_SweeperTupleRemovedOnError` (DB): catalog fails every purge → sweeper tuple still deleted.
   - `TestPurge_RetriesAfterPartialFailure` (DB): fake catalog fails `PurgeTable` once on the 2nd table → first sweep: `cleaned_at` NULL; second sweep: success, purge of already-gone table returns nil.
-  - `TestPurge_WaitsForPipelineRunGone` (DB): PipelineRun still present after cancel (fake never deletes) → Purge returns error, no catalog calls.
+  - `TestPurge_WaitsForPodsGone` (DB, `PurgeWait: 100*time.Millisecond`): PipelineRun gone but a Pod labelled `datuplet.io/run-id=<id>` remains → Purge returns error, no catalog calls.
   - `TestDeleteWorkspace_OnlyThatWorkspace` (DB).
 - [ ] **Step 2:** Run with the Task 6 Postgres container → FAIL.
 - [ ] **Step 3:** Implement.
@@ -339,28 +357,30 @@
 - Create: `pkg/pipelineapi/preview/result.go`, `logs.go`, `result_test.go`
 
 **Interfaces:**
+- `Sampler`, `Sample`, `SampleColumn`, `LogTailer` are declared in Task 7's `catalog.go`; this task implements them.
 - ```go
-  type Sampler interface { Sample(ctx context.Context, projectID uuid.UUID, ns, table string, variantCols []string, rows int) (*Sample, error) }
-  type Sample struct { Columns []SampleColumn `json:"columns"`; Rows [][]any `json:"rows"`; Truncated bool `json:"truncated"` }
-  type SampleColumn struct { Name string `json:"name"`; Type string `json:"type"` }
-  type LogTailer interface { Tail(ctx context.Context, namespace, jobName, container string, lines int64) (string, error) } // pod chosen by label batch.kubernetes.io/job-name=<jobName>; NotFound → "", nil
-  func NewClientsetLogTailer(cs kubernetes.Interface) LogTailer
+  func NewClientsetLogTailer(cs kubernetes.Interface) LogTailer // pod chosen by label batch.kubernetes.io/job-name=<jobName>; NotFound → "", nil
+  func NewQuerySampler(core *queryproxy.Core) Sampler          // sub = authenticated user from ctx (auth.UserFromContext), as storage HTTPHandlers.Preview does
   type Result struct { /* JSON exactly as spec §4.5, field names verbatim */ }
   func (s *Service) Get(ctx context.Context, projectID, id uuid.UUID, resample bool) (*Result, error)
   func ColumnsHint(cols []Column) (hint []ColumnHint, warnings []string)
   ```
+- `Result` carries `ResultReady bool \`json:"result_ready"\`` — true once the cached document exists (false while non-terminal). Clients stop polling on terminal phase + `result_ready`, never on "outputs non-empty" (a preview can legitimately write nothing).
+- `Get` serializes assembly per preview id with `golang.org/x/sync/singleflight` (check it is already in root `go.mod`; if not, use a `sync.Mutex`-guarded map of in-flight ids) so concurrent GETs neither assemble twice nor collide on the query worker's 1-in-flight preview gate.
 - `Get`: load row; non-terminal → result with stages from `stage_statuses`, `outputs: []`; terminal and `result IS NULL` (or `resample`) → assemble (catalog via `s.Catalogs(ctx, s.userCatalogToken, lk, warehouse)` — ctx carries the user), `SetPreviewResult`, return. Cached JSON stores only `stages` (with log tails), `outputs`, `warnings`; the row's own fields fill the rest on every read. `resample=true` re-samples outputs whose `sample` is null and overwrites the cache (use a plain UPDATE for that path).
 - Iceberg → `columns:` map: `int→int, long→long, float→float, double→double, boolean→boolean, string→string, variant→variant`; anything else → `string` + warning `column %q has type %s; hinted as string — declare a supported type or keep string`.
 - `outputs[].rows = TotalRecords`, `at_cap = TotalRecords >= row_limit`; producer = the doc component whose (rewritten) outputs declare that bucket+table, else the component whose `defaultBucket`/`buckets[]` match the namespace when unique, else null.
-- Log tails: for each component with a failed phase, `Tail(ns, comp.podName, "component", 200)` and `Tail(…, "gateway", 200)`.
-- Production `Sampler` (in this task, file `sampler.go`): wraps `*queryproxy.Core.Preview` with `PreviewLimits{TimeoutS: 30, MaxRows: rows, MaxBytes: 1<<20}`; `sub` and qualified warehouse resolved exactly as `storage.HTTPHandlers.Preview` does (read that handler and reuse its prologue helpers; export a small helper from `pkg/pipelineapi/storage` if one is unexported). A 429/`query_disabled` becomes a `warnings` entry, never an error.
+- Log tails: for each component with a failed phase, `Tail(ns, comp.PodName, "component", 200)` and `Tail(…, "gateway", 200)`. Note `ComponentStatus.PodName` holds the **Job** name (set in `startStage`); that is correct for the `jobName` parameter — do not "fix" it.
+- Production `Sampler` (file `sampler.go`): wraps `(*queryproxy.Core).Preview(ctx, user.ID.String(), qualifiedWarehouse, ns, table, variantCols, PreviewLimits{TimeoutS: 30, MaxRows: rows, MaxBytes: 1<<20})`. A `QueryError` (429, `query_disabled`, timeout) becomes a `warnings` entry, never an error. A nil sampler (query worker off) → every sample null with warning `samples unavailable: query service disabled`.
 
 - [ ] **Step 1: Write failing tests** (fakes; DB-gated where a row is needed):
   - `TestColumnsHint`: `[{id long} {ts timestamptz} {v variant}]` → hint `[{id long} {ts string} {v variant}]`, one warning naming `ts`.
   - `TestGet_AssemblesOnceAndCaches` (DB): Succeeded preview, fake catalog with `pv-ab12cd34-raw.data` (TotalRecords 1000, limit 1000) → `outputs[0]` has `bucket raw`, `scratch_table "pv-ab12cd34-raw.data"`, `at_cap true`; second `Get` does not call the catalog or sampler (counters).
   - `TestGet_SamplerUnavailable_Warns` (DB): sampler returns error → `sample null`, one warning, no error.
   - `TestGet_FailedComponentLogTails` (DB): FailedUser stage → `log_tail` and `gateway_log_tail` from the fake tailer.
-  - `TestGet_RunningHasNoOutputs` (DB).
+  - `TestGet_RunningHasNoOutputs` (DB): `result_ready false`.
+  - `TestGet_SucceededNoTables_ResultReady` (DB): fake catalog with empty scratch namespaces → `outputs []`, `result_ready true`.
+  - `TestGet_ConcurrentAssembleOnce` (DB): 5 goroutines call `Get` → catalog `ListTables` per namespace called once.
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `TEST_DATABASE_URL=… go test -p 1 ./pkg/pipelineapi/preview/...` → PASS.
 - [ ] **Step 5: Commit** `feat(preview): assemble and cache the preview result document`.
 
@@ -376,7 +396,7 @@
 - Routes (all `auth.WithUser`, registered only when `s.previews != nil && s.resolver != nil && s.authzr != nil`):
   `POST /api/v1/projects/{pid}/previews`, `GET /api/v1/projects/{pid}/previews`, `GET /api/v1/projects/{pid}/previews/{id}`, `DELETE /api/v1/projects/{pid}/previews/{id}`, `DELETE /api/v1/projects/{pid}/previews` (requires `?workspace=`), `POST /api/v1/projects/{pid}/previews/{id}/cancel`.
 - Auth: `s.mustHaveRelation(w, r, "data_admin")` on all routes (reads too — a preview carries a doc with config).
-- POST body: JSON `{doc: object, workspace, row_limit, timeout_seconds, ttl_seconds, until_stage}`, 1 MiB `http.MaxBytesReader`. Handler: marshal `doc` → bytes; `name := doc.name || "preview"`; `crd, findings := validate.ValidatePipelineDoc(bytes, name, s.registry, s.policy)`; any error finding → 400 `{error:"validation failed", findings}`; non-superadmin and `resourcesModified(&datupletv1.Pipeline{}, crd)` → 403 (same message as PUT); `missingSecretRefs` → 400; then `Create` with `config.CRToDoc(crd)`. Map `ErrBadRequest`→400, `store.ErrPreviewCap`→409 `{error:"too_many_previews", running_in_workspace, running_in_project}`, `store.ErrPreviewNotFound`→404, else 500. 202 body = `CreateResponse` (snake_case JSON). `DELETE` single → 204, `502 {error:"purge_failed"}` on purge error. `DELETE ?workspace=` → 202 `{deleted:[…], failed:{id:msg}}`. `GET /previews` → `{previews:[{id,workspace,phase,doc_name,until_stage,created_at,expires_at}], next_cursor}`; `?workspace=` default `default`, `*` = all. `GET /previews/{id}?resample=true`.
+- POST body: JSON `{doc: object, workspace, row_limit, timeout_seconds, ttl_seconds, until_stage}`, 1 MiB `http.MaxBytesReader`. Handler: marshal `doc` → bytes; `name := doc.name || "preview"`; then **mirror `handlePutPipeline`'s gate order exactly** (`pipeline_handlers.go` ~226-264, create semantics: the "old" spec is an empty `&datupletv1.Pipeline{}`): superadmin check, policy `nil` for superadmins and `s.policy` otherwise, the 403 gates (resources diff, `gateway.*` bound errors for non-superadmins) before the 400 for other error findings (`{error:"validation failed", findings}`); then `missingSecretRefs` → 400; then `Create` with `config.CRToDoc(crd)`. Factor a shared helper out of `handlePutPipeline` only if it is a pure extraction; otherwise duplicate the ~20 lines with a comment pointing at PUT. Map `ErrBadRequest`→400, `store.ErrPreviewCap`→409 `{error:"too_many_previews", running_in_workspace, running_in_project, live_in_project}`, `store.ErrPreviewNotFound`→404, else 500. 202 body = `CreateResponse` (snake_case JSON). `DELETE` single → 204, `502 {error:"purge_failed"}` on purge error. `DELETE ?workspace=` → 202 `{deleted:[…], failed:{id:msg}}`. `GET /previews` → `{previews:[{id,workspace,phase,doc_name,until_stage,created_at,expires_at}], next_cursor}`; `?workspace=` default `default`, `*` = all. `GET /previews/{id}?resample=true`.
 - `main.go` env: `DATUPLET_PREVIEW_MAX_RUNNING_PER_WORKSPACE`, `DATUPLET_PREVIEW_MAX_RUNNING_PER_PROJECT`, `DATUPLET_PREVIEW_MAX_PER_PROJECT` (invalid → log + default). Log tailer from `kubernetes.NewForConfig` on the same rest config the K8s client uses. Sampler from the existing `queryCore` (nil → sampler nil → samples skipped with warning).
 
 - [ ] **Step 1: Write failing tests** (`httptest`, fake service seam: define `type previewService interface{ Create…; Get…; List…; Cancel…; Delete…; DeleteWorkspace… }` in the handler file so tests inject a fake; `*preview.Service` satisfies it):
@@ -399,11 +419,11 @@
 
 **Interfaces:**
 - Subcommands exactly as spec §4.8. Flags parsed with the same `flag.FlagSet` + `loadRemoteArgs(remote, tokenFile, project)` pattern as `pipeline.go`; flags before positionals. `--workspace` default from `$DATUPLET_WORKSPACE`, else `default`.
-- `datuplet preview -f doc.yaml` (no subcommand, or `run`): read YAML/JSON (`-` = stdin) → map via `sigs.k8s.io/yaml` or `gopkg.in/yaml.v3` (whichever the CLI already uses) → POST; unless `--no-wait`, poll `GET /previews/{id}` every 2 s until `phase` terminal **and** `outputs` populated (or phase is not Succeeded); on timeout (`--timeout` + 2 min slack) or SIGINT POST cancel. `--json` prints the final GET body verbatim. Human output: one line per stage `stage <name> <phase> <dur>`, per output `<bucket>.<table> rows=<n> at_cap=<b> → <scratch_table>`, the schema as an aligned table, then up to 10 sample rows, then warnings. `--rows`, `--until-stage`, `--timeout` (duration → seconds), `--ttl`.
+- `datuplet preview -f doc.yaml` (no subcommand, or `run`): read YAML/JSON (`-` = stdin) → map via `sigs.k8s.io/yaml` or `gopkg.in/yaml.v3` (whichever the CLI already uses) → POST; unless `--no-wait`, poll `GET /previews/{id}` every 2 s until `phase` is terminal **and** `result_ready` is true. Preview GETs use an HTTP client timeout of at least 2 minutes (the first terminal GET assembles the document and samples each table); a GET that times out is retried on the next poll. On timeout (`--timeout` + 2 min slack) or SIGINT POST cancel. `--json` prints the final GET body verbatim. Human output: one line per stage `stage <name> <phase> <dur>`, per output `<bucket>.<table> rows=<n> at_cap=<b> → <scratch_table>`, the schema as an aligned table, then up to 10 sample rows, then warnings. `--rows`, `--until-stage`, `--timeout` (duration → seconds), `--ttl`.
 - Exit codes per Global Constraints; validation 400 prints findings (same renderer as `pipeline validate`) and exits 1; 409 prints the counts and exits 1.
 
 - [ ] **Step 1: Write failing tests** with an `httptest` fake API (pattern from `trigger_test.go`):
-  - `TestPreviewRun_WaitsAndPrintsJSON`: POST 202 then GET Running then GET Succeeded with outputs → stdout is the last body, exit 0.
+  - `TestPreviewRun_WaitsAndPrintsJSON`: POST 202 then GET Running then GET Succeeded `result_ready:false` then GET Succeeded `result_ready:true` → stdout is the last body, exit 0, exactly 3 GETs.
   - `TestPreviewRun_FailedUserExit1`, `TestPreviewRun_FailedApplicationExit20`, `TestPreviewRun_ValidationExit1` (findings printed).
   - `TestPreviewRun_WorkspaceFromEnv`: `DATUPLET_WORKSPACE=w1` → POST body `workspace "w1"`.
   - `TestPreviewDeleteWorkspace_CallsBulkRoute`.
@@ -424,11 +444,11 @@
 
 ### Task 12: e2e scenario + live verification on OrbStack
 
-**Files:** Create `tests/e2e/scenarios_preview_test.go` (follow `scenarios_agent_loop_test.go` + `framework/agent_loop.go` for invoking the CLI and querying).
+**Files:** Create `tests/e2e/scenarios_preview_test.go` (follow `scenarios_agent_loop_test.go` + `framework/agent_loop.go` for invoking the CLI and querying) and `tests/e2e/pipelines/k8s/preview-etl.yaml` — an envelope-free two-stage doc modelled on the existing k8s fixtures (they use the in-cluster fixture `http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts` and `{{.RunPrefix}}-…` buckets; `pipelines_doc_guard_test.go` parses every fixture, so keep it valid): stage `extract` http-json-extractor → `{{.RunPrefix}}-raw` table `data`; stage `transform` sql-transform → `{{.RunPrefix}}-etl` table `user_summary` (`SELECT "userId", count(*) AS post_count FROM data GROUP BY 1`). Note that the scratch bucket for `{{.RunPrefix}}-raw` is `pv-<id8>-{{.RunPrefix}}-raw` — keep RunPrefix short enough that this stays ≤63 chars or the test must expect the truncated form via the result document's `scratch_table`.
 
-**Scenario `TestPreview_AgentLoop`** (skips unless `E2E_K8S=1`), workspace `e2e-a`, using `examples/pipelines/etl-duckdb.yaml` with `--rows 50`:
-- result `phase Succeeded`; output `raw.data` has `rows 50`, `at_cap true`, non-empty `schema`, `columns_hint`, and `sample.rows` non-empty; output `etl.user_summary` present.
-- `datuplet storage tables` does **not** list `raw.data` or `etl.user_summary` (only `pv-…` namespaces).
+**Scenario `TestPreview_AgentLoop`** (skips unless `E2E_K8S=1`), workspace `e2e-a`, using `preview-etl.yaml` with `--rows 50` (the fixture must return ≥ 51 posts for `at_cap`; check `tests/e2e/manifests` and use a smaller `--rows` if it returns fewer):
+- result `phase Succeeded`, `result_ready true`; output with logical `bucket <RunPrefix>-raw` / `table data` has `rows 50`, `at_cap true`, non-empty `schema`, `columns_hint`, and `sample.rows` non-empty; output `<RunPrefix>-etl.user_summary` present.
+- `datuplet storage tables` does **not** list `<RunPrefix>-raw.data` or `<RunPrefix>-etl.user_summary`; it lists the `scratch_table`s from the result.
 - `datuplet query --sql 'select count(*) from "<scratch ns>"."data"'` returns 50.
 - `--until-stage extract` → exactly one stage in `stages`.
 - `datuplet preview list --workspace e2e-b --json` does not contain the `e2e-a` ids.
@@ -438,6 +458,6 @@
 
 - [ ] **Step 1:** Write the scenario; `cd tests/e2e && go vet ./...`.
 - [ ] **Step 2:** `duckdb --version` (must print a version; the e2e assertions shell out to it).
-- [ ] **Step 3:** Full live run against OrbStack: `make e2e-k8s` (builds images, installs into `datuplet-e2e`, runs the suite, tears down). Expected: every scenario PASS including `TestPreview_AgentLoop`; record the wall-clock of one capped single-stage preview from the test log for the PR body.
+- [ ] **Step 3:** Full live run against OrbStack **after the Kubernetes-safety export in Global Constraints** (`kubectl config current-context` must print `orbstack`): `make e2e-k8s` (builds images, installs into `datuplet-e2e`, runs the suite, tears down). Expected: every scenario PASS including `TestPreview_AgentLoop`; record the wall-clock of one capped single-stage preview from the test log for the PR body.
 - [ ] **Step 4:** On failure, debug with `make e2e-k8s-deploy` + `scripts/e2e-port-forward.sh datuplet-e2e` and `-run TestPreview_AgentLoop` (see CLAUDE.md), fix in the owning task's files, re-run.
 - [ ] **Step 5: Commit** `test(e2e): preview mode agent loop`.
