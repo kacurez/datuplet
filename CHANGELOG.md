@@ -22,6 +22,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cannot commit even through an iceberg function that skips the `READ_ONLY`
   attach check.
 
+### Changed
+
+- **Gateway rejects writes to undeclared buckets.** A component that opens a writer for a bucket not in its `outputs` now gets PermissionDenied and the run fails, instead of the gateway creating that table.
+
 ### Removed
 
 - **The `upgrade-e2e` CI lane** (`.github/workflows/upgrade-e2e.yml`,

@@ -169,6 +169,8 @@ time is follow-up work.
 `pkg/datupleticeio`'s `gs://` factory with vended OAuth tokens. There is no GCS
 environment in CI; prove it on GKE before relying on it.
 
+**Gateway rejects writes to undeclared buckets.** A component that opens a writer for a bucket not in its `outputs` now gets PermissionDenied and the run fails, instead of the gateway creating that table.
+
 **Partitioned tables: no spec evolution.** A table the gateway creates gets an
 Iceberg partition spec from the output's `partition_fields`; an existing table
 is always written with its own current spec. Changing `partition_fields` on an
