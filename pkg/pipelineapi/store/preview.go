@@ -295,6 +295,14 @@ func SetPreviewResult(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, res
 	return nil
 }
 
+// OverwritePreviewResult replaces a cached result document.
+func OverwritePreviewResult(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, result []byte) error {
+	if _, err := pool.Exec(ctx, `UPDATE previews SET result = $2 WHERE id = $1`, id, result); err != nil {
+		return fmt.Errorf("overwrite preview result: %w", err)
+	}
+	return nil
+}
+
 func MarkPreviewTupleDeleted(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, at time.Time) error {
 	if _, err := pool.Exec(ctx,
 		`UPDATE previews SET fga_tuple_deleted_at = $2 WHERE id = $1`, id, at); err != nil {

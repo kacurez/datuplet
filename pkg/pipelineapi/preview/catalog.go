@@ -31,8 +31,9 @@ type TableInfo struct {
 
 // Column is one top-level field; Type is the Iceberg type string.
 type Column struct {
-	Name, Type string
-	Nullable   bool
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Nullable bool   `json:"nullable"`
 }
 
 // CatalogFactory opens a Catalog for a lakekeeper project + warehouse.

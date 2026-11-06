@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,7 +74,11 @@ type Deps struct {
 }
 
 // Service creates, cancels and cleans up previews.
-type Service struct{ d Deps }
+type Service struct {
+	d Deps
+	// flight serializes result assembly per preview id.
+	flight singleflight.Group
+}
 
 func New(d Deps) *Service {
 	if d.Now == nil {
