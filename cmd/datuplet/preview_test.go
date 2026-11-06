@@ -265,3 +265,133 @@ func TestPreviewListAndCancel(t *testing.T) {
 		t.Errorf("cancel: err=%v cancelled=%v", err, cancelled)
 	}
 }
+
+func shrinkSlack(t *testing.T) {
+	t.Helper()
+	old := previewTimeoutSlack
+	previewTimeoutSlack = 50 * time.Millisecond
+	t.Cleanup(func() { previewTimeoutSlack = old })
+}
+
+func TestPreviewRun_TimeoutCancelsExit1(t *testing.T) {
+	fastPoll(t)
+	shrinkSlack(t)
+	var cancels int32
+	f := &previewFake{getBodies: []string{`{"id":"p1","phase":"Running","result_ready":false}`}}
+	inner := f.handler(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel") {
+			atomic.AddInt32(&cancels, 1)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+	var err error
+	_ = captureStdout(t, func() {
+		err = runPreview([]string{"-f", writePreviewDoc(t), "--timeout", "10ms", "--json"})
+	})
+	if got := previewExitCodeOf(err); got != 1 {
+		t.Errorf("exit = %d (%v), want 1", got, err)
+	}
+	if atomic.LoadInt32(&cancels) != 1 {
+		t.Errorf("cancel POSTs = %d, want 1", cancels)
+	}
+}
+
+func TestPreviewRun_Retries5xxGet(t *testing.T) {
+	fastPoll(t)
+	var gets int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"p1"}`))
+			return
+		}
+		if atomic.AddInt32(&gets, 1) == 1 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"p1","phase":"Succeeded","result_ready":true}`))
+	}))
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+	var err error
+	_ = captureStdout(t, func() { err = runPreview([]string{"-f", writePreviewDoc(t), "--json"}) })
+	if err != nil {
+		t.Fatalf("runPreview: %v", err)
+	}
+	if got := atomic.LoadInt32(&gets); got != 2 {
+		t.Errorf("GETs = %d, want 2", got)
+	}
+}
+
+func TestPreviewRun_Sustained5xxExit20AndCancels(t *testing.T) {
+	fastPoll(t)
+	shrinkSlack(t)
+	var cancels int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel"):
+			atomic.AddInt32(&cancels, 1)
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"p1"}`))
+		default:
+			http.Error(w, "db down", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+	var err error
+	_ = captureStdout(t, func() {
+		err = runPreview([]string{"-f", writePreviewDoc(t), "--timeout", "10ms", "--json"})
+	})
+	if got := previewExitCodeOf(err); got != 20 {
+		t.Errorf("exit = %d (%v), want 20", got, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "db down") {
+		t.Errorf("error should include last failure: %v", err)
+	}
+	if atomic.LoadInt32(&cancels) != 1 {
+		t.Errorf("cancel POSTs = %d, want 1", cancels)
+	}
+}
+
+func TestPreviewRun_StdinPreservesNestedInt(t *testing.T) {
+	fastPoll(t)
+	f := &previewFake{getBodies: []string{`{"id":"p1","phase":"Succeeded","result_ready":true}`}}
+	srv := httptest.NewServer(f.handler(t))
+	defer srv.Close()
+	setHeadlessEnv(t, srv.URL)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString("name: demo\nstages:\n- name: s\n  components:\n  - name: g\n    config:\n      limit: {rowsCount: 7}\n")
+	w.Close()
+	orig := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = orig }()
+
+	_ = captureStdout(t, func() { _ = runPreview([]string{"-f", "-", "--json"}) })
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, _ := json.Marshal(f.postBody["doc"])
+	if !strings.Contains(string(b), `"rowsCount":7`) {
+		t.Errorf("doc = %s, want rowsCount as number 7", b)
+	}
+}
+
+func TestPreviewRun_HelpExit0(t *testing.T) {
+	var err error
+	out := captureStdout(t, func() { err = runPreview([]string{"run", "--help"}) })
+	if err != nil || !strings.Contains(out, "run flags") {
+		t.Errorf("err=%v out=%q", err, out)
+	}
+	out = captureStdout(t, func() { err = runPreview([]string{"get", "-h"}) })
+	if err != nil || !strings.Contains(out, "run flags") {
+		t.Errorf("get -h: err=%v out=%q", err, out)
+	}
+}

@@ -30,7 +30,7 @@ var (
 	previewPollInterval = 2 * time.Second
 )
 
-const previewTimeoutSlack = 2 * time.Minute
+var previewTimeoutSlack = 2 * time.Minute
 
 const (
 	exitPreviewUser     = 1
@@ -120,6 +120,15 @@ exit codes: 0 Succeeded; 1 FailedUser/Cancelled/Expired/timed out/validation/409
 
 // runPreview dispatches `datuplet preview ...`.
 func runPreview(args []string) error {
+	err := runPreviewDispatch(args)
+	if errors.Is(err, errPreviewHelp) {
+		fmt.Print(previewHelpText())
+		return nil
+	}
+	return err
+}
+
+func runPreviewDispatch(args []string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		if len(args) > 0 && (args[0] == "-h" || args[0] == "--help" || args[0] == "-help") {
 			fmt.Print(previewHelpText())
@@ -154,6 +163,15 @@ func (c *previewCommon) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.remote, "remote", "", "pipeline-api URL")
 	fs.StringVar(&c.tokenFile, "token-file", "", "override default ~/.datuplet/token path")
 	fs.StringVar(&c.project, "project", "", "project to operate in")
+}
+
+var errPreviewHelp = errors.New("preview help requested")
+
+func previewParseErr(err error) error {
+	if errors.Is(err, flag.ErrHelp) {
+		return errPreviewHelp
+	}
+	return err
 }
 
 func newPreviewFlagSet(name string) *flag.FlagSet {
@@ -248,7 +266,7 @@ func runPreviewRun(args []string) error {
 	fs.BoolVar(&noWait, "no-wait", false, "return after creating")
 	fs.BoolVar(&asJSON, "json", false, "print the result document verbatim")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return previewParseErr(err)
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected arguments %q (flags go before positionals)", fs.Args())
@@ -364,6 +382,10 @@ func runPreviewRun(args []string) error {
 			if cerr := cancelPreview(cctx, base, created.ID, resolved.APIToken); cerr != nil {
 				fmt.Fprintf(os.Stderr, "WARN: cancel POST failed for preview %s: %v (preview may still be running)\n", created.ID, cerr)
 			}
+			var last *exitCodeErr
+			if errors.As(pollErr, &last) {
+				return &exitCodeErr{code: exitPreviewPlatform, err: fmt.Errorf("preview %s: polling kept failing until the deadline (cancel requested): %w", created.ID, last)}
+			}
 			return &exitCodeErr{code: exitPreviewUser, err: fmt.Errorf("preview %s timed out or was interrupted; cancel requested", created.ID)}
 		}
 		return pollErr
@@ -413,6 +435,9 @@ func pollPreview(ctx context.Context, base, id, token string) (*previewResult, [
 		case <-t.C:
 			r, body, err := getPreview(ctx, base, id, token, "")
 			if err != nil {
+				if ctx.Err() != nil {
+					continue
+				}
 				var ece *exitCodeErr
 				if errors.As(err, &ece) && ece.code == exitPreviewUser {
 					return nil, nil, err
@@ -504,7 +529,7 @@ func runPreviewGet(args []string) error {
 	fs.BoolVar(&asJSON, "json", false, "print the result document verbatim")
 	fs.BoolVar(&resample, "resample", false, "retry sampling for tables whose sample is missing")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return previewParseErr(err)
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: datuplet preview get <id> [--json] [--resample]")
@@ -538,7 +563,7 @@ func runPreviewList(args []string) error {
 	fs.StringVar(&workspace, "workspace", workspace, "workspace ('*' for all)")
 	fs.BoolVar(&asJSON, "json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return previewParseErr(err)
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("list takes no positional args; got %q", fs.Args())
@@ -584,7 +609,7 @@ func runPreviewDelete(args []string) error {
 	fs.BoolVar(&all, "all", false, "delete every preview in --workspace")
 	fs.StringVar(&workspace, "workspace", "", "workspace for --all")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return previewParseErr(err)
 	}
 	if all {
 		if fs.NArg() > 0 {
@@ -641,7 +666,7 @@ func runPreviewCancel(args []string) error {
 	var c previewCommon
 	c.register(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return previewParseErr(err)
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: datuplet preview cancel <id>")
