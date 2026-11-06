@@ -36,7 +36,10 @@ import (
 // UpdateRunPhase" (used by the reaper's Expired transition and by mock
 // updaters in tests).
 type RunStatus struct {
-	RunID     uuid.UUID
+	RunID uuid.UUID
+	// PreviewID is non-zero for preview PipelineRuns (label datuplet.io/preview-id);
+	// RunID then carries the same uuid.
+	PreviewID uuid.UUID
 	Namespace string // K8s namespace the PipelineRun lived in; DB updater validates this matches runs.project_id's project namespace before applying
 	// PipelineRunName is the source PipelineRun's metadata.name. The DB
 	// updater recomputes the expected name from the stored pipeline and
@@ -96,8 +99,10 @@ func NewObserver(cfg *rest.Config, u RunStatusUpdater, onDelete func(types.Names
 	o := &Observer{mgr: mgr, updater: u}
 
 	hasRunID := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		_, ok := obj.GetLabels()["datuplet.io/run-id"]
-		return ok
+		l := obj.GetLabels()
+		_, isRun := l["datuplet.io/run-id"]
+		_, isPreview := l["datuplet.io/preview-id"]
+		return isRun || isPreview
 	})
 
 	// controller-runtime v0.20.4: handler.Funcs is an alias for
@@ -205,8 +210,15 @@ func reconcileOne(ctx context.Context, c client.Client, req reconcile.Request, u
 		// phase still visible on the object.
 		return reconcile.Result{}, nil
 	}
-	rid, ok := pr.Labels["datuplet.io/run-id"]
-	if !ok {
+	var previewID uuid.UUID
+	rid, ok := pr.Labels["datuplet.io/preview-id"]
+	if ok {
+		pid, err := uuid.Parse(rid)
+		if err != nil {
+			return reconcile.Result{}, nil
+		}
+		previewID = pid
+	} else if rid, ok = pr.Labels["datuplet.io/run-id"]; !ok {
 		return reconcile.Result{}, nil
 	}
 	parsed, err := uuid.Parse(rid)
@@ -231,6 +243,7 @@ func reconcileOne(ctx context.Context, c client.Client, req reconcile.Request, u
 	}
 	status := RunStatus{
 		RunID:           parsed,
+		PreviewID:       previewID,
 		Namespace:       pr.Namespace,
 		PipelineRunName: pr.Name,
 		Phase:           phase,
