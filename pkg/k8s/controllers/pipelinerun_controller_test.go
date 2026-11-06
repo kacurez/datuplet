@@ -17,6 +17,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	kfake "k8s.io/client-go/kubernetes/fake"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -300,57 +302,86 @@ func TestHandlePending_NoRefNoSpec_FailedUser(t *testing.T) {
 // A Running preview past its deadline is cancelled: pods annotated, the
 // current stage's Jobs deleted, the run FailedUser with a timeout message.
 func TestHandleRunning_PreviewDeadline(t *testing.T) {
-	scheme := newTestScheme(t)
-	pr := inlineSpecRun()
-	started := metav1.NewTime(time.Now().Add(-10 * time.Minute))
-	pr.Status.RunID = testPreviewID
-	jobName := componentJobName(pr, "extract", "c1")
-	pr.Status = datupletv1.PipelineRunStatus{
-		Phase:        datupletv1.PipelineRunPhaseRunning,
-		RunID:        testPreviewID,
-		StartTime:    &started,
-		ResolvedSpec: pr.Spec.PipelineSpec.DeepCopy(),
-		StageStatuses: []datupletv1.StageStatus{{
-			Name:  "extract",
-			Phase: datupletv1.StagePhaseRunning,
-			ComponentStatuses: []datupletv1.ComponentStatus{{
-				Name:    "c1",
-				Phase:   datupletv1.ComponentPhaseRunning,
-				PodName: jobName,
-			}},
-		}},
+	cases := []struct {
+		name          string
+		clientset     kubernetes.Interface
+		wantComponent string
+	}{
+		// The fake clientset serves "fake logs" for every pod log request.
+		{name: "last log captured", clientset: kfake.NewSimpleClientset(), wantComponent: "preview timed out; last log: fake logs"},
+		{name: "no logs available", clientset: nil, wantComponent: "preview timed out"},
 	}
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: "default"}}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name: jobName + "-abcde", Namespace: "default",
-		Labels: map[string]string{"datuplet.io/run-id": testPreviewID},
-	}}
-	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(pr, job, pod).WithStatusSubresource(pr).Build()
-	r := registryReconciler(c, scheme)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newTestScheme(t)
+			pr := inlineSpecRun()
+			started := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+			pr.Status.RunID = testPreviewID
+			jobName := componentJobName(pr, "extract", "c1")
+			pr.Status = datupletv1.PipelineRunStatus{
+				Phase:        datupletv1.PipelineRunPhaseRunning,
+				RunID:        testPreviewID,
+				StartTime:    &started,
+				ResolvedSpec: pr.Spec.PipelineSpec.DeepCopy(),
+				StageStatuses: []datupletv1.StageStatus{{
+					Name:  "extract",
+					Phase: datupletv1.StagePhaseRunning,
+					ComponentStatuses: []datupletv1.ComponentStatus{{
+						Name:    "c1",
+						Phase:   datupletv1.ComponentPhaseRunning,
+						PodName: jobName,
+					}},
+				}},
+			}
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: "default"}}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: jobName + "-abcde", Namespace: "default",
+				Labels: map[string]string{"datuplet.io/run-id": testPreviewID, "job-name": jobName},
+			}}
+			c := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(pr, job, pod).WithStatusSubresource(pr).Build()
+			r := registryReconciler(c, scheme)
+			r.Clientset = tc.clientset
 
-	reconcilePR1(t, r)
+			reconcilePR1(t, r)
 
-	got := getRun(t, c)
-	if got.Status.Phase != datupletv1.PipelineRunPhaseFailedUser {
-		t.Fatalf("phase = %q, want FailedUser", got.Status.Phase)
-	}
-	if !strings.HasPrefix(got.Status.Message, "preview timed out after 60s during stage ") {
-		t.Errorf("message = %q", got.Status.Message)
-	}
-	if got.Status.CompletionTime == nil {
-		t.Error("CompletionTime not set")
-	}
-	err := c.Get(context.Background(), types.NamespacedName{Name: jobName, Namespace: "default"}, &batchv1.Job{})
-	if !errors.IsNotFound(err) {
-		t.Errorf("stage Job still present (err=%v), want deleted", err)
-	}
-	gotPod := &corev1.Pod{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: "default"}, gotPod); err != nil {
-		t.Fatalf("Get pod: %v", err)
-	}
-	if gotPod.Annotations["datuplet.io/cancel"] != "true" {
-		t.Errorf("pod cancel annotation = %q, want true", gotPod.Annotations["datuplet.io/cancel"])
+			got := getRun(t, c)
+			if got.Status.Phase != datupletv1.PipelineRunPhaseFailedUser {
+				t.Fatalf("phase = %q, want FailedUser", got.Status.Phase)
+			}
+			const wantMsg = "preview timed out after 60s during stage extract"
+			if got.Status.Message != wantMsg {
+				t.Errorf("message = %q, want %q", got.Status.Message, wantMsg)
+			}
+			if got.Status.CompletionTime == nil {
+				t.Error("CompletionTime not set")
+			}
+
+			ss := got.Status.StageStatuses[0]
+			if ss.Phase != datupletv1.StagePhaseFailedUser || ss.Message != wantMsg || ss.CompletionTime == nil {
+				t.Errorf("stage status = {phase %q, message %q, completion %v}, want FailedUser/%q/set",
+					ss.Phase, ss.Message, ss.CompletionTime, wantMsg)
+			}
+			cs := ss.ComponentStatuses[0]
+			if cs.Phase != datupletv1.ComponentPhaseFailedUser || cs.CompletionTime == nil {
+				t.Errorf("component status = {phase %q, completion %v}, want FailedUser/set", cs.Phase, cs.CompletionTime)
+			}
+			if cs.Message != tc.wantComponent {
+				t.Errorf("component message = %q, want %q", cs.Message, tc.wantComponent)
+			}
+
+			err := c.Get(context.Background(), types.NamespacedName{Name: jobName, Namespace: "default"}, &batchv1.Job{})
+			if !errors.IsNotFound(err) {
+				t.Errorf("stage Job still present (err=%v), want deleted", err)
+			}
+			gotPod := &corev1.Pod{}
+			if err := c.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: "default"}, gotPod); err != nil {
+				t.Fatalf("Get pod: %v", err)
+			}
+			if gotPod.Annotations["datuplet.io/cancel"] != "true" {
+				t.Errorf("pod cancel annotation = %q, want true", gotPod.Annotations["datuplet.io/cancel"])
+			}
+		})
 	}
 }
 

@@ -73,10 +73,12 @@ type PreviewSpec struct {
 	ID string `json:"id"`
 
 	// RowLimit caps the rows the gateway accepts per output table.
+	// +kubebuilder:validation:Minimum=1
 	RowLimit int64 `json:"rowLimit"`
 
 	// TimeoutSeconds is the run's wall-clock deadline, measured from
 	// status.startTime.
+	// +kubebuilder:validation:Minimum=1
 	TimeoutSeconds int64 `json:"timeoutSeconds"`
 }
 
