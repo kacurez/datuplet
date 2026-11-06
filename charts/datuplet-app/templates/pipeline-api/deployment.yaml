@@ -184,6 +184,13 @@ spec:
               value: {{ .Values.pipelinePolicy.gateway.maxBufferSize | int64 | quote }}
             - name: PIPELINE_POLICY_GATEWAY_MAX_TARGET_FILE_SIZE
               value: {{ .Values.pipelinePolicy.gateway.maxTargetFileSize | int64 | quote }}
+            # Pipeline preview caps; past one, preview create is a 409.
+            - name: DATUPLET_PREVIEW_MAX_RUNNING_PER_WORKSPACE
+              value: {{ .Values.previews.maxRunningPerWorkspace | int64 | quote }}
+            - name: DATUPLET_PREVIEW_MAX_RUNNING_PER_PROJECT
+              value: {{ .Values.previews.maxRunningPerProject | int64 | quote }}
+            - name: DATUPLET_PREVIEW_MAX_PER_PROJECT
+              value: {{ .Values.previews.maxPerProject | int64 | quote }}
             # Fine-grained authz via OpenFGA.
             - name: OPENFGA_URL
               value: {{ include "datuplet-app.openfgaHttpUrl" . | quote }}

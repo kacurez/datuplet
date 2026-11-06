@@ -15,6 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/datuplet/datuplet/pkg/pipeline/validate"
@@ -24,6 +26,7 @@ import (
 	pipelineapidb "github.com/datuplet/datuplet/pkg/pipelineapi/db"
 	apihttp "github.com/datuplet/datuplet/pkg/pipelineapi/http"
 	pkg8s "github.com/datuplet/datuplet/pkg/pipelineapi/k8s"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/preview"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/registry"
@@ -123,12 +126,18 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	}
 
 	var k8sClient client.Client
+	// restCfg also feeds the clientset the preview log tailer uses.
+	var restCfg *rest.Config
 	if cfg.InCluster || cfg.KubeconfigPath != "" {
 		var err error
-		k8sClient, err = pkg8s.NewClient(pkg8s.ClientOpts{
+		restCfg, err = pkg8s.NewRESTConfig(pkg8s.ClientOpts{
 			InCluster:      cfg.InCluster,
 			KubeconfigPath: cfg.KubeconfigPath,
 		})
+		if err != nil {
+			return fmt.Errorf("k8s client: %w", err)
+		}
+		k8sClient, err = client.New(restCfg, client.Options{Scheme: pkg8s.Scheme()})
 		if err != nil {
 			return fmt.Errorf("k8s client: %w", err)
 		}
@@ -197,6 +206,10 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// that calls this for trigger + cancel. Only constructed when we
 	// have a k8s client, signer, and DB pool.
 	var backend runbackend.Backend
+	// triggerWarehouseResolver and projectNS are shared with the preview
+	// service (below), which starts PipelineRuns the same way.
+	var triggerWarehouseResolver func(ctx context.Context, lakekeeperProjectID string) (string, error)
+	var projectNS runbackend.ProjectNS
 	if k8sClient != nil && signer != nil && pool != nil {
 		// Warehouse resolver for the trigger path. Uses the triggering user's
 		// impersonation token (same one the storage UI uses) — the handler
@@ -204,7 +217,6 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		// grants lakekeeper's `can_list_warehouses`. nil when
 		// DATUPLET_LAKEKEEPER_URL is unset — K8sBackend soft-degrades to an
 		// empty warehouse claim in that case.
-		var triggerWarehouseResolver func(ctx context.Context, lakekeeperProjectID string) (string, error)
 		if lakekeeperURL != "" {
 			triggerWarehouseResolver = storage.NewLakekeeperWarehouseResolver(storage.WarehouseResolverConfig{
 				LakekeeperURL: lakekeeperURL,
@@ -214,10 +226,11 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 				HTTPClient: warehouseHTTPClient,
 			})
 		}
+		projectNS = runbackend.NewStoreProjectNS(pool, k8sClient)
 		backend = runbackend.NewK8sBackend(runbackend.K8sOpts{
 			Client:            k8sClient,
 			RunInserter:       runbackend.NewStoreInserter(pool),
-			ProjectNS:         runbackend.NewStoreProjectNS(pool, k8sClient),
+			ProjectNS:         projectNS,
 			Minter:            runbackend.NewTokenMinter(signer),
 			Audience:          cfg.Audience,
 			DB:                pool,
@@ -411,6 +424,45 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	fmt.Printf("  Pipeline policy: gateway bounds chunkSize=%d bufferSize=%d targetFileSize=%d (0 = no bound)\n",
 		pol.Gateway.MaxChunkSize, pol.Gateway.MaxBufferSize, pol.Gateway.MaxTargetFileSize)
 
+	// Pipeline previews: wired only alongside the run backend (K8s + DB +
+	// signer) and the lakekeeper-backed storage service, whose impersonation
+	// minter reads preview outputs as the requesting user. nil leaves the
+	// /previews routes unregistered.
+	var previewSvc *preview.Service
+	if backend != nil && lakekeeperURL != "" && storageSvc != nil && storageSvc.Minter != nil {
+		cs, err := kubernetes.NewForConfig(restCfg)
+		if err != nil {
+			return fmt.Errorf("preview log tailer: %w", err)
+		}
+		minter := storageSvc.Minter
+		previewSvc = preview.New(preview.Deps{
+			DB:                pool,
+			K8s:               k8sClient,
+			Authz:             authzr,
+			Signer:            signer,
+			ProjectNS:         projectNS,
+			WarehouseResolver: triggerWarehouseResolver,
+			Catalogs:          preview.NewRESTCatalogFactory(lakekeeperURL),
+			UserCatalogToken: func(ctx context.Context) (string, error) {
+				tok, err := minter(ctx)
+				if err != nil {
+					return "", err
+				}
+				return tok.Reveal(), nil
+			},
+			Sampler:  preview.NewQuerySampler(queryCore),
+			Logs:     preview.NewClientsetLogTailer(cs),
+			Caps:     previewCapsFromEnv(),
+			Audience: cfg.Audience,
+		})
+		if queryCore == nil {
+			log.Printf("previews: query service not wired — preview results carry no row samples")
+		}
+		fmt.Println("  Previews: enabled")
+	} else {
+		log.Printf("previews not wired: need K8s, DB, signer and DATUPLET_LAKEKEEPER_URL (preview routes return 404)")
+	}
+
 	srv := apihttp.NewServer(pool).
 		WithCookieSecure(cfg.CookieSecure).
 		WithSigner(signer).
@@ -418,6 +470,7 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 		WithPublicURL(cfg.PublicURL).
 		WithStaticDir(cfg.UIDir).
 		WithRunBackend(backend).
+		WithPreviews(previewSvc).
 		WithStorage(storageSvc).
 		// projGate is nil when lakekeeper wiring didn't complete (e.g. no
 		// signer) — resolveProject soft-degrades to 503 in that case.
@@ -535,9 +588,16 @@ func runServeCluster(ctx context.Context, cfg pipelineapi.Config) error {
 	// informer; pipeline-observer mirrors PipelineRun status into Postgres
 	// independently. Reaper runs as its own CronJob (`pipeline-api reap-once`).
 
+	sweepCtx, stopSweep := context.WithCancel(ctx)
+	defer stopSweep()
+	if previewSvc != nil {
+		go previewSvc.RunSweeper(sweepCtx, 60*time.Second)
+	}
+
 	go func() {
 		<-sigCh
 		fmt.Println("\nReceived shutdown signal...")
+		stopSweep()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		_ = httpSrv.Shutdown(shutdownCtx)
@@ -583,6 +643,28 @@ func envIntOr(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// previewCapsFromEnv reads the preview caps; a malformed or negative value is
+// logged and replaced by its default. 0 disables a cap.
+func previewCapsFromEnv() store.PreviewCaps {
+	capOr := func(key string, def int) int {
+		v := os.Getenv(key)
+		if v == "" {
+			return def
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			log.Printf("previews: invalid %s=%q, using default %d", key, v, def)
+			return def
+		}
+		return n
+	}
+	return store.PreviewCaps{
+		RunningPerWorkspace: capOr("DATUPLET_PREVIEW_MAX_RUNNING_PER_WORKSPACE", 2),
+		RunningPerProject:   capOr("DATUPLET_PREVIEW_MAX_RUNNING_PER_PROJECT", 8),
+		MaxPerProject:       capOr("DATUPLET_PREVIEW_MAX_PER_PROJECT", 50),
+	}
 }
 
 // envInt64Or parses the env var as a base-10 int64, returning def if absent or

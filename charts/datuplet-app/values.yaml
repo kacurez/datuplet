@@ -125,6 +125,13 @@ pipelinePolicy:
     maxBufferSize: 536870912      # 512Mi
     maxTargetFileSize: 1073741824 # 1Gi
 
+# Pipeline preview caps (POST /api/v1/projects/{pid}/previews). Creating a
+# preview past a cap returns 409 too_many_previews. 0 disables a cap.
+previews:
+  maxRunningPerWorkspace: 2   # Pending/Running previews per workspace
+  maxRunningPerProject: 8     # Pending/Running previews per project
+  maxPerProject: 50           # previews not yet cleaned up, per project
+
 pipelineOperator:
   replicas: 1
   resources:
