@@ -100,6 +100,41 @@ points at the exact offending field (e.g. `stages[0].components[0].config.url`)
 don't block a run but are worth reading (e.g. a missing secret key). Treat a
 transport/HTTP failure (exit ≥ 2) as an environment problem, not a bad pipeline.
 
+### 3b. Preview — prove it works before you save it
+
+Validation proves the doc is well-formed; a preview runs it for real with every
+output redirected to throwaway `pv-<id8>-<bucket>` scratch tables, so no real
+table is touched and nothing is saved. Give your task its own workspace so
+parallel agents don't collide on caps or cleanup:
+
+```bash
+export DATUPLET_WORKSPACE=<task-slug>
+datuplet preview -f pipeline.yaml --json
+```
+
+Read the result document: `phase`, per-stage `message` and (for failed
+components) `log_tail` / `gateway_log_tail` tell you what broke; `outputs[]`
+gives `rows`, `at_cap` (true = truncated by `--rows`, default 1000, so counts
+are partial), `schema` and a `sample`. Copy `outputs[].columns_hint` into
+`outputs.tables[].columns` to pin the output types. Iterate stage by stage with
+`--until-stage <stage>`. Dig deeper with SQL on the scratch table:
+
+```bash
+datuplet query --sql 'SELECT count(*) FROM "<scratch namespace>"."<table>"'   # from outputs[].scratch_table
+```
+
+Exit codes: `0` Succeeded, `1` your doc/data (FailedUser, Cancelled, Expired,
+timed out, validation, over the preview cap), `20` platform. Caveats:
+`APPEND` vs `FULL_LOAD` is not observable; inputs from real tables are read in
+full (not capped); an input reading a bucket produced by an earlier stage reads
+the scratch copy. When done, tear down:
+
+```bash
+datuplet preview delete --workspace <task-slug> --all
+```
+
+Fix the doc and re-preview until it is clean, then save it.
+
 ### 4. Save it
 
 ```bash

@@ -21,6 +21,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allows only GET/HEAD and refuses every other catalog request, so user SQL
   cannot commit even through an iceberg function that skips the `READ_ONLY`
   attach check.
+- **Pipeline preview mode.** `datuplet preview -f pipeline.yaml` runs a
+  PipelineDoc for real with every output redirected to per-preview scratch
+  namespaces (`pv-<id8>-<bucket>`), so nothing real is written, and returns a
+  result document with stage status, failed-component log tails, per-table
+  rows, schema, a row sample and a `columns_hint` ready to paste into
+  `columns:`. Supports `--until-stage`, `--rows`, workspaces
+  (`$DATUPLET_WORKSPACE`) that isolate agents, and `preview list|get|cancel|delete`.
+  Backed by `POST/GET/DELETE /api/v1/projects/{pid}/previews`, with caps set
+  by the `previews.*` chart values. See `docs/agent-quickstart.md` Step 3b.
 
 ### Changed
 
