@@ -55,6 +55,29 @@ type PipelineRunSpec struct {
 	// is mounted and lakekeeper rejects every catalog/STS call.
 	// +optional
 	RunTokenRef *RunTokenRef `json:"runTokenRef,omitempty"`
+
+	// PipelineSpec is an inline pipeline spec. When set, PipelineRef is
+	// ignored and no Pipeline resource is read.
+	// +optional
+	PipelineSpec *PipelineSpec `json:"pipelineSpec,omitempty"`
+
+	// Preview marks the run as a preview: its gateway caps rows per table,
+	// its pods are never retried, and it is cancelled at its deadline.
+	// +optional
+	Preview *PreviewSpec `json:"preview,omitempty"`
+}
+
+// PreviewSpec bounds a preview run.
+type PreviewSpec struct {
+	// ID is the preview identifier (UUID) passed to the gateway.
+	ID string `json:"id"`
+
+	// RowLimit caps the rows the gateway accepts per output table.
+	RowLimit int64 `json:"rowLimit"`
+
+	// TimeoutSeconds is the run's wall-clock deadline, measured from
+	// status.startTime.
+	TimeoutSeconds int64 `json:"timeoutSeconds"`
 }
 
 // RunTokenRef is a reference to a Kubernetes Secret holding the run-scoped JWT.
@@ -348,6 +371,16 @@ func (in *PipelineRunSpec) DeepCopyInto(out *PipelineRunSpec) {
 	if in.RunTokenRef != nil {
 		in, out := &in.RunTokenRef, &out.RunTokenRef
 		*out = new(RunTokenRef)
+		**out = **in
+	}
+	if in.PipelineSpec != nil {
+		in, out := &in.PipelineSpec, &out.PipelineSpec
+		*out = new(PipelineSpec)
+		(*in).DeepCopyInto(*out)
+	}
+	if in.Preview != nil {
+		in, out := &in.Preview, &out.Preview
+		*out = new(PreviewSpec)
 		**out = **in
 	}
 }
