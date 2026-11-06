@@ -1,0 +1,34 @@
+name: "{{.RunPrefix}}-preview-etl"
+stages:
+  - name: extract
+    components:
+      - name: posts-extractor
+        component: http-json-extractor
+        version: dev
+        config:
+          url: "http://e2e-http-fixture.datuplet-e2e.svc.cluster.local/posts"
+          table_name: data
+        outputs:
+          tables:
+            - name: data
+              bucket: "{{.RunPrefix}}-raw"
+              writeMode: FULL_LOAD
+
+  - name: transform
+    components:
+      - name: summarize
+        component: sql-transform
+        version: dev
+        inputs:
+          tables:
+            - bucket: "{{.RunPrefix}}-raw"
+              table: data
+        outputs:
+          tables:
+            - name: user_summary
+              bucket: "{{.RunPrefix}}-etl"
+              writeMode: FULL_LOAD
+        config:
+          sql: |
+            CREATE TABLE user_summary AS
+            SELECT "userId", count(*) AS post_count FROM data GROUP BY 1;
