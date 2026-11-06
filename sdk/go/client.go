@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -23,6 +24,10 @@ import (
 // maxCallRecvMsgSize is the gRPC receive cap used for both production and
 // test clients. Sized so a 32-MiB IPC-encoded row group fits with headroom.
 const maxCallRecvMsgSize = 64 << 20
+
+// gatewayBootWait bounds how long New waits for the gateway sidecar to start
+// listening: Kubernetes may start the component container first.
+const gatewayBootWait = 60 * time.Second
 
 // Client connects to the Data Gateway and provides access to inputs/outputs.
 type Client struct {
@@ -111,8 +116,9 @@ func New(ctx context.Context) (*Client, error) {
 
 	client := pb.NewDataGatewayClient(conn)
 
-	// Fetch config immediately
-	config, err := client.GetConfig(ctx, &pb.GetConfigRequest{})
+	cfgCtx, cancel := context.WithTimeout(ctx, gatewayBootWait)
+	defer cancel()
+	config, err := client.GetConfig(cfgCtx, &pb.GetConfigRequest{}, grpc.WaitForReady(true))
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to get config: %w", err)
