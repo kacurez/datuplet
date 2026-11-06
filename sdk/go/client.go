@@ -43,6 +43,11 @@ type Config struct {
 	OutputTables  []OutputTableRef // Specific output tables (declared in CRD)
 	Raw           json.RawMessage // Component-specific configuration
 
+	// PreviewRowLimit is the per-output-table row cap of a preview run, 0
+	// outside previews. Producers that know it up front can stop early
+	// instead of waiting for the gateway's Writer.LimitReached signal.
+	PreviewRowLimit int64
+
 	// Legacy fields (deprecated)
 	Inputs  []string
 	Outputs []string
@@ -177,6 +182,8 @@ func (c *Client) Config() Config {
 		InputTables:   inputTables,
 		OutputTables:  outputTables,
 		Raw:           c.config.Config,
+
+		PreviewRowLimit: c.config.PreviewRowLimit,
 		// Legacy fields
 		Inputs:  inputs,
 		Outputs: outputs,
@@ -303,6 +310,7 @@ type Writer struct {
 	inputFormat    pb.DataFormat
 	inferredSchema *pb.Schema
 	totalRows      int64
+	limitReached   bool // sticky: some response said the table's preview cap is full
 
 	// Write-call batching state. See WithBatchSize for semantics.
 	// `batchThreshold == 0` means batching is disabled (legacy behavior:
@@ -452,7 +460,15 @@ type WriteResult struct {
 	RowsAccepted   int64
 	BufferSize     int64
 	InferredSchema *pb.Schema
+	// LimitReached is true when the gateway reports the table's preview row
+	// cap is full; later chunks are dropped (rows_accepted 0).
+	LimitReached bool
 }
+
+// LimitReached reports whether any response so far said this table's preview
+// row cap is full. Sticky. It is an accessor, not an error, so Arrow sinks
+// don't treat it as a failed write; a producer should stop and exit 0.
+func (w *Writer) LimitReached() bool { return w.limitReached }
 
 // WriteChunk writes a chunk of data immediately and returns the gateway's
 // per-call result (rows accepted, buffer size, inferred schema).
@@ -511,12 +527,16 @@ func (w *Writer) writeChunkHTTP(ctx context.Context, data []byte) (*WriteResult,
 		RowsAccepted    int64      `json:"rows_accepted"`
 		BufferSizeBytes int64      `json:"buffer_size_bytes"`
 		InferredSchema  *pb.Schema `json:"inferred_schema,omitempty"`
+		LimitReached    bool       `json:"limit_reached,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&httpResp); err != nil {
 		return nil, fmt.Errorf("failed to parse HTTP response: %w", err)
 	}
 
 	w.totalRows += httpResp.RowsAccepted
+	if httpResp.LimitReached {
+		w.limitReached = true
+	}
 
 	// Update inferred schema if provided
 	if httpResp.InferredSchema != nil && w.inferredSchema == nil {
@@ -527,6 +547,7 @@ func (w *Writer) writeChunkHTTP(ctx context.Context, data []byte) (*WriteResult,
 		RowsAccepted:   httpResp.RowsAccepted,
 		BufferSize:     httpResp.BufferSizeBytes,
 		InferredSchema: httpResp.InferredSchema,
+		LimitReached:   httpResp.LimitReached,
 	}, nil
 }
 
@@ -541,6 +562,9 @@ func (w *Writer) writeChunkGRPC(ctx context.Context, data []byte) (*WriteResult,
 	}
 
 	w.totalRows += resp.RowsAccepted
+	if resp.LimitReached {
+		w.limitReached = true
+	}
 
 	// Update inferred schema if provided
 	if resp.InferredSchema != nil && w.inferredSchema == nil {
@@ -551,6 +575,7 @@ func (w *Writer) writeChunkGRPC(ctx context.Context, data []byte) (*WriteResult,
 		RowsAccepted:   resp.RowsAccepted,
 		BufferSize:     resp.BufferSizeBytes,
 		InferredSchema: resp.InferredSchema,
+		LimitReached:   resp.LimitReached,
 	}, nil
 }
 

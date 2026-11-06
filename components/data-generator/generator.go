@@ -101,6 +101,29 @@ func generateValue(rng *rand.Rand, colType string) any {
 	}
 }
 
+// effectiveRowsCount combines limit.rowsCount (0 = unset) with the preview row
+// cap (0 = not a preview): the smaller non-zero value, 0 if both are unset. A
+// sizeInBytes/timeoutInSeconds-only limit therefore also stops at the cap.
+func effectiveRowsCount(limit *Limit, previewRowLimit int64) int {
+	rows := 0
+	if limit != nil {
+		rows = limit.RowsCount
+	}
+	if previewRowLimit > 0 && (rows == 0 || int64(rows) > previewRowLimit) {
+		return int(previewRowLimit)
+	}
+	return rows
+}
+
+// previewBatchRows returns the sink batch size to use under a preview cap, or
+// 0 to keep dgarrow.DefaultBatchRows.
+func previewBatchRows(previewRowLimit int64) int {
+	if previewRowLimit > 0 && previewRowLimit < int64(dgarrow.DefaultBatchRows) {
+		return int(previewRowLimit)
+	}
+	return 0
+}
+
 // shouldStop returns true when any active limit has been reached.
 // A limit field of 0 means "unbounded".
 func shouldStop(limit *Limit, rowsWritten int, bytesWritten int, startTime time.Time) bool {
@@ -197,13 +220,29 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 	sortStrings(colNames)
 	arrowSchema := buildArrowSchema(colNames, r.Schema)
 
+	// In a preview run the gateway caps rows per table; cap ourselves up front
+	// (the gateway signal alone would arrive a whole batch too late).
+	limit := r.Limit
+	if rows := effectiveRowsCount(r.Limit, cfg.PreviewRowLimit); rows > 0 {
+		l := Limit{RowsCount: rows}
+		if r.Limit != nil {
+			l = *r.Limit
+			l.RowsCount = rows
+		}
+		limit = &l
+	}
+	batchRows := dgarrow.DefaultBatchRows
+	if b := previewBatchRows(cfg.PreviewRowLimit); b > 0 {
+		batchRows = b
+	}
+
 	// Open writer in Arrow IPC mode lazily, on the sink's first flush. We
 	// don't pass WithSchema — every IPC chunk we send carries its own
 	// schema header, and the gateway uses that to load-or-create the
 	// iceberg table on the first chunk.
 	sink := dgarrow.NewSink(ctx, func() (dgarrow.ChunkWriter, error) {
 		return client.OpenWriter(ctx, t.Name, sdk.WithFormat(pb.DataFormat_FORMAT_ARROW_IPC))
-	}, arrowSchema)
+	}, arrowSchema, dgarrow.WithBatchRows(batchRows))
 	// Every return path below must close any writer the sink opened.
 	// Finish is idempotent, so calling it again after the explicit call in
 	// the normal-completion path (or after finishRandomQuietly, below) is a
@@ -232,7 +271,7 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 
 		// Check stop AFTER err check (so limit=0 still emits 0 rows
 		// AND a userErrorMessage with rowsCount=N fires within [0,N-1]).
-		if shouldStop(r.Limit, rowsWritten, int(sink.BytesShipped()), startTime) {
+		if shouldStop(limit, rowsWritten, int(sink.BytesShipped()), startTime) {
 			break
 		}
 
@@ -251,7 +290,7 @@ func runRandom(ctx context.Context, client *sdk.Client, cfg *sdk.Config, t *Tabl
 			// flush's rows were still included in the returned count).
 			return rowsWritten - pendingRows, fmt.Errorf("table %q: %w", t.Name, err)
 		}
-		if pendingRows == dgarrow.DefaultBatchRows {
+		if pendingRows == batchRows {
 			// RowDone crossed the batch boundary and its flush succeeded.
 			pendingRows = 0
 		}

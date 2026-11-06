@@ -130,7 +130,7 @@ func newExtractorSink(ctx context.Context, client *sdk.Client, outputTable strin
 		for i, c := range mapping {
 			typedCols[i] = dgarrow.TypedColumn{Name: c.Name, Type: c.Type}
 		}
-		sink, err := dgarrow.NewInferringSink(ctx, open, dgarrow.WithTypedColumns(typedCols))
+		sink, err := dgarrow.NewInferringSink(ctx, open, dgarrow.WithTypedColumns(typedCols), dgarrow.WithBatchRows(sinkBatchRows(sdkCfg.PreviewRowLimit)))
 		if err != nil {
 			return nil, fmt.Errorf("output table %q: declared columns: %w", outputTable, err)
 		}
@@ -140,7 +140,7 @@ func newExtractorSink(ctx context.Context, client *sdk.Client, outputTable strin
 		return sink, nil
 	}
 
-	var opts []dgarrow.SinkOption
+	opts := []dgarrow.SinkOption{dgarrow.WithBatchRows(sinkBatchRows(sdkCfg.PreviewRowLimit))}
 	if len(fields) > 0 {
 		names, extract := fieldColumns(fields)
 		opts = append(opts, dgarrow.WithColumns(names, extract))
