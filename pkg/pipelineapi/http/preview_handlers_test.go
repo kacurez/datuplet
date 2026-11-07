@@ -57,6 +57,7 @@ type fakePreviews struct {
 	createResp *preview.CreateResponse
 	createErr  error
 	listWS     string
+	listLimit  int
 	deleteWS   string
 	wsDeleted  []uuid.UUID
 	wsFailed   map[uuid.UUID]string
@@ -71,8 +72,8 @@ func (f *fakePreviews) Get(context.Context, uuid.UUID, uuid.UUID, bool) (*previe
 	return nil, store.ErrPreviewNotFound
 }
 
-func (f *fakePreviews) List(_ context.Context, _ uuid.UUID, ws string, _ int, _ string) ([]store.Preview, string, error) {
-	f.listWS = ws
+func (f *fakePreviews) List(_ context.Context, _ uuid.UUID, ws string, limit int, _ string) ([]store.Preview, string, error) {
+	f.listWS, f.listLimit = ws, limit
 	return nil, "", nil
 }
 
@@ -277,6 +278,28 @@ func TestListPreviews_ScopedToWorkspace(t *testing.T) {
 		}
 		if p, ok := body["previews"].([]any); !ok || len(p) != 0 {
 			t.Errorf("%q: previews = %v, want []", tc.query, body["previews"])
+		}
+	}
+}
+
+func TestListPreviews_NonPositiveLimitUsesDefault(t *testing.T) {
+	pid := uuid.New()
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{{"", 0}, {"?limit=0", 0}, {"?limit=-3", 0}, {"?limit=x", 0}, {"?limit=5", 5}} {
+		fake := &fakePreviews{}
+		ts := newPreviewServer(t, fake, "data_admin", false)
+		resp, err := http.Get(ts.URL + "/api/v1/projects/" + pid.String() + "/previews" + tc.query)
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%q: status = %d, want 200", tc.query, resp.StatusCode)
+		}
+		if fake.listLimit != tc.want {
+			t.Errorf("%q: limit passed to List = %d, want %d (0 = store default)", tc.query, fake.listLimit, tc.want)
 		}
 	}
 }

@@ -194,8 +194,8 @@ func (s *Server) handleListPreviews(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := 0
 	if v := q.Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			limit = max(n, 1)
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
 		}
 	}
 	rows, next, err := s.previews.List(r.Context(), projectID, ws, limit, q.Get("cursor"))
