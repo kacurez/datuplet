@@ -163,6 +163,12 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 	gatewayEnv := r.buildGatewaySidecarEnv(pr)
 
 	ttl := JobTTLSecondsAfterFinished
+	// A preview pod is never retried: a retry would re-run against rows the
+	// first attempt already wrote under the preview row cap.
+	backoffLimit := int32(1)
+	if pr.Spec.Preview != nil {
+		backoffLimit = 0
+	}
 	restartPolicyAlways := corev1.ContainerRestartPolicyAlways
 
 	gatewayImage := r.GatewayImage
@@ -182,7 +188,7 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 			},
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:            int32Ptr(1),
+			BackoffLimit:            int32Ptr(backoffLimit),
 			TTLSecondsAfterFinished: &ttl,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -522,6 +528,9 @@ func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun
 	configMap := make(map[string]any)
 	configMap["mode"] = "minio"
 	configMap["run_id"] = pr.Status.RunID
+	if pr.Spec.Preview != nil {
+		configMap["preview"] = map[string]any{"id": pr.Spec.Preview.ID, "row_limit": pr.Spec.Preview.RowLimit}
+	}
 
 	// Add bucket-based fields
 	inputBuckets := make([]string, 0)

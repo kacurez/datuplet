@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 
 	iceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -45,12 +46,16 @@ type TokenProvider func(ctx context.Context) (string, error)
 // requests to the per-project scope. Without it, lakekeeper falls back
 // to the default project (UUID 00000000-...) where the run's synthetic
 // identity carries no grants — every Check returns deny.
+//
+// Transport, when non-nil, replaces iceberg-go's default HTTP transport
+// (e.g. to bound response waits). The caller owns and closes it.
 type ClientConfig struct {
 	Name          string
 	URI           string
 	Warehouse     string
 	TokenProvider TokenProvider
 	ProjectID     string
+	Transport     http.RoundTripper
 }
 
 // Client wraps an iceberg-go catalog.Catalog so the rest of Datuplet
@@ -108,6 +113,10 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		opts = append(opts, rest.WithHeaders(map[string]string{
 			"x-project-id": cfg.ProjectID,
 		}))
+	}
+
+	if cfg.Transport != nil {
+		opts = append(opts, rest.WithCustomTransport(cfg.Transport))
 	}
 
 	cat, err := rest.NewCatalog(ctx, name, cfg.URI, opts...)

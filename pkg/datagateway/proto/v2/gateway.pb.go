@@ -350,10 +350,11 @@ type ComponentConfig struct {
 	// Storage bootstrap data for components with native S3 access (e.g., DuckDB)
 	StorageBootstrap *StorageBootstrap `protobuf:"bytes,15,opt,name=storage_bootstrap,json=storageBootstrap,proto3" json:"storage_bootstrap,omitempty"`
 	// Legacy fields (deprecated - use bucket-based access)
-	Inputs        map[string]string `protobuf:"bytes,10,rep,name=inputs,proto3" json:"inputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`   // name -> table_path (deprecated)
-	Outputs       map[string]string `protobuf:"bytes,11,rep,name=outputs,proto3" json:"outputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // name -> table_path (deprecated)
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Inputs          map[string]string `protobuf:"bytes,10,rep,name=inputs,proto3" json:"inputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`   // name -> table_path (deprecated)
+	Outputs         map[string]string `protobuf:"bytes,11,rep,name=outputs,proto3" json:"outputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // name -> table_path (deprecated)
+	PreviewRowLimit int64             `protobuf:"varint,16,opt,name=preview_row_limit,json=previewRowLimit,proto3" json:"preview_row_limit,omitempty"`                                 // >0 in a preview run: rows per output table the gateway keeps
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ComponentConfig) Reset() {
@@ -461,6 +462,13 @@ func (x *ComponentConfig) GetOutputs() map[string]string {
 		return x.Outputs
 	}
 	return nil
+}
+
+func (x *ComponentConfig) GetPreviewRowLimit() int64 {
+	if x != nil {
+		return x.PreviewRowLimit
+	}
+	return 0
 }
 
 // InputTableConfig defines a specific table input.
@@ -1010,6 +1018,7 @@ type WriteChunkResponse struct {
 	RowsAccepted    int64                  `protobuf:"varint,1,opt,name=rows_accepted,json=rowsAccepted,proto3" json:"rows_accepted,omitempty"`
 	BufferSizeBytes int64                  `protobuf:"varint,2,opt,name=buffer_size_bytes,json=bufferSizeBytes,proto3" json:"buffer_size_bytes,omitempty"` // Current buffer size (for monitoring)
 	InferredSchema  *Schema                `protobuf:"bytes,3,opt,name=inferred_schema,json=inferredSchema,proto3" json:"inferred_schema,omitempty"`       // Populated on first chunk if schema was inferred
+	LimitReached    bool                   `protobuf:"varint,4,opt,name=limit_reached,json=limitReached,proto3" json:"limit_reached,omitempty"`            // preview row cap reached for this table; later rows are discarded
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1063,6 +1072,13 @@ func (x *WriteChunkResponse) GetInferredSchema() *Schema {
 		return x.InferredSchema
 	}
 	return nil
+}
+
+func (x *WriteChunkResponse) GetLimitReached() bool {
+	if x != nil {
+		return x.LimitReached
+	}
+	return false
 }
 
 type CloseWriterRequest struct {
@@ -3401,7 +3417,7 @@ const file_gateway_proto_rawDesc = "" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x1a\n" +
 	"\bnullable\x18\x03 \x01(\bR\bnullable\x12\x19\n" +
 	"\bfield_id\x18\x04 \x01(\x05R\afieldId\"\x12\n" +
-	"\x10GetConfigRequest\"\xd2\x05\n" +
+	"\x10GetConfigRequest\"\xfe\x05\n" +
 	"\x0fComponentConfig\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12%\n" +
 	"\x0ecomponent_name\x18\x02 \x01(\tR\rcomponentName\x12#\n" +
@@ -3415,7 +3431,8 @@ const file_gateway_proto_rawDesc = "" +
 	"\x11storage_bootstrap\x18\x0f \x01(\v2%.datuplet.gateway.v2.StorageBootstrapR\x10storageBootstrap\x12H\n" +
 	"\x06inputs\x18\n" +
 	" \x03(\v20.datuplet.gateway.v2.ComponentConfig.InputsEntryR\x06inputs\x12K\n" +
-	"\aoutputs\x18\v \x03(\v21.datuplet.gateway.v2.ComponentConfig.OutputsEntryR\aoutputs\x1a9\n" +
+	"\aoutputs\x18\v \x03(\v21.datuplet.gateway.v2.ComponentConfig.OutputsEntryR\aoutputs\x12*\n" +
+	"\x11preview_row_limit\x18\x10 \x01(\x03R\x0fpreviewRowLimit\x1a9\n" +
 	"\vInputsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a:\n" +
@@ -3467,11 +3484,12 @@ const file_gateway_proto_rawDesc = "" +
 	"\x05table\x18\x05 \x01(\tR\x05table\"D\n" +
 	"\x11WriteChunkRequest\x12\x1b\n" +
 	"\twriter_id\x18\x01 \x01(\tR\bwriterId\x12\x12\n" +
-	"\x04data\x18\x02 \x01(\fR\x04data\"\xab\x01\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\"\xd0\x01\n" +
 	"\x12WriteChunkResponse\x12#\n" +
 	"\rrows_accepted\x18\x01 \x01(\x03R\frowsAccepted\x12*\n" +
 	"\x11buffer_size_bytes\x18\x02 \x01(\x03R\x0fbufferSizeBytes\x12D\n" +
-	"\x0finferred_schema\x18\x03 \x01(\v2\x1b.datuplet.gateway.v2.SchemaR\x0einferredSchema\"\x7f\n" +
+	"\x0finferred_schema\x18\x03 \x01(\v2\x1b.datuplet.gateway.v2.SchemaR\x0einferredSchema\x12#\n" +
+	"\rlimit_reached\x18\x04 \x01(\bR\flimitReached\"\x7f\n" +
 	"\x12CloseWriterRequest\x12\x1b\n" +
 	"\twriter_id\x18\x01 \x01(\tR\bwriterId\x12L\n" +
 	"\x0eexternal_files\x18\x02 \x03(\v2%.datuplet.gateway.v2.ExternalDataFileR\rexternalFiles\"z\n" +

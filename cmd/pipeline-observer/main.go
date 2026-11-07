@@ -92,7 +92,10 @@ func run() error {
 	// Coalesce wraps the DB-writing updater: identity-write drops happen
 	// in memory before any DB round-trip. DELETE events from the
 	// informer call coalesce.Forget synchronously.
-	coalesce := pkg8s.NewCoalescedUpdater(pkg8s.NewDBRunUpdater(pool))
+	coalesce := pkg8s.NewCoalescedUpdater(&pkg8s.RoutingUpdater{
+		Runs:     pkg8s.NewDBRunUpdater(pool),
+		Previews: pkg8s.NewDBPreviewUpdater(pool),
+	})
 
 	// Build a rest.Config; controller-runtime's Manager owns the informer
 	// cache + watch lifecycle.

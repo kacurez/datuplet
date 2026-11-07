@@ -657,3 +657,62 @@ func TestOperatorPassesVariantColumn(t *testing.T) {
 		t.Fatalf("variant column not passed through unchanged:\n%s", y)
 	}
 }
+
+func TestBuildComponentJob_PreviewBackoffZero(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+
+	pr := minimalPipelineRun()
+	job, _, err := r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 1 {
+		t.Errorf("non-preview BackoffLimit = %v, want 1", ptrVal(job.Spec.BackoffLimit))
+	}
+
+	pr = minimalPipelineRun()
+	pr.Spec.Preview = &datupletv1.PreviewSpec{ID: testPreviewID, RowLimit: 1000, TimeoutSeconds: 300}
+	job, _, err = r.buildComponentJob(context.Background(), pr, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("buildComponentJob: %v", err)
+	}
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 {
+		t.Errorf("preview BackoffLimit = %v, want 0", ptrVal(job.Spec.BackoffLimit))
+	}
+}
+
+func ptrVal(p *int32) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func TestGenerateGatewayConfig_PreviewBlock(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	pipeline := minimalPipeline()
+
+	pr := minimalPipelineRun()
+	y, err := r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
+	if strings.Contains(y, "preview") {
+		t.Errorf("non-preview config should not contain a preview block:\n%s", y)
+	}
+
+	pr.Spec.Preview = &datupletv1.PreviewSpec{ID: testPreviewID, RowLimit: 1000, TimeoutSeconds: 300}
+	y, err = r.generateGatewayConfig(pr, pipeline, &pipeline.Spec.Stages[0].Components[0])
+	if err != nil {
+		t.Fatalf("generateGatewayConfig: %v", err)
+	}
+	for _, want := range []string{"preview:", "row_limit: 1000", "id: " + testPreviewID} {
+		if !strings.Contains(y, want) {
+			t.Errorf("preview config missing %q:\n%s", want, y)
+		}
+	}
+	if strings.Contains(y, "timeout") {
+		t.Errorf("timeout must not reach the gateway config:\n%s", y)
+	}
+}

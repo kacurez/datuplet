@@ -21,6 +21,9 @@ type GatewayConfig struct {
 	// One file per name; file contents == value. Leave empty to disable resolution.
 	SecretsDir string `yaml:"secrets_dir,omitempty"`
 
+	// Preview is set only for a preview run (see Config.Preview).
+	Preview *PreviewConfig `yaml:"preview,omitempty"`
+
 	// Bucket-based access control (top-level)
 	InputBuckets     []string                  `yaml:"input_buckets,omitempty"`
 	OutputBuckets    []string                  `yaml:"output_buckets,omitempty"`
@@ -162,6 +165,7 @@ func (cfg *GatewayConfig) ToConfig(runTokenPath, podAnnotationsPath string) *Con
 		RunTokenPath:       runTokenPath,
 		PodAnnotationsPath: podAnnotationsPath,
 		SecretsDir:         cfg.SecretsDir,
+		Preview:            cfg.Preview,
 
 		// Bucket-based access control
 		InputBuckets:     cfg.InputBuckets,

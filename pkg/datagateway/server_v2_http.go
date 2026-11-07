@@ -22,6 +22,7 @@ type httpWriteResponse struct {
 	RowsAccepted    int64      `json:"rows_accepted"`
 	BufferSizeBytes int64      `json:"buffer_size_bytes"`
 	InferredSchema  *pb.Schema `json:"inferred_schema,omitempty"`
+	LimitReached    bool       `json:"limit_reached,omitempty"`
 }
 
 // httpErrorResponse is the JSON error envelope returned by the HTTP data plane.
@@ -88,8 +89,12 @@ func (s *ServerV2) handleWrite(w http.ResponseWriter, r *http.Request) {
 
 	// Return JSON response
 	w.Header().Set("Content-Type", "application/json")
+	if resp.LimitReached {
+		w.Header().Set("X-Datuplet-Limit-Reached", "true")
+	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(httpWriteResponse{
+		LimitReached:    resp.LimitReached,
 		RowsAccepted:    resp.RowsAccepted,
 		BufferSizeBytes: resp.BufferSizeBytes,
 		InferredSchema:  resp.InferredSchema,
@@ -183,6 +188,18 @@ func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, rec
 		}
 	}
 
+	// Preview row cap: decided before the writer opens, so a table that is
+	// already full is never created by a later writer.
+	allowed, limitReached := s.rowCap.take(ws.bucket, ws.table, outputRecord.NumRows())
+	if allowed == 0 && outputRecord.NumRows() > 0 {
+		return &pb.WriteChunkResponse{RowsAccepted: 0, LimitReached: true}, nil
+	}
+	if allowed < outputRecord.NumRows() {
+		sliced := outputRecord.NewSlice(0, allowed)
+		defer sliced.Release()
+		outputRecord = sliced
+	}
+
 	tw, dest, responseSchema, err := s.ensureTableWriter(ctx, ws, inferredSchema, outputRecord.Schema())
 	if err != nil {
 		return nil, err
@@ -203,6 +220,7 @@ func (s *ServerV2) processParsedRecord(ctx context.Context, ws *writerState, rec
 		RowsAccepted:    rec.NumRows(),
 		BufferSizeBytes: tw.QueuedBytes(),
 		InferredSchema:  responseSchema,
+		LimitReached:    limitReached,
 	}, nil
 }
 

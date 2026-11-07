@@ -22,6 +22,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go/catalog"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	dglakekeeper "github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
 	pb "github.com/datuplet/datuplet/pkg/datagateway/proto/v2"
@@ -695,5 +697,190 @@ func TestCancelDuringDeferredCreateOpensNoLiveWriter(t *testing.T) {
 		if live {
 			t.Errorf("plane writer %d opened across the cancel is still live", i)
 		}
+	}
+}
+
+func TestOpenWriter_UndeclaredBucket_Denied(t *testing.T) {
+	s, _ := newWriteTestServer(t, &Config{DefaultBucket: "pv-ab12cd34-raw"})
+	_, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Bucket: "raw", Table: "t"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v (err %v), want PermissionDenied", status.Code(err), err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, `"raw"`) || !strings.Contains(msg, "pv-ab12cd34-raw") {
+		t.Fatalf("message %q should name the bucket and the declared set", msg)
+	}
+}
+
+func TestOpenWriter_UndeclaredBucket_NoCatalogCall(t *testing.T) {
+	s, _ := newWriteTestServer(t, &Config{DefaultBucket: "pv-ab12cd34-raw"})
+	fr := &fakeResolver{}
+	s.lakekeeperResolver = fr
+	_, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Bucket: "raw", Table: "t"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied", status.Code(err))
+	}
+	if fr.calls != 0 {
+		t.Fatalf("LoadOrCreateForWrite calls = %d, want 0", fr.calls)
+	}
+}
+
+func TestOpenWriter_DeclaredBuckets_Allowed(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfg    Config
+		bucket string
+	}{
+		{"default bucket", Config{DefaultBucket: "b0"}, "b0"},
+		{"output bucket", Config{OutputBuckets: []string{"b1"}}, "b1"},
+		{"table bucket, empty request", Config{OutputTables: []OutputTableConfig{{Name: "t", Bucket: "b2"}}}, ""},
+		{"table bucket, explicit", Config{OutputTables: []OutputTableConfig{{Name: "t", Bucket: "b2"}}}, "b2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			s, _ := newWriteTestServer(t, &cfg)
+			if _, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Bucket: tc.bucket, Table: "t"}); err != nil {
+				t.Fatalf("OpenWriter: %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenWriter_NoDeclaredOutputs_FenceInactive(t *testing.T) {
+	s, _ := newWriteTestServer(t, &Config{})
+	_, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Bucket: "x", Table: "t"})
+	if status.Code(err) == codes.PermissionDenied {
+		t.Fatalf("fence must be inactive with no declared outputs: %v", err)
+	}
+}
+
+func TestOpenWriter_Preview_NoDeclaredOutputs_Denied(t *testing.T) {
+	s, _ := newWriteTestServer(t, &Config{Preview: &PreviewConfig{ID: "p", RowLimit: 10}})
+	fr := &fakeResolver{}
+	s.lakekeeperResolver = fr
+	_, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Bucket: "raw", Table: "data"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v (err %v), want PermissionDenied", status.Code(err), err)
+	}
+	if fr.calls != 0 {
+		t.Fatalf("LoadOrCreateForWrite calls = %d, want 0", fr.calls)
+	}
+}
+
+func rowCapBatch(t *testing.T, n int) arrow.RecordBatch {
+	t.Helper()
+	b := array.NewInt64Builder(memory.NewGoAllocator())
+	defer b.Release()
+	for i := 0; i < n; i++ {
+		b.Append(int64(i))
+	}
+	col := b.NewArray()
+	defer col.Release()
+	sch := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
+	return array.NewRecordBatch(sch, []arrow.Array{col}, int64(n))
+}
+
+func previewCfg(limit int64) *Config {
+	return &Config{DefaultBucket: "raw", Preview: &PreviewConfig{ID: "p", RowLimit: limit}}
+}
+
+func TestRowCap_SlicesCrossingChunk(t *testing.T) {
+	s, _ := newWriteTestServer(t, previewCfg(5))
+	ctx := context.Background()
+	w := openIPCWriter(t, s, "t")
+	r1, err := s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: w, Data: ipcPayload(t, rowCapBatch(t, 3))})
+	if err != nil || r1.RowsAccepted != 3 || r1.LimitReached {
+		t.Fatalf("chunk1 = %+v, %v", r1, err)
+	}
+	r2, err := s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: w, Data: ipcPayload(t, rowCapBatch(t, 4))})
+	if err != nil || r2.RowsAccepted != 2 || !r2.LimitReached {
+		t.Fatalf("chunk2 = %+v, %v", r2, err)
+	}
+	cl, err := s.CloseWriter(ctx, &pb.CloseWriterRequest{WriterId: w})
+	if err != nil || cl.TotalRows != 5 {
+		t.Fatalf("CloseWriter = %+v, %v", cl, err)
+	}
+	if resp, err := s.Commit(ctx, &pb.CommitRequest{}); err != nil || !resp.Success {
+		t.Fatalf("Commit = %+v, %v", resp, err)
+	}
+}
+
+func TestRowCap_SharedAcrossWriters(t *testing.T) {
+	s, _ := newWriteTestServer(t, previewCfg(5))
+	ctx := context.Background()
+	w1 := openIPCWriter(t, s, "t")
+	w2 := openIPCWriter(t, s, "t")
+	var total int64
+	r, err := s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: w1, Data: ipcPayload(t, rowCapBatch(t, 4))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total += r.RowsAccepted
+	r, err = s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: w2, Data: ipcPayload(t, rowCapBatch(t, 4))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total += r.RowsAccepted
+	if total != 5 || !r.LimitReached {
+		t.Fatalf("total = %d, last = %+v; want 5 and limit reached", total, r)
+	}
+	r, err = s.WriteChunk(ctx, &pb.WriteChunkRequest{WriterId: w2, Data: ipcPayload(t, rowCapBatch(t, 4))})
+	if err != nil || r.RowsAccepted != 0 || !r.LimitReached {
+		t.Fatalf("later chunk = %+v, %v", r, err)
+	}
+}
+
+func TestRowCap_HTTPLimitReachedField(t *testing.T) {
+	s, _ := newWriteTestServer(t, previewCfg(2))
+	w := openIPCWriter(t, s, "t")
+	rec := httpWrite(s, w, ipcPayload(t, rowCapBatch(t, 4)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var body httpWriteResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.RowsAccepted != 2 || !body.LimitReached {
+		t.Fatalf("body = %+v", body)
+	}
+	if rec.Header().Get("X-Datuplet-Limit-Reached") != "true" {
+		t.Fatalf("header missing: %v", rec.Header())
+	}
+}
+
+func TestRowCap_NoPreviewNoCap(t *testing.T) {
+	s, _ := newWriteTestServer(t, &Config{DefaultBucket: "raw"})
+	w := openIPCWriter(t, s, "t")
+	r, err := s.WriteChunk(context.Background(), &pb.WriteChunkRequest{WriterId: w, Data: ipcPayload(t, rowCapBatch(t, 1000))})
+	if err != nil || r.RowsAccepted != 1000 || r.LimitReached {
+		t.Fatalf("resp = %+v, %v", r, err)
+	}
+}
+
+func TestGetConfig_PreviewRowLimit(t *testing.T) {
+	s, _ := newWriteTestServer(t, previewCfg(7))
+	cc, err := s.GetConfig(context.Background(), &pb.GetConfigRequest{})
+	if err != nil || cc.PreviewRowLimit != 7 {
+		t.Fatalf("GetConfig = %+v, %v", cc, err)
+	}
+	s2, _ := newWriteTestServer(t, &Config{DefaultBucket: "raw"})
+	cc, _ = s2.GetConfig(context.Background(), &pb.GetConfigRequest{})
+	if cc.PreviewRowLimit != 0 {
+		t.Fatalf("PreviewRowLimit = %d, want 0", cc.PreviewRowLimit)
+	}
+}
+
+func TestGatewayConfig_PreviewBlock(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "gw.yaml")
+	if err := os.WriteFile(p, []byte("run_id: r\npreview:\n  id: x\n  row_limit: 7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfigFile(p, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Preview == nil || cfg.Preview.RowLimit != 7 || cfg.Preview.ID != "x" {
+		t.Fatalf("Preview = %+v", cfg.Preview)
 	}
 }

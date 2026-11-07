@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -23,6 +24,10 @@ import (
 // maxCallRecvMsgSize is the gRPC receive cap used for both production and
 // test clients. Sized so a 32-MiB IPC-encoded row group fits with headroom.
 const maxCallRecvMsgSize = 64 << 20
+
+// gatewayBootWait bounds how long New waits for the gateway sidecar to start
+// listening: Kubernetes may start the component container first.
+const gatewayBootWait = 60 * time.Second
 
 // Client connects to the Data Gateway and provides access to inputs/outputs.
 type Client struct {
@@ -42,6 +47,11 @@ type Config struct {
 	InputTables   []TableRef      // Specific input tables
 	OutputTables  []OutputTableRef // Specific output tables (declared in CRD)
 	Raw           json.RawMessage // Component-specific configuration
+
+	// PreviewRowLimit is the per-output-table row cap of a preview run, 0
+	// outside previews. Producers that know it up front can stop early
+	// instead of waiting for the gateway's Writer.LimitReached signal.
+	PreviewRowLimit int64
 
 	// Legacy fields (deprecated)
 	Inputs  []string
@@ -106,8 +116,9 @@ func New(ctx context.Context) (*Client, error) {
 
 	client := pb.NewDataGatewayClient(conn)
 
-	// Fetch config immediately
-	config, err := client.GetConfig(ctx, &pb.GetConfigRequest{})
+	cfgCtx, cancel := context.WithTimeout(ctx, gatewayBootWait)
+	defer cancel()
+	config, err := client.GetConfig(cfgCtx, &pb.GetConfigRequest{}, grpc.WaitForReady(true))
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to get config: %w", err)
@@ -177,6 +188,8 @@ func (c *Client) Config() Config {
 		InputTables:   inputTables,
 		OutputTables:  outputTables,
 		Raw:           c.config.Config,
+
+		PreviewRowLimit: c.config.PreviewRowLimit,
 		// Legacy fields
 		Inputs:  inputs,
 		Outputs: outputs,
@@ -303,6 +316,7 @@ type Writer struct {
 	inputFormat    pb.DataFormat
 	inferredSchema *pb.Schema
 	totalRows      int64
+	limitReached   bool // sticky: some response said the table's preview cap is full
 
 	// Write-call batching state. See WithBatchSize for semantics.
 	// `batchThreshold == 0` means batching is disabled (legacy behavior:
@@ -452,7 +466,15 @@ type WriteResult struct {
 	RowsAccepted   int64
 	BufferSize     int64
 	InferredSchema *pb.Schema
+	// LimitReached is true when the gateway reports the table's preview row
+	// cap is full; later chunks are dropped (rows_accepted 0).
+	LimitReached bool
 }
+
+// LimitReached reports whether any response so far said this table's preview
+// row cap is full. Sticky. It is an accessor, not an error, so Arrow sinks
+// don't treat it as a failed write; a producer should stop and exit 0.
+func (w *Writer) LimitReached() bool { return w.limitReached }
 
 // WriteChunk writes a chunk of data immediately and returns the gateway's
 // per-call result (rows accepted, buffer size, inferred schema).
@@ -511,12 +533,16 @@ func (w *Writer) writeChunkHTTP(ctx context.Context, data []byte) (*WriteResult,
 		RowsAccepted    int64      `json:"rows_accepted"`
 		BufferSizeBytes int64      `json:"buffer_size_bytes"`
 		InferredSchema  *pb.Schema `json:"inferred_schema,omitempty"`
+		LimitReached    bool       `json:"limit_reached,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&httpResp); err != nil {
 		return nil, fmt.Errorf("failed to parse HTTP response: %w", err)
 	}
 
 	w.totalRows += httpResp.RowsAccepted
+	if httpResp.LimitReached {
+		w.limitReached = true
+	}
 
 	// Update inferred schema if provided
 	if httpResp.InferredSchema != nil && w.inferredSchema == nil {
@@ -527,6 +553,7 @@ func (w *Writer) writeChunkHTTP(ctx context.Context, data []byte) (*WriteResult,
 		RowsAccepted:   httpResp.RowsAccepted,
 		BufferSize:     httpResp.BufferSizeBytes,
 		InferredSchema: httpResp.InferredSchema,
+		LimitReached:   httpResp.LimitReached,
 	}, nil
 }
 
@@ -541,6 +568,9 @@ func (w *Writer) writeChunkGRPC(ctx context.Context, data []byte) (*WriteResult,
 	}
 
 	w.totalRows += resp.RowsAccepted
+	if resp.LimitReached {
+		w.limitReached = true
+	}
 
 	// Update inferred schema if provided
 	if resp.InferredSchema != nil && w.inferredSchema == nil {
@@ -551,6 +581,7 @@ func (w *Writer) writeChunkGRPC(ctx context.Context, data []byte) (*WriteResult,
 		RowsAccepted:   resp.RowsAccepted,
 		BufferSize:     resp.BufferSizeBytes,
 		InferredSchema: resp.InferredSchema,
+		LimitReached:   resp.LimitReached,
 	}, nil
 }
 

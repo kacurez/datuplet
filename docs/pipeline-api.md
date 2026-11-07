@@ -215,6 +215,84 @@ are envelope-free now; see docs/pipeline-api.md").
 (no ETag / version check). A concurrent editor's save silently overwrites
 yours. See [docs/known-limitations.md](known-limitations.md).
 
+## Previews
+
+A preview runs a PipelineDoc for real, with outputs redirected to per-preview
+scratch namespaces, and returns a result document. Nothing is saved as a
+pipeline and no real table is written. The CLI front end is
+`datuplet preview` ([agent-quickstart](agent-quickstart.md), Step 3b). All
+routes need `data_admin` on the project and are registered only when the
+deployment has K8s, the DB, the signer and `DATUPLET_LAKEKEEPER_URL`
+(otherwise they return 404).
+
+| Endpoint | Behavior |
+|---|---|
+| `POST /api/v1/projects/{pid}/previews` | Create. Body `{"doc": <PipelineDoc>, "workspace", "row_limit", "timeout_seconds", "ttl_seconds", "until_stage"}`; only `doc` is required. `202 {"id","workspace","phase","scratch_namespaces","expires_at"}`. `400 {"error","findings"}` for validation findings (same gates as `PUT`, same finding shape) or a bad request (unknown `until_stage`, out-of-range value). `409 {"error":"too_many_previews","running_in_workspace","running_in_project","live_in_project"}` past a cap. |
+| `GET /api/v1/projects/{pid}/previews?workspace=W` | List one workspace (default `default`; `*` = all), newest first. `{"previews":[{"id","workspace","phase","doc_name","until_stage","created_at","expires_at"}],"next_cursor"}`; `?limit=` and `?cursor=` page. |
+| `GET /api/v1/projects/{pid}/previews/{id}[?resample=true]` | The result document (below). `404` if unknown. After cleanup it still returns `200` until the row is evicted: the cached document if it was assembled before the purge, otherwise stages only with the warning `outputs purged before the result was assembled`. |
+| `POST /api/v1/projects/{pid}/previews/{id}/cancel` | `202`. Cancels a running preview; the running stage's output is discarded, tables committed by earlier stages stay until TTL. |
+| `DELETE /api/v1/projects/{pid}/previews/{id}` | Cancel if running, purge scratch tables and namespaces now (synchronous), `204`. Idempotent. `502 purge_failed` leaves the row for the sweeper. |
+| `DELETE /api/v1/projects/{pid}/previews?workspace=W` | Purge every preview in a workspace (the `workspace` parameter is required). `202 {"deleted":[ids],"failed":{id: message}}`. |
+
+**Request bounds** (defaults in parentheses): `row_limit` 1..100000 (1000), a
+per-output-table row cap; `timeout_seconds` 30..3600 (300); `ttl_seconds`
+60..86400 (3600), how long the preview is kept after it finishes;
+`workspace` matches `^[a-z0-9][a-z0-9-]{0,62}$` (`default`); `until_stage`
+names a stage of the doc and drops every later stage.
+
+**Caps.** Exceeding any cap returns `409 too_many_previews`. Set `0` to disable
+a cap.
+
+| Cap | Chart value | Env var | Default |
+|---|---|---|---|
+| Pending/Running previews per workspace | `previews.maxRunningPerWorkspace` | `DATUPLET_PREVIEW_MAX_RUNNING_PER_WORKSPACE` | 2 |
+| Pending/Running previews per project | `previews.maxRunningPerProject` | `DATUPLET_PREVIEW_MAX_RUNNING_PER_PROJECT` | 8 |
+| Previews not yet cleaned up, per project | `previews.maxPerProject` | `DATUPLET_PREVIEW_MAX_PER_PROJECT` | 50 |
+
+**Lifecycle.** `Pending` -> `Running` -> a terminal phase (`Succeeded`,
+`FailedUser`, `FailedApplication`, `Cancelled`, `Expired`). A preview's `expires_at` starts at
+`created + timeout + ttl`; once it reaches a terminal phase it resets to
+`completed_at + ttl_seconds`; a sweeper in pipeline-api cancels, purges the scratch
+tables, drops the namespaces and deletes the PipelineRun.
+
+**Result document.** Top level: `id`, `workspace`, `phase`, `message`,
+`created_at`, `started_at`, `completed_at`, `expires_at`, `row_limit`,
+`until_stage`, `doc_name`, `stages`, `outputs`, `warnings`, `result_ready`.
+The first `GET` after a terminal phase assembles the document (reads table
+info, a row sample per table through the query worker, and the log tails) and
+caches it; this can take up to ~30 s per table. Until then `result_ready` is
+`false`; clients should stop polling on a terminal `phase` plus
+`result_ready: true`. `?resample=true` retries the samples that are missing.
+
+- `stages[]`: `name`, `phase`, `duration_ms`, `message`, `components[]` with
+  `name`, `phase`, `exit_code`, `message`, `log_tail` (component container) and
+  `gateway_log_tail` (gateway sidecar), both last 200 lines, filled only for failed
+  components (`null` otherwise, or when the tail is empty or could not be fetched). Log tails exist only while the Job pods do (up to 1 h after the stage finishes). A
+  component that hit the preview timeout carries its last log line in `message`.
+- `outputs[]`: `stage`, `component`, `bucket` and `table` (logical, as in the
+  doc), `scratch_table` (`<scratch namespace>.<table>`, queryable with
+  `datuplet query` or `POST .../query`), `rows`, `at_cap` (`rows >= row_limit`,
+  so the data was truncated), `schema` (`name`, `type`, `nullable`),
+  `columns_hint` (the schema in the doc's `columns:` vocabulary; a type with no
+  equivalent is hinted `string` plus a warning), `sample` (`columns`, `rows`,
+  `truncated`; up to 20 rows, `null` if sampling failed).
+- `warnings[]`: non-fatal notes: skipped samples, unavailable log tails,
+  `samples unavailable: query service disabled`, `outputs purged before the
+  result was assembled`.
+
+**How the doc is rewritten (where a preview diverges from a run).** The scratch
+namespace for bucket `B` is `pv-<id8>-B` (`id8` = first 8 characters of the
+preview id; cut to 63 characters). Every output bucket is rewritten to its
+scratch namespace, and so is every input that reads a bucket an *earlier stage*
+of the same doc produces: a bucket that exists for real and is also produced
+earlier in the doc is read from scratch in a preview. Inputs that read
+buckets no earlier stage produces read the real tables, and those reads are not
+capped. Table names are never rewritten. The synthesized pipeline name is
+`preview-<id8>`. Because every preview starts from empty scratch tables,
+`APPEND` and `FULL_LOAD` write modes are indistinguishable in a preview.
+Separately from previews, the gateway now fails a component that writes a
+bucket not declared in its `outputs`.
+
 ## Run locally
 
 ### 1. Start Postgres

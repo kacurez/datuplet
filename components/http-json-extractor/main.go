@@ -190,8 +190,24 @@ func main() {
 		finishQuietly(sink) // sink may already own an open writer; os.Exit skips defers
 		sdk.ExitUserError(fmt.Sprintf("failed to fetch JSON: %v", err))
 	}
-	n, err := decodeRecords(body, compCfg.ArrayPath, sink.Add)
+	recordCap := effectiveRecordCap(0, cfg.PreviewRowLimit)
+	added := 0
+	_, err = decodeRecords(body, compCfg.ArrayPath, func(rec map[string]any) error {
+		if err := sink.Add(rec); err != nil {
+			return err
+		}
+		added++
+		if recordCap > 0 && added >= recordCap {
+			return errRecordCapReached
+		}
+		return nil
+	})
 	body.Close()
+	n := added
+	if errors.Is(err, errRecordCapReached) {
+		client.Log(ctx, "INFO", fmt.Sprintf("Reached preview row cap: %d", recordCap))
+		err = nil
+	}
 	if err != nil {
 		finishQuietly(sink)
 		var we *dgarrow.WriteError
@@ -246,6 +262,28 @@ func main() {
 	client.Log(ctx, "INFO", "HTTP JSON extraction completed successfully")
 }
 
+// effectiveRecordCap combines pagination.max_records (0 = unlimited) with the
+// preview row cap (0 = not a preview): the smaller non-zero value, 0 if both
+// are unset.
+func effectiveRecordCap(maxRecords int, previewRowLimit int64) int {
+	if previewRowLimit > 0 && (maxRecords == 0 || int64(maxRecords) > previewRowLimit) {
+		return int(previewRowLimit)
+	}
+	return maxRecords
+}
+
+// sinkBatchRows returns the sink batch size to use under a preview cap, or 0
+// to keep dgarrow.DefaultBatchRows (not a preview, or the cap is larger).
+func sinkBatchRows(previewRowLimit int64) int {
+	if previewRowLimit > 0 && previewRowLimit < int64(dgarrow.DefaultBatchRows) {
+		return int(previewRowLimit)
+	}
+	return 0
+}
+
+// errRecordCapReached stops decodeRecords once the record cap has been written.
+var errRecordCapReached = errors.New("record cap reached")
+
 // runPaginatedExtraction handles paginated API extraction with streaming writes.
 func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config, outputTable string) error {
 	pagination := cfg.Pagination
@@ -291,6 +329,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 	client.Log(ctx, "INFO", fmt.Sprintf("Starting paginated extraction from: %s (type=%s, param=%s, page_size=%d)",
 		cfg.URL, pagination.Type, pagination.Param, pagination.PageSize))
 
+	recordCap := effectiveRecordCap(pagination.MaxRecords, sdkCfg.PreviewRowLimit)
 	totalRecords := 0
 	pageCount := 0
 
@@ -318,7 +357,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		}
 		truncated := false
 		pageObjects, err := decodeRecords(body, cfg.ArrayPath, func(rec map[string]any) error {
-			if pagination.MaxRecords > 0 && totalRecords >= pagination.MaxRecords {
+			if recordCap > 0 && totalRecords >= recordCap {
 				truncated = true
 				return nil // keep counting the page; stop writing
 			}
@@ -333,7 +372,7 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 			return fmt.Errorf("failed to fetch page %d: %w", pageCount+1, err)
 		}
 		if truncated {
-			client.Log(ctx, "INFO", fmt.Sprintf("Truncating to max records limit: %d", pagination.MaxRecords))
+			client.Log(ctx, "INFO", fmt.Sprintf("Truncating to max records limit: %d", recordCap))
 		}
 
 		// Check if we should stop
@@ -348,8 +387,8 @@ func runPaginatedExtraction(ctx context.Context, client *sdk.Client, cfg *Config
 		client.Log(ctx, "INFO", fmt.Sprintf("Page %d: fetched %d records (total: %d)", pageCount, pageObjects, totalRecords))
 
 		// Check if we've hit max records
-		if pagination.MaxRecords > 0 && totalRecords >= pagination.MaxRecords {
-			client.Log(ctx, "INFO", fmt.Sprintf("Reached max records limit: %d", pagination.MaxRecords))
+		if recordCap > 0 && totalRecords >= recordCap {
+			client.Log(ctx, "INFO", fmt.Sprintf("Reached max records limit: %d", recordCap))
 			break
 		}
 

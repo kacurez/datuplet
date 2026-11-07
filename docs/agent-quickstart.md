@@ -256,6 +256,115 @@ Exit-code contract (spec §7, `cmd/datuplet/pipeline.go`'s `runPipelineValidate`
 error-severity finding, `2+` = the validate request itself failed
 (transport/HTTP problem, not "the pipeline is invalid").
 
+## Step 3b — Preview before you persist
+
+`validate` proves the doc is well-formed; a **preview** proves it works. It
+runs the real pipeline (real components, real inputs) but redirects every
+output into throwaway `pv-<id8>-<bucket>` scratch namespaces, so nothing
+touches your real tables and nothing is saved as a pipeline. Read the result
+document, fix the doc, run again.
+
+Give each agent task its own **workspace**. Workspaces isolate previews from
+each other: `list`, the running-preview caps and teardown are all per
+workspace. The CLI defaults to `$DATUPLET_WORKSPACE`, then `default`:
+
+```bash
+export DATUPLET_WORKSPACE=events-etl-task
+datuplet preview -f events-etl.yaml --rows 200 --json
+```
+
+(`preview` is shorthand for `preview run`. Flags go before positionals, as
+everywhere in the CLI. `--rows` caps the rows each component writes per
+table, default 1000. The command blocks until the phase is terminal and the
+result document is ready; the first read after the run ends assembles the
+document, which can take up to ~30 s per table.)
+
+Abridged output (illustrative; values will differ):
+
+```json
+{
+  "id": "5d1c0a7e-9a41-4a0e-8f55-3c2b6d7e1a90",
+  "workspace": "events-etl-task",
+  "phase": "Succeeded",
+  "result_ready": true,
+  "row_limit": 200,
+  "stages": [
+    {"name": "extract", "phase": "Succeeded", "duration_ms": 6100,
+     "components": [{"name": "gen", "phase": "Succeeded", "exit_code": 0,
+                     "log_tail": null, "gateway_log_tail": null}]},
+    {"name": "transform", "phase": "Succeeded", "duration_ms": 4300, "components": []}
+  ],
+  "outputs": [
+    {"stage": "transform", "component": "sql", "bucket": "curated", "table": "daily_summary",
+     "scratch_table": "pv-5d1c0a7e-curated.daily_summary", "rows": 6, "at_cap": false,
+     "schema": [{"name": "country", "type": "string", "nullable": true}],
+     "columns_hint": [{"name": "country", "type": "string"}],
+     "sample": {"columns": [{"name": "country"}], "rows": [["US"]], "truncated": false}}
+  ],
+  "warnings": []
+}
+```
+
+How to read it:
+
+- `phase` plus per-stage and per-component `phase` / `message` tell you what
+  failed; a failed component also carries `log_tail` / `gateway_log_tail`
+  (last 200 lines; `null` for components that did not fail, and also when the tail is empty or could not be fetched). Exit code: `0` Succeeded, `1`
+  FailedUser / Cancelled / Expired / timed out / validation or cap error
+  (fix the doc or clean up), `20` FailedApplication or a transport/5xx failure.
+- `outputs[]` has one entry per table the preview wrote. `rows` is the row
+  count in the scratch table; `at_cap: true` means the `--rows` cap truncated
+  it, so counts and aggregates are partial. `columns_hint` is the schema in
+  the PipelineDoc `columns:` vocabulary: paste it into `outputs.tables[].columns`
+  to pin the output types.
+- `warnings` carries non-fatal notes (a column type with no `columns:`
+  equivalent hinted as `string`, a log tail or sample that could not be
+  fetched, `samples unavailable: query service disabled` when the deployment
+  has no query worker).
+
+Iterate on one stage at a time with `--until-stage`: later stages are dropped
+and the preview ends after the named one.
+
+```bash
+datuplet preview -f events-etl.yaml --until-stage extract
+```
+
+Inspect a scratch table with SQL by quoting the `scratch_table` value from the
+document:
+
+```bash
+datuplet query --sql 'SELECT country, count(*) FROM "pv-5d1c0a7e-curated"."daily_summary" GROUP BY 1'
+```
+
+Other subcommands (see `datuplet preview help`):
+
+```bash
+datuplet preview list                      # previews in $DATUPLET_WORKSPACE (--workspace '*' lists every workspace)
+datuplet preview get --json <id>           # the result document again (--resample retries missing samples)
+datuplet preview cancel <id>               # stop a running preview; the running stage's output is discarded
+datuplet preview delete <id>               # purge one preview and its scratch tables
+datuplet preview delete --workspace events-etl-task --all    # tear down the whole workspace
+datuplet preview --no-wait -f events-etl.yaml                # print the id and return; poll with get
+```
+
+Behaviour that differs from a real run:
+
+- **Outputs always go to scratch.** Every output bucket is rewritten to
+  `pv-<id8>-<bucket>`. An input that reads a bucket produced by an *earlier
+  stage* of the same doc reads the scratch copy, even if a real table of that
+  name already exists. Inputs from buckets no stage produces read the real
+  tables, uncapped.
+- **`APPEND` vs `FULL_LOAD` is not observable.** Each preview starts from
+  empty scratch tables, so both write modes produce the same result.
+- **Undeclared buckets fail.** A component that writes a bucket not in its
+  `outputs` is rejected by the gateway (this is true for real runs too).
+- **Previews expire.** A preview times out after 5 min by default (`--timeout`)
+  and is kept for 1 h after that (`--ttl`); the server sweeps expired previews
+  and their scratch tables. Delete your workspace when the task is done. The server also
+  caps concurrent previews (409 `too_many_previews`: delete or wait).
+
+When the preview is clean, persist (Step 4).
+
 ## Step 4 — Persist it
 
 ```bash

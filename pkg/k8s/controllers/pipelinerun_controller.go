@@ -284,7 +284,7 @@ func (r *PipelineRunReconciler) runtimePullPolicy() corev1.PullPolicy {
 // +kubebuilder:rbac:groups=datuplet.io,resources=pipelineruns/finalizers,verbs=update
 // +kubebuilder:rbac:groups=datuplet.io,resources=pipelines,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
@@ -358,9 +358,23 @@ func (r *PipelineRunReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv1.PipelineRun) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the Pipeline
+	// The Pipeline to admit: built in memory from an inline spec.pipelineSpec
+	// (no Pipeline CR exists), otherwise fetched via spec.pipelineRef.
 	pipeline := &datupletv1.Pipeline{}
-	if err := r.Get(ctx, types.NamespacedName{
+	if pr.Spec.PipelineSpec != nil {
+		pipeline = &datupletv1.Pipeline{
+			ObjectMeta: metav1.ObjectMeta{Name: pr.Name, Namespace: pr.Namespace, Generation: 0},
+			Spec:       *pr.Spec.PipelineSpec.DeepCopy(),
+		}
+	} else if pr.Spec.PipelineRef.Name == "" {
+		pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+		pr.Status.Message = "spec.pipelineRef or spec.pipelineSpec is required"
+		if err := r.Status().Update(ctx, pr); err != nil {
+			logger.Error(err, "Failed to update PipelineRun status")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	} else if err := r.Get(ctx, types.NamespacedName{
 		Name:      pr.Spec.PipelineRef.Name,
 		Namespace: pr.Namespace,
 	}, pipeline); err != nil {
@@ -773,6 +787,13 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 	stageStatus := &pr.Status.StageStatuses[currentStageIdx]
 	pr.Status.CurrentStage = stage.Name
 
+	// Preview deadline: cancel the in-flight stage and fail the run. A stage
+	// that already failed keeps its own (more specific) failure below.
+	if previewDeadlinePassed(pr) &&
+		(stageStatus.Phase == datupletv1.StagePhasePending || stageStatus.Phase == datupletv1.StagePhaseRunning) {
+		return r.failPreviewTimeout(ctx, pr, stage, stageStatus)
+	}
+
 	// Handle stage based on its phase
 	switch stageStatus.Phase {
 	case datupletv1.StagePhasePending:
@@ -806,6 +827,73 @@ func (r *PipelineRunReconciler) handleRunning(ctx context.Context, pr *datupletv
 	}
 
 	return ctrl.Result{RequeueAfter: PipelineRunRequeueInterval}, nil
+}
+
+// previewDeadlinePassed reports whether a preview run has exceeded its
+// spec.preview.timeoutSeconds, measured from status.startTime.
+func previewDeadlinePassed(pr *datupletv1.PipelineRun) bool {
+	p := pr.Spec.Preview
+	if p == nil || p.TimeoutSeconds <= 0 || pr.Status.StartTime == nil {
+		return false
+	}
+	return time.Since(pr.Status.StartTime.Time) > time.Duration(p.TimeoutSeconds)*time.Second
+}
+
+// failPreviewTimeout cancels a preview run that ran past its deadline: it
+// annotates the run's pods for a graceful gateway exit, records the last log
+// line of each still-running component, deletes the current stage's Jobs, and
+// fails the stage, its unfinished components, and the run FailedUser.
+func (r *PipelineRunReconciler) failPreviewTimeout(ctx context.Context, pr *datupletv1.PipelineRun, stage *datupletv1.StageSpec, stageStatus *datupletv1.StageStatus) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	msg := fmt.Sprintf("preview timed out after %ds during stage %s", pr.Spec.Preview.TimeoutSeconds, stage.Name)
+	now := metav1.Now()
+
+	r.propagateCancelToPods(ctx, pr)
+	for i := range stage.Components {
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+			Name:      componentJobName(pr, stage.Name, stage.Components[i].Name),
+			Namespace: pr.Namespace,
+		}}
+		// Capture the last status line before the delete removes the pod.
+		if cs := componentStatusByName(stageStatus, stage.Components[i].Name); cs != nil && !componentTerminal(cs.Phase) {
+			cs.Phase = datupletv1.ComponentPhaseFailedUser
+			cs.Message = "preview timed out"
+			if line := r.extractComponentStatusMessage(ctx, job, 0); line != "" {
+				cs.Message = status.SanitizeMessage(cs.Message + "; last log: " + line)
+			}
+			cs.CompletionTime = &now
+		}
+		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete timed-out preview Job", "job", job.Name)
+			return ctrl.Result{}, err
+		}
+	}
+
+	stageStatus.Phase = datupletv1.StagePhaseFailedUser
+	stageStatus.Message = msg
+	stageStatus.CompletionTime = &now
+	pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
+	pr.Status.Message = msg
+	pr.Status.CompletionTime = &now
+	if err := r.Status().Update(ctx, pr); err != nil {
+		logger.Error(err, "Failed to update PipelineRun status")
+		return ctrl.Result{}, err
+	}
+	logger.Info("Preview run timed out", "stage", stage.Name)
+	return ctrl.Result{}, nil
+}
+
+func componentStatusByName(ss *datupletv1.StageStatus, name string) *datupletv1.ComponentStatus {
+	for i := range ss.ComponentStatuses {
+		if ss.ComponentStatuses[i].Name == name {
+			return &ss.ComponentStatuses[i]
+		}
+	}
+	return nil
+}
+
+func componentTerminal(p datupletv1.ComponentPhase) bool {
+	return p == datupletv1.ComponentPhaseSucceeded || p == datupletv1.ComponentPhaseFailedUser || p == datupletv1.ComponentPhaseFailedApplication
 }
 
 // startStage creates Jobs for all components in the stage, reading from the

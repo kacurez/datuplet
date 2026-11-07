@@ -169,6 +169,8 @@ time is follow-up work.
 `pkg/datupleticeio`'s `gs://` factory with vended OAuth tokens. There is no GCS
 environment in CI; prove it on GKE before relying on it.
 
+**Gateway rejects writes to undeclared buckets.** A component that opens a writer for a bucket not in its `outputs` now gets PermissionDenied and the run fails, instead of the gateway creating that table.
+
 **Partitioned tables: no spec evolution.** A table the gateway creates gets an
 Iceberg partition spec from the output's `partition_fields`; an existing table
 is always written with its own current spec. Changing `partition_fields` on an
@@ -481,6 +483,32 @@ Python/WASM-Python runtime); viewer authentication is opaque bearer tokens
 only (no SAML/OIDC login for viewers — an app's *authors* already
 authenticate with the normal platform session/api-token). All three are
 named future work in the design spec (§10), not oversights.
+
+---
+
+## Previews
+
+- **Input reads are not capped.** `row_limit` caps what components write per
+  output table; inputs read from real tables are read in full, so a preview over
+  a large table still costs a full read.
+- **`APPEND` vs `FULL_LOAD` is not observable** in a preview: scratch tables
+  start empty.
+- **Log tails are short-lived.** A failed component's `log_tail` /
+  `gateway_log_tail` exist only while the stage's Job pods exist, up to 1 h after it finishes;
+  after that they are `null` with a warning. A component that timed out keeps
+  its last log line in its `message`.
+- **Cancel discards the running stage's output.** Tables committed by earlier
+  stages stay until the preview's TTL.
+- **Row samples need the query worker.** Without it, `sample` is `null` and the
+  document carries the warning `samples unavailable: query service disabled`.
+- **Scratch namespaces are visible to project members.** `pv-<id8>-<bucket>`
+  namespaces show up in `datuplet storage tables` and the storage UI for
+  anyone with access to the project until the preview is deleted or swept.
+- **Stuck previews are retried every 5 minutes.** A preview whose pods cannot
+  be removed (e.g. after node loss) is retried every 5 minutes and does not
+  block cleanup of others.
+- **First read can be slow.** The first `GET` after a preview ends assembles the
+  result (up to ~30 s per table).
 
 ---
 

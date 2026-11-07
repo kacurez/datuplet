@@ -12,6 +12,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/apps"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/preview"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
@@ -109,6 +110,9 @@ type Server struct {
 	// whole internal block unregistered, so app-worker gets a clear 404
 	// rather than an unauthenticated surface.
 	appsInternalToken *apps.ServiceToken
+	// previews backs the /api/v1/projects/{pid}/previews routes. Wired via
+	// WithPreviews; nil leaves those routes unregistered.
+	previews previewService
 }
 
 // NewServer constructs a Server bound to the given DB pool. db may be nil
@@ -355,6 +359,15 @@ func (s *Server) WithAppsInternal(token *apps.ServiceToken) *Server {
 	return s
 }
 
+// WithPreviews wires the pipeline preview routes. When svc is nil, they stay
+// unregistered.
+func (s *Server) WithPreviews(svc *preview.Service) *Server {
+	if svc != nil {
+		s.previews = svc
+	}
+	return s
+}
+
 // Handler returns the configured http.Handler for the server.
 // Authenticated routes only register when a UserResolver is present —
 // the /healthz endpoint remains available without one so smoke tests of
@@ -480,6 +493,16 @@ func (s *Server) Handler() http.Handler {
 	if s.resolver != nil && s.authzr != nil && s.backend != nil && s.pipelines != nil {
 		mux.Handle("POST /api/v1/projects/{pid}/pipelines/{name}/runs",
 			auth.WithUser(s.resolver, http.HandlerFunc(s.handleTriggerRun)))
+	}
+
+	// Preview routes. s.projects backs mustHaveRelation's project lookup.
+	if s.previews != nil && s.resolver != nil && s.authzr != nil && s.projects != nil {
+		mux.Handle("POST /api/v1/projects/{pid}/previews", auth.WithUser(s.resolver, http.HandlerFunc(s.handleCreatePreview)))
+		mux.Handle("GET /api/v1/projects/{pid}/previews", auth.WithUser(s.resolver, http.HandlerFunc(s.handleListPreviews)))
+		mux.Handle("DELETE /api/v1/projects/{pid}/previews", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeletePreviewWorkspace)))
+		mux.Handle("GET /api/v1/projects/{pid}/previews/{id}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleGetPreview)))
+		mux.Handle("DELETE /api/v1/projects/{pid}/previews/{id}", auth.WithUser(s.resolver, http.HandlerFunc(s.handleDeletePreview)))
+		mux.Handle("POST /api/v1/projects/{pid}/previews/{id}/cancel", auth.WithUser(s.resolver, http.HandlerFunc(s.handleCancelPreview)))
 	}
 
 	// Component catalog routes: any authenticated user (WithUser only — no

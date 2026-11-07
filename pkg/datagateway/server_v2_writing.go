@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -109,6 +110,41 @@ func adoptTarget(ws *writerState, target *dglakekeeper.WriterTarget) {
 	}
 }
 
+// declaredOutputBuckets returns the sorted, de-duplicated set of buckets the
+// component declared as outputs (default bucket, buckets, table buckets).
+func (s *ServerV2) declaredOutputBuckets() []string {
+	set := map[string]struct{}{}
+	if s.config.DefaultBucket != "" {
+		set[s.config.DefaultBucket] = struct{}{}
+	}
+	for _, b := range s.config.OutputBuckets {
+		set[b] = struct{}{}
+	}
+	for _, t := range s.config.OutputTables {
+		if t.Bucket != "" {
+			set[t.Bucket] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for b := range set {
+		out = append(out, b)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// declaredOutputBucket reports whether the component may write to bucket.
+// With no outputs declared at all (hand-built test servers, dev mode) the
+// fence is inactive, except in a preview, where it denies every write.
+func (s *ServerV2) declaredOutputBucket(bucket string) bool {
+	declared := s.declaredOutputBuckets()
+	if len(declared) == 0 {
+		return s.config.Preview == nil
+	}
+	i := sort.SearchStrings(declared, bucket)
+	return i < len(declared) && declared[i] == bucket
+}
+
 func (s *ServerV2) OpenWriter(ctx context.Context, req *pb.OpenWriterRequest) (*pb.OpenWriterResponse, error) {
 	resp, err := s.openWriter(ctx, req)
 	return resp, partitionStatus(err)
@@ -153,6 +189,11 @@ func (s *ServerV2) openWriter(ctx context.Context, req *pb.OpenWriterRequest) (*
 				table, strings.Join(declared, ", "), table)
 		}
 		return nil, fmt.Errorf("cannot determine a bucket for table '%s': no bucket in the request, no outputs.tables entries, and no outputs.defaultBucket configured", table)
+	}
+
+	if !s.declaredOutputBucket(bucket) {
+		return nil, status.Errorf(codes.PermissionDenied, "bucket %q is not a declared output of this component (declared: %s)",
+			bucket, strings.Join(s.declaredOutputBuckets(), ", "))
 	}
 
 	// Get format adapter

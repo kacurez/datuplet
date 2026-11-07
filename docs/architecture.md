@@ -113,6 +113,11 @@ Responsibilities:
 - Storage browse proxy at `/api/v1/storage/*` — forwards requests to Lakekeeper
   with a short-lived (60 s) impersonation JWT.
 - Browser SPA at `/ui/*` (vanilla ES modules, no build step).
+- Pipeline previews at `/api/v1/projects/{P}/previews`: runs a PipelineDoc for real
+  with outputs (and inputs read from earlier stages) rewritten onto per-preview
+  scratch namespaces, so nothing real is written. A per-preview run identity is
+  minted as for a run; a sweeper in pipeline-api purges scratch tables and
+  namespaces after the TTL. See [pipeline-api.md](pipeline-api.md#previews).
 
 ### pipeline-observer
 
