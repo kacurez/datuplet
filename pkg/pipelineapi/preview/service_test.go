@@ -2,6 +2,8 @@ package preview
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -425,6 +427,35 @@ func TestCreate_HappyPath(t *testing.T) {
 	}
 	if len(sec.Data[pkg8s.RunTokenSecretKey]) == 0 {
 		t.Error("run token missing")
+	}
+}
+
+// The PipelineRun deadline starts at status.startTime, so the run token must
+// cover time spent Pending as well as the longest allowed timeout.
+func TestCreate_RunTokenCoversPendingAndMaxTimeout(t *testing.T) {
+	e := newEnv(t, roomyCaps)
+	resp, err := e.svc.Create(e.ctx, CreateRequest{ProjectID: e.pid, UserID: e.uid, Doc: twoStageDoc(), TimeoutSeconds: 60})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sec := &corev1.Secret{}
+	if err := e.k8s.Get(e.ctx, types.NamespacedName{Name: "runtoken-" + resp.ID.String(), Namespace: testK8sNS}, sec); err != nil {
+		t.Fatalf("Secret: %v", err)
+	}
+	parts := strings.Split(string(sec.Data[pkg8s.RunTokenSecretKey]), ".")
+	if len(parts) != 3 {
+		t.Fatalf("run token is not a JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims struct{ Iat, Exp int64 }
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := time.Duration(claims.Exp-claims.Iat)*time.Second, 90*time.Minute; got != want {
+		t.Errorf("run token lifetime = %v, want %v", got, want)
 	}
 }
 

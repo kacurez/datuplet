@@ -36,7 +36,9 @@ const (
 	defaultRowLimit, maxRowLimit           = 1000, 100000
 	defaultTimeout, minTimeout, maxTimeout = 300, 30, 3600
 	defaultTTL, minTTL, maxTTL             = 3600, 60, 86400
-	tokenSlack                             = 10 * time.Minute
+	// runTokenLifetime covers the longest timeout plus time spent Pending
+	// (the deadline starts at status.startTime), for every preview alike.
+	runTokenLifetime                       = maxTimeout*time.Second + 30*time.Minute
 	defaultPurgeWait, defaultPollInterval  = 90 * time.Second, 2 * time.Second
 	detachedTimeout                        = 10 * time.Second
 	tupleDeleteTimeout                     = 5 * time.Second
@@ -206,7 +208,7 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (*CreateResponse,
 		PipelineName: rw.Doc.Name,
 		Warehouse:    warehouse,
 		Audience:     s.d.Audience,
-		Lifetime:     time.Duration(r.TimeoutSeconds)*time.Second + tokenSlack,
+		Lifetime:     runTokenLifetime,
 	})
 	if err != nil {
 		return nil, s.failCreate(ctx, p, fmt.Errorf("mint run token: %w", err))
