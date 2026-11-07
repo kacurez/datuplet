@@ -504,6 +504,9 @@ named future work in the design spec (§10), not oversights.
 - **Scratch namespaces are visible to project members.** `pv-<id8>-<bucket>`
   namespaces show up in `datuplet storage tables` and the storage UI for
   anyone with access to the project until the preview is deleted or swept.
+- **Stuck previews are retried every 5 minutes.** A preview whose pods cannot
+  be removed (e.g. after node loss) is retried every 5 minutes and does not
+  block cleanup of others.
 - **First read can be slow.** The first `GET` after a preview ends assembles the
   result (up to ~30 s per table).
 

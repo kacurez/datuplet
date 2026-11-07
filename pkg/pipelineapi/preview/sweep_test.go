@@ -9,6 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/datuplet/datuplet/pkg/catalogwriter"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/authz"
 )
 
@@ -162,6 +166,7 @@ func TestPurge_RetriesAfterPartialFailure(t *testing.T) {
 	if p := e.get(resp.ID); p.CleanedAt != nil {
 		t.Fatal("cleaned_at set after a partial purge")
 	}
+	e.setExpiry(resp.ID, time.Minute) // backoff elapsed
 	if err := e.svc.SweepOnce(e.ctx); err != nil {
 		t.Fatalf("second sweep: %v", err)
 	}
@@ -364,5 +369,90 @@ func TestRESTCatalog_HungLakekeeperTimesOut(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("catalog call not bounded by an HTTP timeout")
+	}
+}
+
+func (e *env) setExpiry(id uuid.UUID, ago time.Duration) {
+	e.t.Helper()
+	if _, err := e.pool.Exec(e.ctx, `UPDATE previews SET expires_at = $2 WHERE id = $1`, id, time.Now().Add(-ago)); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func TestSweep_StuckRowDeferredOthersPurged(t *testing.T) {
+	e := newEnv(t, roomyCaps)
+	a, b := e.create("a"), e.create("b")
+	e.seedTables(a)
+	e.seedTables(b)
+	e.finish(a.ID, time.Now())
+	e.finish(b.ID, time.Now())
+	e.addPod(a.ID)
+	e.setExpiry(a.ID, 10*time.Minute)
+	e.setExpiry(b.ID, 5*time.Minute)
+
+	if err := e.svc.SweepOnce(e.ctx); err == nil {
+		t.Fatal("SweepOnce should report the stuck row")
+	}
+	if e.get(b.ID).CleanedAt == nil {
+		t.Error("healthy row B not cleaned")
+	}
+	pa := e.get(a.ID)
+	if pa.CleanedAt != nil {
+		t.Error("stuck row A cleaned")
+	}
+	if d := time.Until(pa.ExpiresAt) - purgeRetryBackoff; d.Abs() > 30*time.Second {
+		t.Errorf("A.expires_at = %v, want ~now+%s", pa.ExpiresAt, purgeRetryBackoff)
+	}
+
+	e.rec.reset()
+	if err := e.svc.SweepOnce(e.ctx); err != nil {
+		t.Fatalf("second SweepOnce attempted the deferred row: %v", err)
+	}
+	if ev := e.rec.list(); len(ev) != 0 {
+		t.Errorf("second sweep touched catalog/authz: %v", ev)
+	}
+}
+
+func TestSweep_StopsAtTickBudget(t *testing.T) {
+	e := newEnv(t, roomyCaps)
+	var ids []uuid.UUID
+	for i, ws := range []string{"a", "b", "c"} {
+		r := e.create(ws)
+		e.seedTables(r)
+		e.finish(r.ID, time.Now())
+		e.setExpiry(r.ID, time.Duration(30-i)*time.Minute)
+		ids = append(ids, r.ID)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	e.svc.d.Catalogs = func(context.Context, catalogwriter.TokenProvider, string, string) (Catalog, error) {
+		cancel()
+		return nil, errors.New("tick budget ended mid-purge")
+	}
+	before := []time.Time{e.get(ids[1]).ExpiresAt, e.get(ids[2]).ExpiresAt}
+	purgeBefore := testutil.ToFloat64(sweepFailures.WithLabelValues("purge"))
+	budgetBefore := testutil.ToFloat64(sweepFailures.WithLabelValues("budget"))
+
+	start := time.Now()
+	if err := e.svc.SweepOnce(ctx); err == nil {
+		t.Fatal("SweepOnce should report the exhausted budget")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("SweepOnce took %v", time.Since(start))
+	}
+	for i, id := range ids[1:] {
+		p := e.get(id)
+		if p.CleanedAt != nil || !p.ExpiresAt.Equal(before[i]) {
+			t.Errorf("row %d touched: cleaned=%v expires_at %v -> %v", i+1, p.CleanedAt, before[i], p.ExpiresAt)
+		}
+	}
+	if p := e.get(ids[0]); time.Until(p.ExpiresAt) > -29*time.Minute {
+		t.Errorf("first row deferred despite ctx ending: expires_at %v", p.ExpiresAt)
+	}
+	if d := testutil.ToFloat64(sweepFailures.WithLabelValues("purge")) - purgeBefore; d != 0 {
+		t.Errorf("purge failures counted: %v", d)
+	}
+	if d := testutil.ToFloat64(sweepFailures.WithLabelValues("budget")) - budgetBefore; d != 1 {
+		t.Errorf("budget events = %v, want 1", d)
 	}
 }

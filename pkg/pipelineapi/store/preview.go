@@ -321,6 +321,16 @@ func ExpirePreviewNow(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, now
 	return nil
 }
 
+// DeferPreviewExpiry pushes expires_at of an uncleaned preview out to until so
+// the sweeper moves on to other rows.
+func DeferPreviewExpiry(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, until time.Time) error {
+	if _, err := pool.Exec(ctx,
+		`UPDATE previews SET expires_at = $2 WHERE id = $1 AND cleaned_at IS NULL`, id, until); err != nil {
+		return fmt.Errorf("defer preview expiry: %w", err)
+	}
+	return nil
+}
+
 // MarkPreviewCleaned stamps cleaned_at. With expired=true a non-terminal
 // preview also moves to phase Expired.
 func MarkPreviewCleaned(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, at time.Time, expired bool) error {

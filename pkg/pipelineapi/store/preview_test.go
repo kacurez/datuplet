@@ -195,3 +195,33 @@ func TestListPreviews_Workspace(t *testing.T) {
 		t.Fatalf("page2: len=%d next=%q err=%v", len(rest), next, err)
 	}
 }
+
+func TestDeferPreviewExpiry_SkipsCleanedRow(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	pid := seedProject(t, pool)
+	live, cleaned := newPreview(pid, "a"), newPreview(pid, "b")
+	for _, p := range []*store.Preview{live, cleaned} {
+		if err := store.InsertPreview(ctx, pool, p, store.PreviewCaps{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkPreviewCleaned(ctx, pool, cleaned.ID, time.Now().UTC(), false); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := store.GetPreviewByID(ctx, pool, cleaned.ID)
+
+	until := time.Now().UTC().Add(5 * time.Minute).Truncate(time.Microsecond)
+	for _, id := range []uuid.UUID{live.ID, cleaned.ID} {
+		if err := store.DeferPreviewExpiry(ctx, pool, id, until); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := store.GetPreviewByID(ctx, pool, live.ID); !got.ExpiresAt.Equal(until) {
+		t.Errorf("live expires_at = %v, want %v", got.ExpiresAt, until)
+	}
+	if got, _ := store.GetPreviewByID(ctx, pool, cleaned.ID); !got.ExpiresAt.Equal(before.ExpiresAt) {
+		t.Errorf("cleaned expires_at moved: %v -> %v", before.ExpiresAt, got.ExpiresAt)
+	}
+}

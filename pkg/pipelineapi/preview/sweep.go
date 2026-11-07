@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -31,6 +32,11 @@ const (
 	unlockTimeout  = 5 * time.Second
 	minTickBudget  = 2 * time.Minute
 	tickBudgetMult = 5
+
+	// purgeRetryBackoff is how far a row whose purge failed is pushed back so
+	// stuck previews cannot starve newer expired rows.
+	purgeRetryBackoff = 5 * time.Minute
+	deferTimeout      = 5 * time.Second
 )
 
 var sweepFailures = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -139,14 +145,35 @@ func (s *Service) SweepOnce(ctx context.Context) error {
 		return err
 	}
 	for i := range expired {
-		if err := s.Purge(ctx, &expired[i]); err != nil {
-			fail(failedStep(err), expired[i].ID, err)
+		if ctx.Err() != nil {
+			fail("budget", expired[i].ID, errors.New("tick budget exhausted; remaining rows wait for the next tick"))
+			break
 		}
+		err := s.Purge(ctx, &expired[i])
+		if err == nil {
+			continue
+		}
+		if ctx.Err() != nil {
+			fail("budget", expired[i].ID, fmt.Errorf("tick budget exhausted during purge: %w", err))
+			break
+		}
+		fail(failedStep(err), expired[i].ID, err)
+		s.deferPurge(ctx, expired[i].ID)
 	}
 	if failures > 0 {
 		return fmt.Errorf("%d preview sweep step(s) failed", failures)
 	}
 	return nil
+}
+
+// deferPurge pushes a failed row's expiry out by purgeRetryBackoff on a
+// detached ctx so it lands even as the tick ends.
+func (s *Service) deferPurge(ctx context.Context, id uuid.UUID) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deferTimeout)
+	defer cancel()
+	if err := store.DeferPreviewExpiry(dctx, s.d.DB, id, s.d.Now().UTC().Add(purgeRetryBackoff)); err != nil {
+		log.Printf("pipeline-api: preview sweep: defer retry (preview=%s): %v", id, err)
+	}
 }
 
 // Purge stops the preview, waits for its pods to go, then purges and drops
