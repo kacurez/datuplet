@@ -311,6 +311,16 @@ func MarkPreviewTupleDeleted(ctx context.Context, pool *pgxpool.Pool, id uuid.UU
 	return nil
 }
 
+// ExpirePreviewNow pulls expires_at in to now (never later) so the sweeper
+// retries a purge that fails.
+func ExpirePreviewNow(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, now time.Time) error {
+	if _, err := pool.Exec(ctx,
+		`UPDATE previews SET expires_at = LEAST(expires_at, $2) WHERE id = $1`, id, now); err != nil {
+		return fmt.Errorf("expire preview: %w", err)
+	}
+	return nil
+}
+
 // MarkPreviewCleaned stamps cleaned_at. With expired=true a non-terminal
 // preview also moves to phase Expired.
 func MarkPreviewCleaned(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, at time.Time, expired bool) error {

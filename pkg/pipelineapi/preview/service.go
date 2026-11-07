@@ -301,7 +301,8 @@ func (s *Service) stop(ctx context.Context, p *store.Preview) error {
 	return s.deletePipelineRun(ctx, p)
 }
 
-// Delete cancels a running preview and purges it now.
+// Delete cancels a running preview and purges it now. It first expires the
+// row, so a purge that fails (or is cut short) is retried by the next sweep.
 func (s *Service) Delete(ctx context.Context, projectID, id uuid.UUID) error {
 	p, err := store.GetPreview(ctx, s.d.DB, projectID, id)
 	if err != nil {
@@ -314,6 +315,15 @@ func (s *Service) Delete(ctx context.Context, projectID, id uuid.UUID) error {
 		if err := s.cancel(ctx, p); err != nil {
 			return err
 		}
+	}
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedTimeout)
+	defer cancel()
+	now := s.d.Now().UTC()
+	if err := store.ExpirePreviewNow(bg, s.d.DB, p.ID, now); err != nil {
+		return err
+	}
+	if now.Before(p.ExpiresAt) {
+		p.ExpiresAt = now
 	}
 	return s.Purge(ctx, p)
 }

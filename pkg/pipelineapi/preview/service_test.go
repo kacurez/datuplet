@@ -509,6 +509,54 @@ func TestDeleteWorkspace_OnlyThatWorkspace(t *testing.T) {
 	}
 }
 
+func TestDelete_FailedPurgeRetriedNextTick(t *testing.T) {
+	e := newEnv(t, roomyCaps)
+	running, done := e.create("a"), e.create("a")
+	e.seedTables(running)
+	e.seedTables(done)
+	e.finish(done.ID, time.Now())
+	e.cat.purgeErr = func(string, string) error { return errors.New("lakekeeper down") }
+
+	for _, id := range []uuid.UUID{running.ID, done.ID} {
+		if err := e.svc.Delete(e.ctx, e.pid, id); err == nil {
+			t.Fatal("Delete should fail while purge fails")
+		}
+		if p := e.get(id); p.CleanedAt != nil || p.ExpiresAt.After(time.Now()) {
+			t.Errorf("row after failed delete: cleaned_at=%v expires_at=%v; want uncleaned and expired", p.CleanedAt, p.ExpiresAt)
+		}
+	}
+	assertExpiredListed(t, e, running.ID, done.ID)
+}
+
+func TestDeleteWorkspace_FailedPurgeRetriedNextTick(t *testing.T) {
+	e := newEnv(t, roomyCaps)
+	r := e.create("a")
+	e.seedTables(r)
+	e.cat.purgeErr = func(string, string) error { return errors.New("lakekeeper down") }
+
+	if _, failed := e.svc.DeleteWorkspace(e.ctx, e.pid, "a"); len(failed) != 1 {
+		t.Fatalf("failed = %v", failed)
+	}
+	assertExpiredListed(t, e, r.ID)
+}
+
+func assertExpiredListed(t *testing.T, e *env, ids ...uuid.UUID) {
+	t.Helper()
+	expired, err := store.ListExpiredPreviews(e.ctx, e.pool, time.Now(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := map[uuid.UUID]bool{}
+	for _, p := range expired {
+		listed[p.ID] = true
+	}
+	for _, id := range ids {
+		if !listed[id] {
+			t.Errorf("preview %s not picked up by the next sweep tick", id)
+		}
+	}
+}
+
 func TestCreate_FailureAfterInsertMarksFailed(t *testing.T) {
 	e := newEnv(t, roomyCaps)
 	e.svc.d.K8s = fake.NewClientBuilder().WithScheme(pkg8s.Scheme()).WithInterceptorFuncs(interceptor.Funcs{
