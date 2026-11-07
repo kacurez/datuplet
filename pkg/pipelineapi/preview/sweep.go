@@ -27,8 +27,10 @@ import (
 const sweepLockKey int64 = 0x70726576
 
 const (
-	sweepBatch    = 100
-	unlockTimeout = 5 * time.Second
+	sweepBatch     = 100
+	unlockTimeout  = 5 * time.Second
+	minTickBudget  = 2 * time.Minute
+	tickBudgetMult = 5
 )
 
 var sweepFailures = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -54,8 +56,10 @@ func failedStep(err error) string {
 }
 
 // RunSweeper sweeps previews every interval until ctx is done. Only the
-// replica holding the advisory lock sweeps a given tick.
+// replica holding the advisory lock sweeps a given tick, and each tick is
+// bounded so a hung call cannot hold the lock forever.
 func (s *Service) RunSweeper(ctx context.Context, interval time.Duration) {
+	budget := max(tickBudgetMult*interval, minTickBudget)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -63,16 +67,16 @@ func (s *Service) RunSweeper(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if _, err := s.sweepIfLeader(ctx); err != nil {
+			if _, err := s.sweepIfLeader(ctx, budget); err != nil {
 				log.Printf("pipeline-api: preview sweep: %v", err)
 			}
 		}
 	}
 }
 
-// sweepIfLeader runs SweepOnce under the sweep advisory lock and reports
-// whether it got the lock.
-func (s *Service) sweepIfLeader(ctx context.Context) (bool, error) {
+// sweepIfLeader runs SweepOnce, bounded by budget, under the sweep advisory
+// lock and reports whether it got the lock.
+func (s *Service) sweepIfLeader(ctx context.Context, budget time.Duration) (bool, error) {
 	conn, err := s.d.DB.Acquire(ctx)
 	if err != nil {
 		return false, fmt.Errorf("acquire conn: %w", err)
@@ -87,7 +91,9 @@ func (s *Service) sweepIfLeader(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	defer unlockSweep(ctx, conn)
-	return true, s.SweepOnce(ctx)
+	sctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	return true, s.SweepOnce(sctx)
 }
 
 // unlockSweep releases the sweep lock and returns conn to the pool. When the

@@ -140,6 +140,7 @@ type fakeCatalog struct {
 	mu       sync.Mutex
 	tables   map[string]map[string]bool
 	purgeErr func(ns, table string) error
+	listHook func(ctx context.Context) error
 }
 
 func (c *fakeCatalog) seed(ns string, tables ...string) {
@@ -163,7 +164,12 @@ func (c *fakeCatalog) total() int {
 	return n
 }
 
-func (c *fakeCatalog) ListTables(_ context.Context, ns string) ([]string, error) {
+func (c *fakeCatalog) ListTables(ctx context.Context, ns string) ([]string, error) {
+	if c.listHook != nil {
+		if err := c.listHook(ctx); err != nil {
+			return nil, err
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rec.add("list " + ns)

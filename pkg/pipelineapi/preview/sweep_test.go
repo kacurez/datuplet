@@ -228,18 +228,64 @@ func TestSweepIfLeader_SkipsWhenLockHeld(t *testing.T) {
 	if _, err := conn.Exec(e.ctx, `SELECT pg_advisory_lock($1)`, sweepLockKey); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := e.svc.sweepIfLeader(e.ctx); got || err != nil {
+	if got, err := e.svc.sweepIfLeader(e.ctx, time.Minute); got || err != nil {
 		t.Fatalf("lock held elsewhere: got=%v err=%v", got, err)
 	}
 	if _, err := conn.Exec(e.ctx, `SELECT pg_advisory_unlock($1)`, sweepLockKey); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := e.svc.sweepIfLeader(e.ctx); !got || err != nil {
+	if got, err := e.svc.sweepIfLeader(e.ctx, time.Minute); !got || err != nil {
 		t.Fatalf("lock free: got=%v err=%v", got, err)
 	}
 	var relocked bool
 	if err := conn.QueryRow(e.ctx, `SELECT pg_try_advisory_lock($1)`, sweepLockKey).Scan(&relocked); err != nil || !relocked {
 		t.Fatalf("sweep lock not released after a sweep: got=%v err=%v", relocked, err)
+	}
+	if _, err := conn.Exec(e.ctx, `SELECT pg_advisory_unlock($1)`, sweepLockKey); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSweepIfLeader_TickBudgetBoundsHungCatalog(t *testing.T) {
+	e := newEnv(t, roomyCaps)
+	resp := e.create("a")
+	e.seedTables(resp)
+	e.finish(resp.ID, time.Now().Add(-2*time.Hour))
+	e.cat.listHook = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	t.Cleanup(cancel)
+
+	type result struct {
+		got bool
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := e.svc.sweepIfLeader(ctx, 200*time.Millisecond)
+		done <- result{got, err}
+	}()
+	select {
+	case r := <-done:
+		if !r.got || r.err == nil {
+			t.Fatalf("got=%v err=%v; want the lock and a failed tick", r.got, r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep tick not bounded by its budget")
+	}
+	if p := e.get(resp.ID); p.CleanedAt != nil {
+		t.Error("cleaned_at set by a timed-out tick")
+	}
+	conn, err := e.pool.Acquire(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	var relocked bool
+	if err := conn.QueryRow(e.ctx, `SELECT pg_try_advisory_lock($1)`, sweepLockKey).Scan(&relocked); err != nil || !relocked {
+		t.Fatalf("sweep lock not released after a timed-out tick: got=%v err=%v", relocked, err)
 	}
 	if _, err := conn.Exec(e.ctx, `SELECT pg_advisory_unlock($1)`, sweepLockKey); err != nil {
 		t.Fatal(err)
@@ -279,5 +325,44 @@ func TestRESTCatalog_NotFoundIsSuccess(t *testing.T) {
 	}
 	if err := cat.DropNamespace(ctx, "pv-x-raw"); err != nil {
 		t.Errorf("DropNamespace: %v", err)
+	}
+}
+
+func TestRESTCatalog_HungLakekeeperTimesOut(t *testing.T) {
+	old := catalogResponseTimeout
+	catalogResponseTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { catalogResponseTimeout = old })
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/config" {
+			_, _ = w.Write([]byte(`{"defaults":{},"overrides":{}}`))
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cat, err := NewRESTCatalogFactory(srv.URL)(context.Background(),
+		func(context.Context) (string, error) { return "tok", nil }, "lk", "wh")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := cat.ListTables(context.Background(), "pv-x-raw")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("ListTables against a hung lakekeeper succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("catalog call not bounded by an HTTP timeout")
 	}
 }

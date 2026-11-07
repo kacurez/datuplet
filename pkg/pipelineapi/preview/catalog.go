@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
+	"time"
 
 	iceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -62,8 +64,13 @@ type LogTailer interface {
 	Tail(ctx context.Context, namespace, jobName, container string, lines int64) (string, error)
 }
 
+// catalogResponseTimeout bounds the wait for a lakekeeper response.
+var catalogResponseTimeout = 2 * time.Minute
+
 // NewRESTCatalogFactory opens lakekeeper REST catalogs at lakekeeperURL.
 func NewRESTCatalogFactory(lakekeeperURL string) CatalogFactory {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = catalogResponseTimeout
 	return func(ctx context.Context, tp catalogwriter.TokenProvider, lk, warehouse string) (Catalog, error) {
 		cli, err := catalogwriter.NewClient(ctx, catalogwriter.ClientConfig{
 			Name:          "datuplet-pipeline-api-preview",
@@ -71,6 +78,7 @@ func NewRESTCatalogFactory(lakekeeperURL string) CatalogFactory {
 			Warehouse:     warehouse,
 			ProjectID:     lk,
 			TokenProvider: tp,
+			Transport:     tr,
 		})
 		if err != nil {
 			return nil, err
