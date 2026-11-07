@@ -34,6 +34,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - **Gateway rejects writes to undeclared buckets.** A component that opens a writer for a bucket not in its `outputs` now gets PermissionDenied and the run fails, instead of the gateway creating that table.
+- **The Go SDK waits up to 60 s for the gateway sidecar at startup** before `GetConfig`, so a gateway that fails at boot now surfaces as `failed to get config` after up to 60 s instead of immediately.
 
 - **BREAKING: Lakekeeper v0.14.2, OpenFGA v1.22.1, FGA model 4.13; fresh
   install required.** There is no in-place upgrade path from an earlier
