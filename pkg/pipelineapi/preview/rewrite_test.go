@@ -171,3 +171,60 @@ func TestRewrite_OutputValidates(t *testing.T) {
 		}
 	}
 }
+
+// The validator registers each component's outputs as soon as it is checked,
+// so a later component of the same stage may read them; the rewrite must map
+// that input onto scratch too, but never a component's own outputs.
+func TestRewrite_SameStageInputs(t *testing.T) {
+	for _, stages := range [][]config.Stage{
+		{{Name: "s0", Components: []config.Component{
+			{Name: "a", Component: "x", Outputs: &config.OutputSpec{DefaultBucket: "raw"}},
+			{Name: "b", Component: "x", Inputs: &config.InputSpec{Buckets: []string{"raw"}, Tables: []config.InputTableSpec{{Bucket: "raw", Table: "t"}}},
+				Outputs: &config.OutputSpec{DefaultBucket: "out"}},
+		}}},
+		{{Name: "s0", Components: []config.Component{{Name: "g", Component: "x", Outputs: &config.OutputSpec{DefaultBucket: "seed"}}}},
+			{Name: "s1", Components: []config.Component{
+				{Name: "a", Component: "x", Outputs: &config.OutputSpec{DefaultBucket: "raw"}},
+				{Name: "b", Component: "x", Inputs: &config.InputSpec{Buckets: []string{"raw"}, Tables: []config.InputTableSpec{{Bucket: "raw", Table: "t"}}},
+					Outputs: &config.OutputSpec{DefaultBucket: "out"}},
+			}}},
+	} {
+		doc := &config.Pipeline{Name: "orig", Stages: stages}
+		raw, _ := json.Marshal(doc)
+		_, findings := validate.ValidatePipelineDoc(raw, "orig", nil, nil)
+		for _, f := range findings {
+			if f.Severity == "error" {
+				t.Fatalf("original doc should validate: %+v", f)
+			}
+		}
+		res, err := Rewrite(doc, testID, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		last := res.Doc.Stages[len(stages)-1]
+		in := last.Components[1].Inputs
+		if in.Buckets[0] != "pv-ab12cd34-raw" || in.Tables[0].Bucket != "pv-ab12cd34-raw" {
+			t.Errorf("%d stage(s): same-stage input not mapped: %+v", len(stages), in)
+		}
+		rewritten, _ := json.Marshal(res.Doc)
+		_, findings = validate.ValidatePipelineDoc(rewritten, res.Doc.Name, nil, nil)
+		for _, f := range findings {
+			if f.Severity == "error" {
+				t.Errorf("%d stage(s): rewritten doc invalid: %+v", len(stages), f)
+			}
+		}
+	}
+
+	self := &config.Pipeline{Name: "orig", Stages: []config.Stage{{Name: "s0", Components: []config.Component{{
+		Name: "a", Component: "x",
+		Inputs:  &config.InputSpec{Buckets: []string{"raw"}},
+		Outputs: &config.OutputSpec{DefaultBucket: "raw"},
+	}}}}}
+	res, err := Rewrite(self, testID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Doc.Stages[0].Components[0].Inputs.Buckets[0]; got != "raw" {
+		t.Errorf("a component's own output must not feed its input: got %q", got)
+	}
+}

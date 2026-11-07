@@ -32,7 +32,8 @@ func ScratchBucket(previewID uuid.UUID, bucket string) string {
 
 // Rewrite deep-copies doc, drops stages after untilStage (when set) and maps
 // every output bucket, plus inputs that read a bucket produced by an earlier
-// stage, onto scratch namespaces. Table names are never touched.
+// component (of an earlier stage or, as the validator allows, of the same
+// stage), onto scratch namespaces. Table names are never touched.
 func Rewrite(doc *config.Pipeline, previewID uuid.UUID, untilStage string) (*RewriteResult, error) {
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -68,9 +69,8 @@ func Rewrite(doc *config.Pipeline, previewID uuid.UUID, untilStage string) (*Rew
 		return s, nil
 	}
 
-	produced := map[string]bool{} // logical buckets produced by earlier stages
+	produced := map[string]bool{} // logical buckets produced by earlier components
 	for i := range out.Stages {
-		stageOutputs := map[string]bool{}
 		for j := range out.Stages[i].Components {
 			c := &out.Stages[i].Components[j]
 			if in := c.Inputs; in != nil {
@@ -98,7 +98,7 @@ func Rewrite(doc *config.Pipeline, previewID uuid.UUID, untilStage string) (*Rew
 				continue
 			}
 			if o.DefaultBucket != "" {
-				stageOutputs[o.DefaultBucket] = true
+				produced[o.DefaultBucket] = true
 				s, err := scratchOf(o.DefaultBucket)
 				if err != nil {
 					return nil, err
@@ -106,7 +106,7 @@ func Rewrite(doc *config.Pipeline, previewID uuid.UUID, untilStage string) (*Rew
 				o.DefaultBucket = s
 			}
 			for k := range o.Buckets {
-				stageOutputs[o.Buckets[k].Name] = true
+				produced[o.Buckets[k].Name] = true
 				s, err := scratchOf(o.Buckets[k].Name)
 				if err != nil {
 					return nil, err
@@ -114,16 +114,13 @@ func Rewrite(doc *config.Pipeline, previewID uuid.UUID, untilStage string) (*Rew
 				o.Buckets[k].Name = s
 			}
 			for k := range o.Tables {
-				stageOutputs[o.Tables[k].Bucket] = true
+				produced[o.Tables[k].Bucket] = true
 				s, err := scratchOf(o.Tables[k].Bucket)
 				if err != nil {
 					return nil, err
 				}
 				o.Tables[k].Bucket = s
 			}
-		}
-		for b := range stageOutputs {
-			produced[b] = true
 		}
 	}
 
