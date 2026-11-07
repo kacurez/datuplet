@@ -754,6 +754,19 @@ func TestOpenWriter_NoDeclaredOutputs_FenceInactive(t *testing.T) {
 	}
 }
 
+func TestOpenWriter_Preview_NoDeclaredOutputs_Denied(t *testing.T) {
+	s, _ := newWriteTestServer(t, &Config{Preview: &PreviewConfig{ID: "p", RowLimit: 10}})
+	fr := &fakeResolver{}
+	s.lakekeeperResolver = fr
+	_, err := s.OpenWriter(context.Background(), &pb.OpenWriterRequest{Bucket: "raw", Table: "data"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v (err %v), want PermissionDenied", status.Code(err), err)
+	}
+	if fr.calls != 0 {
+		t.Fatalf("LoadOrCreateForWrite calls = %d, want 0", fr.calls)
+	}
+}
+
 func rowCapBatch(t *testing.T, n int) arrow.RecordBatch {
 	t.Helper()
 	b := array.NewInt64Builder(memory.NewGoAllocator())

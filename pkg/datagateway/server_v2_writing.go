@@ -135,11 +135,11 @@ func (s *ServerV2) declaredOutputBuckets() []string {
 
 // declaredOutputBucket reports whether the component may write to bucket.
 // With no outputs declared at all (hand-built test servers, dev mode) the
-// fence is inactive.
+// fence is inactive, except in a preview, where it denies every write.
 func (s *ServerV2) declaredOutputBucket(bucket string) bool {
 	declared := s.declaredOutputBuckets()
 	if len(declared) == 0 {
-		return true
+		return s.config.Preview == nil
 	}
 	i := sort.SearchStrings(declared, bucket)
 	return i < len(declared) && declared[i] == bucket
