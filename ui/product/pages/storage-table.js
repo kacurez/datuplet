@@ -7,7 +7,7 @@
 // The router (app.js renderRoute) passes ctx = { params: [...] } where
 // params[0] = namespace, params[1] = name.
 
-import { esc, getTableInfo, getTableSchema, getTablePreview, deleteTable } from '/ui/api.js';
+import { esc, getTableInfo, getTableSchema, getTablePreview, deleteTable, compactTable } from '/ui/api.js';
 import { skeletonRows } from '/ui/components.js';
 import { timeTag, formatBytes, storageFolderURI, gcsConsoleHref } from '/ui/format.js';
 import * as icons from '/ui/icons.js';
@@ -67,10 +67,15 @@ function renderHeader(ns, name, activeTab) {
         const label = t.charAt(0).toUpperCase() + t.slice(1);
         return `<button class="${cls}" data-tab="${t}">${esc(label)}</button>`;
       }).join('')}
+      <button class="btn btn--secondary" id="compact-table-btn"
+              title="Merge small data files into fewer, larger ones">Compact</button>
       <button class="btn btn--danger" id="delete-table-btn"
               title="Permanently delete this table and its data files">Delete</button>
     </div>
   `;
+  document.getElementById('compact-table-btn').addEventListener('click', () => {
+    onCompactTable(ns, name);
+  });
   document.getElementById('delete-table-btn').addEventListener('click', () => {
     onDeleteTable(ns, name);
   });
@@ -88,6 +93,53 @@ function renderHeader(ns, name, activeTab) {
     const projectId = window.__datupletActiveProjectID;
     renderActiveTab(projectId, ns, name, tab);
   });
+}
+
+// onCompactTable starts a compaction run and jumps to its run page. v1 only
+// reduces the current snapshot's file count; it does not reclaim storage, so
+// the confirm text says so.
+async function onCompactTable(ns, name) {
+  const ref = `${ns}.${name}`;
+  if (!window.confirm(
+    `Compact ${ref}?\n\n` +
+    'This rewrites the table\'s small data files into fewer, larger ones as a ' +
+    'new snapshot. It does not reclaim storage: the old files stay until ' +
+    'snapshots are expired.',
+  )) return;
+  const btn = document.getElementById('compact-table-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+  const projectId = window.__datupletActiveProjectID;
+  try {
+    const res = await compactTable(projectId, ns, name);
+    window.location.assign(`/ui/runs/${encodeURIComponent(res.run_id)}`);
+    return;
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Compact'; }
+    if (e.code === 'compaction_running' && e.runId) {
+      showCompactNotice(`A compaction of ${ref} is already running. `,
+        `/ui/runs/${encodeURIComponent(e.runId)}`, 'View the running run');
+      return;
+    }
+    if (e.code === 'compaction_busy') {
+      window.alert('The server is busy starting other compactions. Try again in a few seconds.');
+      return;
+    }
+    window.alert(`Failed to compact ${ref}: ${e.message}`);
+  }
+}
+
+function showCompactNotice(text, href, linkText) {
+  let box = document.getElementById('compact-notice');
+  if (!box) {
+    box = document.createElement('p');
+    box.id = 'compact-notice';
+    document.getElementById('page-head').appendChild(box);
+  }
+  box.textContent = text;
+  const a = document.createElement('a');
+  a.href = href;
+  a.textContent = linkText;
+  box.appendChild(a);
 }
 
 // onDeleteTable requires the operator to retype the full `ns.name` before

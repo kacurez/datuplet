@@ -23,6 +23,8 @@ type Run struct {
 	// PipelineName is populated only when a query joins the pipelines table
 	// (ListRunsPage, GetRunByID). Empty otherwise.
 	PipelineName string
+	// PipelineDescription is populated alongside PipelineName.
+	PipelineDescription string
 	// StageStatuses is the raw JSON snapshot of PipelineRun.Status.StageStatuses,
 	// or nil when no timeline has been recorded. Populated by GetRunByID only.
 	StageStatuses []byte
@@ -74,13 +76,13 @@ func GetRunByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (*Run, er
 	r := &Run{}
 	var triggeredBy *uuid.UUID
 	err := pool.QueryRow(ctx,
-		`SELECT r.id, r.project_id, r.pipeline_id, pl.name, r.phase, r.current_stage,
+		`SELECT r.id, r.project_id, r.pipeline_id, pl.name, pl.description, r.phase, r.current_stage,
 		        r.message, r.started_at, r.completed_at, r.triggered_by,
 		        r.created_at, r.updated_at, r.stage_statuses
 		   FROM runs r
 		   JOIN pipelines pl ON pl.id = r.pipeline_id
 		  WHERE r.id = $1`, id,
-	).Scan(&r.ID, &r.ProjectID, &r.PipelineID, &r.PipelineName, &r.Phase, &r.CurrentStage,
+	).Scan(&r.ID, &r.ProjectID, &r.PipelineID, &r.PipelineName, &r.PipelineDescription, &r.Phase, &r.CurrentStage,
 		&r.Message, &r.StartedAt, &r.CompletedAt, &triggeredBy,
 		&r.CreatedAt, &r.UpdatedAt, &r.StageStatuses)
 	if err != nil {
@@ -125,6 +127,24 @@ func ListRunsForProject(ctx context.Context, pool *pgxpool.Pool, projectID uuid.
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ActiveRunForPipeline returns the newest Pending or Running run of the named
+// pipeline, or uuid.Nil when there is none.
+func ActiveRunForPipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := pool.QueryRow(ctx,
+		`SELECT r.id FROM runs r
+		   JOIN pipelines pl ON pl.id = r.pipeline_id
+		  WHERE pl.project_id = $1 AND pl.name = $2 AND r.phase IN ('Pending','Running')
+		  ORDER BY r.created_at DESC LIMIT 1`, projectID, name).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("select active run: %w", err)
+	}
+	return id, nil
 }
 
 // RunListOpts are the filters + paging knobs for ListRunsPage. Zero values
@@ -177,7 +197,7 @@ func ListRunsPage(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, 
 	}
 	args = append(args, limit+1)
 	q := fmt.Sprintf(`
-		SELECT r.id, r.project_id, r.pipeline_id, pl.name, r.phase, r.current_stage,
+		SELECT r.id, r.project_id, r.pipeline_id, pl.name, pl.description, r.phase, r.current_stage,
 		       r.message, r.started_at, r.completed_at, r.triggered_by,
 		       r.created_at, r.updated_at
 		  FROM runs r
@@ -195,7 +215,7 @@ func ListRunsPage(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, 
 	for rows.Next() {
 		r := &Run{}
 		var triggeredBy *uuid.UUID
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.PipelineID, &r.PipelineName, &r.Phase,
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.PipelineID, &r.PipelineName, &r.PipelineDescription, &r.Phase,
 			&r.CurrentStage, &r.Message, &r.StartedAt, &r.CompletedAt, &triggeredBy,
 			&r.CreatedAt, &r.UpdatedAt); err != nil {
 			return RunPage{}, fmt.Errorf("scan: %w", err)

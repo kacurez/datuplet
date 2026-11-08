@@ -38,6 +38,24 @@ var (
 		Name: "datuplet_dg_commit_errors_total",
 		Help: "Inline commit errors by class.",
 	}, []string{"class"})
+
+	compactionRuns = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "datagateway_compaction_runs_total",
+		Help: "CompactTable calls by result status (FAILED on error).",
+	}, []string{"status"})
+	compactionDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "datagateway_compaction_duration_seconds",
+		Help:    "CompactTable duration.",
+		Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600},
+	}, []string{"status"})
+	compactionFiles = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "datagateway_compaction_files_total",
+		Help: "Data files removed and added by committed compactions.",
+	}, []string{"op"})
+	compactionErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "datagateway_compaction_errors_total",
+		Help: "CompactTable errors by class.",
+	}, []string{"class"})
 )
 
 // classifyCommitError maps an error to a stable metric label using TYPED

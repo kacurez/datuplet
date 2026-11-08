@@ -135,6 +135,7 @@ func (s *pgxPipelineStore) Get(ctx context.Context, projectID uuid.UUID, name st
 		ID:        p.ID.String(),
 		Name:      p.Name,
 		Doc:       json.RawMessage(p.Doc),
+		System:    p.System,
 		CreatedAt: p.CreatedAt.Format(pipelineTimeLayout),
 		UpdatedAt: p.UpdatedAt.Format(pipelineTimeLayout),
 	}, nil
@@ -181,6 +182,9 @@ func (s *pgxPipelineStore) Delete(ctx context.Context, projectID uuid.UUID, name
 	if err := store.DeletePipeline(ctx, s.pool, projectID, name); err != nil {
 		if errors.Is(err, store.ErrPipelineNotFound) {
 			return errStoreNotFound
+		}
+		if errors.Is(err, store.ErrSystemPipeline) {
+			return errSystemPipeline
 		}
 		return err
 	}

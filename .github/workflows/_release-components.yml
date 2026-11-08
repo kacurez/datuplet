@@ -1,7 +1,7 @@
 name: release-components
 
-# Reusable: builds + manifests the three built-in component images
-# (data-generator, sql-transform, http-json-extractor).
+# Reusable: builds + manifests the four built-in component images
+# (data-generator, sql-transform, http-json-extractor, iceberg-compactor).
 # Each is a call to _release-image.yml. Called once
 # from release.yml as the `components` job; appears as a collapsible
 # group in the run-detail UI containing the three image rows.
@@ -35,3 +35,9 @@ jobs:
       dockerfile: components/http-json-extractor/Dockerfile
     secrets: inherit
 
+  iceberg-compactor:
+    uses: ./.github/workflows/_release-image.yml
+    with:
+      name: iceberg-compactor
+      dockerfile: components/iceberg-compactor/Dockerfile
+    secrets: inherit

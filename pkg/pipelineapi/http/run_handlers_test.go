@@ -45,7 +45,7 @@ func freshServerWithK8s(t *testing.T) (*httptest.Server, *pgxpool.Pool, *authzte
 // client, so tests can inject an interceptor client (e.g. Forbidden on the
 // managed-Secret Get). The run-trigger backend AND WithSecrets share this one
 // client, mirroring main.go's wiring.
-func freshServerWithK8sClient(t *testing.T, c client.Client) (*httptest.Server, *pgxpool.Pool, *authztest.Fake, func()) {
+func freshServerWithK8sClient(t *testing.T, c client.Client, wire ...func(*apihttp.Server, *pgxpool.Pool, *authztest.Fake) *apihttp.Server) (*httptest.Server, *pgxpool.Pool, *authztest.Fake, func()) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -111,6 +111,9 @@ func freshServerWithK8sClient(t *testing.T, c client.Client) (*httptest.Server, 
 		// S7 ladder no-ops for every test above; only the secret-ladder
 		// tests below exercise it.
 		WithSecrets(c, time.Now)
+	for _, w := range wire {
+		srv = w(srv, pool, authzr)
+	}
 	ts := httptest.NewServer(srv.Handler())
 	cleanup := func() { ts.Close(); pool.Close() }
 	return ts, pool, authzr, cleanup

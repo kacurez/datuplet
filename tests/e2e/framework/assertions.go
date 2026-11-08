@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
+	icebergtable "github.com/apache/iceberg-go/table"
 )
 
 // QueryTarget describes how to reach Iceberg tables for assertions.
@@ -343,5 +344,68 @@ func AssertIcebergColumnTypes(t *testing.T, target QueryTarget, bucket, table st
 		if !f.Type.Equals(wantType) {
 			t.Errorf("%s/%s: column %q is %s, want %s", bucket, table, name, f.Type, wantType)
 		}
+	}
+}
+
+// DataFileCount returns the number of data files in bucket.table's current
+// snapshot, planned through the lakekeeper catalog (K8s tier only).
+func DataFileCount(t *testing.T, target QueryTarget, bucket, table string) int {
+	t.Helper()
+	if target.Resolver == nil {
+		t.Fatalf("DataFileCount %s/%s: query target has no lakekeeper resolver", bucket, table)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h := SharedHarness()
+	if h == nil {
+		t.Fatalf("DataFileCount %s/%s: no shared harness", bucket, table)
+	}
+	// Host IO: the Resolver's vended in-cluster storage endpoint is unreachable from the host.
+	load, err := hostIOLoader(ctx, h, "datuplet-e2e-filecount", bucket, table)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	tbl, err := load()
+	if err != nil {
+		t.Fatalf("load %s/%s: %v", bucket, table, err)
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatalf("plan files %s/%s: %v", bucket, table, err)
+	}
+	return len(tasks)
+}
+
+// AssertDataFileCount fails when bucket.table's current snapshot holds more
+// than maxFiles data files.
+func AssertDataFileCount(t *testing.T, target QueryTarget, bucket, table string, maxFiles int) {
+	t.Helper()
+	if n := DataFileCount(t, target, bucket, table); n > maxFiles {
+		t.Errorf("%s/%s: %d data files, want <= %d", bucket, table, n, maxFiles)
+	}
+}
+
+// AssertLatestSnapshotReplaceWithCommitKey checks that bucket.table's current
+// snapshot is a `replace` operation carrying a non-empty datuplet.commit-key.
+func AssertLatestSnapshotReplaceWithCommitKey(t *testing.T, target QueryTarget, bucket, table string) {
+	t.Helper()
+	if target.Resolver == nil {
+		t.Fatalf("AssertLatestSnapshotReplaceWithCommitKey %s/%s: query target has no lakekeeper resolver", bucket, table)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tbl, err := target.Resolver.LoadTable(ctx, bucket, table)
+	if err != nil {
+		t.Fatalf("load %s/%s: %v", bucket, table, err)
+	}
+	snap := tbl.CurrentSnapshot()
+	if snap == nil || snap.Summary == nil {
+		t.Fatalf("%s/%s: no current snapshot summary", bucket, table)
+	}
+	if snap.Summary.Operation != icebergtable.OpReplace {
+		t.Errorf("%s/%s: latest snapshot operation %q, want %q", bucket, table, snap.Summary.Operation, icebergtable.OpReplace)
+	}
+	if snap.Summary.Properties["datuplet.commit-key"] == "" {
+		t.Errorf("%s/%s: latest snapshot lacks datuplet.commit-key: %v", bucket, table, snap.Summary.Properties)
 	}
 }

@@ -36,6 +36,11 @@ func main() {
 	storageRows := storageCmd.Int("rows", 0, "Max preview rows (sample subcommand only; 0 = server default)")
 	storageConfirm := storageCmd.String("confirm", "", "Retype <ns>.<table> to confirm `delete` (required; no undo)")
 
+	storageWait := storageCmd.Bool("wait", false, "Block until the compaction run is terminal (compact subcommand only)")
+	storageTimeout := storageCmd.Duration("timeout", time.Hour, "Cap on --wait (compact subcommand only); on expiry the run keeps going")
+	storageJSON := storageCmd.Bool("json", false, "Structured JSON output (compact subcommand only)")
+	storageTargetMB := storageCmd.Int("target-file-size-mb", 0, "Target data file size in MiB (compact subcommand only; 0 = default)")
+
 	queryCmd := flag.NewFlagSet("query", flag.ExitOnError)
 	queryRemote := queryCmd.String("remote", "", "pipeline-api URL (required)")
 	queryTokenFile := queryCmd.String("token-file", "", "Path to JWT token file (default: ~/.datuplet/token)")
@@ -93,7 +98,7 @@ func main() {
 		storageCmd.Parse(os.Args[2:])
 		if *storageRemote == "" && os.Getenv(envRemote) == "" {
 			fmt.Fprintln(os.Stderr, "Error: --remote is required (or set $DATUPLET_REMOTE)")
-			fmt.Fprintln(os.Stderr, "Usage: datuplet storage --remote <url> [--project N] [--rows N] <tables|info|schema|sample|history|delete> [<ns>.<table>]")
+			fmt.Fprintln(os.Stderr, "Usage: datuplet storage --remote <url> [--project N] [--rows N] <tables|info|schema|sample|history|delete|compact> [<ns>.<table>]")
 			os.Exit(1)
 		}
 		if storageCmd.NArg() < 1 {
@@ -105,7 +110,7 @@ func main() {
 		switch sub {
 		case "tables":
 			err = runStorageTables(*storageRemote, *storageTokenFile, *storageProject)
-		case "info", "schema", "history", "sample", "delete":
+		case "info", "schema", "history", "sample", "delete", "compact":
 			if storageCmd.NArg() < 2 {
 				fmt.Fprintf(os.Stderr, "Error: %s requires <ns>.<table>\n", sub)
 				os.Exit(1)
@@ -120,6 +125,8 @@ func main() {
 				err = runStorageHistory(*storageRemote, *storageTokenFile, *storageProject, ref)
 			case "sample":
 				err = runStorageSample(*storageRemote, *storageTokenFile, *storageProject, ref, *storageRows)
+			case "compact":
+				err = runStorageCompact(*storageRemote, *storageTokenFile, *storageProject, ref, *storageTargetMB, *storageWait, *storageTimeout, *storageJSON)
 			case "delete":
 				err = runStorageDelete(*storageRemote, *storageTokenFile, *storageProject, ref, *storageConfirm)
 			}

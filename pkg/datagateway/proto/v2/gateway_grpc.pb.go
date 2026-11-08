@@ -19,18 +19,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	DataGateway_GetConfig_FullMethodName   = "/datuplet.gateway.v2.DataGateway/GetConfig"
-	DataGateway_Shutdown_FullMethodName    = "/datuplet.gateway.v2.DataGateway/Shutdown"
-	DataGateway_OpenWriter_FullMethodName  = "/datuplet.gateway.v2.DataGateway/OpenWriter"
-	DataGateway_WriteChunk_FullMethodName  = "/datuplet.gateway.v2.DataGateway/WriteChunk"
-	DataGateway_CloseWriter_FullMethodName = "/datuplet.gateway.v2.DataGateway/CloseWriter"
-	DataGateway_OpenReader_FullMethodName  = "/datuplet.gateway.v2.DataGateway/OpenReader"
-	DataGateway_ReadChunk_FullMethodName   = "/datuplet.gateway.v2.DataGateway/ReadChunk"
-	DataGateway_CloseReader_FullMethodName = "/datuplet.gateway.v2.DataGateway/CloseReader"
-	DataGateway_Commit_FullMethodName      = "/datuplet.gateway.v2.DataGateway/Commit"
-	DataGateway_GetSchema_FullMethodName   = "/datuplet.gateway.v2.DataGateway/GetSchema"
-	DataGateway_GetSample_FullMethodName   = "/datuplet.gateway.v2.DataGateway/GetSample"
-	DataGateway_Log_FullMethodName         = "/datuplet.gateway.v2.DataGateway/Log"
+	DataGateway_GetConfig_FullMethodName    = "/datuplet.gateway.v2.DataGateway/GetConfig"
+	DataGateway_Shutdown_FullMethodName     = "/datuplet.gateway.v2.DataGateway/Shutdown"
+	DataGateway_OpenWriter_FullMethodName   = "/datuplet.gateway.v2.DataGateway/OpenWriter"
+	DataGateway_WriteChunk_FullMethodName   = "/datuplet.gateway.v2.DataGateway/WriteChunk"
+	DataGateway_CloseWriter_FullMethodName  = "/datuplet.gateway.v2.DataGateway/CloseWriter"
+	DataGateway_OpenReader_FullMethodName   = "/datuplet.gateway.v2.DataGateway/OpenReader"
+	DataGateway_ReadChunk_FullMethodName    = "/datuplet.gateway.v2.DataGateway/ReadChunk"
+	DataGateway_CloseReader_FullMethodName  = "/datuplet.gateway.v2.DataGateway/CloseReader"
+	DataGateway_Commit_FullMethodName       = "/datuplet.gateway.v2.DataGateway/Commit"
+	DataGateway_CompactTable_FullMethodName = "/datuplet.gateway.v2.DataGateway/CompactTable"
+	DataGateway_GetSchema_FullMethodName    = "/datuplet.gateway.v2.DataGateway/GetSchema"
+	DataGateway_GetSample_FullMethodName    = "/datuplet.gateway.v2.DataGateway/GetSample"
+	DataGateway_Log_FullMethodName          = "/datuplet.gateway.v2.DataGateway/Log"
 )
 
 // DataGatewayClient is the client API for DataGateway service.
@@ -62,6 +63,9 @@ type DataGatewayClient interface {
 	CloseReader(ctx context.Context, in *CloseReaderRequest, opts ...grpc.CallOption) (*CloseReaderResponse, error)
 	// Commit
 	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
+	// Compaction: bin-pack the small data files of one explicitly declared
+	// output table into one replace snapshot. Long-running; no deadline.
+	CompactTable(ctx context.Context, in *CompactTableRequest, opts ...grpc.CallOption) (*CompactTableResponse, error)
 	// Schema/Sampling (for discovery)
 	GetSchema(ctx context.Context, in *GetSchemaRequest, opts ...grpc.CallOption) (*SchemaResponse, error)
 	GetSample(ctx context.Context, in *GetSampleRequest, opts ...grpc.CallOption) (*SampleResponse, error)
@@ -176,6 +180,16 @@ func (c *dataGatewayClient) Commit(ctx context.Context, in *CommitRequest, opts 
 	return out, nil
 }
 
+func (c *dataGatewayClient) CompactTable(ctx context.Context, in *CompactTableRequest, opts ...grpc.CallOption) (*CompactTableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompactTableResponse)
+	err := c.cc.Invoke(ctx, DataGateway_CompactTable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *dataGatewayClient) GetSchema(ctx context.Context, in *GetSchemaRequest, opts ...grpc.CallOption) (*SchemaResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SchemaResponse)
@@ -235,6 +249,9 @@ type DataGatewayServer interface {
 	CloseReader(context.Context, *CloseReaderRequest) (*CloseReaderResponse, error)
 	// Commit
 	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
+	// Compaction: bin-pack the small data files of one explicitly declared
+	// output table into one replace snapshot. Long-running; no deadline.
+	CompactTable(context.Context, *CompactTableRequest) (*CompactTableResponse, error)
 	// Schema/Sampling (for discovery)
 	GetSchema(context.Context, *GetSchemaRequest) (*SchemaResponse, error)
 	GetSample(context.Context, *GetSampleRequest) (*SampleResponse, error)
@@ -276,6 +293,9 @@ func (UnimplementedDataGatewayServer) CloseReader(context.Context, *CloseReaderR
 }
 func (UnimplementedDataGatewayServer) Commit(context.Context, *CommitRequest) (*CommitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Commit not implemented")
+}
+func (UnimplementedDataGatewayServer) CompactTable(context.Context, *CompactTableRequest) (*CompactTableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompactTable not implemented")
 }
 func (UnimplementedDataGatewayServer) GetSchema(context.Context, *GetSchemaRequest) (*SchemaResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSchema not implemented")
@@ -462,6 +482,24 @@ func _DataGateway_Commit_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DataGateway_CompactTable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompactTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataGatewayServer).CompactTable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataGateway_CompactTable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataGatewayServer).CompactTable(ctx, req.(*CompactTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DataGateway_GetSchema_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSchemaRequest)
 	if err := dec(in); err != nil {
@@ -554,6 +592,10 @@ var DataGateway_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Commit",
 			Handler:    _DataGateway_Commit_Handler,
+		},
+		{
+			MethodName: "CompactTable",
+			Handler:    _DataGateway_CompactTable_Handler,
 		},
 		{
 			MethodName: "GetSchema",

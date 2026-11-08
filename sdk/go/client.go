@@ -1109,6 +1109,62 @@ func (c *Client) Commit(ctx context.Context, opts ...CommitOption) (*CommitResul
 }
 
 // =============================================================================
+// Compaction
+// =============================================================================
+
+// CompactOptions tunes Compact. Zero values take the gateway defaults
+// (TargetFileSizeBytes: the pipeline's gateway target_file_size).
+type CompactOptions struct {
+	TargetFileSizeBytes int64
+	MinInputFiles       int
+	MaxInputFiles       int
+	DryRun              bool
+}
+
+// CompactResult reports one compaction. Status is COMPACTED,
+// ALREADY_COMMITTED, NOTHING_TO_DO, SUPERSEDED or DRY_RUN.
+type CompactResult struct {
+	Status                                            string
+	FilesBefore, FilesRemoved, FilesAdded, FilesAfter int
+	FilesSkipped, FilesDeferred, Groups               int
+	BytesBefore, BytesAfter                           int64
+	SnapshotBefore, SnapshotAfter                     int64
+	Duration                                          time.Duration
+}
+
+// Compact compacts bucket.table, which must be one of the component's
+// explicitly declared output tables. It can run for a long time and sets no
+// deadline of its own; the returned error carries the gRPC status code.
+func (c *Client) Compact(ctx context.Context, bucket, table string, opts CompactOptions) (*CompactResult, error) {
+	resp, err := c.client.CompactTable(ctx, &pb.CompactTableRequest{
+		Bucket:              bucket,
+		Table:               table,
+		TargetFileSizeBytes: opts.TargetFileSizeBytes,
+		MinInputFiles:       int32(opts.MinInputFiles),
+		MaxInputFiles:       int32(opts.MaxInputFiles),
+		DryRun:              opts.DryRun,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compact %s.%s failed: %w", bucket, table, err)
+	}
+	return &CompactResult{
+		Status:         resp.Status,
+		FilesBefore:    int(resp.FilesBefore),
+		FilesRemoved:   int(resp.FilesRemoved),
+		FilesAdded:     int(resp.FilesAdded),
+		FilesAfter:     int(resp.FilesAfter),
+		FilesSkipped:   int(resp.FilesSkipped),
+		FilesDeferred:  int(resp.FilesDeferred),
+		Groups:         int(resp.Groups),
+		BytesBefore:    resp.BytesBefore,
+		BytesAfter:     resp.BytesAfter,
+		SnapshotBefore: resp.SnapshotBefore,
+		SnapshotAfter:  resp.SnapshotAfter,
+		Duration:       time.Duration(resp.DurationMs) * time.Millisecond,
+	}, nil
+}
+
+// =============================================================================
 // Schema & Sample
 // =============================================================================
 

@@ -157,6 +157,10 @@ func (s *Server) handlePutPipeline(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if strings.HasPrefix(name, "sys-") {
+		writeError(w, http.StatusBadRequest, "reserved_name")
+		return
+	}
 	// The name becomes a K8s Pipeline/PipelineRun resource name, so it
 	// must satisfy DNS-1123 subdomain rules (lowercase alphanumerics
 	// plus '-' and '.', max 253 chars). Rejecting here yields a clean
@@ -541,6 +545,10 @@ func (s *Server) handleDeletePipeline(w http.ResponseWriter, r *http.Request) {
 	if err := s.pipelines.Delete(r.Context(), projectID, name); err != nil {
 		if errors.Is(err, errStoreNotFound) {
 			writeError(w, http.StatusNotFound, "pipeline not found")
+			return
+		}
+		if errors.Is(err, errSystemPipeline) {
+			writeError(w, http.StatusConflict, "system_pipeline")
 			return
 		}
 		if errors.Is(err, errPipelineInUse) {

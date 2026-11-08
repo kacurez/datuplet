@@ -52,20 +52,11 @@ func (c hostIOCatalog) CommitTable(ctx context.Context, ident icebergtable.Ident
 	return c.cat.CommitTable(ctx, ident, reqs, updates)
 }
 
-// DeleteResult describes a table's scan plan after a delete.
-type DeleteResult struct {
-	DataFiles       int // data files in the current snapshot
-	FilesWithDV     int // data files carrying a deletion vector
-	FilesWithDelete int // data files carrying any other delete file
-}
-
-// DeleteRowsMergeOnRead switches (namespace, table) to merge-on-read and
-// deletes the rows matching filter with iceberg-go, as alice. On a v3 table
-// this writes a deletion vector on each affected data file. It returns the
-// scan plan's file counts after the delete.
-func DeleteRowsMergeOnRead(ctx context.Context, h *FGAHarness, namespace, table string, filter iceberg.BooleanExpression) (DeleteResult, error) {
+// hostIOLoader returns a function that loads (namespace, table) from
+// lakekeeper as alice, with IO against the host-reachable MinIO endpoint.
+func hostIOLoader(ctx context.Context, h *FGAHarness, clientName, namespace, table string) (func() (*icebergtable.Table, error), error) {
 	cli, err := catalogwriter.NewClient(ctx, catalogwriter.ClientConfig{
-		Name:      "datuplet-e2e-delete",
+		Name:      clientName,
 		URI:       h.CatalogURI(),
 		Warehouse: h.WarehouseName,
 		ProjectID: h.LakekeeperProjectID,
@@ -78,7 +69,7 @@ func DeleteRowsMergeOnRead(ctx context.Context, h *FGAHarness, namespace, table 
 		},
 	})
 	if err != nil {
-		return DeleteResult{}, fmt.Errorf("open lakekeeper catalog: %w", err)
+		return nil, fmt.Errorf("open lakekeeper catalog: %w", err)
 	}
 	props := map[string]string{
 		icebergio.S3EndpointURL:            "http://" + minioLocalAddress,
@@ -89,13 +80,31 @@ func DeleteRowsMergeOnRead(ctx context.Context, h *FGAHarness, namespace, table 
 	}
 	cat := hostIOCatalog{cat: cli.Catalog}
 	ident := catalog.ToIdentifier(namespace, table)
-	load := func() (*icebergtable.Table, error) {
+	return func() (*icebergtable.Table, error) {
 		t, err := cli.Catalog.LoadTable(ctx, ident)
 		if err != nil {
 			return nil, fmt.Errorf("LoadTable %s.%s: %w", namespace, table, err)
 		}
 		cat.fsF = icebergio.LoadFSFunc(props, t.Location())
 		return cat.LoadTable(ctx, ident)
+	}, nil
+}
+
+// DeleteResult describes a table's scan plan after a delete.
+type DeleteResult struct {
+	DataFiles       int // data files in the current snapshot
+	FilesWithDV     int // data files carrying a deletion vector
+	FilesWithDelete int // data files carrying any other delete file
+}
+
+// DeleteRowsMergeOnRead switches (namespace, table) to merge-on-read and
+// deletes the rows matching filter with iceberg-go, as alice. On a v3 table
+// this writes a deletion vector on each affected data file. It returns the
+// scan plan's file counts after the delete.
+func DeleteRowsMergeOnRead(ctx context.Context, h *FGAHarness, namespace, table string, filter iceberg.BooleanExpression) (DeleteResult, error) {
+	load, err := hostIOLoader(ctx, h, "datuplet-e2e-delete", namespace, table)
+	if err != nil {
+		return DeleteResult{}, err
 	}
 
 	tbl, err := load()

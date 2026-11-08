@@ -87,6 +87,7 @@ jobs:
             datuplet/data-generator:v0.0.1 \
             datuplet/sql-transform:latest \
             datuplet/http-json-extractor:latest \
+            datuplet/iceberg-compactor:latest \
             datuplet/query-worker:latest \
             datuplet/app-worker:latest \
             mirror.gcr.io/library/nginx:1.27-alpine \

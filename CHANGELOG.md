@@ -8,6 +8,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Table compaction.** A new `iceberg-compactor` component (new image) and a
+  gateway `CompactTable` RPC bin-pack a table's small data files into a single
+  `replace` snapshot, as a pipeline stage or on demand via
+  `POST /api/v1/storage/projects/{pid}/tables/{ns}/{t}/compact`,
+  `datuplet storage compact` and the storage UI. On-demand runs use hidden
+  `sys-compact-*` system pipelines (reserved `sys-` prefix). See
+  `docs/known-limitations.md` for what v1 does not do (no storage reclaim).
 - **Iceberg v3 tables.** The Data Gateway creates every new table as
   format-version 3, and new Lakekeeper warehouses default to v3. Partitioned
   v3 tables are supported (the gateway assigns each file's `first_row_id`),

@@ -566,9 +566,12 @@ func (s *Server) Handler() http.Handler {
 	switch {
 	case s.storage != nil && s.resolver != nil && s.authzr != nil:
 		h := &storage.HTTPHandlers{
-			Svc:    s.storage,
-			Emails: pgxEmailLookup{pool: s.db},
-			Gate:   s.projectGate,
+			Svc:      s.storage,
+			Emails:   pgxEmailLookup{pool: s.db},
+			Gate:     s.projectGate,
+			DB:       s.db,
+			Runs:     s.backend,
+			Registry: s.registry,
 		}
 		if s.queryCore != nil {
 			h.Query = s.queryCore
@@ -587,6 +590,8 @@ func (s *Server) Handler() http.Handler {
 		// data_admin rather than the datuplet_member the reads use.
 		mux.Handle("DELETE /api/v1/storage/projects/{pid}/tables/{ns}/{t}",
 			auth.WithUser(s.resolver, http.HandlerFunc(h.DeleteTable)))
+		mux.Handle("POST /api/v1/storage/projects/{pid}/tables/{ns}/{t}/compact",
+			auth.WithUser(s.resolver, http.HandlerFunc(h.CompactTable)))
 	default:
 		mux.HandleFunc("GET /api/v1/storage/", func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "storage endpoints are not configured on this pipeline-api instance", http.StatusServiceUnavailable)

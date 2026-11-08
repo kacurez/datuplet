@@ -200,6 +200,18 @@ Responsibilities per read:
   iceberg-go (`Scan.ReadTasks`) and re-encoded per chunk. Non-Parquet request
   formats (Arrow IPC, CSV, JSON) always decode.
 
+**Compaction.** The gateway also serves a `CompactTable` RPC that bin-packs a
+table's small data files with iceberg-go's compaction library (scan
+concurrency 1, Parquet written by iceberg-go's compaction writer streaming to
+object storage) and commits one `replace` snapshot in its own conflict-retry
+loop with the same `datuplet.commit-key` idempotency lookup, keyed by a hash of
+run/component/bucket/table. It is exposed through the
+`iceberg-compactor` component (an ordinary pipeline stage whose declared output
+is the table to compact, so FGA and the exact-table check apply unchanged) and
+through the on-demand storage route, which runs that component under a hidden
+`sys-compact-*` pipeline. It never reclaims storage; see
+[known-limitations.md](known-limitations.md#table-compaction).
+
 ### Lakekeeper
 
 Iceberg REST catalog. The single source of truth for table schemas, snapshots, and

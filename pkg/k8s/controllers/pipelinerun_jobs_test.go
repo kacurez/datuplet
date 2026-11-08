@@ -2,9 +2,12 @@ package controllers
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/datuplet/datuplet/pkg/datagateway"
 	datupletv1 "github.com/datuplet/datuplet/pkg/k8s/api/v1"
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
@@ -775,5 +778,37 @@ func TestGenerateGatewayConfig_PreviewBlock(t *testing.T) {
 	}
 	if strings.Contains(y, "timeout") {
 		t.Errorf("timeout must not reach the gateway config:\n%s", y)
+	}
+}
+
+// TestGatewayConfig_CarriesComponentInstanceName: the gateway YAML carries the
+// component's instance name and the gateway loader keeps it (it keys
+// per-component operations such as compaction).
+func TestGatewayConfig_CarriesComponentInstanceName(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	for _, name := range []string{"compact-a", "compact-b"} {
+		comp := &datupletv1.ComponentSpec{Name: name, Component: "iceberg-compactor"}
+		y, err := r.generateGatewayConfig(minimalPipelineRun(), minimalPipeline(), comp)
+		if err != nil {
+			t.Fatalf("generateGatewayConfig: %v", err)
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal([]byte(y), &doc); err != nil {
+			t.Fatalf("generated YAML did not parse: %v", err)
+		}
+		if doc["component_name"] != name {
+			t.Errorf("component_name = %v, want %q\ndoc:\n%s", doc["component_name"], name, y)
+		}
+		p := filepath.Join(t.TempDir(), "gateway.yaml")
+		if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := datagateway.LoadConfigFile(p, "", "")
+		if err != nil {
+			t.Fatalf("LoadConfigFile: %v", err)
+		}
+		if cfg.ComponentName != name {
+			t.Errorf("loaded ComponentName = %q, want %q", cfg.ComponentName, name)
+		}
 	}
 }

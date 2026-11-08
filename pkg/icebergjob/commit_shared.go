@@ -330,14 +330,22 @@ func CommitTableFiles(
 // (decimal string) or "". Full scan — no windowing. POC tables have few
 // snapshots; bound it later if it ever becomes hot.
 func findSnapshotByCommitKey(tbl *icebergtable.Table, key string) string {
+	if s := snapshotByCommitKey(tbl, key); s != nil {
+		return fmt.Sprintf("%d", s.SnapshotID)
+	}
+	return ""
+}
+
+// snapshotByCommitKey is findSnapshotByCommitKey returning the snapshot.
+func snapshotByCommitKey(tbl *icebergtable.Table, key string) *icebergtable.Snapshot {
 	snaps := tbl.Metadata().Snapshots()
 	for i := len(snaps) - 1; i >= 0; i-- {
 		s := snaps[i]
 		if s.Summary != nil && s.Summary.Properties != nil && s.Summary.Properties["datuplet.commit-key"] == key {
-			return fmt.Sprintf("%d", s.SnapshotID)
+			return &s
 		}
 	}
-	return ""
+	return nil
 }
 
 // isNotFoundErr is a best-effort detector for "object not found" errors

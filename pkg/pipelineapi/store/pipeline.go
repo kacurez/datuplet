@@ -21,6 +21,7 @@ type Pipeline struct {
 	Name        string
 	Description string
 	Doc         []byte
+	System      bool
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -57,10 +58,10 @@ func CreatePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID
 func GetPipelineByName(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name string) (*Pipeline, error) {
 	p := &Pipeline{}
 	err := pool.QueryRow(ctx,
-		`SELECT id, project_id, name, description, doc, created_at, updated_at
+		`SELECT id, project_id, name, description, doc, system, created_at, updated_at
 		   FROM pipelines WHERE project_id = $1 AND name = $2`,
 		projectID, name,
-	).Scan(&p.ID, &p.ProjectID, &p.Name, &p.Description, &p.Doc, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.ProjectID, &p.Name, &p.Description, &p.Doc, &p.System, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrPipelineNotFound
@@ -84,11 +85,11 @@ func GetDocByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) ([]byte, 
 	return doc, nil
 }
 
-// ListPipelines returns every pipeline in the project sorted by name.
+// ListPipelines returns every non-system pipeline in the project sorted by name.
 func ListPipelines(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID) ([]*Pipeline, error) {
 	rows, err := pool.Query(ctx,
 		`SELECT id, project_id, name, description, doc, created_at, updated_at
-		   FROM pipelines WHERE project_id = $1 ORDER BY name`, projectID)
+		   FROM pipelines WHERE project_id = $1 AND NOT system ORDER BY name`, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("query pipelines: %w", err)
 	}
@@ -102,6 +103,27 @@ func ListPipelines(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID)
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// UpsertSystemPipeline creates or replaces a system pipeline and returns its
+// id. It never takes over a user pipeline of the same name.
+func UpsertSystemPipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name, description string, doc []byte) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := pool.QueryRow(ctx,
+		`INSERT INTO pipelines(project_id, name, description, doc, system) VALUES ($1, $2, $3, $4, true)
+		 ON CONFLICT (project_id, name) DO UPDATE
+		   SET description = EXCLUDED.description, doc = EXCLUDED.doc, updated_at = now()
+		   WHERE pipelines.system
+		 RETURNING id`,
+		projectID, name, description, doc,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, fmt.Errorf("pipeline %q exists and is not a system pipeline", name)
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("upsert system pipeline: %w", err)
+	}
+	return id, nil
 }
 
 // UpdatePipeline replaces the doc + description of an existing pipeline.
@@ -118,18 +140,31 @@ func UpdatePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID
 	return nil
 }
 
-// DeletePipeline removes a pipeline row. The CASCADE on runs.pipeline_id
+// ErrSystemPipeline is returned by DeletePipeline for a system pipeline.
+var ErrSystemPipeline = errors.New("system pipeline")
+
+// DeletePipeline removes a non-system pipeline row. The CASCADE on runs.pipeline_id
 // takes care of in-flight run rows; the corresponding Pipeline CRD in
 // K8s is NOT deleted by this call (operators can kubectl delete manually
 // once Plan C3 makes this a routine operation).
 func DeletePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name string) error {
 	tag, err := pool.Exec(ctx,
-		`DELETE FROM pipelines WHERE project_id = $1 AND name = $2`, projectID, name)
+		`DELETE FROM pipelines WHERE project_id = $1 AND name = $2 AND NOT system`, projectID, name)
 	if err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrPipelineNotFound
+	if tag.RowsAffected() > 0 {
+		return nil
 	}
-	return nil
+	var system bool
+	err = pool.QueryRow(ctx, `SELECT system FROM pipelines WHERE project_id = $1 AND name = $2`, projectID, name).Scan(&system)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrPipelineNotFound
+	case err != nil:
+		return fmt.Errorf("select pipeline: %w", err)
+	case system:
+		return ErrSystemPipeline
+	}
+	return ErrPipelineNotFound
 }

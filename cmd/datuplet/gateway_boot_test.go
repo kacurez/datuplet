@@ -280,3 +280,35 @@ func TestGatewayBootErrorOmitsRunToken(t *testing.T) {
 		t.Fatal("gateway did not exit after the hold")
 	}
 }
+
+// Boot keeps the component_name from the gateway YAML and falls back to
+// <mode>-component only when it is empty.
+func TestBootGateway_ComponentInstanceName(t *testing.T) {
+	for _, tc := range []struct{ yaml, want string }{
+		{yaml: "run_id: r\ncomponent_name: compact-a\n", want: "compact-a"},
+		{yaml: "run_id: r\n", want: "gateway-component"},
+	} {
+		p := filepath.Join(t.TempDir(), "gateway.yaml")
+		if err := os.WriteFile(p, []byte(tc.yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var got string
+		errStop := errors.New("stop")
+		hooks := gatewayHooks{
+			httpAddr: "127.0.0.1:0",
+			newServer: func(cfg *datagateway.Config, _ datagateway.DataPlaneFactory) (*datagateway.ServerV2, error) {
+				got = cfg.ComponentName
+				return nil, errStop
+			},
+		}
+		gate := datagateway.NewBootGate()
+		_, err := bootGateway(gatewayOptions{configPath: p, mode: "gateway"}, hooks, gate, make(chan error, 1))
+		gate.Stop()
+		if !errors.Is(err, errStop) {
+			t.Fatalf("bootGateway: %v", err)
+		}
+		if got != tc.want {
+			t.Errorf("ComponentName = %q, want %q", got, tc.want)
+		}
+	}
+}

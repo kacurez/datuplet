@@ -486,6 +486,41 @@ named future work in the design spec (§10), not oversights.
 
 ---
 
+## Table compaction
+
+- **No storage reclaim.** Compaction adds a `replace` snapshot; the old files
+  stay in the bucket until snapshots are expired. v1 has no expire-snapshots
+  and no orphan-file cleanup.
+- **Sidecar memory.** The gateway sidecar has no resource limits. The spike
+  measured a peak of about 1357 MiB (1.38 GiB process max RSS) on a skewed
+  input: one 90 MiB ZSTD file that decodes to about 1.25 GiB, among small
+  files. Expect peak memory of roughly the largest candidate file's decoded
+  size plus about 100 MiB. Lowering the writer batch buffer (463 MiB on the same
+  input) is a follow-up.
+- **Vended-credential TTL.** A compaction runs on credentials vended once. It is
+  bounded only by `max_input_files` (default 2000); there is no TTL-based
+  cutoff in v1.
+- **Orphaned files.** A crash, a cancel, or an unknown commit outcome can leave
+  written Parquet files unreferenced; they are kept rather than risk deleting
+  committed data. No cleanup exists.
+- **Duplicate work.** A concurrent non-append commit (FULL_LOAD, delete,
+  another compaction) makes it end `SUPERSEDED`; concurrent APPENDs are
+  tolerated and the compaction re-stages on top of them. The `409 compaction_running` gate covers
+  on-demand runs only; a pipeline-stage compactor is not serialised against
+  other runs of the same table.
+- **Mixed row lineage.** Compacting files with mixed row lineage drops the
+  `_row_id` column.
+- **v3 tables.** Compacted files materialize the lineage columns, so they are
+  served decoded rather than raw: reads are correct but slower.
+- **Deletes.** Foreign position-delete files and deletion vectors are applied on read but not
+  removed in v1, so dead deletes remain. Equality deletes are not cleaned up.
+  Selection is size-only; Datuplet writes no deletes itself.
+- **Preview.** A preview whose only stage is a compactor ends `FailedUser`
+  ("table not found"), because preview redirects outputs to empty scratch
+  namespaces.
+
+---
+
 ## Previews
 
 - **Input reads are not capped.** `row_limit` caps what components write per

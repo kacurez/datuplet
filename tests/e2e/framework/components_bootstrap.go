@@ -147,11 +147,12 @@ func dataGeneratorStableResources() *datupletv1.ComponentResources {
 
 // builtinE2EComponents lists every component instantiated by
 // tests/e2e/pipelines/k8s/*.yaml, i.e. every image `make build-components-e2e`
-// (+ build-component-sql-transform) builds locally as `datuplet/<name>:latest`.
+// (+ build-component-sql-transform, build-component-iceberg-compactor) builds locally as `datuplet/<name>:latest`.
 var builtinE2EComponents = []string{
 	"data-generator",
 	"http-json-extractor",
 	"sql-transform",
+	"iceberg-compactor",
 }
 
 // RegisterBuiltinComponents kubectl-applies a ComponentDefinition for every
@@ -190,7 +191,9 @@ func RegisterBuiltinComponents(ctx context.Context) error {
 // (StaticRegistry.Resolve, pkg/pipeline/validate/registry.go) falls through
 // to LatestStable(), which skips prerelease entries — so unpinned
 // data-generator resolves to "v0.0.1" (its only stable version) without
-// needing an explicit default.
+// needing an explicit default. iceberg-compactor is the exception: the
+// on-demand compact route saves an unpinned doc, so it gets DefaultVersion
+// "dev", mirroring the chart's defaultVersion for that component.
 func devComponentDefinition(name string) *datupletv1.ComponentDefinition {
 	versions := []datupletv1.VersionSpec{
 		{
@@ -208,6 +211,10 @@ func devComponentDefinition(name string) *datupletv1.ComponentDefinition {
 			Resources:    dataGeneratorStableResources(),
 		})
 	}
+	var defaultVersion string
+	if name == "iceberg-compactor" {
+		defaultVersion = "dev"
+	}
 	return &datupletv1.ComponentDefinition{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "datuplet.io/v1",
@@ -217,10 +224,11 @@ func devComponentDefinition(name string) *datupletv1.ComponentDefinition {
 			Name: name,
 		},
 		Spec: datupletv1.ComponentDefinitionSpec{
-			DisplayName: name,
-			Description: "e2e dev registration (RFC 026 P2 Task R11) — local docker-built image, not for production use.",
-			Maintainer:  "datuplet-e2e",
-			Versions:    versions,
+			DisplayName:    name,
+			Description:    "e2e dev registration (RFC 026 P2 Task R11) — local docker-built image, not for production use.",
+			Maintainer:     "datuplet-e2e",
+			DefaultVersion: defaultVersion,
+			Versions:       versions,
 		},
 	}
 }

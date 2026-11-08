@@ -32,6 +32,10 @@ service DataGateway {
   // Commit
   rpc Commit(CommitRequest) returns (CommitResponse);
 
+  // Compaction: bin-pack the small data files of one explicitly declared
+  // output table into one replace snapshot. Long-running; no deadline.
+  rpc CompactTable(CompactTableRequest) returns (CompactTableResponse);
+
   // Schema/Sampling (for discovery)
   rpc GetSchema(GetSchemaRequest) returns (SchemaResponse);
   rpc GetSample(GetSampleRequest) returns (SampleResponse);
@@ -372,6 +376,40 @@ message TableCommitResult {
   int64 rows_added = 6;
   int64 bytes_added = 7;
   string error = 8;
+}
+
+// ============================================================================
+// Compaction
+// ============================================================================
+
+// CompactTableRequest names an exact (bucket, table) from the component's
+// output_tables. Zero options take the defaults: target_file_size_bytes =
+// the pipeline's gateway target_file_size.
+message CompactTableRequest {
+  string bucket = 1;
+  string table = 2;
+  int64 target_file_size_bytes = 3;
+  int32 min_input_files = 4;
+  int32 max_input_files = 5;
+  bool dry_run = 6;
+}
+
+// CompactTableResponse reports one compaction. status is one of COMPACTED,
+// ALREADY_COMMITTED, NOTHING_TO_DO, SUPERSEDED, DRY_RUN.
+message CompactTableResponse {
+  string status = 1;
+  int32 files_before = 2;
+  int32 files_removed = 3;
+  int32 files_added = 4;
+  int32 files_after = 5;
+  int32 files_skipped = 6;
+  int32 files_deferred = 7;
+  int32 groups = 8;
+  int64 bytes_before = 9;
+  int64 bytes_after = 10;
+  int64 snapshot_before = 11;
+  int64 snapshot_after = 12;
+  int64 duration_ms = 13;
 }
 
 // ============================================================================
