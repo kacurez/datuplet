@@ -136,6 +136,32 @@ export async function deleteTable(projectId, namespace, name) {
 }
 
 /**
+ * Start an on-demand compaction of a table (hidden system pipeline run).
+ * Requires data_admin. Resolves { run_id, pipeline, target } on 202. On
+ * failure throws an Error with `.status`, `.code` (server error code, e.g.
+ * 'compaction_running' | 'compaction_busy') and `.runId` (409 only).
+ */
+export async function compactTable(projectId, namespace, name) {
+  try {
+    return await api(`/api/v1/storage/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/compact`, {
+      method: 'POST',
+      body: '{}',
+    });
+  } catch (e) {
+    const m = /^(\d+): ([\s\S]*)$/.exec(e.message || '');
+    if (m) {
+      e.status = Number(m[1]);
+      try {
+        const b = JSON.parse(m[2]);
+        e.code = b.error;
+        e.runId = b.run_id;
+      } catch (_) { /* non-JSON body: keep message */ }
+    }
+    throw e;
+  }
+}
+
+/**
  * Iceberg schema fields for the table's current snapshot.
  * Returns { columns: [{ id, name, type, nullable }, ...] }.
  */

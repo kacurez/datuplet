@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseNsTable(t *testing.T) {
@@ -133,5 +134,49 @@ func TestStorageDELETE_RequestShapeAndErrors(t *testing.T) {
 
 	if _, err := storageDELETE(context.Background(), srv.URL, "/projects/p/tables/raw/boom", "tok"); err == nil {
 		t.Fatal("a 403 response must surface as an error, not a silent success")
+	}
+}
+
+func TestStorageCompact(t *testing.T) {
+	var gotBody, gotMethod, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/storage/projects/p/tables/raw/t/compact":
+			b := make([]byte, 256)
+			n, _ := r.Body.Read(b)
+			gotBody, gotMethod, gotAuth = string(b[:n]), r.Method, r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"run_id":"r1","pipeline":"sys-compact-x","target":"raw.t"}`))
+		case r.URL.Path == "/api/v1/storage/projects/p/tables/raw/busy/compact":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"compaction_running","run_id":"run-42"}`))
+		case r.URL.Path == "/api/v1/storage/projects/p/tables/raw/full/compact":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"compaction_busy"}`))
+		case r.URL.Path == "/api/v1/projects/p/runs/r1":
+			_, _ = w.Write([]byte(`{"id":"r1","pipeline_name":"sys-compact-x","phase":"Succeeded","created_at":"2026-01-01T00:00:00Z"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+
+	run, err := storageCompact(ctx, srv.URL, "p", "tok", "raw", "t", 64, true, 30*time.Second)
+	if err != nil {
+		t.Fatalf("compact --wait: %v", err)
+	}
+	if run.Phase != "Succeeded" {
+		t.Errorf("phase = %q", run.Phase)
+	}
+	if gotMethod != http.MethodPost || gotAuth != "Bearer tok" || !strings.Contains(gotBody, `"target_file_size_mb":64`) {
+		t.Errorf("request = %s %q body=%q", gotMethod, gotAuth, gotBody)
+	}
+
+	if _, err := storageCompact(ctx, srv.URL, "p", "tok", "raw", "busy", 0, false, time.Second); err == nil || !strings.Contains(err.Error(), "run-42") {
+		t.Fatalf("409 must fail and name the running run, got %v", err)
+	}
+	if _, err := storageCompact(ctx, srv.URL, "p", "tok", "raw", "full", 0, false, time.Second); err == nil || !strings.Contains(err.Error(), "busy") || !strings.Contains(err.Error(), "retry") {
+		t.Fatalf("503 compaction_busy must say busy/retry, got %v", err)
 	}
 }

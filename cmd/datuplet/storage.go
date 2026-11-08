@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -222,4 +224,90 @@ func prettyPrintJSON(raw []byte) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// runStorageCompact implements `datuplet storage compact <ns.table>`: it
+// starts a compaction run through the hidden system pipeline and, with
+// --wait, blocks until the run is terminal (non-zero exit unless Succeeded).
+// Compaction rewrites the current snapshot's data files into fewer, larger
+// ones; v1 does NOT reclaim storage (old files stay until snapshots are
+// expired).
+func runStorageCompact(remote, tokenFile, project, ref string, targetMB int, wait bool, timeout time.Duration, asJSON bool) error {
+	ns, tbl, err := parseNsTable(ref)
+	if err != nil {
+		return err
+	}
+	args, err := storageBaseArgs(remote, tokenFile, project)
+	if err != nil {
+		return err
+	}
+	run, err := storageCompact(context.Background(), args.Remote, args.ID, args.APIToken, ns, tbl, targetMB, wait, timeout)
+	if err != nil {
+		return err
+	}
+	if err := emitResult(*run, asJSON); err != nil {
+		return err
+	}
+	if wait && exitCodeForPhase(run.Phase) != 0 {
+		return fmt.Errorf("run %s ended in phase %s", run.ID, run.Phase)
+	}
+	return nil
+}
+
+// storageCompact POSTs the compact route and, when wait is set, polls the
+// run to a terminal phase. Without wait it returns the run as fetched right
+// after admission.
+func storageCompact(ctx context.Context, remote, projectID, token, ns, tbl string, targetMB int, wait bool, timeout time.Duration) (*runJSONOut, error) {
+	reqBody := []byte(`{}`)
+	if targetMB > 0 {
+		reqBody, _ = json.Marshal(map[string]int{"target_file_size_mb": targetMB})
+	}
+	reqURL := fmt.Sprintf("%s/api/v1/storage/projects/%s/tables/%s/%s/compact",
+		strings.TrimRight(remote, "/"), url.PathEscape(projectID), url.PathEscape(ns), url.PathEscape(tbl))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := storageHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, storageMaxResponseBytes))
+	if resp.StatusCode != http.StatusAccepted {
+		var e struct {
+			Error string `json:"error"`
+			RunID string `json:"run_id"`
+		}
+		_ = json.Unmarshal(body, &e)
+		switch {
+		case resp.StatusCode == http.StatusConflict && e.Error == "compaction_running":
+			return nil, fmt.Errorf("a compaction of %s.%s is already running (run %s)", ns, tbl, e.RunID)
+		case resp.StatusCode == http.StatusServiceUnavailable && e.Error == "compaction_busy":
+			return nil, errors.New("the server is busy admitting other compactions; retry in a few seconds")
+		}
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var out struct {
+		RunID string `json:"run_id"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil || out.RunID == "" {
+		return nil, fmt.Errorf("unexpected compact response: %s", string(body))
+	}
+	first, err := getRun(ctx, remote, projectID, out.RunID, token)
+	if err != nil {
+		return nil, fmt.Errorf("fetch run after compact: %w", err)
+	}
+	if !wait || isTerminalPhase(first.Phase) {
+		return first, nil
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	final, err := pollUntilTerminal(pollCtx, remote, projectID, out.RunID, token)
+	if err != nil {
+		return nil, fmt.Errorf("waiting for run %s: %w", out.RunID, err)
+	}
+	return final, nil
 }
