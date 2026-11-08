@@ -7,12 +7,6 @@ import (
 	"fmt"
 	"os"
 	"time"
-
-	// Blank-import the centralised iceberg-go IO scheme registration
-	// package so this binary's `gs://` factory is the Datuplet override
-	// regardless of which transitive package registers first. See
-	// pkg/datupleticeio/doc.go and RFC 019 §4.5.
-	_ "github.com/datuplet/datuplet/pkg/datupleticeio"
 )
 
 func main() {
@@ -56,9 +50,6 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "gateway":
-		os.Exit(gatewayMain(os.Args[2:], os.Getenv, os.Stderr))
-
 	case "login":
 		loginCmd.Parse(os.Args[2:])
 		if *loginRemote == "" {
@@ -222,15 +213,6 @@ func main() {
 	}
 }
 
-// resolveRunTokenPath returns flagVal if non-empty, otherwise envVal. This
-// precedence rule (flag > env) must not be inverted in future refactors.
-func resolveRunTokenPath(flagVal, envVal string) string {
-	if flagVal != "" {
-		return flagVal
-	}
-	return envVal
-}
-
 func printUsage() {
 	fmt.Println(`datuplet - Data pipeline orchestrator
 
@@ -247,7 +229,6 @@ Commands:
   apps                   Manage user apps (init, put, get, list, delete, render, promote, token)
   storage                Browse iceberg storage (tables, info, schema, sample, history)
   query                  Run ad-hoc SQL against the warehouse (routes to the server query service)
-  gateway                Start the data gateway server (container entrypoint)
   version                Show version
   help                   Show this help
 
@@ -325,16 +306,5 @@ Headless / agent auth (RFC 027 §7):
   DATUPLET_REMOTE        pipeline-api URL; precedence: -remote > $DATUPLET_REMOTE > ~/.datuplet/cluster.json
   DATUPLET_PROJECT       Project name (resolved like -project) or UUID (fully-headless fast path only); precedence: -project > $DATUPLET_PROJECT > on-disk project resolution
   With all set, no ~/.datuplet state is needed. Use 'datuplet login -email <e> -password-stdin'
-  for explicit non-interactive login instead.
-
-Options for 'gateway':
-  -config string         Path to config file (YAML, required)
-  -addr string           gRPC server address (default: :50051)
-  -run-token-path string Path to the mounted run-token file (also $RUN_TOKEN_PATH)
-  -pod-annotations-path string  Downward-API pod-annotations file (also $POD_ANNOTATIONS_PATH)
-  -minio, -local         Accepted for compatibility (name the component)
-  -data-dir string       Accepted and ignored
-
-Examples:
-  datuplet gateway --minio --config minio.yaml`)
+  for explicit non-interactive login instead.`)
 }

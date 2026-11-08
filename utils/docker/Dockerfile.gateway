@@ -15,18 +15,18 @@ COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
 COPY api/ ./api/
 
-# Build datuplet binary with cache mounts
+# Build gateway binary with cache mounts
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -o /datuplet ./cmd/datuplet
+    CGO_ENABLED=0 go build -o /gateway ./cmd/gateway
 
 # Runtime image
 FROM alpine:3.19
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /datuplet /usr/local/bin/datuplet
+COPY --from=builder /gateway /usr/local/bin/gateway
 
-# The entrypoint just sets up the gateway command; mode is passed via CMD
-ENTRYPOINT ["datuplet", "gateway"]
+# Mode is passed via CMD
+ENTRYPOINT ["gateway"]
 CMD ["--local"]

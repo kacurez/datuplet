@@ -28,7 +28,7 @@ type gatewayOptions struct {
 	mode               string // "minio" / "local" when given (names the component), else "gateway"
 }
 
-// gatewayMain runs `datuplet gateway` (the Data Gateway sidecar) and returns
+// gatewayMain runs the gateway binary (the Data Gateway sidecar) and returns
 // the process exit code: 0 clean shutdown, 20 boot or serve failure, non-zero
 // on a usage error.
 func gatewayMain(args []string, getenv func(string) string, stderr io.Writer) int {
@@ -60,7 +60,7 @@ func parseGatewayFlags(args []string, getenv func(string) string, stderr io.Writ
 		return gatewayOptions{}, err
 	}
 	if *configPath == "" {
-		fmt.Fprintln(stderr, "datuplet gateway: --config is required")
+		fmt.Fprintln(stderr, "gateway: --config is required")
 		fs.Usage()
 		return gatewayOptions{}, errors.New("--config is required")
 	}
@@ -244,4 +244,13 @@ func orNone(v string) string {
 		return "(none)"
 	}
 	return v
+}
+
+// resolveRunTokenPath returns flagVal if non-empty, otherwise envVal. This
+// precedence rule (flag > env) must not be inverted in future refactors.
+func resolveRunTokenPath(flagVal, envVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return envVal
 }
