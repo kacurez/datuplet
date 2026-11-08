@@ -305,8 +305,7 @@ func compactTable(ctx context.Context, cat catalog.Catalog, ident icebergtable.I
 	return res, nil
 }
 
-// capGroups takes whole groups until maxInputs input files, truncating the
-// group that crosses the cap when the rest still has minInputs files.
+// classifyUnsupported tags iceberg-go's not-implemented errors as ErrUnsupportedFile.
 func classifyUnsupported(err error) error {
 	if errors.Is(err, iceberg.ErrNotImplemented) {
 		return fmt.Errorf("%w: %w", ErrUnsupportedFile, err)
@@ -314,6 +313,8 @@ func classifyUnsupported(err error) error {
 	return err
 }
 
+// capGroups takes whole groups until maxInputs input files, truncating the
+// group that crosses the cap when the rest still has minInputs files.
 func capGroups(groups []compaction.Group, maxInputs, minInputs int) ([]compaction.Group, int) {
 	var out []compaction.Group
 	taken, deferred := 0, 0

@@ -71,7 +71,9 @@ func run(ctx context.Context, c compactor, cfg Config, defaultBucket string, tab
 		}
 		res, err := c.Compact(ctx, t.Bucket, name, cfg.options())
 		if err != nil {
-			parts = append(parts, fmt.Sprintf("%s.%s: failed: %v", t.Bucket, name, err))
+			st := status.Convert(err)
+			msg := strings.NewReplacer("\r", " ", "\n", " ").Replace(st.Message())
+			parts = append(parts, fmt.Sprintf("%s.%s: %s: %s", t.Bucket, name, st.Code(), msg))
 			exit = worst(exit, exitCodeFor(err))
 			continue
 		}

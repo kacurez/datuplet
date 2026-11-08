@@ -284,7 +284,11 @@ func storageCompact(ctx context.Context, remote, projectID, token, ns, tbl strin
 		_ = json.Unmarshal(body, &e)
 		switch {
 		case resp.StatusCode == http.StatusConflict && e.Error == "compaction_running":
-			return nil, fmt.Errorf("a compaction of %s.%s is already running (run %s)", ns, tbl, e.RunID)
+			msg := fmt.Sprintf("a compaction of %s.%s is already running", ns, tbl)
+			if e.RunID != "" {
+				msg += fmt.Sprintf(" (run %s)", e.RunID)
+			}
+			return nil, errors.New(msg)
 		case resp.StatusCode == http.StatusServiceUnavailable && e.Error == "compaction_busy":
 			return nil, errors.New("the server is busy admitting other compactions; retry in a few seconds")
 		}

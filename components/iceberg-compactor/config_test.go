@@ -143,3 +143,19 @@ func TestRun_Options(t *testing.T) {
 		t.Errorf("opts = %+v, want %+v", got, want)
 	}
 }
+
+func TestRun_MultiLineErrorIsSingleLine(t *testing.T) {
+	f := &fakeCompactor{errs: map[string]error{
+		"raw.events": status.Error(codes.Internal, "boom\r\nsecond line\nthird"),
+	}}
+	code, msg := run(context.Background(), f, Config{}, "", []sdk.OutputTableRef{tbl("raw", "events")})
+	if code != exitApp {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.ContainsAny(msg, "\r\n") {
+		t.Errorf("status message must be a single line, got %q", msg)
+	}
+	if !strings.Contains(msg, "raw.events: Internal:") || !strings.Contains(msg, "second line") {
+		t.Errorf("message %q lost detail", msg)
+	}
+}
