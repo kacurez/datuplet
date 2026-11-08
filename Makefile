@@ -30,8 +30,13 @@ help: ## Show this help
 # Build
 # =============================================================================
 
+BUILDINFO_PKG := github.com/datuplet/datuplet/pkg/buildinfo
+LDFLAGS := -X $(BUILDINFO_PKG).Version=$(shell sed -n 's/^version: *//p' charts/datuplet-app/Chart.yaml) \
+	-X $(BUILDINFO_PKG).Commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo none) \
+	-X $(BUILDINFO_PKG).Date=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
 build: ## Build CLI binary (datuplet)
-	go build -o bin/datuplet ./cmd/datuplet
+	go build -ldflags "$(LDFLAGS)" -o bin/datuplet ./cmd/datuplet
 
 build-pipeline-api: ## Build pipeline-api binary
 	go build -o bin/pipeline-api ./cmd/pipeline-api

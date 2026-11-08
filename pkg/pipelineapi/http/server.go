@@ -375,6 +375,7 @@ func (s *Server) WithPreviews(svc *preview.Service) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /api/v1/version", s.handleVersion)
 	// /metrics is registered unconditionally — useful even in reduced
 	// (DB-less) mode. The pipeline-observer serves its own metrics on
 	// :8081; pipeline-api's metrics land here on the main mux.

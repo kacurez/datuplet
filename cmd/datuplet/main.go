@@ -201,7 +201,7 @@ func main() {
 		}
 
 	case "version":
-		fmt.Println("datuplet version 0.1.0-poc")
+		os.Exit(runVersion(os.Args[2:], os.Stdout, os.Stderr))
 
 	case "help", "-h", "--help":
 		printUsage()
