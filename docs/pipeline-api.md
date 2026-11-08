@@ -882,7 +882,7 @@ datuplet storage --remote <url> delete raw.gbif_occurrences_sk --confirm raw.gbi
 Starts an on-demand bin-pack rewrite of the table's small data files, run by
 the `iceberg-compactor` component under a hidden `sys-compact-<hex16>` system
 pipeline. Requires FGA `data_admin`, like delete, and a lakekeeper catalog.
-Optional body: `{"target_file_size_mb": N}`. Answers `202`:
+Optional body: `{"target_file_size_mb": N}` (N in 16-2048, MiB). Answers `202`:
 
 ```json
 { "run_id": "<uuid>", "pipeline": "sys-compact-0123456789abcdef", "target": "raw.events" }
@@ -894,16 +894,21 @@ snapshot.
 
 | Status | Meaning |
 |--------|---------|
+| 400 | Bad identifier, unknown body key, or `target_file_size_mb` outside 16-2048 (`{"error": "validation failed", "findings": [...]}`) |
 | 403 | Caller lacks `data_admin` |
 | 404 | Unknown table |
-| 409 `compaction_running` | A compaction for this table is Pending/Running; the body carries its `run_id` |
+| 409 `compaction_running` | A compaction for this table is Pending/Running; the body carries its `run_id` only when that run row already exists (a concurrent request holding the lock gets just `{"error":"compaction_running"}`) |
+| 413 | Body over 64 KiB |
 | 501 | No lakekeeper catalog configured |
+| 503 | Not configured (no DB / run backend) |
 | 503 `compaction_busy` | This replica's admission limit (half the DB pool, at least 1) is full; retry later |
 | 503 `compactor_unavailable` | The `iceberg-compactor` component is not registered |
 
 The same component also works as an ordinary pipeline stage (declare the
-table as the stage's output). CLI/UI: `datuplet storage compact`, and the
-table page in the storage UI.
+table as the stage's output). CLI: `datuplet storage --remote <url> compact <ns>.<table>`
+with `--wait` (block until the run is terminal), `--timeout` (cap on `--wait`,
+default 1h; the run keeps going after expiry), `--json` and
+`--target-file-size-mb`. The storage UI offers it on the table page.
 
 ### Errors
 

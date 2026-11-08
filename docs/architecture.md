@@ -204,7 +204,7 @@ Responsibilities per read:
 table's small data files with iceberg-go's compaction library (scan
 concurrency 1, Parquet written through the normal streamed-upload path) and
 commits one `replace` snapshot through the same commit machinery, keyed by an
-idempotency hash of run/stage/component/table. It is exposed through the
+idempotency hash of run/component/bucket/table. It is exposed through the
 `iceberg-compactor` component (an ordinary pipeline stage whose declared output
 is the table to compact, so FGA and the exact-table check apply unchanged) and
 through the on-demand storage route, which runs that component under a hidden

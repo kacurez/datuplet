@@ -82,7 +82,7 @@ func TestCompaction_OnDemand(t *testing.T) {
 		framework.SkipOrFail(t, "precheck failed: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	// RunAsUser defaults to Alice (the seeded admin, project_admin => data_admin),

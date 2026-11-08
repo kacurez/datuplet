@@ -16,6 +16,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -94,6 +96,12 @@ func (k *K8sBackend) CompactTable(ctx context.Context, ns, table string) (*Compa
 	code := v.Code
 	if code == "" {
 		code = v.Error
+	}
+	if status == http.StatusAccepted {
+		// Same teardown as a triggered run: Cleanup deletes the PipelineRun by run-id label.
+		if id, perr := uuid.Parse(v.RunID); perr == nil {
+			k.runIDs = append(k.runIDs, id)
+		}
 	}
 	return &CompactResponse{Status: status, RunID: v.RunID, Code: code, Body: string(body)}, nil
 }

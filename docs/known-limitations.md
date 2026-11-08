@@ -503,15 +503,16 @@ named future work in the design spec (§10), not oversights.
 - **Orphaned files.** A crash, a cancel, or an unknown commit outcome can leave
   written Parquet files unreferenced; they are kept rather than risk deleting
   committed data. No cleanup exists.
-- **Duplicate work.** A concurrent writer commit makes the compaction end
-  `SUPERSEDED` and discard its files. The `409 compaction_running` gate covers
+- **Duplicate work.** A concurrent non-append commit (FULL_LOAD, delete,
+  another compaction) makes it end `SUPERSEDED`; concurrent APPENDs are
+  tolerated and the compaction re-stages on top of them. The `409 compaction_running` gate covers
   on-demand runs only; a pipeline-stage compactor is not serialised against
   other runs of the same table.
 - **Mixed row lineage.** Compacting files with mixed row lineage drops the
   `_row_id` column.
 - **v3 tables.** Compacted files materialize the lineage columns, so they are
   served decoded rather than raw: reads are correct but slower.
-- **Deletes.** Foreign position-delete files are applied on read but not
+- **Deletes.** Foreign position-delete files and deletion vectors are applied on read but not
   removed in v1, so dead deletes remain. Equality deletes are not cleaned up.
   Selection is size-only; Datuplet writes no deletes itself.
 - **Preview.** A preview whose only stage is a compactor ends `FailedUser`
