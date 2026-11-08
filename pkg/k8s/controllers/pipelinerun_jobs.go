@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -14,23 +15,27 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// componentJobName returns the K8s Job name for (pr, stage, component).
-// Keep this the single source of truth for the name scheme — both the
-// builder (buildComponentJob) and the status-polling path in
-// pipelinerun_controller.go derive the Job name from here so changes
-// can't drift and leave one side looking for the wrong object.
-//
-// Include shortID(pr.Status.RunID) in the suffix so two runs of the
-// same pipeline (e.g. "kbc-services-pipeline" and
-// "kbc-services-pipeline2") don't collide on the truncated prefix.
-func componentJobName(pr *datupletv1.PipelineRun, stageName, componentName string) string {
-	return fmt.Sprintf("datuplet-%s-%s-%s-%s",
-		pr.Name[:min(15, len(pr.Name))],
-		stageName[:min(10, len(stageName))],
-		componentName[:min(10, len(componentName))],
-		shortID(pr.Status.RunID))
+// componentJobName returns the K8s Job name for the component named compName:
+// run-<RunID>-s<stage index>-c<component index>, positions taken from
+// pr.Status.ResolvedSpec. It is built only from the run ID and positions, never
+// from user-chosen names. Keep this the single source of truth for the name
+// scheme: the builder (buildComponentJob), the status poller and the preview
+// timeout all derive the Job name from here.
+func componentJobName(pr *datupletv1.PipelineRun, compName string) (string, error) {
+	if pr.Status.ResolvedSpec == nil {
+		return "", fmt.Errorf("component %q: resolved spec missing", compName)
+	}
+	for i, stage := range pr.Status.ResolvedSpec.Stages {
+		for j, c := range stage.Components {
+			if c.Name == compName {
+				return fmt.Sprintf("run-%s-s%d-c%d", pr.Status.RunID, i, j), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("component %q not found in resolved spec", compName)
 }
 
 // runSecretsName returns the per-run snapshot Secret name for pr. The snapshot
@@ -38,7 +43,18 @@ func componentJobName(pr *datupletv1.PipelineRun, stageName, componentName strin
 // the managed project Secret at admission (see snapshotRunSecrets). It is
 // ownerRef'd to the PipelineRun and garbage-collected with it.
 func runSecretsName(pr *datupletv1.PipelineRun) string {
-	return "datuplet-runsecrets-" + shortID(pr.Status.RunID)
+	return "datuplet-runsecrets-" + pr.Status.RunID
+}
+
+var errForeignOwned = errors.New("object belongs to another PipelineRun")
+
+// checkOwned returns an errForeignOwned-wrapping error when obj, found under a
+// name pr derives, is not controlled by pr.
+func checkOwned(obj client.Object, pr *datupletv1.PipelineRun, kind string) error {
+	if !metav1.IsControlledBy(obj, pr) {
+		return fmt.Errorf("%s %s already exists and belongs to another PipelineRun: %w", kind, obj.GetName(), errForeignOwned)
+	}
+	return nil
 }
 
 // buildComponentJob builds the Job + gateway ConfigMap for a single component,
@@ -50,17 +66,9 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 	// detection. Wrap it as a Pipeline so the existing helpers keep working.
 	frozen := &datupletv1.Pipeline{Spec: *pr.Status.ResolvedSpec}
 
-	stageIdx := -1
-	for i, stage := range frozen.Spec.Stages {
-		for _, c := range stage.Components {
-			if c.Name == comp.Name {
-				stageIdx = i
-				break
-			}
-		}
-	}
-	if stageIdx == -1 {
-		return nil, nil, fmt.Errorf("component not found in resolved spec")
+	jobName, err := componentJobName(pr, comp.Name)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Resolved image + version were frozen at admission.
@@ -78,9 +86,6 @@ func (r *PipelineRunReconciler) buildComponentJob(_ context.Context, pr *datuple
 		return nil, nil, fmt.Errorf("component %q not found in resolved components", comp.Name)
 	}
 
-	stage := &frozen.Spec.Stages[stageIdx]
-
-	jobName := componentJobName(pr, stage.Name, comp.Name)
 	configMapName := fmt.Sprintf("gateway-config-%s", jobName)
 
 	// Generate gateway config

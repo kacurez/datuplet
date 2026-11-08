@@ -205,7 +205,7 @@ func TestFreeze_ResolvedSpecAndJobImage(t *testing.T) {
 			}
 
 			reconcileOnce(t, r) // startStage builds the Job
-			job := getJob(t, c, componentJobName(got, "extract", "c1"))
+			job := getJob(t, c, mustJobName(t, got, "c1"))
 			img, _ := componentContainerImage(job)
 			if img != tc.wantImage {
 				t.Errorf("component container image = %q, want %q (resolved)", img, tc.wantImage)
@@ -239,7 +239,7 @@ func TestFreeze_ComponentPullPolicy_RegistryDriven(t *testing.T) {
 			reconcileOnce(t, r) // admission
 			reconcileOnce(t, r) // startStage
 			got := getRun(t, c)
-			job := getJob(t, c, componentJobName(got, "extract", "c1"))
+			job := getJob(t, c, mustJobName(t, got, "c1"))
 			img, policy := componentContainerImage(job)
 			if img != tc.image {
 				t.Errorf("component image = %q, want %q", img, tc.image)
@@ -330,7 +330,7 @@ func TestFreeze_MidRunMutation_JobsFromSnapshot(t *testing.T) {
 
 	reconcileOnce(t, r) // handleRunning → startStage(1) from the frozen snapshot
 	got = getRun(t, c)
-	job := getJob(t, c, componentJobName(got, "load", "c2"))
+	job := getJob(t, c, mustJobName(t, got, "c2"))
 	img, _ := componentContainerImage(job)
 	if img != "img-b:v1" {
 		t.Errorf("stage-1 component image = %q, want img-b:v1 (frozen; registry+spec mutation must not leak)", img)
@@ -360,7 +360,7 @@ func TestFreeze_LivePipelineDeleted_StillBuildsFromSnapshot(t *testing.T) {
 	}
 
 	reconcileOnce(t, r) // startStage from the frozen snapshot; must not error on missing Pipeline
-	job := getJob(t, c, componentJobName(got, "extract", "c1"))
+	job := getJob(t, c, mustJobName(t, got, "c1"))
 	img, _ := componentContainerImage(job)
 	if img != "img-a:v1" {
 		t.Errorf("component image = %q, want img-a:v1 (built from frozen snapshot without the live Pipeline)", img)

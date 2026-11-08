@@ -125,7 +125,7 @@ func TestClampFreeze_RegistryMaxRaisedAfterAdmission_JobKeepsAdmissionClamp(t *t
 
 	reconcileOnce(t, r) // startStage builds the Job from the frozen snapshot
 	got := getRun(t, c)
-	job := getJob(t, c, componentJobName(got, "extract", "c1"))
+	job := getJob(t, c, mustJobName(t, got, "c1"))
 	cpu := job.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU]
 	if cpu.Cmp(resource.MustParse("2")) != 0 {
 		t.Errorf("Job limits.cpu = %s, want 2 (admission-time clamp; registry NOT re-read)", cpu.String())

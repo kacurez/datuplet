@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -70,23 +71,15 @@ const (
 //     CONSECUTIVE occurrences — never FailedUser.
 const severityTransient = "transient"
 
-// shortID returns the first 8 chars of id, or the whole string if shorter.
-// Used to build K8s resource names; avoids panicking on unexpectedly short IDs.
-func shortID(id string) string {
-	if len(id) < 8 {
-		return id
-	}
-	return id[:8]
-}
-
 // PipelineRunReconciler reconciles a PipelineRun object
 type PipelineRunReconciler struct {
 	client.Client
 
 	// APIReader is an UNCACHED reader (mgr.GetAPIReader) used to read the
-	// managed project Secret at admission. Reading via the cached client
-	// would spin up a cluster-wide Secret informer; a direct Get needs only
-	// per-namespace `secrets:get` RBAC. Never used for the run's own objects.
+	// managed project Secret and the run's snapshot Secret at admission, and
+	// an already-existing gateway ConfigMap for its ownership check. Reading
+	// via the cached client would spin up a cluster-wide Secret (or
+	// ConfigMap) informer; a direct Get needs only per-namespace `get` RBAC.
 	APIReader client.Reader
 
 	Scheme       *runtime.Scheme
@@ -417,7 +410,8 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 		runID = uuid.New().String()
 	} else {
 		// Validate user-provided RunID is a valid UUID
-		if _, err := uuid.Parse(runID); err != nil {
+		parsed, err := uuid.Parse(runID)
+		if err != nil {
 			pr.Status.Phase = datupletv1.PipelineRunPhaseFailedUser
 			pr.Status.Message = fmt.Sprintf("invalid spec.runId: must be a valid UUID, got %q", runID)
 			if err := r.Status().Update(ctx, pr); err != nil {
@@ -426,6 +420,8 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 			}
 			return ctrl.Result{}, nil
 		}
+		// Canonical form: every per-run object name is derived from it.
+		runID = parsed.String()
 	}
 	// RunID must be set before snapshotRunSecrets: the per-run snapshot name
 	// (runSecretsName) is derived from it.
@@ -435,6 +431,9 @@ func (r *PipelineRunReconciler) handlePending(ctx context.Context, pr *datupletv
 	// admission — before any Job is built. A missing key fails the run
 	// FailedUser here, so no snapshot and no Jobs are ever created for it.
 	missing, err := r.snapshotRunSecrets(ctx, pr, pipeline)
+	if stderrors.Is(err, errForeignOwned) {
+		return r.failForeignOwned(ctx, pr, err)
+	}
 	if err != nil {
 		logger.Error(err, "Failed to snapshot run secrets")
 		return ctrl.Result{}, err
@@ -686,7 +685,7 @@ func (r *PipelineRunReconciler) snapshotRunSecrets(ctx context.Context, pr *datu
 	snapName := runSecretsName(pr)
 	existing := &corev1.Secret{}
 	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: snapName, Namespace: pr.Namespace}, existing); err == nil {
-		return nil, nil
+		return nil, checkOwned(existing, pr, "Secret")
 	} else if !errors.IsNotFound(err) {
 		return nil, err
 	}
@@ -734,10 +733,34 @@ func (r *PipelineRunReconciler) snapshotRunSecrets(ctx context.Context, pr *datu
 	if err := ctrl.SetControllerReference(pr, snap, r.Scheme); err != nil {
 		return nil, err
 	}
-	if err := r.Create(ctx, snap); err != nil && !errors.IsAlreadyExists(err) {
-		return nil, err
+	if err := r.Create(ctx, snap); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return nil, err
+		}
+		// Created between the lookup above and now; the cache may not have it.
+		if err := r.APIReader.Get(ctx, types.NamespacedName{Name: snapName, Namespace: pr.Namespace}, existing); err != nil {
+			return nil, err
+		}
+		return nil, checkOwned(existing, pr, "Secret")
 	}
 	return nil, nil
+}
+
+// failForeignOwned fails the run FailedApplication because a name it derives
+// is held by an object another PipelineRun controls. The foreign object is
+// never mutated or deleted, and the run is not requeued.
+func (r *PipelineRunReconciler) failForeignOwned(ctx context.Context, pr *datupletv1.PipelineRun, err error) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Error(err, "Refusing to use an object owned by another PipelineRun")
+	pr.Status.Phase = datupletv1.PipelineRunPhaseFailedApplication
+	pr.Status.Message = err.Error()
+	now := metav1.Now()
+	pr.Status.CompletionTime = &now
+	if err := r.Status().Update(ctx, pr); err != nil {
+		logger.Error(err, "Failed to update PipelineRun status")
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
 
 // handleRunning continues the PipelineRun execution. It reads exclusively from
@@ -850,10 +873,21 @@ func (r *PipelineRunReconciler) failPreviewTimeout(ctx context.Context, pr *datu
 
 	r.propagateCancelToPods(ctx, pr)
 	for i := range stage.Components {
-		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
-			Name:      componentJobName(pr, stage.Name, stage.Components[i].Name),
-			Namespace: pr.Namespace,
-		}}
+		jobName, err := componentJobName(pr, stage.Components[i].Name)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		job := &batchv1.Job{}
+		found := true
+		if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: pr.Namespace}, job); err != nil {
+			if !errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			found = false
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: pr.Namespace}}
+		} else if err := checkOwned(job, pr, "Job"); err != nil {
+			return r.failForeignOwned(ctx, pr, err)
+		}
 		// Capture the last status line before the delete removes the pod.
 		if cs := componentStatusByName(stageStatus, stage.Components[i].Name); cs != nil && !componentTerminal(cs.Phase) {
 			cs.Phase = datupletv1.ComponentPhaseFailedUser
@@ -863,7 +897,13 @@ func (r *PipelineRunReconciler) failPreviewTimeout(ctx context.Context, pr *datu
 			}
 			cs.CompletionTime = &now
 		}
-		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+		if !found {
+			continue
+		}
+		if err := r.Delete(ctx, job,
+			client.PropagationPolicy(metav1.DeletePropagationBackground),
+			client.Preconditions{UID: &job.UID},
+		); err != nil && !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to delete timed-out preview Job", "job", job.Name)
 			return ctrl.Result{}, err
 		}
@@ -945,15 +985,33 @@ func (r *PipelineRunReconciler) startStage(ctx context.Context, pr *datupletv1.P
 		}
 
 		// Create ConfigMap
-		if err := r.Create(ctx, configMap); err != nil && !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create gateway config map", "component", comp.Name)
-			return ctrl.Result{}, err
+		if err := r.Create(ctx, configMap); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				logger.Error(err, "Failed to create gateway config map", "component", comp.Name)
+				return ctrl.Result{}, err
+			}
+			existing := &corev1.ConfigMap{}
+			if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(configMap), existing); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := checkOwned(existing, pr, "ConfigMap"); err != nil {
+				return r.failForeignOwned(ctx, pr, err)
+			}
 		}
 
 		// Create Job
-		if err := r.Create(ctx, job); err != nil && !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create job", "component", comp.Name)
-			return ctrl.Result{}, err
+		if err := r.Create(ctx, job); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				logger.Error(err, "Failed to create job", "component", comp.Name)
+				return ctrl.Result{}, err
+			}
+			existing := &batchv1.Job{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(job), existing); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := checkOwned(existing, pr, "Job"); err != nil {
+				return r.failForeignOwned(ctx, pr, err)
+			}
 		}
 
 		compStatus.Phase = datupletv1.ComponentPhaseRunning
@@ -1015,7 +1073,11 @@ func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *da
 		// with buildComponentJob — changing the scheme in one place
 		// without the other makes the poller look for the wrong object
 		// and leaves components "running" forever.
-		jobName := componentJobName(pr, stage.Name, compStatus.Name)
+		jobName, err := componentJobName(pr, compStatus.Name)
+		if err != nil {
+			logger.Error(err, "Cannot derive Job name", "component", compStatus.Name)
+			continue
+		}
 
 		job := &batchv1.Job{}
 		if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: pr.Namespace}, job); err != nil {
@@ -1025,6 +1087,9 @@ func (r *PipelineRunReconciler) checkStageComponents(ctx context.Context, pr *da
 			}
 			logger.Error(err, "Failed to get Job", "job", jobName)
 			return ctrl.Result{}, err
+		}
+		if err := checkOwned(job, pr, "Job"); err != nil {
+			return r.failForeignOwned(ctx, pr, err)
 		}
 
 		// Try to extract exit code from pod
