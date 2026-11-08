@@ -1,0 +1,24 @@
+# Compaction scenario (TestCompaction_OnDemand) seed: data-generator
+# APPENDs 400 random rows into a bucket[8](id)-partitioned table. The test runs
+# it 5 times, leaving 5 small files in each of 8 partitions (the on-demand
+# route's default min_input_files).
+name: "{{.RunPrefix}}-compaction-od-seed"
+stages:
+  - name: generate
+    components:
+      - name: generator
+        component: data-generator
+        version: dev
+        config:
+          tables:
+            - name: events
+              random:
+                schema: { id: long, payload: string }
+                limit: { rowsCount: 400 }
+        outputs:
+          tables:
+            - name: events
+              bucket: "{{.RunPrefix}}-compact-od"
+              writeMode: APPEND
+              partitionSpec:
+                - { source_column: id, transform: "bucket[8]" }
