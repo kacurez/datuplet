@@ -42,8 +42,8 @@ type RunStatus struct {
 	PreviewID uuid.UUID
 	Namespace string // K8s namespace the PipelineRun lived in; DB updater validates this matches runs.project_id's project namespace before applying
 	// PipelineRunName is the source PipelineRun's metadata.name. The DB
-	// updater recomputes the expected name from the stored pipeline and
-	// rejects updates that don't match — otherwise any actor with write
+	// updater recomputes the expected name from the run ID (PipelineRunName(runID))
+	// and rejects updates that don't match — otherwise any actor with write
 	// access to the project namespace could create a decoy PipelineRun
 	// carrying a victim's run-id label and hijack its mirrored status.
 	PipelineRunName string

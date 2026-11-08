@@ -230,8 +230,8 @@ func ValidateTyped(p *datupletv1.Pipeline, reg RegistryView, pol *Policy) []Find
 	}
 
 	// Component instance names must be unique across the whole pipeline: the
-	// controller matches Jobs to components by the datuplet.io/component=<name>
-	// label, so duplicate names (same stage or across stages) are ambiguous.
+	// datuplet.io/component=<name> label identifies a component's pods within a
+	// run, so duplicate names (same stage or across stages) are ambiguous.
 	// Structural check — runs independent of registry wiring.
 	findings = append(findings, checkUniqueComponentNames(p)...)
 
@@ -308,6 +308,14 @@ func validateComponent(c *datupletv1.ComponentSpec, stageIdx, compIdx int, avail
 			Message:  fmt.Sprintf("stage %d, component %d: name is required", stageIdx, compIdx),
 			Severity: severityError,
 		})
+	} else {
+		for _, msg := range validation.IsDNS1123Label(c.Name) {
+			findings = append(findings, Finding{
+				Path:     base + ".name",
+				Message:  fmt.Sprintf("stage %d, component %d: invalid component name %q: %s", stageIdx, compIdx, c.Name, msg),
+				Severity: severityError,
+			})
+		}
 	}
 	if c.Component == "" {
 		findings = append(findings, Finding{

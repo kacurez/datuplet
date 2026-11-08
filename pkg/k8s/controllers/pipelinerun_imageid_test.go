@@ -57,7 +57,7 @@ func TestImageID_CapturedFromPodOnce_NeverOverwritten(t *testing.T) {
 	reconcileOnce(t, r) // startStage: builds the component Job
 
 	got := getRun(t, c)
-	jobName := componentJobName(got, "extract", "c1")
+	jobName := mustJobName(t, got, "c1")
 
 	pod := componentPod("c1-pod", jobName, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if err := c.Create(context.Background(), pod); err != nil {
@@ -108,7 +108,7 @@ func TestImageID_EmptyContainerStatus_LeavesImageIDUnset(t *testing.T) {
 	reconcileOnce(t, r) // startStage
 
 	got := getRun(t, c)
-	jobName := componentJobName(got, "extract", "c1")
+	jobName := mustJobName(t, got, "c1")
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "c1-pod", Namespace: "default", Labels: map[string]string{"job-name": jobName}},

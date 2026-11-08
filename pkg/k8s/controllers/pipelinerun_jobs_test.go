@@ -9,6 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // minimalPipeline returns a Pipeline with one stage and one component,
@@ -216,28 +217,88 @@ func TestBuildComponentJob_RunTokenNil_NoVolume(t *testing.T) {
 	}
 }
 
-// TestComponentJobName_IncludesRunIDSuffix pins the Job/CM name scheme
-// so two PipelineRuns of pipelines whose names share the truncated
-// 15-char prefix still get distinct Jobs. Codex caught this on
-// feat/002-slice-e-multi-tenant-tg: the controller's Create returns
-// AlreadyExists silently on a collision and the second run reuses the
-// first run's stale ConfigMap.
-func TestComponentJobName_IncludesRunIDSuffix(t *testing.T) {
-	prA := minimalPipelineRun()
-	prA.Name = "kbc-services-pipeline"
-	prA.Status.RunID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-
-	prB := minimalPipelineRun()
-	prB.Name = "kbc-services-pipeline2" // same 15-char prefix as prA
-	prB.Status.RunID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-
-	nameA := componentJobName(prA, "extract", "c1")
-	nameB := componentJobName(prB, "extract", "c1")
-	if nameA == nameB {
-		t.Fatalf("expected distinct Job names for two runs; both = %q", nameA)
+// mustJobName returns componentJobName(pr, comp), failing the test on error.
+func mustJobName(t *testing.T, pr *datupletv1.PipelineRun, comp string) string {
+	t.Helper()
+	name, err := componentJobName(pr, comp)
+	if err != nil {
+		t.Fatalf("componentJobName(%q): %v", comp, err)
 	}
-	if !strings.HasSuffix(nameA, "aaaaaaaa") || !strings.HasSuffix(nameB, "bbbbbbbb") {
-		t.Errorf("run-id suffix missing: nameA=%q nameB=%q", nameA, nameB)
+	return name
+}
+
+// positionalRun returns a run whose resolved spec has stage 0 {a, b} and
+// stage 1 {c}.
+func positionalRun(runID string) *datupletv1.PipelineRun {
+	pr := &datupletv1.PipelineRun{}
+	pr.Name = "pr1"
+	pr.Status.RunID = runID
+	pr.Status.ResolvedSpec = &datupletv1.PipelineSpec{Stages: []datupletv1.StageSpec{
+		{Name: "extract", Components: []datupletv1.ComponentSpec{{Name: "a"}, {Name: "b"}}},
+		{Name: "load", Components: []datupletv1.ComponentSpec{{Name: "c"}}},
+	}}
+	return pr
+}
+
+func TestComponentJobName_PositionalAndStable(t *testing.T) {
+	const runID = "11111111-2222-3333-4444-555555555555"
+	pr := positionalRun(runID)
+	for comp, want := range map[string]string{
+		"a": "run-" + runID + "-s0-c0",
+		"b": "run-" + runID + "-s0-c1",
+		"c": "run-" + runID + "-s1-c0",
+	} {
+		got := mustJobName(t, pr, comp)
+		if got != want {
+			t.Errorf("componentJobName(%q) = %q, want %q", comp, got, want)
+		}
+		if errs := validation.IsDNS1123Label(got); len(errs) > 0 {
+			t.Errorf("componentJobName(%q) = %q is not a DNS-1123 label: %v", comp, got, errs)
+		}
+		if again := mustJobName(t, pr, comp); again != got {
+			t.Errorf("componentJobName(%q) not stable: %q then %q", comp, got, again)
+		}
+	}
+}
+
+func TestComponentJobName_FullRunIDNoPrefixCollision(t *testing.T) {
+	a := mustJobName(t, positionalRun("aaaaaaaa-0000-0000-0000-000000000001"), "a")
+	b := mustJobName(t, positionalRun("aaaaaaaa-0000-0000-0000-000000000002"), "a")
+	if a == b {
+		t.Fatalf("runs sharing an 8-char prefix got the same Job name %q", a)
+	}
+}
+
+func TestComponentJobName_UnknownComponent(t *testing.T) {
+	pr := positionalRun("11111111-2222-3333-4444-555555555555")
+	if name, err := componentJobName(pr, "nope"); err == nil {
+		t.Errorf("unknown component: got %q, want error", name)
+	}
+	pr.Status.ResolvedSpec = nil
+	if name, err := componentJobName(pr, "a"); err == nil {
+		t.Errorf("nil ResolvedSpec: got %q, want error", name)
+	}
+}
+
+func TestComponentJobName_NoUserText(t *testing.T) {
+	pr := &datupletv1.PipelineRun{}
+	pr.Name = "my-secret-pipeline"
+	pr.Status.RunID = "11111111-2222-3333-4444-555555555555"
+	pr.Status.ResolvedSpec = &datupletv1.PipelineSpec{Stages: []datupletv1.StageSpec{
+		{Name: "ingest", Components: []datupletv1.ComponentSpec{{Name: "extract-orders"}}},
+	}}
+	got := mustJobName(t, pr, "extract-orders")
+	for _, s := range []string{"my-secret-pipeline", "ingest", "extract-orders"} {
+		if strings.Contains(got, s) {
+			t.Errorf("Job name %q contains user text %q", got, s)
+		}
+	}
+}
+
+func TestRunSecretsName_FullRunID(t *testing.T) {
+	pr := positionalRun("11111111-2222-3333-4444-555555555555")
+	if got, want := runSecretsName(pr), "datuplet-runsecrets-"+pr.Status.RunID; got != want {
+		t.Errorf("runSecretsName = %q, want %q", got, want)
 	}
 }
 
