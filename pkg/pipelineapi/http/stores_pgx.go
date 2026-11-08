@@ -135,6 +135,7 @@ func (s *pgxPipelineStore) Get(ctx context.Context, projectID uuid.UUID, name st
 		ID:        p.ID.String(),
 		Name:      p.Name,
 		Doc:       json.RawMessage(p.Doc),
+		System:    p.System,
 		CreatedAt: p.CreatedAt.Format(pipelineTimeLayout),
 		UpdatedAt: p.UpdatedAt.Format(pipelineTimeLayout),
 	}, nil

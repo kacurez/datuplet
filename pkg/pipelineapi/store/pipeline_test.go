@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
 
@@ -153,5 +155,57 @@ func TestDeletePipeline(t *testing.T) {
 	}
 	if _, err := store.GetPipelineByName(ctx, pool, p.ID, "etl"); !errors.Is(err, store.ErrPipelineNotFound) {
 		t.Errorf("expected ErrPipelineNotFound after delete, got %v", err)
+	}
+}
+
+func TestSystemPipeline_CompactUpsertListAndActiveRun(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	p, _ := store.CreateProject(ctx, pool, "proj")
+	if _, err := store.CreatePipeline(ctx, pool, p.ID, "etl", "", minimalDoc); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id1, err := store.UpsertSystemPipeline(ctx, pool, p.ID, "sys-compact-x", "d1", minimalDoc)
+	if err != nil {
+		t.Fatalf("upsert 1: %v", err)
+	}
+	id2, err := store.UpsertSystemPipeline(ctx, pool, p.ID, "sys-compact-x", "d2", minimalDoc)
+	if err != nil || id2 != id1 {
+		t.Fatalf("upsert 2: id=%s want %s err=%v", id2, id1, err)
+	}
+	if _, err := store.UpsertSystemPipeline(ctx, pool, p.ID, "etl", "d", minimalDoc); err == nil {
+		t.Error("upsert over a user pipeline must fail")
+	}
+
+	got, err := store.GetPipelineByName(ctx, pool, p.ID, "sys-compact-x")
+	if err != nil || !got.System || got.Description != "d2" {
+		t.Fatalf("get system pipeline: %+v err=%v", got, err)
+	}
+	list, _ := store.ListPipelines(ctx, pool, p.ID)
+	if len(list) != 1 || list[0].Name != "etl" {
+		t.Errorf("list = %v, want only etl", list)
+	}
+
+	if rid, err := store.ActiveRunForPipeline(ctx, pool, p.ID, "sys-compact-x"); err != nil || rid != uuid.Nil {
+		t.Fatalf("no runs: rid=%s err=%v", rid, err)
+	}
+	runID := uuid.New()
+	if _, err := store.CreateRun(ctx, pool, store.CreateRunOpts{ID: runID, ProjectID: p.ID, PipelineID: id1}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if rid, _ := store.ActiveRunForPipeline(ctx, pool, p.ID, "sys-compact-x"); rid != runID {
+		t.Errorf("pending run: rid=%s want %s", rid, runID)
+	}
+	run, _ := store.GetRunByID(ctx, pool, runID)
+	if run.PipelineDescription != "d2" {
+		t.Errorf("run pipeline description = %q", run.PipelineDescription)
+	}
+	if _, err := store.UpdateRunPhase(ctx, pool, runID, store.UpdateRunPhaseOpts{Phase: "Succeeded"}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if rid, _ := store.ActiveRunForPipeline(ctx, pool, p.ID, "sys-compact-x"); rid != uuid.Nil {
+		t.Errorf("terminal run counted as active: %s", rid)
 	}
 }

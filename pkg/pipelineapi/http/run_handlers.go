@@ -21,6 +21,7 @@ type runJSON struct {
 	ProjectID    string `json:"project_id,omitempty"`
 	PipelineID   string `json:"pipeline_id,omitempty"`
 	PipelineName string `json:"pipeline_name,omitempty"`
+	PipelineDesc string `json:"pipeline_description,omitempty"`
 	Phase        string `json:"phase"`
 	CurrentStage string `json:"current_stage,omitempty"`
 	Message      string `json:"message,omitempty"`
@@ -35,6 +36,7 @@ func runToJSON(v store.RunView) runJSON {
 		Phase: v.Phase, CurrentStage: v.CurrentStage, Message: v.Message,
 		CreatedAt:    v.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		PipelineName: v.PipelineName,
+		PipelineDesc: v.PipelineDescription,
 	}
 	if v.PipelineID != uuid.Nil {
 		j.PipelineID = v.PipelineID.String()
@@ -77,6 +79,13 @@ func (s *Server) handleTriggerRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "get pipeline")
+		return
+	}
+	if pipe.System {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "system_pipeline",
+			"hint":  "use POST /api/v1/storage/projects/{pid}/tables/{ns}/{t}/compact",
+		})
 		return
 	}
 

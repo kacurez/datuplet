@@ -15,10 +15,13 @@ import (
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/datuplet/datuplet/pkg/pipeline/validate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/auth"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/projectgate"
 	"github.com/datuplet/datuplet/pkg/pipelineapi/queryproxy"
+	"github.com/datuplet/datuplet/pkg/pipelineapi/runbackend"
 )
 
 // EmailLookup resolves a user UUID (as it appears in JWT actor claims
@@ -50,6 +53,12 @@ type HTTPHandlers struct {
 	// Query runs storage previews through the shared query-service core.
 	// nil (query service not configured) → preview returns 501 query_disabled.
 	Query PreviewRunner
+	// DB, Runs and Registry back the on-demand compaction route: the hidden
+	// system pipeline is validated against Registry, saved in DB and started
+	// through Runs. Any of them nil → that route returns 503.
+	DB       *pgxpool.Pool
+	Runs     runbackend.Backend
+	Registry validate.RegistryView
 }
 
 // PreviewRunner is the seam Preview uses to run the server-generated

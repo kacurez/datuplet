@@ -74,6 +74,7 @@ type PipelineDetail struct {
 	ID        string
 	Name      string
 	Doc       json.RawMessage
+	System    bool
 	CreatedAt string
 	UpdatedAt string
 }
