@@ -187,6 +187,9 @@ func compactTable(ctx context.Context, cat catalog.Catalog, ident icebergtable.I
 			icebergtable.WithCompactionTargetFileSize(target),
 			icebergtable.WithCompactionScanConcurrency(1),
 			icebergtable.WithCompactionArrowBatchSize(compactArrowBatchSize))
+		// v1 removes no delete files: iceberg-go's safe sets include
+		// position-delete files that also cover files outside the rewrite.
+		gr.SafePosDeletes, gr.SafeDeletionVectors = nil, nil
 		results = append(results, gr)
 		if err != nil {
 			cleanup()

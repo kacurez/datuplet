@@ -11,6 +11,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -265,12 +266,7 @@ const skipTarget = 16 << 10
 func (e *cmpEnv) seedSkipped() string {
 	e.t.Helper()
 	before := e.livePaths()
-	rng := rand.New(rand.NewPCG(3, 4))
-	ids := make([]int64, 2000)
-	for i := range ids {
-		ids[i] = 1_000_000 + rng.Int64N(1<<62)
-	}
-	e.appendRows(ids, "x")
+	e.appendRows(skippedIDs(), "x")
 	for _, f := range e.liveFiles() {
 		if !before[f.FilePath()] {
 			if sz := f.FileSizeBytes(); sz < skipTarget*3/4 || sz > skipTarget*9/5 {
@@ -281,6 +277,16 @@ func (e *cmpEnv) seedSkipped() string {
 	}
 	e.t.Fatal("seedSkipped: no new file")
 	return ""
+}
+
+// skippedIDs are the ids seedSkipped writes.
+func skippedIDs() []int64 {
+	rng := rand.New(rand.NewPCG(3, 4))
+	ids := make([]int64, 2000)
+	for i := range ids {
+		ids[i] = 1_000_000 + rng.Int64N(1<<62)
+	}
+	return ids
 }
 
 // newObjects returns objects under data/ not in before.
@@ -511,6 +517,49 @@ func TestCompactTable_DeleteManifestSuperseded(t *testing.T) {
 	}
 	if left := unreferenced(newObjects(objsBefore, e.dataObjects()), e.referenced()); len(left) != 0 {
 		t.Fatalf("written files left behind: %v", left)
+	}
+}
+
+// TestCompactTable_SharedPositionDeleteKept: one position-delete file covers
+// a row of a rewritten input and a row of a size-skipped file; compaction
+// must not remove it, or the skipped file's deleted row reappears.
+func TestCompactTable_SharedPositionDeleteKept(t *testing.T) {
+	e := newCmpEnv(t, "shared_posdel", false, iceberg.Properties{"format-version": "2", icebergtable.WriteDeleteModeKey: icebergtable.WriteModeMergeOnRead})
+	e.seed(6)
+	big := e.seedSkipped()
+	bigID := skippedIDs()[0]
+	filter := iceberg.NewOr(iceberg.EqualTo(iceberg.Reference("id"), int64(0)), iceberg.EqualTo(iceberg.Reference("id"), bigID))
+	if _, err := e.load().Delete(context.Background(), filter, nil); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	tasks, err := e.load().Scan().PlanFiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	holders := map[string][]string{}
+	for _, task := range tasks {
+		for _, d := range task.DeleteFiles {
+			holders[d.FilePath()] = append(holders[d.FilePath()], task.File.FilePath())
+		}
+	}
+	shared := false
+	for _, files := range holders {
+		shared = len(files) > 1 && slices.Contains(files, big)
+	}
+	if len(holders) != 1 || !shared {
+		t.Fatalf("precondition: want one position-delete file shared by the big file and an input, got %v", holders)
+	}
+
+	res, err := CompactTable(context.Background(), e.cat, e.ident, CompactOpts{TargetFileSizeBytes: skipTarget}, audit(), "k-shared")
+	if err != nil {
+		t.Fatalf("CompactTable: %v", err)
+	}
+	if res.Status != CompactCompacted || res.FilesRemoved != 6 || !e.livePaths()[big] {
+		t.Fatalf("result %+v", res)
+	}
+	got := e.rows()
+	if got[bigID] || got[0] || len(got) != 12-1+2000-1 {
+		t.Fatalf("%d rows; deleted big-file row present=%v, deleted input row present=%v", len(got), got[bigID], got[0])
 	}
 }
 

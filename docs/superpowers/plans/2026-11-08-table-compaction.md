@@ -64,7 +64,7 @@
   - `TestCompactTable_OperationKeyIdempotent`: second call with the same key after more appends → `CompactAlreadyCommitted`, exactly one `replace` snapshot.
   - `TestCompactTable_SizeOnlySelection`: a file ≥ min size with many deletes is not an input.
   - `TestCompactTable_DryRun`: `CompactDryRun`, groups reported, snapshot unchanged, no files written.
-  - `TestCompactTable_OutputRawEligible`: every added file passes the goplane raw-eligibility check.
+  - `TestCompactTable_OutputSchemaMatchesTable` (in `pkg/datagateway/goplane/compact_integration_test.go`; replaces `TestCompactTable_OutputRawEligible`): added files match the table schema except for the two v3 row-lineage columns, so they are NOT raw-eligible and are served decoded (accepted for v1). It lives in goplane because goplane imports icebergjob and the eligibility check is unexported.
 - [ ] **Step 3: Run** `go test -tags=integration ./pkg/icebergjob/ -run TestCompactTable -v`. Expected: FAIL (undefined `CompactTable`).
 - [ ] **Step 4: Implement** `CompactTable` per spec §5 "Shape" and §6. Order: key lookup → baseline snapshot → plan (size-only config) → cap to `MaxInputFiles` group by group → execute groups sequentially → commit loop wrapped in `catalogwriter.RetryOnConflict`, each attempt doing the ancestry + manifest check on the freshly loaded table, staging with `NewRewrite`, then `txn.Commit`. Track `submitted` and whether every submission was a 409 to drive cleanup. Summary props: `auditProps` + `datuplet.commit-key` + `datuplet.compaction.{files-before,files-after,bytes-before,bytes-after}`.
 - [ ] **Step 5: Run** the Step 3 command, then `go test ./pkg/icebergjob/...`. Expected: PASS.
