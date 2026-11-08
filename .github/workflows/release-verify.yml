@@ -87,8 +87,10 @@ jobs:
       - name: Install CLI from the release
         env:
           VER: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if ! curl -fsIL "https://github.com/kacurez/datuplet/releases/download/v${VER}/checksums.txt" >/dev/null; then
+          assets=$(gh release view "v${VER}" --repo kacurez/datuplet --json assets -q '.assets[].name')
+          if ! printf '%s\n' "$assets" | grep -qx 'checksums.txt'; then
             echo "::notice::release v${VER} predates CLI assets; skipping CLI installer check"
             exit 0
           fi

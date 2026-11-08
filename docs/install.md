@@ -22,6 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/insta
 datuplet version
 ```
 
+Set variables on the `sh` side of the pipe, not on `curl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | DATUPLET_VERSION=v0.14.0 DATUPLET_INSTALL_DIR="$HOME/bin" sh
+```
+
 The installer supports macOS and Linux on amd64 and arm64. It downloads the
 tarball and `checksums.txt` from the GitHub Release, verifies the SHA-256, and
 installs `datuplet` atomically. It never uses sudo.
@@ -41,7 +47,9 @@ Manual alternative: download `datuplet_<version>_<os>_<arch>.tar.gz` and
 put `datuplet` on your `PATH`.
 
 Verify: `datuplet version` prints the client version; `datuplet version --json`
-is the machine-readable form. Contributors can instead run `make build` and use
+is the machine-readable form. If `datuplet` is not on `PATH` (often the case for
+`~/.local/bin`), call it by the absolute path from the installer's
+`installed datuplet <version> to <path>` line, e.g. `~/.local/bin/datuplet version --json`. Contributors can instead run `make build` and use
 `bin/datuplet`.
 
 ## Helm repo

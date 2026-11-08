@@ -26,6 +26,7 @@ if [ -z "$tag" ]; then
     || die "could not query the latest release"
   [ -n "$tag" ] || die "could not determine the latest release tag; set DATUPLET_VERSION"
 fi
+tag=v${tag#v}
 version=${tag#v}
 
 if [ -n "${DATUPLET_INSTALL_DIR:-}" ]; then

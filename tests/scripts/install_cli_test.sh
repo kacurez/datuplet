@@ -67,3 +67,10 @@ if DATUPLET_RELEASE_BASE="http://127.0.0.1:$port/bad" DATUPLET_VERSION=$tag DATU
 fi
 [ ! -e "$dir_c/datuplet" ] || fail "case C: binary installed despite mismatch"
 echo "PASS: C checksum mismatch fails and installs nothing"
+
+# Case D: version without the leading v
+dir_d="$work/d/bin"
+DATUPLET_RELEASE_BASE=$base DATUPLET_VERSION=$version DATUPLET_INSTALL_DIR=$dir_d sh "$root/scripts/install-cli.sh" >/dev/null \
+  || fail "case D: installer failed for version without v"
+"$dir_d/datuplet" version | grep -q "client: $version " || fail "case D: unexpected version output"
+echo "PASS: D version without leading v is normalised"

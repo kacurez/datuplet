@@ -44,8 +44,9 @@ curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/insta
 datuplet version --json
 ```
 
-If the installer prints an `export PATH=...` line, run it. Optional env:
-`DATUPLET_VERSION` (tag, e.g. `v0.14.0`), `DATUPLET_INSTALL_DIR`.
+If `datuplet` is not found, it is likely in `~/.local/bin` (not on PATH; `export PATH` does not persist across shell calls). Use the absolute path from the `installed datuplet <version> to <path>` line, e.g. `~/.local/bin/datuplet version --json`, or install into a PATH directory with `DATUPLET_INSTALL_DIR`.
+Set options on the `sh` side of the pipe:
+`curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | DATUPLET_VERSION=v0.14.0 DATUPLET_INSTALL_DIR=/usr/local/bin sh`
 
 ## Prerequisites: authentication
 
