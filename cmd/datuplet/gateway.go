@@ -218,7 +218,9 @@ func bootGateway(opts gatewayOptions, hooks gatewayHooks, gate *datagateway.Boot
 	if cfg.RunID == "" {
 		cfg.RunID = fmt.Sprintf("%s-%d", opts.mode, time.Now().Unix())
 	}
-	cfg.ComponentName = opts.mode + "-component"
+	if cfg.ComponentName == "" {
+		cfg.ComponentName = opts.mode + "-component"
+	}
 
 	newPlane := hooks.newPlane
 	if newPlane == nil {

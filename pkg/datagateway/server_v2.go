@@ -100,6 +100,10 @@ type ServerV2 struct {
 	// case CloseWriter still writes metadata but skips the commit dispatch.
 	commitPool *CommitPool
 
+	// compactFn runs one table compaction against the catalog (seam over
+	// icebergjob.CompactTable). nil without a lakekeeper resolver.
+	compactFn compactFunc
+
 	// validatedClaims holds the validated run-token JWT claims set during
 	// boot. Non-nil only when the run-token was successfully validated
 	// against pipeline-api's JWKS. Used to wire lakekeeper routing
@@ -277,6 +281,14 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 				return icebergjob.CommitTableFiles(ctx, cat, ident, paths, part, mode, auditProps, key)
 			},
 		})
+
+		s.compactFn = func(ctx context.Context, ident icebergtable.Identifier, opts icebergjob.CompactOpts, key string) (*icebergjob.CompactResult, error) {
+			cat, err := res.Catalog(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("catalog: %w", err)
+			}
+			return icebergjob.CompactTable(ctx, cat, ident, opts, auditProps, key)
+		}
 
 		// Wire the per-gateway run-token into datupleticeio's
 		// loadTable-refresh path so iceberg-go's `gs://` IO factory

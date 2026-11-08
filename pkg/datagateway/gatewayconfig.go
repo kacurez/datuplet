@@ -11,6 +11,7 @@ import (
 // GatewayConfig is the configuration file format for the
 type GatewayConfig struct {
 	RunID         string `yaml:"run_id"`
+	ComponentName string `yaml:"component_name,omitempty"` // pipeline component instance name
 	LakekeeperURL string `yaml:"lakekeeper_url,omitempty"` // Lakekeeper REST catalog base URL
 	// PipelineAPIJWKSURL is the JWKS endpoint pipeline-api serves.
 	// The operator injects this whenever LakekeeperURL is set; DG validates
@@ -133,7 +134,7 @@ func LoadGatewayConfigFile(path string) (*GatewayConfig, error) {
 }
 
 // LoadConfigFile loads the gateway YAML into a Config (the datagateway
-// binary's loader). It leaves RunID and ComponentName to the caller.
+// binary's loader). The caller defaults an empty RunID or ComponentName.
 func LoadConfigFile(configPath, runTokenPath, podAnnotationsPath string) (*Config, error) {
 	cfg, err := LoadGatewayConfigFile(configPath)
 	if err != nil {
@@ -142,8 +143,7 @@ func LoadConfigFile(configPath, runTokenPath, podAnnotationsPath string) (*Confi
 	return cfg.ToConfig(runTokenPath, podAnnotationsPath), nil
 }
 
-// ToConfig converts the parsed YAML into the gateway Config. Backend and
-// ComponentName are left for the caller.
+// ToConfig converts the parsed YAML into the gateway Config.
 func (cfg *GatewayConfig) ToConfig(runTokenPath, podAnnotationsPath string) *Config {
 	// Encode component config as JSON
 	componentCfgJSON, err := json.Marshal(cfg.Component.Config)
@@ -154,6 +154,7 @@ func (cfg *GatewayConfig) ToConfig(runTokenPath, podAnnotationsPath string) *Con
 	// Create gateway config
 	gatewayCfg := &Config{
 		RunID:              cfg.RunID,
+		ComponentName:      cfg.ComponentName,
 		Inputs:             cfg.Component.Inputs,
 		ComponentCfg:       componentCfgJSON,
 		ChunkSize:          cfg.Gateway.ChunkSize,

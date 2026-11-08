@@ -528,6 +528,7 @@ func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun
 	configMap := make(map[string]any)
 	configMap["mode"] = "minio"
 	configMap["run_id"] = pr.Status.RunID
+	configMap["component_name"] = comp.Name
 	if pr.Spec.Preview != nil {
 		configMap["preview"] = map[string]any{"id": pr.Spec.Preview.ID, "row_limit": pr.Spec.Preview.RowLimit}
 	}
