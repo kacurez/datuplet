@@ -74,3 +74,12 @@ DATUPLET_RELEASE_BASE=$base DATUPLET_VERSION=$version DATUPLET_INSTALL_DIR=$dir_
   || fail "case D: installer failed for version without v"
 "$dir_d/datuplet" version | grep -q "client: $version " || fail "case D: unexpected version output"
 echo "PASS: D version without leading v is normalised"
+
+# Case E: a non-CLI release tag (e.g. a chart release) is rejected before any download
+dir_e="$work/e/bin"
+if err=$(DATUPLET_RELEASE_BASE=$base DATUPLET_VERSION=datuplet-app-0.20.0 DATUPLET_INSTALL_DIR=$dir_e sh "$root/scripts/install-cli.sh" 2>&1 >/dev/null); then
+  fail "case E: installer must reject a non-CLI tag"
+fi
+echo "$err" | grep -q "is not a CLI release" || fail "case E: unexpected error: $err"
+[ ! -e "$dir_e/datuplet" ] || fail "case E: binary installed for a non-CLI tag"
+echo "PASS: E non-CLI release tag is rejected"

@@ -94,6 +94,7 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          make_latest: true
 
   charts:
     name: package + publish helm charts
@@ -152,20 +153,18 @@ jobs:
           done
 
       - name: Run chart-releaser
-        # packages_with_index=true uploads chart tarballs directly to the
-        # gh-pages branch alongside index.yaml; it BYPASSES the GitHub
-        # Releases API entirely. This is the no-PAT path: GITHUB_TOKEN's
-        # contents:write is sufficient for the git push, but the same
-        # token consistently returns 403 on POST /repos/.../releases for
-        # personal-account public repos (an undocumented limit). Helm
-        # consumers only read index.yaml, so `helm repo add` works
-        # identically — we just don't get per-chart entries on the
-        # GitHub Releases page.
+        # packages_with_index=true also pushes the chart tarballs to the
+        # gh-pages branch alongside index.yaml, which is all `helm repo add`
+        # reads. chart-releaser still creates one GitHub Release per chart
+        # (datuplet-<chart>-<version>); mark_as_latest=false keeps those
+        # from becoming the repo's "latest" release, which must stay the
+        # v<version> CLI release that scripts/install-cli.sh resolves.
         uses: helm/chart-releaser-action@v1.7.0
         with:
           charts_dir: charts
           skip_existing: true
           packages_with_index: true
+          mark_as_latest: false
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CR_SKIP_EXISTING: "true"

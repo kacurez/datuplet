@@ -29,6 +29,10 @@ main() {
   fi
   tag=v${tag#v}
   version=${tag#v}
+  case $version in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) die "release tag '${tag#v}' is not a CLI release (vX.Y.Z); set DATUPLET_VERSION=vX.Y.Z" ;;
+  esac
 
   if [ -n "${DATUPLET_INSTALL_DIR:-}" ]; then
     dir=$DATUPLET_INSTALL_DIR
