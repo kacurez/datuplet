@@ -41,7 +41,7 @@ func kubectlJSONPath(kind, name, ns, path string) (string, error) {
 // the Job from the frozen snapshot before a mid-run mutation is applied.
 //
 // RFC 027 E5: the PipelineRun CR name is minted by pipeline-api
-// (<pipeline>-<run-uuid>), not chosen by the harness, so Jobs are selected by
+// (run-<run-uuid>), not chosen by the harness, so Jobs are selected by
 // the stable datuplet.io/run-id label the controller stamps on every Job/Pod
 // (pkg/k8s/controllers/pipelinerun_jobs.go) rather than by PipelineRun name.
 func waitForComponentJob(t *testing.T, ns string, runID uuid.UUID, componentName string, timeout time.Duration) string {
@@ -63,8 +63,7 @@ func waitForComponentJob(t *testing.T, ns string, runID uuid.UUID, componentName
 }
 
 // pipelineRunNameForRun resolves the PipelineRun CR name for a run by its
-// datuplet.io/run-id label. pipeline-api mints the CR name (<pipeline>-<uuid>,
-// with a DNS-1123 fallback form), so tests that read PipelineRun.status must
+// datuplet.io/run-id label. pipeline-api mints the CR name (run-<uuid>), so tests that read PipelineRun.status must
 // discover the name via the run-id label rather than reconstruct it. Polls
 // briefly because the CR is created asynchronously by the trigger path.
 func pipelineRunNameForRun(t *testing.T, ns string, runID uuid.UUID, timeout time.Duration) string {

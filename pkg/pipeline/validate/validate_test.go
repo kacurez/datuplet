@@ -711,3 +711,76 @@ func TestColumnTypeEnumMatchesCRD(t *testing.T) {
 		t.Fatalf("CRD enum %v != validator vocabulary %v", crd, want)
 	}
 }
+
+func TestValidateComponentName_DNSLabel(t *testing.T) {
+	path := "stages[0].components[0].name"
+	cases := []struct {
+		name    string
+		wantBad bool
+	}{
+		{"Load_Customers", true},
+		{"load customers", true},
+		{"a.b", true},
+		{"-x", true},
+		{"x-", true},
+		{strings.Repeat("a", 64), true},
+		{"c1", false},
+		{"http-json-extractor-2", false},
+		{strings.Repeat("a", 63), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &datupletv1.Pipeline{
+				Spec: datupletv1.PipelineSpec{
+					Stages: []datupletv1.StageSpec{{
+						Name: "extract",
+						Components: []datupletv1.ComponentSpec{{
+							Name:      tc.name,
+							Component: "extractor",
+							Outputs:   &datupletv1.OutputSpec{DefaultBucket: "raw"},
+						}},
+					}},
+				},
+			}
+			p.Name = "ok"
+			var got []Finding
+			for _, f := range ValidateTyped(p, nil, nil) {
+				if f.Path == path {
+					got = append(got, f)
+				}
+			}
+			if tc.wantBad {
+				if len(got) == 0 {
+					t.Fatalf("want a name finding for %q, got none", tc.name)
+				}
+				for _, f := range got {
+					if f.Severity != "error" {
+						t.Fatalf("want severity error, got %+v", f)
+					}
+				}
+			} else if len(got) != 0 {
+				t.Fatalf("want no name finding for %q, got %+v", tc.name, got)
+			}
+		})
+	}
+
+	t.Run("empty name only required", func(t *testing.T) {
+		p := &datupletv1.Pipeline{Spec: datupletv1.PipelineSpec{Stages: []datupletv1.StageSpec{{
+			Name: "extract",
+			Components: []datupletv1.ComponentSpec{{
+				Component: "extractor",
+				Outputs:   &datupletv1.OutputSpec{DefaultBucket: "raw"},
+			}},
+		}}}}
+		p.Name = "ok"
+		var got []Finding
+		for _, f := range ValidateTyped(p, nil, nil) {
+			if f.Path == path {
+				got = append(got, f)
+			}
+		}
+		if len(got) != 1 || !strings.Contains(got[0].Message, "name is required") {
+			t.Fatalf("want only the required finding, got %+v", got)
+		}
+	})
+}

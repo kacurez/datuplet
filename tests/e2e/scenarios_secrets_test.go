@@ -236,9 +236,9 @@ func TestSecretsLadder(t *testing.T) {
 	// (d, part 1) The per-run snapshot Secret exists while the run's
 	// PipelineRun object is still around. Name derived exactly as
 	// runSecretsName does (pkg/k8s/controllers/pipelinerun_jobs.go):
-	// "datuplet-runsecrets-" + first 8 chars of the run UUID.
+	// "datuplet-runsecrets-" + the canonical run UUID.
 	// ------------------------------------------------------------------
-	snapshotName := "datuplet-runsecrets-" + result.RunID.String()[:8]
+	snapshotName := "datuplet-runsecrets-" + result.RunID.String()
 	if !secretExists(t, namespace, snapshotName) {
 		t.Fatalf("snapshot Secret %q does not exist after a successful run", snapshotName)
 	}

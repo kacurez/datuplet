@@ -4,7 +4,7 @@ package controllers
 //
 // handlePending snapshots ONLY the $[name] keys the pipeline references from
 // the managed project Secret (datuplet-project-secrets) into a per-run Secret
-// (datuplet-runsecrets-<shortID>). The snapshot is ownerRef'd to the run,
+// (datuplet-runsecrets-<runID>). The snapshot is ownerRef'd to the run,
 // immutable for its life (rotation-exact), and mounted at the existing
 // gateway-sidecar secrets path. A missing key fails the run FailedUser at
 // admission with zero Jobs and zero snapshot.
@@ -150,7 +150,7 @@ func TestAdmission_SnapshotCreated_ReferencedKeyOnly(t *testing.T) {
 	// the snapshot Secret by name.
 	reconcilePR(t, r, "pr1")
 
-	jobName := componentJobName(got, "extract", "c1")
+	jobName := mustJobName(t, got, "c1")
 	job := &batchv1.Job{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: jobName, Namespace: "default"}, job); err != nil {
 		t.Fatalf("Get component Job %q: %v", jobName, err)
@@ -261,7 +261,7 @@ func TestAdmission_RotationIsolation_SnapshotImmutable(t *testing.T) {
 	}
 
 	// Mounted name unchanged.
-	jobName := componentJobName(got, "extract", "c1")
+	jobName := mustJobName(t, got, "c1")
 	job := &batchv1.Job{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: jobName, Namespace: "default"}, job); err != nil {
 		t.Fatalf("Get component Job: %v", err)
@@ -314,7 +314,7 @@ func TestAdmission_NoRefs_NoSnapshotNoMountNoCondition(t *testing.T) {
 
 	// Drive the stage; the Job must not mount any snapshot Secret.
 	reconcilePR(t, r, "pr1")
-	jobName := componentJobName(got, "extract", "c1")
+	jobName := mustJobName(t, got, "c1")
 	job := &batchv1.Job{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: jobName, Namespace: "default"}, job); err != nil {
 		t.Fatalf("Get component Job: %v", err)
@@ -338,14 +338,19 @@ func TestAdmission_PartialAdmission_SnapshotExists_ProjectKeyRemoved_NotFailed(t
 
 	pipeline := pipelineRefSecret("p1", "api_token")
 	pr := pendingRun("pr1", runID)
+	pr.UID = types.UID("pr1-uid")
 
-	// Pre-existing snapshot from a prior (partial) admission, holding v1. Its
-	// name is derived from the run-id exactly as snapshotRunSecrets derives it.
+	// Pre-existing snapshot from a prior (partial) admission of this run,
+	// holding v1. Its name is derived from the run-id exactly as
+	// snapshotRunSecrets derives it.
 	snapName := runSecretsName(&datupletv1.PipelineRun{Status: datupletv1.PipelineRunStatus{RunID: runID}})
 	preSnap := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: snapName, Namespace: "default"},
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{"api_token": []byte("v1")},
+	}
+	if err := ctrl.SetControllerReference(pr, preSnap, scheme); err != nil {
+		t.Fatalf("SetControllerReference: %v", err)
 	}
 	// Project Secret has since been rotated: the referenced key is GONE. Under
 	// the old (project-Secret-first) order this would drive a FailedUser.
