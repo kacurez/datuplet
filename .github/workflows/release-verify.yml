@@ -89,8 +89,13 @@ jobs:
           VER: ${{ steps.ver.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          assets=$(gh release view "v${VER}" --repo kacurez/datuplet --json assets -q '.assets[].name')
-          if ! printf '%s\n' "$assets" | grep -qx 'checksums.txt'; then
+          if ! out=$(gh release view "v${VER}" --repo kacurez/datuplet --json assets -q '.assets[].name' 2>&1); then
+            case $out in
+              *"release not found"*) echo "::notice::v${VER} has no GitHub Release; skipping CLI install check"; exit 0 ;;
+              *) echo "$out" >&2; exit 1 ;;
+            esac
+          fi
+          if ! printf '%s\n' "$out" | grep -qx 'checksums.txt'; then
             echo "::notice::release v${VER} predates CLI assets; skipping CLI installer check"
             exit 0
           fi

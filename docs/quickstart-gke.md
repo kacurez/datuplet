@@ -283,11 +283,13 @@ Open `http://localhost:8080/ui/` and log in with the admin credentials from step
 ## 7. Trigger a pipeline
 
 Pipelines are envelope-free PipelineDocs (RFC 027) — upserted through the
-API/CLI/UI, not applied as Kubernetes manifests. Build the CLI locally and
+API/CLI/UI, not applied as Kubernetes manifests. Install the CLI and
 point it at the port-forwarded pipeline-api:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
+# Contributors / unreleased main: run `make build` and use ./bin/datuplet instead.
+# If the installer printed a path under ~/.local/bin, use that absolute path (or add it to PATH).
 
 export DATUPLET_REMOTE=http://localhost:8080
 echo 'replace-with-a-strong-password' | datuplet login --remote $DATUPLET_REMOTE \

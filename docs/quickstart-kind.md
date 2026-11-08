@@ -168,10 +168,12 @@ kubectl get svc -n datuplet pipeline-api
 The repo ships a simple example pipeline that fetches JSON from a public API and
 writes it as an Iceberg table. Pipelines are envelope-free PipelineDocs (RFC
 027) — upserted through the API/CLI/UI, not applied as Kubernetes manifests.
-Build the CLI and use it directly:
+Install the CLI and use it directly:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
+# Contributors / unreleased main: run `make build` and use ./bin/datuplet instead.
+# If the installer printed a path under ~/.local/bin, use that absolute path (or add it to PATH).
 
 export DATUPLET_REMOTE=http://localhost:8080
 echo changeme | datuplet login --remote $DATUPLET_REMOTE \

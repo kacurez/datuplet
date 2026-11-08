@@ -60,7 +60,8 @@ open http://localhost:8080/ui/
 # 6. Trigger a pipeline (via the CLI — pipelines are envelope-free
 #    PipelineDocs now, not `kubectl apply`-able CRs; see docs/pipeline-api.md)
 curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
-#    (contributors can also build it from a clone: `make build` -> bin/datuplet)
+#    (contributors / unreleased main: `make build` -> ./bin/datuplet)
+#    (if it printed a path under ~/.local/bin, use that absolute path or add it to PATH)
 export DATUPLET_REMOTE=http://localhost:8080
 echo changeme | datuplet login --remote $DATUPLET_REMOTE \
   --email admin@datuplet.local --password-stdin

@@ -373,6 +373,7 @@ These are conventions a new contributor wouldn't infer from the code:
 | `cmd/pipeline-operator/` | Operator binary. |
 | `cmd/pipeline-observer/` | Standalone informer; mirrors PipelineRun status to DB. |
 | `cmd/pipeline-api/` | HTTP server + admin subcommands. |
+| `cmd/gateway/` | Data Gateway sidecar binary (image entrypoint `gateway`). |
 | `cmd/datuplet/` | CLI (`login`, `pipeline`, `trigger`, `runs`, `components`, `storage`, `query`, `apps`); `docs/agent-quickstart.md` is built on it. |
 | `cmd/app-worker/` | app-worker binary (RFC 028). |
 | `cmd/mock-datagateway/` | In-process fake gateway for `make extractor-local`; example configs alongside. |
