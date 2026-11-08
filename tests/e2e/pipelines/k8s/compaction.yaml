@@ -1,0 +1,17 @@
+# Compaction scenario (TestCompaction_PipelineStage): a single iceberg-compactor
+# stage bin-packs the table the seed pipeline filled with small files.
+# min_input_files is 2 because each partition holds only two seed files.
+name: "{{.RunPrefix}}-compaction"
+stages:
+  - name: compact
+    components:
+      - name: compactor
+        component: iceberg-compactor
+        version: dev
+        config:
+          min_input_files: 2
+        outputs:
+          tables:
+            - name: events
+              bucket: "{{.RunPrefix}}-compact"
+              writeMode: APPEND
