@@ -71,6 +71,9 @@ var (
 	// definitive rejection, and the operation key is not on the table.
 	// The written files are kept.
 	ErrCommitOutcomeUnknown = errors.New("icebergjob: commit outcome unknown; written files kept")
+	// ErrUnsupportedFile: a data file selected for rewrite is in a format
+	// iceberg-go cannot read (e.g. ORC, Avro). Nothing was committed.
+	ErrUnsupportedFile = errors.New("icebergjob: unsupported data file format")
 
 	errSuperseded = errors.New("icebergjob: superseded")
 )
@@ -193,7 +196,7 @@ func compactTable(ctx context.Context, cat catalog.Catalog, ident icebergtable.I
 		results = append(results, gr)
 		if err != nil {
 			cleanup()
-			return nil, fmt.Errorf("CompactTable: %w", err)
+			return nil, fmt.Errorf("CompactTable: %w", classifyUnsupported(err))
 		}
 	}
 	var removed, added int
@@ -304,6 +307,13 @@ func compactTable(ctx context.Context, cat catalog.Catalog, ident icebergtable.I
 
 // capGroups takes whole groups until maxInputs input files, truncating the
 // group that crosses the cap when the rest still has minInputs files.
+func classifyUnsupported(err error) error {
+	if errors.Is(err, iceberg.ErrNotImplemented) {
+		return fmt.Errorf("%w: %w", ErrUnsupportedFile, err)
+	}
+	return err
+}
+
 func capGroups(groups []compaction.Group, maxInputs, minInputs int) ([]compaction.Group, int) {
 	var out []compaction.Group
 	taken, deferred := 0, 0

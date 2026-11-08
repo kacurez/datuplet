@@ -40,7 +40,7 @@ func (s *ServerV2) CompactTable(ctx context.Context, req *pb.CompactTableRequest
 		return nil, status.Errorf(codes.Internal, "compact %s.%s: gateway has no component instance name; refusing to derive a shared operation key", bucket, table)
 	}
 	if s.isCancelled() {
-		return nil, errRunCancelled
+		return nil, cancelledStatus(errRunCancelled)
 	}
 	if s.compactFn == nil {
 		return nil, status.Errorf(codes.Internal, "compact %s.%s: no catalog configured", bucket, table)
@@ -70,7 +70,7 @@ func (s *ServerV2) CompactTable(ctx context.Context, req *pb.CompactTableRequest
 		compactionErrors.WithLabelValues(classifyCommitError(err)).Inc()
 		log.Printf("ERROR: compaction %s.%s (component=%s) failed after %s: %v", bucket, table, component, elapsed.Round(time.Millisecond), err)
 		if s.isCancelled() {
-			return nil, fmt.Errorf("%w: %v", errRunCancelled, err)
+			return nil, cancelledStatus(fmt.Errorf("%w: %v", errRunCancelled, err))
 		}
 		return nil, compactStatusError(bucket, table, err)
 	}
@@ -116,11 +116,17 @@ func (s *ServerV2) isDeclaredOutputTable(bucket, table string) bool {
 func compactStatusError(bucket, table string, err error) error {
 	code := codes.Internal
 	switch {
+	case errors.Is(err, icebergjob.ErrHistoryUnverifiable), errors.Is(err, icebergjob.ErrCommitOutcomeUnknown):
 	case errors.Is(err, catalog.ErrNoSuchTable), errors.Is(err, catalog.ErrNoSuchNamespace):
 		code = codes.NotFound
-	case errors.Is(err, icebergjob.ErrHistoryUnverifiable), errors.Is(err, icebergjob.ErrCommitOutcomeUnknown):
+	case errors.Is(err, icebergjob.ErrUnsupportedFile):
+		code = codes.FailedPrecondition
 	case catalogwriter.IsCommitConflict(err):
 		code = codes.Aborted
 	}
 	return status.Errorf(code, "compact %s.%s: %v", bucket, table, err)
+}
+
+func cancelledStatus(err error) error {
+	return status.Error(codes.Canceled, err.Error())
 }

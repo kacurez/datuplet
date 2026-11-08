@@ -1,6 +1,8 @@
 package icebergjob
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -45,5 +47,17 @@ func TestPureAppendSnapshot(t *testing.T) {
 		if got := pureAppend(c.snap, c.mfs); got != c.want {
 			t.Errorf("%s: pureAppend = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestCompactClassifyUnsupported(t *testing.T) {
+	orc := fmt.Errorf("read data file: %w", fmt.Errorf("orc: %w", iceberg.ErrNotImplemented))
+	got := classifyUnsupported(orc)
+	if !errors.Is(got, ErrUnsupportedFile) || !errors.Is(got, iceberg.ErrNotImplemented) {
+		t.Fatalf("classifyUnsupported(%v) = %v, want ErrUnsupportedFile wrapping ErrNotImplemented", orc, got)
+	}
+	other := errors.New("boom")
+	if got := classifyUnsupported(other); errors.Is(got, ErrUnsupportedFile) {
+		t.Fatalf("classifyUnsupported(%v) = %v, want unchanged", other, got)
 	}
 }

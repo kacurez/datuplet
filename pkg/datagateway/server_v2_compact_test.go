@@ -156,11 +156,14 @@ func TestCompactTable_ErrorCodes(t *testing.T) {
 		err  error
 		want codes.Code
 	}{
-		"not found":          {err: fmt.Errorf("CompactTable: load table: %w", catalog.ErrNoSuchTable), want: codes.NotFound},
-		"unverifiable":       {err: icebergjob.ErrHistoryUnverifiable, want: codes.Internal},
-		"outcome unknown":    {err: icebergjob.ErrCommitOutcomeUnknown, want: codes.Internal},
-		"conflict exhausted": {err: fmt.Errorf("CompactTable: %w", rest.ErrCommitFailed), want: codes.Aborted},
-		"other":              {err: errors.New("boom"), want: codes.Internal},
+		"not found":                 {err: fmt.Errorf("CompactTable: load table: %w", catalog.ErrNoSuchTable), want: codes.NotFound},
+		"unverifiable":              {err: icebergjob.ErrHistoryUnverifiable, want: codes.Internal},
+		"outcome unknown":           {err: icebergjob.ErrCommitOutcomeUnknown, want: codes.Internal},
+		"unsupported file":          {err: fmt.Errorf("CompactTable: %w: %w", icebergjob.ErrUnsupportedFile, errors.New("orc: not implemented")), want: codes.FailedPrecondition},
+		"unverifiable not found":    {err: fmt.Errorf("CompactTable: %w: reload table: %w", icebergjob.ErrHistoryUnverifiable, catalog.ErrNoSuchTable), want: codes.Internal},
+		"outcome unknown not found": {err: fmt.Errorf("CompactTable: %w: %w", icebergjob.ErrCommitOutcomeUnknown, catalog.ErrNoSuchTable), want: codes.Internal},
+		"conflict exhausted":        {err: fmt.Errorf("CompactTable: %w", rest.ErrCommitFailed), want: codes.Aborted},
+		"other":                     {err: errors.New("boom"), want: codes.Internal},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _ := compactServer("compact-a", declaredRawEvents())
@@ -200,8 +203,8 @@ func TestCompactTable_Cancelled(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	_, err := s.CompactTable(context.Background(), &pb.CompactTableRequest{Bucket: "raw", Table: "events"})
-	if !errors.Is(err, errRunCancelled) {
-		t.Fatalf("err = %v, want errRunCancelled", err)
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("code = %v (%v), want Canceled", status.Code(err), err)
 	}
 	if called {
 		t.Fatal("seam called after cancel")
