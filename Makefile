@@ -103,7 +103,7 @@ build-component-data-generator: ## Build data-generator component image
 # daemon, no GHCR pull. Runtime pull policy is IfNotPresent (the operator's
 # DATUPLET_RUNTIME_PULL_POLICY, wired from image.pullPolicy), so a local tag is
 # all K8s needs.
-COMPONENT_TAG ?= v0.13.3
+COMPONENT_TAG ?= v0.20.0
 
 # Namespace for the k8s-* developer-loop targets (deploy-local installs
 # into `datuplet`; override for e2e clusters: make k8s-reload-crds K8S_NS=datuplet-e2e).
