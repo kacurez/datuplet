@@ -21,6 +21,8 @@
 #
 # syntax=docker/dockerfile:1.4
 FROM golang:1.27-bookworm AS builder
+ARG VERSION=dev
+ARG COMMIT=none
 
 WORKDIR /build
 
@@ -39,7 +41,7 @@ COPY . .
 WORKDIR /build/components/queryengine
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 go build -tags=duckdb_arrow -o /query-worker ./cmd/query-worker
+    CGO_ENABLED=1 go build -tags=duckdb_arrow -ldflags "-X github.com/datuplet/datuplet/pkg/buildinfo.Version=${VERSION} -X github.com/datuplet/datuplet/pkg/buildinfo.Commit=${COMMIT}" -o /query-worker ./cmd/query-worker
 
 # Phase 0: run the extension installer to bake iceberg + httpfs into the image.
 # The installer is a standalone Go module under utils/docker/install-duckdb-ext/.

@@ -15,6 +15,43 @@ This split means Datuplet releases (Phase 3) never touch stateful infra (Phase 2
 Iceberg catalog (Phase 4). The install order is fixed and sequential; each phase depends on
 the previous.
 
+## Install the CLI
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
+datuplet version
+```
+
+Set variables on the `sh` side of the pipe, not on `curl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | DATUPLET_VERSION=v0.14.0 DATUPLET_INSTALL_DIR="$HOME/bin" sh
+```
+
+The installer supports macOS and Linux on amd64 and arm64. It downloads the
+tarball and `checksums.txt` from the GitHub Release, verifies the SHA-256, and
+installs `datuplet` atomically. It never uses sudo.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATUPLET_VERSION` | latest release | Release tag with the leading `v`, e.g. `v0.14.0` |
+| `DATUPLET_INSTALL_DIR` | `/usr/local/bin` if writable, else `$HOME/.local/bin` | Target directory (created if missing) |
+
+If the directory is not on `PATH`, the installer prints the `export PATH=...`
+line to add. `DATUPLET_RELEASE_BASE` overrides the download base URL (mirrors).
+
+Manual alternative: download `datuplet_<version>_<os>_<arch>.tar.gz` and
+`checksums.txt` from the
+[GitHub Releases](https://github.com/kacurez/datuplet/releases) page, check with
+`sha256sum -c` (or `shasum -a 256 -c`) against the matching line, extract, and
+put `datuplet` on your `PATH`.
+
+Verify: `datuplet version` prints the client version; `datuplet version --json`
+is the machine-readable form. If `datuplet` is not on `PATH` (often the case for
+`~/.local/bin`), call it by the absolute path from the installer's
+`installed datuplet <version> to <path>` line, e.g. `~/.local/bin/datuplet version --json`. Contributors can instead run `make build` and use
+`bin/datuplet`.
+
 ## Helm repo
 
 Datuplet charts are published to the public helm repo on every release tag:

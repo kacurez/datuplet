@@ -1,5 +1,5 @@
 // Package datupleticeio centralizes Datuplet's iceberg-go IO scheme
-// registrations. Every binary that calls into iceberg-go (cmd/datuplet,
+// registrations. Every binary that calls into iceberg-go (cmd/gateway,
 // cmd/pipeline-api, cmd/pipeline-operator) and every package that uses
 // iceberg-go's IO factory directly (pkg/icebergjob, pkg/datagateway/lakekeeper,
 // pkg/pipelineapi/storage) blank-imports this package so the registration

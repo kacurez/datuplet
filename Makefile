@@ -30,8 +30,13 @@ help: ## Show this help
 # Build
 # =============================================================================
 
+BUILDINFO_PKG := github.com/datuplet/datuplet/pkg/buildinfo
+LDFLAGS := -X $(BUILDINFO_PKG).Version=$(shell sed -n 's/^version: *//p' charts/datuplet-app/Chart.yaml) \
+	-X $(BUILDINFO_PKG).Commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo none) \
+	-X $(BUILDINFO_PKG).Date=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
 build: ## Build CLI binary (datuplet)
-	go build -o bin/datuplet ./cmd/datuplet
+	go build -ldflags "$(LDFLAGS)" -o bin/datuplet ./cmd/datuplet
 
 build-pipeline-api: ## Build pipeline-api binary
 	go build -o bin/pipeline-api ./cmd/pipeline-api
@@ -98,7 +103,7 @@ build-component-data-generator: ## Build data-generator component image
 # daemon, no GHCR pull. Runtime pull policy is IfNotPresent (the operator's
 # DATUPLET_RUNTIME_PULL_POLICY, wired from image.pullPolicy), so a local tag is
 # all K8s needs.
-COMPONENT_TAG ?= v0.13.3
+COMPONENT_TAG ?= v0.20.0
 
 # Namespace for the k8s-* developer-loop targets (deploy-local installs
 # into `datuplet`; override for e2e clusters: make k8s-reload-crds K8S_NS=datuplet-e2e).

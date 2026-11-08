@@ -1,0 +1,54 @@
+name: cli-prerelease-smoke
+
+# Manual dry run of the CLI release path. Publishes a throwaway prerelease
+# under a cli-smoke-* tag, which does not match release.yml's v*.*.* trigger.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  smoke:
+    name: build and publish smoke prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build tarballs
+        run: scripts/build-cli.sh "0.0.0-smoke.${{ github.run_id }}" dist
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cli-smoke-${{ github.run_id }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          name: "CLI smoke (not a release)"
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Summary
+        run: |
+          {
+            echo "### CLI smoke prerelease cli-smoke-${{ github.run_id }}"
+            echo
+            echo "Assets:"
+            for f in dist/*; do
+              echo "- https://github.com/${{ github.repository }}/releases/download/cli-smoke-${{ github.run_id }}/$(basename "$f")"
+            done
+            echo
+            echo "Cleanup:"
+            echo
+            echo '```sh'
+            echo "gh release delete cli-smoke-${{ github.run_id }} --cleanup-tag -y"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -29,8 +29,8 @@
 //
 // This test COMPILES + vets + skips cluster-lessly here; its behaviour is
 // proven on the live OrbStack cluster at the E5 gate. E5 must confirm:
-//   - The `datuplet` root binary builds from ./cmd/datuplet (it links iceberg-go
-//     via the datupleticeio blank-import; build, not run, is what this test needs).
+//   - The `datuplet` root binary builds from ./cmd/datuplet (a thin HTTP client;
+//     build, not run, is what this test needs).
 //   - `datuplet components get data-generator --schema` resolves the STABLE
 //     v0.0.1 registration (real schema with required `tables`) — RegisterBuiltinComponents
 //     registers exactly that, and resolveVersion with no --version picks the

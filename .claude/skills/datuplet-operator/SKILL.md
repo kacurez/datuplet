@@ -35,6 +35,19 @@ failure mode for an agent here is authoring config from memory and skipping
 validation; the second is not confirming the run actually succeeded. This skill
 exists to keep you from both.
 
+## Prerequisites: install the CLI
+
+Install first (macOS/Linux; no sudo), then check it works:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
+datuplet version --json
+```
+
+If `datuplet` is not found, it is likely in `~/.local/bin` (not on PATH; `export PATH` does not persist across shell calls). Use the absolute path from the `installed datuplet <version> to <path>` line, e.g. `~/.local/bin/datuplet version --json`, or install into a PATH directory with `DATUPLET_INSTALL_DIR`.
+Set options on the `sh` side of the pipe:
+`curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | DATUPLET_VERSION=v0.14.0 DATUPLET_INSTALL_DIR=/usr/local/bin sh`
+
 ## Prerequisites: authentication
 
 Every command below talks to pipeline-api and needs a bearer token, a remote

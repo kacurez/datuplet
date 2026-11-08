@@ -53,6 +53,25 @@ jobs:
             ./pkg/datagateway/goplane/... \
             ./pkg/datupleticeio/...
 
+  cli-cross-build:
+    name: cli cross-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build CLI tarballs
+        run: sh tests/scripts/build_cli_test.sh
+
+      - name: Test CLI installer
+        run: sh tests/scripts/install_cli_test.sh
+
   duckdb-modules:
     name: DuckDB module tests
     runs-on: ubuntu-latest

@@ -9,6 +9,8 @@
 #
 # syntax=docker/dockerfile:1.4
 FROM golang:1.27-alpine AS builder
+ARG VERSION=dev
+ARG COMMIT=none
 
 WORKDIR /app
 
@@ -25,7 +27,7 @@ COPY ui/appshell/ ./ui/appshell/
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -o /app-worker ./cmd/app-worker
+    CGO_ENABLED=0 go build -ldflags "-X github.com/datuplet/datuplet/pkg/buildinfo.Version=${VERSION} -X github.com/datuplet/datuplet/pkg/buildinfo.Commit=${COMMIT}" -o /app-worker ./cmd/app-worker
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates

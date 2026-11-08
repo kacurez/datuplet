@@ -84,6 +84,26 @@ jobs:
             --register-mode job \
             -- --admin-email verify@datuplet.local --admin-password 'rv-ci-password-1'
 
+      - name: Install CLI from the release
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! out=$(gh release view "v${VER}" --repo kacurez/datuplet --json assets -q '.assets[].name' 2>&1); then
+            case $out in
+              *"release not found"*) echo "::notice::v${VER} has no GitHub Release; skipping CLI install check"; exit 0 ;;
+              *) echo "$out" >&2; exit 1 ;;
+            esac
+          fi
+          if ! printf '%s\n' "$out" | grep -qx 'checksums.txt'; then
+            echo "::notice::release v${VER} predates CLI assets; skipping CLI installer check"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/bin"
+          DATUPLET_VERSION="v${VER}" DATUPLET_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install-cli.sh
+          got=$("$RUNNER_TEMP/bin/datuplet" version --json | jq -r .client.version)
+          [ "$got" = "$VER" ] || { echo "datuplet version reports '$got', expected '$VER'" >&2; exit 1; }
+
       - name: Smoke
         run: make k8s-smoke SMOKE_URL=http://localhost:30081
 
