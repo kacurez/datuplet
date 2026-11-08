@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -429,8 +430,39 @@ func TestHandleRunning_PreviewDeadline_ForeignJobUntouched(t *testing.T) {
 
 	reconcilePR1(t, r)
 
-	assertForeignFailure(t, c)
+	assertForeignFailure(t, c, "Job", jobName)
 	assertUnchanged(t, c, before)
+}
+
+// With no Job under the derived name, pods that merely carry its job-name
+// label (e.g. another run's) are not read: the component records the timeout
+// without a log line.
+func TestHandleRunning_PreviewDeadline_JobAbsentNoForeignLogs(t *testing.T) {
+	scheme := newTestScheme(t)
+	pr, jobName := timedOutPreviewRun(t)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: jobName + "-zzzzz", Namespace: "default",
+		Labels: map[string]string{"job-name": jobName},
+	}}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(pr, pod).WithStatusSubresource(pr).Build()
+	r := registryReconciler(c, scheme)
+	// The fake clientset serves "fake logs" for every pod log request.
+	r.Clientset = kfake.NewSimpleClientset(pod.DeepCopy())
+
+	reconcilePR1(t, r)
+
+	got := getRun(t, c)
+	if got.Status.Phase != datupletv1.PipelineRunPhaseFailedUser {
+		t.Fatalf("phase = %q (message %q), want FailedUser", got.Status.Phase, got.Status.Message)
+	}
+	cs := got.Status.StageStatuses[1].ComponentStatuses[0]
+	if cs.Phase != datupletv1.ComponentPhaseFailedUser || cs.CompletionTime == nil {
+		t.Errorf("component status = {phase %q, completion %v}, want FailedUser/set", cs.Phase, cs.CompletionTime)
+	}
+	if cs.Message != "preview timed out" {
+		t.Errorf("component message = %q, want %q (no log read without a verified Job)", cs.Message, "preview timed out")
+	}
 }
 
 // Within its deadline, a preview run keeps running.
@@ -509,14 +541,15 @@ func ownedBy(t *testing.T, scheme *runtime.Scheme, owner *datupletv1.PipelineRun
 	return obj
 }
 
-func assertForeignFailure(t *testing.T, c client.Client) {
+func assertForeignFailure(t *testing.T, c client.Client, kind, name string) {
 	t.Helper()
 	got := getRun(t, c)
 	if got.Status.Phase != datupletv1.PipelineRunPhaseFailedApplication {
 		t.Fatalf("phase = %q (message %q), want FailedApplication", got.Status.Phase, got.Status.Message)
 	}
-	if !strings.Contains(got.Status.Message, "belongs to another PipelineRun") {
-		t.Errorf("message = %q, want it to contain %q", got.Status.Message, "belongs to another PipelineRun")
+	want := fmt.Sprintf("%s %s already exists and belongs to another PipelineRun", kind, name)
+	if got.Status.Message != want {
+		t.Errorf("message = %q, want %q", got.Status.Message, want)
 	}
 }
 
@@ -538,7 +571,7 @@ func TestReconcile_ForeignOwnedObjectsFailRun(t *testing.T) {
 	const runID = "33333333-3333-4333-8333-333333333333"
 	jobName := "run-" + runID + "-s0-c0"
 	cases := []struct {
-		name    string
+		name    string // also the kind named in the failure message
 		foreign client.Object
 	}{
 		{"Job", &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: "default"}}},
@@ -566,7 +599,7 @@ func TestReconcile_ForeignOwnedObjectsFailRun(t *testing.T) {
 				reconcileOnce(t, r)
 			}
 
-			assertForeignFailure(t, c)
+			assertForeignFailure(t, c, tc.name, tc.foreign.GetName())
 			assertUnchanged(t, c, before)
 		})
 	}
@@ -604,7 +637,7 @@ func TestSnapshot_CreateRaceForeignOwned(t *testing.T) {
 
 	reconcileOnce(t, r)
 
-	assertForeignFailure(t, c)
+	assertForeignFailure(t, c, "Secret", snapName)
 	got := &corev1.Secret{}
 	if err := c.Get(context.Background(), types.NamespacedName{Name: snapName, Namespace: "default"}, got); err != nil {
 		t.Fatalf("Get foreign Secret: %v", err)

@@ -884,16 +884,19 @@ func (r *PipelineRunReconciler) failPreviewTimeout(ctx context.Context, pr *datu
 				return ctrl.Result{}, err
 			}
 			found = false
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: pr.Namespace}}
 		} else if err := checkOwned(job, pr, "Job"); err != nil {
 			return r.failForeignOwned(ctx, pr, err)
 		}
-		// Capture the last status line before the delete removes the pod.
+		// Capture the last status line before the delete removes the pod. Logs
+		// are read only from a Job verified to belong to this run: pods are
+		// selected by job-name label, which a foreign pod may carry.
 		if cs := componentStatusByName(stageStatus, stage.Components[i].Name); cs != nil && !componentTerminal(cs.Phase) {
 			cs.Phase = datupletv1.ComponentPhaseFailedUser
 			cs.Message = "preview timed out"
-			if line := r.extractComponentStatusMessage(ctx, job, 0); line != "" {
-				cs.Message = status.SanitizeMessage(cs.Message + "; last log: " + line)
+			if found {
+				if line := r.extractComponentStatusMessage(ctx, job, 0); line != "" {
+					cs.Message = status.SanitizeMessage(cs.Message + "; last log: " + line)
+				}
 			}
 			cs.CompletionTime = &now
 		}

@@ -48,11 +48,21 @@ func runSecretsName(pr *datupletv1.PipelineRun) string {
 
 var errForeignOwned = errors.New("object belongs to another PipelineRun")
 
-// checkOwned returns an errForeignOwned-wrapping error when obj, found under a
-// name pr derives, is not controlled by pr.
+// foreignOwnedError is the error checkOwned returns; it matches errForeignOwned
+// under errors.Is while its message stays the exact text stored in status.
+type foreignOwnedError struct{ kind, name string }
+
+func (e *foreignOwnedError) Error() string {
+	return fmt.Sprintf("%s %s already exists and belongs to another PipelineRun", e.kind, e.name)
+}
+
+func (e *foreignOwnedError) Unwrap() error { return errForeignOwned }
+
+// checkOwned returns a foreignOwnedError when obj, found under a name pr
+// derives, is not controlled by pr.
 func checkOwned(obj client.Object, pr *datupletv1.PipelineRun, kind string) error {
 	if !metav1.IsControlledBy(obj, pr) {
-		return fmt.Errorf("%s %s already exists and belongs to another PipelineRun: %w", kind, obj.GetName(), errForeignOwned)
+		return &foreignOwnedError{kind: kind, name: obj.GetName()}
 	}
 	return nil
 }
