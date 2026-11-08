@@ -287,14 +287,14 @@ API/CLI/UI, not applied as Kubernetes manifests. Build the CLI locally and
 point it at the port-forwarded pipeline-api:
 
 ```bash
-make build   # builds bin/datuplet, from the repo root
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
 
 export DATUPLET_REMOTE=http://localhost:8080
-echo 'replace-with-a-strong-password' | ./bin/datuplet login --remote $DATUPLET_REMOTE \
+echo 'replace-with-a-strong-password' | datuplet login --remote $DATUPLET_REMOTE \
   --email admin@example.com --password-stdin
 
-./bin/datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
-./bin/datuplet trigger simple-pipeline
+datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
+datuplet trigger simple-pipeline
 
 kubectl get pipelineruns -n datuplet -w
 ```

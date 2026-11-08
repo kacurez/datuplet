@@ -84,6 +84,19 @@ jobs:
             --register-mode job \
             -- --admin-email verify@datuplet.local --admin-password 'rv-ci-password-1'
 
+      - name: Install CLI from the release
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          if ! curl -fsIL "https://github.com/kacurez/datuplet/releases/download/v${VER}/checksums.txt" >/dev/null; then
+            echo "::notice::release v${VER} predates CLI assets; skipping CLI installer check"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/bin"
+          DATUPLET_VERSION="v${VER}" DATUPLET_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install-cli.sh
+          got=$("$RUNNER_TEMP/bin/datuplet" version --json | jq -r .client.version)
+          [ "$got" = "$VER" ] || { echo "datuplet version reports '$got', expected '$VER'" >&2; exit 1; }
+
       - name: Smoke
         run: make k8s-smoke SMOKE_URL=http://localhost:30081
 

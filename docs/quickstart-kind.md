@@ -171,14 +171,14 @@ writes it as an Iceberg table. Pipelines are envelope-free PipelineDocs (RFC
 Build the CLI and use it directly:
 
 ```bash
-make build   # builds bin/datuplet
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
 
 export DATUPLET_REMOTE=http://localhost:8080
-echo changeme | ./bin/datuplet login --remote $DATUPLET_REMOTE \
+echo changeme | datuplet login --remote $DATUPLET_REMOTE \
   --email admin@datuplet.local --password-stdin
 
-./bin/datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
-./bin/datuplet trigger simple-pipeline
+datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
+datuplet trigger simple-pipeline
 
 kubectl get pipelineruns -n datuplet -w
 ```

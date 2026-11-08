@@ -14,6 +14,16 @@ audience is a script or agent starting from a bare environment.
 
 ## Prerequisites
 
+**0. Install the CLI** (macOS/Linux, amd64/arm64) and check it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
+datuplet version --json   # {"client":{"version":...},...}
+```
+
+If the installer prints an `export PATH=...` line, run it. Pin a release with
+`DATUPLET_VERSION=v0.14.0`, change the target with `DATUPLET_INSTALL_DIR`.
+
 Pick one of two auth paths (RFC 027 §7):
 
 **A. Headless (env vars only) — no files, no login flow:**

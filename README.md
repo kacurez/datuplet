@@ -59,12 +59,13 @@ open http://localhost:8080/ui/
 
 # 6. Trigger a pipeline (via the CLI — pipelines are envelope-free
 #    PipelineDocs now, not `kubectl apply`-able CRs; see docs/pipeline-api.md)
-make build   # builds bin/datuplet
+curl -fsSL https://raw.githubusercontent.com/kacurez/datuplet/main/scripts/install-cli.sh | sh
+#    (contributors can also build it from a clone: `make build` -> bin/datuplet)
 export DATUPLET_REMOTE=http://localhost:8080
-echo changeme | ./bin/datuplet login --remote $DATUPLET_REMOTE \
+echo changeme | datuplet login --remote $DATUPLET_REMOTE \
   --email admin@datuplet.local --password-stdin
-./bin/datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
-./bin/datuplet trigger simple-pipeline
+datuplet pipeline put -f examples/pipelines/simple-http-extract.yaml
+datuplet trigger simple-pipeline
 kubectl get pipelineruns -n datuplet -w
 ```
 
