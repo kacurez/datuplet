@@ -147,11 +147,12 @@ func dataGeneratorStableResources() *datupletv1.ComponentResources {
 
 // builtinE2EComponents lists every component instantiated by
 // tests/e2e/pipelines/k8s/*.yaml, i.e. every image `make build-components-e2e`
-// (+ build-component-sql-transform) builds locally as `datuplet/<name>:latest`.
+// (+ build-component-sql-transform, build-component-iceberg-compactor) builds locally as `datuplet/<name>:latest`.
 var builtinE2EComponents = []string{
 	"data-generator",
 	"http-json-extractor",
 	"sql-transform",
+	"iceberg-compactor",
 }
 
 // RegisterBuiltinComponents kubectl-applies a ComponentDefinition for every

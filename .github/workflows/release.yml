@@ -60,7 +60,7 @@ jobs:
     secrets: inherit
 
   # Component images: data-generator, sql-transform,
-  # http-json-extractor. Same UI shape as the
+  # http-json-extractor, iceberg-compactor. Same UI shape as the
   # services bucket.
   components:
     needs: verify-tag

@@ -9,8 +9,8 @@ read its `schema.json` directly (pointers below) or fetch it live:
 datuplet components get <name> --schema
 ```
 
-Datuplet ships three built-in components (`data-generator`,
-`http-json-extractor`, `sql-transform`). Each runs as an ordinary
+Datuplet ships four built-in components (`data-generator`,
+`http-json-extractor`, `sql-transform`, `iceberg-compactor`). Each runs as an ordinary
 container alongside the Data Gateway sidecar; the component communicates with
 the sidecar via gRPC and HTTP — it never touches S3 directly.
 
@@ -368,6 +368,49 @@ component.
   is not yet honoured by the Lakekeeper read path; full-snapshot reads are used.
 - Schema evolution: if your SQL creates an output table with a different schema than
   the existing Iceberg target, the commit fails with `FailedUser`.
+
+---
+
+## iceberg-compactor
+
+Bin-packs the small data files of each declared output table into target-size
+Parquet files in one atomic Iceberg snapshot. The component does no data I/O
+itself: it calls the Data Gateway's `CompactTable` RPC once per output table.
+
+**Image:** `ghcr.io/kacurez/iceberg-compactor:<components.tag>` · **Registry
+name:** `iceberg-compactor` · **IO:** `{inputs: none, outputs: required}`
+
+**Config schema:** [`components/iceberg-compactor/schema.json`](../components/iceberg-compactor/schema.json)
+(`min_input_files`/`max_input_files` are `x-datuplet-advanced`).
+
+```yaml
+- name: compact
+  component: iceberg-compactor
+  config: { target_file_size_mb: 128 }
+  outputs: { tables: [ { name: events, bucket: raw } ] }
+```
+
+**Key points:**
+
+- Outputs must be explicit `outputs.tables`; `defaultBucket`/`buckets`-only
+  outputs exit 1. `writeMode` is ignored.
+- `target_file_size_mb` is only sent when set; otherwise the pipeline's
+  `gateway.targetFileSize` applies. Unset file-count bounds use the library
+  defaults (5 / 2000).
+- Statuses `COMPACTED`, `ALREADY_COMMITTED`, `NOTHING_TO_DO`, `SUPERSEDED` and
+  `DRY_RUN` all exit 0. One `DUPLET_STATUS_MESSAGE:` line summarises every
+  table (files before -> after).
+- gRPC `NotFound`, `PermissionDenied`, `InvalidArgument`, `FailedPrecondition`
+  exit 1 (FailedUser); anything else (conflict exhaustion, storage/catalog
+  errors, cancellation) exits 20. With several tables the worst outcome wins.
+
+**Limitations:**
+
+- Old data files stay in storage until snapshots are expired; compaction does
+  not reclaim space by itself.
+- In a preview run the output tables are redirected to a scratch namespace, so
+  the compactor only does something if an earlier stage of the same preview
+  wrote the table; otherwise it ends `FailedUser` (table not found).
 
 ---
 

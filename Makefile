@@ -4,7 +4,7 @@ export DOCKER_BUILDKIT=1
 .PHONY: \
 	build build-pipeline-api build-gateway \
 	build-components build-components-e2e build-components-local build-component-data-generator build-operators \
-	build-component-sql-transform build-component-datuplet-query \
+	build-component-sql-transform build-component-iceberg-compactor build-component-datuplet-query \
 	engine-wasm \
 	extractor-local \
 	docker-build-operators docker-build-pipeline-api docker-build-pipeline-observer docker-build-app-worker docker-build-k8s \
@@ -54,6 +54,7 @@ build-components: build-gateway ## Build all component Docker images
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
 	docker build -t datuplet/sql-transform:latest -f components/sql-transform/Dockerfile .
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
+	docker build -t datuplet/iceberg-compactor:latest -f components/iceberg-compactor/Dockerfile .
 	docker build -t datuplet/query-worker:latest -f utils/docker/query-worker.Dockerfile .
 
 # E2E-only component subset: builds only the components scenarios reference.
@@ -65,7 +66,7 @@ build-components: build-gateway ## Build all component Docker images
 # bootstrap (tests/e2e/framework/components_bootstrap.go) has a real stable
 # version to register alongside the mutable "dev" tag, giving the
 # unpinned-resolution and schema-invalid scenarios something to pin against.
-build-components-e2e: build-gateway build-component-sql-transform ## Build only the components actively used by e2e (data-generator + http-json-extractor + sql-transform + query-worker)
+build-components-e2e: build-gateway build-component-sql-transform build-component-iceberg-compactor ## Build only the components actively used by e2e (data-generator + http-json-extractor + sql-transform + query-worker)
 	docker build -t datuplet/data-generator:latest -f components/data-generator/Dockerfile .
 	docker tag datuplet/data-generator:latest datuplet/data-generator:v0.0.1
 	docker build -t datuplet/http-json-extractor:latest -f components/http-json-extractor/Dockerfile .
@@ -73,6 +74,9 @@ build-components-e2e: build-gateway build-component-sql-transform ## Build only 
 
 build-component-sql-transform: ## Build sql-transform component image (RFC 010)
 	docker build -t datuplet/sql-transform:latest -f components/sql-transform/Dockerfile .
+
+build-component-iceberg-compactor: ## Build iceberg-compactor component image
+	docker build -t datuplet/iceberg-compactor:latest -f components/iceberg-compactor/Dockerfile .
 
 # datuplet-query (RFC 022 Task 3.1): BYO-local ad-hoc SQL binary. SEPARATE
 # install from the duckdb-free root `datuplet` CLI — the root binary cannot run
@@ -104,7 +108,7 @@ K8S_NS ?= datuplet
 # (RFC 024 W3) overrides it to a port-forwarded address in the verify cluster.
 SMOKE_URL ?= http://localhost:30081
 build-components-local: build-components ## Build + tag built-in component images as datuplet/<name>:$(COMPONENT_TAG) for deploy-local
-	for c in data-generator sql-transform http-json-extractor; do \
+	for c in data-generator sql-transform http-json-extractor iceberg-compactor; do \
 	  docker tag datuplet/$$c:latest datuplet/$$c:$(COMPONENT_TAG); \
 	done
 

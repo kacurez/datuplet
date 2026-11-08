@@ -39,6 +39,9 @@ jobs:
       - name: go test
         run: go test -count=1 ./...
 
+      - name: go test (iceberg-compactor)
+        run: cd components/iceberg-compactor && go test -count=1 ./...
+
       - name: go test (integration — goplane + datupleticeio)
         # Validates pkg/datagateway/goplane (Lakekeeper + object-store
         # fixtures) and pkg/datupleticeio (fsouza/fake-gcs-server) via
