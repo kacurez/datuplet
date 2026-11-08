@@ -307,6 +307,9 @@ func storageCompact(ctx context.Context, remote, projectID, token, ns, tbl strin
 	defer cancel()
 	final, err := pollUntilTerminal(pollCtx, remote, projectID, out.RunID, token)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("timed out waiting for run %s; it is still running (check with `datuplet runs get %s`)", out.RunID, out.RunID)
+		}
 		return nil, fmt.Errorf("waiting for run %s: %w", out.RunID, err)
 	}
 	return final, nil

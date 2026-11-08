@@ -53,7 +53,9 @@ function renderRow(r) {
   return `
     <tr data-href="${href}" data-id="${esc(id)}">
       <td><a href="${href}"><code class="mono">${esc(id.slice(0, 8))}</code></a></td>
-      <td title="${esc(r.pipeline_name || '')}">${esc(r.pipeline_description || r.pipeline_name || r.pipeline_id || '')}</td>
+      ${(r.pipeline_name || '').startsWith('sys-') && r.pipeline_description
+        ? `<td title="${esc(r.pipeline_name)}">${esc(r.pipeline_description)}</td>`
+        : `<td>${esc(r.pipeline_name || r.pipeline_id || '')}</td>`}
       <td><span class="pill ${pill}">${esc(r.phase)}</span></td>
       <td>${started}</td>
       <td>${dur}</td>

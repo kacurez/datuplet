@@ -102,7 +102,9 @@ export async function renderRunDetail(ctx) {
       <table class="table">
         <tbody>
           <tr><td style="width:140px;color:var(--fg-2);">Run ID</td><td class="mono">${esc(run.id)}</td></tr>
-          <tr><td style="color:var(--fg-2);">Pipeline</td><td class="mono" title="${esc(run.pipeline_name || '')}">${esc(run.pipeline_description || run.pipeline_id || '')}</td></tr>
+          <tr><td style="color:var(--fg-2);">Pipeline</td>${(run.pipeline_name || '').startsWith('sys-') && run.pipeline_description
+            ? `<td class="mono" title="${esc(run.pipeline_name)}">${esc(run.pipeline_description)}</td>`
+            : `<td class="mono">${esc(run.pipeline_id || '')}</td>`}</tr>
           <tr><td style="color:var(--fg-2);">Phase</td><td><span class="pill ${pill}">${esc(run.phase)}</span></td></tr>
           <tr><td style="color:var(--fg-2);">Created</td><td>${timeTag(run.created_at)}</td></tr>
           <tr><td style="color:var(--fg-2);">Started</td><td>${timeTag(run.started_at)}</td></tr>

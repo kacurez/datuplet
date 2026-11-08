@@ -37,7 +37,7 @@ func main() {
 	storageConfirm := storageCmd.String("confirm", "", "Retype <ns>.<table> to confirm `delete` (required; no undo)")
 
 	storageWait := storageCmd.Bool("wait", false, "Block until the compaction run is terminal (compact subcommand only)")
-	storageTimeout := storageCmd.Duration("timeout", time.Hour, "Cap on --wait (compact subcommand only)")
+	storageTimeout := storageCmd.Duration("timeout", time.Hour, "Cap on --wait (compact subcommand only); on expiry the run keeps going")
 	storageJSON := storageCmd.Bool("json", false, "Structured JSON output (compact subcommand only)")
 	storageTargetMB := storageCmd.Int("target-file-size-mb", 0, "Target data file size in MiB (compact subcommand only; 0 = default)")
 

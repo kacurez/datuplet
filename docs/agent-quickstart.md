@@ -455,7 +455,8 @@ datuplet storage compact --wait --json curated.daily_summary
 datuplet storage compact --target-file-size-mb 256 curated.daily_summary   # returns the run
 ```
 
-It prints the run (`--wait` blocks and exits non-zero unless it Succeeded).
+It prints the run (`--wait` blocks and exits non-zero unless it Succeeded; if `--timeout` expires the run keeps
+going and the error names it — check with `datuplet runs get <id>`).
 A compaction already running on the table exits non-zero naming that run;
 a "server busy" error means retry shortly. v1 does not reclaim storage — the
 old files stay until snapshots are expired.

@@ -133,8 +133,7 @@ function showCompactNotice(text, href, linkText) {
   if (!box) {
     box = document.createElement('p');
     box.id = 'compact-notice';
-    const app = document.getElementById('app');
-    app.parentNode.insertBefore(box, app);
+    document.getElementById('page-head').appendChild(box);
   }
   box.textContent = text;
   const a = document.createElement('a');
