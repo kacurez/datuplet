@@ -12,7 +12,7 @@ import (
 )
 
 // DBRunUpdater is the production RunStatusUpdater. It validates the
-// PipelineRun's identity against the runs+projects+pipelines join
+// PipelineRun's identity against the runs+projects join
 // before applying the phase write — otherwise any actor with write
 // access to a project namespace could create a decoy PipelineRun with
 // a victim's run-id label and hijack its mirrored status.

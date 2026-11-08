@@ -76,7 +76,7 @@ Keys must match `^[A-Za-z0-9_-]+$`.
 
 At run admission the PipelineRun controller reads the *exact* set of
 `$[name]` keys the pipeline references, copies only those keys from the
-managed project Secret into a per-run Secret (`datuplet-runsecrets-<id>`),
+managed project Secret into a per-run Secret (`datuplet-runsecrets-<run-uuid>`),
 and mounts that snapshot read-only at `/var/run/secrets/datuplet` on the
 **gateway sidecar only** — never on the component container. If a
 referenced key is missing from the project Secret at admission time (e.g.
