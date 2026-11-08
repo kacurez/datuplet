@@ -356,7 +356,16 @@ func DataFileCount(t *testing.T, target QueryTarget, bucket, table string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	tbl, err := target.Resolver.LoadTable(ctx, bucket, table)
+	h := SharedHarness()
+	if h == nil {
+		t.Fatalf("DataFileCount %s/%s: no shared harness", bucket, table)
+	}
+	// Host IO: the Resolver's vended in-cluster storage endpoint is unreachable from the host.
+	load, err := hostIOLoader(ctx, h, "datuplet-e2e-filecount", bucket, table)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	tbl, err := load()
 	if err != nil {
 		t.Fatalf("load %s/%s: %v", bucket, table, err)
 	}
