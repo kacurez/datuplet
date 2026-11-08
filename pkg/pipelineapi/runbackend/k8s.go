@@ -371,11 +371,7 @@ func (b *K8sBackend) CancelRun(ctx context.Context, req CancelRequest) error {
 	if err != nil {
 		return fmt.Errorf("get project: %w", err)
 	}
-	pipeName, err := store.GetPipelineNameByID(ctx, b.db, run.PipelineID)
-	if err != nil {
-		return fmt.Errorf("get pipeline: %w", err)
-	}
-	prName := pkg8s.CreateRunOpts{PipelineName: pipeName, RunID: req.RunID}.PipelineRunName()
+	prName := pkg8s.PipelineRunName(req.RunID)
 
 	pr := &datupletv1.PipelineRun{}
 	err = b.client.Get(ctx, types.NamespacedName{Name: prName, Namespace: proj.K8sNamespace}, pr)

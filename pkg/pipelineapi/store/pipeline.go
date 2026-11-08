@@ -70,21 +70,6 @@ func GetPipelineByName(ctx context.Context, pool *pgxpool.Pool, projectID uuid.U
 	return p, nil
 }
 
-// GetPipelineNameByID returns a pipeline's name by id, or ErrPipelineNotFound.
-// Used by cancel-path code that already has the pipeline_id from runs.pipeline_id
-// and doesn't need the full row.
-func GetPipelineNameByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (string, error) {
-	var name string
-	err := pool.QueryRow(ctx, `SELECT name FROM pipelines WHERE id = $1`, id).Scan(&name)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrPipelineNotFound
-		}
-		return "", fmt.Errorf("select pipeline name: %w", err)
-	}
-	return name, nil
-}
-
 // GetDocByID returns the stored doc (canonical JSON) for a pipeline, or
 // ErrPipelineNotFound.
 func GetDocByID(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) ([]byte, error) {

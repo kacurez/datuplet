@@ -33,13 +33,12 @@ func NewDBRunUpdater(pool *pgxpool.Pool) *DBRunUpdater {
 // validation failed (benign drop), and (false, err) is a real DB
 // error the caller should surface.
 func (d *DBRunUpdater) Update(ctx context.Context, s RunStatus) (bool, error) {
-	var expectedNS, pipelineName string
+	var expectedNS string
 	err := d.pool.QueryRow(ctx, `
-		SELECT p.k8s_namespace, pl.name FROM runs r
-		  JOIN projects p  ON p.id  = r.project_id
-		  JOIN pipelines pl ON pl.id = r.pipeline_id
+		SELECT p.k8s_namespace FROM runs r
+		  JOIN projects p ON p.id = r.project_id
 		 WHERE r.id = $1
-	`, s.RunID).Scan(&expectedNS, &pipelineName)
+	`, s.RunID).Scan(&expectedNS)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No matching run row — could be a reaped-but-visible
 		// PipelineRun or an unauthorized copy. Benign drop.
@@ -52,8 +51,7 @@ func (d *DBRunUpdater) Update(ctx context.Context, s RunStatus) (bool, error) {
 		// Cross-namespace hijack attempt — drop silently.
 		return false, nil
 	}
-	expectedName := CreateRunOpts{PipelineName: pipelineName, RunID: s.RunID}.PipelineRunName()
-	if s.PipelineRunName != expectedName {
+	if s.PipelineRunName != PipelineRunName(s.RunID) {
 		// Decoy PipelineRun with the right label, wrong name.
 		return false, nil
 	}
