@@ -542,13 +542,13 @@ func (s *Server) handleDeletePipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	if p, err := s.pipelines.Get(r.Context(), projectID, name); err == nil && p.System {
-		writeError(w, http.StatusConflict, "system_pipeline")
-		return
-	}
 	if err := s.pipelines.Delete(r.Context(), projectID, name); err != nil {
 		if errors.Is(err, errStoreNotFound) {
 			writeError(w, http.StatusNotFound, "pipeline not found")
+			return
+		}
+		if errors.Is(err, errSystemPipeline) {
+			writeError(w, http.StatusConflict, "system_pipeline")
 			return
 		}
 		if errors.Is(err, errPipelineInUse) {

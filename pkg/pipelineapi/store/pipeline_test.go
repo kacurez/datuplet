@@ -209,3 +209,23 @@ func TestSystemPipeline_CompactUpsertListAndActiveRun(t *testing.T) {
 		t.Errorf("terminal run counted as active: %s", rid)
 	}
 }
+
+func TestDeletePipeline_RefusesSystem(t *testing.T) {
+	pool, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	p, _ := store.CreateProject(ctx, pool, "proj")
+	if _, err := store.UpsertSystemPipeline(ctx, pool, p.ID, "sys-compact-x", "d", minimalDoc); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := store.DeletePipeline(ctx, pool, p.ID, "sys-compact-x"); !errors.Is(err, store.ErrSystemPipeline) {
+		t.Fatalf("delete system pipeline: err = %v, want ErrSystemPipeline", err)
+	}
+	if _, err := store.GetPipelineByName(ctx, pool, p.ID, "sys-compact-x"); err != nil {
+		t.Errorf("system pipeline was deleted: %v", err)
+	}
+	if err := store.DeletePipeline(ctx, pool, p.ID, "missing"); !errors.Is(err, store.ErrPipelineNotFound) {
+		t.Errorf("delete missing: err = %v, want ErrPipelineNotFound", err)
+	}
+}

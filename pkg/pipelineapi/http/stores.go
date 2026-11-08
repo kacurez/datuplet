@@ -25,6 +25,9 @@ var errStoreNotFound = errors.New("not found")
 // the pgx path CASCADEs deletes and never pushes back.
 var errPipelineInUse = errors.New("pipeline in use")
 
+// errSystemPipeline is the "delete rejected: system pipeline" signal; 409.
+var errSystemPipeline = errors.New("system pipeline")
+
 // ProjectReader serves the project endpoints that exist under
 // /api/v1/projects. Local mode returns a single hard-coded project;
 // cluster mode delegates to the pgx store's project functions.

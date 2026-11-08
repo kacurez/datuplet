@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
@@ -59,6 +60,9 @@ type HTTPHandlers struct {
 	DB       *pgxpool.Pool
 	Runs     runbackend.Backend
 	Registry validate.RegistryView
+
+	compactOnce  sync.Once
+	compactSlots chan struct{}
 }
 
 // PreviewRunner is the seam Preview uses to run the server-generated

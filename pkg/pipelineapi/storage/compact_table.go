@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -70,7 +71,12 @@ func (h *HTTPHandlers) CompactTable(w http.ResponseWriter, r *http.Request) {
 	var req compactRequest
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
 	if err != nil {
-		writeErrResp(w, http.StatusRequestEntityTooLarge, "body too large")
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErrResp(w, http.StatusRequestEntityTooLarge, "body too large")
+			return
+		}
+		writeErrResp(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
 	if len(bytes.TrimSpace(body)) > 0 {
@@ -155,6 +161,11 @@ func (h *HTTPHandlers) CompactTable(w http.ResponseWriter, r *http.Request) {
 		writeErrResp(w, http.StatusServiceUnavailable, "compaction is not configured on this pipeline-api instance")
 		return
 	}
+	if !h.tryCompactSlot() {
+		writeErrResp(w, http.StatusServiceUnavailable, "compaction_busy")
+		return
+	}
+	defer h.releaseCompactSlot()
 	conn, err := h.DB.Acquire(r.Context())
 	if err != nil {
 		writeErrResp(w, http.StatusServiceUnavailable, "acquire database connection")
@@ -208,6 +219,24 @@ func (h *HTTPHandlers) CompactTable(w http.ResponseWriter, r *http.Request) {
 		"target":   ns + "." + name,
 	})
 }
+
+// tryCompactSlot takes a process-wide admission slot without blocking. Each
+// admitted request pins one pooled connection for its advisory lock and needs
+// a second for its own queries, so at most MaxConns/2 may be in flight at once
+// across all tables, or concurrent compactions could exhaust the pool.
+func (h *HTTPHandlers) tryCompactSlot() bool {
+	h.compactOnce.Do(func() {
+		h.compactSlots = make(chan struct{}, max(1, int(h.DB.Config().MaxConns)/2))
+	})
+	select {
+	case h.compactSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *HTTPHandlers) releaseCompactSlot() { <-h.compactSlots }
 
 // unlockCompaction releases the admission lock and returns conn to the pool.
 // Releasing a pooled connection does not drop its session locks, so when the

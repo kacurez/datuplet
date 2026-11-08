@@ -183,6 +183,9 @@ func (s *pgxPipelineStore) Delete(ctx context.Context, projectID uuid.UUID, name
 		if errors.Is(err, store.ErrPipelineNotFound) {
 			return errStoreNotFound
 		}
+		if errors.Is(err, store.ErrSystemPipeline) {
+			return errSystemPipeline
+		}
 		return err
 	}
 	return nil

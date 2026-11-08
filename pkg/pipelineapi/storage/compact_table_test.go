@@ -114,7 +114,7 @@ func newFakeLakekeeper(t *testing.T) string {
 	})
 	mux.HandleFunc("/v1/namespaces/raw/tables/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if strings.TrimPrefix(r.URL.Path, "/v1/namespaces/raw/tables/") == "events" {
+		if tbl := strings.TrimPrefix(r.URL.Path, "/v1/namespaces/raw/tables/"); tbl == "events" || tbl == "orders" {
 			_, _ = w.Write([]byte(fakeTableMetadataJSON("s3://datuplet/m.json", fakeUUID(1))))
 			return
 		}
@@ -398,17 +398,20 @@ func TestCompactTable_SmallPoolNoStall(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("winner did not return after release")
 	}
-	var accepted, conflicts int
+	// With MaxConns=2 the admission semaphore has one slot, so losers are
+	// turned away with 503 compaction_busy before they reach the lock (409).
+	var accepted, rejected int
 	for _, r := range got {
-		switch r.status {
-		case http.StatusAccepted:
+		switch {
+		case r.status == http.StatusAccepted:
 			accepted++
-		case http.StatusConflict:
-			conflicts++
+		case r.status == http.StatusConflict && r.body["error"] == "compaction_running",
+			r.status == http.StatusServiceUnavailable && r.body["error"] == "compaction_busy":
+			rejected++
 		}
 	}
-	if accepted != 1 || conflicts != n-1 {
-		t.Errorf("accepted = %d, conflicts = %d; want 1 and %d", accepted, conflicts, n-1)
+	if accepted != 1 || rejected != n-1 {
+		t.Errorf("accepted = %d, rejected = %d; want 1 and %d", accepted, rejected, n-1)
 	}
 }
 
@@ -421,5 +424,59 @@ func TestCompactTable_LockReleasedOnError(t *testing.T) {
 	env.backend.setErr(nil)
 	if r := env.compact(t, "raw", "events", ""); r.status != http.StatusAccepted {
 		t.Fatalf("after error: %d %v, want 202", r.status, r.body)
+	}
+}
+
+func TestCompactTable_PoolBoundAcrossTables(t *testing.T) {
+	env := newCompactEnv(t, compactEnvOpts{db: true, maxConns: 2})
+	env.backend.entered = make(chan struct{}, 1)
+	env.backend.release = make(chan struct{})
+
+	first := make(chan compactResp, 1)
+	go func() { first <- env.compact(t, "raw", "events", "") }()
+	select {
+	case <-env.backend.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached TriggerRun")
+	}
+	second := make(chan compactResp, 1)
+	go func() { second <- env.compact(t, "raw", "orders", "") }()
+	var other compactResp
+	select {
+	case other = <-second:
+	case <-time.After(5 * time.Second):
+		close(env.backend.release)
+		t.Fatal("second table's request stalled while the first held a slot")
+	}
+	close(env.backend.release)
+	if w := <-first; w.status != http.StatusAccepted {
+		t.Fatalf("first: %d %v, want 202", w.status, w.body)
+	}
+	if other.status != http.StatusServiceUnavailable || other.body["error"] != "compaction_busy" {
+		t.Fatalf("second: %d %v, want 503 compaction_busy", other.status, other.body)
+	}
+	env.backend.release = nil
+	if r := env.compact(t, "raw", "orders", ""); r.status != http.StatusAccepted {
+		t.Fatalf("after release: %d %v, want 202", r.status, r.body)
+	}
+}
+
+type failingBody struct{}
+
+func (failingBody) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+func TestCompactTable_BodyReadErrorIs400(t *testing.T) {
+	h := &HTTPHandlers{Gate: &projectgate.Gate{
+		LakekeeperProjectIDFor: func(context.Context, uuid.UUID) (string, error) { return fixtureLakekeeperProjectID, nil },
+		Authorizer:             dataAdminFake(),
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/compact", failingBody{})
+	req.SetPathValue("pid", fixtureProjectID)
+	req.SetPathValue("ns", "raw")
+	req.SetPathValue("t", "events")
+	rec := httptest.NewRecorder()
+	auth.WithUser(stubResolver{}, http.HandlerFunc(h.CompactTable)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }

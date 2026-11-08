@@ -155,18 +155,31 @@ func UpdatePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID
 	return nil
 }
 
-// DeletePipeline removes a pipeline row. The CASCADE on runs.pipeline_id
+// ErrSystemPipeline is returned by DeletePipeline for a system pipeline.
+var ErrSystemPipeline = errors.New("system pipeline")
+
+// DeletePipeline removes a non-system pipeline row. The CASCADE on runs.pipeline_id
 // takes care of in-flight run rows; the corresponding Pipeline CRD in
 // K8s is NOT deleted by this call (operators can kubectl delete manually
 // once Plan C3 makes this a routine operation).
 func DeletePipeline(ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID, name string) error {
 	tag, err := pool.Exec(ctx,
-		`DELETE FROM pipelines WHERE project_id = $1 AND name = $2`, projectID, name)
+		`DELETE FROM pipelines WHERE project_id = $1 AND name = $2 AND NOT system`, projectID, name)
 	if err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrPipelineNotFound
+	if tag.RowsAffected() > 0 {
+		return nil
 	}
-	return nil
+	var system bool
+	err = pool.QueryRow(ctx, `SELECT system FROM pipelines WHERE project_id = $1 AND name = $2`, projectID, name).Scan(&system)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrPipelineNotFound
+	case err != nil:
+		return fmt.Errorf("select pipeline: %w", err)
+	case system:
+		return ErrSystemPipeline
+	}
+	return ErrPipelineNotFound
 }
