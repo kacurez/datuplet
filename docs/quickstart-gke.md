@@ -135,6 +135,18 @@ warehouse:
   type: gcs
   gcs:
     bucket: "${GCS_BUCKET}"
+queryWorker:
+  extraEgress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
 EOF
 
 # Phase 4, Mode A (Workload Identity) — GSA was set in step 3 above.
@@ -158,6 +170,15 @@ EOF
   -f-infra /tmp/datuplet-gke-infra.yaml \
   -f-app /tmp/datuplet-gke-app.yaml
 ```
+
+The app values explicitly allow query-worker public IPv4 HTTPS reads for both
+GCS credential modes. **This is broader than GCS hostname access:** standard
+NetworkPolicy cannot filter by hostname, so the rule permits TCP 443 to every
+IPv4 destination outside the three excluded private ranges. Use narrower
+endpoint CIDRs or a hostname-aware egress gateway for stricter isolation; see
+[query-worker egress for external storage](warehouse-setup.md#query-worker-egress-for-external-storage).
+Without an explicit rule, the default policy allows only in-cluster MinIO
+storage reads, so GCS sample/SQL requests can time out on enforcing clusters.
 
 Run **one** of the two `install.sh` invocations above, matching the GCS
 access mode you chose in step 3. Phase 2 provisions a CNPG Postgres cluster

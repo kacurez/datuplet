@@ -287,6 +287,64 @@ helm install datuplet-staging ./charts/datuplet-app \
   -f values.staging.yaml
 ```
 
+## Query-worker egress for external storage
+
+The `datuplet-app` chart's query-worker NetworkPolicy permits DNS, Lakekeeper,
+in-cluster MinIO TCP 9000, and pipeline-api JWKS by default. It does **not**
+permit external GCS or S3 reads. On clusters that enforce policies, storage
+sample and SQL queries can time out even when warehouse registration and
+pipeline writes succeed. This applies to both GCS credential modes and to
+policy-capable development clusters, including kindnet versions with nftables
+enforcement.
+
+Set `queryWorker.extraEgress` in the **app chart values** (`-f-app` with
+`scripts/install.sh` or `scripts/upgrade.sh`). It is a list of native Kubernetes
+NetworkPolicy egress rules, appended without replacing the built-in rules.
+The default `[]` adds no access; disabling query-worker renders no worker policy.
+
+For GCS or AWS S3 over public IPv4 HTTPS, an explicit opt-in example is:
+
+```yaml
+# values.external-storage-app.yaml (datuplet-app)
+queryWorker:
+  extraEgress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+**Security warning:** this permits TCP 443 to all IPv4 addresses except the
+listed private ranges, not just `storage.googleapis.com`, an S3 hostname, or
+your bucket. Other non-public ranges are not excluded. Standard NetworkPolicy
+cannot filter by hostname. Prefer provider-approved destination CIDRs, a
+private endpoint, or an egress proxy/gateway with hostname-aware controls when
+stricter isolation is required. IPv6 endpoints need separate IPv6 rules.
+
+For an S3-compatible endpoint with a fixed address and custom port, replace
+the broad rule with a narrow rule (substitute your actual endpoint CIDR/port):
+
+```yaml
+queryWorker:
+  extraEgress:
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.10/32 # documentation address; replace before use
+      ports:
+        - protocol: TCP
+          port: 9443
+```
+
+These rules affect only query-worker, not Lakekeeper or pipeline pods. Keep
+their networking configured separately. Native rules are additive: an empty
+rule (`{}`), or omitted destination/ports, can grant much broader access.
+
 ## Switching between S3 and GCS
 
 The chart's `values.schema.json` enforces:

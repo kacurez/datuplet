@@ -191,6 +191,12 @@ queryWorker:
   # rendered; pipeline-api also skips the DATUPLET_QUERY_WORKER_URL env var.
   enabled: true
 
+  # Additional native Kubernetes NetworkPolicy egress rules, appended to DNS,
+  # catalog, MinIO, and JWKS access. External GCS/S3 requires an explicit rule.
+  # Default [] preserves lockdown; rules are additive and can widen access.
+  # See docs/warehouse-setup.md#query-worker-egress-for-external-storage.
+  extraEgress: []
+
   # replicas: number of query-worker Deployment replicas. Each replica runs
   # its own embedded DuckDB at full concurrency. Keep at 1 for v1 (single
   # DuckDB instance; scale via concurrency knob inside the pod).
@@ -418,7 +424,7 @@ components:
   # Chart.yaml's appVersion ("1.0") is not vX.Y.Z-shaped, so this is pinned
   # explicitly instead of deriving from appVersion; it matches the image tag
   # documented for all three built-in components in docs/components.md.
-  tag: v0.20.0
+  tag: v0.20.1
 
 bootstrap:
   externalImages:
