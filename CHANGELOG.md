@@ -21,7 +21,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Iceberg maintenance.** A new `iceberg-maintenance` component (new image)
+- **Iceberg maintenance (0.21.0).** A new `iceberg-maintenance` component (new image)
   runs up to four tasks per declared output table as a pipeline stage:
   compaction (on by default), manifest rewrite, snapshot expiry
   (`expire_snapshots`) and orphan-file cleanup (`delete_orphan_files`); the
