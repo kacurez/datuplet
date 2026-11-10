@@ -5,11 +5,11 @@ WORKDIR /app
 # Copy entire project (required for replace directives)
 COPY . .
 
-WORKDIR /app/components/iceberg-compactor
+WORKDIR /app/components/iceberg-maintenance
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -o /iceberg-compactor .
+    CGO_ENABLED=0 GOOS=linux go build -o /iceberg-maintenance .
 
 FROM alpine:3.19
 
@@ -17,10 +17,10 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-COPY --from=builder /iceberg-compactor /app/iceberg-compactor
+COPY --from=builder /iceberg-maintenance /app/iceberg-maintenance
 
 # Run as non-root user
 RUN adduser -D -u 1000 datuplet
 USER datuplet
 
-ENTRYPOINT ["/app/iceberg-compactor"]
+ENTRYPOINT ["/app/iceberg-maintenance"]

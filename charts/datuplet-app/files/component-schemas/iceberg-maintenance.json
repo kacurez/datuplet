@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Iceberg Maintenance",
+  "description": "Runs Iceberg table maintenance on each declared output table: compact small files, rewrite manifests, expire snapshots and delete orphan files, in that order.",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "dry_run": { "type": "boolean", "default": false,
+      "description": "Plan only: report what each enabled task would do and change nothing." },
+    "compact": {
+      "type": "object", "additionalProperties": false,
+      "description": "Bin-packs the small data files of each table into target-size files in one atomic snapshot.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true,
+          "description": "Run file compaction." },
+        "target_file_size_mb": { "type": "integer", "minimum": 16, "maximum": 2048, "default": 128,
+          "description": "Target size of a compacted Parquet file in MiB.",
+          "x-datuplet-doc": "Files smaller than 75% of this are compaction candidates; files larger than 180% are never rewritten. Defaults to the pipeline's gateway.targetFileSize." },
+        "min_input_files": { "type": "integer", "minimum": 2, "default": 5, "x-datuplet-advanced": true,
+          "description": "Minimum number of small files in one partition before it is worth rewriting." },
+        "max_input_files": { "type": "integer", "minimum": 1, "default": 2000, "x-datuplet-advanced": true,
+          "description": "Upper bound on input files rewritten in one run; the rest is left for a later run." }
+      }
+    },
+    "rewrite_manifests": {
+      "type": "object", "additionalProperties": false,
+      "description": "Rewrites many small manifest files into fewer larger ones to speed up query planning.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false,
+          "description": "Run manifest rewriting." },
+        "target_manifest_size_mb": { "type": "integer", "minimum": 1, "default": 8, "x-datuplet-advanced": true,
+          "description": "Target size of a rewritten manifest file in MiB." }
+      }
+    },
+    "expire_snapshots": {
+      "type": "object", "additionalProperties": false,
+      "description": "Removes old snapshots and the data files only they reference.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false,
+          "description": "Run snapshot expiry." },
+        "older_than_hours": { "type": "integer", "minimum": 24, "default": 168,
+          "description": "Expire snapshots older than this many hours (minimum 24)." },
+        "retain_last": { "type": "integer", "minimum": 1, "default": 10,
+          "description": "Always keep at least this many of the most recent snapshots." }
+      }
+    },
+    "delete_orphan_files": {
+      "type": "object", "additionalProperties": false,
+      "description": "Deletes storage files under the table location that no snapshot references.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false,
+          "description": "Run orphan-file deletion." },
+        "older_than_hours": { "type": "integer", "minimum": 25, "default": 72,
+          "description": "Only delete orphan files older than this many hours (minimum 25)." },
+        "max_files": { "type": "integer", "minimum": 1, "default": 10000, "x-datuplet-advanced": true,
+          "description": "Upper bound on files deleted in one run." }
+      }
+    }
+  }
+}

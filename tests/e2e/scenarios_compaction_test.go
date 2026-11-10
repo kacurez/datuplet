@@ -10,7 +10,7 @@ import (
 	"github.com/datuplet/datuplet/tests/e2e/framework"
 )
 
-// TestCompaction_PipelineStage proves iceberg-compactor works as a pipeline
+// TestCompaction_PipelineStage proves iceberg-maintenance works as a pipeline
 // stage: a bucket[8]-partitioned table gets 16 small files from two APPEND
 // runs, then a compactor stage rewrites them into at most one file per
 // partition in a single `replace` snapshot, leaving the rows unchanged.

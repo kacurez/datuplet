@@ -787,7 +787,7 @@ func TestGenerateGatewayConfig_PreviewBlock(t *testing.T) {
 func TestGatewayConfig_CarriesComponentInstanceName(t *testing.T) {
 	r := &PipelineRunReconciler{}
 	for _, name := range []string{"compact-a", "compact-b"} {
-		comp := &datupletv1.ComponentSpec{Name: name, Component: "iceberg-compactor"}
+		comp := &datupletv1.ComponentSpec{Name: name, Component: "iceberg-maintenance"}
 		y, err := r.generateGatewayConfig(minimalPipelineRun(), minimalPipeline(), comp)
 		if err != nil {
 			t.Fatalf("generateGatewayConfig: %v", err)

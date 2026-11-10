@@ -17,13 +17,13 @@ type call struct {
 	opts          sdk.CompactOptions
 }
 
-type fakeCompactor struct {
+type fakeMaintainer struct {
 	calls   []call
 	results map[string]*sdk.CompactResult
 	errs    map[string]error
 }
 
-func (f *fakeCompactor) Compact(_ context.Context, bucket, table string, opts sdk.CompactOptions) (*sdk.CompactResult, error) {
+func (f *fakeMaintainer) Compact(_ context.Context, bucket, table string, opts sdk.CompactOptions) (*sdk.CompactResult, error) {
 	f.calls = append(f.calls, call{bucket, table, opts})
 	key := bucket + "." + table
 	if err := f.errs[key]; err != nil {
@@ -70,7 +70,7 @@ func TestRun_ExitCodes(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeCompactor{results: map[string]*sdk.CompactResult{"raw.events": tc.res}, errs: map[string]error{"raw.events": tc.err}}
+			f := &fakeMaintainer{results: map[string]*sdk.CompactResult{"raw.events": tc.res}, errs: map[string]error{"raw.events": tc.err}}
 			code, msg := run(context.Background(), f, Config{}, tc.defaultBucket, tc.tables)
 			if code != tc.want {
 				t.Fatalf("exit = %d, want %d (msg %q)", code, tc.want, msg)
@@ -86,7 +86,7 @@ func TestRun_ExitCodes(t *testing.T) {
 }
 
 func TestRun_StatusMessage(t *testing.T) {
-	f := &fakeCompactor{results: map[string]*sdk.CompactResult{
+	f := &fakeMaintainer{results: map[string]*sdk.CompactResult{
 		"raw.events": {Status: "COMPACTED", FilesBefore: 12, FilesAfter: 2},
 	}}
 	code, msg := run(context.Background(), f, Config{}, "", []sdk.OutputTableRef{tbl("raw", "events")})
@@ -102,7 +102,7 @@ func TestRun_StatusMessage(t *testing.T) {
 
 func TestRun_MultiTableWorstWins(t *testing.T) {
 	tables := []sdk.OutputTableRef{tbl("raw", "a"), tbl("raw", "b"), tbl("raw", "c")}
-	f := &fakeCompactor{
+	f := &fakeMaintainer{
 		results: map[string]*sdk.CompactResult{"raw.a": {Status: "COMPACTED", FilesBefore: 9, FilesAfter: 1}},
 		errs: map[string]error{
 			"raw.b": status.Error(codes.NotFound, "gone"),
@@ -122,21 +122,21 @@ func TestRun_MultiTableWorstWins(t *testing.T) {
 		}
 	}
 
-	f = &fakeCompactor{errs: map[string]error{"raw.b": status.Error(codes.NotFound, "gone")}}
+	f = &fakeMaintainer{errs: map[string]error{"raw.b": status.Error(codes.NotFound, "gone")}}
 	if code, _ := run(context.Background(), f, Config{}, "", tables); code != 1 {
 		t.Fatalf("user-only failure exit = %d, want 1", code)
 	}
 }
 
 func TestRun_Options(t *testing.T) {
-	f := &fakeCompactor{}
+	f := &fakeMaintainer{}
 	run(context.Background(), f, Config{}, "", []sdk.OutputTableRef{tbl("raw", "events")})
 	if got := f.calls[0].opts; got != (sdk.CompactOptions{}) {
 		t.Errorf("unset config must send zero options (gateway defaults), got %+v", got)
 	}
 
-	f = &fakeCompactor{}
-	cfg := Config{TargetFileSizeMB: 64, MinInputFiles: 3, MaxInputFiles: 10, DryRun: true}
+	f = &fakeMaintainer{}
+	cfg := Config{DryRun: true, Compact: CompactTask{TargetFileSizeMB: 64, MinInputFiles: 3, MaxInputFiles: 10}}
 	run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "events")})
 	want := sdk.CompactOptions{TargetFileSizeBytes: 64 << 20, MinInputFiles: 3, MaxInputFiles: 10, DryRun: true}
 	if got := f.calls[0].opts; got != want {
@@ -145,7 +145,7 @@ func TestRun_Options(t *testing.T) {
 }
 
 func TestRun_MultiLineErrorIsSingleLine(t *testing.T) {
-	f := &fakeCompactor{errs: map[string]error{
+	f := &fakeMaintainer{errs: map[string]error{
 		"raw.events": status.Error(codes.Internal, "boom\r\nsecond line\nthird"),
 	}}
 	code, msg := run(context.Background(), f, Config{}, "", []sdk.OutputTableRef{tbl("raw", "events")})
@@ -157,5 +157,41 @@ func TestRun_MultiLineErrorIsSingleLine(t *testing.T) {
 	}
 	if !strings.Contains(msg, "raw.events: Internal:") || !strings.Contains(msg, "second line") {
 		t.Errorf("message %q lost detail", msg)
+	}
+}
+
+func TestRun_EmptyConfig_CompactsOnly(t *testing.T) {
+	f := &fakeMaintainer{}
+	tables := []sdk.OutputTableRef{tbl("raw", "a"), tbl("raw", "b")}
+	code, msg := run(context.Background(), f, Config{}, "", tables)
+	if code != 0 {
+		t.Fatalf("exit = %d (msg %q)", code, msg)
+	}
+	if len(f.calls) != 2 {
+		t.Fatalf("calls = %d, want one Compact per table", len(f.calls))
+	}
+}
+
+func TestRun_AllTasksDisabled_ExitUser(t *testing.T) {
+	f := &fakeMaintainer{}
+	off := false
+	cfg := Config{Compact: CompactTask{Enabled: &off}}
+	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != exitUser {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(msg, "no maintenance task enabled") {
+		t.Errorf("message %q", msg)
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("gateway called with every task disabled")
+	}
+}
+
+func TestRun_StatusLinePrefix(t *testing.T) {
+	f := &fakeMaintainer{}
+	_, msg := run(context.Background(), f, Config{}, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if !strings.HasPrefix(msg, "maintenance: ") {
+		t.Errorf("message %q lacks prefix", msg)
 	}
 }

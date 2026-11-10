@@ -23,7 +23,7 @@ import (
 	"github.com/datuplet/datuplet/pkg/pipelineapi/store"
 )
 
-const compactorComponent = "iceberg-compactor"
+const compactorComponent = "iceberg-maintenance"
 
 const compactUnlockTimeout = 5 * time.Second
 
@@ -115,7 +115,10 @@ func (h *HTTPHandlers) CompactTable(w http.ResponseWriter, r *http.Request) {
 		Outputs:   &config.OutputSpec{Tables: []config.OutputTableSpec{{Bucket: ns, Name: name}}},
 	}
 	if req.TargetFileSizeMB != nil {
-		comp.Config = map[string]any{"target_file_size_mb": *req.TargetFileSizeMB}
+		comp.Config = map[string]any{"compact": map[string]any{
+			"enabled":             true,
+			"target_file_size_mb": *req.TargetFileSizeMB,
+		}}
 	}
 	raw, err := json.Marshal(config.Pipeline{
 		Name:        pipelineName,
