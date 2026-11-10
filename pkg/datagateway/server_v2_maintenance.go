@@ -31,6 +31,9 @@ const (
 	defaultOrphanOlderThanH    = 72
 	defaultOrphanMaxFiles      = 10000
 	minOrphanOlderThanH        = 25
+	// maxOlderThanHours (10 years) keeps time.Duration(hours)*time.Hour far
+	// from int64 overflow, which would turn the age guard negative.
+	maxOlderThanHours = 87600
 )
 
 // maintenancePreflight gates the maintenance RPCs: they are served only to
@@ -129,8 +132,8 @@ func (s *ServerV2) ExpireSnapshots(_ context.Context, req *pb.ExpireSnapshotsReq
 	if retain == 0 {
 		retain = defaultExpireRetainLast
 	}
-	if hours < minExpireOlderThanH || retain < 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "%s %s.%s: older_than_hours must be >= %d and retain_last >= 1", task, bucket, table, minExpireOlderThanH)
+	if hours < minExpireOlderThanH || hours > maxOlderThanHours || retain < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "%s %s.%s: older_than_hours must be between %d and %d, and retain_last must be >= 1 (0 = default %d)", task, bucket, table, minExpireOlderThanH, maxOlderThanHours, defaultExpireRetainLast)
 	}
 	if s.expireFn == nil {
 		return nil, status.Errorf(codes.Unimplemented, "%s %s.%s: not implemented", task, bucket, table)
@@ -170,8 +173,8 @@ func (s *ServerV2) DeleteOrphanFiles(_ context.Context, req *pb.DeleteOrphanFile
 	if maxFiles == 0 {
 		maxFiles = defaultOrphanMaxFiles
 	}
-	if hours < minOrphanOlderThanH || maxFiles < 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "%s %s.%s: older_than_hours must be >= %d and max_files must not be negative", task, bucket, table, minOrphanOlderThanH)
+	if hours < minOrphanOlderThanH || hours > maxOlderThanHours || maxFiles < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "%s %s.%s: older_than_hours must be between %d and %d, and max_files must not be negative", task, bucket, table, minOrphanOlderThanH, maxOlderThanHours)
 	}
 	if s.orphansFn == nil {
 		return nil, status.Errorf(codes.Unimplemented, "%s %s.%s: not implemented", task, bucket, table)

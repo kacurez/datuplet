@@ -154,3 +154,36 @@ func TestMaintenanceRPCs_DefaultsAndFloors(t *testing.T) {
 		t.Errorf("orphans at floor: %v", err)
 	}
 }
+
+func TestMaintenanceRPCs_UpperBoundAndNegatives(t *testing.T) {
+	ctx := context.Background()
+	s := maintenanceServer(true, declaredRawEvents())
+	s.rewriteManifestsFn = func(context.Context, icebergtable.Identifier, icebergjob.RewriteManifestsOpts) (*icebergjob.RewriteManifestsResult, error) {
+		return &icebergjob.RewriteManifestsResult{Status: "REWRITTEN"}, nil
+	}
+	s.expireFn = func(context.Context, icebergtable.Identifier, icebergjob.ExpireOpts) (*icebergjob.ExpireResult, error) {
+		return &icebergjob.ExpireResult{Status: "EXPIRED"}, nil
+	}
+	s.orphansFn = func(context.Context, icebergtable.Identifier, icebergjob.OrphanOpts) (*icebergjob.OrphanResult, error) {
+		return &icebergjob.OrphanResult{Status: "DELETED"}, nil
+	}
+	for _, tc := range []struct {
+		hours int32
+		want  codes.Code
+	}{{87600, codes.OK}, {87601, codes.InvalidArgument}, {1 << 30, codes.InvalidArgument}} {
+		_, err := s.ExpireSnapshots(ctx, &pb.ExpireSnapshotsRequest{Bucket: "raw", Table: "events", OlderThanHours: tc.hours})
+		if status.Code(err) != tc.want {
+			t.Errorf("expire hours=%d: code = %v, want %v", tc.hours, status.Code(err), tc.want)
+		}
+		_, err = s.DeleteOrphanFiles(ctx, &pb.DeleteOrphanFilesRequest{Bucket: "raw", Table: "events", OlderThanHours: tc.hours})
+		if status.Code(err) != tc.want {
+			t.Errorf("orphans hours=%d: code = %v, want %v", tc.hours, status.Code(err), tc.want)
+		}
+	}
+	if _, err := s.DeleteOrphanFiles(ctx, &pb.DeleteOrphanFilesRequest{Bucket: "raw", Table: "events", MaxFiles: -1}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("negative max_files: code = %v, want InvalidArgument", status.Code(err))
+	}
+	if _, err := s.RewriteManifests(ctx, &pb.RewriteManifestsRequest{Bucket: "raw", Table: "events", TargetManifestSizeBytes: -1}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("negative target size: code = %v, want InvalidArgument", status.Code(err))
+	}
+}

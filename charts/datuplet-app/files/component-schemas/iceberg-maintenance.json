@@ -37,7 +37,7 @@
       "properties": {
         "enabled": { "type": "boolean", "default": false,
           "description": "Run snapshot expiry." },
-        "older_than_hours": { "type": "integer", "minimum": 24, "default": 168,
+        "older_than_hours": { "type": "integer", "minimum": 24, "maximum": 87600, "default": 168,
           "description": "Expire snapshots older than this many hours (minimum 24)." },
         "retain_last": { "type": "integer", "minimum": 1, "default": 10,
           "description": "Always keep at least this many of the most recent snapshots." }
@@ -49,7 +49,7 @@
       "properties": {
         "enabled": { "type": "boolean", "default": false,
           "description": "Run orphan-file deletion." },
-        "older_than_hours": { "type": "integer", "minimum": 25, "default": 72,
+        "older_than_hours": { "type": "integer", "minimum": 25, "maximum": 87600, "default": 72,
           "description": "Only delete orphan files older than this many hours (minimum 25)." },
         "max_files": { "type": "integer", "minimum": 1, "default": 10000, "x-datuplet-advanced": true,
           "description": "Upper bound on files deleted in one run." }

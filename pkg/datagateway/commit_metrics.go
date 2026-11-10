@@ -87,6 +87,6 @@ var (
 	}, []string{"task", "status"})
 	maintenanceFiles = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "datagateway_maintenance_files_total",
-		Help: "Files affected by maintenance tasks (deleted storage files, rewritten manifests).",
+		Help: "Storage files deleted by maintenance tasks (expire_snapshots, delete_orphan_files).",
 	}, []string{"task", "status"})
 )
