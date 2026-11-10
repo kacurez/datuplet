@@ -104,6 +104,12 @@ type ServerV2 struct {
 	// icebergjob.CompactTable). nil without a lakekeeper resolver.
 	compactFn compactFunc
 
+	// Maintenance seams (nil → Unimplemented), wired by the maintenance
+	// tasks over the icebergjob functions.
+	rewriteManifestsFn rewriteManifestsFunc
+	expireFn           expireFunc
+	orphansFn          orphansFunc
+
 	// validatedClaims holds the validated run-token JWT claims set during
 	// boot. Non-nil only when the run-token was successfully validated
 	// against pipeline-api's JWKS. Used to wire lakekeeper routing

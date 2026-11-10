@@ -8,6 +8,8 @@ import (
 type Config struct {
 	RunID         string `yaml:"run_id,omitempty"` // Unique run identifier for this pipeline execution
 	ComponentName string `yaml:"component_name,omitempty"`
+	// TableMaintenance: see GatewayConfig.TableMaintenance.
+	TableMaintenance bool `yaml:"table_maintenance,omitempty"`
 
 	// Bucket-based access control
 	InputBuckets  []string `yaml:"input_buckets,omitempty"`  // Buckets component can read from
