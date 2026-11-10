@@ -65,7 +65,11 @@ func (c *memCatalog) CommitTable(_ context.Context, ident table.Identifier, reqs
 	return md, loc, nil
 }
 
-func appendRows(t *testing.T, cat *memCatalog, ids ...int64) {
+func appendRows(t *testing.T, cat *memCatalog, ids ...int64) { writeRows(t, cat, false, ids...) }
+
+// writeRows appends ids, or with overwrite replaces every row with ids in one
+// snapshot (every current file new, as after a compaction).
+func writeRows(t *testing.T, cat *memCatalog, overwrite bool, ids ...int64) {
 	t.Helper()
 	sc := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
 	b := array.NewInt64Builder(memory.DefaultAllocator)
@@ -78,7 +82,13 @@ func appendRows(t *testing.T, cat *memCatalog, ids ...int64) {
 	tbl := array.NewTableFromRecords(sc, []arrow.RecordBatch{rec})
 	defer tbl.Release()
 	txn := cat.tbl.NewTransaction()
-	if err := txn.AppendTable(context.Background(), tbl, 1024, nil); err != nil {
+	write := txn.AppendTable
+	if overwrite {
+		write = func(ctx context.Context, tbl arrow.Table, batch int64, props iceberg.Properties) error {
+			return txn.OverwriteTable(ctx, tbl, batch, props)
+		}
+	}
+	if err := write(context.Background(), tbl, 1024, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := txn.Commit(context.Background()); err != nil {
@@ -194,10 +204,10 @@ func (r respellIO) WalkDir(root string, fn fs.WalkDirFunc) error {
 	})
 }
 
-// TestGCSOrphans_MisspelledListing_GuardRefuses: a listing that drops the
-// gs://b/ prefix makes every live file look orphaned to iceberg-go's planner;
-// the live-file guard must refuse and delete nothing.
-func TestGCSOrphans_MisspelledListing_GuardRefuses(t *testing.T) {
+// TestGCSOrphans_MisspelledListing_Refused: a listing that drops the gs://b/
+// prefix makes every live file look orphaned to iceberg-go's planner; the
+// prefix check must refuse and delete nothing.
+func TestGCSOrphans_MisspelledListing_Refused(t *testing.T) {
 	ctx := context.Background()
 	bucket := memblob.OpenBucket(nil)
 	t.Cleanup(func() { _ = bucket.Close() })
@@ -223,10 +233,61 @@ func TestGCSOrphans_MisspelledListing_GuardRefuses(t *testing.T) {
 	tbl := table.New(ident, cat.tbl.Metadata(), cat.tbl.MetadataLocation(),
 		func(context.Context) (iceio.IO, error) { return bare, nil }, cat)
 	res, err := icebergjob.DeleteOrphansOnTable(ctx, tbl, icebergjob.OrphanOpts{OlderThan: 1, MaxFiles: 100})
-	if !errors.Is(err, icebergjob.ErrRefused) || !strings.Contains(err.Error(), "live-file guard") {
-		t.Fatalf("DeleteOrphansOnTable = %+v, %v; want live-file guard refusal", res, err)
+	if !errors.Is(err, icebergjob.ErrRefused) || !strings.Contains(err.Error(), "prefix check") {
+		t.Fatalf("DeleteOrphansOnTable = %+v, %v; want prefix check refusal", res, err)
 	}
 	if after := listAll(t, fsys, loc); !slices.Equal(after, before) {
 		t.Fatalf("files changed despite refusal:\n%v\nwant:\n%v", after, before)
+	}
+}
+
+// TestGCSOrphans_CompactedHistory_NothingDeleted: after an overwrite every
+// current file is new, while retained older snapshots reference files older
+// than the cutoff (OlderThan 1 ns makes every file old). A listing whose
+// spellings match nothing is refused; a correct listing finds no orphans.
+func TestGCSOrphans_CompactedHistory_NothingDeleted(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	t.Cleanup(func() { _ = bucket.Close() })
+	fsys := datupleticeio.NewGCSIOForTest(bucket, "b")
+	const loc = "gs://b/wh/t"
+
+	sch := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64})
+	md, err := table.NewMetadata(sch, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, loc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := &memCatalog{fsys: fsys}
+	mdLoc, err := cat.writeMetadata(md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := table.Identifier{"wh", "t"}
+	cat.tbl = table.New(ident, md, mdLoc, cat.fsF, cat)
+	appendRows(t, cat, 1, 2)
+	appendRows(t, cat, 3)
+	writeRows(t, cat, true, 1, 2, 3)
+	if n := len(cat.tbl.Metadata().Snapshots()); n != 3 {
+		t.Fatalf("%d snapshots, want 3", n)
+	}
+	before := listAll(t, fsys, loc)
+	opts := icebergjob.OrphanOpts{OlderThan: 1, MaxFiles: 100}
+
+	odd := respellIO{IO: fsys, spell: func(p string) string { return strings.TrimPrefix(p, "gs://") }}
+	tbl := table.New(ident, cat.tbl.Metadata(), cat.tbl.MetadataLocation(),
+		func(context.Context) (iceio.IO, error) { return odd, nil }, cat)
+	if res, err := icebergjob.DeleteOrphansOnTable(ctx, tbl, opts); !errors.Is(err, icebergjob.ErrRefused) || !strings.Contains(err.Error(), "prefix check") {
+		t.Fatalf("misspelled listing = %+v, %v; want ErrRefused", res, err)
+	}
+	if after := listAll(t, fsys, loc); !slices.Equal(after, before) {
+		t.Fatalf("files changed despite refusal:\n%v\nwant:\n%v", after, before)
+	}
+
+	res, err := icebergjob.DeleteOrphansOnTable(ctx, cat.tbl, opts)
+	if err != nil || res.Status != "NOTHING_TO_DO" {
+		t.Fatalf("correct listing = %+v, %v", res, err)
+	}
+	if after := listAll(t, fsys, loc); !slices.Equal(after, before) {
+		t.Fatalf("files changed:\n%v\nwant:\n%v", after, before)
 	}
 }

@@ -674,7 +674,11 @@ func TestOrphans_YoungFileKept(t *testing.T) {
 
 // TestOrphans_SiblingTableUntouched: t_v2's location is t's location plus
 // "_v2", so a listing of the bare prefix would include it; its uncommitted
-// file must survive a run on t.
+// file must survive a run on t. On S3 this is a regression check only:
+// Lakekeeper's STS session policy already refuses listing outside t's own
+// prefix (403), so an over-broad scan fails before it can delete. The GCS
+// memblob test (pkg/datupleticeio/gcs_orphans_test.go) is the one that
+// detects a sibling-prefix listing bug.
 func TestOrphans_SiblingTableUntouched(t *testing.T) {
 	fx := sharedFixture(t)
 	const ns, tbl, sib = "gw_it", "orph_sib", "orph_sib_v2"

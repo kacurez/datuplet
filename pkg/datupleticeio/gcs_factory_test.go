@@ -217,9 +217,9 @@ func TestRefreshingTokenSourceStringRedacts(t *testing.T) {
 func TestPickRefreshEndpointActivationFailsClosed(t *testing.T) {
 	parsed, _ := url.Parse("gs://test-bucket")
 	props := map[string]string{
-		"gcs.oauth2.token":                         "ya29.test",
-		"gcs.oauth2.refresh-credentials-endpoint":  "https://lakekeeper.example/refresh",
-		"gcs.oauth2.refresh-credentials-enabled":   "true", // explicit opt-in
+		"gcs.oauth2.token":                        "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lakekeeper.example/refresh",
+		"gcs.oauth2.refresh-credentials-enabled":  "true", // explicit opt-in
 	}
 	_, err := datupletGCSFactory(context.Background(), parsed, props)
 	if err == nil {
@@ -260,9 +260,9 @@ func TestPickRefreshEndpointPresentButNotOptedIn(t *testing.T) {
 func TestPickRefreshEndpointExplicitlyDisabledSucceeds(t *testing.T) {
 	parsed, _ := url.Parse("gs://test-bucket")
 	props := map[string]string{
-		"gcs.oauth2.token":                         "ya29.test",
-		"gcs.oauth2.refresh-credentials-endpoint":  "https://lakekeeper.example/refresh",
-		"gcs.oauth2.refresh-credentials-enabled":   "false",
+		"gcs.oauth2.token":                        "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lakekeeper.example/refresh",
+		"gcs.oauth2.refresh-credentials-enabled":  "false",
 	}
 	gcsio, err := datupletGCSFactory(context.Background(), parsed, props)
 	if err != nil {

@@ -263,16 +263,28 @@ scope; `known-limitations.md` records them.
   `max_files` files, refuse (`FailedPrecondition`, exit 1) and delete
   nothing; the message reports the count so the user can raise the cap or
   investigate. A sudden huge orphan count usually means something is wrong.
-- **Live-file guard before any delete (design review, Important 4):** abort
-  with `FailedPrecondition` (exit 1), nothing deleted, if any planned path
-  is the current metadata file, a manifest list or manifest of the current
-  snapshot, or a live data/delete file of the current snapshot (checked
-  against paths read independently of the orphan planner). A path-spelling
-  bug in a listing makes live files look orphaned, so this guard catches
-  it even on small tables where `max_files` would not. No orphan-ratio
-  guard (maintainer decision, review round 2): iceberg-go's plan carries
-  no scanned-file count, and a ratio would permanently block small or
-  often-replaced tables whose leftovers are exactly what this task deletes.
+- **Two checks before any delete (design review, Important 4; Task 6
+  review, maintainer decision):** both abort with `FailedPrecondition`
+  (exit 1), nothing deleted.
+  1. *Table-location prefix check:* every planned path must literally start
+     with the table location (one trailing `/` trimmed) plus `/`. This
+     rejects any listing that respells paths (bare keys, `bucket/key`,
+     another scheme such as `s3a://`, percent-encoding, interior `//`) and
+     any sibling table whose location merely shares the prefix string.
+  2. *Live-file guard:* no planned path may be a file the table metadata
+     references, compared by object key (`scheme://authority/` and leading
+     `/` stripped). The live set is read independently of the orphan
+     planner: the current metadata file, every metadata-log entry,
+     statistics and partition-statistics files, and for **every retained
+     snapshot** its manifest list, its manifests and every non-DELETED entry
+     (data and delete files).
+
+  A path-spelling bug in a listing makes live files look orphaned, so these
+  checks catch it even on small tables where `max_files` would not. No
+  orphan-ratio guard (maintainer decision, review round 2): iceberg-go's
+  plan carries no scanned-file count, and a ratio would permanently block
+  small or often-replaced tables whose leftovers are exactly what this task
+  deletes.
 - `gc.enabled=false` on the table → `FailedPrecondition` (exit 1), as
   Java's DeleteOrphanFiles does (design review, Nit 1).
 - Planning reads every snapshot's manifests; it must finish before any
@@ -410,3 +422,9 @@ All round-1 findings closed.
 | R2-I1 | 50 % orphan-ratio guard needs a scanned count iceberg-go's plan lacks, and permanently blocks small / often-replaced tables | Dropped (maintainer decision); the live-file guard covers the path-spelling failure |
 | R2-N1 | Bare-key test proves the guard trips, not that a correct GCS listing passes | §7: positive GCS case |
 | R2-N2 | Keep-set guard should say *effective* `retain_last` | §5.2 wording fixed |
+
+## 12. Task 6 review (2026-11-10)
+
+| # | Finding | Resolution |
+|---|---|---|
+| T6-I1 | Task 6 review: guard covered only current snapshot / objectKey misses spellings | Prefix check + all-snapshot live set (maintainer decision); §5.3 updated |

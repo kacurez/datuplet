@@ -493,8 +493,8 @@ type gcsWriteFile struct {
 	w *blob.Writer
 }
 
-func (f *gcsWriteFile) Write(p []byte) (int, error)        { return f.w.Write(p) }
-func (f *gcsWriteFile) Close() error                       { return f.w.Close() }
+func (f *gcsWriteFile) Write(p []byte) (int, error)         { return f.w.Write(p) }
+func (f *gcsWriteFile) Close() error                        { return f.w.Close() }
 func (f *gcsWriteFile) ReadFrom(r io.Reader) (int64, error) { return io.Copy(f.w, r) }
 
 // Verify gcsIO satisfies io.Closer at compile time.
@@ -554,5 +554,5 @@ func (f *gcsFile) Size() int64 { return f.Reader.Size() }
 var (
 	_ iceio.IO         = (*gcsIO)(nil)
 	_ iceio.ListableIO = (*gcsIO)(nil)
-	_ iceio.File = (*gcsFile)(nil)
+	_ iceio.File       = (*gcsFile)(nil)
 )

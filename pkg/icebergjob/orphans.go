@@ -21,6 +21,7 @@ const (
 	OrphanDryRun      = "DRY_RUN"
 
 	orphanDeleteConcurrency = 8
+	maxReportedDeleteErrors = 10
 )
 
 // DeleteTableOrphanFiles loads ident and deletes its orphan files; see
@@ -41,11 +42,13 @@ func DeleteTableOrphanFiles(ctx context.Context, cat catalog.Catalog, ident iceb
 // metadata references and that are older than opts.OlderThan.
 //
 // Nothing is deleted when: gc.enabled is false (ErrRefused); the plan holds
-// more than opts.MaxFiles files (ErrRefused with the count); the live-file
-// guard finds a planned path among the current snapshot's files (ErrRefused);
-// opts.DryRun is set (DRY_RUN); or ctx is done before the delete. iceberg-go
-// plans with PrefixMismatchError, and the delete runs exactly that plan. A
-// partial delete returns an error carrying the counts; re-running is safe.
+// more than opts.MaxFiles files (ErrRefused with the count); a planned path is
+// not literally under the table location (prefix check, ErrRefused); a planned
+// path is referenced by table metadata, compared by object key (live-file
+// guard, ErrRefused); opts.DryRun is set (DRY_RUN); or ctx is done before the
+// delete. iceberg-go plans with PrefixMismatchError, and the delete runs
+// exactly that plan. A partial delete returns an error carrying the counts;
+// re-running is safe.
 func DeleteOrphansOnTable(ctx context.Context, tbl *icebergtable.Table, opts OrphanOpts) (*OrphanResult, error) {
 	start := time.Now()
 	if opts.OlderThan <= 0 || opts.MaxFiles < 1 {
@@ -70,6 +73,9 @@ func DeleteOrphansOnTable(ctx context.Context, tbl *icebergtable.Table, opts Orp
 		return nil, fmt.Errorf("%w: %d orphan files exceed max_files %d; nothing deleted", ErrRefused, len(planned), opts.MaxFiles)
 	}
 
+	if err := prefixCheck(planned, tbl.Location()); err != nil {
+		return nil, err
+	}
 	live, err := liveFiles(ctx, tbl)
 	if err != nil {
 		return nil, fmt.Errorf("live files: %w", err)
@@ -103,11 +109,29 @@ func DeleteOrphansOnTable(ctx context.Context, tbl *icebergtable.Table, opts Orp
 		}))
 	res.FilesDeleted = int(deleted.Load())
 	if err != nil {
-		return nil, fmt.Errorf("deleted %d of %d orphan files: %w", res.FilesDeleted, len(planned), err)
+		return nil, fmt.Errorf("deleted %d of %d orphan files: %w", res.FilesDeleted, len(planned), capErrors(err, maxReportedDeleteErrors))
 	}
 	res.Status = OrphanDeleted
 	res.Duration = time.Since(start)
 	return res, nil
+}
+
+// capErrors keeps the first n errors of the joined delete error inside err
+// and summarises the rest, so a mass delete failure stays a short status
+// message.
+func capErrors(err error, n int) error {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		j, ok := e.(interface{ Unwrap() []error })
+		if !ok {
+			continue
+		}
+		errs := j.Unwrap()
+		if len(errs) <= n {
+			return err
+		}
+		return fmt.Errorf("%w; and %d more errors", errors.Join(errs[:n]...), len(errs)-n)
+	}
+	return err
 }
 
 // objectKey reduces a storage path to its object key: it strips
@@ -125,37 +149,74 @@ func objectKey(p string) string {
 }
 
 // liveFiles reads, independently of the orphan planner, the object keys of
-// the current metadata file and of the current snapshot's manifest list,
-// manifests and every non-DELETED entry (data and delete files).
+// every file the table metadata references: the current metadata file, every
+// metadata-log entry, statistics and partition-statistics files, and for
+// every retained snapshot its manifest list, its manifests and every
+// non-DELETED entry (data and delete files).
 func liveFiles(ctx context.Context, tbl *icebergtable.Table) (map[string]struct{}, error) {
+	md := tbl.Metadata()
 	live := map[string]struct{}{objectKey(tbl.MetadataLocation()): {}}
-	snap := tbl.CurrentSnapshot()
-	if snap == nil {
+	for e := range md.PreviousFiles() {
+		live[objectKey(e.MetadataFile)] = struct{}{}
+	}
+	for sf := range md.Statistics() {
+		if sf.StatisticsPath != "" {
+			live[objectKey(sf.StatisticsPath)] = struct{}{}
+		}
+	}
+	for sf := range md.PartitionStatistics() {
+		if sf.StatisticsPath != "" {
+			live[objectKey(sf.StatisticsPath)] = struct{}{}
+		}
+	}
+	snaps := md.Snapshots()
+	if len(snaps) == 0 {
 		return live, nil
 	}
 	fsys, err := tbl.FS(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("table io: %w", err)
 	}
-	if snap.ManifestList != "" {
-		live[objectKey(snap.ManifestList)] = struct{}{}
-	}
-	mfs, err := snap.Manifests(fsys)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot %d manifests: %w", snap.SnapshotID, err)
-	}
-	for _, m := range mfs {
-		live[objectKey(m.FilePath())] = struct{}{}
-		for e, err := range m.Entries(fsys, false) {
-			if err != nil {
-				return nil, fmt.Errorf("read manifest %s: %w", m.FilePath(), err)
+	seen := map[string]struct{}{}
+	for _, snap := range snaps {
+		if snap.ManifestList != "" {
+			live[objectKey(snap.ManifestList)] = struct{}{}
+		}
+		mfs, err := snap.Manifests(fsys)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot %d manifests: %w", snap.SnapshotID, err)
+		}
+		for _, m := range mfs {
+			if _, ok := seen[m.FilePath()]; ok {
+				continue
 			}
-			if e.Status() != iceberg.EntryStatusDELETED {
-				live[objectKey(e.DataFile().FilePath())] = struct{}{}
+			seen[m.FilePath()] = struct{}{}
+			live[objectKey(m.FilePath())] = struct{}{}
+			for e, err := range m.Entries(fsys, false) {
+				if err != nil {
+					return nil, fmt.Errorf("read manifest %s: %w", m.FilePath(), err)
+				}
+				if e.Status() != iceberg.EntryStatusDELETED {
+					live[objectKey(e.DataFile().FilePath())] = struct{}{}
+				}
 			}
 		}
 	}
 	return live, nil
+}
+
+// prefixCheck refuses a plan with any path that does not literally start
+// with the table location plus "/". Listings that respell paths (bare keys,
+// bucket/key, another scheme, percent-encoding, interior "//") or reach a
+// sibling table whose location shares the prefix string all fail here.
+func prefixCheck(planned []string, location string) error {
+	prefix := strings.TrimSuffix(location, "/") + "/"
+	for _, p := range planned {
+		if !strings.HasPrefix(p, prefix) {
+			return fmt.Errorf("%w: prefix check: planned orphan %s is not under table location %s; nothing deleted", ErrRefused, p, prefix)
+		}
+	}
+	return nil
 }
 
 // liveFileGuard refuses a plan that names any live file, compared by object
@@ -163,7 +224,7 @@ func liveFiles(ctx context.Context, tbl *icebergtable.Table) (map[string]struct{
 func liveFileGuard(planned []string, live map[string]struct{}) error {
 	for _, p := range planned {
 		if _, ok := live[objectKey(p)]; ok {
-			return fmt.Errorf("%w: live-file guard: planned orphan %s is a live file of the current snapshot; nothing deleted", ErrRefused, p)
+			return fmt.Errorf("%w: live-file guard: planned orphan %s is referenced by table metadata; nothing deleted", ErrRefused, p)
 		}
 	}
 	return nil
