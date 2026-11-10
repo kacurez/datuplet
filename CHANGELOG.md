@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Query-worker external storage egress (0.20.1).** The app chart accepts
+  opt-in `queryWorker.extraEgress` NetworkPolicy rules for GCS and external
+  S3 endpoints. Defaults remain locked down; warehouse/GCS guides show
+  explicit HTTPS and restricted endpoint examples and their security scope.
+
 ### Added
 
 - **Table compaction.** A new `iceberg-compactor` component (new image) and a
