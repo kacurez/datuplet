@@ -312,6 +312,14 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 			return icebergjob.ExpireTableSnapshots(ctx, cat, ident, opts)
 		}
 
+		s.orphansFn = func(ctx context.Context, ident icebergtable.Identifier, opts icebergjob.OrphanOpts) (*icebergjob.OrphanResult, error) {
+			cat, err := res.Catalog(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("catalog: %w", err)
+			}
+			return icebergjob.DeleteTableOrphanFiles(ctx, cat, ident, opts)
+		}
+
 		// Wire the per-gateway run-token into datupleticeio's
 		// loadTable-refresh path so iceberg-go's `gs://` IO factory
 		// can re-fetch fresh GCS vended creds when the initial token

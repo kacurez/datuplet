@@ -23,6 +23,8 @@ type fakeMaintainer struct {
 	rwErrs  map[string]error
 	exOpts  []sdk.ExpireOptions
 	exRes   *sdk.ExpireResult
+	orOpts  []sdk.OrphanOptions
+	orErr   error
 	results map[string]*sdk.CompactResult
 	errs    map[string]error
 }
@@ -56,6 +58,15 @@ func (f *fakeMaintainer) ExpireSnapshots(_ context.Context, bucket, table string
 		return f.exRes, nil
 	}
 	return &sdk.ExpireResult{Status: "EXPIRED", SnapshotsExpired: 4, FilesDeleted: 9, BytesDeleted: 1234}, nil
+}
+
+func (f *fakeMaintainer) DeleteOrphanFiles(_ context.Context, bucket, table string, opts sdk.OrphanOptions) (*sdk.OrphanResult, error) {
+	f.order = append(f.order, "orphans "+bucket+"."+table)
+	f.orOpts = append(f.orOpts, opts)
+	if f.orErr != nil {
+		return nil, f.orErr
+	}
+	return &sdk.OrphanResult{Status: "DELETED", OrphanFiles: 3, OrphanBytes: 456, FilesDeleted: 3}, nil
 }
 
 func tbl(bucket, name string) sdk.OutputTableRef {
@@ -296,5 +307,48 @@ func TestRun_ExpireFilesLeftUnknown(t *testing.T) {
 	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
 	if code != 0 || !strings.Contains(msg, "EXPIRED_PARTIAL snapshots 2, files 0 (0 bytes), files_left unknown") {
 		t.Fatalf("exit %d, message %q", code, msg)
+	}
+}
+
+func TestRun_AllFourTasksInOrder(t *testing.T) {
+	f := &fakeMaintainer{}
+	cfg := Config{DryRun: true, RewriteManifests: RewriteManifestsTask{Enabled: true},
+		ExpireSnapshots:   ExpireSnapshotsTask{Enabled: true},
+		DeleteOrphanFiles: DeleteOrphanFilesTask{Enabled: true, OlderThanHours: 96, MaxFiles: 50}}
+	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != 0 {
+		t.Fatalf("exit = %d (msg %q)", code, msg)
+	}
+	if want := "compact raw.a,rewrite raw.a,expire raw.a,orphans raw.a"; strings.Join(f.order, ",") != want {
+		t.Fatalf("calls = %v, want %s", f.order, want)
+	}
+	if got, want := f.orOpts[0], (sdk.OrphanOptions{OlderThanHours: 96, MaxFiles: 50, DryRun: true}); got != want {
+		t.Errorf("orphan opts = %+v, want %+v", got, want)
+	}
+	if !strings.Contains(msg, "delete_orphan_files DELETED orphans 3 (456 bytes), deleted 3") {
+		t.Errorf("message %q missing orphan summary", msg)
+	}
+}
+
+func TestRun_OrphansOnly_Enabled(t *testing.T) {
+	off := false
+	f := &fakeMaintainer{}
+	cfg := Config{Compact: CompactTask{Enabled: &off}, DeleteOrphanFiles: DeleteOrphanFilesTask{Enabled: true}}
+	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != 0 || strings.Join(f.order, ",") != "orphans raw.a" {
+		t.Fatalf("exit %d, calls %v, msg %q", code, f.order, msg)
+	}
+	if f.orOpts[0] != (sdk.OrphanOptions{}) {
+		t.Errorf("unset orphan config must send zero options, got %+v", f.orOpts[0])
+	}
+}
+
+func TestRun_OrphansRefusedExitsUser(t *testing.T) {
+	off := false
+	f := &fakeMaintainer{orErr: status.Error(codes.FailedPrecondition, "maintenance refused: 3 orphan files exceed max_files 2")}
+	cfg := Config{Compact: CompactTask{Enabled: &off}, DeleteOrphanFiles: DeleteOrphanFilesTask{Enabled: true}}
+	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != exitUser || !strings.Contains(msg, "delete_orphan_files FailedPrecondition") {
+		t.Fatalf("exit %d, msg %q", code, msg)
 	}
 }

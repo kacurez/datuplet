@@ -580,3 +580,164 @@ func TestExpire_DeletionSetUnreadable_FilesLeftUnknown(t *testing.T) {
 		}
 	}
 }
+
+// orphanSeed creates ns.tbl with two committed APPEND runs and returns the
+// catalog, the committed data files and the table's writer target.
+func orphanSeed(t *testing.T, fx *fixture, ns, tbl string) (*lakekeeper.Resolver, catalog.Catalog, []string, *lakekeeper.WriterTarget) {
+	t.Helper()
+	r, written := seedAppends(t, fx, ns, tbl, 2)
+	sch, _ := allTypesSchema(t)
+	target := createTable(t, r, ns, tbl, sch)
+	cat, err := r.Catalog(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, cat, written, target
+}
+
+// writeUncommitted uploads n data-file runs into target without committing.
+func writeUncommitted(t *testing.T, target *lakekeeper.WriterTarget, prefix string, n int) []string {
+	t.Helper()
+	p := New(Config{})
+	defer p.Close()
+	sch, inputs := allTypesSchema(t)
+	var out []string
+	for i := 1; i <= n; i++ {
+		out = append(out, paths(writeRun(t, p, target, fmt.Sprintf("%s%d", prefix, i), sch, inputs, 1, target.VendedCreds, 0))...)
+	}
+	return out
+}
+
+func allExist(t *testing.T, cat catalog.Catalog, ns, tbl string, ps []string) {
+	t.Helper()
+	for _, p := range ps {
+		if !fileExists(t, cat, ns, tbl, p) {
+			t.Fatalf("%s was deleted", p)
+		}
+	}
+}
+
+func TestOrphans_DeletesOldUncommitted(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "orph_delete"
+	r, cat, written, target := orphanSeed(t, fx, ns, tbl)
+	orphans := writeUncommitted(t, target, "part-orphan-w", 1)
+	rowsBefore, _ := scanRows(t, r, ns, tbl)
+	ctx := context.Background()
+	tb, err := cat.LoadTable(ctx, catalog.ToIdentifier(ns, tbl))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := icebergjob.DeleteTableOrphanFiles(ctx, cat, catalog.ToIdentifier(ns, tbl), icebergjob.OrphanOpts{OlderThan: time.Nanosecond, MaxFiles: 100})
+	if err != nil || res.Status != icebergjob.OrphanDeleted || res.OrphanFiles != len(orphans) || res.FilesDeleted != len(orphans) || res.OrphanBytes <= 0 {
+		t.Fatalf("result = %+v, %v (orphans %v)", res, err, orphans)
+	}
+	for _, p := range orphans {
+		if fileExists(t, cat, ns, tbl, p) {
+			t.Fatalf("orphan %s survived", p)
+		}
+	}
+	allExist(t, cat, ns, tbl, append(written, tb.MetadataLocation(), tb.CurrentSnapshot().ManifestList))
+	if n, _ := scanRows(t, r, ns, tbl); n != rowsBefore {
+		t.Fatalf("rows %d, want %d", n, rowsBefore)
+	}
+}
+
+func TestOrphans_RerunNoop(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "orph_rerun"
+	_, cat, _, target := orphanSeed(t, fx, ns, tbl)
+	writeUncommitted(t, target, "part-orphan-w", 1)
+	ctx := context.Background()
+	ident := catalog.ToIdentifier(ns, tbl)
+	opts := icebergjob.OrphanOpts{OlderThan: time.Nanosecond, MaxFiles: 100}
+	if res, err := icebergjob.DeleteTableOrphanFiles(ctx, cat, ident, opts); err != nil || res.Status != icebergjob.OrphanDeleted {
+		t.Fatalf("first run = %+v, %v", res, err)
+	}
+	if res, err := icebergjob.DeleteTableOrphanFiles(ctx, cat, ident, opts); err != nil || res.Status != icebergjob.OrphanNothingToDo || res.FilesDeleted != 0 {
+		t.Fatalf("rerun = %+v, %v", res, err)
+	}
+}
+
+func TestOrphans_YoungFileKept(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "orph_young"
+	_, cat, _, target := orphanSeed(t, fx, ns, tbl)
+	orphans := writeUncommitted(t, target, "part-orphan-w", 1)
+	res, err := icebergjob.DeleteTableOrphanFiles(context.Background(), cat, catalog.ToIdentifier(ns, tbl), icebergjob.OrphanOpts{OlderThan: time.Hour, MaxFiles: 100})
+	if err != nil || res.Status != icebergjob.OrphanNothingToDo {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	allExist(t, cat, ns, tbl, orphans)
+}
+
+// TestOrphans_SiblingTableUntouched: t_v2's location is t's location plus
+// "_v2", so a listing of the bare prefix would include it; its uncommitted
+// file must survive a run on t.
+func TestOrphans_SiblingTableUntouched(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl, sib = "gw_it", "orph_sib", "orph_sib_v2"
+	r, cat, _, target := orphanSeed(t, fx, ns, tbl)
+	ctx := context.Background()
+	tb, err := cat.LoadTable(ctx, catalog.ToIdentifier(ns, tbl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(ctx, catalog.ToIdentifier(ns, sib), tb.Schema(), catalog.WithLocation(tb.Location()+"_v2")); err != nil {
+		t.Fatalf("create sibling at %s_v2: %v", tb.Location(), err)
+	}
+	sch, _ := allTypesSchema(t)
+	sibTarget := createTable(t, r, ns, sib, sch)
+	if !strings.HasPrefix(sibTarget.BasePath, tb.Location()+"_v2/") {
+		t.Fatalf("sibling data prefix %q not under %s_v2/", sibTarget.BasePath, tb.Location())
+	}
+	sibFiles := writeUncommitted(t, sibTarget, "part-sib-w", 1)
+	orphans := writeUncommitted(t, target, "part-orphan-w", 1)
+
+	res, err := icebergjob.DeleteTableOrphanFiles(ctx, cat, catalog.ToIdentifier(ns, tbl), icebergjob.OrphanOpts{OlderThan: time.Nanosecond, MaxFiles: 100})
+	if err != nil || res.Status != icebergjob.OrphanDeleted || res.FilesDeleted != len(orphans) {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	allExist(t, cat, ns, sib, sibFiles)
+}
+
+func TestOrphans_MaxFilesRefused(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "orph_maxfiles"
+	_, cat, _, target := orphanSeed(t, fx, ns, tbl)
+	orphans := writeUncommitted(t, target, "part-orphan-w", 3)
+	if len(orphans) != 3 {
+		t.Fatalf("wrote %d orphans, want 3", len(orphans))
+	}
+	res, err := icebergjob.DeleteTableOrphanFiles(context.Background(), cat, catalog.ToIdentifier(ns, tbl), icebergjob.OrphanOpts{OlderThan: time.Nanosecond, MaxFiles: 2})
+	if !errors.Is(err, icebergjob.ErrRefused) || !strings.Contains(err.Error(), "3 orphan files exceed max_files 2") {
+		t.Fatalf("result = %+v, %v; want ErrRefused with the count", res, err)
+	}
+	allExist(t, cat, ns, tbl, orphans)
+}
+
+func TestOrphans_DryRun(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "orph_dry"
+	_, cat, _, target := orphanSeed(t, fx, ns, tbl)
+	orphans := writeUncommitted(t, target, "part-orphan-w", 1)
+	res, err := icebergjob.DeleteTableOrphanFiles(context.Background(), cat, catalog.ToIdentifier(ns, tbl), icebergjob.OrphanOpts{OlderThan: time.Nanosecond, MaxFiles: 100, DryRun: true})
+	if err != nil || res.Status != icebergjob.OrphanDryRun || res.OrphanFiles != len(orphans) || res.FilesDeleted != 0 {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	allExist(t, cat, ns, tbl, orphans)
+}
+
+func TestOrphans_GCDisabled_Refused(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "orph_gc_off"
+	_, cat, _, target := orphanSeed(t, fx, ns, tbl)
+	orphans := writeUncommitted(t, target, "part-orphan-w", 1)
+	setProps(t, cat, ns, tbl, iceberg.Properties{"gc.enabled": "false"})
+	res, err := icebergjob.DeleteTableOrphanFiles(context.Background(), cat, catalog.ToIdentifier(ns, tbl), icebergjob.OrphanOpts{OlderThan: time.Nanosecond, MaxFiles: 100})
+	if !errors.Is(err, icebergjob.ErrRefused) {
+		t.Fatalf("result = %+v, %v; want ErrRefused", res, err)
+	}
+	allExist(t, cat, ns, tbl, orphans)
+}

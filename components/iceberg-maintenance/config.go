@@ -50,12 +50,12 @@ type DeleteOrphanFilesTask struct {
 	MaxFiles       int  `json:"max_files"`
 }
 
-// maintainer is the gateway surface the component needs; it grows with each
-// maintenance task.
+// maintainer is the gateway surface the component needs.
 type maintainer interface {
 	Compact(ctx context.Context, bucket, table string, opts sdk.CompactOptions) (*sdk.CompactResult, error)
 	RewriteManifests(ctx context.Context, bucket, table string, opts sdk.RewriteManifestsOptions) (*sdk.RewriteManifestsResult, error)
 	ExpireSnapshots(ctx context.Context, bucket, table string, opts sdk.ExpireOptions) (*sdk.ExpireResult, error)
+	DeleteOrphanFiles(ctx context.Context, bucket, table string, opts sdk.OrphanOptions) (*sdk.OrphanResult, error)
 }
 
 func (c Config) compactEnabled() bool {
@@ -72,7 +72,7 @@ func (c Config) compactOptions() sdk.CompactOptions {
 }
 
 func (c Config) anyEnabled() bool {
-	return c.compactEnabled() || c.RewriteManifests.Enabled || c.ExpireSnapshots.Enabled
+	return c.compactEnabled() || c.RewriteManifests.Enabled || c.ExpireSnapshots.Enabled || c.DeleteOrphanFiles.Enabled
 }
 
 func (c Config) rewriteManifestsOptions() sdk.RewriteManifestsOptions {
@@ -90,6 +90,14 @@ func (c Config) expireOptions() sdk.ExpireOptions {
 	}
 }
 
+func (c Config) orphanOptions() sdk.OrphanOptions {
+	return sdk.OrphanOptions{
+		OlderThanHours: c.DeleteOrphanFiles.OlderThanHours,
+		MaxFiles:       c.DeleteOrphanFiles.MaxFiles,
+		DryRun:         c.DryRun,
+	}
+}
+
 // task is one maintenance step on one table. do returns the summary text that
 // follows the task name.
 type task struct {
@@ -98,8 +106,7 @@ type task struct {
 }
 
 // tasks returns the enabled tasks in the fixed order: compact,
-// rewrite_manifests, expire_snapshots. Later maintenance tasks append here,
-// keeping that order.
+// rewrite_manifests, expire_snapshots, delete_orphan_files.
 func (c Config) tasks() []task {
 	var ts []task
 	if c.compactEnabled() {
@@ -134,6 +141,15 @@ func (c Config) tasks() []task {
 				out += fmt.Sprintf(", files_left %d", res.FilesLeft)
 			}
 			return out, nil
+		}})
+	}
+	if c.DeleteOrphanFiles.Enabled {
+		ts = append(ts, task{"delete_orphan_files", func(ctx context.Context, m maintainer, bucket, table string) (string, error) {
+			res, err := m.DeleteOrphanFiles(ctx, bucket, table, c.orphanOptions())
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%s orphans %d (%d bytes), deleted %d", res.Status, res.OrphanFiles, res.OrphanBytes, res.FilesDeleted), nil
 		}})
 	}
 	return ts
