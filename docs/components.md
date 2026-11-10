@@ -398,13 +398,16 @@ are `x-datuplet-advanced`).
 | `rewrite_manifests.target_manifest_size_mb` | 8 | >= 1 | Target manifest size. |
 | `expire_snapshots.enabled` | `false` | | Expire old snapshots and delete the files only they reference. |
 | `expire_snapshots.older_than_hours` | 168 | 24-87600 | Expire snapshots older than this. |
-| `expire_snapshots.retain_last` | 10 | >= 1 (0 = default) | Always keep this many newest snapshots. |
+| `expire_snapshots.retain_last` | 10 | >= 1 | Always keep this many newest snapshots. |
 | `delete_orphan_files.enabled` | `false` | | Delete files under the table location that no snapshot references. |
 | `delete_orphan_files.older_than_hours` | 72 | 25-87600 | Only files older than this are deleted. |
 | `delete_orphan_files.max_files` | 10000 | >= 1 | Cap on files deleted per run. |
 
-The floors are enforced by the gateway (`InvalidArgument`, exit 1), not only by
-the schema.
+The gateway enforces the `older_than_hours` floors for expiry and orphan
+cleanup, the 87600 h maximum, and `retain_last` (`InvalidArgument`, exit 1).
+Every other bound in the table is validated by the config schema only.
+`retain_last` has no explicit "0 = default": the schema minimum is 1, so the
+default of 10 applies only when the field is omitted.
 
 ```yaml
 - name: maintain

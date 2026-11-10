@@ -101,7 +101,7 @@ func DeleteOrphansOnTable(ctx context.Context, tbl *icebergtable.Table, opts Orp
 	_, err = tbl.ExecuteOrphanCleanup(ctx, plan,
 		icebergtable.WithCleanupMaxConcurrency(orphanDeleteConcurrency),
 		icebergtable.WithDeleteFunc(func(p string) error {
-			if err := fsys.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) && gcerrors.Code(err) != gcerrors.NotFound {
+			if err := fsys.Remove(p); err != nil && !isNotFound(err) {
 				return err
 			}
 			deleted.Add(1)
@@ -230,4 +230,10 @@ func liveFileGuard(planned []string, live map[string]struct{}) error {
 		}
 	}
 	return nil
+}
+
+// isNotFound reports whether a Remove error means the object is already gone
+// (local/S3 fs.ErrNotExist or a gocloud NotFound from gcsIO).
+func isNotFound(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || gcerrors.Code(err) == gcerrors.NotFound
 }

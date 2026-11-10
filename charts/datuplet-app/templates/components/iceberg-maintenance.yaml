@@ -15,7 +15,7 @@ metadata:
     app.kubernetes.io/name: iceberg-maintenance
 spec:
   displayName: Iceberg Maintenance
-  description: Maintains each declared output table: compacts small files, rewrites manifests, expires old snapshots and deletes orphan files. Only compaction is on by default.
+  description: "Maintains each declared output table: compacts small files, rewrites manifests, expires old snapshots and deletes orphan files. Only compaction is on by default."
   maintainer: datuplet
   io:
     inputs: none

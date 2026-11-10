@@ -2,6 +2,7 @@ package icebergjob
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"gocloud.dev/blob"
+	"gocloud.dev/blob/memblob"
 )
 
 const hourMs = int64(time.Hour / time.Millisecond)
@@ -279,5 +282,24 @@ func TestGuardRefs(t *testing.T) {
 	}
 	if err := guardRefs(base, chainMetadata(t, ts, map[string]int64{"audit": 1}, 2)); err != nil {
 		t.Fatalf("guardRefs with refs intact = %v", err)
+	}
+}
+
+// gcsNotFoundIO fails Remove with a real gocloud NotFound, as gcsIO does.
+type gcsNotFoundIO struct {
+	iceio.IO
+	bucket *blob.Bucket
+}
+
+func (g gcsNotFoundIO) Remove(name string) error { return g.bucket.Delete(context.Background(), name) }
+
+func TestDeleteFiles_GocloudNotFoundCountsAsDeleted(t *testing.T) {
+	b := memblob.OpenBucket(nil)
+	defer b.Close()
+	paths := []string{"a.parquet", "b.parquet"}
+	deleted, left, bytes := deleteFiles(context.Background(), gcsNotFoundIO{bucket: b}, paths,
+		map[string]int64{"a.parquet": 10, "b.parquet": 5})
+	if deleted != 2 || left != 0 || bytes != 15 {
+		t.Fatalf("deleted=%d left=%d bytes=%d, want 2/0/15", deleted, left, bytes)
 	}
 }

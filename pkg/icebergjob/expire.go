@@ -2,9 +2,7 @@ package icebergjob
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"strings"
 	"sync"
@@ -372,7 +370,7 @@ func deleteFiles(ctx context.Context, fsys iceio.IO, paths []string, sizes map[s
 		go func(p string) {
 			defer func() { <-sem; wg.Done() }()
 			err := fsys.Remove(p)
-			if err != nil && errors.Is(err, fs.ErrNotExist) {
+			if err != nil && isNotFound(err) {
 				err = nil
 			}
 			mu.Lock()
