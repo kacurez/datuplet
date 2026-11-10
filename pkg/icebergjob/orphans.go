@@ -209,6 +209,8 @@ func liveFiles(ctx context.Context, tbl *icebergtable.Table) (map[string]struct{
 // with the table location plus "/". Listings that respell paths (bare keys,
 // bucket/key, another scheme, percent-encoding, interior "//") or reach a
 // sibling table whose location shares the prefix string all fail here.
+// This check is the only defence against `bucket/key` spellings, which
+// objectKey does not normalise. Do not relax it without extending objectKey.
 func prefixCheck(planned []string, location string) error {
 	prefix := strings.TrimSuffix(location, "/") + "/"
 	for _, p := range planned {

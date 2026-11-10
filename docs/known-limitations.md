@@ -488,9 +488,10 @@ named future work in the design spec (§10), not oversights.
 
 ## Table compaction
 
-- **No storage reclaim.** Compaction adds a `replace` snapshot; the old files
-  stay in the bucket until snapshots are expired. v1 has no expire-snapshots
-  and no orphan-file cleanup.
+- **No storage reclaim by compaction alone.** Compaction adds a `replace`
+  snapshot; the old files stay in the bucket until the `expire_snapshots` task of
+  the `iceberg-maintenance` component removes the snapshots that reference them
+  (see [Table maintenance](#table-maintenance)).
 - **Sidecar memory.** The gateway sidecar has no resource limits. The spike
   measured a peak of about 1357 MiB (1.38 GiB process max RSS) on a skewed
   input: one 90 MiB ZSTD file that decodes to about 1.25 GiB, among small
@@ -502,7 +503,8 @@ named future work in the design spec (§10), not oversights.
   cutoff in v1.
 - **Orphaned files.** A crash, a cancel, or an unknown commit outcome can leave
   written Parquet files unreferenced; they are kept rather than risk deleting
-  committed data. No cleanup exists.
+  committed data. The `delete_orphan_files` task of `iceberg-maintenance`
+  removes them (see [Table maintenance](#table-maintenance)).
 - **Duplicate work.** A concurrent non-append commit (FULL_LOAD, delete,
   another compaction) makes it end `SUPERSEDED`; concurrent APPENDs are
   tolerated and the compaction re-stages on top of them. The `409 compaction_running` gate covers
@@ -520,6 +522,41 @@ named future work in the design spec (§10), not oversights.
   namespaces.
 
 ---
+
+## Table maintenance
+
+`iceberg-maintenance` (rewrite manifests, expire snapshots, delete orphan files)
+deletes data permanently, so its safety rests on these assumptions.
+
+- **25 h assumption.** Orphan deletion needs `older_than_hours >= 25` and expiry
+  `>= 24`, on the assumption that no writer holds a snapshot or an uncommitted
+  file for longer than a pipeline run (run tokens last 24 h). This covers
+  pipeline runs only. Catalog tokens from `datuplet login` last up to 30 days and
+  foreign writers (other engines writing the same table) are not protected.
+- **Retention drift.** Retention comes from the stage config, not from Iceberg
+  table properties (`history.expire.*` are not read). Two pipelines maintaining
+  one table with different values: the last run wins. Table-level retention is a
+  follow-up.
+- **Unauthenticated gateway port.** The gateway's `:50051` is unauthenticated and
+  run pods have no NetworkPolicy (pre-existing). The maintenance RPCs are gated
+  by the gateway's `table_maintenance` flag, which the controller sets only for
+  the `iceberg-maintenance` component, but a pod that can reach another stage's
+  gateway port is not otherwise stopped.
+- **Concurrent maintenance stages.** Two maintenance stages on one table can
+  conflict; the loser ends `>=20` (FailedApplication) and is safe to re-run.
+- **Skewed writer clock.** Snapshot commit times that are not monotone (a writer
+  with a skewed clock) can make iceberg-go expire a snapshot that the
+  reader-protection keep set retains; the keep-set guard then refuses the whole
+  expiry (exit 1) and nothing is committed. The same happens when another engine
+  wrote per-ref retention that overrides the call options.
+- **`rewrite_manifests` dry run.** It writes temporary manifests and then
+  deletes them, so a dry run is not read-only.
+- **Operator IAM (S3).** Grant the Lakekeeper STS role `s3:DeleteObject` and
+  `s3:ListBucket` on the warehouse prefix. Whether the vended policy's
+  `ListBucket` carries a prefix condition on real AWS is unverified (tested live
+  on a MinIO-compatible store only).
+- **GCS.** Deletion and listing rely on the documented downscoped
+  `roles/storage.objectUser` token; documented, not live-verified.
 
 ## Previews
 

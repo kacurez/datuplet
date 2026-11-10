@@ -1,0 +1,25 @@
+# Maintenance scenario (TestMaintenance_PipelineStage): one iceberg-maintenance
+# stage runs all four tasks on the table the seed pipeline filled. Only
+# compact.min_input_files is raised from its default (each partition holds two
+# seed files); retention and orphan settings stay at their defaults.
+name: "{{.RunPrefix}}-maintenance"
+stages:
+  - name: maintain
+    components:
+      - name: maintainer
+        component: iceberg-maintenance
+        version: dev
+        config:
+          compact:
+            min_input_files: 2
+          rewrite_manifests:
+            enabled: true
+          expire_snapshots:
+            enabled: true
+          delete_orphan_files:
+            enabled: true
+        outputs:
+          tables:
+            - name: events
+              bucket: "{{.RunPrefix}}-maint"
+              writeMode: APPEND

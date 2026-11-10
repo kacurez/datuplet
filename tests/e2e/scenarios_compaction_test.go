@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,4 +160,80 @@ func TestCompaction_OnDemand(t *testing.T) {
 	framework.AssertDataFileCount(t, target, ns, "events", 8)
 	framework.AssertRowCount(t, target, ns, "events", rows)
 	framework.AssertLatestSnapshotReplaceWithCommitKey(t, target, ns, "events")
+}
+
+// TestMaintenance_PipelineStage runs all four iceberg-maintenance tasks as one
+// pipeline stage on a freshly seeded table. At default retention nothing is
+// old enough to expire or delete, so expire_snapshots and delete_orphan_files
+// must report NOTHING_TO_DO; compact bin-packs the 16 seed files, and
+// rewrite_manifests may or may not find work. The rows must be unchanged.
+func TestMaintenance_PipelineStage(t *testing.T) {
+	h := framework.SharedHarness()
+	if h == nil {
+		framework.SkipOrFail(t, "K8s e2e requires E2E_K8S=1 and SetupFGABootstrap to have run in TestMain — see framework/bootstrap.go")
+	}
+	if err := framework.PreCheck(); err != nil {
+		framework.SkipOrFail(t, "precheck failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	kb, err := framework.NewK8sBackend(h, runPrefix)
+	if err != nil {
+		t.Fatalf("init K8s backend: %v", err)
+	}
+	defer kb.Cleanup(context.Background())
+	target := framework.NewK8sQueryTarget(ctx, t, h)
+	ns := runPrefix + "-maint"
+
+	run := func(fixture string) *framework.RunResult {
+		t.Helper()
+		rendered, err := framework.RenderPipeline(filepath.Join("pipelines", "k8s", fixture), framework.TemplateVars{RunPrefix: runPrefix})
+		if err != nil {
+			t.Fatalf("render %s: %v", fixture, err)
+		}
+		defer os.Remove(rendered)
+		res, err := kb.RunPipeline(ctx, rendered, framework.RunOpts{StorageType: "s3", Timeout: 5 * time.Minute})
+		if err != nil {
+			t.Fatalf("run %s: %v", fixture, err)
+		}
+		if !res.Success {
+			t.Fatalf("run %s failed (exit %d, %s): %s\nlogs:\n%s", fixture, res.ExitCode, res.FailureType, res.StatusMessage, res.Logs)
+		}
+		return res
+	}
+
+	run("maintenance-seed.yaml")
+	run("maintenance-seed.yaml")
+
+	const rows = 800
+	framework.AssertRowCount(t, target, ns, "events", rows)
+	if n := framework.DataFileCount(t, target, ns, "events"); n < 16 {
+		t.Fatalf("seed produced %d data files, want >= 16", n)
+	}
+
+	res := run("maintenance.yaml")
+	// A succeeded run carries no StatusMessage; the component's summary is the
+	// DUPLET_STATUS_MESSAGE line in its logs.
+	msg := res.Logs
+	if !strings.Contains(msg, "DUPLET_STATUS_MESSAGE:maintenance: ") && !strings.Contains(msg, "DUPLET_STATUS_MESSAGE: maintenance: ") {
+		t.Fatalf("no maintenance status line in logs:\n%s", msg)
+	}
+	for _, want := range []string{
+		"compact COMPACTED",
+		"expire_snapshots NOTHING_TO_DO",
+		"delete_orphan_files NOTHING_TO_DO",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("status line missing %q; logs:\n%s", want, msg)
+		}
+	}
+	// rewrite_manifests depends on how many manifests the seed left.
+	if !strings.Contains(msg, "rewrite_manifests REWRITTEN") && !strings.Contains(msg, "rewrite_manifests NOTHING_TO_DO") {
+		t.Errorf("status line has no rewrite_manifests success status; logs:\n%s", msg)
+	}
+
+	framework.AssertDataFileCount(t, target, ns, "events", 8)
+	framework.AssertRowCount(t, target, ns, "events", rows)
 }

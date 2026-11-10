@@ -3089,11 +3089,14 @@ type ExpireSnapshotsResponse struct {
 	SnapshotsExpired int32                  `protobuf:"varint,2,opt,name=snapshots_expired,json=snapshotsExpired,proto3" json:"snapshots_expired,omitempty"`
 	FilesDeleted     int32                  `protobuf:"varint,3,opt,name=files_deleted,json=filesDeleted,proto3" json:"files_deleted,omitempty"`
 	BytesDeleted     int64                  `protobuf:"varint,4,opt,name=bytes_deleted,json=bytesDeleted,proto3" json:"bytes_deleted,omitempty"`
-	FilesLeft        int32                  `protobuf:"varint,5,opt,name=files_left,json=filesLeft,proto3" json:"files_left,omitempty"`
-	CurrentSnapshot  int64                  `protobuf:"varint,6,opt,name=current_snapshot,json=currentSnapshot,proto3" json:"current_snapshot,omitempty"`
-	DurationMs       int64                  `protobuf:"varint,7,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Files freed by the expiry that were not deleted (left for orphan
+	// cleanup). -1 means unknown: the expiry committed but the deletion set
+	// could not be computed.
+	FilesLeft       int32 `protobuf:"varint,5,opt,name=files_left,json=filesLeft,proto3" json:"files_left,omitempty"`
+	CurrentSnapshot int64 `protobuf:"varint,6,opt,name=current_snapshot,json=currentSnapshot,proto3" json:"current_snapshot,omitempty"`
+	DurationMs      int64 `protobuf:"varint,7,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ExpireSnapshotsResponse) Reset() {

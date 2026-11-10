@@ -15,8 +15,9 @@ const (
 	exitApp  = 20
 )
 
-// Config is the iceberg-maintenance component config. Zero values defer to the
-// gateway (target size) or library (file-count bounds) defaults.
+// Config is the iceberg-maintenance component config: one nested block per
+// maintenance task plus a global dry_run. Zero values defer to the gateway or
+// library defaults.
 type Config struct {
 	DryRun            bool                  `json:"dry_run"`
 	Compact           CompactTask           `json:"compact"`
@@ -155,7 +156,8 @@ func (c Config) tasks() []task {
 	return ts
 }
 
-// exitCodeFor maps a maintenance error to the exit-code contract.
+// exitCodeFor maps a maintenance task error (from any of the four tasks) to the
+// exit-code contract: user-fixable gRPC codes exit 1, everything else 20.
 func exitCodeFor(err error) int {
 	st, ok := status.FromError(err)
 	if !ok {

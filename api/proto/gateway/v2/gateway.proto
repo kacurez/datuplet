@@ -457,6 +457,9 @@ message ExpireSnapshotsResponse {
   int32 snapshots_expired = 2;
   int32 files_deleted = 3;
   int64 bytes_deleted = 4;
+  // Files freed by the expiry that were not deleted (left for orphan
+  // cleanup). -1 means unknown: the expiry committed but the deletion set
+  // could not be computed.
   int32 files_left = 5;
   int64 current_snapshot = 6;
   int64 duration_ms = 7;

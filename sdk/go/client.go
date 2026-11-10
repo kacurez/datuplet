@@ -1214,7 +1214,7 @@ type ExpireOptions struct {
 }
 
 // ExpireResult reports one snapshot expiry. Status is EXPIRED,
-// EXPIRED_PARTIAL, NOTHING_TO_DO or DRY_RUN.
+// EXPIRED_PARTIAL, NOTHING_TO_DO or DRY_RUN. FilesLeft is -1 when unknown.
 type ExpireResult struct {
 	Status           string
 	SnapshotsExpired int

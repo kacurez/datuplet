@@ -373,24 +373,47 @@ component.
 
 ## iceberg-maintenance
 
-Runs Iceberg table maintenance on each declared output table. Tasks run per
+Runs Iceberg table maintenance on each declared output table. Four tasks run per
 table in a fixed order: `compact`, `rewrite_manifests`, `expire_snapshots`,
-`delete_orphan_files`; only `compact` is on by default. The component does no
+`delete_orphan_files`. Only `compact` is on by default. The component does no
 data I/O itself: it calls the Data Gateway's maintenance RPCs once per output
-table. Currently only `compact` is wired to the gateway; the other tasks are
-accepted in the config but not yet executed.
+table, and the gateway (which holds the vended storage credentials) does the work.
+A failed task skips the remaining tasks for that table only.
 
 **Image:** `ghcr.io/kacurez/iceberg-maintenance:<components.tag>` · **Registry
 name:** `iceberg-maintenance` · **IO:** `{inputs: none, outputs: required}`
 
 **Config schema:** [`components/iceberg-maintenance/schema.json`](../components/iceberg-maintenance/schema.json)
-(`min_input_files`/`max_input_files` are `x-datuplet-advanced`).
+(`min_input_files`, `max_input_files`, `target_manifest_size_mb` and `max_files`
+are `x-datuplet-advanced`).
+
+| Key | Default | Floor / range | Meaning |
+|-----|---------|---------------|---------|
+| `dry_run` | `false` | | Plan only: every enabled task reports what it would do and changes nothing. |
+| `compact.enabled` | `true` | | Bin-pack small files into one atomic `replace` snapshot. |
+| `compact.target_file_size_mb` | pipeline `gateway.targetFileSize` | 16-2048 | Target compacted file size. |
+| `compact.min_input_files` | 5 | >= 2 | Small files needed in a partition before it is rewritten. |
+| `compact.max_input_files` | 2000 | >= 1 | Input files rewritten per run; the rest waits for a later run. |
+| `rewrite_manifests.enabled` | `false` | | Merge small manifests into fewer larger ones. |
+| `rewrite_manifests.target_manifest_size_mb` | 8 | >= 1 | Target manifest size. |
+| `expire_snapshots.enabled` | `false` | | Expire old snapshots and delete the files only they reference. |
+| `expire_snapshots.older_than_hours` | 168 | 24-87600 | Expire snapshots older than this. |
+| `expire_snapshots.retain_last` | 10 | >= 1 (0 = default) | Always keep this many newest snapshots. |
+| `delete_orphan_files.enabled` | `false` | | Delete files under the table location that no snapshot references. |
+| `delete_orphan_files.older_than_hours` | 72 | 25-87600 | Only files older than this are deleted. |
+| `delete_orphan_files.max_files` | 10000 | >= 1 | Cap on files deleted per run. |
+
+The floors are enforced by the gateway (`InvalidArgument`, exit 1), not only by
+the schema.
 
 ```yaml
 - name: maintain
   component: iceberg-maintenance
   config:
     compact: { target_file_size_mb: 128 }
+    rewrite_manifests: { enabled: true }
+    expire_snapshots: { enabled: true, older_than_hours: 168, retain_last: 10 }
+    delete_orphan_files: { enabled: true, older_than_hours: 72 }
   outputs: { tables: [ { name: events, bucket: raw } ] }
 ```
 
@@ -400,23 +423,39 @@ name:** `iceberg-maintenance` · **IO:** `{inputs: none, outputs: required}`
   outputs exit 1. `writeMode` is ignored.
 - With every task disabled (`compact.enabled: false` and nothing else on) the
   run exits 1 with `no maintenance task enabled`.
-- `compact.target_file_size_mb` is only sent when set; otherwise the pipeline's
-  `gateway.targetFileSize` applies. Unset file-count bounds use the library
-  defaults (5 / 2000).
-- Statuses `COMPACTED`, `ALREADY_COMMITTED`, `NOTHING_TO_DO`, `SUPERSEDED` and
-  `DRY_RUN` all exit 0. One `DUPLET_STATUS_MESSAGE:` line (prefix
-  `maintenance: `) summarises every table (files before -> after).
+- Statuses, per task: `compact` `COMPACTED`, `ALREADY_COMMITTED`,
+  `NOTHING_TO_DO`, `SUPERSEDED`, `DRY_RUN`; `rewrite_manifests` `REWRITTEN`,
+  `NOTHING_TO_DO`, `DRY_RUN`; `expire_snapshots` `EXPIRED`, `EXPIRED_PARTIAL`,
+  `NOTHING_TO_DO`, `DRY_RUN`; `delete_orphan_files` `DELETED`, `NOTHING_TO_DO`,
+  `DRY_RUN`. All exit 0. One `DUPLET_STATUS_MESSAGE:` line (prefix
+  `maintenance: `) summarises every table and task. `files_left unknown` in the
+  expire summary means the expiry committed but the deletion set could not be
+  computed; the files are left for `delete_orphan_files`.
 - gRPC `NotFound`, `PermissionDenied`, `InvalidArgument`, `FailedPrecondition`
   exit 1 (FailedUser); anything else (conflict exhaustion, storage/catalog
   errors, cancellation) exits 20. With several tables the worst outcome wins.
+- Compaction alone does not reclaim space: old files stay until
+  `expire_snapshots` removes the snapshots that reference them. Without
+  `expire_snapshots` the summary says so.
+- `expire_snapshots` refuses (exit 1) and commits nothing when its keep-set
+  guard sees iceberg-go would remove a snapshot that must be kept, for example
+  under a skewed writer clock or foreign per-ref retention.
+- A `dry_run` of `rewrite_manifests` writes temporary manifests and then deletes
+  them.
+- The maintenance RPCs are served only to this component (the controller sets
+  `table_maintenance` on its gateway); any other component gets
+  `PermissionDenied`.
+- Retention comes from the stage config, not from Iceberg table properties, so
+  two pipelines maintaining one table with different values race: the last run
+  wins.
 
 **Limitations:**
 
-- Old data files stay in storage until snapshots are expired; compaction does
-  not reclaim space by itself.
 - In a preview run the output tables are redirected to a scratch namespace, so
   the component only does something if an earlier stage of the same preview
   wrote the table; otherwise it ends `FailedUser` (table not found).
+- See [known-limitations.md](known-limitations.md#table-maintenance) for the
+  safety assumptions behind snapshot expiry and orphan deletion.
 
 ---
 
