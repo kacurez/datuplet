@@ -6,7 +6,7 @@ metadata:
   name: lakekeeper
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.20.1
+    helm.sh/chart: datuplet-lakekeeper-0.20.2
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -60,7 +60,7 @@ metadata:
   name: lakekeeper-config
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.20.1
+    helm.sh/chart: datuplet-lakekeeper-0.20.2
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -499,7 +499,7 @@ metadata:
   name: datuplet-lakekeeper-bootstrap
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.20.1
+    helm.sh/chart: datuplet-lakekeeper-0.20.2
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -515,7 +515,7 @@ metadata:
   name: datuplet-lakekeeper-bootstrap
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.20.1
+    helm.sh/chart: datuplet-lakekeeper-0.20.2
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -536,7 +536,7 @@ metadata:
   name: datuplet-lakekeeper-bootstrap
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.20.1
+    helm.sh/chart: datuplet-lakekeeper-0.20.2
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet
@@ -612,7 +612,7 @@ metadata:
   name: wait-for-fga-pin
   namespace: default
   labels:
-    helm.sh/chart: datuplet-lakekeeper-0.20.1
+    helm.sh/chart: datuplet-lakekeeper-0.20.2
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/part-of: datuplet

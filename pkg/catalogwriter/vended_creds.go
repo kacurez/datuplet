@@ -23,11 +23,17 @@ import (
 // of TTL.
 const MinRenewalInterval = 60 * time.Second
 
-// maxResponseBytes caps lakekeeper response payloads we read into
-// memory. A vended-creds response is ~1 KiB; 1 MiB is generous and
-// guards against runaway / hostile responses without affecting
-// legitimate traffic.
+// maxResponseBytes caps lakekeeper response payloads read into memory
+// (error bodies, /v1/config).
 const maxResponseBytes = 1 << 20
+
+// maxLoadTableResponseBytes caps how much of a loadTable response is
+// scanned. The response embeds the full table metadata (every snapshot,
+// snapshot-log and metadata-log entry), which grows ~1 KiB per commit, so
+// it is stream-decoded: only the `config` object is held in memory.
+const maxLoadTableResponseBytes = 256 << 20
+
+var errResponseTooLarge = errors.New("response too large")
 
 // defaultHTTPTimeout is the per-request timeout used when callers
 // don't supply their own *http.Client. Long enough to tolerate a
@@ -356,26 +362,25 @@ func (v *VendedCreds) fetch(ctx context.Context) (Creds, error) {
 	}
 	defer resp.Body.Close()
 
-	// Bound the response read so a misbehaving / hostile lakekeeper
-	// can't OOM the data gateway with a multi-GB body.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil {
-		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
-		return nil, fmt.Errorf("catalogwriter: read response: %w", err)
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
 		return nil, fmt.Errorf("catalogwriter: lakekeeper GET: status %d body=%s", resp.StatusCode, scrubBody(body))
 	}
 
-	var parsed struct {
-		Config map[string]any `json:"config"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
+	cfg, err := decodeLoadTableConfig(resp.Body, maxLoadTableResponseBytes)
+	var readErr *bodyReadError
+	switch {
+	case errors.Is(err, errResponseTooLarge):
+		credsRefreshFailuresTotal.WithLabelValues(credType, "too_large").Inc()
+		return nil, fmt.Errorf("catalogwriter: loadTable response exceeds %d bytes: %w", maxLoadTableResponseBytes, err)
+	case errors.As(err, &readErr):
+		credsRefreshFailuresTotal.WithLabelValues(credType, "http").Inc()
+		return nil, fmt.Errorf("catalogwriter: read response: %w", readErr.err)
+	case err != nil:
 		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
 		return nil, fmt.Errorf("catalogwriter: unmarshal response: %w", err)
 	}
-	cfg := parsed.Config
 	if cfg == nil {
 		credsRefreshFailuresTotal.WithLabelValues(credType, "parse").Inc()
 		return nil, errors.New("catalogwriter: lakekeeper response had no config block")
@@ -518,6 +523,106 @@ func readMillis(cfg map[string]any, key string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return time.UnixMilli(ms), true
+}
+
+// decodeLoadTableConfig stream-decodes a loadTable response, returning its
+// top-level `config` object. Every other member (notably `metadata`) is
+// skipped token by token, so memory stays bounded by the config block
+// regardless of table history. Reading more than limit bytes fails with
+// errResponseTooLarge.
+func decodeLoadTableConfig(r io.Reader, limit int64) (map[string]any, error) {
+	dec := json.NewDecoder(&capReader{r: r, n: limit})
+	if tok, err := dec.Token(); err != nil {
+		return nil, err
+	} else if tok != json.Delim('{') {
+		return nil, fmt.Errorf("expected JSON object, got %T", tok)
+	}
+	var cfg map[string]any
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		if key, _ := tok.(string); key == "config" {
+			cfg = nil
+			if err := dec.Decode(&cfg); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := skipJSONValue(dec); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			err = errors.New("unexpected data after JSON object")
+		}
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func skipJSONValue(dec *json.Decoder) error {
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch tok {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+		if depth == 0 {
+			return nil
+		}
+	}
+}
+
+// bodyReadError marks a failure reading the underlying body (network
+// reset, client timeout) so callers can tell it from a JSON parse error.
+type bodyReadError struct{ err error }
+
+func (e *bodyReadError) Error() string { return e.err.Error() }
+func (e *bodyReadError) Unwrap() error { return e.err }
+
+// capReader reads at most n bytes from r; a body that continues past n
+// fails with errResponseTooLarge instead of being silently truncated.
+// Non-EOF errors from r are wrapped in *bodyReadError.
+type capReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *capReader) Read(p []byte) (int, error) {
+	if c.n <= 0 {
+		var one [1]byte
+		if k, err := c.r.Read(one[:]); k > 0 {
+			return 0, errResponseTooLarge
+		} else if err != nil {
+			return 0, wrapReadErr(err)
+		}
+		return 0, nil
+	}
+	if int64(len(p)) > c.n {
+		p = p[:c.n]
+	}
+	k, err := c.r.Read(p)
+	c.n -= int64(k)
+	return k, wrapReadErr(err)
+}
+
+func wrapReadErr(err error) error {
+	if err == nil || err == io.EOF {
+		return err
+	}
+	return &bodyReadError{err: err}
 }
 
 // discoverPrefix queries lakekeeper's `/v1/config?warehouse=<name>` and

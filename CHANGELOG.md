@@ -8,6 +8,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Large table metadata no longer breaks gateway reads/writes (0.20.2,
+  #55).** The Data Gateway truncated Lakekeeper's loadTable response at
+  1 MiB when fetching vended credentials; tables with ~1,000+ snapshots
+  failed with `catalogwriter: unmarshal response: unexpected end of JSON
+  input`. The response is now stream-decoded (only `config` is kept in
+  memory) with a 256 MiB cap that fails with an explicit "exceeds" error.
 - **Query-worker external storage egress (0.20.1).** The app chart accepts
   opt-in `queryWorker.extraEgress` NetworkPolicy rules for GCS and external
   S3 endpoints. Defaults remain locked down; warehouse/GCS guides show
