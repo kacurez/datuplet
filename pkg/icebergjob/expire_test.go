@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,5 +247,37 @@ func TestExpireDeletionSet_LiveFileKept(t *testing.T) {
 	want := []string{"mem://t/metadata/m1.avro", "mem://t/metadata/snap-1.avro"}
 	if len(paths) != len(want) || paths[0] != want[0] || paths[1] != want[1] {
 		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+}
+
+func TestKeepSet_NonMonotoneChain(t *testing.T) {
+	now := testNow
+	cutoff := now - 24*hourMs
+	// Writer clock skew: snapshot 3 carries an old timestamp between two
+	// recent ones. Snapshot 1 was superseded by 2 after the cutoff, but
+	// effective (3) covers only 4, 3, 2.
+	md := chainMetadata(t, []int64{now - 30*24*hourMs, now - 2*hourMs, now - 40*24*hourMs, now - hourMs}, nil)
+	eff := effectiveRetainLast(md, cutoff, 1)
+	if eff != 3 {
+		t.Fatalf("effectiveRetainLast = %d, want 3", eff)
+	}
+	ks := keepSet(md, cutoff, eff)
+	for _, id := range []int64{1, 2, 3, 4} {
+		if _, ok := ks[id]; !ok {
+			t.Errorf("keepSet %v lacks snapshot %d", ids(ks), id)
+		}
+	}
+}
+
+func TestGuardRefs(t *testing.T) {
+	now := testNow
+	ts := []int64{now - 3*hourMs, now - 2*hourMs, now - hourMs}
+	base := chainMetadata(t, ts, map[string]int64{"audit": 1})
+	// iceberg-go drops a tag past its max-ref-age-ms.
+	if err := guardRefs(base, chainMetadata(t, ts, nil)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), `"audit"`) {
+		t.Fatalf("guardRefs = %v, want ErrRefused naming audit", err)
+	}
+	if err := guardRefs(base, chainMetadata(t, ts, map[string]int64{"audit": 1}, 2)); err != nil {
+		t.Fatalf("guardRefs with refs intact = %v", err)
 	}
 }

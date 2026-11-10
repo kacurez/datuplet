@@ -187,3 +187,14 @@ func TestMaintenanceRPCs_UpperBoundAndNegatives(t *testing.T) {
 		t.Errorf("negative target size: code = %v, want InvalidArgument", status.Code(err))
 	}
 }
+
+func TestExpireSnapshots_FilesLeftUnknownPassesThrough(t *testing.T) {
+	s := maintenanceServer(true, declaredRawEvents())
+	s.expireFn = func(context.Context, icebergtable.Identifier, icebergjob.ExpireOpts) (*icebergjob.ExpireResult, error) {
+		return &icebergjob.ExpireResult{Status: "EXPIRED_PARTIAL", SnapshotsExpired: 2, FilesLeft: -1}, nil
+	}
+	resp, err := s.ExpireSnapshots(context.Background(), &pb.ExpireSnapshotsRequest{Bucket: "raw", Table: "events"})
+	if err != nil || resp.GetFilesLeft() != -1 || resp.GetStatus() != "EXPIRED_PARTIAL" {
+		t.Fatalf("resp = %+v, %v; want files_left -1", resp, err)
+	}
+}

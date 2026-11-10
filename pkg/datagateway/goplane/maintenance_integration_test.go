@@ -9,11 +9,13 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/datuplet/datuplet/pkg/datagateway/lakekeeper"
@@ -339,6 +341,9 @@ func TestExpire_ConcurrentAppend_Recomputes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Let iceberg-go replay a conflicting commit (its default is 0 retries),
+	// so the test fails if the expiry is not run under noReplay.
+	setProps(t, cat, ns, tbl, iceberg.Properties{"commit.retry.num-retries": "3"})
 	p := New(Config{})
 	defer p.Close()
 	sch, inputs := allTypesSchema(t)
@@ -433,22 +438,145 @@ func TestExpire_GCDisabled_Refused(t *testing.T) {
 		t.Fatal(err)
 	}
 	ident := catalog.ToIdentifier(ns, tbl)
-	tb, err := cat.LoadTable(ctx, ident)
-	if err != nil {
-		t.Fatal(err)
-	}
-	txn := tb.NewTransaction()
-	if err := txn.SetProperties(iceberg.Properties{"gc.enabled": "false"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := txn.Commit(ctx); err != nil {
-		t.Fatalf("set gc.enabled: %v", err)
-	}
+	setProps(t, cat, ns, tbl, iceberg.Properties{"gc.enabled": "false"})
 	res, err := icebergjob.ExpireTableSnapshots(ctx, cat, ident, icebergjob.ExpireOpts{OlderThan: 168 * time.Hour, RetainLast: 1, Now: later})
 	if !errors.Is(err, icebergjob.ErrRefused) {
 		t.Fatalf("ExpireTableSnapshots = %+v, %v; want ErrRefused", res, err)
 	}
 	if ids := snapshotIDs(t, cat, ns, tbl); len(ids) != 2 {
 		t.Fatalf("snapshots %v, want 2", ids)
+	}
+}
+
+func setProps(t *testing.T, cat catalog.Catalog, ns, tbl string, props iceberg.Properties) {
+	t.Helper()
+	ctx := context.Background()
+	tb, err := cat.LoadTable(ctx, catalog.ToIdentifier(ns, tbl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := tb.NewTransaction()
+	if err := txn.SetProperties(props); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txn.Commit(ctx); err != nil {
+		t.Fatalf("set %v: %v", props, err)
+	}
+}
+
+func TestExpire_RefMaxAge_Refused(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "expire_refage"
+	r, _ := seedAppends(t, fx, ns, tbl, 2)
+	ctx := context.Background()
+	cat, err := r.Catalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := catalog.ToIdentifier(ns, tbl)
+	tb, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := tb.CurrentSnapshot().SnapshotID
+	// A foreign tag with max-ref-age-ms=1: iceberg-go's expiry would drop it.
+	if _, _, err := cat.CommitTable(ctx, ident, []table.Requirement{table.AssertTableUUID(tb.Metadata().TableUUID())},
+		[]table.Update{table.NewSetSnapshotRefUpdate("audit", head, table.TagRef, 1, 0, 0)}); err != nil {
+		t.Fatalf("set tag: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	res, err := icebergjob.ExpireTableSnapshots(ctx, cat, ident, icebergjob.ExpireOpts{OlderThan: 168 * time.Hour, RetainLast: 1, Now: later})
+	if !errors.Is(err, icebergjob.ErrRefused) || !strings.Contains(err.Error(), "ref guard") {
+		t.Fatalf("ExpireTableSnapshots = %+v, %v; want ref-guard ErrRefused", res, err)
+	}
+	tb, err = cat.LoadTable(ctx, ident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tb.Metadata().SnapshotByName("audit") == nil || len(tb.Metadata().Snapshots()) != 2 {
+		t.Fatalf("table changed: tag present=%v, snapshots %d", tb.Metadata().SnapshotByName("audit") != nil, len(tb.Metadata().Snapshots()))
+	}
+}
+
+// failAfterCommit hands out tables whose IO refuses every Open (and counts
+// Removes) once an expiry commit has landed through it.
+type failAfterCommit struct {
+	catalog.Catalog
+	committed atomic.Bool
+	opens     atomic.Int32
+	removes   atomic.Int32
+}
+
+type failAfterCommitIO struct {
+	iceio.WriteFileIO
+	c *failAfterCommit
+}
+
+func (f failAfterCommitIO) Open(name string) (iceio.File, error) {
+	if f.c.committed.Load() {
+		f.c.opens.Add(1)
+		return nil, fmt.Errorf("injected: open %s", name)
+	}
+	return f.WriteFileIO.Open(name)
+}
+
+func (f failAfterCommitIO) Remove(name string) error {
+	f.c.removes.Add(1)
+	return f.WriteFileIO.Remove(name)
+}
+
+func (c *failAfterCommit) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	tb, err := c.Catalog.LoadTable(ctx, ident)
+	if err != nil {
+		return nil, err
+	}
+	fsF := func(ctx context.Context) (iceio.IO, error) {
+		fsys, err := tb.FS(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return failAfterCommitIO{WriteFileIO: fsys.(iceio.WriteFileIO), c: c}, nil
+	}
+	return table.New(tb.Identifier(), tb.Metadata(), tb.MetadataLocation(), fsF, c), nil
+}
+
+func (c *failAfterCommit) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	md, loc, err := c.Catalog.CommitTable(ctx, ident, reqs, updates)
+	if err == nil {
+		c.committed.Store(true)
+	}
+	return md, loc, err
+}
+
+func TestExpire_DeletionSetUnreadable_FilesLeftUnknown(t *testing.T) {
+	fx := sharedFixture(t)
+	const ns, tbl = "gw_it", "expire_unreadable"
+	r, written := seedAppends(t, fx, ns, tbl, 3)
+	ctx := context.Background()
+	cat, err := r.Catalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &failAfterCommit{Catalog: cat}
+	res, err := icebergjob.ExpireTableSnapshots(ctx, wrapped, catalog.ToIdentifier(ns, tbl), icebergjob.ExpireOpts{OlderThan: 168 * time.Hour, RetainLast: 1, Now: later})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != icebergjob.ExpireExpiredPartial || res.FilesLeft != -1 || res.FilesDeleted != 0 || res.SnapshotsExpired != 2 {
+		t.Fatalf("result = %+v; want EXPIRED_PARTIAL, files_left -1", res)
+	}
+	if n := wrapped.opens.Load(); n < 2 {
+		t.Fatalf("failed opens after commit = %d, want >= 2 (one retry)", n)
+	}
+	if n := wrapped.removes.Load(); n != 0 {
+		t.Fatalf("%d removes with an unknown deletion set", n)
+	}
+	if ids := snapshotIDs(t, cat, ns, tbl); len(ids) != 1 {
+		t.Fatalf("snapshots %v, want the expiry committed", ids)
+	}
+	for _, p := range written {
+		if !fileExists(t, cat, ns, tbl, p) {
+			t.Fatalf("%s deleted", p)
+		}
 	}
 }

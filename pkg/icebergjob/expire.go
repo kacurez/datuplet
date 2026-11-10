@@ -51,11 +51,10 @@ func ExpireTableSnapshots(ctx context.Context, cat catalog.Catalog, ident iceber
 	}
 
 	var (
-		res      *ExpireResult
-		paths    []string
-		sizes    map[string]int64
-		fsys     iceio.IO
-		finished bool
+		res       *ExpireResult
+		committed *icebergtable.Table
+		expired   []icebergtable.Snapshot
+		finished  bool
 	)
 	err := catalogwriter.RetryOnConflict(ctx, catalogwriter.RetryOpts{MaxAttempts: catalogwriter.DefaultMaxRetries}, func(ctx context.Context) error {
 		tbl, err := cat.LoadTable(ctx, ident)
@@ -86,6 +85,9 @@ func ExpireTableSnapshots(ctx context.Context, cat catalog.Catalog, ident iceber
 		if err := guardKeepSet(removed, ks); err != nil {
 			return err
 		}
+		if err := guardRefs(md, staged.Metadata()); err != nil {
+			return err
+		}
 
 		res = &ExpireResult{SnapshotsExpired: len(removed), CurrentSnapshot: snapshotIDOf(tbl)}
 		if len(removed) == 0 {
@@ -93,15 +95,17 @@ func ExpireTableSnapshots(ctx context.Context, cat catalog.Catalog, ident iceber
 			finished = true
 			return nil
 		}
-		expired := snapshotsByID(md, removed)
-		if fsys, err = tbl.FS(ctx); err != nil {
-			return fmt.Errorf("table io: %w", err)
-		}
 		if opts.DryRun {
-			paths, sizes, err = expireDeletionSet(ctx, fsys, staged.Metadata().Snapshots(), expired)
+			fsys, err := tbl.FS(ctx)
+			if err != nil {
+				return fmt.Errorf("table io: %w", err)
+			}
+			paths, sizes, err := expireDeletionSet(ctx, fsys, staged.Metadata().Snapshots(), snapshotsByID(md, removed))
 			if err != nil {
 				return fmt.Errorf("dry run deletion set: %w", err)
 			}
+			// Dry run: FilesDeleted/BytesDeleted are the planned deletions,
+			// so the gateway's files metric counts them under status DRY_RUN.
 			res.Status = ExpireDryRun
 			res.FilesDeleted = len(paths)
 			for _, p := range paths {
@@ -111,12 +115,13 @@ func ExpireTableSnapshots(ctx context.Context, cat catalog.Catalog, ident iceber
 			return nil
 		}
 
-		committed, err := txn.Commit(ctx)
+		out, err := txn.Commit(ctx)
 		if err != nil {
 			return fmt.Errorf("commit expiry: %w", err)
 		}
+		committed = out
 		// Only snapshots the committed table really lacks count as expired.
-		expired = expired[:0]
+		expired = nil
 		for _, s := range snapshotsByID(md, removed) {
 			if committed.Metadata().SnapshotByID(s.SnapshotID) == nil {
 				expired = append(expired, s)
@@ -124,27 +129,28 @@ func ExpireTableSnapshots(ctx context.Context, cat catalog.Catalog, ident iceber
 		}
 		res.SnapshotsExpired = len(expired)
 		res.CurrentSnapshot = snapshotIDOf(committed)
-		if fsys, err = committed.FS(ctx); err != nil {
-			return fmt.Errorf("%w: committed table io: %w", errExpireCommitted, err)
-		}
-		paths, sizes, err = expireDeletionSet(ctx, fsys, committed.Metadata().Snapshots(), expired)
-		if err != nil {
-			return fmt.Errorf("%w: deletion set: %w", errExpireCommitted, err)
-		}
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, errExpireCommitted) {
-			// The expiry landed but the files to delete are unknown: they
-			// are orphans now, left to the orphan pass.
-			slog.Warn("expire: committed, deletion set unavailable", "table", ident, "err", err)
-			res.Status = ExpireExpiredPartial
-			res.Duration = time.Since(start)
-			return res, nil
-		}
 		return nil, fmt.Errorf("ExpireTableSnapshots %v: %w", ident, err)
 	}
 	if finished {
+		res.Duration = time.Since(start)
+		return res, nil
+	}
+
+	// The expiry has landed. The deletion set comes from the committed table
+	// only; one retry, then the files are orphans for the orphan pass and
+	// their count is unknown (FilesLeft -1).
+	fsys, paths, sizes, err := committedDeletionSet(ctx, committed, expired)
+	if err != nil {
+		slog.Warn("expire: deletion set unavailable, retrying once", "table", ident, "err", err)
+		fsys, paths, sizes, err = committedDeletionSet(ctx, committed, expired)
+	}
+	if err != nil {
+		slog.Warn("expire: committed, deletion set unavailable; files left as orphans", "table", ident, "err", err)
+		res.Status = ExpireExpiredPartial
+		res.FilesLeft = -1
 		res.Duration = time.Since(start)
 		return res, nil
 	}
@@ -159,8 +165,17 @@ func ExpireTableSnapshots(ctx context.Context, cat catalog.Catalog, ident iceber
 	return res, nil
 }
 
-// errExpireCommitted marks a failure after the expiry commit landed.
-var errExpireCommitted = errors.New("expiry committed")
+func committedDeletionSet(ctx context.Context, committed *icebergtable.Table, expired []icebergtable.Snapshot) (iceio.IO, []string, map[string]int64, error) {
+	fsys, err := committed.FS(ctx)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("committed table io: %w", err)
+	}
+	paths, sizes, err := expireDeletionSet(ctx, fsys, committed.Metadata().Snapshots(), expired)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("deletion set: %w", err)
+	}
+	return fsys, paths, sizes, nil
+}
 
 // olderThanFromCutoff converts the cutoff into the age iceberg-go measures
 // against its own clock, so an injected Now and iceberg-go agree on which
@@ -197,11 +212,16 @@ func effectiveRetainLast(md icebergtable.Metadata, cutoffMs int64, retainLast in
 }
 
 // keepSet is every snapshot this expiry must not remove: main's head, the
-// first effective snapshots of main, and every snapshot another ref points to.
+// first effective snapshots of main, every snapshot of main superseded after
+// cutoffMs, and every snapshot another ref points to.
 func keepSet(md icebergtable.Metadata, cutoffMs int64, effective int) map[int64]struct{} {
 	ks := map[int64]struct{}{}
-	for i, s := range mainChain(md) {
-		if i < effective {
+	chain := mainChain(md)
+	for i, s := range chain {
+		// The second clause matters when commit times on the chain are not
+		// monotone (writer clock skew): a snapshot superseded after the
+		// cutoff can then sit beyond effective.
+		if i < effective || (i >= 1 && chain[i-1].TimestampMs > cutoffMs) {
 			ks[s.SnapshotID] = struct{}{}
 		}
 	}
@@ -229,6 +249,21 @@ func guardKeepSet(removed []int64, ks map[int64]struct{}) error {
 	for _, id := range removed {
 		if _, ok := ks[id]; ok {
 			return fmt.Errorf("%w: keep-set guard: snapshot %d would be expired (per-ref retention overrides the options)", ErrRefused, id)
+		}
+	}
+	return nil
+}
+
+// guardRefs refuses an expiry that would drop a ref: iceberg-go removes a
+// non-main branch or tag past its max-ref-age-ms, which this task must not do.
+func guardRefs(base, staged icebergtable.Metadata) error {
+	kept := map[string]struct{}{}
+	for name := range staged.Refs() {
+		kept[name] = struct{}{}
+	}
+	for name := range base.Refs() {
+		if _, ok := kept[name]; !ok {
+			return fmt.Errorf("%w: ref guard: ref %q would be removed (max-ref-age-ms)", ErrRefused, name)
 		}
 	}
 	return nil

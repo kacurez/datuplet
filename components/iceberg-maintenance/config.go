@@ -127,7 +127,10 @@ func (c Config) tasks() []task {
 				return "", err
 			}
 			out := fmt.Sprintf("%s snapshots %d, files %d (%d bytes)", res.Status, res.SnapshotsExpired, res.FilesDeleted, res.BytesDeleted)
-			if res.FilesLeft > 0 {
+			switch {
+			case res.FilesLeft < 0:
+				out += ", files_left unknown"
+			case res.FilesLeft > 0:
 				out += fmt.Sprintf(", files_left %d", res.FilesLeft)
 			}
 			return out, nil

@@ -35,13 +35,19 @@ type ExpireOpts struct {
 }
 
 // ExpireResult reports one snapshot expiry. Status is EXPIRED,
-// EXPIRED_PARTIAL, NOTHING_TO_DO or DRY_RUN.
+// EXPIRED_PARTIAL, NOTHING_TO_DO or DRY_RUN. In a dry run FilesDeleted and
+// BytesDeleted are the planned deletions.
 type ExpireResult struct {
-	Status                                    string
-	SnapshotsExpired, FilesDeleted, FilesLeft int
-	BytesDeleted                              int64
-	CurrentSnapshot                           int64
-	Duration                                  time.Duration
+	Status           string
+	SnapshotsExpired int
+	FilesDeleted     int
+	// FilesLeft counts files the expiry freed but could not delete (now
+	// orphans). -1 means unknown: the commit landed but the deletion set
+	// could not be read.
+	FilesLeft       int
+	BytesDeleted    int64
+	CurrentSnapshot int64
+	Duration        time.Duration
 }
 
 // OrphanOpts tunes DeleteTableOrphanFiles.

@@ -288,3 +288,13 @@ func TestRun_ExpirePartialExitsZero(t *testing.T) {
 		t.Errorf("unset expire config must send zero options, got %+v", f.exOpts[0])
 	}
 }
+
+func TestRun_ExpireFilesLeftUnknown(t *testing.T) {
+	off := false
+	f := &fakeMaintainer{exRes: &sdk.ExpireResult{Status: "EXPIRED_PARTIAL", SnapshotsExpired: 2, FilesLeft: -1}}
+	cfg := Config{Compact: CompactTask{Enabled: &off}, ExpireSnapshots: ExpireSnapshotsTask{Enabled: true}}
+	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != 0 || !strings.Contains(msg, "EXPIRED_PARTIAL snapshots 2, files 0 (0 bytes), files_left unknown") {
+		t.Fatalf("exit %d, message %q", code, msg)
+	}
+}
