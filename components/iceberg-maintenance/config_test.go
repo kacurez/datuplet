@@ -21,6 +21,8 @@ type fakeMaintainer struct {
 	calls   []call
 	order   []string
 	rwErrs  map[string]error
+	exOpts  []sdk.ExpireOptions
+	exRes   *sdk.ExpireResult
 	results map[string]*sdk.CompactResult
 	errs    map[string]error
 }
@@ -45,6 +47,15 @@ func (f *fakeMaintainer) RewriteManifests(_ context.Context, bucket, table strin
 		return nil, fmt.Errorf("rewrite %s failed: %w", key, err)
 	}
 	return &sdk.RewriteManifestsResult{Status: "REWRITTEN", ManifestsBefore: 12, ManifestsAfter: 1}, nil
+}
+
+func (f *fakeMaintainer) ExpireSnapshots(_ context.Context, bucket, table string, opts sdk.ExpireOptions) (*sdk.ExpireResult, error) {
+	f.order = append(f.order, "expire "+bucket+"."+table)
+	f.exOpts = append(f.exOpts, opts)
+	if f.exRes != nil {
+		return f.exRes, nil
+	}
+	return &sdk.ExpireResult{Status: "EXPIRED", SnapshotsExpired: 4, FilesDeleted: 9, BytesDeleted: 1234}, nil
 }
 
 func tbl(bucket, name string) sdk.OutputTableRef {
@@ -237,5 +248,43 @@ func TestRun_RewriteOnly(t *testing.T) {
 	code, _ := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
 	if code != 0 || len(f.calls) != 0 || len(f.order) != 1 {
 		t.Fatalf("exit %d, compact calls %d, order %v", code, len(f.calls), f.order)
+	}
+}
+
+func TestRun_ExpireAfterRewrite(t *testing.T) {
+	f := &fakeMaintainer{results: map[string]*sdk.CompactResult{"raw.a": {Status: "COMPACTED", FilesBefore: 12, FilesAfter: 2}}}
+	cfg := Config{DryRun: true, RewriteManifests: RewriteManifestsTask{Enabled: true},
+		ExpireSnapshots: ExpireSnapshotsTask{Enabled: true, OlderThanHours: 48, RetainLast: 3}}
+	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != 0 {
+		t.Fatalf("exit = %d (msg %q)", code, msg)
+	}
+	if want := "compact raw.a,rewrite raw.a,expire raw.a"; strings.Join(f.order, ",") != want {
+		t.Fatalf("calls = %v, want %s", f.order, want)
+	}
+	if got, want := f.exOpts[0], (sdk.ExpireOptions{OlderThanHours: 48, RetainLast: 3, DryRun: true}); got != want {
+		t.Errorf("expire opts = %+v, want %+v", got, want)
+	}
+	if !strings.Contains(msg, "expire_snapshots EXPIRED snapshots 4, files 9 (1234 bytes)") {
+		t.Errorf("message %q missing expire summary", msg)
+	}
+	if strings.Contains(msg, "old files stay") {
+		t.Errorf("message %q claims old files stay although expiry ran", msg)
+	}
+}
+
+func TestRun_ExpirePartialExitsZero(t *testing.T) {
+	off := false
+	f := &fakeMaintainer{exRes: &sdk.ExpireResult{Status: "EXPIRED_PARTIAL", SnapshotsExpired: 2, FilesDeleted: 5, FilesLeft: 3}}
+	cfg := Config{Compact: CompactTask{Enabled: &off}, ExpireSnapshots: ExpireSnapshotsTask{Enabled: true}}
+	code, msg := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (msg %q)", code, msg)
+	}
+	if !strings.Contains(msg, "EXPIRED_PARTIAL") || !strings.Contains(msg, "files_left 3") {
+		t.Errorf("message %q missing partial status / files_left", msg)
+	}
+	if f.exOpts[0] != (sdk.ExpireOptions{}) {
+		t.Errorf("unset expire config must send zero options, got %+v", f.exOpts[0])
 	}
 }

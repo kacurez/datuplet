@@ -55,6 +55,7 @@ type DeleteOrphanFilesTask struct {
 type maintainer interface {
 	Compact(ctx context.Context, bucket, table string, opts sdk.CompactOptions) (*sdk.CompactResult, error)
 	RewriteManifests(ctx context.Context, bucket, table string, opts sdk.RewriteManifestsOptions) (*sdk.RewriteManifestsResult, error)
+	ExpireSnapshots(ctx context.Context, bucket, table string, opts sdk.ExpireOptions) (*sdk.ExpireResult, error)
 }
 
 func (c Config) compactEnabled() bool {
@@ -71,13 +72,21 @@ func (c Config) compactOptions() sdk.CompactOptions {
 }
 
 func (c Config) anyEnabled() bool {
-	return c.compactEnabled() || c.RewriteManifests.Enabled
+	return c.compactEnabled() || c.RewriteManifests.Enabled || c.ExpireSnapshots.Enabled
 }
 
 func (c Config) rewriteManifestsOptions() sdk.RewriteManifestsOptions {
 	return sdk.RewriteManifestsOptions{
 		TargetManifestSizeBytes: int64(c.RewriteManifests.TargetManifestSizeMB) << 20,
 		DryRun:                  c.DryRun,
+	}
+}
+
+func (c Config) expireOptions() sdk.ExpireOptions {
+	return sdk.ExpireOptions{
+		OlderThanHours: c.ExpireSnapshots.OlderThanHours,
+		RetainLast:     c.ExpireSnapshots.RetainLast,
+		DryRun:         c.DryRun,
 	}
 }
 
@@ -88,8 +97,9 @@ type task struct {
 	do   func(ctx context.Context, m maintainer, bucket, table string) (string, error)
 }
 
-// tasks returns the enabled tasks in the fixed order: compact, then
-// rewrite_manifests. Later maintenance tasks append here, keeping that order.
+// tasks returns the enabled tasks in the fixed order: compact,
+// rewrite_manifests, expire_snapshots. Later maintenance tasks append here,
+// keeping that order.
 func (c Config) tasks() []task {
 	var ts []task
 	if c.compactEnabled() {
@@ -108,6 +118,19 @@ func (c Config) tasks() []task {
 				return "", err
 			}
 			return fmt.Sprintf("%s %d -> %d", res.Status, res.ManifestsBefore, res.ManifestsAfter), nil
+		}})
+	}
+	if c.ExpireSnapshots.Enabled {
+		ts = append(ts, task{"expire_snapshots", func(ctx context.Context, m maintainer, bucket, table string) (string, error) {
+			res, err := m.ExpireSnapshots(ctx, bucket, table, c.expireOptions())
+			if err != nil {
+				return "", err
+			}
+			out := fmt.Sprintf("%s snapshots %d, files %d (%d bytes)", res.Status, res.SnapshotsExpired, res.FilesDeleted, res.BytesDeleted)
+			if res.FilesLeft > 0 {
+				out += fmt.Sprintf(", files_left %d", res.FilesLeft)
+			}
+			return out, nil
 		}})
 	}
 	return ts
@@ -169,7 +192,10 @@ func run(ctx context.Context, m maintainer, cfg Config, defaultBucket string, ta
 		parts = append(parts, fmt.Sprintf("%s.%s: %s", t.Bucket, name, strings.Join(steps, "; ")))
 	}
 
-	msg := "maintenance: " + strings.Join(parts, "; ") + " (old files stay until snapshots are expired)"
+	msg := "maintenance: " + strings.Join(parts, "; ")
+	if !cfg.ExpireSnapshots.Enabled {
+		msg += " (old files stay until snapshots are expired)"
+	}
 	return exit, msg
 }
 
