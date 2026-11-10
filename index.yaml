@@ -2,6 +2,24 @@ apiVersion: v1
 entries:
   datuplet-app:
   - apiVersion: v2
+    appVersion: 0.20.2
+    created: "2026-11-10T20:18:18.066136088Z"
+    description: Datuplet control plane — pipeline-api, pipeline-operator, CRDs, pipeline-observer,
+      and reaper (Phase 3 of the 5-phase install). Requires datuplet-infra (Phase
+      2) installed first. Lakekeeper is Phase 4 (charts/datuplet-lakekeeper).
+    digest: d4d4d2c44e1b6357ac9f604e14fbea8d575098dd883a7f57d7b22d0491471d3d
+    home: https://github.com/kacurez/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-app
+    sources:
+    - https://github.com/kacurez/datuplet
+    type: application
+    urls:
+    - datuplet-app-0.20.2.tgz
+    version: 0.20.2
+  - apiVersion: v2
     appVersion: 0.20.0
     created: "2026-11-08T22:26:11.38361345Z"
     description: Datuplet control plane — pipeline-api, pipeline-operator, CRDs, pipeline-observer,
@@ -594,6 +612,33 @@ entries:
     - datuplet-app-0.1.3.tgz
     version: 0.1.3
   datuplet-infra:
+  - apiVersion: v2
+    appVersion: 0.20.2
+    created: "2026-11-10T20:18:18.255448176Z"
+    dependencies:
+    - condition: openfga.enabled
+      name: openfga
+      repository: https://openfga.github.io/helm-charts
+      version: 0.3.19
+    - condition: minio.enabled
+      name: minio
+      repository: https://charts.min.io/
+      version: 5.4.0
+    description: Datuplet infrastructure layer — CNPG Postgres Cluster, OpenFGA, MinIO,
+      NetworkPolicies, and FGA model bootstrap. Requires datuplet-operators to be
+      installed first.
+    digest: cea3b8422c4861d8979b9629232d9307dc1d23efbf465a3faba31feb4bf896f1
+    home: https://github.com/kacurez/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-infra
+    sources:
+    - https://github.com/kacurez/datuplet
+    type: application
+    urls:
+    - datuplet-infra-0.20.2.tgz
+    version: 0.20.2
   - apiVersion: v2
     appVersion: 0.20.0
     created: "2026-11-08T22:26:11.550037125Z"
@@ -1485,6 +1530,30 @@ entries:
     version: 0.1.3
   datuplet-lakekeeper:
   - apiVersion: v2
+    appVersion: 0.20.2
+    created: "2026-11-10T20:18:18.588077451Z"
+    dependencies:
+    - alias: lakekeeper
+      condition: lakekeeper.enabled
+      name: lakekeeper
+      repository: https://lakekeeper.github.io/lakekeeper-charts
+      version: 0.13.0
+    description: Datuplet Lakekeeper Iceberg REST catalog (Phase 4 of the 5-phase
+      install). Requires datuplet-infra (Phase 2) + datuplet-app (Phase 3) installed
+      first.
+    digest: 531acf8ac13d8a70f241d73d0ff5ce9e30030589ca3ad96ef3e61b70c888a65f
+    home: https://github.com/kacurez/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-lakekeeper
+    sources:
+    - https://github.com/kacurez/datuplet
+    type: application
+    urls:
+    - datuplet-lakekeeper-0.20.2.tgz
+    version: 0.20.2
+  - apiVersion: v2
     appVersion: 0.20.0
     created: "2026-11-08T22:26:11.712842893Z"
     dependencies:
@@ -2276,6 +2345,29 @@ entries:
     version: 0.1.3
   datuplet-operators:
   - apiVersion: v2
+    appVersion: 0.20.2
+    created: "2026-11-10T20:18:18.902617055Z"
+    dependencies:
+    - condition: cloudnative-pg.enabled
+      name: cloudnative-pg
+      repository: https://cloudnative-pg.github.io/charts
+      version: 0.29.0
+    description: Datuplet operators — CNPG (CloudNativePG) operator. Install before
+      datuplet-infra so the operator's mutating webhook has endpoints when the Cluster
+      CR is applied.
+    digest: 9d28199c3641e3980553eff350c82dc028e5a271048d1d691499a09afdf77c2a
+    home: https://github.com/kacurez/datuplet
+    maintainers:
+    - email: tomas.kacur@keboola.com
+      name: kacurez
+    name: datuplet-operators
+    sources:
+    - https://github.com/kacurez/datuplet
+    type: application
+    urls:
+    - datuplet-operators-0.20.2.tgz
+    version: 0.20.2
+  - apiVersion: v2
     appVersion: 0.20.0
     created: "2026-11-08T22:26:11.91049863Z"
     dependencies:
@@ -3032,4 +3124,4 @@ entries:
     urls:
     - datuplet-operators-0.1.3.tgz
     version: 0.1.3
-generated: "2026-11-08T22:26:11.912439793Z"
+generated: "2026-11-10T20:18:18.903014835Z"
