@@ -19,12 +19,15 @@ type call struct {
 
 type fakeMaintainer struct {
 	calls   []call
+	order   []string
+	rwErrs  map[string]error
 	results map[string]*sdk.CompactResult
 	errs    map[string]error
 }
 
 func (f *fakeMaintainer) Compact(_ context.Context, bucket, table string, opts sdk.CompactOptions) (*sdk.CompactResult, error) {
 	f.calls = append(f.calls, call{bucket, table, opts})
+	f.order = append(f.order, "compact "+bucket+"."+table)
 	key := bucket + "." + table
 	if err := f.errs[key]; err != nil {
 		return nil, fmt.Errorf("compact %s failed: %w", key, err)
@@ -33,6 +36,15 @@ func (f *fakeMaintainer) Compact(_ context.Context, bucket, table string, opts s
 		return r, nil
 	}
 	return &sdk.CompactResult{Status: "NOTHING_TO_DO"}, nil
+}
+
+func (f *fakeMaintainer) RewriteManifests(_ context.Context, bucket, table string, _ sdk.RewriteManifestsOptions) (*sdk.RewriteManifestsResult, error) {
+	key := bucket + "." + table
+	f.order = append(f.order, "rewrite "+key)
+	if err := f.rwErrs[key]; err != nil {
+		return nil, fmt.Errorf("rewrite %s failed: %w", key, err)
+	}
+	return &sdk.RewriteManifestsResult{Status: "REWRITTEN", ManifestsBefore: 12, ManifestsAfter: 1}, nil
 }
 
 func tbl(bucket, name string) sdk.OutputTableRef {
@@ -155,7 +167,7 @@ func TestRun_MultiLineErrorIsSingleLine(t *testing.T) {
 	if strings.ContainsAny(msg, "\r\n") {
 		t.Errorf("status message must be a single line, got %q", msg)
 	}
-	if !strings.Contains(msg, "raw.events: Internal:") || !strings.Contains(msg, "second line") {
+	if !strings.Contains(msg, "raw.events: compact Internal:") || !strings.Contains(msg, "second line") {
 		t.Errorf("message %q lost detail", msg)
 	}
 }
@@ -193,5 +205,37 @@ func TestRun_StatusLinePrefix(t *testing.T) {
 	_, msg := run(context.Background(), f, Config{}, "", []sdk.OutputTableRef{tbl("raw", "a")})
 	if !strings.HasPrefix(msg, "maintenance: ") {
 		t.Errorf("message %q lacks prefix", msg)
+	}
+}
+
+func TestRun_OrderAndSkipAfterFailure(t *testing.T) {
+	tables := []sdk.OutputTableRef{tbl("raw", "a"), tbl("raw", "b")}
+	f := &fakeMaintainer{
+		results: map[string]*sdk.CompactResult{"raw.b": {Status: "COMPACTED", FilesBefore: 12, FilesAfter: 2}},
+		errs:    map[string]error{"raw.a": status.Error(codes.Unavailable, "down")},
+	}
+	cfg := Config{RewriteManifests: RewriteManifestsTask{Enabled: true}}
+	code, msg := run(context.Background(), f, cfg, "", tables)
+	if code != 20 {
+		t.Fatalf("exit = %d, want 20 (msg %q)", code, msg)
+	}
+	want := []string{"compact raw.a", "compact raw.b", "rewrite raw.b"}
+	if strings.Join(f.order, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", f.order, want)
+	}
+	for _, w := range []string{"compact COMPACTED files 12 -> 2; rewrite_manifests REWRITTEN 12 -> 1", "rewrite_manifests skipped"} {
+		if !strings.Contains(msg, w) {
+			t.Errorf("message %q missing %q", msg, w)
+		}
+	}
+}
+
+func TestRun_RewriteOnly(t *testing.T) {
+	off := false
+	f := &fakeMaintainer{}
+	cfg := Config{Compact: CompactTask{Enabled: &off}, RewriteManifests: RewriteManifestsTask{Enabled: true}}
+	code, _ := run(context.Background(), f, cfg, "", []sdk.OutputTableRef{tbl("raw", "a")})
+	if code != 0 || len(f.calls) != 0 || len(f.order) != 1 {
+		t.Fatalf("exit %d, compact calls %d, order %v", code, len(f.calls), f.order)
 	}
 }

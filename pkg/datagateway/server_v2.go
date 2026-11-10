@@ -296,6 +296,14 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 			return icebergjob.CompactTable(ctx, cat, ident, opts, auditProps, key)
 		}
 
+		s.rewriteManifestsFn = func(ctx context.Context, ident icebergtable.Identifier, opts icebergjob.RewriteManifestsOpts) (*icebergjob.RewriteManifestsResult, error) {
+			cat, err := res.Catalog(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("catalog: %w", err)
+			}
+			return icebergjob.RewriteTableManifests(ctx, cat, ident, opts)
+		}
+
 		// Wire the per-gateway run-token into datupleticeio's
 		// loadTable-refresh path so iceberg-go's `gs://` IO factory
 		// can re-fetch fresh GCS vended creds when the initial token

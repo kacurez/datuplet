@@ -54,6 +54,7 @@ type DeleteOrphanFilesTask struct {
 // maintenance task.
 type maintainer interface {
 	Compact(ctx context.Context, bucket, table string, opts sdk.CompactOptions) (*sdk.CompactResult, error)
+	RewriteManifests(ctx context.Context, bucket, table string, opts sdk.RewriteManifestsOptions) (*sdk.RewriteManifestsResult, error)
 }
 
 func (c Config) compactEnabled() bool {
@@ -69,7 +70,50 @@ func (c Config) compactOptions() sdk.CompactOptions {
 	}
 }
 
-// exitCodeFor maps a Compact error to the exit-code contract.
+func (c Config) anyEnabled() bool {
+	return c.compactEnabled() || c.RewriteManifests.Enabled
+}
+
+func (c Config) rewriteManifestsOptions() sdk.RewriteManifestsOptions {
+	return sdk.RewriteManifestsOptions{
+		TargetManifestSizeBytes: int64(c.RewriteManifests.TargetManifestSizeMB) << 20,
+		DryRun:                  c.DryRun,
+	}
+}
+
+// task is one maintenance step on one table. do returns the summary text that
+// follows the task name.
+type task struct {
+	name string
+	do   func(ctx context.Context, m maintainer, bucket, table string) (string, error)
+}
+
+// tasks returns the enabled tasks in the fixed order: compact, then
+// rewrite_manifests. Later maintenance tasks append here, keeping that order.
+func (c Config) tasks() []task {
+	var ts []task
+	if c.compactEnabled() {
+		ts = append(ts, task{"compact", func(ctx context.Context, m maintainer, bucket, table string) (string, error) {
+			res, err := m.Compact(ctx, bucket, table, c.compactOptions())
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%s files %d -> %d", res.Status, res.FilesBefore, res.FilesAfter), nil
+		}})
+	}
+	if c.RewriteManifests.Enabled {
+		ts = append(ts, task{"rewrite_manifests", func(ctx context.Context, m maintainer, bucket, table string) (string, error) {
+			res, err := m.RewriteManifests(ctx, bucket, table, c.rewriteManifestsOptions())
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%s %d -> %d", res.Status, res.ManifestsBefore, res.ManifestsAfter), nil
+		}})
+	}
+	return ts
+}
+
+// exitCodeFor maps a maintenance error to the exit-code contract.
 func exitCodeFor(err error) int {
 	st, ok := status.FromError(err)
 	if !ok {
@@ -94,10 +138,11 @@ func run(ctx context.Context, m maintainer, cfg Config, defaultBucket string, ta
 		return exitUser, "iceberg-maintenance needs explicit output tables: " + hint
 	}
 
-	if !cfg.compactEnabled() {
+	if !cfg.anyEnabled() {
 		return exitUser, "no maintenance task enabled"
 	}
 
+	tasks := cfg.tasks()
 	exit := 0
 	parts := make([]string, 0, len(tables))
 	for _, t := range tables {
@@ -105,15 +150,23 @@ func run(ctx context.Context, m maintainer, cfg Config, defaultBucket string, ta
 		if name == "" {
 			name = t.Name
 		}
-		res, err := m.Compact(ctx, t.Bucket, name, cfg.compactOptions())
-		if err != nil {
-			st := status.Convert(err)
-			msg := strings.NewReplacer("\r", " ", "\n", " ").Replace(st.Message())
-			parts = append(parts, fmt.Sprintf("%s.%s: %s: %s", t.Bucket, name, st.Code(), msg))
-			exit = worst(exit, exitCodeFor(err))
-			continue
+		steps := make([]string, 0, len(tasks))
+		for i, tk := range tasks {
+			out, err := tk.do(ctx, m, t.Bucket, name)
+			if err != nil {
+				st := status.Convert(err)
+				msg := strings.NewReplacer("\r", " ", "\n", " ").Replace(st.Message())
+				steps = append(steps, fmt.Sprintf("%s %s: %s", tk.name, st.Code(), msg))
+				// A failed task skips the rest for this table only.
+				for _, skipped := range tasks[i+1:] {
+					steps = append(steps, skipped.name+" skipped")
+				}
+				exit = worst(exit, exitCodeFor(err))
+				break
+			}
+			steps = append(steps, tk.name+" "+out)
 		}
-		parts = append(parts, fmt.Sprintf("%s.%s: %s, files %d -> %d", t.Bucket, name, res.Status, res.FilesBefore, res.FilesAfter))
+		parts = append(parts, fmt.Sprintf("%s.%s: %s", t.Bucket, name, strings.Join(steps, "; ")))
 	}
 
 	msg := "maintenance: " + strings.Join(parts, "; ") + " (old files stay until snapshots are expired)"
