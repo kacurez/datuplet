@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -804,5 +806,144 @@ func TestCredsRefreshMetrics_ParseFailure(t *testing.T) {
 	got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "parse"))
 	if got != 1 {
 		t.Errorf("datuplet_creds_refresh_failures_total{type=s3,reason=parse} = %v, want 1", got)
+	}
+}
+
+// largeLoadTableBody builds a loadTable response whose metadata (snapshot
+// history) is well past 1 MiB, with config last so the decoder must skip
+// the whole metadata object first (regression for #55).
+func largeLoadTableBody(t *testing.T, snapshots int) []byte {
+	t.Helper()
+	snaps := make([]map[string]any, snapshots)
+	for i := range snaps {
+		snaps[i] = map[string]any{
+			"snapshot-id":   i + 1,
+			"manifest-list": fmt.Sprintf("gs://bucket/warehouse/tbl/metadata/snap-%d-%s.avro", i, strings.Repeat("x", 120)),
+			"summary": map[string]string{
+				"operation":           "append",
+				"datuplet.commit-key": strings.Repeat("k", 64),
+				"total-records":       "10000000",
+				"padding":             strings.Repeat("p", 600),
+			},
+		}
+	}
+	body, err := json.Marshal(map[string]any{
+		"metadata-location": "gs://bucket/warehouse/tbl/metadata/v1.json",
+		"metadata":          map[string]any{"format-version": 2, "snapshots": snaps},
+		"config": map[string]string{
+			"s3.access-key-id":     "AKIA-LARGE",
+			"s3.secret-access-key": "secret-large",
+			"s3.session-token":     "session-large",
+			"s3.region":            "local-01",
+			"s3.endpoint":          "http://minio:9000",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func TestVendedCreds_LargeLoadTableResponse(t *testing.T) {
+	body := largeLoadTableBody(t, 2000)
+	if len(body) <= 1<<20 {
+		t.Fatalf("test body is %d bytes, want > 1 MiB", len(body))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	c, err := v.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if s3, ok := c.(S3Creds); !ok || s3.AccessKeyID != "AKIA-LARGE" {
+		t.Fatalf("got creds %v, want S3Creds with AKIA-LARGE", c)
+	}
+}
+
+func TestDecodeLoadTableConfig(t *testing.T) {
+	body := largeLoadTableBody(t, 50)
+
+	cfg, err := decodeLoadTableConfig(strings.NewReader(string(body)), int64(len(body)))
+	if err != nil {
+		t.Fatalf("exact-limit body: %v", err)
+	}
+	if cfg["s3.access-key-id"] != "AKIA-LARGE" {
+		t.Fatalf("config = %v", cfg)
+	}
+
+	_, err = decodeLoadTableConfig(strings.NewReader(string(body)), int64(len(body))-1)
+	if !errors.Is(err, errResponseTooLarge) {
+		t.Fatalf("over-limit body: err = %v, want errResponseTooLarge", err)
+	}
+	if strings.Contains(err.Error(), "secret-large") {
+		t.Fatalf("error leaks credentials: %v", err)
+	}
+
+	for name, in := range map[string]string{
+		"truncated": string(body[:len(body)/2]),
+		"array":     `[]`,
+		"empty":     ``,
+	} {
+		if _, err := decodeLoadTableConfig(strings.NewReader(in), 1<<20); err == nil || errors.Is(err, errResponseTooLarge) {
+			t.Errorf("%s: err = %v, want a parse error", name, err)
+		}
+	}
+
+	cfg, err = decodeLoadTableConfig(strings.NewReader(`{"metadata":{}}`), 1<<20)
+	if err != nil || cfg != nil {
+		t.Fatalf("no config: cfg=%v err=%v, want nil, nil", cfg, err)
+	}
+
+	if _, err := decodeLoadTableConfig(strings.NewReader(`{"config":{}} trailing`), 1<<20); err == nil {
+		t.Error("trailing data: want error, got nil")
+	}
+
+	if _, err := decodeLoadTableConfig(strings.NewReader(`"s3.secret=XYZ"`), 1<<20); err == nil || strings.Contains(err.Error(), "XYZ") {
+		t.Errorf("scalar body: err = %v, want error without body contents", err)
+	}
+
+	var readErr *bodyReadError
+	_, err = decodeLoadTableConfig(io.MultiReader(strings.NewReader(`{"metadata":`), iotest.ErrReader(errors.New("connection reset"))), 1<<20)
+	if !errors.As(err, &readErr) {
+		t.Errorf("body read failure: err = %v, want *bodyReadError", err)
+	}
+}
+
+// A body cut short by the network is an "http" failure, not "parse".
+func TestCredsRefreshMetrics_BodyReadFailure(t *testing.T) {
+	resetMetrics()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		_, _ = w.Write([]byte(`{"metadata":{`))
+	}))
+	defer srv.Close()
+
+	v := &VendedCreds{
+		LakekeeperURL:     srv.URL,
+		Namespace:         "public",
+		Table:             "events",
+		ExpectedCredsType: CredsTypeS3,
+		TokenProvider:     func(context.Context) (string, error) { return "tok", nil },
+	}
+	_, err := v.Get(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "read response") {
+		t.Fatalf("err = %v, want a read response error", err)
+	}
+	if got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "http")); got != 1 {
+		t.Errorf("failures{reason=http} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(credsRefreshFailuresTotal.WithLabelValues("s3", "parse")); got != 0 {
+		t.Errorf("failures{reason=parse} = %v, want 0", got)
 	}
 }

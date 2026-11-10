@@ -27,7 +27,8 @@ var credsRefreshTotal = promauto.NewCounterVec(
 //	type   — "s3" or "gcs" (ExpectedCredsType, always set at construction).
 //	reason — bucketed error category:
 //	           "token_provider" — TokenProvider callback failed.
-//	           "http"           — network error or non-2xx HTTP status.
+//	           "http"           — network error (incl. body read) or non-2xx HTTP status.
+//	           "too_large"      — loadTable response exceeded maxLoadTableResponseBytes.
 //	           "parse"          — JSON unmarshal or parseCreds rejected body.
 //	           "other"          — anything that doesn't fit the above.
 var credsRefreshFailuresTotal = promauto.NewCounterVec(
