@@ -21,13 +21,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Table compaction.** A new `iceberg-compactor` component (new image) and a
-  gateway `CompactTable` RPC bin-pack a table's small data files into a single
-  `replace` snapshot, as a pipeline stage or on demand via
-  `POST /api/v1/storage/projects/{pid}/tables/{ns}/{t}/compact`,
-  `datuplet storage compact` and the storage UI. On-demand runs use hidden
+- **Iceberg maintenance (0.21.0).** A new `iceberg-maintenance` component (new image)
+  runs up to four tasks per declared output table as a pipeline stage:
+  compaction (on by default), manifest rewrite, snapshot expiry
+  (`expire_snapshots`) and orphan-file cleanup (`delete_orphan_files`); the
+  last three are opt-in. Compaction bin-packs a table's small data files into
+  a single `replace` snapshot via the gateway `CompactTable` RPC. `expire_snapshots`
+  reclaims storage by deleting the files only expired snapshots referenced, and
+  `delete_orphan_files` removes unreferenced files under the table location.
+  The Compact button, `POST /api/v1/storage/projects/{pid}/tables/{ns}/{t}/compact`
+  and `datuplet storage compact` are unchanged; on-demand runs use hidden
   `sys-compact-*` system pipelines (reserved `sys-` prefix). See
-  `docs/known-limitations.md` for what v1 does not do (no storage reclaim).
+  `docs/components.md` for the config reference and `docs/known-limitations.md`
+  for what it does not do.
 - **Iceberg v3 tables.** The Data Gateway creates every new table as
   format-version 3, and new Lakekeeper warehouses default to v3. Partitioned
   v3 tables are supported (the gateway assigns each file's `first_row_id`),

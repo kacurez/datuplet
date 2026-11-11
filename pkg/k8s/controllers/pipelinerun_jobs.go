@@ -544,6 +544,9 @@ func (r *PipelineRunReconciler) generateGatewayConfig(pr *datupletv1.PipelineRun
 	configMap["mode"] = "minio"
 	configMap["run_id"] = pr.Status.RunID
 	configMap["component_name"] = comp.Name
+	if comp.Component == "iceberg-maintenance" {
+		configMap["table_maintenance"] = true
+	}
 	if pr.Spec.Preview != nil {
 		configMap["preview"] = map[string]any{"id": pr.Spec.Preview.ID, "row_limit": pr.Spec.Preview.RowLimit}
 	}

@@ -103,15 +103,15 @@ func fakeLakekeeperForEvents(t *testing.T) string {
 }
 
 func TestCompactTable_RunCancellable(t *testing.T) {
-	schema, err := os.ReadFile("../../../components/iceberg-compactor/schema.json")
+	schema, err := os.ReadFile("../../../components/iceberg-maintenance/schema.json")
 	if err != nil {
 		t.Fatalf("read schema: %v", err)
 	}
 	reg := newFakeComponentRegistry(datupletv1.ComponentDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: "iceberg-compactor"},
+		ObjectMeta: metav1.ObjectMeta{Name: "iceberg-maintenance"},
 		Spec: datupletv1.ComponentDefinitionSpec{
 			DefaultVersion: "v1.0.0",
-			Versions:       []datupletv1.VersionSpec{{Version: "v1.0.0", Image: "x/iceberg-compactor:v1.0.0", ConfigSchema: string(schema)}},
+			Versions:       []datupletv1.VersionSpec{{Version: "v1.0.0", Image: "x/iceberg-maintenance:v1.0.0", ConfigSchema: string(schema)}},
 			IO:             &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"},
 		},
 	})

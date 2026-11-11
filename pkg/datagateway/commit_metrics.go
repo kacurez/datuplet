@@ -74,3 +74,19 @@ func classifyCommitError(err error) string {
 		return "other"
 	}
 }
+
+var (
+	maintenanceRuns = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "datagateway_maintenance_runs_total",
+		Help: "Maintenance RPC calls by task and result status (FAILED on error).",
+	}, []string{"task", "status"})
+	maintenanceDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "datagateway_maintenance_duration_seconds",
+		Help:    "Maintenance RPC duration by task and result status.",
+		Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600},
+	}, []string{"task", "status"})
+	maintenanceFiles = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "datagateway_maintenance_files_total",
+		Help: "Storage files deleted by maintenance tasks (expire_snapshots, delete_orphan_files).",
+	}, []string{"task", "status"})
+)

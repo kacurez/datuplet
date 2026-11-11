@@ -880,7 +880,7 @@ datuplet storage --remote <url> delete raw.gbif_occurrences_sk --confirm raw.gbi
 `POST /api/v1/storage/projects/{pid}/tables/{ns}/{t}/compact`
 
 Starts an on-demand bin-pack rewrite of the table's small data files, run by
-the `iceberg-compactor` component under a hidden `sys-compact-<hex16>` system
+the `iceberg-maintenance` component under a hidden `sys-compact-<hex16>` system
 pipeline. Requires FGA `data_admin`, like delete, and a lakekeeper catalog.
 Optional body: `{"target_file_size_mb": N}` (N in 16-2048, MiB). Answers `202`:
 
@@ -902,7 +902,7 @@ snapshot.
 | 501 | No lakekeeper catalog configured |
 | 503 | Not configured (no DB / run backend) |
 | 503 `compaction_busy` | This replica's admission limit (half the DB pool, at least 1) is full; retry later |
-| 503 `compactor_unavailable` | The `iceberg-compactor` component is not registered |
+| 503 `compactor_unavailable` | The `iceberg-maintenance` component is not registered |
 
 The same component also works as an ordinary pipeline stage (declare the
 table as the stage's output). CLI: `datuplet storage --remote <url> compact <ns>.<table>`

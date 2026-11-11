@@ -12,7 +12,11 @@ import (
 type GatewayConfig struct {
 	RunID         string `yaml:"run_id"`
 	ComponentName string `yaml:"component_name,omitempty"` // pipeline component instance name
-	LakekeeperURL string `yaml:"lakekeeper_url,omitempty"` // Lakekeeper REST catalog base URL
+	// TableMaintenance opens the maintenance RPCs (rewrite manifests, expire
+	// snapshots, delete orphan files). Written by the controller only for
+	// iceberg-maintenance stages; never read from user config.
+	TableMaintenance bool   `yaml:"table_maintenance,omitempty"`
+	LakekeeperURL    string `yaml:"lakekeeper_url,omitempty"` // Lakekeeper REST catalog base URL
 	// PipelineAPIJWKSURL is the JWKS endpoint pipeline-api serves.
 	// The operator injects this whenever LakekeeperURL is set; DG validates
 	// the mounted run-token JWT against it at boot. NewServerV2 fail-closes
@@ -155,6 +159,7 @@ func (cfg *GatewayConfig) ToConfig(runTokenPath, podAnnotationsPath string) *Con
 	gatewayCfg := &Config{
 		RunID:              cfg.RunID,
 		ComponentName:      cfg.ComponentName,
+		TableMaintenance:   cfg.TableMaintenance,
 		Inputs:             cfg.Component.Inputs,
 		ComponentCfg:       componentCfgJSON,
 		ChunkSize:          cfg.Gateway.ChunkSize,

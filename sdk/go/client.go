@@ -1164,6 +1164,131 @@ func (c *Client) Compact(ctx context.Context, bucket, table string, opts Compact
 	}, nil
 }
 
+// RewriteManifestsOptions tunes RewriteManifests. Zero TargetManifestSizeBytes
+// takes the gateway default (8 MiB).
+type RewriteManifestsOptions struct {
+	TargetManifestSizeBytes int64
+	DryRun                  bool
+}
+
+// RewriteManifestsResult reports one manifest rewrite. Status is REWRITTEN,
+// NOTHING_TO_DO or DRY_RUN.
+type RewriteManifestsResult struct {
+	Status          string
+	ManifestsBefore int
+	ManifestsAfter  int
+	SnapshotBefore  int64
+	SnapshotAfter   int64
+	Duration        time.Duration
+}
+
+// RewriteManifests merges the manifests of one explicitly declared output
+// table. Only iceberg-maintenance stages are served; others get
+// PermissionDenied.
+func (c *Client) RewriteManifests(ctx context.Context, bucket, table string, opts RewriteManifestsOptions) (*RewriteManifestsResult, error) {
+	resp, err := c.client.RewriteManifests(ctx, &pb.RewriteManifestsRequest{
+		Bucket:                  bucket,
+		Table:                   table,
+		TargetManifestSizeBytes: opts.TargetManifestSizeBytes,
+		DryRun:                  opts.DryRun,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rewrite manifests %s.%s failed: %w", bucket, table, err)
+	}
+	return &RewriteManifestsResult{
+		Status:          resp.Status,
+		ManifestsBefore: int(resp.ManifestsBefore),
+		ManifestsAfter:  int(resp.ManifestsAfter),
+		SnapshotBefore:  resp.SnapshotBefore,
+		SnapshotAfter:   resp.SnapshotAfter,
+		Duration:        time.Duration(resp.DurationMs) * time.Millisecond,
+	}, nil
+}
+
+// ExpireOptions tunes ExpireSnapshots. Zero values take the gateway defaults
+// (OlderThanHours 168, RetainLast 10); the gateway enforces floors.
+type ExpireOptions struct {
+	OlderThanHours int
+	RetainLast     int
+	DryRun         bool
+}
+
+// ExpireResult reports one snapshot expiry. Status is EXPIRED,
+// EXPIRED_PARTIAL, NOTHING_TO_DO or DRY_RUN. FilesLeft is -1 when unknown.
+type ExpireResult struct {
+	Status           string
+	SnapshotsExpired int
+	FilesDeleted     int
+	BytesDeleted     int64
+	FilesLeft        int
+	CurrentSnapshot  int64
+	Duration         time.Duration
+}
+
+// ExpireSnapshots expires old snapshots of one explicitly declared output
+// table and deletes the files only they referenced.
+func (c *Client) ExpireSnapshots(ctx context.Context, bucket, table string, opts ExpireOptions) (*ExpireResult, error) {
+	resp, err := c.client.ExpireSnapshots(ctx, &pb.ExpireSnapshotsRequest{
+		Bucket:         bucket,
+		Table:          table,
+		OlderThanHours: int32(opts.OlderThanHours),
+		RetainLast:     int32(opts.RetainLast),
+		DryRun:         opts.DryRun,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("expire snapshots %s.%s failed: %w", bucket, table, err)
+	}
+	return &ExpireResult{
+		Status:           resp.Status,
+		SnapshotsExpired: int(resp.SnapshotsExpired),
+		FilesDeleted:     int(resp.FilesDeleted),
+		BytesDeleted:     resp.BytesDeleted,
+		FilesLeft:        int(resp.FilesLeft),
+		CurrentSnapshot:  resp.CurrentSnapshot,
+		Duration:         time.Duration(resp.DurationMs) * time.Millisecond,
+	}, nil
+}
+
+// OrphanOptions tunes DeleteOrphanFiles. Zero values take the gateway
+// defaults (OlderThanHours 72, MaxFiles 10000); the gateway enforces floors.
+type OrphanOptions struct {
+	OlderThanHours int
+	MaxFiles       int
+	DryRun         bool
+}
+
+// OrphanResult reports one orphan cleanup. Status is DELETED, NOTHING_TO_DO
+// or DRY_RUN.
+type OrphanResult struct {
+	Status       string
+	OrphanFiles  int
+	OrphanBytes  int64
+	FilesDeleted int
+	Duration     time.Duration
+}
+
+// DeleteOrphanFiles deletes unreferenced files under one explicitly declared
+// output table's location.
+func (c *Client) DeleteOrphanFiles(ctx context.Context, bucket, table string, opts OrphanOptions) (*OrphanResult, error) {
+	resp, err := c.client.DeleteOrphanFiles(ctx, &pb.DeleteOrphanFilesRequest{
+		Bucket:         bucket,
+		Table:          table,
+		OlderThanHours: int32(opts.OlderThanHours),
+		MaxFiles:       int32(opts.MaxFiles),
+		DryRun:         opts.DryRun,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("delete orphan files %s.%s failed: %w", bucket, table, err)
+	}
+	return &OrphanResult{
+		Status:       resp.Status,
+		OrphanFiles:  int(resp.OrphanFiles),
+		OrphanBytes:  resp.OrphanBytes,
+		FilesDeleted: int(resp.FilesDeleted),
+		Duration:     time.Duration(resp.DurationMs) * time.Millisecond,
+	}, nil
+}
+
 // =============================================================================
 // Schema & Sample
 // =============================================================================

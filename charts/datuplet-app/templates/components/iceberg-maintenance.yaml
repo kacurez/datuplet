@@ -1,21 +1,21 @@
 {{- if .Values.components.builtins }}
 {{- /*
-ComponentDefinition CR for the built-in iceberg-compactor component. See
+ComponentDefinition CR for the built-in iceberg-maintenance component. See
 data-generator.yaml in this directory for the cluster-scoped naming rationale.
-It asks the Data Gateway to compact each declared output table; the component
-itself does no data I/O, so default resources stay small.
+It asks the Data Gateway to run maintenance on each declared output table; the
+component itself does no data I/O, so default resources stay small.
 */ -}}
 ---
 apiVersion: datuplet.io/v1
 kind: ComponentDefinition
 metadata:
-  name: iceberg-compactor
+  name: iceberg-maintenance
   labels:
     {{- include "datuplet-app.labels" . | nindent 4 }}
-    app.kubernetes.io/name: iceberg-compactor
+    app.kubernetes.io/name: iceberg-maintenance
 spec:
-  displayName: Iceberg Compactor
-  description: Bin-packs the small data files of each declared output table into target-size files in one atomic snapshot. Old files stay until snapshots are expired.
+  displayName: Iceberg Maintenance
+  description: "Maintains each declared output table: compacts small files, rewrites manifests, expires old snapshots and deletes orphan files. Only compaction is on by default."
   maintainer: datuplet
   io:
     inputs: none
@@ -23,9 +23,9 @@ spec:
   defaultVersion: {{ .Values.components.tag }}
   versions:
     - version: {{ .Values.components.tag }}
-      image: "{{ .Values.components.registry }}/iceberg-compactor:{{ .Values.components.tag }}"
+      image: "{{ .Values.components.registry }}/iceberg-maintenance:{{ .Values.components.tag }}"
       configSchema: |
-{{ .Files.Get (printf "files/component-schemas/%s.json" "iceberg-compactor") | indent 8 }}
+{{ .Files.Get (printf "files/component-schemas/%s.json" "iceberg-maintenance") | indent 8 }}
       resources:
         default:
           requests:

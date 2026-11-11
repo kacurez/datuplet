@@ -104,6 +104,12 @@ type ServerV2 struct {
 	// icebergjob.CompactTable). nil without a lakekeeper resolver.
 	compactFn compactFunc
 
+	// Maintenance seams (nil → Unimplemented), wired by the maintenance
+	// tasks over the icebergjob functions.
+	rewriteManifestsFn rewriteManifestsFunc
+	expireFn           expireFunc
+	orphansFn          orphansFunc
+
 	// validatedClaims holds the validated run-token JWT claims set during
 	// boot. Non-nil only when the run-token was successfully validated
 	// against pipeline-api's JWKS. Used to wire lakekeeper routing
@@ -288,6 +294,30 @@ func NewServerV2(cfg *Config, newPlane DataPlaneFactory) (*ServerV2, error) {
 				return nil, fmt.Errorf("catalog: %w", err)
 			}
 			return icebergjob.CompactTable(ctx, cat, ident, opts, auditProps, key)
+		}
+
+		s.rewriteManifestsFn = func(ctx context.Context, ident icebergtable.Identifier, opts icebergjob.RewriteManifestsOpts) (*icebergjob.RewriteManifestsResult, error) {
+			cat, err := res.Catalog(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("catalog: %w", err)
+			}
+			return icebergjob.RewriteTableManifests(ctx, cat, ident, opts)
+		}
+
+		s.expireFn = func(ctx context.Context, ident icebergtable.Identifier, opts icebergjob.ExpireOpts) (*icebergjob.ExpireResult, error) {
+			cat, err := res.Catalog(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("catalog: %w", err)
+			}
+			return icebergjob.ExpireTableSnapshots(ctx, cat, ident, opts)
+		}
+
+		s.orphansFn = func(ctx context.Context, ident icebergtable.Identifier, opts icebergjob.OrphanOpts) (*icebergjob.OrphanResult, error) {
+			cat, err := res.Catalog(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("catalog: %w", err)
+			}
+			return icebergjob.DeleteTableOrphanFiles(ctx, cat, ident, opts)
 		}
 
 		// Wire the per-gateway run-token into datupleticeio's

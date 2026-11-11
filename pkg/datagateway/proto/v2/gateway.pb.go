@@ -2848,6 +2848,491 @@ func (x *CompactTableResponse) GetDurationMs() int64 {
 	return 0
 }
 
+// RewriteManifestsRequest names an exact (bucket, table) from output_tables.
+// Zero target_manifest_size_bytes takes the default (8 MiB).
+type RewriteManifestsRequest struct {
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	Bucket                  string                 `protobuf:"bytes,1,opt,name=bucket,proto3" json:"bucket,omitempty"`
+	Table                   string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
+	TargetManifestSizeBytes int64                  `protobuf:"varint,3,opt,name=target_manifest_size_bytes,json=targetManifestSizeBytes,proto3" json:"target_manifest_size_bytes,omitempty"`
+	DryRun                  bool                   `protobuf:"varint,4,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *RewriteManifestsRequest) Reset() {
+	*x = RewriteManifestsRequest{}
+	mi := &file_gateway_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RewriteManifestsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RewriteManifestsRequest) ProtoMessage() {}
+
+func (x *RewriteManifestsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_gateway_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RewriteManifestsRequest.ProtoReflect.Descriptor instead.
+func (*RewriteManifestsRequest) Descriptor() ([]byte, []int) {
+	return file_gateway_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *RewriteManifestsRequest) GetBucket() string {
+	if x != nil {
+		return x.Bucket
+	}
+	return ""
+}
+
+func (x *RewriteManifestsRequest) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *RewriteManifestsRequest) GetTargetManifestSizeBytes() int64 {
+	if x != nil {
+		return x.TargetManifestSizeBytes
+	}
+	return 0
+}
+
+func (x *RewriteManifestsRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+// RewriteManifestsResponse status is REWRITTEN, NOTHING_TO_DO or DRY_RUN.
+type RewriteManifestsResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Status          string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	ManifestsBefore int32                  `protobuf:"varint,2,opt,name=manifests_before,json=manifestsBefore,proto3" json:"manifests_before,omitempty"`
+	ManifestsAfter  int32                  `protobuf:"varint,3,opt,name=manifests_after,json=manifestsAfter,proto3" json:"manifests_after,omitempty"`
+	SnapshotBefore  int64                  `protobuf:"varint,4,opt,name=snapshot_before,json=snapshotBefore,proto3" json:"snapshot_before,omitempty"`
+	SnapshotAfter   int64                  `protobuf:"varint,5,opt,name=snapshot_after,json=snapshotAfter,proto3" json:"snapshot_after,omitempty"`
+	DurationMs      int64                  `protobuf:"varint,6,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *RewriteManifestsResponse) Reset() {
+	*x = RewriteManifestsResponse{}
+	mi := &file_gateway_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RewriteManifestsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RewriteManifestsResponse) ProtoMessage() {}
+
+func (x *RewriteManifestsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_gateway_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RewriteManifestsResponse.ProtoReflect.Descriptor instead.
+func (*RewriteManifestsResponse) Descriptor() ([]byte, []int) {
+	return file_gateway_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *RewriteManifestsResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *RewriteManifestsResponse) GetManifestsBefore() int32 {
+	if x != nil {
+		return x.ManifestsBefore
+	}
+	return 0
+}
+
+func (x *RewriteManifestsResponse) GetManifestsAfter() int32 {
+	if x != nil {
+		return x.ManifestsAfter
+	}
+	return 0
+}
+
+func (x *RewriteManifestsResponse) GetSnapshotBefore() int64 {
+	if x != nil {
+		return x.SnapshotBefore
+	}
+	return 0
+}
+
+func (x *RewriteManifestsResponse) GetSnapshotAfter() int64 {
+	if x != nil {
+		return x.SnapshotAfter
+	}
+	return 0
+}
+
+func (x *RewriteManifestsResponse) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+// ExpireSnapshotsRequest: zero older_than_hours takes 168 and zero
+// retain_last takes 10; older_than_hours < 24 is rejected.
+type ExpireSnapshotsRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Bucket         string                 `protobuf:"bytes,1,opt,name=bucket,proto3" json:"bucket,omitempty"`
+	Table          string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
+	OlderThanHours int32                  `protobuf:"varint,3,opt,name=older_than_hours,json=olderThanHours,proto3" json:"older_than_hours,omitempty"`
+	RetainLast     int32                  `protobuf:"varint,4,opt,name=retain_last,json=retainLast,proto3" json:"retain_last,omitempty"`
+	DryRun         bool                   `protobuf:"varint,5,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ExpireSnapshotsRequest) Reset() {
+	*x = ExpireSnapshotsRequest{}
+	mi := &file_gateway_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpireSnapshotsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpireSnapshotsRequest) ProtoMessage() {}
+
+func (x *ExpireSnapshotsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_gateway_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpireSnapshotsRequest.ProtoReflect.Descriptor instead.
+func (*ExpireSnapshotsRequest) Descriptor() ([]byte, []int) {
+	return file_gateway_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *ExpireSnapshotsRequest) GetBucket() string {
+	if x != nil {
+		return x.Bucket
+	}
+	return ""
+}
+
+func (x *ExpireSnapshotsRequest) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *ExpireSnapshotsRequest) GetOlderThanHours() int32 {
+	if x != nil {
+		return x.OlderThanHours
+	}
+	return 0
+}
+
+func (x *ExpireSnapshotsRequest) GetRetainLast() int32 {
+	if x != nil {
+		return x.RetainLast
+	}
+	return 0
+}
+
+func (x *ExpireSnapshotsRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+// ExpireSnapshotsResponse status is EXPIRED, EXPIRED_PARTIAL, NOTHING_TO_DO
+// or DRY_RUN.
+type ExpireSnapshotsResponse struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Status           string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	SnapshotsExpired int32                  `protobuf:"varint,2,opt,name=snapshots_expired,json=snapshotsExpired,proto3" json:"snapshots_expired,omitempty"`
+	FilesDeleted     int32                  `protobuf:"varint,3,opt,name=files_deleted,json=filesDeleted,proto3" json:"files_deleted,omitempty"`
+	BytesDeleted     int64                  `protobuf:"varint,4,opt,name=bytes_deleted,json=bytesDeleted,proto3" json:"bytes_deleted,omitempty"`
+	// Files freed by the expiry that were not deleted (left for orphan
+	// cleanup). -1 means unknown: the expiry committed but the deletion set
+	// could not be computed.
+	FilesLeft       int32 `protobuf:"varint,5,opt,name=files_left,json=filesLeft,proto3" json:"files_left,omitempty"`
+	CurrentSnapshot int64 `protobuf:"varint,6,opt,name=current_snapshot,json=currentSnapshot,proto3" json:"current_snapshot,omitempty"`
+	DurationMs      int64 `protobuf:"varint,7,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ExpireSnapshotsResponse) Reset() {
+	*x = ExpireSnapshotsResponse{}
+	mi := &file_gateway_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpireSnapshotsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpireSnapshotsResponse) ProtoMessage() {}
+
+func (x *ExpireSnapshotsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_gateway_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpireSnapshotsResponse.ProtoReflect.Descriptor instead.
+func (*ExpireSnapshotsResponse) Descriptor() ([]byte, []int) {
+	return file_gateway_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *ExpireSnapshotsResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *ExpireSnapshotsResponse) GetSnapshotsExpired() int32 {
+	if x != nil {
+		return x.SnapshotsExpired
+	}
+	return 0
+}
+
+func (x *ExpireSnapshotsResponse) GetFilesDeleted() int32 {
+	if x != nil {
+		return x.FilesDeleted
+	}
+	return 0
+}
+
+func (x *ExpireSnapshotsResponse) GetBytesDeleted() int64 {
+	if x != nil {
+		return x.BytesDeleted
+	}
+	return 0
+}
+
+func (x *ExpireSnapshotsResponse) GetFilesLeft() int32 {
+	if x != nil {
+		return x.FilesLeft
+	}
+	return 0
+}
+
+func (x *ExpireSnapshotsResponse) GetCurrentSnapshot() int64 {
+	if x != nil {
+		return x.CurrentSnapshot
+	}
+	return 0
+}
+
+func (x *ExpireSnapshotsResponse) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+// DeleteOrphanFilesRequest: zero older_than_hours takes 72 and zero
+// max_files takes 10000; older_than_hours < 25 is rejected.
+type DeleteOrphanFilesRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Bucket         string                 `protobuf:"bytes,1,opt,name=bucket,proto3" json:"bucket,omitempty"`
+	Table          string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
+	OlderThanHours int32                  `protobuf:"varint,3,opt,name=older_than_hours,json=olderThanHours,proto3" json:"older_than_hours,omitempty"`
+	MaxFiles       int32                  `protobuf:"varint,4,opt,name=max_files,json=maxFiles,proto3" json:"max_files,omitempty"`
+	DryRun         bool                   `protobuf:"varint,5,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *DeleteOrphanFilesRequest) Reset() {
+	*x = DeleteOrphanFilesRequest{}
+	mi := &file_gateway_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteOrphanFilesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteOrphanFilesRequest) ProtoMessage() {}
+
+func (x *DeleteOrphanFilesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_gateway_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteOrphanFilesRequest.ProtoReflect.Descriptor instead.
+func (*DeleteOrphanFilesRequest) Descriptor() ([]byte, []int) {
+	return file_gateway_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *DeleteOrphanFilesRequest) GetBucket() string {
+	if x != nil {
+		return x.Bucket
+	}
+	return ""
+}
+
+func (x *DeleteOrphanFilesRequest) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *DeleteOrphanFilesRequest) GetOlderThanHours() int32 {
+	if x != nil {
+		return x.OlderThanHours
+	}
+	return 0
+}
+
+func (x *DeleteOrphanFilesRequest) GetMaxFiles() int32 {
+	if x != nil {
+		return x.MaxFiles
+	}
+	return 0
+}
+
+func (x *DeleteOrphanFilesRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+// DeleteOrphanFilesResponse status is DELETED, NOTHING_TO_DO or DRY_RUN.
+type DeleteOrphanFilesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	OrphanFiles   int32                  `protobuf:"varint,2,opt,name=orphan_files,json=orphanFiles,proto3" json:"orphan_files,omitempty"`
+	OrphanBytes   int64                  `protobuf:"varint,3,opt,name=orphan_bytes,json=orphanBytes,proto3" json:"orphan_bytes,omitempty"`
+	FilesDeleted  int32                  `protobuf:"varint,4,opt,name=files_deleted,json=filesDeleted,proto3" json:"files_deleted,omitempty"`
+	DurationMs    int64                  `protobuf:"varint,5,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteOrphanFilesResponse) Reset() {
+	*x = DeleteOrphanFilesResponse{}
+	mi := &file_gateway_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteOrphanFilesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteOrphanFilesResponse) ProtoMessage() {}
+
+func (x *DeleteOrphanFilesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_gateway_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteOrphanFilesResponse.ProtoReflect.Descriptor instead.
+func (*DeleteOrphanFilesResponse) Descriptor() ([]byte, []int) {
+	return file_gateway_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *DeleteOrphanFilesResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *DeleteOrphanFilesResponse) GetOrphanFiles() int32 {
+	if x != nil {
+		return x.OrphanFiles
+	}
+	return 0
+}
+
+func (x *DeleteOrphanFilesResponse) GetOrphanBytes() int64 {
+	if x != nil {
+		return x.OrphanBytes
+	}
+	return 0
+}
+
+func (x *DeleteOrphanFilesResponse) GetFilesDeleted() int32 {
+	if x != nil {
+		return x.FilesDeleted
+	}
+	return 0
+}
+
+func (x *DeleteOrphanFilesResponse) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
 type GetSchemaRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Bucket string                 `protobuf:"bytes,1,opt,name=bucket,proto3" json:"bucket,omitempty"` // Bucket name
@@ -2860,7 +3345,7 @@ type GetSchemaRequest struct {
 
 func (x *GetSchemaRequest) Reset() {
 	*x = GetSchemaRequest{}
-	mi := &file_gateway_proto_msgTypes[39]
+	mi := &file_gateway_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2872,7 +3357,7 @@ func (x *GetSchemaRequest) String() string {
 func (*GetSchemaRequest) ProtoMessage() {}
 
 func (x *GetSchemaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[39]
+	mi := &file_gateway_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2885,7 +3370,7 @@ func (x *GetSchemaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSchemaRequest.ProtoReflect.Descriptor instead.
 func (*GetSchemaRequest) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{39}
+	return file_gateway_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *GetSchemaRequest) GetBucket() string {
@@ -2918,7 +3403,7 @@ type SchemaResponse struct {
 
 func (x *SchemaResponse) Reset() {
 	*x = SchemaResponse{}
-	mi := &file_gateway_proto_msgTypes[40]
+	mi := &file_gateway_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2930,7 +3415,7 @@ func (x *SchemaResponse) String() string {
 func (*SchemaResponse) ProtoMessage() {}
 
 func (x *SchemaResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[40]
+	mi := &file_gateway_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2943,7 +3428,7 @@ func (x *SchemaResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SchemaResponse.ProtoReflect.Descriptor instead.
 func (*SchemaResponse) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{40}
+	return file_gateway_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *SchemaResponse) GetSchema() *Schema {
@@ -2967,7 +3452,7 @@ type GetSampleRequest struct {
 
 func (x *GetSampleRequest) Reset() {
 	*x = GetSampleRequest{}
-	mi := &file_gateway_proto_msgTypes[41]
+	mi := &file_gateway_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2979,7 +3464,7 @@ func (x *GetSampleRequest) String() string {
 func (*GetSampleRequest) ProtoMessage() {}
 
 func (x *GetSampleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[41]
+	mi := &file_gateway_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2992,7 +3477,7 @@ func (x *GetSampleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSampleRequest.ProtoReflect.Descriptor instead.
 func (*GetSampleRequest) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{41}
+	return file_gateway_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *GetSampleRequest) GetBucket() string {
@@ -3041,7 +3526,7 @@ type SampleResponse struct {
 
 func (x *SampleResponse) Reset() {
 	*x = SampleResponse{}
-	mi := &file_gateway_proto_msgTypes[42]
+	mi := &file_gateway_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3053,7 +3538,7 @@ func (x *SampleResponse) String() string {
 func (*SampleResponse) ProtoMessage() {}
 
 func (x *SampleResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[42]
+	mi := &file_gateway_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3066,7 +3551,7 @@ func (x *SampleResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SampleResponse.ProtoReflect.Descriptor instead.
 func (*SampleResponse) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{42}
+	return file_gateway_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *SampleResponse) GetSchema() *Schema {
@@ -3101,7 +3586,7 @@ type LogRequest struct {
 
 func (x *LogRequest) Reset() {
 	*x = LogRequest{}
-	mi := &file_gateway_proto_msgTypes[43]
+	mi := &file_gateway_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3113,7 +3598,7 @@ func (x *LogRequest) String() string {
 func (*LogRequest) ProtoMessage() {}
 
 func (x *LogRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[43]
+	mi := &file_gateway_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3126,7 +3611,7 @@ func (x *LogRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogRequest.ProtoReflect.Descriptor instead.
 func (*LogRequest) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{43}
+	return file_gateway_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *LogRequest) GetLevel() string {
@@ -3158,7 +3643,7 @@ type LogResponse struct {
 
 func (x *LogResponse) Reset() {
 	*x = LogResponse{}
-	mi := &file_gateway_proto_msgTypes[44]
+	mi := &file_gateway_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3170,7 +3655,7 @@ func (x *LogResponse) String() string {
 func (*LogResponse) ProtoMessage() {}
 
 func (x *LogResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[44]
+	mi := &file_gateway_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3183,7 +3668,7 @@ func (x *LogResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogResponse.ProtoReflect.Descriptor instead.
 func (*LogResponse) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{44}
+	return file_gateway_proto_rawDescGZIP(), []int{50}
 }
 
 type ShutdownRequest struct {
@@ -3194,7 +3679,7 @@ type ShutdownRequest struct {
 
 func (x *ShutdownRequest) Reset() {
 	*x = ShutdownRequest{}
-	mi := &file_gateway_proto_msgTypes[45]
+	mi := &file_gateway_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3206,7 +3691,7 @@ func (x *ShutdownRequest) String() string {
 func (*ShutdownRequest) ProtoMessage() {}
 
 func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[45]
+	mi := &file_gateway_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3219,7 +3704,7 @@ func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownRequest.ProtoReflect.Descriptor instead.
 func (*ShutdownRequest) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{45}
+	return file_gateway_proto_rawDescGZIP(), []int{51}
 }
 
 type ShutdownResponse struct {
@@ -3230,7 +3715,7 @@ type ShutdownResponse struct {
 
 func (x *ShutdownResponse) Reset() {
 	*x = ShutdownResponse{}
-	mi := &file_gateway_proto_msgTypes[46]
+	mi := &file_gateway_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3242,7 +3727,7 @@ func (x *ShutdownResponse) String() string {
 func (*ShutdownResponse) ProtoMessage() {}
 
 func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[46]
+	mi := &file_gateway_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3255,7 +3740,7 @@ func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownResponse.ProtoReflect.Descriptor instead.
 func (*ShutdownResponse) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{46}
+	return file_gateway_proto_rawDescGZIP(), []int{52}
 }
 
 // StorageBootstrap provides resolved storage locations and credentials
@@ -3274,7 +3759,7 @@ type StorageBootstrap struct {
 
 func (x *StorageBootstrap) Reset() {
 	*x = StorageBootstrap{}
-	mi := &file_gateway_proto_msgTypes[47]
+	mi := &file_gateway_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3286,7 +3771,7 @@ func (x *StorageBootstrap) String() string {
 func (*StorageBootstrap) ProtoMessage() {}
 
 func (x *StorageBootstrap) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[47]
+	mi := &file_gateway_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3299,7 +3784,7 @@ func (x *StorageBootstrap) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageBootstrap.ProtoReflect.Descriptor instead.
 func (*StorageBootstrap) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{47}
+	return file_gateway_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *StorageBootstrap) GetInputs() []*ResolvedInput {
@@ -3337,7 +3822,7 @@ type ResolvedInput struct {
 
 func (x *ResolvedInput) Reset() {
 	*x = ResolvedInput{}
-	mi := &file_gateway_proto_msgTypes[48]
+	mi := &file_gateway_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3349,7 +3834,7 @@ func (x *ResolvedInput) String() string {
 func (*ResolvedInput) ProtoMessage() {}
 
 func (x *ResolvedInput) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[48]
+	mi := &file_gateway_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3362,7 +3847,7 @@ func (x *ResolvedInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolvedInput.ProtoReflect.Descriptor instead.
 func (*ResolvedInput) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{48}
+	return file_gateway_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *ResolvedInput) GetBucket() string {
@@ -3412,7 +3897,7 @@ type ResolvedOutput struct {
 
 func (x *ResolvedOutput) Reset() {
 	*x = ResolvedOutput{}
-	mi := &file_gateway_proto_msgTypes[49]
+	mi := &file_gateway_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3424,7 +3909,7 @@ func (x *ResolvedOutput) String() string {
 func (*ResolvedOutput) ProtoMessage() {}
 
 func (x *ResolvedOutput) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[49]
+	mi := &file_gateway_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3437,7 +3922,7 @@ func (x *ResolvedOutput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolvedOutput.ProtoReflect.Descriptor instead.
 func (*ResolvedOutput) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{49}
+	return file_gateway_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *ResolvedOutput) GetBucket() string {
@@ -3480,7 +3965,7 @@ type S3Credentials struct {
 
 func (x *S3Credentials) Reset() {
 	*x = S3Credentials{}
-	mi := &file_gateway_proto_msgTypes[50]
+	mi := &file_gateway_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3492,7 +3977,7 @@ func (x *S3Credentials) String() string {
 func (*S3Credentials) ProtoMessage() {}
 
 func (x *S3Credentials) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[50]
+	mi := &file_gateway_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3505,7 +3990,7 @@ func (x *S3Credentials) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use S3Credentials.ProtoReflect.Descriptor instead.
 func (*S3Credentials) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{50}
+	return file_gateway_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *S3Credentials) GetAccessKeyId() string {
@@ -3592,7 +4077,7 @@ type ColumnConfig struct {
 
 func (x *ColumnConfig) Reset() {
 	*x = ColumnConfig{}
-	mi := &file_gateway_proto_msgTypes[51]
+	mi := &file_gateway_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3604,7 +4089,7 @@ func (x *ColumnConfig) String() string {
 func (*ColumnConfig) ProtoMessage() {}
 
 func (x *ColumnConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_gateway_proto_msgTypes[51]
+	mi := &file_gateway_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3617,7 +4102,7 @@ func (x *ColumnConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ColumnConfig.ProtoReflect.Descriptor instead.
 func (*ColumnConfig) Descriptor() ([]byte, []int) {
-	return file_gateway_proto_rawDescGZIP(), []int{51}
+	return file_gateway_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *ColumnConfig) GetName() string {
@@ -3874,6 +4359,49 @@ const file_gateway_proto_rawDesc = "" +
 	"\x0fsnapshot_before\x18\v \x01(\x03R\x0esnapshotBefore\x12%\n" +
 	"\x0esnapshot_after\x18\f \x01(\x03R\rsnapshotAfter\x12\x1f\n" +
 	"\vduration_ms\x18\r \x01(\x03R\n" +
+	"durationMs\"\x9d\x01\n" +
+	"\x17RewriteManifestsRequest\x12\x16\n" +
+	"\x06bucket\x18\x01 \x01(\tR\x06bucket\x12\x14\n" +
+	"\x05table\x18\x02 \x01(\tR\x05table\x12;\n" +
+	"\x1atarget_manifest_size_bytes\x18\x03 \x01(\x03R\x17targetManifestSizeBytes\x12\x17\n" +
+	"\adry_run\x18\x04 \x01(\bR\x06dryRun\"\xf7\x01\n" +
+	"\x18RewriteManifestsResponse\x12\x16\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\x12)\n" +
+	"\x10manifests_before\x18\x02 \x01(\x05R\x0fmanifestsBefore\x12'\n" +
+	"\x0fmanifests_after\x18\x03 \x01(\x05R\x0emanifestsAfter\x12'\n" +
+	"\x0fsnapshot_before\x18\x04 \x01(\x03R\x0esnapshotBefore\x12%\n" +
+	"\x0esnapshot_after\x18\x05 \x01(\x03R\rsnapshotAfter\x12\x1f\n" +
+	"\vduration_ms\x18\x06 \x01(\x03R\n" +
+	"durationMs\"\xaa\x01\n" +
+	"\x16ExpireSnapshotsRequest\x12\x16\n" +
+	"\x06bucket\x18\x01 \x01(\tR\x06bucket\x12\x14\n" +
+	"\x05table\x18\x02 \x01(\tR\x05table\x12(\n" +
+	"\x10older_than_hours\x18\x03 \x01(\x05R\x0eolderThanHours\x12\x1f\n" +
+	"\vretain_last\x18\x04 \x01(\x05R\n" +
+	"retainLast\x12\x17\n" +
+	"\adry_run\x18\x05 \x01(\bR\x06dryRun\"\x93\x02\n" +
+	"\x17ExpireSnapshotsResponse\x12\x16\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\x12+\n" +
+	"\x11snapshots_expired\x18\x02 \x01(\x05R\x10snapshotsExpired\x12#\n" +
+	"\rfiles_deleted\x18\x03 \x01(\x05R\ffilesDeleted\x12#\n" +
+	"\rbytes_deleted\x18\x04 \x01(\x03R\fbytesDeleted\x12\x1d\n" +
+	"\n" +
+	"files_left\x18\x05 \x01(\x05R\tfilesLeft\x12)\n" +
+	"\x10current_snapshot\x18\x06 \x01(\x03R\x0fcurrentSnapshot\x12\x1f\n" +
+	"\vduration_ms\x18\a \x01(\x03R\n" +
+	"durationMs\"\xa8\x01\n" +
+	"\x18DeleteOrphanFilesRequest\x12\x16\n" +
+	"\x06bucket\x18\x01 \x01(\tR\x06bucket\x12\x14\n" +
+	"\x05table\x18\x02 \x01(\tR\x05table\x12(\n" +
+	"\x10older_than_hours\x18\x03 \x01(\x05R\x0eolderThanHours\x12\x1b\n" +
+	"\tmax_files\x18\x04 \x01(\x05R\bmaxFiles\x12\x17\n" +
+	"\adry_run\x18\x05 \x01(\bR\x06dryRun\"\xbf\x01\n" +
+	"\x19DeleteOrphanFilesResponse\x12\x16\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\x12!\n" +
+	"\forphan_files\x18\x02 \x01(\x05R\vorphanFiles\x12!\n" +
+	"\forphan_bytes\x18\x03 \x01(\x03R\vorphanBytes\x12#\n" +
+	"\rfiles_deleted\x18\x04 \x01(\x05R\ffilesDeleted\x12\x1f\n" +
+	"\vduration_ms\x18\x05 \x01(\x03R\n" +
 	"durationMs\"_\n" +
 	"\x10GetSchemaRequest\x12\x16\n" +
 	"\x06bucket\x18\x01 \x01(\tR\x06bucket\x12\x14\n" +
@@ -3948,7 +4476,7 @@ const file_gateway_proto_rawDesc = "" +
 	"\vFORMAT_JSON\x10\x02\x12\x10\n" +
 	"\fFORMAT_JSONL\x10\x03\x12\x12\n" +
 	"\x0eFORMAT_PARQUET\x10\x04\x12\x14\n" +
-	"\x10FORMAT_ARROW_IPC\x10\x052\xab\t\n" +
+	"\x10FORMAT_ARROW_IPC\x10\x052\xfe\v\n" +
 	"\vDataGateway\x12X\n" +
 	"\tGetConfig\x12%.datuplet.gateway.v2.GetConfigRequest\x1a$.datuplet.gateway.v2.ComponentConfig\x12W\n" +
 	"\bShutdown\x12$.datuplet.gateway.v2.ShutdownRequest\x1a%.datuplet.gateway.v2.ShutdownResponse\x12]\n" +
@@ -3962,7 +4490,10 @@ const file_gateway_proto_rawDesc = "" +
 	"\tReadChunk\x12%.datuplet.gateway.v2.ReadChunkRequest\x1a\x1e.datuplet.gateway.v2.DataChunk0\x01\x12`\n" +
 	"\vCloseReader\x12'.datuplet.gateway.v2.CloseReaderRequest\x1a(.datuplet.gateway.v2.CloseReaderResponse\x12Q\n" +
 	"\x06Commit\x12\".datuplet.gateway.v2.CommitRequest\x1a#.datuplet.gateway.v2.CommitResponse\x12c\n" +
-	"\fCompactTable\x12(.datuplet.gateway.v2.CompactTableRequest\x1a).datuplet.gateway.v2.CompactTableResponse\x12W\n" +
+	"\fCompactTable\x12(.datuplet.gateway.v2.CompactTableRequest\x1a).datuplet.gateway.v2.CompactTableResponse\x12o\n" +
+	"\x10RewriteManifests\x12,.datuplet.gateway.v2.RewriteManifestsRequest\x1a-.datuplet.gateway.v2.RewriteManifestsResponse\x12l\n" +
+	"\x0fExpireSnapshots\x12+.datuplet.gateway.v2.ExpireSnapshotsRequest\x1a,.datuplet.gateway.v2.ExpireSnapshotsResponse\x12r\n" +
+	"\x11DeleteOrphanFiles\x12-.datuplet.gateway.v2.DeleteOrphanFilesRequest\x1a..datuplet.gateway.v2.DeleteOrphanFilesResponse\x12W\n" +
 	"\tGetSchema\x12%.datuplet.gateway.v2.GetSchemaRequest\x1a#.datuplet.gateway.v2.SchemaResponse\x12W\n" +
 	"\tGetSample\x12%.datuplet.gateway.v2.GetSampleRequest\x1a#.datuplet.gateway.v2.SampleResponse\x12H\n" +
 	"\x03Log\x12\x1f.datuplet.gateway.v2.LogRequest\x1a .datuplet.gateway.v2.LogResponseBAZ?github.com/datuplet/datuplet/pkg/datagateway/proto/v2;gatewaypbb\x06proto3"
@@ -3980,81 +4511,87 @@ func file_gateway_proto_rawDescGZIP() []byte {
 }
 
 var file_gateway_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_gateway_proto_msgTypes = make([]protoimpl.MessageInfo, 58)
+var file_gateway_proto_msgTypes = make([]protoimpl.MessageInfo, 64)
 var file_gateway_proto_goTypes = []any{
-	(DataFormat)(0),                // 0: datuplet.gateway.v2.DataFormat
-	(BucketCommitResult_Status)(0), // 1: datuplet.gateway.v2.BucketCommitResult.Status
-	(TableCommitResult_Status)(0),  // 2: datuplet.gateway.v2.TableCommitResult.Status
-	(*Schema)(nil),                 // 3: datuplet.gateway.v2.Schema
-	(*ColumnDef)(nil),              // 4: datuplet.gateway.v2.ColumnDef
-	(*GetConfigRequest)(nil),       // 5: datuplet.gateway.v2.GetConfigRequest
-	(*ComponentConfig)(nil),        // 6: datuplet.gateway.v2.ComponentConfig
-	(*InputTableConfig)(nil),       // 7: datuplet.gateway.v2.InputTableConfig
-	(*OutputConfig)(nil),           // 8: datuplet.gateway.v2.OutputConfig
-	(*BucketOutputConfig)(nil),     // 9: datuplet.gateway.v2.BucketOutputConfig
-	(*TableOutputConfig)(nil),      // 10: datuplet.gateway.v2.TableOutputConfig
-	(*ProcessorConfig)(nil),        // 11: datuplet.gateway.v2.ProcessorConfig
-	(*OpenWriterRequest)(nil),      // 12: datuplet.gateway.v2.OpenWriterRequest
-	(*OpenWriterResponse)(nil),     // 13: datuplet.gateway.v2.OpenWriterResponse
-	(*WriteChunkRequest)(nil),      // 14: datuplet.gateway.v2.WriteChunkRequest
-	(*WriteChunkResponse)(nil),     // 15: datuplet.gateway.v2.WriteChunkResponse
-	(*CloseWriterRequest)(nil),     // 16: datuplet.gateway.v2.CloseWriterRequest
-	(*CloseWriterResponse)(nil),    // 17: datuplet.gateway.v2.CloseWriterResponse
-	(*ExternalDataFile)(nil),       // 18: datuplet.gateway.v2.ExternalDataFile
-	(*OpenReaderRequest)(nil),      // 19: datuplet.gateway.v2.OpenReaderRequest
-	(*IncrementalReadSpec)(nil),    // 20: datuplet.gateway.v2.IncrementalReadSpec
-	(*DeltaInfo)(nil),              // 21: datuplet.gateway.v2.DeltaInfo
-	(*OpenReaderResponse)(nil),     // 22: datuplet.gateway.v2.OpenReaderResponse
-	(*ReadChunkRequest)(nil),       // 23: datuplet.gateway.v2.ReadChunkRequest
-	(*DataChunk)(nil),              // 24: datuplet.gateway.v2.DataChunk
-	(*CloseReaderRequest)(nil),     // 25: datuplet.gateway.v2.CloseReaderRequest
-	(*CloseReaderResponse)(nil),    // 26: datuplet.gateway.v2.CloseReaderResponse
-	(*TransformSpec)(nil),          // 27: datuplet.gateway.v2.TransformSpec
-	(*TransformOp)(nil),            // 28: datuplet.gateway.v2.TransformOp
-	(*FilterOp)(nil),               // 29: datuplet.gateway.v2.FilterOp
-	(*SelectOp)(nil),               // 30: datuplet.gateway.v2.SelectOp
-	(*DropOp)(nil),                 // 31: datuplet.gateway.v2.DropOp
-	(*RenameOp)(nil),               // 32: datuplet.gateway.v2.RenameOp
-	(*ComputeOp)(nil),              // 33: datuplet.gateway.v2.ComputeOp
-	(*CastOp)(nil),                 // 34: datuplet.gateway.v2.CastOp
-	(*ReorderOp)(nil),              // 35: datuplet.gateway.v2.ReorderOp
-	(*CommitRequest)(nil),          // 36: datuplet.gateway.v2.CommitRequest
-	(*CommitResponse)(nil),         // 37: datuplet.gateway.v2.CommitResponse
-	(*BucketCommitResult)(nil),     // 38: datuplet.gateway.v2.BucketCommitResult
-	(*TableCommitResult)(nil),      // 39: datuplet.gateway.v2.TableCommitResult
-	(*CompactTableRequest)(nil),    // 40: datuplet.gateway.v2.CompactTableRequest
-	(*CompactTableResponse)(nil),   // 41: datuplet.gateway.v2.CompactTableResponse
-	(*GetSchemaRequest)(nil),       // 42: datuplet.gateway.v2.GetSchemaRequest
-	(*SchemaResponse)(nil),         // 43: datuplet.gateway.v2.SchemaResponse
-	(*GetSampleRequest)(nil),       // 44: datuplet.gateway.v2.GetSampleRequest
-	(*SampleResponse)(nil),         // 45: datuplet.gateway.v2.SampleResponse
-	(*LogRequest)(nil),             // 46: datuplet.gateway.v2.LogRequest
-	(*LogResponse)(nil),            // 47: datuplet.gateway.v2.LogResponse
-	(*ShutdownRequest)(nil),        // 48: datuplet.gateway.v2.ShutdownRequest
-	(*ShutdownResponse)(nil),       // 49: datuplet.gateway.v2.ShutdownResponse
-	(*StorageBootstrap)(nil),       // 50: datuplet.gateway.v2.StorageBootstrap
-	(*ResolvedInput)(nil),          // 51: datuplet.gateway.v2.ResolvedInput
-	(*ResolvedOutput)(nil),         // 52: datuplet.gateway.v2.ResolvedOutput
-	(*S3Credentials)(nil),          // 53: datuplet.gateway.v2.S3Credentials
-	(*ColumnConfig)(nil),           // 54: datuplet.gateway.v2.ColumnConfig
-	nil,                            // 55: datuplet.gateway.v2.ComponentConfig.InputsEntry
-	nil,                            // 56: datuplet.gateway.v2.ComponentConfig.OutputsEntry
-	nil,                            // 57: datuplet.gateway.v2.DataChunk.MetadataEntry
-	nil,                            // 58: datuplet.gateway.v2.RenameOp.MappingEntry
-	nil,                            // 59: datuplet.gateway.v2.LogRequest.FieldsEntry
-	nil,                            // 60: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
+	(DataFormat)(0),                   // 0: datuplet.gateway.v2.DataFormat
+	(BucketCommitResult_Status)(0),    // 1: datuplet.gateway.v2.BucketCommitResult.Status
+	(TableCommitResult_Status)(0),     // 2: datuplet.gateway.v2.TableCommitResult.Status
+	(*Schema)(nil),                    // 3: datuplet.gateway.v2.Schema
+	(*ColumnDef)(nil),                 // 4: datuplet.gateway.v2.ColumnDef
+	(*GetConfigRequest)(nil),          // 5: datuplet.gateway.v2.GetConfigRequest
+	(*ComponentConfig)(nil),           // 6: datuplet.gateway.v2.ComponentConfig
+	(*InputTableConfig)(nil),          // 7: datuplet.gateway.v2.InputTableConfig
+	(*OutputConfig)(nil),              // 8: datuplet.gateway.v2.OutputConfig
+	(*BucketOutputConfig)(nil),        // 9: datuplet.gateway.v2.BucketOutputConfig
+	(*TableOutputConfig)(nil),         // 10: datuplet.gateway.v2.TableOutputConfig
+	(*ProcessorConfig)(nil),           // 11: datuplet.gateway.v2.ProcessorConfig
+	(*OpenWriterRequest)(nil),         // 12: datuplet.gateway.v2.OpenWriterRequest
+	(*OpenWriterResponse)(nil),        // 13: datuplet.gateway.v2.OpenWriterResponse
+	(*WriteChunkRequest)(nil),         // 14: datuplet.gateway.v2.WriteChunkRequest
+	(*WriteChunkResponse)(nil),        // 15: datuplet.gateway.v2.WriteChunkResponse
+	(*CloseWriterRequest)(nil),        // 16: datuplet.gateway.v2.CloseWriterRequest
+	(*CloseWriterResponse)(nil),       // 17: datuplet.gateway.v2.CloseWriterResponse
+	(*ExternalDataFile)(nil),          // 18: datuplet.gateway.v2.ExternalDataFile
+	(*OpenReaderRequest)(nil),         // 19: datuplet.gateway.v2.OpenReaderRequest
+	(*IncrementalReadSpec)(nil),       // 20: datuplet.gateway.v2.IncrementalReadSpec
+	(*DeltaInfo)(nil),                 // 21: datuplet.gateway.v2.DeltaInfo
+	(*OpenReaderResponse)(nil),        // 22: datuplet.gateway.v2.OpenReaderResponse
+	(*ReadChunkRequest)(nil),          // 23: datuplet.gateway.v2.ReadChunkRequest
+	(*DataChunk)(nil),                 // 24: datuplet.gateway.v2.DataChunk
+	(*CloseReaderRequest)(nil),        // 25: datuplet.gateway.v2.CloseReaderRequest
+	(*CloseReaderResponse)(nil),       // 26: datuplet.gateway.v2.CloseReaderResponse
+	(*TransformSpec)(nil),             // 27: datuplet.gateway.v2.TransformSpec
+	(*TransformOp)(nil),               // 28: datuplet.gateway.v2.TransformOp
+	(*FilterOp)(nil),                  // 29: datuplet.gateway.v2.FilterOp
+	(*SelectOp)(nil),                  // 30: datuplet.gateway.v2.SelectOp
+	(*DropOp)(nil),                    // 31: datuplet.gateway.v2.DropOp
+	(*RenameOp)(nil),                  // 32: datuplet.gateway.v2.RenameOp
+	(*ComputeOp)(nil),                 // 33: datuplet.gateway.v2.ComputeOp
+	(*CastOp)(nil),                    // 34: datuplet.gateway.v2.CastOp
+	(*ReorderOp)(nil),                 // 35: datuplet.gateway.v2.ReorderOp
+	(*CommitRequest)(nil),             // 36: datuplet.gateway.v2.CommitRequest
+	(*CommitResponse)(nil),            // 37: datuplet.gateway.v2.CommitResponse
+	(*BucketCommitResult)(nil),        // 38: datuplet.gateway.v2.BucketCommitResult
+	(*TableCommitResult)(nil),         // 39: datuplet.gateway.v2.TableCommitResult
+	(*CompactTableRequest)(nil),       // 40: datuplet.gateway.v2.CompactTableRequest
+	(*CompactTableResponse)(nil),      // 41: datuplet.gateway.v2.CompactTableResponse
+	(*RewriteManifestsRequest)(nil),   // 42: datuplet.gateway.v2.RewriteManifestsRequest
+	(*RewriteManifestsResponse)(nil),  // 43: datuplet.gateway.v2.RewriteManifestsResponse
+	(*ExpireSnapshotsRequest)(nil),    // 44: datuplet.gateway.v2.ExpireSnapshotsRequest
+	(*ExpireSnapshotsResponse)(nil),   // 45: datuplet.gateway.v2.ExpireSnapshotsResponse
+	(*DeleteOrphanFilesRequest)(nil),  // 46: datuplet.gateway.v2.DeleteOrphanFilesRequest
+	(*DeleteOrphanFilesResponse)(nil), // 47: datuplet.gateway.v2.DeleteOrphanFilesResponse
+	(*GetSchemaRequest)(nil),          // 48: datuplet.gateway.v2.GetSchemaRequest
+	(*SchemaResponse)(nil),            // 49: datuplet.gateway.v2.SchemaResponse
+	(*GetSampleRequest)(nil),          // 50: datuplet.gateway.v2.GetSampleRequest
+	(*SampleResponse)(nil),            // 51: datuplet.gateway.v2.SampleResponse
+	(*LogRequest)(nil),                // 52: datuplet.gateway.v2.LogRequest
+	(*LogResponse)(nil),               // 53: datuplet.gateway.v2.LogResponse
+	(*ShutdownRequest)(nil),           // 54: datuplet.gateway.v2.ShutdownRequest
+	(*ShutdownResponse)(nil),          // 55: datuplet.gateway.v2.ShutdownResponse
+	(*StorageBootstrap)(nil),          // 56: datuplet.gateway.v2.StorageBootstrap
+	(*ResolvedInput)(nil),             // 57: datuplet.gateway.v2.ResolvedInput
+	(*ResolvedOutput)(nil),            // 58: datuplet.gateway.v2.ResolvedOutput
+	(*S3Credentials)(nil),             // 59: datuplet.gateway.v2.S3Credentials
+	(*ColumnConfig)(nil),              // 60: datuplet.gateway.v2.ColumnConfig
+	nil,                               // 61: datuplet.gateway.v2.ComponentConfig.InputsEntry
+	nil,                               // 62: datuplet.gateway.v2.ComponentConfig.OutputsEntry
+	nil,                               // 63: datuplet.gateway.v2.DataChunk.MetadataEntry
+	nil,                               // 64: datuplet.gateway.v2.RenameOp.MappingEntry
+	nil,                               // 65: datuplet.gateway.v2.LogRequest.FieldsEntry
+	nil,                               // 66: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
 }
 var file_gateway_proto_depIdxs = []int32{
 	4,  // 0: datuplet.gateway.v2.Schema.columns:type_name -> datuplet.gateway.v2.ColumnDef
 	7,  // 1: datuplet.gateway.v2.ComponentConfig.input_tables:type_name -> datuplet.gateway.v2.InputTableConfig
 	8,  // 2: datuplet.gateway.v2.ComponentConfig.output_config:type_name -> datuplet.gateway.v2.OutputConfig
-	50, // 3: datuplet.gateway.v2.ComponentConfig.storage_bootstrap:type_name -> datuplet.gateway.v2.StorageBootstrap
-	55, // 4: datuplet.gateway.v2.ComponentConfig.inputs:type_name -> datuplet.gateway.v2.ComponentConfig.InputsEntry
-	56, // 5: datuplet.gateway.v2.ComponentConfig.outputs:type_name -> datuplet.gateway.v2.ComponentConfig.OutputsEntry
+	56, // 3: datuplet.gateway.v2.ComponentConfig.storage_bootstrap:type_name -> datuplet.gateway.v2.StorageBootstrap
+	61, // 4: datuplet.gateway.v2.ComponentConfig.inputs:type_name -> datuplet.gateway.v2.ComponentConfig.InputsEntry
+	62, // 5: datuplet.gateway.v2.ComponentConfig.outputs:type_name -> datuplet.gateway.v2.ComponentConfig.OutputsEntry
 	9,  // 6: datuplet.gateway.v2.OutputConfig.buckets:type_name -> datuplet.gateway.v2.BucketOutputConfig
 	10, // 7: datuplet.gateway.v2.OutputConfig.tables:type_name -> datuplet.gateway.v2.TableOutputConfig
 	11, // 8: datuplet.gateway.v2.OutputConfig.processors:type_name -> datuplet.gateway.v2.ProcessorConfig
-	54, // 9: datuplet.gateway.v2.TableOutputConfig.columns:type_name -> datuplet.gateway.v2.ColumnConfig
+	60, // 9: datuplet.gateway.v2.TableOutputConfig.columns:type_name -> datuplet.gateway.v2.ColumnConfig
 	0,  // 10: datuplet.gateway.v2.OpenWriterRequest.input_format:type_name -> datuplet.gateway.v2.DataFormat
 	3,  // 11: datuplet.gateway.v2.OpenWriterRequest.schema:type_name -> datuplet.gateway.v2.Schema
 	27, // 12: datuplet.gateway.v2.OpenWriterRequest.transforms:type_name -> datuplet.gateway.v2.TransformSpec
@@ -4067,7 +4604,7 @@ var file_gateway_proto_depIdxs = []int32{
 	3,  // 19: datuplet.gateway.v2.OpenReaderResponse.schema:type_name -> datuplet.gateway.v2.Schema
 	21, // 20: datuplet.gateway.v2.OpenReaderResponse.delta_info:type_name -> datuplet.gateway.v2.DeltaInfo
 	0,  // 21: datuplet.gateway.v2.DataChunk.format:type_name -> datuplet.gateway.v2.DataFormat
-	57, // 22: datuplet.gateway.v2.DataChunk.metadata:type_name -> datuplet.gateway.v2.DataChunk.MetadataEntry
+	63, // 22: datuplet.gateway.v2.DataChunk.metadata:type_name -> datuplet.gateway.v2.DataChunk.MetadataEntry
 	28, // 23: datuplet.gateway.v2.TransformSpec.operations:type_name -> datuplet.gateway.v2.TransformOp
 	29, // 24: datuplet.gateway.v2.TransformOp.filter:type_name -> datuplet.gateway.v2.FilterOp
 	30, // 25: datuplet.gateway.v2.TransformOp.select:type_name -> datuplet.gateway.v2.SelectOp
@@ -4076,7 +4613,7 @@ var file_gateway_proto_depIdxs = []int32{
 	33, // 28: datuplet.gateway.v2.TransformOp.compute:type_name -> datuplet.gateway.v2.ComputeOp
 	34, // 29: datuplet.gateway.v2.TransformOp.cast:type_name -> datuplet.gateway.v2.CastOp
 	35, // 30: datuplet.gateway.v2.TransformOp.reorder:type_name -> datuplet.gateway.v2.ReorderOp
-	58, // 31: datuplet.gateway.v2.RenameOp.mapping:type_name -> datuplet.gateway.v2.RenameOp.MappingEntry
+	64, // 31: datuplet.gateway.v2.RenameOp.mapping:type_name -> datuplet.gateway.v2.RenameOp.MappingEntry
 	38, // 32: datuplet.gateway.v2.CommitResponse.buckets:type_name -> datuplet.gateway.v2.BucketCommitResult
 	1,  // 33: datuplet.gateway.v2.BucketCommitResult.status:type_name -> datuplet.gateway.v2.BucketCommitResult.Status
 	39, // 34: datuplet.gateway.v2.BucketCommitResult.tables:type_name -> datuplet.gateway.v2.TableCommitResult
@@ -4084,13 +4621,13 @@ var file_gateway_proto_depIdxs = []int32{
 	3,  // 36: datuplet.gateway.v2.SchemaResponse.schema:type_name -> datuplet.gateway.v2.Schema
 	0,  // 37: datuplet.gateway.v2.GetSampleRequest.format:type_name -> datuplet.gateway.v2.DataFormat
 	3,  // 38: datuplet.gateway.v2.SampleResponse.schema:type_name -> datuplet.gateway.v2.Schema
-	59, // 39: datuplet.gateway.v2.LogRequest.fields:type_name -> datuplet.gateway.v2.LogRequest.FieldsEntry
-	51, // 40: datuplet.gateway.v2.StorageBootstrap.inputs:type_name -> datuplet.gateway.v2.ResolvedInput
-	52, // 41: datuplet.gateway.v2.StorageBootstrap.outputs:type_name -> datuplet.gateway.v2.ResolvedOutput
-	60, // 42: datuplet.gateway.v2.StorageBootstrap.bucket_credentials:type_name -> datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
-	53, // 43: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry.value:type_name -> datuplet.gateway.v2.S3Credentials
+	65, // 39: datuplet.gateway.v2.LogRequest.fields:type_name -> datuplet.gateway.v2.LogRequest.FieldsEntry
+	57, // 40: datuplet.gateway.v2.StorageBootstrap.inputs:type_name -> datuplet.gateway.v2.ResolvedInput
+	58, // 41: datuplet.gateway.v2.StorageBootstrap.outputs:type_name -> datuplet.gateway.v2.ResolvedOutput
+	66, // 42: datuplet.gateway.v2.StorageBootstrap.bucket_credentials:type_name -> datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry
+	59, // 43: datuplet.gateway.v2.StorageBootstrap.BucketCredentialsEntry.value:type_name -> datuplet.gateway.v2.S3Credentials
 	5,  // 44: datuplet.gateway.v2.DataGateway.GetConfig:input_type -> datuplet.gateway.v2.GetConfigRequest
-	48, // 45: datuplet.gateway.v2.DataGateway.Shutdown:input_type -> datuplet.gateway.v2.ShutdownRequest
+	54, // 45: datuplet.gateway.v2.DataGateway.Shutdown:input_type -> datuplet.gateway.v2.ShutdownRequest
 	12, // 46: datuplet.gateway.v2.DataGateway.OpenWriter:input_type -> datuplet.gateway.v2.OpenWriterRequest
 	14, // 47: datuplet.gateway.v2.DataGateway.WriteChunk:input_type -> datuplet.gateway.v2.WriteChunkRequest
 	16, // 48: datuplet.gateway.v2.DataGateway.CloseWriter:input_type -> datuplet.gateway.v2.CloseWriterRequest
@@ -4099,24 +4636,30 @@ var file_gateway_proto_depIdxs = []int32{
 	25, // 51: datuplet.gateway.v2.DataGateway.CloseReader:input_type -> datuplet.gateway.v2.CloseReaderRequest
 	36, // 52: datuplet.gateway.v2.DataGateway.Commit:input_type -> datuplet.gateway.v2.CommitRequest
 	40, // 53: datuplet.gateway.v2.DataGateway.CompactTable:input_type -> datuplet.gateway.v2.CompactTableRequest
-	42, // 54: datuplet.gateway.v2.DataGateway.GetSchema:input_type -> datuplet.gateway.v2.GetSchemaRequest
-	44, // 55: datuplet.gateway.v2.DataGateway.GetSample:input_type -> datuplet.gateway.v2.GetSampleRequest
-	46, // 56: datuplet.gateway.v2.DataGateway.Log:input_type -> datuplet.gateway.v2.LogRequest
-	6,  // 57: datuplet.gateway.v2.DataGateway.GetConfig:output_type -> datuplet.gateway.v2.ComponentConfig
-	49, // 58: datuplet.gateway.v2.DataGateway.Shutdown:output_type -> datuplet.gateway.v2.ShutdownResponse
-	13, // 59: datuplet.gateway.v2.DataGateway.OpenWriter:output_type -> datuplet.gateway.v2.OpenWriterResponse
-	15, // 60: datuplet.gateway.v2.DataGateway.WriteChunk:output_type -> datuplet.gateway.v2.WriteChunkResponse
-	17, // 61: datuplet.gateway.v2.DataGateway.CloseWriter:output_type -> datuplet.gateway.v2.CloseWriterResponse
-	22, // 62: datuplet.gateway.v2.DataGateway.OpenReader:output_type -> datuplet.gateway.v2.OpenReaderResponse
-	24, // 63: datuplet.gateway.v2.DataGateway.ReadChunk:output_type -> datuplet.gateway.v2.DataChunk
-	26, // 64: datuplet.gateway.v2.DataGateway.CloseReader:output_type -> datuplet.gateway.v2.CloseReaderResponse
-	37, // 65: datuplet.gateway.v2.DataGateway.Commit:output_type -> datuplet.gateway.v2.CommitResponse
-	41, // 66: datuplet.gateway.v2.DataGateway.CompactTable:output_type -> datuplet.gateway.v2.CompactTableResponse
-	43, // 67: datuplet.gateway.v2.DataGateway.GetSchema:output_type -> datuplet.gateway.v2.SchemaResponse
-	45, // 68: datuplet.gateway.v2.DataGateway.GetSample:output_type -> datuplet.gateway.v2.SampleResponse
-	47, // 69: datuplet.gateway.v2.DataGateway.Log:output_type -> datuplet.gateway.v2.LogResponse
-	57, // [57:70] is the sub-list for method output_type
-	44, // [44:57] is the sub-list for method input_type
+	42, // 54: datuplet.gateway.v2.DataGateway.RewriteManifests:input_type -> datuplet.gateway.v2.RewriteManifestsRequest
+	44, // 55: datuplet.gateway.v2.DataGateway.ExpireSnapshots:input_type -> datuplet.gateway.v2.ExpireSnapshotsRequest
+	46, // 56: datuplet.gateway.v2.DataGateway.DeleteOrphanFiles:input_type -> datuplet.gateway.v2.DeleteOrphanFilesRequest
+	48, // 57: datuplet.gateway.v2.DataGateway.GetSchema:input_type -> datuplet.gateway.v2.GetSchemaRequest
+	50, // 58: datuplet.gateway.v2.DataGateway.GetSample:input_type -> datuplet.gateway.v2.GetSampleRequest
+	52, // 59: datuplet.gateway.v2.DataGateway.Log:input_type -> datuplet.gateway.v2.LogRequest
+	6,  // 60: datuplet.gateway.v2.DataGateway.GetConfig:output_type -> datuplet.gateway.v2.ComponentConfig
+	55, // 61: datuplet.gateway.v2.DataGateway.Shutdown:output_type -> datuplet.gateway.v2.ShutdownResponse
+	13, // 62: datuplet.gateway.v2.DataGateway.OpenWriter:output_type -> datuplet.gateway.v2.OpenWriterResponse
+	15, // 63: datuplet.gateway.v2.DataGateway.WriteChunk:output_type -> datuplet.gateway.v2.WriteChunkResponse
+	17, // 64: datuplet.gateway.v2.DataGateway.CloseWriter:output_type -> datuplet.gateway.v2.CloseWriterResponse
+	22, // 65: datuplet.gateway.v2.DataGateway.OpenReader:output_type -> datuplet.gateway.v2.OpenReaderResponse
+	24, // 66: datuplet.gateway.v2.DataGateway.ReadChunk:output_type -> datuplet.gateway.v2.DataChunk
+	26, // 67: datuplet.gateway.v2.DataGateway.CloseReader:output_type -> datuplet.gateway.v2.CloseReaderResponse
+	37, // 68: datuplet.gateway.v2.DataGateway.Commit:output_type -> datuplet.gateway.v2.CommitResponse
+	41, // 69: datuplet.gateway.v2.DataGateway.CompactTable:output_type -> datuplet.gateway.v2.CompactTableResponse
+	43, // 70: datuplet.gateway.v2.DataGateway.RewriteManifests:output_type -> datuplet.gateway.v2.RewriteManifestsResponse
+	45, // 71: datuplet.gateway.v2.DataGateway.ExpireSnapshots:output_type -> datuplet.gateway.v2.ExpireSnapshotsResponse
+	47, // 72: datuplet.gateway.v2.DataGateway.DeleteOrphanFiles:output_type -> datuplet.gateway.v2.DeleteOrphanFilesResponse
+	49, // 73: datuplet.gateway.v2.DataGateway.GetSchema:output_type -> datuplet.gateway.v2.SchemaResponse
+	51, // 74: datuplet.gateway.v2.DataGateway.GetSample:output_type -> datuplet.gateway.v2.SampleResponse
+	53, // 75: datuplet.gateway.v2.DataGateway.Log:output_type -> datuplet.gateway.v2.LogResponse
+	60, // [60:76] is the sub-list for method output_type
+	44, // [44:60] is the sub-list for method input_type
 	44, // [44:44] is the sub-list for extension type_name
 	44, // [44:44] is the sub-list for extension extendee
 	0,  // [0:44] is the sub-list for field type_name
@@ -4146,7 +4689,7 @@ func file_gateway_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_gateway_proto_rawDesc), len(file_gateway_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   58,
+			NumMessages:   64,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

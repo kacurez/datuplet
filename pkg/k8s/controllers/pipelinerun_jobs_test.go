@@ -787,7 +787,7 @@ func TestGenerateGatewayConfig_PreviewBlock(t *testing.T) {
 func TestGatewayConfig_CarriesComponentInstanceName(t *testing.T) {
 	r := &PipelineRunReconciler{}
 	for _, name := range []string{"compact-a", "compact-b"} {
-		comp := &datupletv1.ComponentSpec{Name: name, Component: "iceberg-compactor"}
+		comp := &datupletv1.ComponentSpec{Name: name, Component: "iceberg-maintenance"}
 		y, err := r.generateGatewayConfig(minimalPipelineRun(), minimalPipeline(), comp)
 		if err != nil {
 			t.Fatalf("generateGatewayConfig: %v", err)
@@ -810,5 +810,35 @@ func TestGatewayConfig_CarriesComponentInstanceName(t *testing.T) {
 		if cfg.ComponentName != name {
 			t.Errorf("loaded ComponentName = %q, want %q", cfg.ComponentName, name)
 		}
+	}
+}
+
+// TestGatewayConfig_TableMaintenanceOnlyForMaintenanceComponent: the
+// maintenance gate is written by the controller from the registry component
+// name and can never be set through user config.
+func TestGatewayConfig_TableMaintenanceOnlyForMaintenanceComponent(t *testing.T) {
+	r := &PipelineRunReconciler{}
+	gen := func(comp *datupletv1.ComponentSpec) map[string]any {
+		y, err := r.generateGatewayConfig(minimalPipelineRun(), minimalPipeline(), comp)
+		if err != nil {
+			t.Fatalf("generateGatewayConfig: %v", err)
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal([]byte(y), &doc); err != nil {
+			t.Fatalf("generated YAML did not parse: %v", err)
+		}
+		return doc
+	}
+	doc := gen(&datupletv1.ComponentSpec{Name: "maint", Component: "iceberg-maintenance"})
+	if doc["table_maintenance"] != true {
+		t.Errorf("iceberg-maintenance: table_maintenance = %v, want true", doc["table_maintenance"])
+	}
+	doc = gen(&datupletv1.ComponentSpec{
+		Name:      "sql",
+		Component: "sql-transform",
+		Config:    apiextensionsv1.JSON{Raw: []byte(`{"table_maintenance": true}`)},
+	})
+	if _, ok := doc["table_maintenance"]; ok {
+		t.Errorf("sql-transform with user config: table_maintenance leaked into gateway YAML: %v", doc["table_maintenance"])
 	}
 }

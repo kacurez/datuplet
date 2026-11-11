@@ -87,16 +87,16 @@ func (f *fakeRunBackend) CancelRun(context.Context, runbackend.CancelRequest) er
 
 func compactorRegistry(t *testing.T) validate.StaticRegistry {
 	t.Helper()
-	schema, err := os.ReadFile("../../../components/iceberg-compactor/schema.json")
+	schema, err := os.ReadFile("../../../components/iceberg-maintenance/schema.json")
 	if err != nil {
 		t.Fatalf("read compactor schema: %v", err)
 	}
 	return validate.StaticRegistry{
-		"iceberg-compactor": datupletv1.ComponentDefinition{
-			ObjectMeta: metav1.ObjectMeta{Name: "iceberg-compactor"},
+		"iceberg-maintenance": datupletv1.ComponentDefinition{
+			ObjectMeta: metav1.ObjectMeta{Name: "iceberg-maintenance"},
 			Spec: datupletv1.ComponentDefinitionSpec{
 				DefaultVersion: "v1.0.0",
-				Versions:       []datupletv1.VersionSpec{{Version: "v1.0.0", Image: "x/iceberg-compactor:v1.0.0", ConfigSchema: string(schema)}},
+				Versions:       []datupletv1.VersionSpec{{Version: "v1.0.0", Image: "x/iceberg-maintenance:v1.0.0", ConfigSchema: string(schema)}},
 				IO:             &datupletv1.ComponentIO{Inputs: "none", Outputs: "required"},
 			},
 		},
@@ -240,7 +240,8 @@ func storedTargetSize(t *testing.T, pool *pgxpool.Pool, projectID uuid.UUID, nam
 	if err != nil {
 		t.Fatalf("parse stored doc: %v", err)
 	}
-	return doc.Stages[0].Components[0].Config["target_file_size_mb"]
+	c, _ := doc.Stages[0].Components[0].Config["compact"].(map[string]any)
+	return c["target_file_size_mb"]
 }
 
 func TestCompactTable_Handler(t *testing.T) {
@@ -301,9 +302,12 @@ func TestCompactTable_Handler(t *testing.T) {
 		}
 		doc, _ := config.Parse(p.Doc)
 		c := doc.Stages[0].Components[0]
-		if doc.Stages[0].Name != "compact" || c.Name != "compact" || c.Component != "iceberg-compactor" ||
+		if doc.Stages[0].Name != "compact" || c.Name != "compact" || c.Component != "iceberg-maintenance" ||
 			c.Outputs == nil || len(c.Outputs.Tables) != 1 || c.Outputs.Tables[0].Bucket != "raw" || c.Outputs.Tables[0].Name != "events" {
 			t.Errorf("doc = %+v", doc)
+		}
+		if got, _ := json.Marshal(c.Config); string(got) != `{"compact":{"enabled":true,"target_file_size_mb":64}}` {
+			t.Errorf("config = %s", got)
 		}
 	})
 	t.Run("running compaction is 409 and the doc is unchanged", func(t *testing.T) {

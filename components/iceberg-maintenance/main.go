@@ -1,5 +1,6 @@
-// Package main is the iceberg-compactor component: it asks the Data Gateway
-// to bin-pack the small data files of each declared output table.
+// Package main is the iceberg-maintenance component: it asks the Data Gateway
+// to run Iceberg maintenance (compact, rewrite manifests, expire snapshots,
+// delete orphan files) on each declared output table.
 package main
 
 import (

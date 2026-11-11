@@ -36,6 +36,11 @@ service DataGateway {
   // output table into one replace snapshot. Long-running; no deadline.
   rpc CompactTable(CompactTableRequest) returns (CompactTableResponse);
 
+  // Table maintenance: served only to iceberg-maintenance stages.
+  rpc RewriteManifests(RewriteManifestsRequest) returns (RewriteManifestsResponse);
+  rpc ExpireSnapshots(ExpireSnapshotsRequest) returns (ExpireSnapshotsResponse);
+  rpc DeleteOrphanFiles(DeleteOrphanFilesRequest) returns (DeleteOrphanFilesResponse);
+
   // Schema/Sampling (for discovery)
   rpc GetSchema(GetSchemaRequest) returns (SchemaResponse);
   rpc GetSample(GetSampleRequest) returns (SampleResponse);
@@ -410,6 +415,73 @@ message CompactTableResponse {
   int64 snapshot_before = 11;
   int64 snapshot_after = 12;
   int64 duration_ms = 13;
+}
+
+// ============================================================================
+// Table maintenance
+// ============================================================================
+
+// RewriteManifestsRequest names an exact (bucket, table) from output_tables.
+// Zero target_manifest_size_bytes takes the default (8 MiB).
+message RewriteManifestsRequest {
+  string bucket = 1;
+  string table = 2;
+  int64 target_manifest_size_bytes = 3;
+  bool dry_run = 4;
+}
+
+// RewriteManifestsResponse status is REWRITTEN, NOTHING_TO_DO or DRY_RUN.
+message RewriteManifestsResponse {
+  string status = 1;
+  int32 manifests_before = 2;
+  int32 manifests_after = 3;
+  int64 snapshot_before = 4;
+  int64 snapshot_after = 5;
+  int64 duration_ms = 6;
+}
+
+// ExpireSnapshotsRequest: zero older_than_hours takes 168 and zero
+// retain_last takes 10; older_than_hours < 24 is rejected.
+message ExpireSnapshotsRequest {
+  string bucket = 1;
+  string table = 2;
+  int32 older_than_hours = 3;
+  int32 retain_last = 4;
+  bool dry_run = 5;
+}
+
+// ExpireSnapshotsResponse status is EXPIRED, EXPIRED_PARTIAL, NOTHING_TO_DO
+// or DRY_RUN.
+message ExpireSnapshotsResponse {
+  string status = 1;
+  int32 snapshots_expired = 2;
+  int32 files_deleted = 3;
+  int64 bytes_deleted = 4;
+  // Files freed by the expiry that were not deleted (left for orphan
+  // cleanup). -1 means unknown: the expiry committed but the deletion set
+  // could not be computed.
+  int32 files_left = 5;
+  int64 current_snapshot = 6;
+  int64 duration_ms = 7;
+}
+
+// DeleteOrphanFilesRequest: zero older_than_hours takes 72 and zero
+// max_files takes 10000; older_than_hours < 25 is rejected.
+message DeleteOrphanFilesRequest {
+  string bucket = 1;
+  string table = 2;
+  int32 older_than_hours = 3;
+  int32 max_files = 4;
+  bool dry_run = 5;
+}
+
+// DeleteOrphanFilesResponse status is DELETED, NOTHING_TO_DO or DRY_RUN.
+message DeleteOrphanFilesResponse {
+  string status = 1;
+  int32 orphan_files = 2;
+  int64 orphan_bytes = 3;
+  int32 files_deleted = 4;
+  int64 duration_ms = 5;
 }
 
 // ============================================================================

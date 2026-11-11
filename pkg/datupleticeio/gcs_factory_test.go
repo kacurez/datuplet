@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"strings"
@@ -216,9 +217,9 @@ func TestRefreshingTokenSourceStringRedacts(t *testing.T) {
 func TestPickRefreshEndpointActivationFailsClosed(t *testing.T) {
 	parsed, _ := url.Parse("gs://test-bucket")
 	props := map[string]string{
-		"gcs.oauth2.token":                         "ya29.test",
-		"gcs.oauth2.refresh-credentials-endpoint":  "https://lakekeeper.example/refresh",
-		"gcs.oauth2.refresh-credentials-enabled":   "true", // explicit opt-in
+		"gcs.oauth2.token":                        "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lakekeeper.example/refresh",
+		"gcs.oauth2.refresh-credentials-enabled":  "true", // explicit opt-in
 	}
 	_, err := datupletGCSFactory(context.Background(), parsed, props)
 	if err == nil {
@@ -259,9 +260,9 @@ func TestPickRefreshEndpointPresentButNotOptedIn(t *testing.T) {
 func TestPickRefreshEndpointExplicitlyDisabledSucceeds(t *testing.T) {
 	parsed, _ := url.Parse("gs://test-bucket")
 	props := map[string]string{
-		"gcs.oauth2.token":                         "ya29.test",
-		"gcs.oauth2.refresh-credentials-endpoint":  "https://lakekeeper.example/refresh",
-		"gcs.oauth2.refresh-credentials-enabled":   "false",
+		"gcs.oauth2.token":                        "ya29.test",
+		"gcs.oauth2.refresh-credentials-endpoint": "https://lakekeeper.example/refresh",
+		"gcs.oauth2.refresh-credentials-enabled":  "false",
 	}
 	gcsio, err := datupletGCSFactory(context.Background(), parsed, props)
 	if err != nil {
@@ -323,4 +324,109 @@ func TestDatupletGCSFactoryEndToEnd(t *testing.T) {
 		t.Skip("INTEGRATION=1 required (uses fake-gcs-server, currently disabled)")
 	}
 	t.Skip("end-to-end harness not yet wired up; tracked in RFC 019 follow-on slice")
+}
+
+type walked struct {
+	size    int64
+	modTime time.Time
+}
+
+func walkGCS(t *testing.T, g *gcsIO, root string) map[string]walked {
+	t.Helper()
+	got := map[string]walked{}
+	err := g.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		got[p] = walked{size: info.Size(), modTime: info.ModTime()}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDir(%q): %v", root, err)
+	}
+	return got
+}
+
+func seedGCS(t *testing.T, g *gcsIO, objs map[string]string) {
+	t.Helper()
+	for k, v := range objs {
+		if err := g.bucket.WriteAll(g.ctx, k, []byte(v), nil); err != nil {
+			t.Fatalf("seed %s: %v", k, err)
+		}
+	}
+}
+
+func TestGCSWalkDir_FullURIs(t *testing.T) {
+	g := newTestGcsIO(t)
+	seedGCS(t, g, map[string]string{
+		"wh/t/data/a.parquet":   "aa",
+		"wh/t/metadata/v1.json": "{}",
+	})
+	got := walkGCS(t, g, "gs://test-bucket/wh/t")
+	want := []string{"gs://test-bucket/wh/t/data/a.parquet", "gs://test-bucket/wh/t/metadata/v1.json"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for _, w := range want {
+		if _, ok := got[w]; !ok {
+			t.Errorf("missing %q in %v", w, got)
+		}
+	}
+}
+
+func TestGCSWalkDir_SiblingPrefix(t *testing.T) {
+	g := newTestGcsIO(t)
+	seedGCS(t, g, map[string]string{
+		"wh/t/data/a.parquet":    "a",
+		"wh/t_v2/data/x.parquet": "x",
+	})
+	got := walkGCS(t, g, "gs://test-bucket/wh/t")
+	if len(got) != 1 {
+		t.Fatalf("got %v, want only wh/t/data/a.parquet", got)
+	}
+	if _, ok := got["gs://test-bucket/wh/t/data/a.parquet"]; !ok {
+		t.Errorf("missing table file in %v", got)
+	}
+}
+
+func TestGCSWalkDir_SizeAndModTime(t *testing.T) {
+	g := newTestGcsIO(t)
+	before := time.Now().Add(-time.Minute)
+	seedGCS(t, g, map[string]string{"wh/t/data/a.parquet": "12345"})
+	got := walkGCS(t, g, "gs://test-bucket/wh/t")
+	w, ok := got["gs://test-bucket/wh/t/data/a.parquet"]
+	if !ok {
+		t.Fatalf("missing file in %v", got)
+	}
+	if w.size != 5 {
+		t.Errorf("size = %d, want 5", w.size)
+	}
+	if w.modTime.Before(before) || w.modTime.After(time.Now().Add(time.Minute)) {
+		t.Errorf("modTime = %v, want ~now", w.modTime)
+	}
+}
+
+func TestGCSWalkDir_RootWithTrailingSlash(t *testing.T) {
+	g := newTestGcsIO(t)
+	seedGCS(t, g, map[string]string{
+		"wh/t/data/a.parquet":    "a",
+		"wh/t_v2/data/x.parquet": "x",
+	})
+	a := walkGCS(t, g, "gs://test-bucket/wh/t")
+	b := walkGCS(t, g, "gs://test-bucket/wh/t/")
+	if len(a) != 1 || len(b) != 1 {
+		t.Fatalf("a=%v b=%v", a, b)
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			t.Errorf("%q missing with trailing slash", k)
+		}
+	}
 }

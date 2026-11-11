@@ -19,19 +19,22 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	DataGateway_GetConfig_FullMethodName    = "/datuplet.gateway.v2.DataGateway/GetConfig"
-	DataGateway_Shutdown_FullMethodName     = "/datuplet.gateway.v2.DataGateway/Shutdown"
-	DataGateway_OpenWriter_FullMethodName   = "/datuplet.gateway.v2.DataGateway/OpenWriter"
-	DataGateway_WriteChunk_FullMethodName   = "/datuplet.gateway.v2.DataGateway/WriteChunk"
-	DataGateway_CloseWriter_FullMethodName  = "/datuplet.gateway.v2.DataGateway/CloseWriter"
-	DataGateway_OpenReader_FullMethodName   = "/datuplet.gateway.v2.DataGateway/OpenReader"
-	DataGateway_ReadChunk_FullMethodName    = "/datuplet.gateway.v2.DataGateway/ReadChunk"
-	DataGateway_CloseReader_FullMethodName  = "/datuplet.gateway.v2.DataGateway/CloseReader"
-	DataGateway_Commit_FullMethodName       = "/datuplet.gateway.v2.DataGateway/Commit"
-	DataGateway_CompactTable_FullMethodName = "/datuplet.gateway.v2.DataGateway/CompactTable"
-	DataGateway_GetSchema_FullMethodName    = "/datuplet.gateway.v2.DataGateway/GetSchema"
-	DataGateway_GetSample_FullMethodName    = "/datuplet.gateway.v2.DataGateway/GetSample"
-	DataGateway_Log_FullMethodName          = "/datuplet.gateway.v2.DataGateway/Log"
+	DataGateway_GetConfig_FullMethodName         = "/datuplet.gateway.v2.DataGateway/GetConfig"
+	DataGateway_Shutdown_FullMethodName          = "/datuplet.gateway.v2.DataGateway/Shutdown"
+	DataGateway_OpenWriter_FullMethodName        = "/datuplet.gateway.v2.DataGateway/OpenWriter"
+	DataGateway_WriteChunk_FullMethodName        = "/datuplet.gateway.v2.DataGateway/WriteChunk"
+	DataGateway_CloseWriter_FullMethodName       = "/datuplet.gateway.v2.DataGateway/CloseWriter"
+	DataGateway_OpenReader_FullMethodName        = "/datuplet.gateway.v2.DataGateway/OpenReader"
+	DataGateway_ReadChunk_FullMethodName         = "/datuplet.gateway.v2.DataGateway/ReadChunk"
+	DataGateway_CloseReader_FullMethodName       = "/datuplet.gateway.v2.DataGateway/CloseReader"
+	DataGateway_Commit_FullMethodName            = "/datuplet.gateway.v2.DataGateway/Commit"
+	DataGateway_CompactTable_FullMethodName      = "/datuplet.gateway.v2.DataGateway/CompactTable"
+	DataGateway_RewriteManifests_FullMethodName  = "/datuplet.gateway.v2.DataGateway/RewriteManifests"
+	DataGateway_ExpireSnapshots_FullMethodName   = "/datuplet.gateway.v2.DataGateway/ExpireSnapshots"
+	DataGateway_DeleteOrphanFiles_FullMethodName = "/datuplet.gateway.v2.DataGateway/DeleteOrphanFiles"
+	DataGateway_GetSchema_FullMethodName         = "/datuplet.gateway.v2.DataGateway/GetSchema"
+	DataGateway_GetSample_FullMethodName         = "/datuplet.gateway.v2.DataGateway/GetSample"
+	DataGateway_Log_FullMethodName               = "/datuplet.gateway.v2.DataGateway/Log"
 )
 
 // DataGatewayClient is the client API for DataGateway service.
@@ -66,6 +69,10 @@ type DataGatewayClient interface {
 	// Compaction: bin-pack the small data files of one explicitly declared
 	// output table into one replace snapshot. Long-running; no deadline.
 	CompactTable(ctx context.Context, in *CompactTableRequest, opts ...grpc.CallOption) (*CompactTableResponse, error)
+	// Table maintenance: served only to iceberg-maintenance stages.
+	RewriteManifests(ctx context.Context, in *RewriteManifestsRequest, opts ...grpc.CallOption) (*RewriteManifestsResponse, error)
+	ExpireSnapshots(ctx context.Context, in *ExpireSnapshotsRequest, opts ...grpc.CallOption) (*ExpireSnapshotsResponse, error)
+	DeleteOrphanFiles(ctx context.Context, in *DeleteOrphanFilesRequest, opts ...grpc.CallOption) (*DeleteOrphanFilesResponse, error)
 	// Schema/Sampling (for discovery)
 	GetSchema(ctx context.Context, in *GetSchemaRequest, opts ...grpc.CallOption) (*SchemaResponse, error)
 	GetSample(ctx context.Context, in *GetSampleRequest, opts ...grpc.CallOption) (*SampleResponse, error)
@@ -190,6 +197,36 @@ func (c *dataGatewayClient) CompactTable(ctx context.Context, in *CompactTableRe
 	return out, nil
 }
 
+func (c *dataGatewayClient) RewriteManifests(ctx context.Context, in *RewriteManifestsRequest, opts ...grpc.CallOption) (*RewriteManifestsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RewriteManifestsResponse)
+	err := c.cc.Invoke(ctx, DataGateway_RewriteManifests_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dataGatewayClient) ExpireSnapshots(ctx context.Context, in *ExpireSnapshotsRequest, opts ...grpc.CallOption) (*ExpireSnapshotsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExpireSnapshotsResponse)
+	err := c.cc.Invoke(ctx, DataGateway_ExpireSnapshots_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dataGatewayClient) DeleteOrphanFiles(ctx context.Context, in *DeleteOrphanFilesRequest, opts ...grpc.CallOption) (*DeleteOrphanFilesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteOrphanFilesResponse)
+	err := c.cc.Invoke(ctx, DataGateway_DeleteOrphanFiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *dataGatewayClient) GetSchema(ctx context.Context, in *GetSchemaRequest, opts ...grpc.CallOption) (*SchemaResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SchemaResponse)
@@ -252,6 +289,10 @@ type DataGatewayServer interface {
 	// Compaction: bin-pack the small data files of one explicitly declared
 	// output table into one replace snapshot. Long-running; no deadline.
 	CompactTable(context.Context, *CompactTableRequest) (*CompactTableResponse, error)
+	// Table maintenance: served only to iceberg-maintenance stages.
+	RewriteManifests(context.Context, *RewriteManifestsRequest) (*RewriteManifestsResponse, error)
+	ExpireSnapshots(context.Context, *ExpireSnapshotsRequest) (*ExpireSnapshotsResponse, error)
+	DeleteOrphanFiles(context.Context, *DeleteOrphanFilesRequest) (*DeleteOrphanFilesResponse, error)
 	// Schema/Sampling (for discovery)
 	GetSchema(context.Context, *GetSchemaRequest) (*SchemaResponse, error)
 	GetSample(context.Context, *GetSampleRequest) (*SampleResponse, error)
@@ -296,6 +337,15 @@ func (UnimplementedDataGatewayServer) Commit(context.Context, *CommitRequest) (*
 }
 func (UnimplementedDataGatewayServer) CompactTable(context.Context, *CompactTableRequest) (*CompactTableResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CompactTable not implemented")
+}
+func (UnimplementedDataGatewayServer) RewriteManifests(context.Context, *RewriteManifestsRequest) (*RewriteManifestsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RewriteManifests not implemented")
+}
+func (UnimplementedDataGatewayServer) ExpireSnapshots(context.Context, *ExpireSnapshotsRequest) (*ExpireSnapshotsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExpireSnapshots not implemented")
+}
+func (UnimplementedDataGatewayServer) DeleteOrphanFiles(context.Context, *DeleteOrphanFilesRequest) (*DeleteOrphanFilesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteOrphanFiles not implemented")
 }
 func (UnimplementedDataGatewayServer) GetSchema(context.Context, *GetSchemaRequest) (*SchemaResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSchema not implemented")
@@ -500,6 +550,60 @@ func _DataGateway_CompactTable_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DataGateway_RewriteManifests_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RewriteManifestsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataGatewayServer).RewriteManifests(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataGateway_RewriteManifests_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataGatewayServer).RewriteManifests(ctx, req.(*RewriteManifestsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DataGateway_ExpireSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExpireSnapshotsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataGatewayServer).ExpireSnapshots(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataGateway_ExpireSnapshots_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataGatewayServer).ExpireSnapshots(ctx, req.(*ExpireSnapshotsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DataGateway_DeleteOrphanFiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteOrphanFilesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataGatewayServer).DeleteOrphanFiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataGateway_DeleteOrphanFiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataGatewayServer).DeleteOrphanFiles(ctx, req.(*DeleteOrphanFilesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DataGateway_GetSchema_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSchemaRequest)
 	if err := dec(in); err != nil {
@@ -596,6 +700,18 @@ var DataGateway_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CompactTable",
 			Handler:    _DataGateway_CompactTable_Handler,
+		},
+		{
+			MethodName: "RewriteManifests",
+			Handler:    _DataGateway_RewriteManifests_Handler,
+		},
+		{
+			MethodName: "ExpireSnapshots",
+			Handler:    _DataGateway_ExpireSnapshots_Handler,
+		},
+		{
+			MethodName: "DeleteOrphanFiles",
+			Handler:    _DataGateway_DeleteOrphanFiles_Handler,
 		},
 		{
 			MethodName: "GetSchema",

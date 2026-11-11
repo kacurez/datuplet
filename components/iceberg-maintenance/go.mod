@@ -1,4 +1,4 @@
-module github.com/datuplet/datuplet/components/iceberg-compactor
+module github.com/datuplet/datuplet/components/iceberg-maintenance
 
 go 1.27.3
 

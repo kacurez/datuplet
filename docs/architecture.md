@@ -206,11 +206,18 @@ concurrency 1, Parquet written by iceberg-go's compaction writer streaming to
 object storage) and commits one `replace` snapshot in its own conflict-retry
 loop with the same `datuplet.commit-key` idempotency lookup, keyed by a hash of
 run/component/bucket/table. It is exposed through the
-`iceberg-compactor` component (an ordinary pipeline stage whose declared output
+`iceberg-maintenance` component (an ordinary pipeline stage whose declared output
 is the table to compact, so FGA and the exact-table check apply unchanged) and
 through the on-demand storage route, which runs that component under a hidden
-`sys-compact-*` pipeline. It never reclaims storage; see
-[known-limitations.md](known-limitations.md#table-compaction).
+`sys-compact-*` pipeline. Compaction alone never reclaims storage.
+
+**Maintenance.** The same component also drives three more gateway RPCs,
+`RewriteManifests`, `ExpireSnapshots` and `DeleteOrphanFiles`, which are served
+only to `iceberg-maintenance` stages (the controller writes `table_maintenance:
+true` into that component's gateway config). Expiry and orphan deletion remove
+objects using the vended STS credentials; see
+[components.md](components.md#iceberg-maintenance) and
+[known-limitations.md](known-limitations.md#table-maintenance).
 
 ### Lakekeeper
 

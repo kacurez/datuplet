@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -375,6 +376,65 @@ func (g *gcsIO) Remove(name string) error {
 	return g.bucket.Delete(g.ctx, key)
 }
 
+// WalkDir satisfies iceio.ListableIO. It lists every object under root
+// (flat, no delimiter) and calls fn once per object with the full
+// gs://<bucket>/<key> URI, matching how Lakekeeper spells locations in
+// table metadata; orphan detection compares these strings verbatim.
+// The listing prefix is root with exactly one trailing "/", so a sibling
+// table whose location merely starts with the same string is never listed.
+// Only files are reported (no directory entries), and zero-byte "folder"
+// marker objects (keys ending in "/") are skipped so they are never
+// planned for deletion.
+func (g *gcsIO) WalkDir(root string, fn fs.WalkDirFunc) error {
+	key, err := g.preprocess(root)
+	if err != nil {
+		return &fs.PathError{Op: "walk dir", Path: root, Err: err}
+	}
+	prefix := strings.TrimRight(key, "/") + "/"
+	if prefix == "/" {
+		return &fs.PathError{Op: "walk dir", Path: root, Err: fs.ErrInvalid}
+	}
+	it := g.bucket.List(&blob.ListOptions{Prefix: prefix})
+	for {
+		obj, err := it.Next(g.ctx)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return &fs.PathError{Op: "walk dir", Path: root, Err: err}
+		}
+		if obj.IsDir || strings.HasSuffix(obj.Key, "/") {
+			continue
+		}
+		uri := "gs://" + g.bucketName + "/" + obj.Key
+		entry := fs.FileInfoToDirEntry(gcsListInfo{
+			name:    path.Base(obj.Key),
+			size:    obj.Size,
+			modTime: obj.ModTime,
+		})
+		if err := fn(uri, entry, nil); err != nil {
+			if errors.Is(err, fs.SkipAll) || errors.Is(err, fs.SkipDir) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// gcsListInfo is the fs.FileInfo reported for a listed object.
+type gcsListInfo struct {
+	name    string
+	size    int64
+	modTime time.Time
+}
+
+func (i gcsListInfo) Name() string       { return i.name }
+func (i gcsListInfo) Size() int64        { return i.size }
+func (i gcsListInfo) Mode() fs.FileMode  { return 0 }
+func (i gcsListInfo) ModTime() time.Time { return i.modTime }
+func (i gcsListInfo) IsDir() bool        { return false }
+func (i gcsListInfo) Sys() any           { return nil }
+
 // Close releases the underlying gocloud blob.Bucket. iceio.IO doesn't
 // declare Close, but Datuplet callers that hold a non-iceio reference
 // to *gcsIO should call this defensively. Today gcsblob.Bucket.Close
@@ -433,8 +493,8 @@ type gcsWriteFile struct {
 	w *blob.Writer
 }
 
-func (f *gcsWriteFile) Write(p []byte) (int, error)        { return f.w.Write(p) }
-func (f *gcsWriteFile) Close() error                       { return f.w.Close() }
+func (f *gcsWriteFile) Write(p []byte) (int, error)         { return f.w.Write(p) }
+func (f *gcsWriteFile) Close() error                        { return f.w.Close() }
 func (f *gcsWriteFile) ReadFrom(r io.Reader) (int64, error) { return io.Copy(f.w, r) }
 
 // Verify gcsIO satisfies io.Closer at compile time.
@@ -492,6 +552,7 @@ func (f *gcsFile) Size() int64 { return f.Reader.Size() }
 
 // Compile-time interface assertions.
 var (
-	_ iceio.IO   = (*gcsIO)(nil)
-	_ iceio.File = (*gcsFile)(nil)
+	_ iceio.IO         = (*gcsIO)(nil)
+	_ iceio.ListableIO = (*gcsIO)(nil)
+	_ iceio.File       = (*gcsFile)(nil)
 )
